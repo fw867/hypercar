@@ -100,6 +100,9 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+        // SPIKE-P0：Shizuku UserService 用 AIDL 暴露「shell 身份建副屏」。
+        // AGP 默认不开 aidl，这里显式打开（P0 结束若删 spike 包，这一行也可删）。
+        aidl = true
     }
     packaging {
         resources {

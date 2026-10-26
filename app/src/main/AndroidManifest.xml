@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
@@ -50,9 +50,15 @@
         android:name="android.hardware.wifi"
         android:required="true" />
 
-    <!-- Android 11+ 包可见性：探测 Shizuku 服务端 -->
+    <!-- Android 11+ 包可见性：探测 Shizuku 服务端 + spike 要拉起来的目标 App -->
     <queries>
         <package android:name="moe.shizuku.privileged.api" />
+        <!-- SPIKE-P0：D2 上要启动的 App（不加 <queries> 的话 getPackageInfo/getLaunchIntent 返回 null） -->
+        <package android:name="com.autonavi.minimap" />
+        <package android:name="com.baidu.BaiduMap" />
+        <package android:name="com.tencent.qqmusic" />
+        <package android:name="com.netease.cloudmusic" />
+        <package android:name="com.luna.music" />
     </queries>
 
     <application
@@ -84,6 +90,32 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- SPIKE-P0：调试控制台与受控注入目标。
+             ConsoleActivity 必须 exported=true：唯一入口是 adb shell am start（后台启动 Activity
+             会被系统拦，广播拉起不可靠）。它不接入生产导航，P0 结束后可整段删除。 -->
+        <activity
+            android:name=".spike.SpikeConsoleActivity"
+            android:exported="true"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
+            android:theme="@style/Theme.HyperCar" />
+
+        <!-- SPIKE-P0：受控注入目标。必须 exported=true：D2 上的 Activity 只能由
+             Shizuku shell 的 am start（带 display 参数）拉起；app 进程用 launchDisplayId 会被拒。 -->
+        <activity
+            android:name=".spike.SpikeProbeActivity"
+            android:exported="true"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
+            android:theme="@style/Theme.HyperCar" />
+
+        <!-- SPIKE-P0：以后台前台服务方式跑 spike（不占主屏、不被 HyperOS 冻结）。
+             由 adb shell 显式 start-foreground-service 触发，故 exported=true。 -->
+        <service
+            android:name=".spike.SpikeRunService"
+            android:exported="true"
+            android:foregroundServiceType="connectedDevice" />
 
         <!-- 秒连链路：上车（车机蓝牙 ACL 连上）冷启动进程 → 前台服务 → 全自动协商 -->
         <service

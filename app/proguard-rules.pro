@@ -6,9 +6,14 @@
 -keep class io.github.hypercar.core.RustCoreBridge { *; }
 -keep interface io.github.hypercar.core.RustCoreBridge$EventListener { *; }
 -keep interface io.github.hypercar.core.RustCoreBridge$SocketProvider { *; }
+-keep interface io.github.hypercar.core.RustCoreBridge$TouchListener { *; }
 # 回调实现类（匿名 object）：方法名与接口一致，接口 keep 后即可，但显式保一下更稳
 -keep class * implements io.github.hypercar.core.RustCoreBridge$EventListener { *; }
 -keep class * implements io.github.hypercar.core.RustCoreBridge$SocketProvider { *; }
+-keep class * implements io.github.hypercar.core.RustCoreBridge$TouchListener { *; }
+
+# ---- SPIKE-P0：调试控制台/探针（P0 结束后连同 spike 包一起删） ----
+-keep class io.github.hypercar.spike.** { *; }
 
 # ---- Shizuku（binder 反射 + provider）----
 -keep class dev.rikka.shizuku.** { *; }

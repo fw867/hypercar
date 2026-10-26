@@ -1,4 +1,4 @@
-﻿//! HyperCar 核心层 —— JNI 入口、Tokio 运行时、引擎生命周期。
+//! HyperCar 核心层 —— JNI 入口、Tokio 运行时、引擎生命周期。
 //!
 //! 与「参考文档」的架构差异（docs/NEGOTIATION-GAPS.md）：
 //!  参考文档里 AirPlay 协商留在 Kotlin，Rust 只接「已连通 FD + 已派生密钥」；
@@ -55,6 +55,12 @@ static TOKIO_RT: Lazy<Runtime> = Lazy::new(|| {
 
 static JAVA_VM: RwLock<Option<jni::JavaVM>> = RwLock::new(None);
 static LISTENER: RwLock<Option<GlobalRef>> = RwLock::new(None);
+/// 车机 HID 触摸回调（Rust → Kotlin）。
+///
+/// 与 [LISTENER] 分开持有 GlobalRef：触摸是高频事件（车机滑一下就是几十条），
+/// 不能因为 UI 层临时把 EventListener 置空而丢触摸；EngineHandle 里另有一条
+/// 触摸通道（`touch_tx`），引擎重启不需要重装监听器。
+static TOUCH_LISTENER: RwLock<Option<GlobalRef>> = RwLock::new(None);
 
 struct EngineHandle {
     stop: Arc<Notify>,
@@ -155,6 +161,29 @@ fn call_listener(method: &str, f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::err
     let obj = global.as_obj();
     let _ = with_env(|env| f(env, obj));
     let _ = method;
+}
+
+/// Rust → Kotlin 触摸回调（action: 0=DOWN 1=UP 2=MOVE；坐标为编码画布像素）。
+///
+/// 在 Rust 工作线程调用：`with_env` 会按需 attach（daemon）并清掉 Pending 异常。
+/// 没有装监听器时直接丢弃——这样「只连车机、不跑界面」的路径也能安全工作。
+pub(crate) fn emit_touch(action: u32, x: u32, y: u32) {
+    let guard = TOUCH_LISTENER.read();
+    let Some(global) = guard.as_ref() else { return };
+    let obj = global.as_obj();
+    let _ = with_env(|env| {
+        env.call_method(
+            obj,
+            "onTouch",
+            "(III)V",
+            &[
+                (action as jint).into(),
+                (x as jint).into(),
+                (y as jint).into(),
+            ],
+        )
+        .map(|_| ())
+    });
 }
 
 // ---------------------------------------------------------------- socket 供给器
@@ -264,6 +293,21 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSetList
     };
 }
 
+/// 装/卸车机触摸监听器（Rust 每收到一条 HID 触摸就回调 `onTouch(action,x,y)`）。
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSetTouchListener(
+    env: JNIEnv,
+    _class: JClass,
+    listener: JObject,
+) {
+    let mut guard = TOUCH_LISTENER.write();
+    *guard = if listener.is_null() {
+        None
+    } else {
+        Some(env.new_global_ref(listener).expect("TouchListener GlobalRef 创建失败"))
+    };
+}
+
 /// 启动全链路网关：controlFd（已连车机 AirPlay 端口）+ socket 供给器 + 引擎配置 JSON。
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStart(
@@ -357,8 +401,16 @@ fn native_start_impl(
         obj: factory_obj,
     });
 
-    let (touch_tx, _touch_rx) = mpsc::unbounded_channel::<TouchInput>();
+    let (touch_tx, mut touch_rx) = mpsc::unbounded_channel::<TouchInput>();
     let (key_tx, _key_rx) = mpsc::unbounded_channel::<u32>();
+    // 车机 HID 触摸 → Kotlin：airplay::handle_hid_report 只负责换算坐标与边沿，
+    // 投递到这里后由独立任务回调监听器（P1 喂 Compose 首页，P2 注入 D2）。
+    // 通道随引擎重建；监听器是独立 GlobalRef，不随引擎重启丢失。
+    TOKIO_RT.spawn(async move {
+        while let Some(t) = touch_rx.recv().await {
+            emit_touch(t.action, t.x, t.y);
+        }
+    });
     // 自绘界面 → 引擎：视频帧 / 音频 PCM 都走这条通道
     let (source_tx, source_rx) = mpsc::unbounded_channel::<engine::SourceEvent>();
     let stop = Arc::new(Notify::new());
@@ -492,6 +544,28 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePushAud
             rate: rate.max(8000) as u32,
             channels: channels.clamp(1, 2) as u8,
             data: bytes,
+        });
+    }
+}
+
+/// **SPIKE-P0 调试专用**：把一条触摸直接塞进引擎的触摸通道。
+///
+/// 没有车机/接收端发 HID 时，用它验证「Rust 触摸通道 → JNI → Kotlin onTouch」这条
+/// 回调链是否通（HID 报告解析本身由 `airplay::handle_hid_report` 负责，车上已定谳）。
+/// 生产路径不调用它；P0 结束后可删。
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeDebugTouch(
+    _env: JNIEnv,
+    _class: JClass,
+    action: jint,
+    x: jint,
+    y: jint,
+) {
+    if let Some(handle) = ENGINE.lock().as_ref() {
+        let _ = handle.touch_tx.send(TouchInput {
+            action: action.clamp(0, 2) as u32,
+            x: x.max(0) as u32,
+            y: y.max(0) as u32,
         });
     }
 }

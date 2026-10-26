@@ -1,4 +1,4 @@
-﻿//! 引擎编排：**本机自绘界面（自采自编）→ AirPlay 推流** 的粘合层。
+//! 引擎编排：**本机自绘界面（自采自编）→ AirPlay 推流** 的粘合层。
 //!
 //! 数据面：
 //!  - 视频：Kotlin 侧 MediaCodec 出来的 H.264 Annex B（nativePushVideoFrame）→ ScreenSender
@@ -128,6 +128,10 @@ pub async fn run_engine(
             let mut sender: Option<ScreenSender> = None;
             // 屏幕流就绪前收到的编码尺寸先存着，就绪时补上
             let mut pending_size: Option<(u32, u32)> = None;
+            // 编码器真实尺寸（最后一次 EncoderResolution）。待机循环会临时把画布切成
+            // 待机母版尺寸；首帧到来时必须**再切回编码尺寸**，否则 send_config 会用
+            // 待机母版的宽高去标注 1920x720 的码流 → 车机按错误画布解码（拉伸）。
+            let mut encoder_size: Option<(u32, u32)> = None;
             let mut ready = Some(screen_ready_rx);
             let mut video_rx = video_rx;
             // 16ms tick：真帧没到时用它按 ~60fps 发待机循环帧
@@ -162,6 +166,7 @@ pub async fn run_engine(
                         Some(SourceEvent::EncoderResolution { width, height }) => {
                             // 手机回报实际编码尺寸 → 同步 AirPlay 画布（VideoConfig 宽高）。
                             // 必须在首帧引出 VideoConfig 之前生效，否则车机按旧画布解码。
+                            encoder_size = Some((width, height));
                             if let Some(s) = sender.as_mut() {
                                 s.set_size(width, height);
                             } else {
@@ -171,6 +176,13 @@ pub async fn run_engine(
                         Some(SourceEvent::VideoFrame { pts_us, data }) => {
                             if let Some(s) = sender.as_mut() {
                                 let len = data.len() as u64;
+                                // 待机循环可能刚把画布切成母版尺寸；首帧前切回编码尺寸，
+                                // 保证随后 send_config 写进去的是 1920x720。
+                                if let Some((w, h)) = encoder_size {
+                                    if s.size() != (w, h) {
+                                        s.set_size(w, h);
+                                    }
+                                }
                                 // 上游时间戳可能为 0/非单调，为 0 时用本机单调钟
                                 // 直接当 PTS 会让车机按 0 排播 → 卡顿/丢帧。为 0 时用本机单调钟。
                                 let pts = if pts_us == 0 {

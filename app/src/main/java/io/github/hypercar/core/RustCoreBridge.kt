@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.core
+package io.github.hypercar.core
 
 /**
  * Rust 核心层 JNI 桥（libhypercar_core.so）。
@@ -38,6 +38,16 @@ object RustCoreBridge {
         fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean)
     }
 
+    /**
+     * 车机 HID 触摸回调（Rust 工作线程调用，实现方需自行切主线程）。
+     *
+     * action：0=DOWN、1=UP、2=MOVE；x/y 已换算到编码画布像素（与 VideoConfig 画布一致）。
+     * 与 [EventListener] 分开注册：触摸是高频事件，且 UI 层可能在会话中途重建。
+     */
+    interface TouchListener {
+        fun onTouch(action: Int, x: Int, y: Int)
+    }
+
     @Volatile
     private var listener: EventListener? = null
 
@@ -48,9 +58,22 @@ object RustCoreBridge {
 
     fun currentListener(): EventListener? = listener
 
+    @Volatile
+    private var touchListener: TouchListener? = null
+
+    /** 装/卸车机触摸监听器（null = 卸载）。会话开始前装一次即可。 */
+    fun setTouchListener(l: TouchListener?) {
+        touchListener = l
+        nativeSetTouchListener(l)
+    }
+
+    fun currentTouchListener(): TouchListener? = touchListener
+
     external fun nativeInitLogger()
 
     external fun nativeSetListener(listener: EventListener?)
+
+    external fun nativeSetTouchListener(listener: TouchListener?)
 
     /**
      * 启动全链路网关。
@@ -73,6 +96,14 @@ object RustCoreBridge {
 
     /** 投喂一包 PCM（16-bit 小端交错；本机采集的音频）。 */
     external fun nativePushAudioPcm(pcm: ShortArray, rate: Int, channels: Int)
+
+    /**
+     * **SPIKE-P0 调试专用**：直接向引擎触摸通道注入一条事件。
+     *
+     * 没有车机/接收端发 HID 时，用它验证「Rust 触摸通道 → JNI → Kotlin onTouch」。
+     * 生产路径不调用；P0 结束后可删。
+     */
+    external fun nativeDebugTouch(action: Int, x: Int, y: Int)
 
     /** Rust 侧是否在运行（诊断）。 */
     external fun nativeIsRunning(): Boolean
