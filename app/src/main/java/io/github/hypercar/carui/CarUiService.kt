@@ -94,6 +94,31 @@ class CarUiService : Service() {
             }
             return START_NOT_STICKY
         }
+        if (action == "rustswipe") {
+            // 调试：直接给地图触摸路由喂 DOWN/MOVE/UP，验证顶部下滑退图/滑动注入
+            startForeground(NOTIF_ID, notification())
+            val x1 = (intent?.getFloatExtra("x1", 0f) ?: 0f).toInt()
+            val y1 = (intent?.getFloatExtra("y1", 0f) ?: 0f).toInt()
+            val x2 = (intent?.getFloatExtra("x2", 0f) ?: 0f).toInt()
+            val y2 = (intent?.getFloatExtra("y2", 0f) ?: 0f).toInt()
+            val routed = MapController.onTouch(0, x1, y1)
+            MapController.onTouch(2, (x1 + x2) / 2, (y1 + y2) / 2)
+            MapController.onTouch(1, x2, y2)
+            HyperCarRepo.log("CARUI: rustswipe ($x1,$y1)->($x2,$y2) routed=$routed")
+            return START_NOT_STICKY
+        }
+        if (action == "mapenter") {
+            startForeground(NOTIF_ID, notification())
+            MapController.requestEnter()
+            HyperCarRepo.log("CARUI: mapenter")
+            return START_NOT_STICKY
+        }
+        if (action == "mapexit") {
+            startForeground(NOTIF_ID, notification())
+            MapController.requestExit()
+            HyperCarRepo.log("CARUI: mapexit")
+            return START_NOT_STICKY
+        }
         if (action == "playpause") {
             startForeground(NOTIF_ID, notification())
             MusicBridge.playPause()

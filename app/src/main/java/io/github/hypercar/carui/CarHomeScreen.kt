@@ -85,7 +85,6 @@ private val hhmm: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
 fun CarHomeScreen() {
     val nowPlaying by MusicBridge.state.collectAsStateWithLifecycle()
     var now by remember { mutableStateOf(LocalDateTime.now()) }
-    var mapFullscreen by remember { mutableStateOf(false) }
     var showApps by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
@@ -95,17 +94,13 @@ fun CarHomeScreen() {
         }
     }
 
-    if (mapFullscreen) {
-        MapFullscreenScreen(now = now, onBack = { mapFullscreen = false })
-    } else {
-        HomeContent(
-            now = now,
-            nowPlaying = nowPlaying,
-            showApps = showApps,
-            onToggleApps = { showApps = !showApps },
-            onMapClick = { mapFullscreen = true },
-        )
-    }
+    HomeContent(
+        now = now,
+        nowPlaying = nowPlaying,
+        showApps = showApps,
+        onToggleApps = { showApps = !showApps },
+        onMapClick = { MapController.requestEnter() },
+    )
 }
 
 @Composable
@@ -116,6 +111,14 @@ private fun HomeContent(
     onToggleApps: () -> Unit,
     onMapClick: () -> Unit,
 ) {
+    // 顶层帧脉冲：切到 AppsPage 后 MapCard 被移出组合树，否则整屏只剩 1s 时钟，
+    // 编码 Surface 会掉到 1fps，点图标要等半秒~1 秒才看到反馈。
+    val frameKeepAlive by rememberInfiniteTransition(label = "d1KeepAlive").animateFloat(
+        initialValue = 0.55f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(1200), RepeatMode.Reverse),
+        label = "d1Pulse",
+    )
     Box(
         Modifier
             .fillMaxSize()
@@ -125,6 +128,9 @@ private fun HomeContent(
                 ),
             ),
     ) {
+        Canvas(Modifier.size(1.dp)) {
+            drawCircle(Color(0x0100E5FF), radius = frameKeepAlive)
+        }
         Row(Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 14.dp)) {
             DockRail(
                 Modifier.width(96.dp).fillMaxHeight(),
@@ -235,7 +241,7 @@ private fun MapCard(modifier: Modifier = Modifier, onClick: () -> Unit) {
             SearchPill("搜索目的地")
             Column {
                 Text("地图", color = TextPrimary, fontSize = 30.sp, fontWeight = FontWeight.Bold)
-                Text("点击进入全屏 · 导航预览", color = TextSecondary, fontSize = 13.sp)
+                Text("点击打开高德地图 · 顶部下滑返回", color = TextSecondary, fontSize = 13.sp)
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Pill("实时路况")
@@ -418,7 +424,7 @@ private fun AppsPage(modifier: Modifier, onMapClick: () -> Unit) {
         CarApp(Icons.Rounded.MusicNote, "音乐"),
         CarApp(Icons.Rounded.Phone, "电话"),
         CarApp(Icons.Rounded.Settings, "设置"),
-        CarApp(Icons.Rounded.Navigation, "高德"),
+        CarApp(Icons.Rounded.Navigation, "高德", onMapClick),
         CarApp(Icons.Rounded.LibraryMusic, "QQ音乐"),
         CarApp(Icons.Rounded.Radio, "收音机"),
         CarApp(Icons.Rounded.Apps, "更多"),
@@ -505,40 +511,6 @@ private fun DockRailItem(
         )
         Spacer(Modifier.height(4.dp))
         Text(label, color = if (active) ElectricCyan else TextSecondary, fontSize = 10.sp)
-    }
-}
-
-@Composable
-private fun MapFullscreenScreen(now: LocalDateTime, onBack: () -> Unit) {
-    Box(Modifier.fillMaxSize()) {
-        Canvas(Modifier.fillMaxSize()) { drawMapBackdrop() }
-        Column(Modifier.fillMaxSize().padding(20.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = onBack) {
-                    Icon(Icons.Rounded.ArrowBack, "返回", tint = TextPrimary)
-                }
-                Spacer(Modifier.width(8.dp))
-                Text("地图", color = TextPrimary, fontSize = 26.sp, fontWeight = FontWeight.Bold)
-                Spacer(Modifier.width(20.dp))
-                SearchPill("搜索目的地", Modifier.weight(1f))
-                Spacer(Modifier.width(20.dp))
-                Text(now.format(hhmm), color = TextPrimary, fontSize = 30.sp, fontFamily = FontFamily.Monospace)
-            }
-            Spacer(Modifier.weight(1f))
-            GlassCard(Modifier.fillMaxWidth().height(84.dp)) {
-                Row(
-                    Modifier.fillMaxSize().padding(horizontal = 20.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Icon(Icons.Rounded.Map, null, tint = ElectricCyan, modifier = Modifier.size(26.dp))
-                    Spacer(Modifier.width(12.dp))
-                    Column {
-                        Text("地图全屏预览", color = TextPrimary, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
-                        Text("高德/百度接入将在 P2 完成（D2 副屏 + 触摸注入）", color = TextSecondary, fontSize = 11.sp)
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -653,3 +625,4 @@ private fun weekdayCn(time: LocalDateTime): String = when (time.dayOfWeek.value)
     6 -> "周六"
     else -> "周日"
 }
+

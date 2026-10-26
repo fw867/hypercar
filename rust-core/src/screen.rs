@@ -1,4 +1,4 @@
-﻿//! CarPlay 主屏视频发送端（屏幕流 TCP 推流，对照 cardeck `video/VideoSender.kt`）。
+//! CarPlay 主屏视频发送端（屏幕流 TCP 推流，对照 cardeck `video/VideoSender.kt`）。
 //!
 //! 线格式：每条消息 = 128 字节明文头 + body。头部布局（Little-Endian）：
 //!  - `[0..4)`  u32LE body 长度（VideoFrame 含 16B Poly1305 tag）
@@ -138,7 +138,7 @@ impl ScreenSender {
     ///
     /// 车机按 VideoConfig 里的宽高建立解码画布；若与真实码流不一致，画面会被
     /// 拉伸/裁切，触摸坐标也会整体偏移。故以手机实际尺寸为准，而非设置里的值。
-    /// 当前画布尺寸（engine 用它挑待机卡片、判断是否需要重发 VideoConfig）。
+    /// 当前画布尺寸（engine 用它判断是否需要重发 VideoConfig）。
     pub fn size(&self) -> (u32, u32) {
         (self.width as u32, self.height as u32)
     }

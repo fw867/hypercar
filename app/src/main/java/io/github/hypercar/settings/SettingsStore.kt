@@ -220,15 +220,28 @@ object SettingsStore {
         airplayPort: Int,
         deviceBluetoothMac: String,
         identityPath: String,
+        width: Int = videoWidth,
+        height: Int = videoHeight,
     ): String {
         fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
+        // 触摸兜底空间：车机档案若给了 touchDisplay 就用它；否则 PC 接收端
+        // （DiPlay 2400×1080）兜底。真车 /info 有尺寸时 airplay.rs 优先用 /info。
+        val profileTouch = io.github.hypercar.headunit.HeadUnitProfiles.current().touchDisplay
+        val (tdW, tdH) = profileTouch
+            ?.split('x', 'X')
+            ?.takeIf { it.size == 2 }
+            ?.let { (it[0].toIntOrNull() ?: 0) to (it[1].toIntOrNull() ?: 0) }
+            ?.takeIf { it.first > 0 && it.second > 0 }
+            ?: (2400 to 1080)
         return buildString {
             append("{")
             append("\"device_id\":\"").append(esc(deviceBluetoothMac)).append("\",")
             append("\"car_ip\":\"").append(esc(carIp)).append("\",")
             append("\"airplay_port\":").append(airplayPort).append(",")
-            append("\"width\":").append(videoWidth.coerceAtLeast(2) / 2 * 2).append(",")
-            append("\"height\":").append(videoHeight.coerceAtLeast(2) / 2 * 2).append(",")
+            append("\"width\":").append(width.coerceAtLeast(2) / 2 * 2).append(",")
+            append("\"height\":").append(height.coerceAtLeast(2) / 2 * 2).append(",")
+            append("\"touch_display_w\":").append(tdW).append(",")
+            append("\"touch_display_h\":").append(tdH).append(",")
             append("\"fps\":").append(videoFps).append(",")
             append("\"enable_audio\":").append(enableAudio).append(",")
             append("\"keep_alive_stats\":").append(keepAliveStats).append(",")

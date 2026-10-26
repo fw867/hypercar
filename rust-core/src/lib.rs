@@ -68,6 +68,8 @@ struct EngineHandle {
     key_tx: mpsc::UnboundedSender<u32>,
     /// 自绘界面投喂给引擎的视频帧 / 音频 PCM（nativePushVideoFrame / nativePushAudioPcm）
     source_tx: mpsc::UnboundedSender<engine::SourceEvent>,
+    /// 手机实际编码尺寸（触摸坐标目标）。与 /info 的 encoder_size 分开。
+    touch_size: Arc<parking_lot::Mutex<(u32, u32)>>,
 }
 
 static ENGINE: Lazy<parking_lot::Mutex<Option<EngineHandle>>> =
@@ -413,6 +415,13 @@ fn native_start_impl(
     });
     // 自绘界面 → 引擎：视频帧 / 音频 PCM 都走这条通道
     let (source_tx, source_rx) = mpsc::unbounded_channel::<engine::SourceEvent>();
+    // 触摸坐标目标：手机实际编码尺寸（nativeSetVideoSize 直接更新）；
+    // 与 /info 的 encoder_size 分开，避免车机显示参数覆盖后 HID 坐标被缩放错。
+    let touch_size = Arc::new(parking_lot::Mutex::new((
+        cfg.width.max(2),
+        cfg.height.max(2),
+    )));
+    let touch_size_engine = touch_size.clone();
     let stop = Arc::new(Notify::new());
 
     let stop_run = stop.clone();
@@ -427,6 +436,7 @@ fn native_start_impl(
             key_tx_engine,
             source_rx,
             stop_run,
+            touch_size_engine,
         )
         .await;
         if let Err(e) = &result {
@@ -450,6 +460,7 @@ fn native_start_impl(
         touch_tx,
         key_tx,
         source_tx,
+        touch_size,
     });
 
     emit_log("nativeStart: 引擎任务已派生");
@@ -511,6 +522,7 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSetVide
     height: jint,
 ) {
     if let Some(handle) = ENGINE.lock().as_ref() {
+        *handle.touch_size.lock() = (width.max(2) as u32, height.max(2) as u32);
         let _ = handle.source_tx.send(engine::SourceEvent::EncoderResolution {
             width: width.max(2) as u32,
             height: height.max(2) as u32,

@@ -392,10 +392,11 @@ async fn reader_loop(
                     }
                 }
             } else {
-                // 车机的来向请求：先应答（立即，防止车机塞满 3 条拆通道），再分发
-                respond_ok(&write, &cipher, msg.cseq()).await;
-                // 上层接收器被丢弃（会话收尾）时静默跳过，不结束读循环
+                // 先立刻把车机触摸/命令投递给上层（零等待），再回 200 OK。
+                // 先写 TCP 会把触摸分发卡在 Wi-Fi 抖动/锁竞争上。
+                let cseq = msg.cseq();
                 let _ = inbound_tx.send(msg);
+                respond_ok(&write, &cipher, cseq).await;
             }
         }
     }

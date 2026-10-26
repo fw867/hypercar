@@ -1,4 +1,4 @@
-﻿//! AirPlay 发送端会话（协商整体下沉 Rust —— 与参考文档的关键差异，见 docs/NEGOTIATION-GAPS.md）。
+//! AirPlay 发送端会话（协商整体下沉 Rust —— 与参考文档的关键差异，见 docs/NEGOTIATION-GAPS.md）。
 //!
 //! 流程（cardeck 真车验证的顺序，Audi MIB3 / BMW iD8.5 通用骨架）：
 //!  1. `GET /info`（带空 bplist 体 + plist Content-Type，老固件对缺体的 /info 回 400/455）
@@ -53,10 +53,16 @@ pub struct AirplayParams {
     /// 真车会给真实尺寸，WinPlay 这类接收端固定报 0x0（它按自己的窗口 2732x794 算 HID 坐标）。
     /// 给错会让触摸整体缩放偏移——越靠右/下越明显（"按钮很难点上"）。
     pub touch_display: Option<(u32, u32)>,
+    /// PC 接收端窗口在桌面上的矩形（left,top,right,bottom），HID 全局坐标；
+    /// 仅当 `/info` 没有有效显示器尺寸时使用。
+    pub touch_rect: Option<(u32, u32, u32, u32)>,
     /// 当前编码分辨率（共享单元）：
     /// `/info` 报到车机真实显示尺寸后由协商写入，手机在 `VIDEO_ENCODER_INIT_DONE`
     /// 里回报实际选择后由编码侧覆盖。触摸坐标换算与 VideoConfig 都读它。
     pub encoder_size: Arc<Mutex<(u32, u32)>>,
+    /// 手机实际编码尺寸（`nativeSetVideoSize` 由 JNI 直接写入）。触摸坐标换算用它，
+    /// 避免被 `/info` 的车机显示尺寸覆盖后把 HID 坐标缩放到画布外。
+    pub touch_size: Arc<Mutex<(u32, u32)>>,
 }
 
 /// 车机触摸（已是编码画布坐标）。
@@ -277,6 +283,8 @@ pub async fn negotiate(
     // 车机要把小画面拉伸整屏（发虚），所以这里直接改成车机原生尺寸。
     if disp_w >= 320 && disp_h >= 240 {
         let target = (even(disp_w.max(2)), even(disp_h.max(2)));
+        // 车机下发的屏幕参数：用于 VideoConfig/编码画布（保持原行为）。
+        // 触摸目标另行使用 actual_size，不再被这里覆盖。
         *p.encoder_size.lock() = target;
         emit_log(&format!(
             "AIRPLAY: 车机实际 {}x{} → 请求按 {}x{} 编码（设置值 {}x{} 仅作兜底）",
@@ -375,7 +383,9 @@ pub async fn negotiate(
             };
             (dw.max(1), dh.max(1))
         },
-        p.encoder_size.clone(),
+        // 只有 /info 报 0x0（PC 接收端）才用窗口矩形；真车用真实显示空间。
+        if disp_w >= 320 && disp_h >= 240 { None } else { p.touch_rect },
+        p.touch_size.clone(),
         stop.clone(),
     );
 
@@ -429,32 +439,7 @@ pub async fn negotiate(
     emit_log(&format!(
         "AIRPLAY: ✓ 主屏流就绪 dataPort={data_port} connId={conn_id_screen} {enc_w}x{enc_h}"
     ));
-    // 屏幕流一建好就发**待机卡片**（真有画面，车机不再黑屏），避免车机 1.5s 收不到数据就拆通道。
-    // 素材是母版分辨率（1280x372 宽屏 / 1280x720 16:9），VideoConfig 按母版尺寸下发，车机放大到全屏。
     let mut screen = screen;
-    match standby_for_aspect(enc_w, enc_h) {
-        Some(set) => {
-            screen.set_size(set.width, set.height);
-            if let Some(first) = set.frames.first() {
-                let nals = crate::screen::annexb_nals(first);
-                let sps = nals.iter().find(|n| crate::screen::nal_type(n) == 7).copied();
-                let pps = nals.iter().find(|n| crate::screen::nal_type(n) == 8).copied();
-                if let (Some(sps), Some(pps)) = (sps, pps) {
-                    let avcc = crate::screen::build_avcc(sps, pps);
-                    let cfg_ok = screen.send_config(&avcc).await.is_ok();
-                    let frame_ok = screen.send_video_annexb(first, 0).await.is_ok();
-                    emit_log(&format!(
-                        "AIRPLAY: 已发送待机卡片母版 {}x{}（config={cfg_ok} idr={frame_ok}，{} 帧素材）——车机不再黑屏",
-                        set.width, set.height, set.frames.len()
-                    ));
-                } else {
-                    emit_log("AIRPLAY: ⚠ 待机素材缺少 SPS/PPS——跳过卡片");
-                }
-            }
-        }
-        None => emit_log("AIRPLAY: 没有匹配宽高比的待机素材——跳过卡片"),
-    }
-
 
     // ---- 7. （音频挪到 RECORD 之后，见第 8 步）----
     // 宝马这台（AirTunes/450.14）在屏幕流 SETUP 后约 1.5s 就关控制通道；
@@ -812,6 +797,7 @@ fn spawn_event_dispatcher(
     touch_tx: mpsc::UnboundedSender<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
     display_size: (u32, u32),
+    touch_rect: Option<(u32, u32, u32, u32)>,
     target_size: Arc<Mutex<(u32, u32)>>,
     stop: Arc<Notify>,
 ) {
@@ -897,6 +883,7 @@ fn spawn_event_dispatcher(
                             &touch_tx,
                             &key_tx,
                             display_size,
+                            touch_rect,
                             &target_size,
                             &mut tip_down,
                             &mut touch_logged,
@@ -927,6 +914,7 @@ fn handle_hid_report(
     touch_tx: &mpsc::UnboundedSender<TouchInput>,
     key_tx: &mpsc::UnboundedSender<u32>,
     display: (u32, u32),
+    touch_rect: Option<(u32, u32, u32, u32)>,
     target_size: &Arc<Mutex<(u32, u32)>>,
     tip_down: &mut bool,
     logged: &mut u32,
@@ -985,8 +973,23 @@ fn handle_hid_report(
     // debug 直接 panic（编码器还没回报尺寸时就是 0）。
     let (tw, th) = (target.0.max(1), target.1.max(1));
     let (dw, dh) = (display.0.max(1), display.1.max(1));
-    let x = (x_raw.saturating_mul(tw) / dw).min(tw.saturating_sub(1));
-    let y = (y_raw.saturating_mul(th) / dh).min(th.saturating_sub(1));
+    // DiPlay 实测：画面拉伸铺满整个窗口（无黑边）。HID 是桌面全局坐标时，
+    // 先用窗口矩形 (left,top,right,bottom) 归一化，再映射到画布。
+    let (x, y) = if let Some((l, t, r, b)) = touch_rect {
+        let rw = r.saturating_sub(l).max(1);
+        let rh = b.saturating_sub(t).max(1);
+        (
+            x_raw.saturating_sub(l).saturating_mul(tw) / rw,
+            y_raw.saturating_sub(t).saturating_mul(th) / rh,
+        )
+    } else {
+        (
+            x_raw.saturating_mul(tw) / dw,
+            y_raw.saturating_mul(th) / dh,
+        )
+    };
+    let x = x.min(tw.saturating_sub(1));
+    let y = y.min(th.saturating_sub(1));
     *logged = logged.wrapping_add(1);
     if *logged <= 5 || *logged % 200 == 0 {
         crate::emit_log(&format!(
@@ -1167,98 +1170,3 @@ fn random_positive_i64() -> i64 {
 fn random_uuid_upper() -> String {
     uuid::Uuid::new_v4().simple().to_string().to_uppercase()
 }
-
-// ---------------------------------------------------------------- 待机素材
-//
-// 只保留**两套母版**（宽屏 3.44:1 与 16:9），按屏幕宽高比自动选，运行时不再按分辨率编码：
-//   宝马带鱼屏 2560x744 → 3.44:1 → 用 1280x372 母版（车机放大到全屏）
-//   1920x720 / 1280x720 → 16:9 → 用 1280x720 母版
-// 每套都是 1 秒 @60fps（1 个 IDR + 59 个极小 P 帧）：既占住屏幕流，又不是黑屏。
-const STANDBY_WIDE: &[u8] = include_bytes!("../assets/standby-wide.h264");
-const STANDBY_WIDE_16X9: &[u8] = include_bytes!("../assets/standby-wide16x9.h264");
-// 2560x744 宽屏母版（由 1280x372 用 lanczos 放大生成，ffmpeg 一次成型）：
-// 宝马 iD8.5 这类 2560x744 的带鱼屏直接用原生尺寸，车机不用再放大 → 待机字更锐。
-const STANDBY_WIDE_2X: &[u8] = include_bytes!("../assets/standby-wide-2x.h264");
-
-/// 一套待机素材：帧序列 + 母版原始尺寸（VideoConfig 必须按母版尺寸下发）。
-pub(crate) struct StandbySet {
-    pub frames: &'static [&'static [u8]],
-    pub width: u32,
-    pub height: u32,
-}
-
-/// 按屏幕宽高比挑母版：> 2.6 用宽屏（带鱼屏），否则用 16:9。
-pub(crate) fn standby_for_aspect(width: u32, height: u32) -> Option<StandbySet> {
-    if width == 0 || height == 0 {
-        return None;
-    }
-    // 按**最接近的宽高比**挑母版（原来用固定 2.6 阈值：2560x744=3.44、2732x794=3.44
-    // 走宽屏都对，但 1920x900=2.13 这类中间比例会被强行拉伸变形）。
-    let ratio = width as f32 / height as f32;
-    let wide_ratio = 1280.0f32 / 372.0f32; // 3.441
-    let wide16_ratio = 1280.0f32 / 720.0f32; // 1.778
-    let wide = (ratio - wide_ratio).abs() <= (ratio - wide16_ratio).abs();
-    // 宽屏且车机宽度 >= 2000 时直接用 2560x744 原生母版（否则用 1280x372，车机放大）
-    let (bytes, w, h) = if wide && width >= 2000 {
-        (STANDBY_WIDE_2X, 2560u32, 744u32)
-    } else if wide {
-        (STANDBY_WIDE, 1280u32, 372u32)
-    } else {
-        (STANDBY_WIDE_16X9, 1280u32, 720u32)
-    };
-    let frames = frames_of(w, h, bytes)?;
-    Some(StandbySet { frames, width: w, height: h })
-}
-
-fn frames_of(w: u32, h: u32, data: &'static [u8]) -> Option<&'static [&'static [u8]]> {
-    use std::sync::OnceLock;
-    static WIDE: OnceLock<Vec<&'static [u8]>> = OnceLock::new();
-    static WIDE16: OnceLock<Vec<&'static [u8]>> = OnceLock::new();
-    static WIDE2X: OnceLock<Vec<&'static [u8]>> = OnceLock::new();
-    if w == 1280 && h == 372 {
-        Some(WIDE.get_or_init(|| split_annexb_frames(STANDBY_WIDE)))
-    } else if w == 1280 && h == 720 {
-        Some(WIDE16.get_or_init(|| split_annexb_frames(STANDBY_WIDE_16X9)))
-    } else if w == 2560 && h == 744 {
-        Some(WIDE2X.get_or_init(|| split_annexb_frames(STANDBY_WIDE_2X)))
-    } else {
-        let _ = data;
-        None
-    }
-}
-
-/// 把 Annex B 流切成「一帧一片」：帧边界 = 每个 VCL NAL（type 1/5）的起点；
-/// **首帧从文件头开始**，这样 SPS/PPS/SEI 与第一个 IDR 落在同一帧里。
-fn split_annexb_frames(data: &'static [u8]) -> Vec<&'static [u8]> {
-    let mut starts: Vec<(usize, u8)> = Vec::new();
-    let mut i = 0usize;
-    while i + 4 < data.len() {
-        let sc3 = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1;
-        let sc4 = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1;
-        if sc3 || sc4 {
-            let hdr = if sc4 { i + 4 } else { i + 3 };
-            if hdr < data.len() {
-                starts.push((i, data[hdr] & 0x1f));
-            }
-            i = hdr + 1;
-        } else {
-            i += 1;
-        }
-    }
-    let vcl: Vec<usize> = starts
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, t))| matches!(t, 1 | 5))
-        .map(|(i, _)| i)
-        .collect();
-    let mut frames = Vec::with_capacity(vcl.len());
-    for (k, &vi) in vcl.iter().enumerate() {
-        let start = if k == 0 { 0 } else { starts[vi].0 };
-        let end = vcl.get(k + 1).map(|&n| starts[n].0).unwrap_or(data.len());
-        if end > start {
-            frames.push(&data[start..end]);
-        }
-    }
-    frames
-}
-

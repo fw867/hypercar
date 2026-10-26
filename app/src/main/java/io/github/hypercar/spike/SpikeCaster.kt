@@ -12,6 +12,7 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Bundle
 import android.os.SystemClock
 import android.view.Surface
 import android.view.View
@@ -50,6 +51,10 @@ class SpikeCaster(
     @Volatile
     private var running = false
 
+    /** P2：双屏切源时暂停/恢复本编码器向 Rust 推帧（编码器本身继续跑，切换时只需 requestSyncFrame）。 */
+    @Volatile
+    private var pushing = true
+
     private val csdFromConfig = java.io.ByteArrayOutputStream()
     private val csdFromFormat = java.io.ByteArrayOutputStream()
 
@@ -60,6 +65,7 @@ class SpikeCaster(
     private var statsAtNs = System.nanoTime()
     private var startedAtNs = 0L
     private var frameSeq = 0L
+    private var lastSourcePtsUs = 0L
     private var sourceFrames = 0L
     private var sourceFramesAtStats = 0L
     private var sourceFps = 60.0
@@ -76,6 +82,35 @@ class SpikeCaster(
     /** 编码器 InputSurface：可以由 shell UserService 拿去建屏（S3 推荐路径）。 */
     val encoderSurface: Surface? get() = inputSurface
 
+    /** P2：切源时暂停/恢复推帧；暂停期间仍排空编码器，恢复时先请求关键帧。 */
+    fun setPushing(enabled: Boolean) {
+        pushing = enabled
+    }
+
+    /** P2：暂停/恢复编码器（MediaCodec suspend 丢帧，不释放 InputSurface/显示）。 */
+    fun setSuspended(suspended: Boolean) {
+        synchronized(lock) {
+            runCatching {
+                codec?.setParameters(
+                    Bundle().apply {
+                        putInt(MediaCodec.PARAMETER_KEY_SUSPEND, if (suspended) 1 else 0)
+                    },
+                )
+            }
+        }
+    }
+
+    /** 让编码器立即产出关键帧（切源后解码器需要 IDR + SPS/PPS 重新同步）。 */
+    fun requestSyncFrame() {
+        synchronized(lock) {
+            runCatching {
+                codec?.setParameters(
+                    Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) },
+                )
+            }
+        }
+    }
+
     /** 只启编码器，不建屏（建屏交给 shell UserService / 调用方）。 */
     fun startEncoder(): String {
         if (running) return "已经在跑"
@@ -88,6 +123,14 @@ class SpikeCaster(
             setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel51)
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
             setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
+            // 低延迟：实时优先级、无 B 帧、0 帧输入缓冲；静止 100ms 补发上一帧，
+            // 避免点击后的尾帧卡在编码器 pipeline 里。
+            runCatching { setInteger(MediaFormat.KEY_PRIORITY, 0) }
+            runCatching { setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0) }
+            runCatching { setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L) }
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                runCatching { setInteger(MediaFormat.KEY_LATENCY, 0) }
+            }
         }
         val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         try {
@@ -209,7 +252,7 @@ class SpikeCaster(
                         if (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
                             synchronized(lock) { csdFromConfig.write(data) }
                             SpikeReport.add(tag, "codec-config ${data.size}B")
-                        } else {
+                        } else if (pushing) {
                             val key = info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0
                             val prefix = if (key) synchronized(lock) {
                                 when {
@@ -224,9 +267,13 @@ class SpikeCaster(
                             val now = System.nanoTime()
                             sourceFrames++
                             frameSeq++
-                            // 90Hz/120Hz 屏幕上 Compose 按屏幕刷新率出帧；按源帧率做 2/3 或 1/2
-                            // 抽帧，让 AirPlay 收到稳定 ~60fps。简单按时间阈值会在 90Hz 掉到 45fps。
+                            // 只有源帧间隔真的 <12.5ms（>80fps）时才抽帧；静止后第一次点击
+                            // 产生的那唯一一帧必须发出去，否则车机会等下一秒时钟才更新。
+                            val deltaUs = info.presentationTimeUs - lastSourcePtsUs
+                            val isBurst = lastSourcePtsUs > 0 && deltaUs in 1..12_500
+                            lastSourcePtsUs = info.presentationTimeUs
                             val dropEvery = when {
+                                !isBurst -> 0
                                 sourceFps > 100.0 -> 2
                                 sourceFps > 75.0 -> 3
                                 else -> 0

@@ -93,6 +93,11 @@ object SpikeShell {
         service?.releaseDisplay() ?: "ERR 未连接"
     }.getOrElse { "ERR ${it.javaClass.simpleName}: ${it.message}" }
 
+    /** P2：只释放指定副屏（D1/D2 并存）。 */
+    fun releaseDisplay(displayId: Int): String = runCatching {
+        service?.releaseDisplayById(displayId) ?: "ERR 未连接"
+    }.getOrElse { "ERR ${it.javaClass.simpleName}: ${it.message}" }
+
     fun status(): String = runCatching {
         service?.status() ?: "ERR 未连接"
     }.getOrElse { "ERR ${it.javaClass.simpleName}: ${it.message}" }
@@ -101,6 +106,9 @@ object SpikeShell {
     fun setPhysicalScreenPower(on: Boolean): Boolean = runCatching {
         service?.setPhysicalScreenPower(on) ?: false
     }.getOrDefault(false)
+
+    fun motion(displayId: Int, action: Int, x: Int, y: Int, downTimeMs: Long): String =
+        call("motion") { it.motion(displayId, action, x, y, downTimeMs) }
 
     fun tap(displayId: Int, x: Int, y: Int): String =
         call("tap") { it.tap(displayId, x, y) }

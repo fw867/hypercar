@@ -42,6 +42,8 @@ object CarUiCaster {
     private var cpuLock: PowerManager.WakeLock? = null
     private var savedScreenOffTimeout = -1
     private var appContext: Context? = null
+    @Volatile private var starting = false
+    private var panelOff = false
 
     @Volatile
     var running: Boolean = false
@@ -50,7 +52,22 @@ object CarUiCaster {
     val currentDisplayId: Int get() = displayId
 
     suspend fun start(context: Context): String {
-        if (running) return "已经在跑（display=$displayId）"
+        if (running || starting) {
+            // stop 可能清掉监听器后卡住；重连分支必须补装，否则触摸静默丢失
+            installTouchListener()
+            // 引擎重连会新建一个 encoder_size（初始值来自设置，可能是 2560x744）；
+            // 画面尺寸必须重新上报，否则 Rust 触摸坐标按 2560x744 缩放，D1/D2 上点不动。
+            runCatching { RustCoreBridge.nativeSetVideoSize(WIDTH, HEIGHT) }
+            if (MapController.mapActive) MapController.refreshVideoSize()
+            scope.launch {
+                kotlinx.coroutines.delay(900)
+                runCatching { RustCoreBridge.nativeSetVideoSize(WIDTH, HEIGHT) }
+                if (MapController.mapActive) MapController.refreshVideoSize()
+            }
+            return "已经在跑（display=$displayId，已重新上报 ${WIDTH}x$HEIGHT）"
+        }
+        starting = true
+        try {
         val c = SpikeCaster(context, width = WIDTH, height = HEIGHT, tag = TAG)
         caster = c
         val encoder = runCatching { c.startEncoder() }.getOrElse { t ->
@@ -63,6 +80,8 @@ object CarUiCaster {
             return "编码器没有 InputSurface"
         }
         val bind = SpikeShell.connect(context)
+        // 清掉上一进程/上次会话残留的副屏（shell UserService 独立存活，不随 App 进程退出）
+        runCatching { SpikeShell.releaseDisplay() }
         val created = SpikeShell.createDisplay(surface, WIDTH, HEIGHT, DPI, 0, "hypercar-d1")
         val id = Regex("id=(\\d+)").find(created)?.groupValues?.get(1)?.toIntOrNull() ?: -1
         if (id <= 0) {
@@ -72,14 +91,9 @@ object CarUiCaster {
         }
         displayId = id
         val component = "io.github.hypercar/" + CarHomeActivity::class.java.name
-        val launch = SpikeDisplay.amStartComponentOnDisplay(id, component, clearTask = true)
-        RustCoreBridge.setTouchListener(object : RustCoreBridge.TouchListener {
-            override fun onTouch(action: Int, x: Int, y: Int) {
-                main.post {
-                    CarHomeActivity.instance?.dispatchCarTouch(action, x.toFloat(), y.toFloat())
-                }
-            }
-        })
+        val launch = SpikeDisplay.amStartComponentOnDisplay(id, component, clearTask = false)
+        installTouchListener()
+        MapController.init(context, c)
         appContext = context.applicationContext
 
         // 会话期 CPU 常醒：面板断电后系统不能进 Doze
@@ -103,17 +117,63 @@ object CarUiCaster {
             false
         }
 
+        panelOff = screenOff
         running = true
+        // 引擎刚起时 nativeSetVideoSize 可能落在 ENGINE 句柄安装之前；延迟补报一次
+        scope.launch {
+            kotlinx.coroutines.delay(900)
+            runCatching { RustCoreBridge.nativeSetVideoSize(WIDTH, HEIGHT) }
+            if (MapController.mapActive) MapController.refreshVideoSize()
+        }
         val msg = "启动 ok display=$id | $encoder | bind=$bind | create=$created | " +
             "launch=$launch | screenOff=$screenOff"
         HyperCarRepo.log("CARUI: $msg")
         return msg
+        } finally {
+            starting = false
+        }
+    }
+
+    /**
+     * 安装 Rust 触摸监听。stop() 会先 setTouchListener(null)；若上一次 stop 卡在
+     * shell binder/编码器释放里，running 仍是 true，重连走「已经在跑」分支时必须重装，
+     * 否则画面继续但所有触摸被静默丢弃（2026-10-27 现场定位）。
+     */
+    private fun installTouchListener() {
+        RustCoreBridge.setTouchListener(object : RustCoreBridge.TouchListener {
+            override fun onTouch(action: Int, x: Int, y: Int) {
+                if (MapController.onTouch(action, x, y)) return
+                main.post {
+                    val act = CarHomeActivity.instance
+                    if (act == null) {
+                        HyperCarRepo.log("CARUI: touch drop（home instance=null）($x,$y)")
+                    } else {
+                        act.dispatchCarTouch(action, x.toFloat(), y.toFloat())
+                    }
+                }
+            }
+        })
+    }
+
+    private val cleanupExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "carui-cleanup").apply { isDaemon = true }
+    }
+
+    /** 会话拆除路径调用：清理可能卡在 binder/编码器释放上，不能阻塞断开流程。 */
+    fun stopAsync() {
+        runCatching { cleanupExecutor.execute { runCatching { stop() } } }
     }
 
     fun stop() {
         if (!running && displayId < 0) return
-        // 先点亮物理面板（人可能就在手机前），再释放显示/编码器
-        runCatching { SpikeShell.setPhysicalScreenPower(true) }
+        // 先收地图（释放 D2/复原横屏覆盖），再收 D1
+        MapController.stop()
+        MapController.reset()
+        // 只有我们真断过面板才去点亮；默认没断过，省掉一次可能卡住的 shell binder
+        if (panelOff) {
+            runCatching { SpikeShell.setPhysicalScreenPower(true) }
+            panelOff = false
+        }
         RustCoreBridge.setTouchListener(null)
         if (displayId > 0) SpikeShell.releaseDisplay()
         displayId = -1

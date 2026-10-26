@@ -61,6 +61,15 @@ pub struct EngineConfig {
     pub touch_display_w: u32,
     #[serde(default)]
     pub touch_display_h: u32,
+    /// PC 接收端窗口在桌面上的矩形（HID 全局坐标），用于 /info 报 0x0 的情况。
+    #[serde(default)]
+    pub touch_left: u32,
+    #[serde(default)]
+    pub touch_top: u32,
+    #[serde(default)]
+    pub touch_right: u32,
+    #[serde(default)]
+    pub touch_bottom: u32,
 }
 
 fn default_true() -> bool {
@@ -83,6 +92,7 @@ pub async fn run_engine(
     key_tx: mpsc::UnboundedSender<u32>,
     mut source_rx: mpsc::UnboundedReceiver<SourceEvent>,
     stop: Arc<Notify>,
+    touch_size: Arc<Mutex<(u32, u32)>>,
 ) -> Result<(), String> {
     emit_state("negotiating", "AirPlay 会话启动");
     // 触摸/按键通道：CarPlay 事件通道把车机操作送到这里，P1 起交给自绘 UI 处理。
@@ -128,23 +138,13 @@ pub async fn run_engine(
             let mut sender: Option<ScreenSender> = None;
             // 屏幕流就绪前收到的编码尺寸先存着，就绪时补上
             let mut pending_size: Option<(u32, u32)> = None;
-            // 编码器真实尺寸（最后一次 EncoderResolution）。待机循环会临时把画布切成
-            // 待机母版尺寸；首帧到来时必须**再切回编码尺寸**，否则 send_config 会用
-            // 待机母版的宽高去标注 1920x720 的码流 → 车机按错误画布解码（拉伸）。
+            // 编码器真实尺寸（最后一次 EncoderResolution）。VideoConfig/画布都以它为准；
+            // /info 可能先写入车机尺寸，编码器回报后覆盖。
             let mut encoder_size: Option<(u32, u32)> = None;
             let mut ready = Some(screen_ready_rx);
             let mut video_rx = video_rx;
-            // 16ms tick：真帧没到时用它按 ~60fps 发待机循环帧
+            // 16ms tick：仅用于 keepAlive 节拍（真帧由视频泵推送）
             let mut tick = tokio::time::interval(Duration::from_millis(16));
-            // 真帧到来前用待机卡片占住屏幕流（避免车机黑屏/提前关通道）
-            let mut last_real_frame: Option<std::time::Instant> = None;
-            let mut standby_idx: usize = 0;
-            let mut standby_size_sent: Option<(u32, u32)> = None;
-            // 待机节奏：前 2s 全速（60fps）让接收端锁住流，之后降到 15fps 省带宽；
-            // 每 5s 从 IDR 重放一次，迟到的/卡住的解码器能自己恢复。
-            let mut standby_started: Option<std::time::Instant> = None;
-            let mut standby_tick: u32 = 0;
-            let mut standby_last_idr = std::time::Instant::now();
             loop {
                 tokio::select! {
                     _ = stop_v.notified() => return,
@@ -176,8 +176,7 @@ pub async fn run_engine(
                         Some(SourceEvent::VideoFrame { pts_us, data }) => {
                             if let Some(s) = sender.as_mut() {
                                 let len = data.len() as u64;
-                                // 待机循环可能刚把画布切成母版尺寸；首帧前切回编码尺寸，
-                                // 保证随后 send_config 写进去的是 1920x720。
+                                // 编码尺寸变化时先切画布，保证随后 send_config 标注正确。
                                 if let Some((w, h)) = encoder_size {
                                     if s.size() != (w, h) {
                                         s.set_size(w, h);
@@ -194,7 +193,6 @@ pub async fn run_engine(
                                     emit_state("ended", "屏幕流写失败（车机侧断开）");
                                     return;
                                 }
-                                last_real_frame = Some(std::time::Instant::now());
                                 let mut st = stats.lock();
                                 st.frames += 1;
                                 st.bytes += len;
@@ -208,62 +206,6 @@ pub async fn run_engine(
                         // 屏幕流 keepAlive 帧（明文、1s 节流；缺它 Audi MMI 3315 10.2s 拆轮）
                         if let Some(s) = sender.as_mut() {
                             let _ = s.maybe_send_keep_alive().await;
-                            // 真帧没到 → 按 ~60fps 播放待机循环（1 IDR + 59 个极小 P 帧）
-                            // 真帧到达后自动停用（1s 内有过真帧就不再插卡片）。
-                            let stale = last_real_frame
-                                .map(|t| t.elapsed() >= Duration::from_millis(900))
-                                .unwrap_or(true);
-                            if stale {
-                                let (w, h) = s.size();
-                                if let Some(set) =
-                                    crate::airplay::standby_for_aspect(w, h)
-                                {
-                                    if !set.frames.is_empty() {
-                                        if standby_size_sent != Some((set.width, set.height)) {
-                                            // 切到母版尺寸并重发 VideoConfig（画面就是母版分辨率）
-                                            s.set_size(set.width, set.height);
-                                            if let Some(first) = set.frames.first() {
-                                                let nals = crate::screen::annexb_nals(first);
-                                                let sps = nals.iter().find(|n| crate::screen::nal_type(n) == 7).copied();
-                                                let pps = nals.iter().find(|n| crate::screen::nal_type(n) == 8).copied();
-                                                if let (Some(sps), Some(pps)) = (sps, pps) {
-                                                    let avcc = crate::screen::build_avcc(sps, pps);
-                                                    let _ = s.send_config(&avcc).await;
-                                                }
-                                            }
-                                            standby_size_sent = Some((set.width, set.height));
-                                            standby_idx = 0;
-                                            standby_tick = 0;
-                                            standby_started = Some(std::time::Instant::now());
-                                            standby_last_idr = std::time::Instant::now();
-                                            emit_log(&format!(
-                                                "AIRPLAY: 待机循环开始（母版 {}x{}，{} 帧；前 2s 60fps，之后 15fps，每 5s 补 IDR）",
-                                                set.width,
-                                                set.height,
-                                                set.frames.len()
-                                            ));
-                                        }
-                                        standby_tick = standby_tick.wrapping_add(1);
-                                        let warmup = standby_started
-                                            .map(|t| t.elapsed() < Duration::from_secs(2))
-                                            .unwrap_or(true);
-                                        // tick 是 16ms（≈60fps）：每 4 拍发一帧 = 15fps
-                                        let mut due = warmup || standby_tick % 4 == 0;
-                                        if standby_last_idr.elapsed() >= Duration::from_secs(5) {
-                                            // 强制从 IDR 重放：接收端中途重启/丢包也能恢复画面
-                                            standby_idx = 0;
-                                            standby_last_idr = std::time::Instant::now();
-                                            due = true;
-                                        }
-                                        if due {
-                                            let frame = set.frames[standby_idx % set.frames.len()];
-                                            let pts = crate::timing::monotonic_nanos() / 1_000;
-                                            let _ = s.send_video_annexb(frame, pts).await;
-                                            standby_idx = standby_idx.wrapping_add(1);
-                                        }
-                                    }
-                                }
-                                    }
                         }
                     }
                 }
@@ -421,8 +363,14 @@ pub async fn run_engine(
             (w, h) if w > 0 && h > 0 => Some((w, h)),
             _ => None,
         },
-    // 与编码侧共用：/info 报到车机真实尺寸后写入，编码器回报后再覆盖
+        touch_rect: if cfg.touch_right > cfg.touch_left && cfg.touch_bottom > cfg.touch_top {
+            Some((cfg.touch_left, cfg.touch_top, cfg.touch_right, cfg.touch_bottom))
+        } else {
+            None
+        },
+        // 与编码侧共用：/info 报到车机真实尺寸后写入，编码器回报后再覆盖
         encoder_size: encoder_size.clone(),
+        touch_size: touch_size.clone(),
     };
     let outcome = airplay::negotiate(
         ctrl_r,

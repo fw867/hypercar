@@ -10,6 +10,9 @@ interface ISpikeShell {
 
     String releaseDisplay();
 
+    /** P2：只释放指定 display（D1 首页与 D2 地图同时存在时用）。 */
+    String releaseDisplayById(int displayId);
+
     String status();
 
     /**
@@ -17,6 +20,9 @@ interface ISpikeShell {
      * 独立显示组的虚拟屏继续渲染。返回是否成功。
      */
     boolean setPhysicalScreenPower(boolean on);
+
+    /** 实时流式注入单条 DOWN(0)/UP(1)/MOVE(2)/CANCEL(3) 事件（异步模式，跟手拖动用）。 */
+    String motion(int displayId, int action, int x, int y, long downTimeMs);
 
     /** 单击。返回 "OK <耗时µs>" 或 "ERR ..."。 */
     String tap(int displayId, int x, int y);

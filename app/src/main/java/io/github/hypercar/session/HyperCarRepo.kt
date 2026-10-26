@@ -673,6 +673,15 @@ object HyperCarRepo {
                 return
             }
             streaming = true
+            // 引擎一启动就先把自绘 UI/编码器准备好（不等 AirPlay RECORD）：
+            // 这样 connected 后第一帧就是首页，不再出现黑屏/待机页。
+            if (SettingsStore.carUiEnabled) {
+                scope.launch {
+                    val result = runCatching { CarUiCaster.start(context) }
+                        .getOrElse { "启动失败: ${it.javaClass.simpleName}: ${it.message}" }
+                    log("CARUI: $result")
+                }
+            }
         } catch (cancelled: CancellationException) {
             // disconnect() 掐掉在途连接：正常取消，不算失败（也不要把 Failed 写进快照）
             throw cancelled
@@ -774,8 +783,9 @@ object HyperCarRepo {
      */
     private fun releaseSessionResources() {
         streaming = false
-        // P1：先停自绘界面（释放 D1 显示/编码器），再停引擎
-        runCatching { CarUiCaster.stop() }
+        // P1：先停自绘界面（释放 D1 显示/编码器），再停引擎。
+        // 清理涉及 shell binder/编码器释放，可能卡住；异步执行，断开流程不等它。
+        CarUiCaster.stopAsync()
         runCatching { RustCoreBridge.nativeStop() }
         runCatching { iap2?.stop() }
         iap2 = null

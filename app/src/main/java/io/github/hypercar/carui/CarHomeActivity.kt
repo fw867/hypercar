@@ -21,6 +21,7 @@ import io.github.hypercar.ui.theme.HyperCarTheme
 class CarHomeActivity : ComponentActivity() {
 
     private var downTime = 0L
+    private var touchLogs = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -46,7 +47,7 @@ class CarHomeActivity : ComponentActivity() {
 
     override fun onDestroy() {
         if (instance === this) instance = null
-        HyperCarRepo.log("CARUI: CarHomeActivity onDestroy")
+        HyperCarRepo.log("CARUI: CarHomeActivity onDestroy display=${display?.displayId}")
         super.onDestroy()
     }
 
@@ -69,7 +70,14 @@ class CarHomeActivity : ComponentActivity() {
             0,
         )
         ev.setSource(InputDevice.SOURCE_TOUCHSCREEN)
-        runCatching { window.decorView.dispatchTouchEvent(ev) }
+        if (touchLogs++ < 12) {
+            HyperCarRepo.log("CARUI: dispatch($action $x,$y) display=${display?.displayId}")
+        }
+        runCatching {
+            window.decorView.dispatchTouchEvent(ev)
+            // 副屏静止时 RenderThread 可能休眠：触摸后立即请求一帧，别等 1s 时钟。
+            window.decorView.postInvalidateOnAnimation()
+        }
         ev.recycle()
         if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) downTime = 0L
     }

@@ -60,7 +60,6 @@ class SpikeShellService : ISpikeShell.Stub {
         //   SecurityException: packageName must match the owner uid
         // 传 null 也会被拒（已实测）。这里把包名覆盖成 shell uid 自己登记的包名再试。
         synchronized(lock) {
-            releaseLocked()
             val base = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION or
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
@@ -100,6 +99,7 @@ class SpikeShellService : ISpikeShell.Stub {
                         val vd = dm.createVirtualDisplay(name, width, height, dpi, surface, candidate)
                         if (vd != null) {
                             display = vd
+                            displays[vd.display.displayId] = vd
                             flagsUsed = candidate
                             val msg = "OK id=${vd.display.displayId} flags=0x${candidate.toString(16)} package=$pkg"
                             SpikeReport.add("SHELL", "createDisplay $msg")
@@ -119,12 +119,20 @@ class SpikeShellService : ISpikeShell.Stub {
     }
 
     override fun releaseDisplay(): String = synchronized(lock) {
-        val had = display != null
+        val had = displays.size
         releaseLocked()
         if (physicalScreenOff) {
             runCatching { setPhysicalScreenPower(true) }
         }
         "OK released=$had"
+    }
+
+    override fun releaseDisplayById(displayId: Int): String = synchronized(lock) {
+        val vd = displays.remove(displayId)
+        runCatching { vd?.release() }
+        if (display === vd) display = displays.values.lastOrNull()
+        if (displays.isEmpty()) flagsUsed = 0
+        "OK released=${vd != null} remaining=${displays.size}"
     }
 
     // ---- 物理主屏电源（真息屏；系统保持唤醒，虚拟屏继续渲染） ----
@@ -244,7 +252,7 @@ class SpikeShellService : ISpikeShell.Stub {
         val vd = display ?: return "OK no display"
         val displayId = vd.display.displayId
         val state = runCatching { vd.display.state }.getOrDefault(-1)
-        "OK id=$displayId state=$state flags=0x${flagsUsed.toString(16)}"
+        "OK id=$displayId state=$state flags=0x${flagsUsed.toString(16)} count=${displays.size}"
     }
 
     // ------------------------------------------------------------ 触摸注入（shell 身份）
@@ -260,8 +268,58 @@ class SpikeShellService : ISpikeShell.Stub {
         else "ERR $inputError"
     }
 
-    override fun tap(displayId: Int, x: Int, y: Int): String {
+    override fun motion(
+        displayId: Int,
+        action: Int,
+        x: Int,
+        y: Int,
+        downTimeMs: Long,
+    ): String {
         if (!ensureInput()) return "ERR $inputError"
+        val a = when (action) {
+            0 -> MotionEvent.ACTION_DOWN
+            1 -> MotionEvent.ACTION_UP
+            2 -> MotionEvent.ACTION_MOVE
+            else -> MotionEvent.ACTION_CANCEL
+        }
+        val now = SystemClock.uptimeMillis()
+        val dt = if (downTimeMs > 0L) downTimeMs else now
+        val ev = MotionEvent.obtain(
+            dt,
+            now,
+            a,
+            x.toFloat(),
+            y.toFloat(),
+            1f,
+            1f,
+            0,
+            1f,
+            1f,
+            0,
+            0,
+        )
+        ev.source = InputDevice.SOURCE_TOUCHSCREEN
+        val ok = sendAsync(displayId, ev)
+        return if (ok) "OK" else "ERR $inputError"
+    }
+
+    private fun sendAsync(displayId: Int, event: MotionEvent): Boolean {
+        if (!ensureInput()) return false
+        return try {
+            setDisplayIdMethod!!.invoke(event, displayId)
+            // 0 = INJECT_INPUT_EVENT_MODE_ASYNC：立即返回，不阻塞触摸线程
+            val result = injectMethod!!.invoke(inputManager, event, 0)
+            result !is Boolean || result
+        } catch (t: Throwable) {
+            inputError = "${t.javaClass.simpleName}: ${t.message}"
+            Log.w(TAG, "inject(async) 失败: $t")
+            false
+        } finally {
+            event.recycle()
+        }
+    }
+
+    override fun tap(displayId: Int, x: Int, y: Int): String {        if (!ensureInput()) return "ERR $inputError"
         val t0 = SystemClock.elapsedRealtimeNanos()
         val downTime = SystemClock.uptimeMillis()
         val ok = send(displayId, single(displayId, MotionEvent.ACTION_DOWN, x.toFloat(), y.toFloat(), downTime)) &&
@@ -453,7 +511,8 @@ class SpikeShellService : ISpikeShell.Stub {
     }
 
     private fun releaseLocked() {
-        runCatching { display?.release() }
+        displays.values.forEach { runCatching { it.release() } }
+        displays.clear()
         display = null
         flagsUsed = 0
     }
@@ -462,6 +521,7 @@ class SpikeShellService : ISpikeShell.Stub {
         private const val TAG = "HyperCar-SpikeShell"
         private val lock = Any()
         private var display: VirtualDisplay? = null
+        private val displays = LinkedHashMap<Int, VirtualDisplay>()
         private var flagsUsed: Int = 0
         private var appContext: Context? = null
 
