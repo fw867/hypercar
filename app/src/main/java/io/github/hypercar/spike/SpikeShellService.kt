@@ -1,8 +1,11 @@
 package io.github.hypercar.spike
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.os.Build
+import android.os.IBinder
 import android.os.SystemClock
 import android.util.Log
 import android.view.InputDevice
@@ -66,7 +69,14 @@ class SpikeShellService : ISpikeShell.Stub {
             val touch = 1 shl 6
             val trusted = 1 shl 10
             val ownFocus = 1 shl 14
+            // cardeck 2026-10-23 实测：虚拟屏必须进自己的 DisplayGroup，否则物理主屏
+            // 断电/锁屏时整组跟着 OFF（车机侧表现为黑屏/冻结）。OWN_DISPLAY_GROUP 要求
+            // TRUSTED（shell 已具备）；ALWAYS_UNLOCKED 另有权限，部分 ROM 不给，故三级降级。
+            val ownGroup = 1 shl 11
+            val alwaysUnlocked = 1 shl 12
             val candidates = intArrayOf(
+                base or flags or touch or ownFocus or trusted or ownGroup or alwaysUnlocked,
+                base or flags or touch or ownFocus or trusted or ownGroup,
                 base or flags or touch or ownFocus or trusted,
                 base or flags or touch or ownFocus,
                 base or flags or touch,
@@ -111,7 +121,123 @@ class SpikeShellService : ISpikeShell.Stub {
     override fun releaseDisplay(): String = synchronized(lock) {
         val had = display != null
         releaseLocked()
+        if (physicalScreenOff) {
+            runCatching { setPhysicalScreenPower(true) }
+        }
         "OK released=$had"
+    }
+
+    // ---- 物理主屏电源（真息屏；系统保持唤醒，虚拟屏继续渲染） ----
+
+    /**
+     * 对物理主屏做硬件级断电/点亮（scrcpy `-S/--turn-screen-off` 同款）：
+     * 不按电源键（那会锁屏 + Doze），只切断面板电源。框架仍认为亮屏，
+     * 独立显示组的虚拟屏继续 60fps，Keyguard 也不会画到它上面。
+     */
+    override fun setPhysicalScreenPower(on: Boolean): Boolean {
+        val token = internalDisplayToken()
+        if (token == null) {
+            SpikeReport.add("SHELL", "setPhysicalScreenPower($on) 失败：拿不到物理屏 token")
+            Log.w(TAG, "setPhysicalScreenPower($on): no physical display token")
+            return false
+        }
+        val ok = setDisplayPowerMode(token, if (on) POWER_MODE_NORMAL else POWER_MODE_OFF)
+        if (ok) physicalScreenOff = !on
+        SpikeReport.add("SHELL", "setPhysicalScreenPower($on) ok=$ok")
+        Log.i(TAG, "setPhysicalScreenPower($on) ok=$ok")
+        return ok
+    }
+
+    private fun setDisplayPowerMode(token: IBinder, mode: Int): Boolean = try {
+        Class.forName("android.view.SurfaceControl")
+            .getMethod("setDisplayPowerMode", IBinder::class.java, Integer.TYPE)
+            .invoke(null, token, mode)
+        true
+    } catch (t: Throwable) {
+        Log.w(TAG, "SurfaceControl.setDisplayPowerMode($mode) 失败: $t")
+        false
+    }
+
+    /**
+     * 物理主屏 token。Android 14（SDK 34）删除了 SurfaceControl.getInternalDisplayToken /
+     * getPhysicalDisplayToken，只剩 services.jar 里的 DisplayControl——必须用
+     * ClassLoaderFactory + SYSTEMSERVERCLASSPATH 造类加载器并注册 libandroid_servers.so
+     * （scrcpy / cardeck 同款）。
+     */
+    private fun internalDisplayToken(): IBinder? {
+        if (Build.VERSION.SDK_INT >= 34) {
+            displayControlClass?.let { cls ->
+                try {
+                    val ids = cls.getMethod("getPhysicalDisplayIds").invoke(null) as LongArray
+                    if (ids.isNotEmpty()) {
+                        return cls
+                            .getMethod("getPhysicalDisplayToken", Long::class.javaPrimitiveType!!)
+                            .invoke(null, ids[0]) as? IBinder
+                    }
+                } catch (t: Throwable) {
+                    Log.w(TAG, "DisplayControl 取 token 失败: $t")
+                }
+            }
+        }
+        try {
+            val sc = Class.forName("android.view.SurfaceControl")
+            val token = runCatching { sc.getMethod("getInternalDisplayToken").invoke(null) }
+                .getOrElse {
+                    val ids = sc.getMethod("getPhysicalDisplayIds").invoke(null) as LongArray
+                    sc.getMethod("getPhysicalDisplayToken", Long::class.javaPrimitiveType!!)
+                        .invoke(null, ids[0])
+                }
+            return token as? IBinder
+        } catch (t: Throwable) {
+            Log.w(TAG, "SurfaceControl 取 token 失败: $t")
+        }
+        return null
+    }
+
+    private val displayControlClass: Class<*>? by lazy {
+        try {
+            val factory = Class.forName("com.android.internal.os.ClassLoaderFactory")
+            val create = factory.getDeclaredMethod(
+                "createClassLoader",
+                String::class.java,
+                String::class.java,
+                String::class.java,
+                ClassLoader::class.java,
+                Integer.TYPE,
+                java.lang.Boolean.TYPE,
+                String::class.java,
+            )
+            val classpath = System.getenv("SYSTEMSERVERCLASSPATH")
+            if (classpath.isNullOrEmpty()) {
+                Log.w(TAG, "SYSTEMSERVERCLASSPATH 为空——无法加载 DisplayControl")
+                return@lazy null
+            }
+            val loader = create.invoke(
+                null,
+                classpath,
+                null,
+                null,
+                ClassLoader.getSystemClassLoader(),
+                0,
+                true,
+                null,
+            ) as ClassLoader
+            val cls = loader.loadClass("com.android.server.display.DisplayControl")
+            registerAndroidServersLibrary(cls)
+            Log.i(TAG, "DisplayControl 已就绪")
+            cls
+        } catch (t: Throwable) {
+            Log.w(TAG, "DisplayControl 加载失败（SDK ${Build.VERSION.SDK_INT}）: $t")
+            null
+        }
+    }
+
+    @SuppressLint("BlockedPrivateApi")
+    private fun registerAndroidServersLibrary(cls: Class<*>) {
+        val loadLibrary0 =
+            Runtime::class.java.getDeclaredMethod("loadLibrary0", Class::class.java, String::class.java)
+        loadLibrary0.isAccessible = true
+        loadLibrary0.invoke(Runtime.getRuntime(), cls, "android_servers")
     }
 
     override fun status(): String = synchronized(lock) {
@@ -338,5 +464,11 @@ class SpikeShellService : ISpikeShell.Stub {
         private var display: VirtualDisplay? = null
         private var flagsUsed: Int = 0
         private var appContext: Context? = null
+
+        /** SurfaceControl 显示电源模式：OFF=硬件断电，NORMAL=正常点亮。 */
+        private const val POWER_MODE_OFF = 0
+        private const val POWER_MODE_NORMAL = 2
+
+        private var physicalScreenOff = false
     }
 }

@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.session
+package io.github.hypercar.session
 
 import android.bluetooth.BluetoothDevice
 import android.content.Context
@@ -9,6 +9,7 @@ import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import io.github.hypercar.autowake.AutoStart
 import io.github.hypercar.autowake.HyperCarService
+import io.github.hypercar.carui.CarUiCaster
 import io.github.hypercar.core.AudioStats
 import io.github.hypercar.core.LinkState
 import io.github.hypercar.core.RustCoreBridge
@@ -773,6 +774,8 @@ object HyperCarRepo {
      */
     private fun releaseSessionResources() {
         streaming = false
+        // P1：先停自绘界面（释放 D1 显示/编码器），再停引擎
+        runCatching { CarUiCaster.stop() }
         runCatching { RustCoreBridge.nativeStop() }
         runCatching { iap2?.stop() }
         iap2 = null
@@ -1336,6 +1339,17 @@ object HyperCarRepo {
                             sinceMillis = System.currentTimeMillis(),
                         ),
                     )
+                    // P1：AirPlay RECORD 完成 → 自绘车机首页接管屏幕流（替换待机卡片）
+                    if (SettingsStore.carUiEnabled) {
+                        val ctx = appContext()
+                        if (ctx != null) {
+                            scope.launch {
+                                val result = runCatching { CarUiCaster.start(ctx) }
+                                    .getOrElse { "启动失败: ${it.javaClass.simpleName}: ${it.message}" }
+                                log("CARUI: $result")
+                            }
+                        }
+                    }
                 }
                 "failed" -> retryAirplayOrFail(detail)
                 "ended" -> {

@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.ui.screens
+package io.github.hypercar.ui.screens
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -991,6 +991,9 @@ private fun FpsSegment() {
 private fun BehaviorSection() {
     var autoConnect by rememberSaveable { mutableStateOf(SettingsStore.autoConnect) }
     var enableAudio by rememberSaveable { mutableStateOf(SettingsStore.enableAudio) }
+    var carUi by rememberSaveable { mutableStateOf(SettingsStore.carUiEnabled) }
+    var phoneScreenOff by rememberSaveable { mutableStateOf(SettingsStore.phoneScreenOff) }
+    val context = androidx.compose.ui.platform.LocalContext.current
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionLabel(text = "行为")
@@ -1016,6 +1019,65 @@ private fun BehaviorSection() {
                     SettingsStore.enableAudio = it
                 },
             )
+            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+            SwitchRow(
+                title = "自绘车机首页",
+                subtitle = "D1 显示自绘首页（地图/音乐卡片）；需 Shizuku + 手机亮屏解锁",
+                checked = carUi,
+                onCheckedChange = {
+                    carUi = it
+                    SettingsStore.carUiEnabled = it
+                    if (!it) io.github.hypercar.carui.CarUiCaster.stop()
+                },
+            )
+            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+            SwitchRow(
+                title = "连接时关闭手机屏幕",
+                subtitle = "默认关：连接不熄屏；开启后连接即断面板电源，系统保持唤醒（按电源键两次恢复）",
+                checked = phoneScreenOff,
+                onCheckedChange = {
+                    phoneScreenOff = it
+                    SettingsStore.phoneScreenOff = it
+                    if (!it) {
+                        io.github.hypercar.spike.SpikeShell.setPhysicalScreenPower(true)
+                    } else if (io.github.hypercar.carui.CarUiCaster.running) {
+                        io.github.hypercar.spike.SpikeShell.setPhysicalScreenPower(false)
+                    }
+                },
+            )
+            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+            val musicAccess = io.github.hypercar.carui.MusicBridge.hasAccess(context)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { io.github.hypercar.carui.MusicBridge.openAccessSettings(context) }
+                    .heightIn(min = 56.dp)
+                    .padding(vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "音乐卡片通知使用权",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = TextPrimary,
+                    )
+                    Text(
+                        text = if (musicAccess) {
+                            "已授予（QQ音乐 / 汽水音乐可读）"
+                        } else {
+                            "未授予——点此去系统设置开启"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (musicAccess) MintGreen else AmberWarning,
+                    )
+                }
+                Spacer(modifier = Modifier.width(12.dp))
+                Text(
+                    text = "›",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = TextSecondary,
+                )
+            }
         }
     }
 }

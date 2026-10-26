@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.settings
+package io.github.hypercar.settings
 
 import android.content.Context
 import android.content.SharedPreferences
@@ -37,6 +37,8 @@ object SettingsStore {
     private const val KEY_HEIGHT = "video_height"
     private const val KEY_FPS = "video_fps"
     private const val KEY_ENABLE_AUDIO = "enable_audio"
+    private const val KEY_CAR_UI = "car_ui_enabled"
+    private const val KEY_PHONE_SCREEN_OFF = "phone_screen_off"
     private const val KEY_IAP2_KEEPALIVE_ONLY = "iap2_keepalive_only"
     private const val KEY_KEEP_ALIVE_STATS = "keep_alive_stats"
     private const val KEY_DEBUG_LOG = "debug_log_enabled"
@@ -126,6 +128,26 @@ object SettingsStore {
     var enableAudio: Boolean
         get() = p().getBoolean(KEY_ENABLE_AUDIO, true)
         set(v) = p().edit().putBoolean(KEY_ENABLE_AUDIO, v).apply()
+
+    /**
+     * P1：自绘车机首页（D1）。会话建立后自动启动 CarUiCaster。
+     *
+     * 依赖 Shizuku（shell 建屏）与手机亮屏解锁（虚拟屏在锁屏/息屏时暂停合成）。
+     * 默认开：这是产品主形态；不想用时可在设置里关掉，回落到待机卡片。
+     */
+    var carUiEnabled: Boolean
+        get() = p().getBoolean(KEY_CAR_UI, true)
+        set(v) = p().edit().putBoolean(KEY_CAR_UI, v).apply()
+
+    /**
+     * P1：会话期「真息屏」——只切断物理面板电源，系统逻辑上保持亮屏/未锁屏。
+     *
+     * cardeck 2026-10-23 验证过的方案（scrcpy -S 同款）：面板黑掉后 Keyguard/Doze 不触发，
+     * 独立显示组的虚拟屏（D1）继续 60fps；不这么做时锁屏/息屏会让虚拟屏冻结。
+     */
+    var phoneScreenOff: Boolean
+        get() = p().getBoolean(KEY_PHONE_SCREEN_OFF, false)
+        set(v) = p().edit().putBoolean(KEY_PHONE_SCREEN_OFF, v).apply()
 
     /**
      * 联调开关：只保持 iAP2 链路，不在手机上启动 AirPlay 引擎。

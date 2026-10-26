@@ -97,6 +97,11 @@ object SpikeShell {
         service?.status() ?: "ERR 未连接"
     }.getOrElse { "ERR ${it.javaClass.simpleName}: ${it.message}" }
 
+    /** 真息屏：物理面板断电（系统保持唤醒），false=断电，true=点亮。 */
+    fun setPhysicalScreenPower(on: Boolean): Boolean = runCatching {
+        service?.setPhysicalScreenPower(on) ?: false
+    }.getOrDefault(false)
+
     fun tap(displayId: Int, x: Int, y: Int): String =
         call("tap") { it.tap(displayId, x, y) }
 

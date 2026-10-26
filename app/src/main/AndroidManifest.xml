@@ -117,6 +117,32 @@
             android:exported="true"
             android:foregroundServiceType="connectedDevice" />
 
+        <!-- P1：自绘车机首页。由 CarUiCaster 通过 Shizuku shell 的 am start 放到 D1 副屏，
+             故 exported=true；launchMode=singleTask 避免重复实例。 -->
+        <activity
+            android:name=".carui.CarHomeActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
+            android:theme="@style/Theme.HyperCar" />
+
+        <!-- P1：首页 caster 的前台服务（亮屏锁 + 编码器 + shell 建屏） -->
+        <service
+            android:name=".carui.CarUiService"
+            android:exported="true"
+            android:foregroundServiceType="connectedDevice" />
+
+        <!-- P1：音乐卡片的数据源。需要用户在系统设置里授予「通知使用权」。 -->
+        <service
+            android:name=".carui.MusicNotificationListener"
+            android:exported="true"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
         <!-- 秒连链路：上车（车机蓝牙 ACL 连上）冷启动进程 → 前台服务 → 全自动协商 -->
         <service
             android:name=".autowake.HyperCarService"

@@ -15,6 +15,9 @@
 # ---- SPIKE-P0：调试控制台/探针（P0 结束后连同 spike 包一起删） ----
 -keep class io.github.hypercar.spike.** { *; }
 
+# ---- P1：自绘车机首页 / 音乐通知监听（manifest 组件 + Compose） ----
+-keep class io.github.hypercar.carui.** { *; }
+
 # ---- Shizuku（binder 反射 + provider）----
 -keep class dev.rikka.shizuku.** { *; }
 -keep class moe.shizuku.** { *; }

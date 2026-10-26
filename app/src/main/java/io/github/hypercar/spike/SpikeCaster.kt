@@ -59,6 +59,10 @@ class SpikeCaster(
     private var framesAtStats = 0L
     private var statsAtNs = System.nanoTime()
     private var startedAtNs = 0L
+    private var frameSeq = 0L
+    private var sourceFrames = 0L
+    private var sourceFramesAtStats = 0L
+    private var sourceFps = 60.0
     private var lastPtsUs = 0L
     private var ptsUnitWarned = false
 
@@ -96,6 +100,15 @@ class SpikeCaster(
             enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         }
         val surface = enc.createInputSurface()
+        // 把编码器输入面的帧率钉到配置值：设备/虚拟屏是 90Hz 时 Compose 会按 90 出帧，
+        // 不钉要么被发送端丢帧成 45fps 抖动，要么 90~110fps 压垮 AirPlay 接收端。
+        runCatching {
+            surface.setFrameRate(
+                fps.toFloat(),
+                Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
+                Surface.CHANGE_FRAME_RATE_ALWAYS,
+            )
+        }
         val ht = HandlerThread("hypercar-spike-enc")
         ht.start()
         val handler = Handler(ht.looper)
@@ -209,8 +222,20 @@ class SpikeCaster(
                             }
                             val payload = if (prefix != null) prefix + data else data
                             val now = System.nanoTime()
-                            RustCoreBridge.nativePushVideoFrame(payload, info.presentationTimeUs)
-                            onFrame(info.presentationTimeUs, payload.size, now)
+                            sourceFrames++
+                            frameSeq++
+                            // 90Hz/120Hz 屏幕上 Compose 按屏幕刷新率出帧；按源帧率做 2/3 或 1/2
+                            // 抽帧，让 AirPlay 收到稳定 ~60fps。简单按时间阈值会在 90Hz 掉到 45fps。
+                            val dropEvery = when {
+                                sourceFps > 100.0 -> 2
+                                sourceFps > 75.0 -> 3
+                                else -> 0
+                            }
+                            val drop = !key && dropEvery > 0 && frameSeq % dropEvery == 0L
+                            if (!drop) {
+                                RustCoreBridge.nativePushVideoFrame(payload, info.presentationTimeUs)
+                                onFrame(info.presentationTimeUs, payload.size, now)
+                            }
                         }
                     }
                 }
@@ -257,6 +282,8 @@ class SpikeCaster(
             val now = System.nanoTime()
             if (now - statsAtNs >= 1_000_000_000L) {
                 val secs = (now - statsAtNs) / 1e9
+                sourceFps = (sourceFrames - sourceFramesAtStats) / secs
+                sourceFramesAtStats = sourceFrames
                 val fpsNow = (frames - framesAtStats) / secs
                 val kbps = (bytesTotal - bytesAtStats) * 8.0 / secs / 1000.0
                 statsLine = "fps=${"%.1f".format(fpsNow)} frames=$frames kbps=${kbps.toInt()} " +

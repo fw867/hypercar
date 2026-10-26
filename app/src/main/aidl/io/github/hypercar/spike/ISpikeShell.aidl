@@ -12,6 +12,12 @@ interface ISpikeShell {
 
     String status();
 
+    /**
+     * 物理主屏硬件断电/点亮（scrcpy -S 同款）：系统仍认为亮屏，不锁屏/不进 Doze，
+     * 独立显示组的虚拟屏继续渲染。返回是否成功。
+     */
+    boolean setPhysicalScreenPower(boolean on);
+
     /** 单击。返回 "OK <耗时µs>" 或 "ERR ..."。 */
     String tap(int displayId, int x, int y);
 
