@@ -282,10 +282,9 @@ internal fun LogLineRow(line: String, modifier: Modifier = Modifier) {
 
 
 /**
- * 「首次连接」引导：CarWith 首次配对必须手动点一次，之后同一台车会自动回连。
+ * 「首次连接」引导：车机首次配对必须手动点一次，之后同一台车会自动回连。
  *
- * 这一步没有对外接口（CarWith 的 Activity 不导出、值存在 CarLife 的私有
- * SharedPreferences 里），所以只能引导用户在界面上点一次。
+ * 车机侧的 CarPlay 授权只在系统界面里，应用无法代劳，所以只能引导用户点一次。
  */
 @Composable
 internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
@@ -313,7 +312,7 @@ internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
         Text(
             text = "① 车机侧开始接收（PC/WinPlay 联调时先在 PC 上起 hub）\n" +
                 "② 手机点「启动连接」，等状态到「已连接」\n" +
-                "③ 打开 CarWith → CarLife 连接 → 无线连接 → 车辆热点\n" +
+                "③ 车机侧打开 Apple CarPlay（首次会在车机屏幕上确认）\n" +
                 "④ 点列表里的车机蓝牙名称 → 下一步 → 开始连接",
             style = MaterialTheme.typography.bodySmall,
             color = TextSecondary,

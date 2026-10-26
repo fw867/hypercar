@@ -20,7 +20,6 @@
 mod airplay;
 mod audio_out;
 mod bplist;
-mod carlife;
 mod crypto;
 mod engine;
 mod iap2_nav;
@@ -34,8 +33,8 @@ mod timing;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;
 
-use jni::objects::{GlobalRef, JClass, JObject, JShortArray, JString};
-use jni::sys::{jboolean, jint, JNI_TRUE, JNI_FALSE};
+use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JShortArray, JString};
+use jni::sys::{jboolean, jint, jlong, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -61,8 +60,8 @@ struct EngineHandle {
     stop: Arc<Notify>,
     touch_tx: mpsc::UnboundedSender<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
-    /// 手机麦克风 PCM → CarLife VR 通道（语音助手用）
-    mic_tx: mpsc::UnboundedSender<Vec<i16>>,
+    /// 自绘界面投喂给引擎的视频帧 / 音频 PCM（nativePushVideoFrame / nativePushAudioPcm）
+    source_tx: mpsc::UnboundedSender<engine::SourceEvent>,
 }
 
 static ENGINE: Lazy<parking_lot::Mutex<Option<EngineHandle>>> =
@@ -358,10 +357,10 @@ fn native_start_impl(
         obj: factory_obj,
     });
 
-    let (touch_tx, touch_rx) = mpsc::unbounded_channel::<TouchInput>();
-    let (key_tx, key_rx) = mpsc::unbounded_channel::<u32>();
-    // 手机麦克风 → CarLife VR（语音助手要靠车机喂麦克风）
-    let (mic_tx, mic_rx) = mpsc::unbounded_channel::<Vec<i16>>();
+    let (touch_tx, _touch_rx) = mpsc::unbounded_channel::<TouchInput>();
+    let (key_tx, _key_rx) = mpsc::unbounded_channel::<u32>();
+    // 自绘界面 → 引擎：视频帧 / 音频 PCM 都走这条通道
+    let (source_tx, source_rx) = mpsc::unbounded_channel::<engine::SourceEvent>();
     let stop = Arc::new(Notify::new());
 
     let stop_run = stop.clone();
@@ -373,11 +372,8 @@ fn native_start_impl(
             control_stream,
             factory,
             touch_tx_engine,
-            touch_rx,
             key_tx_engine,
-            key_rx,
-            // 手机麦克风（AudioRecord）经 nativeSendMic 注入
-            Some(mic_rx),
+            source_rx,
             stop_run,
         )
         .await;
@@ -395,13 +391,13 @@ fn native_start_impl(
         }
     });
 
-    // 发送端留在句柄里供 nativeSendTouch/nativeSendHardKey 注入
-    // （AirPlay 事件通道触摸与 JNI 触摸共用同一 mpsc，最终都进 CarLife 触摸通道）
+    // 发送端留在句柄里（触摸/按键通道 P1 起接给自绘 UI）
+    // 发送端留在句柄里，供 nativePushVideoFrame / nativePushAudioPcm 投喂数据
     *ENGINE.lock() = Some(EngineHandle {
         stop,
         touch_tx,
         key_tx,
-        mic_tx,
+        source_tx,
     });
 
     emit_log("nativeStart: 引擎任务已派生");
@@ -427,16 +423,57 @@ fn stop_engine() {
     }
 }
 
-/// 手机麦克风 PCM（16kHz 单声道 16-bit）→ CarLife VR 通道。
-///
-/// CarLife 的语音助手要求「车机」提供麦克风数据（VR 通道 `VR_MIC_DATA 0x00058001`）；
-/// 本机 HU 就用手机自己的 `AudioRecord` 采，经这里注入，再由 `carlife::inject_mic`
-/// 封帧推给 MD。Android 侧需要在 manifest 申请 RECORD_AUDIO 并运行时授权。
+/// 投喂一帧 H.264（Annex B，来自本机 MediaCodec 的编码输出）。
 #[no_mangle]
-pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendMic(
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePushVideoFrame(
+    mut env: JNIEnv,
+    _class: JClass,
+    data: JByteArray,
+    pts_us: jlong,
+) {
+    let Ok(len) = env.get_array_length(&data) else {
+        return;
+    };
+    if len <= 0 {
+        return;
+    }
+    let mut buf = vec![0i8; len as usize];
+    if env.get_byte_array_region(&data, 0, &mut buf).is_err() {
+        return;
+    }
+    let bytes: Vec<u8> = buf.into_iter().map(|b| b as u8).collect();
+    if let Some(handle) = ENGINE.lock().as_ref() {
+        let _ = handle.source_tx.send(engine::SourceEvent::VideoFrame {
+            pts_us: pts_us.max(0) as u64,
+            data: bytes,
+        });
+    }
+}
+
+/// 投喂编码画面的新尺寸（对齐 AirPlay VideoConfig）。
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSetVideoSize(
+    _env: JNIEnv,
+    _class: JClass,
+    width: jint,
+    height: jint,
+) {
+    if let Some(handle) = ENGINE.lock().as_ref() {
+        let _ = handle.source_tx.send(engine::SourceEvent::EncoderResolution {
+            width: width.max(2) as u32,
+            height: height.max(2) as u32,
+        });
+    }
+}
+
+/// 投喂一包 PCM（16-bit 小端交错；用于把手机音频送进 AirPlay 音频流）。
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePushAudioPcm(
     mut env: JNIEnv,
     _class: JClass,
     pcm: JShortArray,
+    rate: jint,
+    channels: jint,
 ) {
     let Ok(len) = env.get_array_length(&pcm) else {
         return;
@@ -448,38 +485,14 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendMic
     if env.get_short_array_region(&pcm, 0, &mut buf).is_err() {
         return;
     }
+    let bytes: Vec<u8> = buf.iter().flat_map(|s| s.to_le_bytes()).collect();
     if let Some(handle) = ENGINE.lock().as_ref() {
-        let _ = handle.mic_tx.send(buf);
-    }
-}
-
-/// AirPlay 事件通道触摸 → CarLife（坐标已换算到 CarLife 编码空间）。
-#[no_mangle]
-pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendTouch(
-    _env: JNIEnv,
-    _class: JClass,
-    action: jint,
-    x: jint,
-    y: jint,
-) {
-    if let Some(handle) = ENGINE.lock().as_ref() {
-        let _ = handle.touch_tx.send(TouchInput {
-            action: action as u32,
-            x: x.max(0) as u32,
-            y: y.max(0) as u32,
+        let _ = handle.source_tx.send(engine::SourceEvent::AudioData {
+            tts: false,
+            rate: rate.max(8000) as u32,
+            channels: channels.clamp(1, 2) as u8,
+            data: bytes,
         });
-    }
-}
-
-/// iDrive 旋钮/方向盘媒体键 → CarLife 硬按键 0x68008。
-#[no_mangle]
-pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendHardKey(
-    _env: JNIEnv,
-    _class: JClass,
-    carlife_key_code: jint,
-) {
-    if let Some(handle) = ENGINE.lock().as_ref() {
-        let _ = handle.key_tx.send(carlife_key_code as u32);
     }
 }
 
@@ -527,6 +540,7 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeBuildIa
         .expect("jbyteArray 创建失败")
         .into_raw()
 }
+
 
 
 

@@ -1,8 +1,8 @@
-[package]
+﻿[package]
 name = "hypercar_core"
 version = "0.1.0"
 edition = "2021"
-description = "HyperCar 核心层：CarLife 本机回环接收端 + AirPlay 零转码推流（宝马 ID8.5）"
+description = "HyperCar 核心层：本机自绘画面 → AirPlay 推流（宝马 ID8.5 等 CarPlay 车机）"
 
 [lib]
 crate-type = ["cdylib"]
@@ -45,3 +45,4 @@ codegen-units = 1
 # 保持默认 unwind 后，tokio 任务内的 panic 由任务边界捕获，lib.rs 的看门狗把它
 # 报成「引擎任务异常退出」；panic hook 再把 PANIC 行打到 logcat（tag HyperCar-Core）。
 strip = true
+

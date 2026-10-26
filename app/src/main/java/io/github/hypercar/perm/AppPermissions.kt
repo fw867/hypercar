@@ -42,7 +42,7 @@ enum class PermGroup {
     /** 通知（前台服务常驻通知）。 */
     Notification,
 
-    /** 麦克风（语音助手：CarLife 要求车机侧供麦克风，本机用手机麦克风）。 */
+    /** 麦克风（音频采集预留：本机自采自编的音轨）。 */
     Microphone,
 }
 
@@ -87,7 +87,7 @@ object AppPermissions {
         add(PermGroup.Nearby)
         if (Build.VERSION.SDK_INT <= 32) add(PermGroup.Location)
         if (Build.VERSION.SDK_INT >= 33) add(PermGroup.Notification)
-          add(PermGroup.Microphone)
+            // 音频经 AudioPlaybackCapture 采集时再申请（当前无麦克风代码）
     }
 
     /** 缺失的必需组（用于一键申请与连接前预检）。 */

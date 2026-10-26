@@ -1,16 +1,15 @@
-﻿//! 网关引擎编排：CarLife 回环 ⇄ AirPlay 推流 的粘合层。
+﻿//! 引擎编排：**本机自绘界面（自采自编）→ AirPlay 推流** 的粘合层。
 //!
-//! 数据面（全部零转码）：
-//!  - 视频：CarLife 8240 的 H.264 Annex B 裸流 → ScreenSender（128B 头 + ChaCha20-Poly1305）
-//!  - 音频：CarLife 9240/9241 的 PCM → 线性重采样 48kHz 立体声 → TTS 闪避混音 → RTP
-//!  - 触摸：AirPlay 事件通道 HID → CarLife 9340；iDrive 旋钮 → 硬按键 0x68008
+//! 数据面：
+//!  - 视频：Kotlin 侧 MediaCodec 出来的 H.264 Annex B（nativePushVideoFrame）→ ScreenSender
+//!  - 音频：Kotlin 侧采集的 PCM（nativePushAudioPcm）→ 重采样 48kHz 立体声 → RTP
 //!
 //! 控制面：Kotlin 交来「已连上车机 AirPlay 端口的 control FD」+ socket 供给器，
 //! 其余协商（/info、pair-verify、SETUP、RECORD、三条心跳）全部在本层闭环。
 //!
 //! 任务拓扑（单分发器 → 双泵，避免多消费者抢同一接收器）：
-//!   CarLifeHub ─events─▶ demux ─video─▶ video pump ─▶ ScreenSender
-//!                          └──audio─▶ audio pump ─▶ AudioOut(RTP)
+//!   nativePush* ─events─▶ demux ─video─▶ video pump ─▶ ScreenSender
+//!                         └──audio─▶ audio pump ─▶ AudioOut(RTP)
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -21,20 +20,22 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::airplay::{self, AirplayParams, SocketProvider, TouchInput};
 use crate::audio_out::AudioOut;
-use crate::carlife::{CarLifeConfig, CarLifeHub};
 use crate::screen::ScreenSender;
 use crate::{emit_log, emit_stats, emit_state};
 
-/// CarLife 通道产出的事件。
-pub enum CarLifeEvent {
-    Handshake,
+/// 外部（Kotlin 侧）投喂给引擎的数据事件。
+pub enum SourceEvent {
+    /// 视频编码器产出一帧（H.264 Annex B，可能含 SPS/PPS/IDR）。
     VideoFrame { pts_us: u64, data: Vec<u8> },
-    AudioInit { tts: bool, rate: u32, channels: u8 },
-    AudioStop { tts: bool },
-    AudioData { tts: bool, rate: u32, channels: u8, data: Vec<u8> },
-    /// 手机在 VIDEO_ENCODER_INIT_DONE 里回报的**实际**编码分辨率
-    /// （可能与我们请求的不同：机型编码器会自行压缩到支持的上限）。
+    /// 编码器画布尺寸变化（对齐 AirPlay VideoConfig 宽高）。
     EncoderResolution { width: u32, height: u32 },
+    /// 音频流开始（tts=true 表示提示音，参与闪避混音）。
+    AudioInit { tts: bool, rate: u32, channels: u8 },
+    /// 音频流停止。
+    AudioStop { tts: bool },
+    /// 一包 PCM（16-bit 小端，交错）。
+    AudioData { tts: bool, rate: u32, channels: u8, data: Vec<u8> },
+    /// 视频源断开（自绘界面停止推流）。
     ClientLeft { video: bool },
 }
 
@@ -52,12 +53,6 @@ pub struct EngineConfig {
     #[serde(default)]
     pub keep_alive_stats: bool,
     pub identity_path: String,
-    /// 非空 = CarLife 走**主动连接模式**：不发监听，改为逐个拨 `md_host` 的标准端口。
-    ///
-    /// 小米 CarLife/CarWith「车辆热点 → 开始连接」后是 MD 在监听（7240/8240/…），
-    /// 等车机连入；Android 上（HU 与 MD 同机）保持 `None`，仍用回环监听。
-    #[serde(default)]
-    pub md_host: Option<String>,
     /// 接收端 `/info` 报 0x0 时的**触摸显示空间**宽/高（0 = 用协商的屏幕尺寸）。
     ///
     /// WinPlay 这类接收端固定报 0x0，但它的 HID 坐标按自己窗口像素算
@@ -66,13 +61,6 @@ pub struct EngineConfig {
     pub touch_display_w: u32,
     #[serde(default)]
     pub touch_display_h: u32,
-    /// 特性配置里的 `voice`：0 = 车机不提供语音（MD 回落到**手机自己的麦克风**），
-    /// 1 = HU 通过 VR 通道推麦克风数据。
-    ///
-    /// 默认 0：我们没有可靠的车机麦克风来源；声明 1 会让手机等我们喂麦克风，
-    /// 语音助手于是报「麦克风有问题」（现场 2026-10-24 定位）。
-    #[serde(default)]
-    pub voice: u32,
 }
 
 fn default_true() -> bool {
@@ -83,122 +71,44 @@ const TARGET_RATE: u32 = 48_000;
 const SPF: usize = 352; // AirPlay 每包样本帧（512 在真车无声）
 
 /// 引擎主入口：control FD → AirPlay 协商 → 双向泵。
-/// 触摸/按键注入通道由 JNI 层创建（nativeSendTouch/nativeSendHardKey 持发送端），
-/// 发送端同时交给 AirPlay 事件分发器，接收端在此转发给 CarLife 触摸通道。
+///
+/// 数据来源由 Kotlin 侧主动投喂（`nativePushVideoFrame` / `nativePushAudioPcm`），
+/// 本层不再起任何随车 App 的回环网关：帧与音频都由 Kotlin 侧投喂。
 #[allow(clippy::too_many_arguments)]
 pub async fn run_engine(
     cfg: EngineConfig,
     control_stream: tokio::net::TcpStream,
     factory: Arc<dyn SocketProvider>,
     touch_tx: mpsc::UnboundedSender<TouchInput>,
-    mut touch_rx: mpsc::UnboundedReceiver<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
-    mut key_rx: mpsc::UnboundedReceiver<u32>,
-    // 麦克风 PCM 来源（PC 侧联调注入；Android 上为 None）
-    mut mic_rx: Option<mpsc::UnboundedReceiver<Vec<i16>>>,
+    mut source_rx: mpsc::UnboundedReceiver<SourceEvent>,
     stop: Arc<Notify>,
 ) -> Result<(), String> {
-    emit_state("negotiating", "CarLife 网关启动");
+    emit_state("negotiating", "AirPlay 会话启动");
+    // 触摸/按键通道：CarPlay 事件通道把车机操作送到这里，P1 起交给自绘 UI 处理。
+    let _ = (&touch_tx, &key_tx);
 
-    // ---- CarLife 网关先行：协商期间 CarLife app 即可接入回环 ----
-    // （触摸接收端已内化给通道任务，hub 只保留注入 Sender）
-    let life_cfg = CarLifeConfig {
-        width: cfg.width,
-        height: cfg.height,
-        fps: cfg.fps,
-        voice: cfg.voice,
-        // HU_INFO 里 required 的 btaddress/btname：用 iAP2 的稳定设备号当车机蓝牙 MAC
-        bt_address: cfg.device_id.clone(),
-        bt_name: "BMW".to_string(),
-    };
-    let (hub, mut life_events) = match cfg.md_host.clone() {
-        Some(host) => CarLifeHub::connect(life_cfg, host, stop.clone())?,
-        None => match CarLifeHub::start(life_cfg.clone(), stop.clone()) {
-            Ok(v) => v,
-            // **端口被本机 CarLife 占了 = 它才是监听方**：小米 CarLife/CarWith 在
-            // 「车辆热点 → 开始连接」后自己 bind 7240~9340 等车机连入。此时我们改当客户端，
-            // 直接拨 127.0.0.1 即可同机打通（2026-10-25 验证：两个进程抢 7240 会双双卡死）。
-            Err(e) if e.contains("Address already in use") || e.contains("os error 98") => {
-                emit_log(
-                    "CARLIFE: 7240 已被本机 CarLife/CarWith 监听占用——自动改走「主动拨号 127.0.0.1」",
-                );
-                CarLifeHub::connect(life_cfg, "127.0.0.1".to_string(), stop.clone())?
-            }
-            Err(e) => return Err(e),
-        },
-    };
-    let hub = Arc::new(hub);
-
-    // 触摸/按键注入桥：AirPlay 事件通道 → CarLife 触摸通道
-    {
-        let hub = hub.clone();
-        let stop_t = stop.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = stop_t.notified() => return,
-                    t = touch_rx.recv() => match t {
-                        Some(t) => hub.inject_touch(t.action, t.x, t.y),
-                        None => return,
-                    },
-                    k = key_rx.recv() => match k {
-                        Some(k) => hub.inject_hard_key(k),
-                        None => return,
-                    },
-                }
-            }
-        });
-    }
-
-    // 麦克风上行：外部 PCM（PC 侧采集）→ CarLife VR 通道
-    if let Some(mut mic_rx) = mic_rx.take() {
-        let hub = hub.clone();
-        let stop_m = stop.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = stop_m.notified() => return,
-                    pcm = mic_rx.recv() => match pcm {
-                        Some(pcm) => hub.inject_mic(&pcm),
-                        None => return,
-                    },
-                }
-            }
-        });
-    }
-    // ---- 分发器：CarLife 事件 → 视频泵 / 音频泵 ----
-    let (video_tx, video_rx) = mpsc::unbounded_channel::<CarLifeEvent>();
-    let (audio_tx, audio_rx) = mpsc::unbounded_channel::<CarLifeEvent>();
+    // ---- 分发器：外部事件 → 视频泵 / 音频泵 ----
+    let (video_tx, video_rx) = mpsc::unbounded_channel::<SourceEvent>();
+    let (audio_tx, audio_rx) = mpsc::unbounded_channel::<SourceEvent>();
     {
         let stop_d = stop.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = stop_d.notified() => return,
-                    ev = life_events.recv() => match ev {
+                    ev = source_rx.recv() => match ev {
                         Some(ev) => {
                             let to_audio = matches!(
                                 ev,
-                                CarLifeEvent::AudioInit { .. }
-                                    | CarLifeEvent::AudioStop { .. }
-                                    | CarLifeEvent::AudioData { .. }
-                            );
-                            let to_video = matches!(
-                                ev,
-                                CarLifeEvent::VideoFrame { .. }
-                                    | CarLifeEvent::EncoderResolution { .. }
+                                SourceEvent::AudioInit { .. }
+                                    | SourceEvent::AudioStop { .. }
+                                    | SourceEvent::AudioData { .. }
                             );
                             if to_audio {
                                 if audio_tx.send(ev).is_err() { return; }
-                            } else if to_video {
-                                if video_tx.send(ev).is_err() { return; }
-                            } else {
-                                match ev {
-                                    CarLifeEvent::Handshake => emit_log("CARLIFE: 握手完成"),
-                                    CarLifeEvent::ClientLeft { video: true } =>
-                                        emit_log("CARLIFE: 视频客户端断开"),
-                                    _ => {}
-                                }
+                            } else if video_tx.send(ev).is_err() {
+                                return;
                             }
                         }
                         None => return,
@@ -220,9 +130,9 @@ pub async fn run_engine(
             let mut pending_size: Option<(u32, u32)> = None;
             let mut ready = Some(screen_ready_rx);
             let mut video_rx = video_rx;
-            // 16ms tick：CarLife 没推流时用它按 ~60fps 发待机循环帧（真帧来了就以真帧为主）
+            // 16ms tick：真帧没到时用它按 ~60fps 发待机循环帧
             let mut tick = tokio::time::interval(Duration::from_millis(16));
-            // CarLife 还没开始推流时，用待机卡片按 1 帧/秒占住屏幕流（避免车机黑屏/提前关通道）
+            // 真帧到来前用待机卡片占住屏幕流（避免车机黑屏/提前关通道）
             let mut last_real_frame: Option<std::time::Instant> = None;
             let mut standby_idx: usize = 0;
             let mut standby_size_sent: Option<(u32, u32)> = None;
@@ -249,7 +159,7 @@ pub async fn run_engine(
                         ready = None;
                     }
                     ev = video_rx.recv() => match ev {
-                        Some(CarLifeEvent::EncoderResolution { width, height }) => {
+                        Some(SourceEvent::EncoderResolution { width, height }) => {
                             // 手机回报实际编码尺寸 → 同步 AirPlay 画布（VideoConfig 宽高）。
                             // 必须在首帧引出 VideoConfig 之前生效，否则车机按旧画布解码。
                             if let Some(s) = sender.as_mut() {
@@ -258,10 +168,10 @@ pub async fn run_engine(
                                 pending_size = Some((width, height));
                             }
                         }
-                        Some(CarLifeEvent::VideoFrame { pts_us, data }) => {
+                        Some(SourceEvent::VideoFrame { pts_us, data }) => {
                             if let Some(s) = sender.as_mut() {
                                 let len = data.len() as u64;
-                                // CarLife 媒体头的时间戳偶有 0/非单调（不同发送端实现不一），
+                                // 上游时间戳可能为 0/非单调，为 0 时用本机单调钟
                                 // 直接当 PTS 会让车机按 0 排播 → 卡顿/丢帧。为 0 时用本机单调钟。
                                 let pts = if pts_us == 0 {
                                     crate::timing::monotonic_nanos() / 1_000
@@ -277,7 +187,7 @@ pub async fn run_engine(
                                 st.frames += 1;
                                 st.bytes += len;
                             }
-                            // 屏幕流未就绪：丢帧（CarLife 先于 AirPlay 接入属正常）
+                            // 屏幕流未就绪：丢帧（AirPlay 会话可能晚于画面就绪）
                         }
                         Some(_) => {}
                         None => return,
@@ -286,7 +196,7 @@ pub async fn run_engine(
                         // 屏幕流 keepAlive 帧（明文、1s 节流；缺它 Audi MMI 3315 10.2s 拆轮）
                         if let Some(s) = sender.as_mut() {
                             let _ = s.maybe_send_keep_alive().await;
-                            // CarLife 还没推流 → 按 ~60fps 播放待机循环（1 IDR + 59 个极小 P 帧）。
+                            // 真帧没到 → 按 ~60fps 播放待机循环（1 IDR + 59 个极小 P 帧）
                             // 真帧到达后自动停用（1s 内有过真帧就不再插卡片）。
                             let stale = last_real_frame
                                 .map(|t| t.elapsed() >= Duration::from_millis(900))
@@ -373,7 +283,7 @@ pub async fn run_engine(
             //
             // cardeck 的节奏天然正确——它由 AudioRecord.read() 的阻塞读取驱动，
             // 硬件按 48k 实时吐 352 帧，一包一发，永不累计误差。
-            // 我们这里是「收 CarLife PCM → 自己重排节奏」，所以必须用绝对时刻对齐：
+    // 我们这里是「收 PCM → 自己重排节奏」，所以必须用绝对时刻对齐：
             //  - Burst：漏掉的拍**立刻补发**（Delay 会永久丢拍 → RTP 时钟持续落后于
             //    墙钟，接收端表现为 late/discontinuity 一直涨、听感断续）。
             //  - 补发仍受混音队列上限（~0.5s）约束，不会无限喷包。
@@ -401,15 +311,15 @@ pub async fn run_engine(
                         ready = None;
                     }
                     ev = audio_rx.recv() => match ev {
-                        Some(CarLifeEvent::AudioInit { tts, rate, channels }) => {
+                        Some(SourceEvent::AudioInit { tts, rate, channels }) => {
                             if tts { tts_fmt = (rate.max(1), channels.max(1)); }
                             else { media_fmt = (rate.max(1), channels.max(1)); }
                             stats.lock().playing = true;
                         }
-                        Some(CarLifeEvent::AudioStop { tts }) => {
+                        Some(SourceEvent::AudioStop { tts }) => {
                             if tts { tts_mix.clear(); } else { media_mix.clear(); }
                         }
-                        Some(CarLifeEvent::AudioData { tts, rate, channels, data }) => {
+                        Some(SourceEvent::AudioData { tts, rate, channels, data }) => {
                             let (fmt, remain, mix) = if tts {
                                 (&mut tts_fmt, &mut tts_remain, &mut tts_mix)
                             } else {
@@ -482,6 +392,9 @@ pub async fn run_engine(
     // ---- AirPlay 协商（控制 FD 已连接车机端口）----
     emit_state("negotiating", "AirPlay 协商开始");
     let (ctrl_r, ctrl_w) = control_stream.into_split();
+    // 编码画布尺寸：/info 报到车机真实尺寸后写入，编码器回报后覆盖
+    let encoder_size: Arc<Mutex<(u32, u32)>> =
+        Arc::new(Mutex::new((cfg.width.max(2), cfg.height.max(2))));
     let params = AirplayParams {
         car_ip: cfg.car_ip.clone(),
         airplay_port: cfg.airplay_port,
@@ -496,8 +409,8 @@ pub async fn run_engine(
             (w, h) if w > 0 && h > 0 => Some((w, h)),
             _ => None,
         },
-        // 与 CarLife 层共用：/info 报到车机真实尺寸后写入，手机回报实际值后再覆盖
-        encoder_size: hub.encoder_size_handle(),
+    // 与编码侧共用：/info 报到车机真实尺寸后写入，编码器回报后再覆盖
+        encoder_size: encoder_size.clone(),
     };
     let outcome = airplay::negotiate(
         ctrl_r,
@@ -554,7 +467,7 @@ pub async fn run_engine(
 /// 把一包 PCM（LE i16 交错）线性重采样为 48kHz 立体声，推入混音缓冲。
 ///
 /// 注：参考文档用简单线性插值；44.1k→48k 的镜像抑制对车机喇叭听感足够
-/// （CarLife 音源本身已是有损编码后的 PCM，抗混叠收益有限）。后续如需
+/// （音源本身已是有损压缩后的 PCM，抗混叠收益有限）。后续如需
 /// 更好音质可换 windowed-sinc（此函数是唯一改动点）。
 fn push_resampled(
     raw: &[u8],
@@ -636,6 +549,7 @@ struct AudioPumpStat {
     playing: bool,
     ducking: bool,
 }
+
 
 
 

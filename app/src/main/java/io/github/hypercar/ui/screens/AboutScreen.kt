@@ -83,7 +83,7 @@ fun AboutScreen(modifier: Modifier = Modifier) {
                     color = TextPrimary,
                 )
                 Text(
-                    text = "CarLife 回环 · 零转码 · 宝马 AirPlay 网关",
+                    text = "本机自绘 · 零转码 · 宝马 AirPlay 网关",
                     style = MaterialTheme.typography.bodySmall,
                     color = TextSecondary,
                 )

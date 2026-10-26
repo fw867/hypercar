@@ -19,7 +19,6 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.GraphicEq
 import androidx.compose.material.icons.rounded.Navigation
 import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.Videocam
@@ -35,7 +34,6 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.github.hypercar.core.AudioStats
-import io.github.hypercar.core.CarLifeState
 import io.github.hypercar.core.SessionSnapshot
 import io.github.hypercar.core.VideoStats
 import io.github.hypercar.ui.theme.AmberWarning
@@ -48,19 +46,19 @@ import io.github.hypercar.ui.theme.TextSecondary
 import java.util.Locale
 
 /**
- * 统计芯片：视频 / CarLife / 音频 / Shizuku。
+ * 统计芯片：视频 / 音频 / Shizuku。
  *
  * 布局（现场 2026-10-24 两轮反馈后定稿）：
- *  - 第一行三枚等分：视频 │ CarLife │ 音频；
- *  - Shizuku 单独一行、整宽（与上面三枚总宽对齐），因此可以写完整说明文字；
- *  - 四枚统一装进一张 GlassPanel，与首页其它卡片视觉一致（原来是单行横滑，
+ *  - 第一行两枚等分：视频 │ 音频；
+ *  - Shizuku 单独一行、整宽（与上面两枚总宽对齐），因此可以写完整说明文字；
+ *  - 三枚统一装进一张 GlassPanel，与首页其它卡片视觉一致（原来是单行横滑，
  *    Shizuku 在窄屏被挤出屏幕，要左滑才看得到）。
  */
 @Composable
 fun StatGrid(
     snapshot: SessionSnapshot,
     modifier: Modifier = Modifier,
-    /** 联调模式（PC 侧当 HU）：本机引擎不跑，视频/CarLife/音频统计无从更新，芯片改为说明来源。 */
+    /** 联调模式（PC 侧当 HU）：本机引擎不跑，视频/音频统计无从更新，芯片改为说明来源。 */
     externalMode: Boolean = false,
     onOpenShizuku: (() -> Unit)? = null,
     /** 降级模式说明（原首页下方那张大卡，已并到 Shizuku 芯片）。 */
@@ -75,7 +73,6 @@ fun StatGrid(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             VideoChip(snapshot.video, externalMode, Modifier.weight(1f))
-            CarLifeChip(snapshot.carLife, externalMode, Modifier.weight(1f))
             AudioChip(snapshot.audio, externalMode, Modifier.weight(1f))
         }
         Spacer(modifier = Modifier.height(10.dp))
@@ -165,35 +162,6 @@ private fun VideoChip(video: VideoStats, external: Boolean = false, modifier: Mo
         leadingIcon = Icons.Rounded.Videocam,
         modifier = modifier,
     )
-}
-
-@Composable
-private fun CarLifeChip(carLife: CarLifeState, external: Boolean = false, modifier: Modifier = Modifier) {
-    when (carLife) {
-        is CarLifeState.Idle -> StatChip(
-            label = "CarLife",
-                value = if (external) "PC 侧接入" else "未接入",
-            accent = TextSecondary,
-            leadingIcon = Icons.Rounded.GraphicEq,
-            modifier = modifier,
-        )
-
-        is CarLifeState.Waiting -> StatChip(
-            label = "CarLife",
-            value = "等待接入 :${carLife.port}",
-            accent = AmberWarning,
-            leadingIcon = Icons.Rounded.GraphicEq,
-            modifier = modifier,
-        )
-
-        is CarLifeState.Active -> StatChip(
-            label = "CarLife",
-            value = "已接入 · ${carLife.appLabel}",
-            accent = MintGreen,
-            leadingIcon = Icons.Rounded.GraphicEq,
-            modifier = modifier,
-        )
-    }
 }
 
 @Composable

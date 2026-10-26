@@ -12,7 +12,7 @@
 //!     UDP keepAlive 5s（4B；间隔必须小于车机 10s 看门狗——等长必输）
 //!     RTSP /feedback 1s（车机 ~3s 看门狗）
 //!     屏幕流 keepAlive 帧 1s（在视频 pump 内节流；缺它 Audi MMI 3315 10.2s 拆轮）
-//!  9. 事件通道 hidSendReport → 触摸坐标换算 → CarLife 触摸通道
+//!  9. 事件通道 hidSendReport → 触摸坐标换算 → 交给本机自绘界面
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,20 +46,20 @@ pub struct AirplayParams {
     pub identity_path: String,
     pub enable_audio: bool,
     pub keep_alive_stats: bool,
-    /// 设置里的 CarLife 编码分辨率（仅作 `/info` 无显示器信息时的兜底）。
+    /// 设置里的编码分辨率（仅作 `/info` 无显示器信息时的兜底）。
     pub width: u32,
     pub height: u32,
     /// **触摸的显示空间**（接收端屏幕像素）。`/info` 报 0x0 时用它；
     /// 真车会给真实尺寸，WinPlay 这类接收端固定报 0x0（它按自己的窗口 2732x794 算 HID 坐标）。
     /// 给错会让触摸整体缩放偏移——越靠右/下越明显（"按钮很难点上"）。
     pub touch_display: Option<(u32, u32)>,
-    /// 当前 CarLife 编码分辨率（共享单元）：
+    /// 当前编码分辨率（共享单元）：
     /// `/info` 报到车机真实显示尺寸后由协商写入，手机在 `VIDEO_ENCODER_INIT_DONE`
-    /// 里回报实际选择后由 CarLife 层覆盖。触摸坐标换算与 VideoConfig 都读它。
+    /// 里回报实际选择后由编码侧覆盖。触摸坐标换算与 VideoConfig 都读它。
     pub encoder_size: Arc<Mutex<(u32, u32)>>,
 }
 
-/// 车机触摸（已是 CarLife 编码空间坐标）。
+/// 车机触摸（已是编码画布坐标）。
 #[derive(Debug, Clone, Copy)]
 pub struct TouchInput {
     pub action: u32,
@@ -265,21 +265,21 @@ pub async fn negotiate(
             )
         })
         .unwrap_or((0, 0));
-    // 车机能力位图：判断是否支持 HEVC 等能力，只能靠它（我们无法向 CarLife 指定 codec）
+    // 车机能力位图：判断是否支持 HEVC 等能力，只能靠它（codec 由本机编码器决定）
     let car_features = info.get("features").and_then(Value::as_int).unwrap_or(0);
     emit_log(&format!(
         "AIRPLAY: /info displays[0].uuid={:?} {}x{} features=0x{:x}",
         display_uuid, disp_w, disp_h, car_features
     ));
 
-    // 车机真实显示分辨率 → CarLife 编码请求。
+    // 车机真实显示分辨率 → 编码请求。
     // 设置里的分辨率只是"用户以为的"，实际以 `/info` 为准：两侧不一致时
     // 车机要把小画面拉伸整屏（发虚），所以这里直接改成车机原生尺寸。
     if disp_w >= 320 && disp_h >= 240 {
         let target = (even(disp_w.max(2)), even(disp_h.max(2)));
         *p.encoder_size.lock() = target;
         emit_log(&format!(
-            "AIRPLAY: 车机实际 {}x{} → 请求 CarLife 按 {}x{} 编码（设置值 {}x{} 仅作兜底）",
+            "AIRPLAY: 车机实际 {}x{} → 请求按 {}x{} 编码（设置值 {}x{} 仅作兜底）",
             disp_w, disp_h, target.0, target.1, p.width, p.height
         ));
     } else {
@@ -423,7 +423,7 @@ pub async fn negotiate(
         .ok_or_else(|| format!("屏幕流连接失败 {}:{data_port}", p.car_ip))?;
     // into_split 返回 (读半部, 写半部)；屏幕流只推不收，读半部直接丢弃
     let (_screen_r, screen_w) = screen_stream.into_split();
-    // 画布尺寸取当前编码分辨率（/info 已写入；手机回报实际值后 CarLife 层会再覆盖）
+    // 画布尺寸取当前编码分辨率（/info 已写入；编码侧回报实际值后会再覆盖）
     let (enc_w, enc_h) = *p.encoder_size.lock();
     let screen = ScreenSender::new(screen_w, cipher, enc_w, enc_h, keep_alive_stats);
     emit_log(&format!(
@@ -914,14 +914,14 @@ fn spawn_event_dispatcher(
     });
 }
 
-/// HID 触摸报告 → CarLife 触摸。
+/// HID 触摸报告 → 本机界面触摸事件。
 ///
 /// 坐标格式（cardeck 奥迪实测；BMW 按 /info hidDevices 描述符校准，见 docs）：
 /// 5 字节 `[tip 1bit][X u16LE][Y u16LE]`，X/Y 为车机显示空间绝对坐标；
-/// 这里缩放到 CarLife 编码空间（VideoConfig 画布）。
+/// 这里缩放到编码画布空间（VideoConfig 画布）。
 ///
 /// 动作边沿：按下沿 → DOWN(1)，保持 → MOVE(3)，抬起沿 → UP(2)——
-/// CarLife 触摸通道需要完整的 down/move/up 序列才认点按。
+/// 本机界面需要完整的 down/move/up 序列才认点按。
 fn handle_hid_report(
     report: &[u8],
     touch_tx: &mpsc::UnboundedSender<TouchInput>,
@@ -1004,19 +1004,20 @@ fn handle_hid_report(
             }
         }
     }
-    // 动作边沿：按下沿 → DOWN，保持 → MOVE，抬起沿 → UP。
-    // 用 **CarLife 语义**（0=DOWN/1=UP/2=MOVE），不是 Android MotionEvent 的 1/2/3——
-    // 下游 carlife::inject_touch 直接按 CarLife 裸结构封包。
+    // 动作边沿：按下沿 → DOWN，保持 → MOVE，抬起沿 → UP（0=DOWN/1=UP/2=MOVE）。
+    // 下游由 Kotlin 侧的自绘界面消费（P1 接线），这里只负责换算坐标与边沿。
+    const TOUCH_DOWN: u32 = 0;
+    const TOUCH_UP: u32 = 1;
+    const TOUCH_MOVE: u32 = 2;
     let action = match (*tip_down, pressed) {
-        (false, true) => crate::carlife::TOUCH_DOWN,
-        (true, true) => crate::carlife::TOUCH_MOVE,
-        (true, false) => crate::carlife::TOUCH_UP,
+        (false, true) => TOUCH_DOWN,
+        (true, true) => TOUCH_MOVE,
+        (true, false) => TOUCH_UP,
         (false, false) => return, // 无状态变化
     };
     *tip_down = pressed;
     let _ = touch_tx.send(TouchInput { action, x, y });
 }
-
 /// Consumer 页媒体键的极简映射。
 fn consumer_key_of(report: &[u8]) -> Option<u32> {
     let usage = *report.last()?;
@@ -1260,3 +1261,4 @@ fn split_annexb_frames(data: &'static [u8]) -> Vec<&'static [u8]> {
     }
     frames
 }
+

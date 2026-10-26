@@ -3,9 +3,8 @@ package io.github.hypercar.core
 /**
  * 会话状态模型 —— UI（Compose）与 Orchestrator 之间的唯一契约。
  *
- * 本项目砍掉了 cardeck 的 VirtualDisplay / EGL 合成链路：手机不再自绘车机桌面，
- * 而是让本机 CarLife/CarWith/车联 连回 127.0.0.1，Rust 核心层零转码直推宝马 AirPlay。
- * 因此状态模型只有三条链路：蓝牙 iAP2 协商 → AirPlay 会话 → CarLife 回环。
+ * 本项目只保留 CarPlay 一条链路：蓝牙 iAP2 协商 → AirPlay 会话 → 屏幕/音频推流。
+ * 车机上的画面由本机自绘界面（自采自编）产生。
  */
 sealed interface LinkState {
     /** 未连接（首页大卡：待机态）。 */
@@ -23,18 +22,7 @@ sealed interface LinkState {
     data object Stopping : LinkState
 }
 
-/** 本机 CarLife 回环接入状态（Rust 核心层回报）。 */
-sealed interface CarLifeState {
-    data object Idle : CarLifeState
-
-    /** 网关监听就绪，正在等 CarLife/CarWith 接入 127.0.0.1。 */
-    data class Waiting(val port: Int = 7240) : CarLifeState
-
-    /** CarLife 已接入并在推流。 */
-    data class Active(val appLabel: String = "CarLife") : CarLifeState
-}
-
-/** 视频通路统计（零转码：帧率即 CarLife 编码帧率）。 */
+/** 视频通路统计（自绘界面自采自编，帧率 = 我们的编码帧率）。 */
 data class VideoStats(
     val fps: Int = 0,
     val frames: Long = 0,
@@ -51,7 +39,6 @@ data class AudioStats(
 /** UI 快照：Repo 每次变更推送给 Compose。 */
 data class SessionSnapshot(
     val link: LinkState = LinkState.Idle,
-    val carLife: CarLifeState = CarLifeState.Idle,
     val video: VideoStats = VideoStats(),
     val audio: AudioStats = AudioStats(),
     val shizukuReady: Boolean = false,

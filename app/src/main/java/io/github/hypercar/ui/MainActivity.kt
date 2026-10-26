@@ -311,7 +311,6 @@ private fun MainContent() {
                         onClearLogs = { HyperCarRepo.clearLogs() },
                         onExport = { HyperCarRepo.exportLogs() },
                         onDumpDisplays = { HyperCarRepo.dumpDisplays() },
-                        onDumpCarLifeDiag = { HyperCarRepo.dumpCarLifeDiag() },
                     )
 
                     AppTab.About -> AboutScreen()

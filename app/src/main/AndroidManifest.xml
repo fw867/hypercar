@@ -2,7 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- 网络：车机热点（无外网）+ AirPlay/CarLife 回环 -->
+    <!-- 网络：车机热点（无外网）+ AirPlay 推流 -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
@@ -35,15 +35,12 @@
     <!-- 服务与唤醒 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
-    <!-- 语音助手要供麦（AudioRecord）：Android 14+ 后台录音必须声明 microphone 类型 -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <!-- 语音助手（2026-10-24 起）：CarLife 的语音识别要求「车机」侧提供麦克风数据
-         （VR 通道 VR_MIC_DATA 0x00058001）。本机 HU 就用手机自己的麦克风采，
-         经 nativeSendMic 注入；除此之外不采集任何音频。 -->
+    <!-- 语音助手/音频采集（预留）：本机自采音频供后续推流链路使用，
+         当前仅声明权限，不采集任何音频。 -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
     <uses-feature
@@ -56,17 +53,6 @@
     <!-- Android 11+ 包可见性：探测 Shizuku 服务端 -->
     <queries>
         <package android:name="moe.shizuku.privileged.api" />
-        <!-- CarLife 系 app：Android 11+ 的包可见性限制会让 getPackageInfo 误报「未安装」
-             （2026-10-26 00:34 现场：com.baidu.carlife.xiaomi 明明在 pm list 里，
-             我们却判成未安装，唤醒一路退回 com.miui.carlink）。 -->
-        <package android:name="com.baidu.carlife" />
-        <package android:name="com.baidu.carlife.xiaomi" />
-        <package android:name="com.miui.carlink" />
-        <package android:name="com.xiaomi.carlink" />
-        <package android:name="com.hihonor.carwith" />
-        <intent>
-            <action android:name="com.baidu.carlife.Action.StartWireless" />
-        </intent>
     </queries>
 
     <application
@@ -103,17 +89,15 @@
         <service
             android:name=".autowake.HyperCarService"
             android:exported="false"
-            android:foregroundServiceType="connectedDevice|microphone" />
+            android:foregroundServiceType="connectedDevice" />
 
         <!-- ACL 广播在隐式广播例外清单内，清单静态注册可拉起被杀进程 -->
-        <!-- 调试：adb 广播触发 CarLife 投屏 AIDL 探测（结果写 files/cast_probe.txt） -->
+        <!-- 调试：adb 广播触发连接/断开（无需打开界面） -->
         <receiver
             android:name=".session.DebugProbeReceiver"
             android:exported="true">
             <intent-filter>
-                <action android:name="io.github.hypercar.PROBE_CAST" />
                 <action android:name="io.github.hypercar.PROBE_CONNECT" />
-                <action android:name="io.github.hypercar.PROBE_EXPERIMENT" />
                 <action android:name="io.github.hypercar.PROBE_DISCONNECT" />
             </intent-filter>
         </receiver>

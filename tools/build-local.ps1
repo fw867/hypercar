@@ -136,7 +136,8 @@ if (-not $SkipRust) {
   # ---- PC 侧联调工具：宿主（Windows）构建，产物直接落到 tools\ 供入库/双击 ----
   # 与 Android 的 arm64 交叉编译互不影响（不同 target、不同 CARGO_TARGET_DIR），
   # 放这里是为了「改了 Rust 就不会忘带更新 exe」——之前 el repo 里的 exe 就是这样过期的。
-  if (-not $SkipHub) {
+$hubDir = Join-Path $root 'rust-core\hub'
+if ((-not $SkipHub) -and (Test-Path $hubDir)) {
     Write-Host "`n==> cargo build --release（hub，宿主 Windows）" -ForegroundColor Cyan
     $hubTarget = Join-Path $devtools 'build\hypercar-hub'
     New-Item -ItemType Directory -Force -Path $hubTarget | Out-Null
@@ -159,7 +160,7 @@ if (-not $SkipRust) {
     Copy-Item $hubExe $hubDest -Force
     Write-Host ("hub    : {0:N0} KB  {1}  → tools\hypercar-hub.exe" -f ((Get-Item $hubDest).Length / 1KB), (Get-Item $hubDest).LastWriteTime)
   } else {
-    Write-Host "`n==> 跳过 hub 构建（-SkipHub）" -ForegroundColor Yellow
+    Write-Host "`n==> 跳过 hub 构建（-SkipHub 或 hub 源码已移除）" -ForegroundColor Yellow
   }
 } else {
   Write-Host "`n==> 跳过 Rust（-SkipRust）" -ForegroundColor Yellow

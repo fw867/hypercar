@@ -134,7 +134,7 @@ impl ScreenSender {
         }
     }
 
-    /// 更新画布尺寸（CarLife 手机回报其**实际**编码分辨率时调用）。
+    /// 更新画布尺寸（编码侧回报其**实际**编码分辨率时调用）。
     ///
     /// 车机按 VideoConfig 里的宽高建立解码画布；若与真实码流不一致，画面会被
     /// 拉伸/裁切，触摸坐标也会整体偏移。故以手机实际尺寸为准，而非设置里的值。
@@ -191,7 +191,7 @@ impl ScreenSender {
             return Ok(());
         }
         // 诊断：首次出帧打印 NAL 类型（H.264 应为 7=SPS/8=PPS/5=IDR/1=P）；
-        // 同时守卫 HEVC——CarLife 新版（如 8.8.5）可能改用 H.265，而当前实现只做
+        // 同时守卫 HEVC——编码器若改用 H.265，当前实现只做
         // H.264（avcC+SPS/PPS）。不检测的话表现就是「握手全对、车机一直黑屏」。
         if !self.logged_first_frame {
             self.logged_first_frame = true;
@@ -206,7 +206,7 @@ impl ScreenSender {
             self.logged_hevc = true;
             crate::emit_log(
                 "VIDEO: ⚠ 检测到 H.265/HEVC NAL（32/33/34 或 19/20/21）——当前核心层只支持 H.264，\
-                 画面不会出。请换 CarLife 旧版（≤6.7.2）或 CarWith 的 CarLife 连接（H.264 通路）",
+                 画面不会出。请在设置里改用 H.264 输出（当前只支持 avc）",
             );
         }
         let mut sps: Option<&[u8]> = None;
@@ -435,4 +435,5 @@ pub fn build_avcc(sps: &[u8], pps: &[u8]) -> Vec<u8> {
     avcc.extend_from_slice(pps);
     avcc
 }
+
 

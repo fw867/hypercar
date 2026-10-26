@@ -7,7 +7,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 /**
- * 本机真实蓝牙 MAC 解析（无线 CarPlay/CarLife 协议身份必需）。
+ * 本机真实蓝牙 MAC 解析（无线 CarPlay 协议身份必需）。
  *
  * Android 11+ 应用层调 `BluetoothAdapter.getAddress()` 只会拿到占位 `02:00:00:00:00:00`；
  * 车机会校验协议里的 bluetoothTransportIdentifier 是否与 RFCOMM 对端一致，占位值会被静默丢弃

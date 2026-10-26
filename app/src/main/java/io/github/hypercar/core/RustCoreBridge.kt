@@ -16,29 +16,6 @@ object RustCoreBridge {
         nativeInitLogger()
     }
 
-    // ---- CarLife 原生硬按键码（宝马 iDrive 旋钮/方向盘快捷键 → CarLife 0x68008）----
-    // 对齐 `CarlifeCarHardKeyCode { int32 keycode = 1; }`。**旧值有错**：BACK 曾写成 0x02，
-    // 那其实是电话键；旋钮左右/确认也整体偏了一位（0x1C/0x1D/0x1E → 0x1B/0x1C/0x1D）。
-    // 取值尚未在真车上逐条验证，先与截图/日志里的实际效果对照再定。
-    const val CL_KEY_HOME = 0x01
-    const val CL_KEY_PHONE_CALL = 0x02
-    const val CL_KEY_PHONE_END = 0x03
-    const val CL_KEY_VR_START = 0x09
-    const val CL_KEY_NEXT_SONG = 0x0E
-    const val CL_KEY_PREV_SONG = 0x0F
-    const val CL_KEY_PLAY_PAUSE = 0x10
-    const val CL_KEY_BACK = 0x11
-    const val CL_KEY_DPAD_UP = 0x19
-    const val CL_KEY_DPAD_DOWN = 0x1A
-    const val CL_KEY_KNOB_LEFT = 0x1B
-    const val CL_KEY_KNOB_RIGHT = 0x1C
-    const val CL_KEY_KNOB_SELECT = 0x1D
-
-    /** 触摸动作（**CarLife 语义**：0=DOWN/1=UP/2=MOVE，不是 Android MotionEvent 的 1/2/3）。 */
-    const val TOUCH_DOWN = 0
-    const val TOUCH_UP = 1
-    const val TOUCH_MOVE = 2
-
     /**
      * socket 供给器：Rust 协商过程中需要新开「绑定车机网络」的套接字
      * （事件通道、视频 dataPort、音频 dataPort/controlPort、keepAlive 端口）。
@@ -79,7 +56,7 @@ object RustCoreBridge {
      * 启动全链路网关。
      *
      * @param configJson 引擎配置（见 rust-core/src/engine.rs 的 EngineConfig::from_json）：
-     *   device_id（本机真实蓝牙 MAC）、car_ip、airplay_port、width/height/fps（CarLife 编码分辨率）、
+     *   device_id（本机真实蓝牙 MAC）、car_ip、airplay_port、width/height/fps（屏幕推送分辨率）、
      *   identity_path（ed25519 长期身份落盘路径）、enable_audio、keep_alive_stats…
      * @param controlFd Kotlin 已 connect 到 车机 AirPlay 端口（carNetwork 绑定）的 TCP FD（已 detach）
      * @param socketProvider 后续新端口的 socket 供给
@@ -88,14 +65,14 @@ object RustCoreBridge {
 
     external fun nativeStop()
 
-    /** AirPlay 事件通道解出的车机触摸 → CarLife 0x68001（坐标已在 Rust 侧换算）。 */
-    external fun nativeSendTouch(action: Int, x: Int, y: Int)
+    /** 投喂一帧 H.264（Annex B，本机 MediaCodec 编码输出）。[ptsUs] 为微秒时间戳。 */
+    external fun nativePushVideoFrame(data: ByteArray, ptsUs: Long)
 
-    /** iDrive 旋钮/方向盘媒体键 → CarLife 0x68008 硬按键。 */
-    external fun nativeSendHardKey(carlifeKeyCode: Int)
+    /** 投喂画面新尺寸（对齐 AirPlay VideoConfig）。 */
+    external fun nativeSetVideoSize(width: Int, height: Int)
 
-    /** 手机麦克风 PCM（16kHz 单声道）→ CarLife VR 通道（语音助手用）。 */
-    external fun nativeSendMic(pcm: ShortArray)
+    /** 投喂一包 PCM（16-bit 小端交错；本机采集的音频）。 */
+    external fun nativePushAudioPcm(pcm: ShortArray, rate: Int, channels: Int)
 
     /** Rust 侧是否在运行（诊断）。 */
     external fun nativeIsRunning(): Boolean

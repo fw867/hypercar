@@ -25,8 +25,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.ArrowDropDown
-import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -97,21 +95,13 @@ import io.github.hypercar.ui.theme.TextSecondary
  */
 private val FpsOptions = listOf(30, 60)
 
-private val CarLifePackagePresets = listOf(
-    "百度 CarLife" to "com.baidu.carlife",
-    // 小米定制版 CarLife（HyperOS 预装，包名带 .xiaomi；现场 2026-10-23 实测就是它）
-    "小米 CarLife（定制）" to "com.baidu.carlife.xiaomi",
-    "小米 CarWith" to "com.miui.carlink",
-    "荣耀车联" to "com.hihonor.carlink",
-)
-
 /**
  * 设置页：全部直读直写 [SettingsStore]，改动即时生效（apply() 异步落盘，读路径内存可见）。
  *
  * 排布原则（按"改动频率 × 影响面"自上而下）：
- *   1. **常用**：行为（自动连接/音频）、唤醒包名——装好就要调的；
+ *   1. **常用**：行为（自动连接/音频）——装好就要调的；
  *   2. **一次性配置**：目标车机、权限与系统设置；
- *   3. **高级**（分隔线以下）：编码分辨率（现在是兜底值）、设备身份（蓝牙 MAC）、Shizuku。
+ *   3. **高级**（分隔线以下）：屏幕推送分辨率/帧率（兜底值）、设备身份（蓝牙 MAC）、Shizuku。
  */
 @Composable
 fun SettingsScreen(modifier: Modifier = Modifier, linkConnected: Boolean = false) {
@@ -124,7 +114,6 @@ fun SettingsScreen(modifier: Modifier = Modifier, linkConnected: Boolean = false
     ) {
         // ---- 常用 ----
         BehaviorSection()
-        WakePackageSection()
         // ---- 一次性配置 ----
         HeadUnitSection(connected = linkConnected)
         TargetCarSection()
@@ -294,13 +283,13 @@ private fun ShizukuState.label(): String = when (this) {
 }
 
 private fun ShizukuState.hint(): String = when (this) {
-    ShizukuState.Ready -> "可以静默加入车机热点（不弹系统确认框），也能用 shell 兜底拉起 CarLife。"
+    ShizukuState.Ready -> "可以静默加入车机热点（不弹系统确认框），也能用 shell 执行调试命令。"
     ShizukuState.NotGranted ->
         "点下方按钮会弹出 Shizuku 的授权框；若没弹，请先在 Shizuku 里确认服务已启动。"
     ShizukuState.NotRunning ->
         "需要先打开 Shizuku 并启动服务（无线调试配对，或 root 启动）。"
     ShizukuState.NotInstalled ->
-        "Shizuku 是可选的：装上后能免除每个热点首次的系统确认框，并在包名不对时兜底拉起 CarLife。" +
+        "Shizuku 是可选的：装上后能免除每个热点首次的系统确认框。" +
             "不装也能用；真实蓝牙 MAC 可手动填写，不依赖 Shizuku。"
 }
 
@@ -903,38 +892,12 @@ private fun DialogTextField(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ResolutionSection() {
-    // 分辨率改为自由输入（原三个预设已删除）：编码尺寸随机型而异，
+    // 分辨率改为自由输入（原三个预设已删除）：屏幕尺寸随机型而异，
     // 写死选项反而逼用户改代码。输入即生效，偶数对齐在配置下发前完成。
-    var carlifeOn by rememberSaveable { mutableStateOf(SettingsStore.carlifeEnabled) }
-    var carlifeFirst by rememberSaveable { mutableStateOf(SettingsStore.carlifeFirst) }
-    var widthText by rememberSaveable { mutableStateOf(SettingsStore.carlifeWidth.toString()) }
-    var heightText by rememberSaveable { mutableStateOf(SettingsStore.carlifeHeight.toString()) }
+    var widthText by rememberSaveable { mutableStateOf(SettingsStore.videoWidth.toString()) }
+    var heightText by rememberSaveable { mutableStateOf(SettingsStore.videoHeight.toString()) }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        SectionLabel(text = "CarLife 联动")
-        GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)) {
-            SwitchRow(
-                title = "启用 CarLife 联动",
-                subtitle = "默认关闭。开启后 HyperCar 会拉起 CarLife 并尝试驱动投屏；但小米 CarLife 一激活就会抢占蓝牙，实测会把 CarPlay 的 iAP2 链路顶断。",
-                checked = carlifeOn,
-                onCheckedChange = {
-                    carlifeOn = it
-                    SettingsStore.carlifeEnabled = it
-                    io.github.hypercar.settings.SettingsRevision.bump()
-                },
-            )
-            SwitchRow(
-                title = "CarLife 优先启动（实验）",
-                subtitle = "先拉 CarLife 到前台、等它做完蓝牙初始化，再起 iAP2。CarLife 只有在前台才产视频，" +
-                    "但它一起前台就会抢蓝牙——这个开关用来验证「顺序反转后能否共存」。",
-                checked = carlifeFirst,
-                onCheckedChange = {
-                    carlifeFirst = it
-                    SettingsStore.carlifeFirst = it
-                    io.github.hypercar.settings.SettingsRevision.bump()
-                },
-            )
-        }
-        SectionLabel(text = "CarLife 编码分辨率（兜底值）")
+        SectionLabel(text = "屏幕推送分辨率（兜底值）")
         GlassPanel(
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 16.dp),
         ) {
@@ -955,7 +918,7 @@ private fun ResolutionSection() {
                     value = widthText,
                     onValueChange = { s ->
                         widthText = s.filter { it.isDigit() }.take(5)
-                        widthText.toIntOrNull()?.let { if (it >= 320) SettingsStore.carlifeWidth = it }
+                        widthText.toIntOrNull()?.let { if (it >= 320) SettingsStore.videoWidth = it }
                     },
                     label = { Text("宽", style = MaterialTheme.typography.labelMedium) },
                     singleLine = true,
@@ -966,7 +929,7 @@ private fun ResolutionSection() {
                     value = heightText,
                     onValueChange = { s ->
                         heightText = s.filter { it.isDigit() }.take(5)
-                        heightText.toIntOrNull()?.let { if (it >= 240) SettingsStore.carlifeHeight = it }
+                        heightText.toIntOrNull()?.let { if (it >= 240) SettingsStore.videoHeight = it }
                     },
                     label = { Text("高", style = MaterialTheme.typography.labelMedium) },
                     singleLine = true,
@@ -975,8 +938,8 @@ private fun ResolutionSection() {
                 )
                 TextButton(
                     onClick = {
-                        SettingsStore.carlifeWidth = 2560
-                        SettingsStore.carlifeHeight = 744
+                        SettingsStore.videoWidth = 2560
+                        SettingsStore.videoHeight = 744
                         widthText = "2560"
                         heightText = "744"
                     },
@@ -995,7 +958,7 @@ private fun ResolutionSection() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun FpsSegment() {
-    var fps by rememberSaveable { mutableStateOf(SettingsStore.carlifeFps.coerceIn(30, 60)) }
+    var fps by rememberSaveable { mutableStateOf(SettingsStore.videoFps.coerceIn(30, 60)) }
     Text(
         text = "帧率",
         style = MaterialTheme.typography.bodySmall,
@@ -1008,7 +971,7 @@ private fun FpsSegment() {
                 selected = fps == option,
                 onClick = {
                     fps = option
-                    SettingsStore.carlifeFps = option
+                    SettingsStore.videoFps = option
                 },
                 shape = SegmentedButtonDefaults.itemShape(index = index, count = FpsOptions.size),
                 label = {
@@ -1046,7 +1009,7 @@ private fun BehaviorSection() {
             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
             SwitchRow(
                 title = "音频转发",
-                subtitle = "CarLife 音轨直通 AirPlay 通道",
+                subtitle = "本机音轨直通 AirPlay 通道",
                 checked = enableAudio,
                 onCheckedChange = {
                     enableAudio = it
@@ -1099,140 +1062,6 @@ private fun SwitchRow(
         )
     }
 }
-
-/* ---------- 唤醒包名 ---------- */
-
-@Composable
-private fun WakePackageSection() {
-    var pkg by rememberSaveable { mutableStateOf(SettingsStore.carlifePackage) }
-    var menuExpanded by remember { mutableStateOf(false) }
-    val isPreset = CarLifePackagePresets.any { it.second == pkg }
-    val presetLabel = CarLifePackagePresets.firstOrNull { it.second == pkg }?.first
-
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        SectionLabel(text = "CarLife 唤醒包名")
-        GlassPanel(
-            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
-        ) {
-            Box {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 52.dp)
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(SurfaceInset)
-                        .border(1.dp, StrokeGlass, RoundedCornerShape(14.dp))
-                        .clickable { menuExpanded = true }
-                        .padding(horizontal = 14.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = presetLabel ?: "自定义",
-                            style = MaterialTheme.typography.titleSmall,
-                            color = if (isPreset) TextPrimary else MintGreen,
-                        )
-                        Text(
-                            text = pkg,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = TextSecondary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                    Icon(
-                        imageVector = Icons.Rounded.ArrowDropDown,
-                        contentDescription = "选择包名",
-                        tint = ElectricCyan,
-                    )
-                }
-                DropdownMenu(
-                    expanded = menuExpanded,
-                    onDismissRequest = { menuExpanded = false },
-                    modifier = Modifier
-                        .background(Color(0xF2101826))
-                        .border(1.dp, StrokeGlass, RoundedCornerShape(16.dp)),
-                ) {
-                    CarLifePackagePresets.forEach { (label, packageName) ->
-                        DropdownMenuItem(
-                            text = {
-                                Column {
-                                    Text(label, style = MaterialTheme.typography.titleSmall)
-                                    Text(
-                                        packageName,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = TextSecondary,
-                                    )
-                                }
-                            },
-                            trailingIcon = {
-                                if (pkg == packageName) {
-                                    Icon(
-                                        imageVector = Icons.Rounded.Check,
-                                        contentDescription = "当前",
-                                        tint = ElectricCyan,
-                                    )
-                                }
-                            },
-                            onClick = {
-                                pkg = packageName
-                                SettingsStore.carlifePackage = packageName
-                                menuExpanded = false
-                            },
-                        )
-                    }
-                    HorizontalDivider(color = StrokeGlass.copy(alpha = 0.6f))
-                    DropdownMenuItem(
-                        text = {
-                            Text(
-                                text = "自定义…",
-                                style = MaterialTheme.typography.titleSmall,
-                                color = ElectricCyan,
-                            )
-                        },
-                        onClick = {
-                            pkg = ""
-                            SettingsStore.carlifePackage = ""
-                            menuExpanded = false
-                        },
-                    )
-                }
-            }
-            if (!isPreset) {
-                Spacer(modifier = Modifier.height(12.dp))
-                OutlinedTextField(
-                    value = pkg,
-                    onValueChange = {
-                        pkg = it
-                        SettingsStore.carlifePackage = it
-                    },
-                    label = {
-                        Text("自定义包名", style = MaterialTheme.typography.labelSmall)
-                    },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
-                    shape = RoundedCornerShape(14.dp),
-                    colors = TextFieldDefaults.colors(
-                        focusedContainerColor = SurfaceInset,
-                        unfocusedContainerColor = SurfaceInset,
-                        focusedTextColor = MintGreen,
-                        unfocusedTextColor = MintGreen,
-                        cursorColor = ElectricCyan,
-                        focusedLabelColor = ElectricCyan,
-                        unfocusedLabelColor = TextSecondary,
-                        focusedIndicatorColor = ElectricCyan,
-                        unfocusedIndicatorColor = StrokeGlass,
-                    ),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
-            Spacer(modifier = Modifier.height(6.dp))
-        }
-    }
-}
-
-
-
 
 /** 「3 分钟前」这类相对时间；用于远程车型列表的更新时间提示。 */
 private fun agoText(atMillis: Long): String {
