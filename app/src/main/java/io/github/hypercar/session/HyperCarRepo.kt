@@ -2015,6 +2015,24 @@ object HyperCarRepo {
         val pkg = resolveCarLifePackage()
         _snapshots.value = _snapshots.value.copy(carLife = CarLifeState.Waiting())
 
+        // **没有 Shizuku 也能拉起公版**（2026-10-28）：小米定制版没装时 Shizuku 不是必须的，
+        // 公版 `.CarlifeActivity` 是导出的，普通 `startActivity` 就能起（此刻我们 App 在前台，
+        // 不受后台启动限制）。这条路省掉 Shizuku，直接 return。
+        if (!ShizukuTools.isReady && pkg == "com.baidu.carlife") {
+            val ctx = appContext()
+            val li = ctx?.packageManager?.getLaunchIntentForPackage(pkg)
+            if (li != null) {
+                li.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                runCatching { ctx.startActivity(li) }
+                    .onSuccess { log("WAKE: 无 Shizuku → 直接 startActivity 拉起公版 CarLife") }
+                    .onFailure { log("WAKE: 无 Shizuku 且 startActivity 失败：${it.message}") }
+                carLifeLaunchedAt = SystemClock.uptimeMillis()
+            } else {
+                log("WAKE: ⚠ 公版 CarLife 没有可启动的 Activity（安装不完整？）")
+            }
+            return
+        }
+
         // 小米这套有两个进程会互相打架：CarWith（com.miui.carlink）收到唤醒广播后会自己
         // 启动一份 CarLife，而 CarLife 有"单实例"逻辑（ProcessUtil.killAllProcess）。
         // 2026-10-26 00:45 现场：我们用 `am start` 拉起的那份已经握手到 Phase 7，
@@ -2598,26 +2616,36 @@ object HyperCarRepo {
         val pm = context.packageManager
         fun installed(p: String) = runCatching { pm.getPackageInfo(p, 0) }.isSuccess
         val hasPublic = installed("com.baidu.carlife")
+        // 小米定制版**不是系统预装**：只有用户用过 CarWith 的 CarLife 模式才会被装上。
+        // 它没装时我们不 need 冻结谁，Shizuku 也就不再是必须的（拉起公版 Activity 用普通
+        // startActivity 即可，公版的 `.CarlifeActivity` 是导出的）。
         val hasXiaomi = installed("com.baidu.carlife.xiaomi")
         val shizukuOk = ShizukuTools.isReady
-        if (shizukuOk && hasPublic) {
+        // 只有"装了小米版"才必须 Shizuku：要靠它 `pm disable-user` 冻结，否则 CarWith 会不停
+        // 把小米版拉起来抢 7240（见 §27）。
+        val needShizuku = hasXiaomi
+        if (hasPublic && (shizukuOk || !needShizuku)) {
             log(
-                "ENV: ✓ 环境就绪（Shizuku 已启用 + 公版 CarLife" +
-                    (if (hasXiaomi) "；小米定制版会被自动冻结）" else "）"),
+                "ENV: ✓ 环境就绪（公版 CarLife" +
+                    when {
+                        !hasXiaomi && !shizukuOk -> "；未装小米定制版，无需 Shizuku"
+                        !hasXiaomi -> "；未装小米定制版"
+                        else -> "；Shizuku 已启用，小米定制版会被自动冻结"
+                    } + "）",
             )
             return true
         }
         val missing = buildList {
-            if (!shizukuOk) add("Shizuku 未启用")
             if (!hasPublic) add("未安装公版 CarLife（com.baidu.carlife）")
+            if (!shizukuOk && needShizuku) add("Shizuku 未启用（装了小米定制版，需要它冻结）")
         }.joinToString("、")
         val reason = "环境未就绪：$missing。" +
-            if (!shizukuOk && !hasPublic) {
-                "请先启动 Shizuku 并在设置里授予权限，再到应用宝安装「百度 CarLife+」公版。"
-            } else if (!shizukuOk) {
-                "请先启动 Shizuku（设置 → Shizuku 状态 → 启动）。当前版本靠它冻结小米定制版并拉起公版界面。"
-            } else {
-                "请安装公版「百度 CarLife+」（应用宝搜 CarLife）。小米定制版无法得到原生车机界面。"
+            when {
+                !hasPublic && !shizukuOk && needShizuku ->
+                    "请到应用宝安装「百度 CarLife+」公版，并启动 Shizuku（装了小米定制版需要它冻结）。"
+                !hasPublic -> "请到应用宝安装「百度 CarLife+」公版（小米定制版没有原生车机界面）。"
+                else -> "请先启动 Shizuku（设置 → Shizuku 状态 → 启动）——装了小米定制版 CarLife，" +
+                    "需要它来冻结，否则 CarWith 会不停把它拉起来抢 7240。"
             }
         log("ENV: ✗ $reason")
         fail(reason)

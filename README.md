@@ -17,7 +17,7 @@
 
 | 条件 | 为什么必须 | 缺失时 |
 |---|---|---|
-| **Shizuku 已启动并授权** | 只有 shell 身份能做三件事：① `pm disable-user com.baidu.carlife.xiaomi` 冻结小米定制版（否则 CarWith 会不停把它拉起来、抢走 7240，公版永远拿不到会话 → 母帧/闪屏）；② `am start` 拉起公版 CarLife 的 Activity（它的 `Presentation` 必须挂在 Activity 上）；③ 静默入网 / 读取真实蓝牙 MAC | 日志 `ENV: ✗ 环境未就绪：Shizuku 未启用…`，连接直接不开始 |
+| **Shizuku 已启动并授权**（**仅当装了小米定制版 CarLife 时必需**：它只管冻结小米版；没装小米版时会自动跳过，用普通 startActivity 拉起公版） | 只有 shell 身份能做三件事：① `pm disable-user com.baidu.carlife.xiaomi` 冻结小米定制版（否则 CarWith 会不停把它拉起来、抢走 7240，公版永远拿不到会话 → 母帧/闪屏）；② `am start` 拉起公版 CarLife 的 Activity（它的 `Presentation` 必须挂在 Activity 上）；③ 静默入网 / 读取真实蓝牙 MAC | 日志 `ENV: ✗ 环境未就绪：Shizuku 未启用…`，连接直接不开始 |
 | **已安装公版「百度 CarLife+」**（`com.baidu.carlife`，应用宝可下） | 只有公版会自己渲染车机界面（见上）；小米定制版没有原生界面 | 日志 `ENV: ✗ 环境未就绪：未安装公版 CarLife…`，连接直接不开始 |
 
 - 小米定制版可以存在（系统预装），程序在会话开始时**自动冻结它**、断开时**自动恢复**
