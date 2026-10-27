@@ -44,6 +44,9 @@ const SYNC_PACKET_LEN: usize = 20;
 
 /// CarPlay 音频发送器：RTP over UDP，ChaCha20-Poly1305 密封。
 pub struct AudioOut {
+    /// **跨批次的余数缓冲**：CarLife 的 MEDIA/TTS 数据块长度与 352 帧不对齐，chunks_exact 会把
+    /// 每块的尾巴丢掉 → 丢样本=卡顿/破音，还可能把左右声道切错位（听起来像单声道）。
+    carry: Vec<i16>,
     /** 音频数据报套接字（调用方 connect 好到车机 dataPort）。 */
     udp: UdpSocket,
     /** 同步包套接字（调用方 connect 好到车机 controlPort；车机没下发时为 None）。 */
@@ -85,6 +88,7 @@ impl AudioOut {
             packets: 0,
             sync_seq: 0,
             marker_pending: true,
+            carry: Vec::new(),
         }
     }
 
@@ -97,7 +101,13 @@ impl AudioOut {
     /// AAC 通路不换序（比特流语义），本项目只走 PCM 故恒换序。
     pub async fn send_pcm(&mut self, frames: &[i16]) -> std::io::Result<()> {
         let samples_per_packet = SAMPLES_PER_PACKET * CHANNELS;
-        for chunk in frames.chunks_exact(samples_per_packet) {
+        // 先并入上一批余数，攒够整包才发（余数留到下一次）：
+        // CarLife 的 MEDIA/TTS 数据块长度与 352 帧不对齐，`chunks_exact` 会丢掉每块尾巴 →
+        // 丢样本=卡顿/破音，还可能把左右声道切错位（听起来像单声道）。
+        self.carry.extend_from_slice(frames);
+        let ready = self.carry.len() / samples_per_packet * samples_per_packet;
+        let pending: Vec<i16> = self.carry.drain(..ready).collect();
+        for chunk in pending.chunks_exact(samples_per_packet) {
             // PCM 负载（交错立体声 16bit **BE**）
             let mut payload = Vec::with_capacity(samples_per_packet * 2);
             for sample in chunk {

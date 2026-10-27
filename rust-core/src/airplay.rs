@@ -1,4 +1,4 @@
-﻿//! AirPlay 发送端会话（协商整体下沉 Rust —— 与参考文档的关键差异，见 docs/NEGOTIATION-GAPS.md）。
+//! AirPlay 发送端会话（协商整体下沉 Rust —— 与参考文档的关键差异，见 docs/NEGOTIATION-GAPS.md）。
 //!
 //! 流程（cardeck 真车验证的顺序，Audi MIB3 / BMW iD8.5 通用骨架）：
 //!  1. `GET /info`（带空 bplist 体 + plist Content-Type，老固件对缺体的 /info 回 400/455）
@@ -277,15 +277,26 @@ pub async fn negotiate(
     // 车机要把小画面拉伸整屏（发虚），所以这里直接改成车机原生尺寸。
     if disp_w >= 320 && disp_h >= 240 {
         let target = (even(disp_w.max(2)), even(disp_h.max(2)));
+        let prev = *p.encoder_size.lock();
         *p.encoder_size.lock() = target;
         emit_log(&format!(
-            "AIRPLAY: 车机实际 {}x{} → 请求 CarLife 按 {}x{} 编码（设置值 {}x{} 仅作兜底）",
+            "AIRPLAY: 分辨率来源 = 车机下发（/info {}x{}）→ 请求 CarLife 按 {}x{} 编码；App 设置 {}x{} 仅兜底",
             disp_w, disp_h, target.0, target.1, p.width, p.height
         ));
+        if prev != target {
+            // CarLife 的 VIDEO_ENCODER_INIT 可能已经用旧尺寸发过（握手先后不定），
+            // 两边暂时不一致。不必干预：真帧到达时会按它自己的 SPS/PPS 重发 VideoConfig
+            // 并 set_size，车机最终按实际编码尺寸解码（见 engine.rs「按真帧重发」）。
+            emit_log(&format!(
+                "AIRPLAY: ⚠ 尺寸 {}x{} → {}x{}（若 CarLife 已按旧尺寸起编，以首帧 SPS 为准自动纠正）",
+                prev.0, prev.1, target.0, target.1
+            ));
+        }
     } else {
+        // 车机没下发分辨率（DiPlay / WinPlay 这类 `/info` 固定报 0x0）→ **用 App 设置兜底**。
         emit_log(&format!(
-            "AIRPLAY: /info 未提供有效显示器尺寸（{disp_w}x{disp_h}），沿用设置 {}x{}",
-            p.width, p.height
+            "AIRPLAY: 分辨率来源 = App 设置兜底（/info 报 {}x{}，无效）→ 请求 CarLife 按 {}x{} 编码",
+            disp_w, disp_h, p.width, p.height
         ));
     }
 
@@ -429,31 +440,16 @@ pub async fn negotiate(
     emit_log(&format!(
         "AIRPLAY: ✓ 主屏流就绪 dataPort={data_port} connId={conn_id_screen} {enc_w}x{enc_h}"
     ));
-    // 屏幕流一建好就发**待机卡片**（真有画面，车机不再黑屏），避免车机 1.5s 收不到数据就拆通道。
-    // 素材是母版分辨率（1280x372 宽屏 / 1280x720 16:9），VideoConfig 按母版尺寸下发，车机放大到全屏。
-    let mut screen = screen;
-    match standby_for_aspect(enc_w, enc_h) {
-        Some(set) => {
-            screen.set_size(set.width, set.height);
-            if let Some(first) = set.frames.first() {
-                let nals = crate::screen::annexb_nals(first);
-                let sps = nals.iter().find(|n| crate::screen::nal_type(n) == 7).copied();
-                let pps = nals.iter().find(|n| crate::screen::nal_type(n) == 8).copied();
-                if let (Some(sps), Some(pps)) = (sps, pps) {
-                    let avcc = crate::screen::build_avcc(sps, pps);
-                    let cfg_ok = screen.send_config(&avcc).await.is_ok();
-                    let frame_ok = screen.send_video_annexb(first, 0).await.is_ok();
-                    emit_log(&format!(
-                        "AIRPLAY: 已发送待机卡片母版 {}x{}（config={cfg_ok} idr={frame_ok}，{} 帧素材）——车机不再黑屏",
-                        set.width, set.height, set.frames.len()
-                    ));
-                } else {
-                    emit_log("AIRPLAY: ⚠ 待机素材缺少 SPS/PPS——跳过卡片");
-                }
-            }
-        }
-        None => emit_log("AIRPLAY: 没有匹配宽高比的待机素材——跳过卡片"),
-    }
+    // **不再在这里立刻发待机卡片**（2026-10-27 23:2x）：
+    // 卡片素材是母版分辨率（1280x372 / 1280x720），立刻发就得把画布从目标尺寸
+    // （如 2400x1080）改成母版尺寸、真帧来了再改回来 —— 日志里就是一抖
+    // `2400x1080 → 1280x720 → 2400x1088`，也是早期"母帧"问题的温床。
+    // 现在交给 engine 的视频泵延时兜底：**1.2 秒内收到真帧就完全不发卡片**；
+    // 只有真的没画面时才切母版发卡片（保证车机不黑屏、不拆通道）。
+    let screen = screen;
+    emit_log(&format!(
+        "AIRPLAY: 待机卡片延后（画布保持 {enc_w}x{enc_h}；1.2s 内来真帧就不发，避免尺寸抖动）"
+    ));
 
 
     // ---- 7. （音频挪到 RECORD 之后，见第 8 步）----

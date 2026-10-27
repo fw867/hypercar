@@ -1,4 +1,4 @@
-﻿//! CarLife HU（车机）侧网关——严格按 CarLifeWirelessBox / apollo-DuerOS 的 HU 实现重构。
+//! CarLife HU（车机）侧网关——严格按 CarLifeWirelessBox / apollo-DuerOS 的 HU 实现重构。
 //!
 //! 我们扮演「车机」，本机 CarLife / CarWith(CarLife 兼容) / 荣耀车联 作为「手机(MD)」连回
 //! 127.0.0.1 的一组标准端口。
@@ -1359,6 +1359,7 @@ async fn handle_media_client(
                 },
                 MediaKind::Media | MediaKind::Tts => {
                     let tts = matches!(kind, MediaKind::Tts);
+                    let mut media_probe: u32 = 0;
                     match service_type {
                         MEDIA_INIT | TTS_INIT => {
                             let (r, c) = parse_audio_init(&payload);
@@ -1382,13 +1383,51 @@ async fn handle_media_client(
                             let _ = events.send(CarLifeEvent::AudioStop { tts });
                         }
                         MEDIA_DATA | TTS_DATA => {
+                            // **一次性取证**：CarLife 的 MEDIA 负载可能带 PCM 包头（SDK 里就有
+                            // `makePCMPackageHead`）。16bit 立体声每样本帧 4 字节，若长度不是 4 的
+                            // 整数倍，几乎可以断定包头混进了 PCM —— 车机听到的"破音"就是它。
+                            if !tts && media_probe < 3 {
+                                media_probe += 1;
+                                let head: Vec<String> = payload
+                                    .iter()
+                                    .take(16)
+                                    .map(|b| format!("{b:02X}"))
+                                    .collect();
+                                emit_log(&format!(
+                                    "CARLIFE: MEDIA 负载 {}B（%4={}）头: {}",
+                                    payload.len(),
+                                    payload.len() % 4,
+                                    head.join(" ")
+                                ));
+                            }
                             if !payload.is_empty() {
-                                let _ = events.send(CarLifeEvent::AudioData {
-                                    tts,
-                                    rate,
-                                    channels,
-                                    data: payload,
-                                });
+                                // **剥掉 12 字节 PCM 包头**（2026-10-27 23:56 定案）：
+                                // 反编译 `PCMPackageHead` 明确 mMediaHeadLen=12/mTTSHeadLen=12，
+                                // 布局 [0..4]=dataLen(BE) [4..8]=timeStamp(BE) [8..12]=type(BE)。
+                                // 现场取证 `00 00 00 00 00 00 00 00 01 00 00 00` 正是 type=1 的包头；
+                                // 不剥掉就会被当样本播 → 每包一次"咔"（破音）。
+                                let pcm: &[u8] = if payload.len() >= 12 + 4
+                                    && (payload.len() - 12) % 4 == 0
+                                    && payload.len() % 4 != 0
+                                {
+                                    &payload[12..]
+                                } else if payload.len() >= 12
+                                    && (payload.len() - 12) % 4 == 0
+                                    && payload[8..12] == [0, 0, 0, 1]
+                                {
+                                    // 兜底：长度凑巧也是 4 的倍数，但 type 字段是 1（MEDIA 数据类型）
+                                    &payload[12..]
+                                } else {
+                                    payload.as_slice()
+                                };
+                                if !pcm.is_empty() {
+                                    let _ = events.send(CarLifeEvent::AudioData {
+                                        tts,
+                                        rate,
+                                        channels,
+                                        data: pcm.to_vec(),
+                                    });
+                                }
                             }
                         }
                         other => {

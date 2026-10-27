@@ -1,4 +1,4 @@
-﻿//! 网关引擎编排：CarLife 回环 ⇄ AirPlay 推流 的粘合层。
+//! 网关引擎编排：CarLife 回环 ⇄ AirPlay 推流 的粘合层。
 //!
 //! 数据面（全部零转码）：
 //!  - 视频：CarLife 8240 的 H.264 Annex B 裸流 → ScreenSender（128B 头 + ChaCha20-Poly1305）
@@ -257,6 +257,8 @@ pub async fn run_engine(
             // 缓存的真帧 SPS/PPS（屏幕流就绪前收到的帧被丢弃，但参数要留下）
             let mut cached_sps: Option<Vec<u8>> = None;
             let mut cached_pps: Option<Vec<u8>> = None;
+            // 屏幕流就绪时刻（待机卡片的 1.2s 宽限从此刻算起）
+            let mut stream_ready_at: Option<std::time::Instant> = None;
             let mut last_real_frame: Option<std::time::Instant> = None;
             let mut standby_idx: usize = 0;
             let mut standby_size_sent: Option<(u32, u32)> = None;
@@ -279,6 +281,9 @@ pub async fn run_engine(
                                 s.set_size(w, h);
                             }
                             sender = Some(s);
+                            // 记录屏幕流就绪时刻：待机卡片要延后 1.2s 才考虑，
+                            // 否则会把画布从目标尺寸切到母版尺寸（真帧来了再切回来）→ 尺寸抖动。
+                            stream_ready_at = Some(std::time::Instant::now());
                         }
                         ready = None;
                     }
@@ -344,9 +349,14 @@ pub async fn run_engine(
                             let _ = s.maybe_send_keep_alive().await;
                             // CarLife 还没推流 → 按 ~60fps 播放待机循环（1 IDR + 59 个极小 P 帧）。
                             // 真帧到达后自动停用（1s 内有过真帧就不再插卡片）。
-                            // 只在"从未收到过真帧"时插待机卡片：
-                            // 真帧一旦来过就不再插，否则会和真帧的画布尺寸来回抖（车机解码器反复重建 → 一直是母帧）
-                            let stale = last_real_frame.is_none();
+                            // 只在"从未收到过真帧、且屏幕流就绪已超过 1.2s"时插待机卡片：
+                            //  · 真帧一来就永久停用，否则与真帧画布尺寸来回抖（解码器反复重建 → 母帧）；
+                            //  · 1.2s 宽限是为了**根本不发卡片**——CarLife 正常 0.3s 内就出帧，
+                            //    这样画布始终停在目标尺寸，日志也不会出现 2400x1080→1280x720→2400x1088 的抖动。
+                            let stale = last_real_frame.is_none()
+                                && stream_ready_at
+                                    .map(|t| t.elapsed() >= Duration::from_millis(1200))
+                                    .unwrap_or(false);
                             if stale {
                                 let (w, h) = s.size();
                                 if let Some(set) =
@@ -444,6 +454,8 @@ pub async fn run_engine(
             let mut sent_packets: u64 = 0;
             let mut rate_mark = std::time::Instant::now();
             let mut mixed = vec![0i16; SPF * 2];
+            // 抗抖动预缓冲状态：false = 正在攒数据（发静音），true = 正在播放
+            let mut audio_started = false;
             loop {
                 tokio::select! {
                     _ = stop_a.notified() => return,
@@ -495,12 +507,29 @@ pub async fn run_engine(
                         let target = if duck_hold > 0 { 0.25f32 } else { 1.0f32 };
                         gain += (target - gain) * 0.15;
 
+                        // **抗抖动预缓冲**（2026-10-28 00:00）：CarLife 的 PCM 是突发到达的
+                        // （一次 4096B ≈ 21ms），边到边播会让队列周期性见底 → 车机端欠载 =
+                        // "稍微有点卡"。做法：
+                        //   · 队列攒够 ~40ms 才开始消费（prebuf）；
+                        //   · 播放中掉到 ~10ms 以下 → 回到"重新攒"状态（继续发静音，不消耗）；
+                        // 发送节奏本来就是每 tick 一包（7.33ms），等于给接收端一个稳定流。
+                        const SAMPLES_PER_MS: usize = (TARGET_RATE as usize / 1000) * 2; // 立体声
+                        let prebuf = 40 * SAMPLES_PER_MS;
+                        let low_water = 10 * SAMPLES_PER_MS;
+                        if !audio_started {
+                            if media_mix.len() >= prebuf {
+                                audio_started = true;
+                            }
+                        } else if media_mix.len() < low_water && tts_mix.is_empty() {
+                            audio_started = false;
+                        }
+
                         for i in 0..SPF {
                             // 混音队列里是**交错立体声**（push_resampled 每帧压 L、R 两个样本）。
                             // 之前每帧只取一个样本再左右都填它——只消费了一半数据、还把立体声
                             // 压成单声道，听感就是沙沙声 + 断续（现场 2026-10-23 23:10 定位）。
-                            let ml = take_or_zero(&mut media_mix);
-                            let mr = take_or_zero(&mut media_mix);
+                            let ml = if audio_started { take_or_zero(&mut media_mix) } else { 0 };
+                            let mr = if audio_started { take_or_zero(&mut media_mix) } else { 0 };
                             let tl = take_or_zero(&mut tts_mix);
                             let tr = take_or_zero(&mut tts_mix);
                             let l = (ml as f32 * gain) as i32 + tl as i32;

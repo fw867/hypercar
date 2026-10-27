@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.ui.components
+package io.github.hypercar.ui.components
 
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.LinearEasing
@@ -23,6 +23,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Bluetooth
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.ExitToApp
 import androidx.compose.material.icons.rounded.DirectionsCar
 import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material.icons.rounded.Refresh
@@ -75,6 +76,8 @@ fun StatusHeroCard(
     link: LinkState,
     onStartClick: () -> Unit,
     onStopClick: () -> Unit,
+    /** 「退出」：断开 + 停后台循环 + 恢复冻结的小米 CarLife（默认空实现，兼容旧调用）。 */
+    onExitClick: () -> Unit = {},
     /** 右上角日志图标（原来首页底部那行「查看全部日志」文字链接）。 */
     onOpenLogs: (() -> Unit)? = null,
     /** 当前车机档案名（显示在标题上方，小字）。 */
@@ -113,7 +116,12 @@ fun StatusHeroCard(
                 ) { state ->
                     HeroHeadline(link = state, nowMillis = nowMillis, profileLabel = profileLabel)
                 }
-                HeroAction(link = link, onStartClick = onStartClick, onStopClick = onStopClick)
+                HeroAction(
+                    link = link,
+                    onStartClick = onStartClick,
+                    onStopClick = onStopClick,
+                    onExitClick = onExitClick,
+                )
             }
             if (onOpenLogs != null) {
                 Text(
@@ -438,20 +446,33 @@ private fun HeroAction(
     link: LinkState,
     onStartClick: () -> Unit,
     onStopClick: () -> Unit,
+    onExitClick: () -> Unit = {},
 ) {
     val buttonModifier = Modifier
         .fillMaxWidth()
         .height(52.dp)
     when (link) {
-        is LinkState.Connected -> CapsuleButton(
-            text = "断开",
-            onClick = onStopClick,
-            modifier = buttonModifier,
-            filled = false,
-            contentColor = CoralError,
-            borderColor = CoralError.copy(alpha = 0.65f),
-            leadingIcon = Icons.Rounded.Close,
-        )
+        is LinkState.Connected -> Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            CapsuleButton(
+                text = "断开",
+                onClick = onStopClick,
+                modifier = buttonModifier,
+                filled = false,
+                contentColor = CoralError,
+                borderColor = CoralError.copy(alpha = 0.65f),
+                leadingIcon = Icons.Rounded.Close,
+            )
+            // **退出**：断开 + 停掉所有后台循环 + 恢复被冻结的小米 CarLife（之后能去连 CarWith 盒子）。
+            CapsuleButton(
+                text = "退出",
+                onClick = onExitClick,
+                modifier = buttonModifier,
+                filled = false,
+                contentColor = Color(0xFF9AA4B2),
+                borderColor = Color(0xFF9AA4B2).copy(alpha = 0.45f),
+                leadingIcon = Icons.Rounded.ExitToApp,
+            )
+        }
 
         is LinkState.Negotiating -> CapsuleButton(
             text = "停止",

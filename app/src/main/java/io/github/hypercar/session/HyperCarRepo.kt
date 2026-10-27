@@ -429,6 +429,43 @@ object HyperCarRepo {
         connectJob = scope.launch { runConnect(context.applicationContext) }
     }
 
+    /**
+     * **彻底退出**（UI 上的「退出」按钮）：断开 + 停掉所有后台循环 + 恢复小米版 + 停前台服务。
+     *
+     * 与 [disconnect] 的区别：
+     *  · [disconnect] 只停这一轮会话，App 仍在后台待命（保留冻结的小米版，方便随时再连）；
+     *  · [shutdown] 是"我用完了"：**解除冻结**（让用户能去连 CarWith 盒子）、
+     *    `nativeStop` 让 Rust 侧所有 CarLife/视频重连循环随之退出（不再反复唤醒 CarLife）、
+     *    停掉前台服务。
+     */
+    fun shutdown(context: Context) {
+        log("EXIT: 用户点击退出——断开 + 停后台循环 + 恢复小米版 CarLife")
+        userDisconnectRequested = true
+        reconnectJob?.cancel()
+        reconnectJob = null
+        connectJob?.cancel()
+        connectJob = null
+        runCatching { RustCoreBridge.nativeStop() }
+        runCatching { io.github.hypercar.carlife.CastDisplay.release() }
+        runCatching { iap2?.stop() }
+        iap2 = null
+        runCatching { ctrlAdvertiser?.stop() }
+        ctrlAdvertiser = null
+        runCatching { wifiJoiner?.release() }
+        wifiJoiner = null
+        streaming = false
+        connecting = false
+        stopVoiceMic()
+        // 恢复小米版：退出后用户可能要去连 CarWith 盒子
+        unfreezeXiaomiCarLifeIfNeeded()
+        // 停前台服务（它的看门狗/监听不再需要）
+        runCatching {
+            context.stopService(android.content.Intent(context, HyperCarService::class.java))
+        }
+        push(link = LinkState.Idle)
+        log("EXIT: 已退出（Rust 引擎已停、小米版已恢复、前台服务已停）")
+    }
+
     fun disconnect() {
         // CARLIFE-ONLY（调试）模式没走状态机，必须在这里显式收尾，否则界面永远停在"协商中"
         if (carLifeOnlyMode) {
@@ -925,18 +962,22 @@ object HyperCarRepo {
     private fun scheduleAutoReconnect(reason: String, hadLink: Boolean) {
         if (!hadLink) {
             log("RECONNECT: 本次会话没建立过链路（$reason）——不自动重连")
+            unfreezeXiaomiCarLifeIfNeeded()   // 不再重连 = 小米版不再需要保持冻结
             return
         }
         if (userDisconnectRequested) {
             log("RECONNECT: 用户主动断开——不自动重连")
+            unfreezeXiaomiCarLifeIfNeeded()
             return
         }
         if (!SettingsStore.autoConnect) {
             log("RECONNECT: 「上车自动连接」关着——不自动重连")
+            unfreezeXiaomiCarLifeIfNeeded()
             return
         }
         if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
             log("RECONNECT: 已连续失败 $reconnectAttempts 次——停止自动重连，等车机重新连入")
+            unfreezeXiaomiCarLifeIfNeeded()
             return
         }
         val ctx = appContext() ?: return
@@ -967,9 +1008,12 @@ object HyperCarRepo {
      */
     private fun releaseSessionResources() {
         runCatching { io.github.hypercar.carlife.CastDisplay.release() }
-        // **恢复被冻结的小米定制版 CarLife**：冻结是为了本次会话独占 7240（见 §27），
-        // 但小米版是用户"连 CarWith 盒子"时的必需品——不恢复的话断开后盒子就连不上了。
-        unfreezeXiaomiCarLifeIfNeeded()
+        // **冻结/恢复小米定制版：只在"连接周期"结束时恢复一次**（2026-10-27 23:3x）。
+        // 之前每次掉线都 `pm enable`，CarWith 立刻把小米版拉起来跟公版抢 7240，
+        // 自动重连那一轮就必然撞车。现在：
+        //   · 掉线（还要自动重连）→ **保持冻结**，别让 CarWith 插手；
+        //   · 用户主动断开 / 不再重连 → 在 scheduleAutoReconnect 的退出分支里恢复。
+        if (userDisconnectRequested) unfreezeXiaomiCarLifeIfNeeded()
         val wasDialMode = carLifeDialMode
         carLifeDialMode = false
         sessionMdHost = null
@@ -984,7 +1028,18 @@ object HyperCarRepo {
         carLifeLaunchedAt = 0L
         // Rust 引擎停了之后清理本机 CarLife：否则它会留下"半死空壳"（7240 还占着、
         // 内部状态机停在上一轮 Phase 7），下次上车连上去永远不回 Phase 1。
-        stopLocalCarLife(wasDialMode)
+        //
+        // **例外（2026-10-27 23:3x）**：公版 CarLife 自渲染时，**对端断开/自动重连不要杀它**。
+        // 自动重连只等 1s，而 CarLife 冷启动要 3~8s：杀掉之后那一轮必然
+        // `7240/8240/9240 Connection refused`，三条通道各自每秒重连刷屏 —— 用户感受就是"连不稳"。
+        // 只有用户主动点「断开」时才真正停掉它（那次不会再自动重连）。
+        val autoReconnectPending = !userDisconnectRequested
+        val publicCarLife = resolveCastHostCarLifePackage() == "com.baidu.carlife"
+        if (autoReconnectPending && publicCarLife && wasDialMode) {
+            log("CARLIFE: 保留公版 CarLife 进程（自动重连要接上它；用户主动断开时才停）")
+        } else {
+            stopLocalCarLife(wasDialMode)
+        }
         runCatching { iap2?.stop() }
         iap2 = null
         runCatching { ctrlAdvertiser?.stop() }
@@ -1802,14 +1857,50 @@ object HyperCarRepo {
             log("WAKE: ⚠ Shizuku 未就绪，无法冻结小米版 CarLife（它可能抢占 7240）")
             return
         }
+        // 先看小米版此刻是不是活着（用户断开后 CarWith 会把它拉起来占 7240）
+        val xiaomiWasAlive = runCatching {
+            ShizukuTools.exec("pidof com.baidu.carlife.xiaomi", 4_000)
+        }.getOrNull()?.out?.isNotBlank() == true
+        // **每次连接都检查一次冻结状态**（用户可能手动 pm enable 过、或退出按钮恢复过）：
+        // `pm list packages -d` 列出本用户被禁用的包，命中 = 已冻结（disabled-user）。
+        val alreadyFrozen = runCatching {
+            ShizukuTools.exec("pm list packages -d --user 0", 4_000)
+        }.getOrNull()?.out?.contains("com.baidu.carlife.xiaomi") == true
+        log(
+            "WAKE: 连接前检查小米版 = ${if (alreadyFrozen) "已冻结(disabled-user)" else "未冻结"}；" +
+                "进程=${if (xiaomiWasAlive) "在跑（可能占着 7240）" else "未运行"}",
+        )
         val st = runCatching {
             ShizukuTools.exec("pm disable-user --user 0 com.baidu.carlife.xiaomi", 8_000)
         }.getOrNull()
         val ok = st != null && st.code == 0
         if (ok) microXiaomiFrozen = true
-        log("WAKE: 冻结小米版 CarLife exit=${st?.code} " +
-            st?.out?.lineSequence()?.firstOrNull().orEmpty().take(80))
+        log("WAKE: 冻结小米版 CarLife exit=${st?.code}（此前是否在跑=$xiaomiWasAlive）" +
+            st?.out?.lineSequence()?.firstOrNull().orEmpty().take(60))
         runCatching { ShizukuTools.exec("am force-stop com.baidu.carlife.xiaomi", 5_000) }
+        // 复核：确保真的冻上了（否则后面必然被抢 7240）
+        val frozenNow = runCatching {
+            ShizukuTools.exec("pm list packages -d --user 0", 4_000)
+        }.getOrNull()?.out?.contains("com.baidu.carlife.xiaomi") == true
+        log("WAKE: 冻结复核 = ${if (frozenNow) "✓ 小米版已禁用" else "✗ 仍未禁用（CarWith 可能抢 7240）"}")
+
+        // **端口收权**：如果小米版刚才占着 7240（比如用户断开后 CarWith 拉起了它），
+        // 光冻结/force-stop 之后端口可能还没释放，而我们下一行 isLocalPortListening()
+        // 会误判成"CarLife 已在监听"→ 跳过拉起 → 去跟一个已经死掉的实例握手。
+        // 所以这里把**公版也重启一遍**，并等到 7240 真正空闲，确保 7240 的持有者
+        // 一定是我们随后拉起的那一个公版进程。
+        if (xiaomiWasAlive || isLocalPortListening(CARLIFE_CMD_PORT)) {
+            log("WAKE: 7240 被占用（小米版/旧实例）→ 一并重启公版 CarLife，把端口拿回来")
+            runCatching { ShizukuTools.exec("am force-stop com.baidu.carlife", 5_000) }
+            for (i in 0 until 15) {
+                if (!isLocalPortListening(CARLIFE_CMD_PORT)) break
+                delay(400)
+            }
+            log(
+                "WAKE: 7240 " +
+                    if (isLocalPortListening(CARLIFE_CMD_PORT)) "仍被占用（继续，可能连错实例）" else "已空闲，准备拉起公版",
+            )
+        }
     }
 
     /**

@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.ui.screens
+package io.github.hypercar.ui.screens
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -51,6 +51,8 @@ fun HomeScreen(
     snapshot: SessionSnapshot,
     onStart: () -> Unit,
     onStop: () -> Unit,
+    /** 「退出」：断开 + 停后台循环 + 恢复小米 CarLife。 */
+    onExit: () -> Unit = {},
     onOpenDiagnostics: () -> Unit,
     onRequestDegradedPermission: () -> Unit,
     permissions: PermissionSummary,
@@ -96,6 +98,7 @@ fun HomeScreen(
                         link = snapshot.link,
                         onStartClick = onStart,
                         onStopClick = onStop,
+                        onExitClick = onExit,
                         onOpenLogs = onOpenDiagnostics,
                         profileLabel = io.github.hypercar.headunit.HeadUnitProfiles.current().label,
                     )
@@ -131,6 +134,7 @@ fun HomeScreen(
                     link = snapshot.link,
                     onStartClick = onStart,
                     onStopClick = onStop,
+                    onExitClick = onExit,
                     onOpenLogs = onOpenDiagnostics,
                         profileLabel = io.github.hypercar.headunit.HeadUnitProfiles.current().label,
                 )

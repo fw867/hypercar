@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.ui
+package io.github.hypercar.ui
 
 import android.content.Intent
 import android.net.Uri
@@ -274,6 +274,7 @@ private fun MainContent() {
                         snapshot = snapshot,
                         onStart = { HyperCarRepo.connect(context) },
                         onStop = { HyperCarRepo.disconnect() },
+                        onExit = { HyperCarRepo.shutdown(context) },
                         onOpenDiagnostics = { tabIndex = AppTab.Diagnostics.ordinal },
                         onRequestDegradedPermission = {
                             permissionLauncher.launch(HyperCarRepo.degradedPermissionsToRequest())
