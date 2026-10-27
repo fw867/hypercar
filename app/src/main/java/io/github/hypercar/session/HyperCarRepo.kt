@@ -1930,10 +1930,9 @@ object HyperCarRepo {
     }
 
     private fun resolveCastHostCarLifePackage(): String {
-        val ctx = appContext() ?: return "com.baidu.carlife.xiaomi"
-        return listOf("com.baidu.carlife", "com.baidu.carlife.xiaomi")
-            .firstOrNull { p -> runCatching { ctx.packageManager.getPackageInfo(p, 0) }.isSuccess }
-            ?: "com.baidu.carlife"
+        // **只支持公版**（2026-10-28）：小米定制版路线已放弃，
+        // 反编译结论与四道门见 docs/ARCHIVE-CARWITH-XIAMI.md。
+        return "com.baidu.carlife"
     }
 
     /**

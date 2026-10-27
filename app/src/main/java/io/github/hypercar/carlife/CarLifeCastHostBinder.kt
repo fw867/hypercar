@@ -110,13 +110,11 @@ class CarLifeCastHostBinder : android.os.Binder() {
     private fun answerAction(action: String?, extras: Bundle?): Bundle? {
         return when (action) {
             ACTION_USE_OPENGL -> Bundle().apply {
-                // 按目标包决定（2026-10-27 23:0x）：
-                //  · 公版 com.baidu.carlife：答 1（OPENGL_OPEN）→ 它 isCarLifeApp()=true，
-                //    走 ScreenCarlifeImpl **自己渲染车机界面**（我们不自绘）；
-                //  · 小米版 .xiaomi：答 0（OPENGL_CLOSE）→ 它把编码面交给宿主（自绘那条已被否，仅留兼容）。
-                val isPublic = !io.github.hypercar.carlife.CastHostService.targetPackage.endsWith(".xiaomi")
-                putInt("use_opengl_type", if (isPublic) 1 else 0)
-                putBoolean("use_opengl", isPublic)
+                // **只支持公版 + 答 1（OPENGL_OPEN）**（2026-10-28）：公版 isCarLifeApp()=true，
+                // 走 ScreenCarlifeImpl **自己渲染车机界面**，我们只做 8240 → AirPlay 的管道。
+                // 答 0 会把编码面交给宿主（需要自绘虚显），那条路已放弃。
+                putInt("use_opengl_type", 1)
+                putBoolean("use_opengl", true)
             }
             // CarLife 会问宿主这两项（CarWith 的 k.r() 里就是这些 key）：
             ACTION_REQUEST_DEVICE_ID -> Bundle().apply {
