@@ -848,10 +848,9 @@ object HyperCarRepo {
             // ⚠ 关掉联动时**必须跳过这个 30s 等待**：CarLife 不会被拉起，7240 永远不会监听，
             // 而车机侧 CarPlay 只等十几秒就拆链路（2026-10-26 16:48 现场：iAP2 Phase 1 全过、
             // 之后一直"仍在等 CarLife 监听 7240"到第 16s，车机 LINK closed，AirPlay 根本没开始）。
-            val mdHost = if (!SettingsStore.carlifeEnabled && !SettingsStore.carlifeFirst) {
-                log("CARLIFE: 联动已关闭——跳过 7240 探测，引擎直接以 HU 身份监听并马上协商 AirPlay")
-                null
-            } else {
+            // **不再受"联动开关"影响**（2026-10-28）：CarLife 是画面唯一来源，
+            // 一律先探测并唤醒它，再以 HU 身份协商 AirPlay。
+            val mdHost = run {
                 probeLocalCarLifeMd(timeoutMillis = 30_000L) { attempt ->
                     if (attempt % 8 == 0) {   // 8 × 200ms ≈ 1.6s → 每 ~1.6s 之后 4s 补一次
                         log("CARLIFE: 仍在等 CarLife 监听 7240（第 ${attempt * 200 / 1000}s），补发唤醒广播")
@@ -1746,9 +1745,13 @@ object HyperCarRepo {
             // 用 update（CAS）而不是读-改-写：每秒一次，与 log() 的读-改-写并发会吞掉日志行。
             lastVideoFrames = frames
             _snapshots.update { s ->
+                // **CarLife 卡片以"是否出帧"收敛**：统计每秒必到，这里兜住
+                // 那些"事件没到/被 Waiting 覆盖"的情况（2026-10-28）。
+                val carLifeNow = if (frames > 0) CarLifeState.Active() else s.carLife
                 s.copy(
                     video = s.video.copy(fps = fps, frames = frames, kbps = kbps),
                     audio = s.audio.copy(playing = audioPlaying, ducking = ducking),
+                    carLife = carLifeNow,
                 )
             }
         }
@@ -2006,12 +2009,8 @@ object HyperCarRepo {
      * 顺带把设备上「CarLife/CarLink 系」的包名列进日志——包名配错时一眼可见。
      */
     private fun wakeLocalCarLife() {
-        // 用户默认关掉 CarLife 联动：CarLife 一激活就会抢蓝牙，把 CarPlay 的 ACL 顶断。
-        // （实验开关 carlifeFirst 打开时允许拉起：那正是我们要验证的场景。）
-        if (!SettingsStore.carlifeEnabled && !SettingsStore.carlifeFirst) {
-            log("CARLIFE: 联动已关闭（设置里关着）——不拉起 CarLife，避免它抢蓝牙顶掉 CarPlay")
-            return
-        }
+        // **不再有"CarLife 联动开关"**（2026-10-28）：当前形态下 CarLife 是画面的唯一来源，
+        // 不拉起就等于没有画面。小米版的冻结/恢复由环境检测那一步统一处理。
         val pkg = resolveCarLifePackage()
         _snapshots.value = _snapshots.value.copy(carLife = CarLifeState.Waiting())
 
@@ -2539,9 +2538,20 @@ object HyperCarRepo {
 
     private fun push(link: LinkState? = null, carLife: CarLifeState? = null) {
         _snapshots.update { s ->
+            // **CarLife 卡片以"实际出帧"为准**（2026-10-28）：公版自渲染时 Rust 侧的
+            // `carlife_active` 事件可能在端口收权/重连过程中被后续 `carlife_waiting` 覆盖，
+            // 于是首页一直显示"等待接入"，而视频/音频其实已经在跑。
+            // 只要已经收到过视频帧且链路已连上，就按"已接入"显示。
+            val frames = s.video.frames
+            // 只要真的在出帧且链路已连上，就**压过任何 Waiting 事件**（事件会被通道重连覆盖）
+            val carLifeResolved = if (frames > 0) {
+                CarLifeState.Active()
+            } else {
+                carLife ?: s.carLife
+            }
             s.copy(
                 link = link ?: s.link,
-                carLife = carLife ?: s.carLife,
+                carLife = carLifeResolved,
                 shizukuReady = ShizukuTools.isReady,
                 degradedPermissionGranted = degradedPermissionGranted(),
                 degradedLocationOn = degradedLocationOn(),

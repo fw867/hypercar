@@ -494,21 +494,45 @@ private fun HeroAction(
             borderColor = StrokeGlass,
         )
 
-        is LinkState.Failed -> CapsuleButton(
-            text = "重试连接",
-            onClick = onStartClick,
-            modifier = buttonModifier,
-            filled = true,
-            leadingIcon = Icons.Rounded.Refresh,
-        )
+        is LinkState.Failed -> Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            CapsuleButton(
+                text = "重试连接",
+                onClick = onStartClick,
+                modifier = buttonModifier,
+                filled = true,
+                leadingIcon = Icons.Rounded.Refresh,
+            )
+            // 未连接时也提供「退出」：停后台循环 + 恢复被冻结的小米版 CarLife
+            CapsuleButton(
+                text = "退出",
+                onClick = onExitClick,
+                modifier = buttonModifier,
+                filled = false,
+                contentColor = Color(0xFF9AA4B2),
+                borderColor = Color(0xFF9AA4B2).copy(alpha = 0.45f),
+                leadingIcon = Icons.Rounded.ExitToApp,
+            )
+        }
 
-        is LinkState.Idle -> CapsuleButton(
-            text = "启动连接",
-            onClick = onStartClick,
-            modifier = buttonModifier,
-            filled = true,
-            leadingIcon = Icons.Rounded.PowerSettingsNew,
-        )
+        is LinkState.Idle -> Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            CapsuleButton(
+                text = "启动连接",
+                onClick = onStartClick,
+                modifier = buttonModifier,
+                filled = true,
+                leadingIcon = Icons.Rounded.PowerSettingsNew,
+            )
+            // 未连接时也提供「退出」（用户 2026-10-28 反馈：断开后就找不到关闭入口）
+            CapsuleButton(
+                text = "退出",
+                onClick = onExitClick,
+                modifier = buttonModifier,
+                filled = false,
+                contentColor = Color(0xFF9AA4B2),
+                borderColor = Color(0xFF9AA4B2).copy(alpha = 0.45f),
+                leadingIcon = Icons.Rounded.ExitToApp,
+            )
+        }
     }
 }
 

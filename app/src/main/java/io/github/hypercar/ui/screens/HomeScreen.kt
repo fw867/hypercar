@@ -286,10 +286,10 @@ internal fun LogLineRow(line: String, modifier: Modifier = Modifier) {
 
 
 /**
- * 「首次连接」引导：CarWith 首次配对必须手动点一次，之后同一台车会自动回连。
+ * 「首次使用」引导（2026-10-28 重写）：当前版本是"公版 CarLife 自渲染 + AirPlay 转发"，
  *
- * 这一步没有对外接口（CarWith 的 Activity 不导出、值存在 CarLife 的私有
- * SharedPreferences 里），所以只能引导用户在界面上点一次。
+ * 不再需要 CarWith 那套手动连接流程。
+
  */
 @Composable
 internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
@@ -302,7 +302,7 @@ internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
         val headUnit = io.github.hypercar.headunit.HeadUnitProfiles.current()
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
-                text = "首次连接（只需做一次）",
+                text = "首次使用（三步）",
                 style = MaterialTheme.typography.titleSmall,
                 color = TextPrimary,
             )
@@ -315,10 +315,10 @@ internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
         }
         Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = "① 车机侧开始接收（PC/WinPlay 联调时先在 PC 上起 hub）\n" +
-                "② 手机点「启动连接」，等状态到「已连接」\n" +
-                "③ 打开 CarWith → CarLife 连接 → 无线连接 → 车辆热点\n" +
-                "④ 点列表里的车机蓝牙名称 → 下一步 → 开始连接",
+            text = "① 装公版「百度 CarLife+」（应用宝搜 CarLife）\n" +
+                "② 若装了小米定制版 CarLife，需启动 Shizuku（用它冻结，防抢端口）\n" +
+                "③ 车机侧开始接收（CarPlay 车机在 iDrive 里选本机；PC 联调先开 WinPlay）\n" +
+                "④ 点「启动连接」，车机出画面即成功，之后同一台车自动回连",
             style = MaterialTheme.typography.bodySmall,
             color = TextSecondary,
         )
@@ -352,8 +352,8 @@ internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
             },
         )
         Text(
-            text = "做完这一次，同一台车以后会自动回连。第 ④ 步「开始连接」" +
-                "只有在 CarWith 检测到车机蓝牙时才可用；列表为空就回第 ① 步确认车机在接收。",
+            text = "画面和触摸都由 CarLife 自己渲染，本 App 只负责传输。" +
+                "要去连 CarWith 盒子时点「退出」，会恢复被冻结的小米版 CarLife。",
             style = MaterialTheme.typography.labelSmall,
             color = MintGreen,
         )

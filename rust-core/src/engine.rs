@@ -456,6 +456,22 @@ pub async fn run_engine(
             let mut mixed = vec![0i16; SPF * 2];
             // 抗抖动预缓冲状态：false = 正在攒数据（发静音），true = 正在播放
             let mut audio_started = false;
+            // 欠载 de-click 状态：沿用上一帧并指数衰减，避免填 0 的阶跃杂音
+            let mut last_l: i16 = 0;
+            let mut last_r: i16 = 0;
+            let mut media_empty_ticks: u32 = 0;
+            let mut media_byte_carry: Option<u8> = None;
+            let mut tts_byte_carry: Option<u8> = None;
+            // ---- 诊断计数器（每秒汇总一行）----
+            let mut diag_underrun: u32 = 0;      // 已起播但队列空的 tick 数
+            let mut diag_min_q: u32 = u32::MAX;  // 每秒最低队列水位(ms)
+            let mut diag_chunks: u32 = 0;        // 收到的 PCM 块数
+            let mut diag_bytes: u64 = 0;         // 累计字节
+            let mut diag_last_chunk: Option<std::time::Instant> = None;
+            let mut diag_max_gap_ms: u64 = 0;    // 块间最大间隔
+            // 重采样跨包小数相位（必须与 remain 同生命周期，否则每块重算会丢样本）
+            let mut media_phase: f64 = 0.0;
+            let mut tts_phase: f64 = 0.0;
             loop {
                 tokio::select! {
                     _ = stop_a.notified() => return,
@@ -478,18 +494,30 @@ pub async fn run_engine(
                             if tts { tts_mix.clear(); } else { media_mix.clear(); }
                         }
                         Some(CarLifeEvent::AudioData { tts, rate, channels, data }) => {
-                            let (fmt, remain, mix) = if tts {
-                                (&mut tts_fmt, &mut tts_remain, &mut tts_mix)
+                            // phase 必须与 remain 同生命周期（跨包保留），否则每块重算会丢样本、
+                            // 累积成"每 2 秒卡一下"（2026-10-28 定位）。
+                            let (fmt, byte_carry, remain, phase, mix) = if tts {
+                                (&mut tts_fmt, &mut tts_byte_carry, &mut tts_remain, &mut tts_phase, &mut tts_mix)
                             } else {
-                                (&mut media_fmt, &mut media_remain, &mut media_mix)
+                                (&mut media_fmt, &mut media_byte_carry, &mut media_remain, &mut media_phase, &mut media_mix)
                             };
-                            if rate > 0 && rate != fmt.0 { fmt.0 = rate; }
-                            if channels >= 1 && channels <= 2 && channels != fmt.1 { fmt.1 = channels; }
-                            push_resampled(&data, fmt.0, fmt.1, remain, mix);
-                            // 缓冲上限 ~0.5s：过载丢旧（导航长语音不至于拖垮媒体）
+                            if rate > 0 && rate != fmt.0 { fmt.0 = rate; *phase = 0.0; }
+                            if channels >= 1 && channels <= 2 && channels != fmt.1 {
+                                fmt.1 = channels; remain.clear(); *phase = 0.0;
+                            }
+                            diag_chunks = diag_chunks.saturating_add(1);
+                            diag_bytes = diag_bytes.saturating_add(data.len() as u64);
+                            if let Some(prev) = diag_last_chunk {
+                                let gap = prev.elapsed().as_millis() as u64;
+                                if gap > diag_max_gap_ms { diag_max_gap_ms = gap; }
+                            }
+                            diag_last_chunk = Some(std::time::Instant::now());
+                            push_resampled(&data, fmt.0, fmt.1, byte_carry, remain, phase, mix);
+                            // 缓冲上限 ~0.5s：成对弹出，避免左右声道永久反相错位
                             let cap = (TARGET_RATE as usize) * 2 / 2;
-                            while mix.len() > cap { mix.pop_front(); }
+                            while mix.len() > cap { mix.pop_front(); mix.pop_front(); }
                         }
+                        // 音频泵只关心音频事件；其余事件由视频泵处理
                         Some(_) => {}
                         None => return,
                     },
@@ -513,29 +541,53 @@ pub async fn run_engine(
                         //   · 队列攒够 ~40ms 才开始消费（prebuf）；
                         //   · 播放中掉到 ~10ms 以下 → 回到"重新攒"状态（继续发静音，不消耗）；
                         // 发送节奏本来就是每 tick 一包（7.33ms），等于给接收端一个稳定流。
+                        // **40ms 起播 + 只在真正断流(250ms)时重攒**（2026-10-28 实测修正）：
+                        // CarLife 每 26ms 送一块、速率精确 44100，数据源很稳；
+                        // 200ms 预缓冲会在"队列抽空→重攒"时插入 200ms 静音，反而是最严重的卡顿来源。
                         const SAMPLES_PER_MS: usize = (TARGET_RATE as usize / 1000) * 2; // 立体声
                         let prebuf = 40 * SAMPLES_PER_MS;
-                        let low_water = 10 * SAMPLES_PER_MS;
                         if !audio_started {
                             if media_mix.len() >= prebuf {
                                 audio_started = true;
+                                media_empty_ticks = 0;
                             }
-                        } else if media_mix.len() < low_water && tts_mix.is_empty() {
-                            audio_started = false;
+                        } else if media_mix.is_empty() && tts_mix.is_empty() {
+                            media_empty_ticks = media_empty_ticks.saturating_add(1);
+                            // ~250ms（34 tick × 7.33ms）完全没数据才认为是真断流
+                            if media_empty_ticks > 34 {
+                                audio_started = false;
+                                media_empty_ticks = 0;
+                            }
+                        } else {
+                            media_empty_ticks = 0;
                         }
-
+                        let q_ms_now = (media_mix.len() / SAMPLES_PER_MS.max(1)) as u32;
+                        if q_ms_now < diag_min_q { diag_min_q = q_ms_now; }
+                        // **不足一整包时绝不拆包填零**（2026-10-28 定案）：
+                        // 之前半包有声、剩余填 0，会在 1 个样本内从 +25000 垂直掉到 0，
+                        // 3ms 后又跳回去 = 持续的"沙沙/噼啪"。现在改为：数据不足就**沿用上一帧
+                        // 并指数衰减**（de-click），波形连续，听感干净。
+                        let enough = media_mix.len() >= SPF * 2;
                         for i in 0..SPF {
-                            // 混音队列里是**交错立体声**（push_resampled 每帧压 L、R 两个样本）。
-                            // 之前每帧只取一个样本再左右都填它——只消费了一半数据、还把立体声
-                            // 压成单声道，听感就是沙沙声 + 断续（现场 2026-10-23 23:10 定位）。
-                            let ml = if audio_started { take_or_zero(&mut media_mix) } else { 0 };
-                            let mr = if audio_started { take_or_zero(&mut media_mix) } else { 0 };
+                            let (ml, mr) = if audio_started && enough {
+                                let l = media_mix.pop_front().unwrap_or(0);
+                                let r = media_mix.pop_front().unwrap_or(0);
+                                last_l = l;
+                                last_r = r;
+                                (l, r)
+                            } else {
+                                // 平滑衰减到 0（每样本 ×31/32 ≈ -0.27dB），避免阶跃
+                                last_l = ((last_l as i32 * 31) / 32) as i16;
+                                last_r = ((last_r as i32 * 31) / 32) as i16;
+                                (last_l, last_r)
+                            };
                             let tl = take_or_zero(&mut tts_mix);
                             let tr = take_or_zero(&mut tts_mix);
                             let l = (ml as f32 * gain) as i32 + tl as i32;
                             let r = (mr as f32 * gain) as i32 + tr as i32;
-                            mixed[i * 2] = l.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                            mixed[i * 2 + 1] = r.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                            // 软饱和限幅（之前定义了 soft_clip_i32 却没用上，硬削波 = 破音）
+                            mixed[i * 2] = soft_clip_i32(l);
+                            mixed[i * 2 + 1] = soft_clip_i32(r);
                         }
                         stats.lock().ducking = duck_hold > 0;
                         if let Some(a) = out.as_mut() {
@@ -549,12 +601,22 @@ pub async fn run_engine(
                         if rate_mark.elapsed() >= Duration::from_secs(1) {
                             let secs = rate_mark.elapsed().as_secs_f64().max(0.001);
                             emit_log(&format!(
-                                "AUDIO: 发包 {:.0}/s（应 {:.0}/s） 队列 media={}ms tts={}ms",
+                                "AUDIO: 发包 {:.0}/s（应 {:.0}/s） 队列 media={}ms tts={}ms 欠载={} 最低={}ms 块={}({}B) 最大间隔={}ms",
                                 sent_packets as f64 / secs,
                                 TARGET_RATE as f64 / SPF as f64,
                                 media_mix.len() * 1000 / (TARGET_RATE as usize).max(1) / 2,
-                                tts_mix.len() * 1000 / (TARGET_RATE as usize).max(1) / 2
+                                tts_mix.len() * 1000 / (TARGET_RATE as usize).max(1) / 2,
+                                diag_underrun,
+                                if diag_min_q == u32::MAX { 0 } else { diag_min_q },
+                                diag_chunks,
+                                diag_bytes,
+                                diag_max_gap_ms
                             ));
+                            diag_underrun = 0;
+                            diag_min_q = u32::MAX;
+                            diag_chunks = 0;
+                            diag_bytes = 0;
+                            diag_max_gap_ms = 0;
                             sent_packets = 0;
                             rate_mark = std::time::Instant::now();
                         }
@@ -645,63 +707,117 @@ fn push_resampled(
     raw: &[u8],
     src_rate: u32,
     src_ch: u8,
+    byte_carry: &mut Option<u8>,
     remain: &mut Vec<i16>,
+    phase: &mut f64,
     out: &mut VecDeque<i16>,
 ) {
-    let shorts = raw.len() / 2;
+    // **奇数字节跨块拼接**（2026-10-28 修"沙沙杂音"）：TCP 分块可能把 i16 切成两半；
+    // 之前 `raw.len()/2` 直接丢掉末尾那个字节，导致其后所有样本错位半个样本 =
+    // 持续的高频沙沙声。
+    let mut joined: Vec<u8>;
+    let data: &[u8] = match byte_carry.take() {
+        Some(prev) => {
+            joined = Vec::with_capacity(raw.len() + 1);
+            joined.push(prev);
+            joined.extend_from_slice(raw);
+            &joined
+        }
+        None => raw,
+    };
+    let shorts = data.len() / 2;
+    remain.reserve(shorts);
     for i in 0..shorts {
-        remain.push(i16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]));
+        remain.push(i16::from_le_bytes([data[i * 2], data[i * 2 + 1]]));
+    }
+    if data.len() % 2 == 1 {
+        *byte_carry = Some(data[data.len() - 1]);
     }
     let ch = src_ch.max(1) as usize;
-    let src_frames = remain.len() / ch;
-    if src_frames == 0 || src_rate == 0 {
+    if src_rate == 0 {
         return;
     }
-    if src_rate == TARGET_RATE && ch == 2 {
-        let total = src_frames * 2;
-        for i in 0..total {
-            out.push_back(remain[i]);
+    // 48k 立体声直通（单声道复制成双声道）
+    if src_rate == TARGET_RATE {
+        let frames = remain.len() / ch;
+        let total = frames * ch;
+        if ch == 2 {
+            for i in 0..total {
+                out.push_back(remain[i]);
+            }
+        } else {
+            for i in 0..frames {
+                out.push_back(remain[i]);
+                out.push_back(remain[i]);
+            }
         }
         remain.drain(..total);
+        *phase = 0.0;
         return;
     }
+
+    // **跨包相位保留**（2026-10-28 修"每 2 秒卡一下"）：
+    // 之前每块都用 `dst_frames` 重算并 drain，向下取整会每块丢 0~1 帧 →
+    // 累积漂移使音频比 RTP 时钟慢，接收端约每 2s 做一次重同步 = 周期性卡顿。
+    // 现在 phase 表示"下一个输出样本在源数据中的位置"，跨块保留，不丢样本。
     let ratio = src_rate as f64 / TARGET_RATE as f64;
-    let dst_frames = ((src_frames as f64) / ratio) as usize;
-    let read = |idx: usize, lane: usize| -> i16 {
+    let src_frames = remain.len() / ch;
+    let read = |idx: usize, lane: usize| -> f32 {
         if ch == 1 {
-            remain[idx]
+            remain[idx] as f32
         } else {
-            remain[idx * ch + lane]
+            remain[idx * ch + lane] as f32
         }
     };
-    for i in 0..dst_frames {
-        let pos = i as f64 * ratio;
-        let i0 = (pos as usize).min(src_frames - 1);
-        let i1 = (i0 + 1).min(src_frames - 1);
-        let frac = (pos - i0 as f64) as f32;
-        let l = if ch == 1 {
-            let m0 = read(i0, 0) as f32;
-            let m1 = read(i1, 0) as f32;
-            m0 + (m1 - m0) * frac
-        } else {
-            let l0 = read(i0, 0) as f32;
-            let l1 = read(i1, 0) as f32;
-            l0 + (l1 - l0) * frac
-        };
+    // 4 点 Catmull-Rom：高频滚降比线性插值小，包边界也连续
+    #[inline]
+    fn hermite(y0: f32, y1: f32, y2: f32, y3: f32, t: f32) -> f32 {
+        let c0 = y1;
+        let c1 = 0.5 * (y2 - y0);
+        let c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+        let c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
+        ((c3 * t + c2) * t + c1) * t + c0
+    }
+    if *phase < 1.0 {
+        *phase = 1.0;
+    }
+    // 需要 y3，所以最后两帧留到下一块
+    while (*phase as usize) + 2 < src_frames {
+        let i1 = *phase as usize;
+        let t = (*phase - i1 as f64) as f32;
+        let i0 = i1 - 1;
+        let i2 = i1 + 1;
+        let i3 = i1 + 2;
+        let l = hermite(read(i0, 0), read(i1, 0), read(i2, 0), read(i3, 0), t);
         let r = if ch == 1 {
             l
         } else {
-            let r0 = read(i0, 1) as f32;
-            let r1 = read(i1, 1) as f32;
-            r0 + (r1 - r0) * frac
+            hermite(read(i0, 1), read(i1, 1), read(i2, 1), read(i3, 1), t)
         };
         out.push_back(l.clamp(i16::MIN as f32, i16::MAX as f32) as i16);
         out.push_back(r.clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+        *phase += ratio;
     }
-    // 已消费的源帧丢弃（浮点取整误差在余数里可忽略）
-    let consumed = (dst_frames as f64 * ratio) as usize;
-    let consumed = consumed.min(src_frames) * ch;
-    remain.drain(..consumed);
+    // 只丢弃已经用过的源帧（保留 3 帧做下一块的插值上下文），phase 同步回退
+    let advance = (*phase as usize).saturating_sub(1);
+    if advance > 0 {
+        remain.drain(..advance * ch);
+        *phase -= advance as f64;
+    }
+}
+
+/// 软饱和限幅：接近满刻度时平滑压缩，避免硬削波产生"破音"（尤其 TTS 叠加时）。
+fn soft_clip_i32(x: i32) -> i16 {
+    const LIMIT: f32 = 28_000.0;
+    const MAX: f32 = 32_767.0;
+    let v = x as f32;
+    if v.abs() <= LIMIT {
+        return v as i16;
+    }
+    let sign = if v < 0.0 { -1.0 } else { 1.0 };
+    let over = (v.abs() - LIMIT) / (MAX - LIMIT);
+    let compressed = LIMIT + (MAX - LIMIT) * (over / (1.0 + over));
+    (sign * compressed).clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
 fn take_or_zero(q: &mut VecDeque<i16>) -> i16 {

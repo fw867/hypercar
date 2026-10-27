@@ -1406,26 +1406,12 @@ async fn handle_media_client(
                                 // 布局 [0..4]=dataLen(BE) [4..8]=timeStamp(BE) [8..12]=type(BE)。
                                 // 现场取证 `00 00 00 00 00 00 00 00 01 00 00 00` 正是 type=1 的包头；
                                 // 不剥掉就会被当样本播 → 每包一次"咔"（破音）。
-                                let pcm: &[u8] = if payload.len() >= 12 + 4
-                                    && (payload.len() - 12) % 4 == 0
-                                    && payload.len() % 4 != 0
                                 {
-                                    &payload[12..]
-                                } else if payload.len() >= 12
-                                    && (payload.len() - 12) % 4 == 0
-                                    && payload[8..12] == [0, 0, 0, 1]
-                                {
-                                    // 兜底：长度凑巧也是 4 的倍数，但 type 字段是 1（MEDIA 数据类型）
-                                    &payload[12..]
-                                } else {
-                                    payload.as_slice()
-                                };
-                                if !pcm.is_empty() {
                                     let _ = events.send(CarLifeEvent::AudioData {
                                         tts,
                                         rate,
                                         channels,
-                                        data: pcm.to_vec(),
+                                        data: payload.to_vec(),
                                     });
                                 }
                             }

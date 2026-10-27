@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.ui.screens
+package io.github.hypercar.ui.screens
 
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -910,30 +910,6 @@ private fun ResolutionSection() {
     var widthText by rememberSaveable { mutableStateOf(SettingsStore.carlifeWidth.toString()) }
     var heightText by rememberSaveable { mutableStateOf(SettingsStore.carlifeHeight.toString()) }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        SectionLabel(text = "CarLife 联动")
-        GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)) {
-            SwitchRow(
-                title = "启用 CarLife 联动",
-                subtitle = "默认关闭。开启后 HyperCar 会拉起 CarLife 并尝试驱动投屏；但小米 CarLife 一激活就会抢占蓝牙，实测会把 CarPlay 的 iAP2 链路顶断。",
-                checked = carlifeOn,
-                onCheckedChange = {
-                    carlifeOn = it
-                    SettingsStore.carlifeEnabled = it
-                    io.github.hypercar.settings.SettingsRevision.bump()
-                },
-            )
-            SwitchRow(
-                title = "CarLife 优先启动（实验）",
-                subtitle = "先拉 CarLife 到前台、等它做完蓝牙初始化，再起 iAP2。CarLife 只有在前台才产视频，" +
-                    "但它一起前台就会抢蓝牙——这个开关用来验证「顺序反转后能否共存」。",
-                checked = carlifeFirst,
-                onCheckedChange = {
-                    carlifeFirst = it
-                    SettingsStore.carlifeFirst = it
-                    io.github.hypercar.settings.SettingsRevision.bump()
-                },
-            )
-        }
         SectionLabel(text = "CarLife 编码分辨率（兜底值）")
         GlassPanel(
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 16.dp),
@@ -1104,6 +1080,11 @@ private fun SwitchRow(
 
 @Composable
 private fun WakePackageSection() {
+    // **已废弃并隐藏**（2026-10-28）：唤醒包名不再可配——目标固定为公版
+    // `com.baidu.carlife`（自渲染界面），小米定制版由环境检测自动冻结。
+    // 保留函数体只为兼容既有调用点，这里直接返回。
+    if (true) return
+    @Suppress("UNREACHABLE_CODE")
     var pkg by rememberSaveable { mutableStateOf(SettingsStore.carlifePackage) }
     var menuExpanded by remember { mutableStateOf(false) }
     val isPreset = CarLifePackagePresets.any { it.second == pkg }

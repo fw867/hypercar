@@ -126,6 +126,7 @@ docs/          架构、CarLife 协议、协商对比、编译指南、车机档
 | [docs/HEADUNIT-PROFILES.md](docs/HEADUNIT-PROFILES.md) | 车机档案字段、**新增品牌四步走**、**远程下发（改 JSON 不发版）** |
 | [docs/IPHONE-HCI-CAPTURE.md](docs/IPHONE-HCI-CAPTURE.md) | **iPhone HCI 抓包手册**（描述文件 → sysdiagnose → .pklg） |
 | [docs/BUILD.md](docs/BUILD.md) | 编译环境、本地出包、CI 标记 |
+| [docs/ARCHIVE-CARWITH-XIAMI.md](docs/ARCHIVE-CARWITH-XIAMI.md) | **存档**：小米 CarWith / 小米定制版 CarLife 路线（已放弃）的反编译结论与四道门 |
 
 ## 快速开始
 
