@@ -2076,3 +2076,32 @@ if !real_config_sent {
 `carlife/CastHostService.kt`、`carlife/CarLifeCastHostBinder.kt`、`carlife/CastDisplay.kt`、
 `carlife/CastProbeActivity.kt`（保留未用）、`session/HyperCarRepo.kt`、`session/DebugProbeReceiver.kt`、
 `settings/SettingsStore.kt`、`AndroidManifest.xml`、`rust-core/src/engine.rs`、`rust-core/src/carlife.rs`、`rust-core/src/lib.rs`。
+### 26.8 补充：两个后续踩到的坑（0.1.0.241/242）
+
+**坑 6：关键帧早于屏幕流就绪 → 永远不会补发 VideoConfig。**
+
+`VIDEO: 按真帧重发 VideoConfig` 只在"收到带 SPS/PPS 的帧、且此刻 sender 已就绪"时才执行。
+但实测（22:07 现场）第一个关键帧（60879B，SPS+PPS+IDR）**在屏幕流就绪之前就到了**，被当"未就绪丢帧"丢掉，
+之后收到的全是 P 帧（1609B/1532B/663B，不含 SPS/PPS）→ 补发永远不发生 → 画布停在待机卡片的 1280x720 → 母帧。
+
+```
+22:07:10.047  VIDEO 读到 60879B   ← 关键帧（被丢）
+22:07:10.117  VIDEO 读到 1609B    ← 已是 P 帧
+（全日志没有一条 "按真帧重发 VideoConfig"）
+```
+
+→ **把 SPS/PPS 与"屏幕流是否就绪"解耦**：收到任何带 SPS/PPS 的帧就先缓存，
+等 sender 就绪后的第一帧再补发 config（并 set_size 到实际编码尺寸）。
+238 版能成功纯属"关键帧恰好晚到"的运气，242 版起不再看运气。
+
+**坑 7：`LAUNCH_MODE_NORMAL` 是"进投屏态"的必要条件，但它会 `openHome()` 弹前台。**
+
+反编译 `CarlifeConnectHsgHandler:293`：收到 `MSG_CMD_LAUNCH_MODE_NORMAL(0x1801D)` 后走
+`ProviderManager.getHomeProvider().openHome()` —— 也就是**把我们一直看到的那个 CarLife 设置页弹出来**。
+试过不发这条（0.1.0.240）：CarLife 不进投屏态 → 只有母帧。
+所以目前是二选一：**要画面就得让它弹一次前台**。
+
+后续处理方向（未做）：
+1. 用 Shizuku 在**独立的虚拟屏**上启动 `CarlifeActivity`（`am start --display <id>`），它的 `openHome()` 就落在隐藏屏上，不打扰主屏；
+2. 或者继续深挖：`isLaunchInit` 为 true 时走的是 `dispatchMessage(4001, MSG_ARG_SHOW_FIRST_HOME)` + `openHome()`，
+   看能否只在 `prepareCast` 之后驱动 `VIDEO_ENCODER_START` + 心跳而不发 LAUNCH_MODE。

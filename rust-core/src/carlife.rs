@@ -755,7 +755,8 @@ async fn handle_cmd_client(
                     // 官方文档（V2.1.1 §10.2.2）：`MSG_CMD_LAUNCH_MODE_NORMAL(0x1801D)`
                     // 才是"让手机 CarLife 进入 Home 投屏界面"的命令。缺了它，手机 CarLife
                     // 永远停在自己的落地页，编码器空转 → 车机侧 Qin:0（我们踩了一整天）。
-                    let _ = send_cmd(&mut wr, CMD_LAUNCH_MODE_NORMAL, &[]).await;
+                    // 不再发 LAUNCH_MODE_NORMAL：CarLife 收到它会 ProviderManager.openHome()，
+                    // 把 CarLife 自己的首页/设置页拉到前台（我们冒充宿主时不需要它，见 §26）。
                     let _ = send_cmd(&mut wr, CMD_VIDEO_ENCODER_START, &[]).await;
                     emit_log(&format!(
                         "CARLIFE: 首帧视频未到——第 {start_retries} 次补发 LAUNCH_MODE_NORMAL + VIDEO_ENCODER_START"
@@ -968,8 +969,10 @@ async fn handle_cmd_client(
                         emit_log("CARLIFE: [Phase 7] → VIDEO_ENCODER_START —— 握手完成，开始推流");
                         emit_state("carlife_active", "CarLife 已开始推流");
                         // 紧接着要求手机 CarLife 进入 Home（投屏）界面：
-                        // 官方文档 §10.2.2 MSG_CMD_LAUNCH_MODE_NORMAL(0x1801D)，
-                        // 不带这条手机就一直停在自己的落地页（编码器空转 → Qin:0）。
+                        // 官方文档 §10.2.2 MSG_CMD_LAUNCH_MODE_NORMAL(0x1801D)。
+                        // 注意：这条会让 CarLife `ProviderManager.openHome()` 把它的主页/设置页
+                        // 弹到前台（反编译 CarlifeConnectHsgHandler:293）。画面不受影响（我们自己也往
+                        // CastConfig.surface 里画），但用户会看到 CarLife 界面——后续再想别的办法压掉。
                         if send_cmd(&mut wr, CMD_LAUNCH_MODE_NORMAL, &[]).await {
                             emit_log("CARLIFE: [Phase 8] → LAUNCH_MODE_NORMAL（让 CarLife 进入投屏界面）");
                         }

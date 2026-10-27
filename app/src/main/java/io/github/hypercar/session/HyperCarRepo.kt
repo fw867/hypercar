@@ -1603,6 +1603,16 @@ object HyperCarRepo {
                 "carlife_waiting" -> push(carLife = CarLifeState.Waiting())
                 // Rust 侧 CarLife 14 步握手完成（VIDEO_ENCODER_START 已发）
                 "carlife_active" -> {
+                    // CarLife 收到 LAUNCH_MODE_NORMAL 会 `openHome()` 把自己的主页弹到前台
+                    // （反编译 CarlifeHsgHandler:293）。它需要这条命令才会进投屏态，
+                    // 但我们不需要用户看见它 → 过 3 秒用 Shizuku 把我们自己拉回前台，
+                    // CarLife 留在后台继续编码（视频通路不受影响，已实测）。
+                    scope.launch {
+                        kotlinx.coroutines.delay(3_000)
+                        runCatching {
+                            ShizukuTools.exec("am start -n io.github.hypercar/.ui.MainActivity", 5_000)
+                        }.onSuccess { log("CARLIFE: 已把 HyperCar 拉回前台（CarLife 留在后台继续推流）") }
+                    }
                     push(carLife = CarLifeState.Active())
                     carLifeActiveAt = SystemClock.uptimeMillis()
                     // CarWith 用 ICarLifeManager.register + IDisplayController.startDisplay 让
@@ -1908,23 +1918,38 @@ object HyperCarRepo {
             }.getOrNull()
             log("WAKE: ② shell 广播 exit=${bcast?.code} ${bcast?.out?.replace("\n", " ")?.take(160).orEmpty()}")
 
-            // ③ 直接拉起 CarLife：**实测有效的组件是引擎包的 CarlifeActivity**
-            //    （2026-10-26 00:41 adb 实测：`am start -n com.baidu.carlife.xiaomi/
-            //     com.baidu.carlife.CarlifeActivity` 之后 6 秒内 7240/8240/9240/9241/9242/9340
-            //     全部开始 LISTEN）。
-            //    对比：CarWith 的 `CarlifeDialogActivity` **未导出**（SecurityException），
-            //    `monkey -p com.miui.carlink` 只会停在首页、不启动 CarLife 引擎。
-            val deepLink = "com.baidu.carlife.xiaomi/com.baidu.carlife.CarlifeActivity"
-            val launched = runCatching {
-                ShizukuTools.exec("am start -n $deepLink", 8_000)
+            // ③ 拉起 CarLife **进程**（不打开它那个设置页）：
+            //    CarLifeApplication.onCreate():83 → CarlifeConnectInitUtils.initConnectModule()
+            //      → CarlifeCoreSDK.initConnectModule() → ConnectClient.init()
+            //      → startTcpListener() → ConnectManager.startAcceptThread()
+            //    也就是说：**进程一起来，7240/8240/… 就开始监听了**，不需要任何 Activity。
+            //    这正是 CarWith 的做法（它从来不给用户看那个页面）。
+            val svc = "$pkg/com.baidu.carlife.service.CarlifeConnectService"
+            val hostPkg = appContext()?.packageName ?: "io.github.hypercar"
+            val started = runCatching {
+                ShizukuTools.exec(
+                    "am startservice -n $svc --es bindPackageName $hostPkg " +
+                        "--es bindClassName io.github.hypercar.carlife.CastHostService --ei usb_type 0",
+                    8_000,
+                )
             }.getOrNull()
-            log("WAKE: ③ 拉起 CarLife 引擎页 $deepLink exit=${launched?.code} " +
-                launched?.out?.lineSequence()?.firstOrNull().orEmpty().take(120))
-            if (launched == null || launched.code != 0) {
-                val launch = runCatching {
-                    ShizukuTools.exec("monkey -p $pkg -c android.intent.category.LAUNCHER 1", 8_000)
+            log("WAKE: ③ 启动 CarLife 服务（不开界面）exit=${started?.code} " +
+                started?.out?.lineSequence()?.firstOrNull().orEmpty().take(120))
+            // 等端口起来；起不来才退回"打开引擎页"（这一步会露出 CarLife 的设置页，属兜底）
+            var up = false
+            for (i in 0 until 10) {
+                delay(500)
+                if (isLocalPortListening(CARLIFE_CMD_PORT)) { up = true; break }
+            }
+            if (!up) {
+                log("WAKE: ③ 端口仍未监听 → 退回打开 CarLife 引擎页（会出现它的设置页）")
+                val deepLink = "$pkg/com.baidu.carlife.CarlifeActivity"
+                val launched = runCatching {
+                    ShizukuTools.exec("am start -n $deepLink", 8_000)
                 }.getOrNull()
-                log("WAKE: ③ 退回拉起 $pkg exit=${launch?.code} ${launch?.out?.lineSequence()?.firstOrNull().orEmpty().take(160)}")
+                log("WAKE: ③ 退回 am start exit=${launched?.code}")
+            } else {
+                log("WAKE: ③ CarLife 端口已就绪（未打开任何界面）")
             }
         }
     }

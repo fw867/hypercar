@@ -254,6 +254,9 @@ pub async fn run_engine(
             // 真帧自带的画布尺寸 / 是否已按真帧重发过 VideoConfig
             let mut real_size: Option<(u32, u32)> = None;
             let mut real_config_sent = false;
+            // 缓存的真帧 SPS/PPS（屏幕流就绪前收到的帧被丢弃，但参数要留下）
+            let mut cached_sps: Option<Vec<u8>> = None;
+            let mut cached_pps: Option<Vec<u8>> = None;
             let mut last_real_frame: Option<std::time::Instant> = None;
             let mut standby_idx: usize = 0;
             let mut standby_size_sent: Option<(u32, u32)> = None;
@@ -288,31 +291,34 @@ pub async fn run_engine(
                                 real_size = Some((width, height));
                             } else {
                                 pending_size = Some((width, height));
-                            real_size = Some((width, height));
                             }
                         }
                         Some(CarLifeEvent::VideoFrame { pts_us, data }) => {
-                            // **真帧到达时按它自己的 SPS/PPS 重发 VideoConfig**：
-                            // 屏幕流 SETUP 时发的待机卡片会把画布设成母版尺寸（1280x720），
-                            // 与 CarLife 实际编码尺寸（如 1920x1080）不一致 → 车机解码器按 1280x720 解 1920x1080 流 → 永远母帧。
-                            if real_config_sent == false {
+                            // 先把 SPS/PPS 缓存下来：**即使此刻屏幕流还没就绪（帧被丢）也要缓存**，
+                            // 否则等屏幕流就绪后收到的 P 帧里没有 SPS/PPS，就永远不会补发 VideoConfig，
+                            // 画布会一直停在待机卡片的母版尺寸 → 车机永远母帧（2026-10-27 21:07 现场）。
+                            if cached_sps.is_none() {
                                 let nals = crate::screen::annexb_nals(&data);
                                 let sps = nals.iter().find(|n| crate::screen::nal_type(n) == 7).copied();
                                 let pps = nals.iter().find(|n| crate::screen::nal_type(n) == 8).copied();
                                 if let (Some(sps), Some(pps)) = (sps, pps) {
-                                    if let Some(s) = sender.as_mut() {
-                                        if let Some((w, h)) = real_size { s.set_size(w, h); }
-                                        let avcc = crate::screen::build_avcc(sps, pps);
-                                        let _ = s.send_config(&avcc).await;
-                                        emit_log(&format!("VIDEO: 按真帧重发 VideoConfig（画布 {:?}）", real_size));
-                                    }
-                                    real_config_sent = true;
+                                    cached_sps = Some(sps.to_vec());
+                                    cached_pps = Some(pps.to_vec());
                                 }
                             }
                             if let Some(s) = sender.as_mut() {
+                                // 首次真正拿到屏幕流时，按真帧 SPS/PPS + 实际编码尺寸重发 VideoConfig
+                                if !real_config_sent {
+                                    if let (Some(sps), Some(pps)) = (cached_sps.clone(), cached_pps.clone()) {
+                                        if let Some((w, h)) = real_size { s.set_size(w, h); }
+                                        let avcc = crate::screen::build_avcc(&sps, &pps);
+                                        let _ = s.send_config(&avcc).await;
+                                        emit_log(&format!("VIDEO: 按真帧重发 VideoConfig（画布 {:?}）", real_size));
+                                        real_config_sent = true;
+                                    }
+                                }
                                 let len = data.len() as u64;
-                                // CarLife 媒体头的时间戳偶有 0/非单调（不同发送端实现不一），
-                                // 直接当 PTS 会让车机按 0 排播 → 卡顿/丢帧。为 0 时用本机单调钟。
+                                // CarLife 媒体头的时间戳偶有 0/非单调，为 0 时用本机单调钟
                                 let pts = if pts_us == 0 {
                                     crate::timing::monotonic_nanos() / 1_000
                                 } else {
@@ -327,7 +333,7 @@ pub async fn run_engine(
                                 st.frames += 1;
                                 st.bytes += len;
                             }
-                            // 屏幕流未就绪：丢帧（CarLife 先于 AirPlay 接入属正常）
+                            // 屏幕流未就绪：丢帧（SPS/PPS 已缓存，就绪后会补发 config）
                         }
                         Some(_) => {}
                         None => return,
