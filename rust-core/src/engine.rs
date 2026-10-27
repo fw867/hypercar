@@ -73,6 +73,9 @@ pub struct EngineConfig {
     /// 语音助手于是报「麦克风有问题」（现场 2026-10-24 定位）。
     #[serde(default)]
     pub voice: u32,
+    /// 只跑 CarLife 通道（不做蓝牙/iAP2/AirPlay）：调试广播 PROBE_CARLIFE_ONLY 用。
+    #[serde(default)]
+    pub carlife_only: bool,
 }
 
 fn default_true() -> bool {
@@ -167,7 +170,7 @@ pub async fn run_engine(
         });
     }
     // ---- 分发器：CarLife 事件 → 视频泵 / 音频泵 ----
-    let (video_tx, video_rx) = mpsc::unbounded_channel::<CarLifeEvent>();
+    let (video_tx, mut video_rx) = mpsc::unbounded_channel::<CarLifeEvent>();
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<CarLifeEvent>();
     {
         let stop_d = stop.clone();
@@ -208,6 +211,31 @@ pub async fn run_engine(
         });
     }
 
+    // ---- CARLIFE-ONLY：只验证 CarLife 通道（绑宿主 → 握手 → 8240 帧），完全不碰 AirPlay ----
+    if cfg.carlife_only {
+        emit_log("CARLIFE-ONLY: 进入只跑 CarLife 模式（不做蓝牙/AirPlay）");
+        let mut frames: u64 = 0;
+        let mut last_log = std::time::Instant::now();
+        loop {
+            tokio::select! {
+                _ = stop.notified() => return Ok(()),
+                ev = video_rx.recv() => match ev {
+                    Some(CarLifeEvent::VideoFrame { data, .. }) => {
+                        frames += 1;
+                        if frames <= 3 || last_log.elapsed() >= Duration::from_secs(2) {
+                            last_log = std::time::Instant::now();
+                            emit_log(&format!("CARLIFE-ONLY: 累计 {frames} 帧，最近一帧 {}B", data.len()));
+                        }
+                    }
+                    Some(CarLifeEvent::EncoderResolution { width, height }) =>
+                        emit_log(&format!("CARLIFE-ONLY: 编码画布 {width}x{height}")),
+                    Some(_) => {}
+                    None => return Ok(()),
+                },
+            }
+        }
+    }
+
     // ---- 视频泵 ----
     let (screen_ready_tx, screen_ready_rx) = tokio::sync::oneshot::channel::<ScreenSender>();
     let video_stats = Arc::new(Mutex::new(PumpStat::default()));
@@ -223,6 +251,9 @@ pub async fn run_engine(
             // 16ms tick：CarLife 没推流时用它按 ~60fps 发待机循环帧（真帧来了就以真帧为主）
             let mut tick = tokio::time::interval(Duration::from_millis(16));
             // CarLife 还没开始推流时，用待机卡片按 1 帧/秒占住屏幕流（避免车机黑屏/提前关通道）
+            // 真帧自带的画布尺寸 / 是否已按真帧重发过 VideoConfig
+            let mut real_size: Option<(u32, u32)> = None;
+            let mut real_config_sent = false;
             let mut last_real_frame: Option<std::time::Instant> = None;
             let mut standby_idx: usize = 0;
             let mut standby_size_sent: Option<(u32, u32)> = None;
@@ -254,11 +285,30 @@ pub async fn run_engine(
                             // 必须在首帧引出 VideoConfig 之前生效，否则车机按旧画布解码。
                             if let Some(s) = sender.as_mut() {
                                 s.set_size(width, height);
+                                real_size = Some((width, height));
                             } else {
                                 pending_size = Some((width, height));
+                            real_size = Some((width, height));
                             }
                         }
                         Some(CarLifeEvent::VideoFrame { pts_us, data }) => {
+                            // **真帧到达时按它自己的 SPS/PPS 重发 VideoConfig**：
+                            // 屏幕流 SETUP 时发的待机卡片会把画布设成母版尺寸（1280x720），
+                            // 与 CarLife 实际编码尺寸（如 1920x1080）不一致 → 车机解码器按 1280x720 解 1920x1080 流 → 永远母帧。
+                            if real_config_sent == false {
+                                let nals = crate::screen::annexb_nals(&data);
+                                let sps = nals.iter().find(|n| crate::screen::nal_type(n) == 7).copied();
+                                let pps = nals.iter().find(|n| crate::screen::nal_type(n) == 8).copied();
+                                if let (Some(sps), Some(pps)) = (sps, pps) {
+                                    if let Some(s) = sender.as_mut() {
+                                        if let Some((w, h)) = real_size { s.set_size(w, h); }
+                                        let avcc = crate::screen::build_avcc(sps, pps);
+                                        let _ = s.send_config(&avcc).await;
+                                        emit_log(&format!("VIDEO: 按真帧重发 VideoConfig（画布 {:?}）", real_size));
+                                    }
+                                    real_config_sent = true;
+                                }
+                            }
                             if let Some(s) = sender.as_mut() {
                                 let len = data.len() as u64;
                                 // CarLife 媒体头的时间戳偶有 0/非单调（不同发送端实现不一），
@@ -288,9 +338,9 @@ pub async fn run_engine(
                             let _ = s.maybe_send_keep_alive().await;
                             // CarLife 还没推流 → 按 ~60fps 播放待机循环（1 IDR + 59 个极小 P 帧）。
                             // 真帧到达后自动停用（1s 内有过真帧就不再插卡片）。
-                            let stale = last_real_frame
-                                .map(|t| t.elapsed() >= Duration::from_millis(900))
-                                .unwrap_or(true);
+                            // 只在"从未收到过真帧"时插待机卡片：
+                            // 真帧一旦来过就不再插，否则会和真帧的画布尺寸来回抖（车机解码器反复重建 → 一直是母帧）
+                            let stale = last_real_frame.is_none();
                             if stale {
                                 let (w, h) = s.size();
                                 if let Some(set) =

@@ -358,6 +358,18 @@ fn native_start_impl(
         obj: factory_obj,
     });
 
+    // **单实例保证**：若上一次引擎还没收到停止信号（比如 CARLIFE-ONLY 调试模式被直接顶掉），
+    // 这里必须先停它 —— 否则两个视频泵会同时往屏幕流写、同时改画布尺寸，
+    // 车机解码器被反复重建，表现就是"永远停在母帧"（2026-10-27 现场）。
+    {
+        let mut guard = ENGINE.lock();
+        if let Some(old) = guard.take() {
+            old.stop.notify_waiters();
+            old.stop.notify_one();
+            emit_log("nativeStart: 已停掉上一轮引擎（单实例保证）");
+        }
+    }
+
     let (touch_tx, touch_rx) = mpsc::unbounded_channel::<TouchInput>();
     let (key_tx, key_rx) = mpsc::unbounded_channel::<u32>();
     // 手机麦克风 → CarLife VR（语音助手要靠车机喂麦克风）

@@ -1842,3 +1842,237 @@ Phase 1 卡死，每 ~2s 重发；公版进程无 video-debug-enc
 
 > 判断标准：若 A 在 1 小时内拿不到"握手前置条件"的明确线索，直接转 B；
 > 若 B 也无法在当晚拿到抓包，转 C。
+---
+
+## 25. 冒充 CarWith：让 CarLife 真正出画面（2026-10-27 晚，0.1.0.211~217）
+
+> 本节是整条 CarLife 路线**第一次拿到真 H.264 帧**的完整记录。
+> 前面 §24 的结论（GL 被 `use_carlife_opengl` 挡住）在这里被证实，并给出了绕过的办法：**我们自己当宿主**。
+
+### 25.1 一句话结论
+
+> CarLife 不是"MD 服务端 + 自己渲染"的独立应用，它把**宿主（正常情况下是 CarWith）**当成了必需的一环：
+> 没有宿主，它照样监听 7240/8240，但**不会建渲染源**，媒体通道 accept 后 15~30ms 就关掉。
+> 我们自己实现宿主（`ICarLifeCastManager`）并回答 `use_carlife_opengl`，它就正常渲染并往 8240 推帧了。
+
+### 25.2 入场券：`CarlifeConnectService` 需要两个 extra
+
+```java
+// com/baidu/carlife/service/CarlifeConnectService.java:38-53
+private void connectStart(Intent intent) {
+    if (intent == null || !intent.hasExtra("bindPackageName")
+            || !intent.hasExtra(MixConstants.CONNECT_KEY_USB_TYPE)) { return; }   // ← 少一个就直接 return
+    if (MixPhoneStrategy.getInstance().getMixCastManager() == null) {
+        MixConnectManager.getInstance().bindManufacturerService(intent);          // ← bind 我们
+    }
+    MixConnectManager.getInstance().onConnectStart(intent);                       // ← 会话开始
+}
+```
+
+```java
+// MixPhoneStrategy.connectCastManager():31-46
+String pkg = intent.getStringExtra("bindPackageName");
+String cls = intent.getStringExtra("bindClassName");
+Intent i2 = new Intent(); i2.setClassName(pkg, cls);
+CarLifeCastManagerProxy.bindService(AppContext.getInstance(), i2);                // ← bind 到我们的 Service
+```
+
+所以我们发过去的是：
+
+```kotlin
+Intent().apply {
+    setClassName(carLifePackage, "com.baidu.carlife.service.CarlifeConnectService")
+    putExtra("bindPackageName", context.packageName)      // 我们自己的包
+    putExtra("bindClassName",   CastHostService::class.java.name)   // 我们的宿主 Service
+    putExtra("usb_type", 0)                               // MixConstants：0=WIFI_HOTSPOT 1=P2P 2=WIFI_BOX 11=AOA 12=ADB
+}
+```
+
+> 这也解释了 §19.14 那次探测为什么拿到空 binder：当时只 `setComponent`，两个 extra 都没有。
+
+### 25.3 宿主 AIDL 的字节级布局（无需引入对方 SDK）
+
+`com.baidu.carlife.mixing.aidl.ICarLifeCastManager`，DESCRIPTOR 固定为
+`com.baidu.carlife.mixing.aidl.ICarLifeCastManager`，事务号：
+
+| code | 方法 | 载荷 |
+|---|---|---|
+| 1 | `prepareCast` | `writeInt(存在标记)` + `int width, int height, int dpi, Surface`（`CastConfig.writeToParcel`） |
+| 2 | `stopCast` | 无 |
+| 3 | `setSystemAudioCallback` | `IBinder` |
+| 4 | `setCastCallback` | `IBinder` |
+| 5 | `invokeMethod` | `writeInt(存在标记)` + `Intent.writeToParcel`；**返回值** `writeInt(1)+Bundle` 或 `writeInt(0)` |
+| 1598968902 | INTERFACE_TRANSACTION | 回写 DESCRIPTOR |
+
+实现见 `app/src/main/java/io/github/hypercar/carlife/CarLifeCastHostBinder.kt`（纯 `Binder.onTransact`，不复制对方 26 KB 的 AIDL 生成类）。
+
+**⚠ 坑 1**：`prepareCast` 的第一个 int 是**存在标记**，不是 width。第一版漏了它，日志读成 `1x1920@720`（应为 `1920x720@320`）。
+
+### 25.4 关键回答：`use_carlife_opengl`
+
+CarLife 会通过 `invokeMethod` 问宿主要一堆动作，其中一条决定它到底渲不渲染（§24.2③）：
+
+```kotlin
+"use_carlife_opengl" -> Bundle().apply {
+    putInt("use_opengl_type", 1)     // CarlifeSurfaceWrapper.openglRenderType() 读这个
+    putBoolean("use_opengl", true)   // 兼容另一条读取分支
+}
+```
+
+返回 1 之后：`bindEncodeSurface()` 不再早退 → `TextureSufaceHelper.initRender/start` → GL 起来 →
+`createCarlifeSurface` + `showCarlifePresentaion` → 车机界面开始渲染进编码器。
+
+实测这条询问只在**编码器初始化那一刻**发生，所以顺序必须是"先绑宿主，再发 `VIDEO_ENCODER_INIT`"。
+
+### 25.5 实测：第一次拿到真帧（2026-10-27 20:55）
+
+```
+CASTHOST: 会话开始前先绑定宿主 target=com.baidu.carlife.xiaomi
+CASTHOST: ← setCastCallback(true) / setSystemAudioCallback(true)
+CASTHOST: ← invokeMethod action=carlife_notify_vehicle_channel        → null（不需要回答）
+CARLIFE: [Phase 1] ← 版本匹配
+CASTHOST: ← invokeMethod action=use_carlife_opengl → use_opengl,use_opengl_type
+CASTHOST: ← prepareCast 1920x720@320dpi surface=true                  ← 画布交过来了
+CARLIFE: [Phase 7] → VIDEO_ENCODER_START —— 握手完成
+CARLIFE: VIDEO 读到 12B    ：00 00 40 1A 6A E0 9F 56 00 02 00 01
+CARLIFE: VIDEO 读到 16410B ：00 00 00 01 67 42 80 29 DA 01 E0 16 …   ← SPS(67)+PPS(68)+IDR
+CARLIFE: VIDEO 读到 414B   ：00 00 00 01 41 E2 09 FC …               ← P 帧
+```
+
+`67 42 80 29` 解出来是 **1920×720**，与我们请求的画布一致。
+
+### 25.6 三个必须遵守的时序/状态约束
+
+1. **先绑宿主，再握手**：CarLife 只在编码器初始化时问 `use_carlife_opengl`；编码器先起来（比如它自己预热）我们就永远等不到这条询问 → 表现为 `Qin:0`。
+2. **CarLife 每进程只 bind 一次**：`MixConnectManager.bindManufacturerService` 开头
+   `if (this.mMixCastManager != null || intent == null) return;`。改代码后必须 `am force-stop` 冷启动，否则它不理你。
+3. **`CarlifeConnectService` 有 3 秒节流**：`startServiceTime` 内重复 start 会被 "repeated startup service" 丢掉。
+
+另外：`am force-stop` 之后包处于 stopped 状态，**必须先 `am start` 它的 Activity** 才能收到我们的 `startService`
+（否则连 `Connection refused`）。同一约束也适用于我们的触发广播：宿主 App 需在前台，`startService` 才不被 Android 8+ 拦。
+
+### 25.7 已实现的代码（未提交）
+
+| 文件 | 作用 |
+|---|---|
+| `app/src/main/java/io/github/hypercar/carlife/CarLifeCastHostBinder.kt` | ICarLifeCastManager 的 Binder 实现（事务 1~5 + INTERFACE），回答 `use_carlife_opengl` |
+| `app/src/main/java/io/github/hypercar/carlife/CastHostService.kt` | 宿主 Service + `startCarLifeSession(pkg, usbType)` |
+| `AndroidManifest.xml` | 声明 `.carlife.CastHostService`（`exported=true`，CarLife 才能 bind） |
+| `HyperCarRepo.kt` | ① `init()` 接线日志与画布回调；② **握手前预绑定宿主**（`resolveCastHostCarLifePackage()` 只认 `com.baidu.carlife.xiaomi` / `com.baidu.carlife`，**不包括 CarWith**） |
+| `DebugProbeReceiver.kt` | `PROBE_CAST` 广播：`--es pkg <包名> --ei usbType 0|1|2` |
+
+### 25.8 尚未解决的问题
+
+- **帧到了 8240，但车机上仍是待机卡片（母帧）**：说明 AirPlay 屏幕流没接上这批帧，或 CarLife 会话在 Phase 8 后停掉。
+  下一步排查点：
+  1. `engine.rs` 视频泵在 `ScreenSender` 未就绪时丢帧（日志"屏幕流未就绪"）——需要确认帧是否在 SETUP/RECORD 之后才到；
+  2. CarLife 在我们 Phase 8 关 CMD 后是否停止编码（`VIDEO 读到` 是否持续增长）；
+  3. 画布 1920x720 与车机 `VideoConfig` 是否一致（车机侧 `/info` 报的尺寸）。
+---
+
+## 26. 打通：CarLife 画面真的上到车机（2026-10-27 22:00，0.1.0.238）
+
+> **结论先行**：这一节记录整条链路第一次**完整成功** ——
+> CarLife 编码 → 8240 → 我们转发 → AirPlay → 车机屏上出现**我们自己画的内容**（验证页大字 + 跳动时钟 + 每秒换底色）。
+
+### 26.1 CarWith 的宿主实现（反编译 `CarWith.apk`，53.5 MB / 8 dex）
+
+```java
+// com/xiaomi/ucar/carlife/CarlifeConnService.java:48
+public class CarLifeCastManagerImpl extends ICarLifeCastManager.Stub {
+    public void prepareCast(CastConfig cfg) {                       // :60
+        e2.g.i().t(new e2.b(cfg.width, cfg.height, cfg.dpi, cfg.surface));   // 交给 e2.g 单例
+    }
+    public Bundle invokeMethod(Intent it) {                          // :50
+        return com.xiaomi.ucar.carlife.k.p().r(it);                  // 所有动作应答都在 k(33KB) 里
+    }
+}
+// e2/g.t() → 分发给监听者
+// com/miui/carlink/castfwk/CarlinkService.java:534  public void b(e2.b v) → 状态机
+// com/miui/carlink/castfwk/CarlinkStateMachine.java:1166
+public VirtualDisplay N0(Surface s, int w, int h, int dpi) {
+    return displayConnected(s, w, h, 0, dpi, 30, 2);                 // ← 关键是 VirtualDisplay(surface)
+}
+```
+
+**CarWith 拿到 `CastConfig.surface` 后，就是建一个 `VirtualDisplay`，把界面挂上去。**
+我们的实现与它同构，只是把"挂什么"换成了自己的 `Presentation`。
+
+### 26.2 我们的实现
+
+| 文件 | 作用 |
+|---|---|
+| `carlife/CastHostService.kt` | 向 `CarlifeConnectService` 发带 `bindPackageName`/`bindClassName`/`usb_type` 的 Intent（= 冒充 CarWith） |
+| `carlife/CarLifeCastHostBinder.kt` | `ICarLifeCastManager` 的字节级实现；**回答 `use_opengl_type=0`** |
+| `carlife/CastDisplay.kt` | `prepareCast` → `VirtualDisplay(OWN_CONTENT_ONLY, surface)` → `Presentation` 挂验证页 |
+
+### 26.3 五个坑（按踩到的顺序，全部有现场日志）
+
+**坑 1：先绑宿主，再握手。**
+CarLife 只在**编码器初始化那一刻**问宿主 `use_carlife_opengl`；编码器先起来就永远等不到这条询问。
+→ `HyperCarRepo` 在 CarLife 探测/唤醒之前就 `startCarLifeSession()`。
+
+**坑 2：`use_opengl_type` 必须答 0（OPENGL_CLOSE）。**
+答 1 时 CarLife 走自己的 GL 合成线程，我们 VirtualDisplay 画的内容**进不去** —— 表现为帧大小恒 `475B` 一动不动；
+答 0 时走 `ScreenRealImpl.getVirtualSurface()`，直接把**编码器输入面**交给宿主，像素才会真的变成我们的画面。
+（答 1 时帧大小 768/1157/851/1034 来回跳，答 0 时同样跳但内容真的进去了 —— 先用"每秒换底色"验证的。）
+
+**坑 3：`VIRTUAL_DISPLAY_FLAG_PUBLIC` 要签名权限。**
+`createVirtualDisplay(..., PUBLIC, ...)` 抛
+`Requires ADD_MIRROR_DISPLAY, CAPTURE_VIDEO_OUTPUT or CAPTURE_SECURE_VIDEO_OUTPUT permission`。
+→ 改用 `OWN_CONTENT_ONLY`（display 变 `FLAG_PRIVATE`），但**私有虚显不能再 `startActivity(launchDisplayId=…)`**
+（`SecurityException: Permission Denial … with launchDisplayId=29`）→ 改用 `Presentation` 挂窗口（`PRIVATE_PRESENTATION`），
+且必须在**有 Looper 的线程**创建（binder 回调线程直接 new Presentation 会 `Can't create handler inside thread`）。
+
+**坑 4：待机卡片会把画布改成母版尺寸，和真帧尺寸打架。**
+屏幕流 SETUP 后立刻发母版卡片（1280x720）是为了"车机不黑屏"，但 CarLife 实际编码是 1920x1080：
+```
+CASTHOST: prepareCast 画布 1920x1080@320dpi surface=true
+VIDEO: 画布 1920x1080 → 1280x720（母版卡片）
+CARLIFE: VIDEO 读到 768B …            ← 真帧是 1920x1080
+```
+车机按 1280x720 配解码器、却收到 1920x1080 的流 → **解码器起不来，永远停在自己的母帧**。
+→ 待机卡片只在"从未收到过真帧"时插；真帧来过之后不再插。
+
+**坑 5（决定性）：真帧到达时必须按它自己的 SPS/PPS 重发一次 VideoConfig。**
+```rust
+// engine.rs 视频泵，首个真帧：
+if !real_config_sent {
+    let sps = …nal_type==7; let pps = …nal_type==8;
+    s.set_size(real_size);                    // CarLife 实际编码尺寸（1920x1080）
+    s.send_config(build_avcc(sps, pps));      // 车机按真帧重配解码器
+    real_config_sent = true;
+}
+```
+**加完这一条，画面立刻出来了**（`VIDEO: 按真帧重发 VideoConfig（画布 Some((1920, 1080))）`）。
+
+另外两个配套修复：
+- **单实例保证**：`nativeStart` 先取出旧 `ENGINE` 句柄并 `notify` 停止 —— 否则两个视频泵同时改画布尺寸（日志里能看到两个不同 TID 在互相覆盖）。
+- **CMD 重连策略**：重连时**不再重发 `VIDEO_ENCODER_INIT`**（会重置编码器），但**要补发 `VIDEO_ENCODER_START`**（否则 CarLife 不再编码）。
+
+### 26.4 分辨率：车机不下发就用自定义
+
+- DiPlay 这类接收端**连接时不下发分辨率** → 用设置里的自定义值（本次设为 **2400×1080**，`PROBE_RESET_RES` 广播可随时改）；
+- CarLife 收到 `VIDEO_ENCODER_INIT 2400x1080` 后**夹到 1920×1080**（`prepareCast 1920x1080@320dpi`），这属正常；
+- 我们最终以 **CarLife 报告的实际编码尺寸**为准重发 VideoConfig，所以夹取不影响出画。
+
+### 26.5 成功现场（21:57:35）
+
+```
+10-27 21:57:35.733  VIDEO: 按真帧重发 VideoConfig（画布 Some((1920, 1080))）
+10-27 21:57:35.733  VIDEO: 画布 1280x720 → 1920x1080（跟随手机实际编码分辨率）
+                    → 车机屏出现：黑底 + 青色 "HyperCar CAST OK" + 跳动时钟 + 每秒换一次的底色
+```
+
+### 26.6 下一步
+
+1. **把验证页换成真正的车机界面**：`CastDisplay.buildProbeView()` → 正式首页（Dock + 地图卡片 + 音乐卡片）；
+2. 触摸回传：`PRIVATE_PRESENTATION` 窗口收不到车机触摸，需要把 AirPlay HID 事件注入到这块虚显
+   （普通应用没有 `INJECT_EVENTS`，计划走 Shizuku 的 `IInputManager.injectInputEvent(displayId=虚显)`）；
+3. 音频：CarLife 的 9240/9241 已经在读，确认能进 AirPlay 的音频流。
+
+### 26.7 代码清单（截至 0.1.0.238，**均未提交**）
+
+`carlife/CastHostService.kt`、`carlife/CarLifeCastHostBinder.kt`、`carlife/CastDisplay.kt`、
+`carlife/CastProbeActivity.kt`（保留未用）、`session/HyperCarRepo.kt`、`session/DebugProbeReceiver.kt`、
+`settings/SettingsStore.kt`、`AndroidManifest.xml`、`rust-core/src/engine.rs`、`rust-core/src/carlife.rs`、`rust-core/src/lib.rs`。

@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.settings
+package io.github.hypercar.settings
 
 import android.content.Context
 import android.content.SharedPreferences
@@ -126,11 +126,11 @@ object SettingsStore {
 
 
     var carlifeWidth: Int
-        get() = p().getInt(KEY_WIDTH, 2560)
+        get() = p().getInt(KEY_WIDTH, 2400)
         set(v) = p().edit().putInt(KEY_WIDTH, v.coerceAtLeast(2)).apply()
 
     var carlifeHeight: Int
-        get() = p().getInt(KEY_HEIGHT, 744)
+        get() = p().getInt(KEY_HEIGHT, 1080)
         set(v) = p().edit().putInt(KEY_HEIGHT, v.coerceAtLeast(2)).apply()
 
     var carlifeFps: Int
@@ -261,6 +261,7 @@ object SettingsStore {
         deviceBluetoothMac: String,
         identityPath: String,
         mdHost: String? = null,
+        carlifeOnly: Boolean = false,
     ): String {
         fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
         return buildString {
@@ -273,6 +274,7 @@ object SettingsStore {
             append("\"fps\":").append(carlifeFps).append(",")
             append("\"enable_audio\":").append(enableAudio).append(",")
             append("\"keep_alive_stats\":").append(keepAliveStats).append(",")
+            if (carlifeOnly) append("\"carlife_only\":true,")
             // 主动拨号模式：探测到本机 CarLife（MD）自己在 7240 监听时传 "127.0.0.1"，
             // Rust 就会逐个拨这 6 条通道，而不是去 bind（两边抢端口必有一边 EADDRINUSE）。
             if (!mdHost.isNullOrBlank()) {

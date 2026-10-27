@@ -250,6 +250,8 @@ object HyperCarRepo {
 
     /** 上一次 `am start` 拉起 CarLife 的时间（uptimeMillis），用于避免 300ms 内重复拉起。 */
     @Volatile
+    /** 是否处于 CARLIFE-ONLY 调试模式（不接 CarPlay，需要单独收尾）。 */
+    private var carLifeOnlyMode = false
     private var carLifeLaunchedAt: Long = 0L
 
     /** CarLife 握手完成（`carlife_active`）的时间戳，握手看门狗用它判断是否卡住。 */
@@ -294,6 +296,19 @@ object HyperCarRepo {
     private var boundNetwork: Network? = null
 
     fun init(context: Context) {
+        // 投屏宿主（ICarLifeCastManager）→ 统一日志与画布回调（见 carlife/CarLifeCastHostBinder.kt）
+        io.github.hypercar.carlife.CarLifeCastHostBinder.logger = { line -> log(line) }
+        io.github.hypercar.carlife.CarLifeCastHostBinder.onPrepareCast = { w, h, dpi, surface ->
+            log("CASTHOST: prepareCast 画布 ${w}x${h}@${dpi}dpi surface=${surface != null}")
+            // 建虚显（sink = CarLife 的编码面）并把验证页启动上去（carlife/CastDisplay.kt）
+            val ctx = appContext()
+            if (ctx != null && surface != null) {
+                runCatching { io.github.hypercar.carlife.CastDisplay.attach(ctx, w, h, dpi, surface) }
+                    .onFailure { log("CAST-DISPLAY: attach 失败 ${it.message}") }
+            } else {
+                log("CAST-DISPLAY: 跳过（ctx=${ctx != null} surface=${surface != null}）")
+            }
+        }
         if (initialized) return
         synchronized(this) {
             if (initialized) return
@@ -408,6 +423,15 @@ object HyperCarRepo {
     }
 
     fun disconnect() {
+        // CARLIFE-ONLY（调试）模式没走状态机，必须在这里显式收尾，否则界面永远停在"协商中"
+        if (carLifeOnlyMode) {
+            carLifeOnlyMode = false
+            runCatching { RustCoreBridge.nativeStop() }
+            runCatching { io.github.hypercar.carlife.CastDisplay.release() }
+            push(link = LinkState.Idle)
+            log("CARLIFE-ONLY: 已停止并释放虚显")
+            return
+        }
         // 用户主动断开：不再自动重连
         userDisconnectRequested = true
         reconnectJob?.cancel()
@@ -648,6 +672,14 @@ object HyperCarRepo {
             // 进程杀掉，新实例虽然也 bind 7240，却**不回 Phase 1**（空壳）。
             // 2026-10-26 13:54 现场：22.758 连上 → 22.869 我们 am start → 22.767 通道断开
             // → 23.77 新实例、一直"握手进行中（Phase 1: 等版本匹配）"。
+        // **顺序很关键**：CarLife 只在"编码器初始化"那一刻问宿主 use_carlife_opengl。
+        // 所以必须在发 VIDEO_ENCODER_INIT 之前就把我们的宿主 Service 绑上（= 冒充 CarWith）。
+        runCatching {
+            // 注意：这里要绑的是真正提供投屏服务的 CarLife，不是 CarWith（CarWith 没有我们的宿主实现）
+            val pkg = resolveCastHostCarLifePackage()
+            log("CASTHOST: 会话开始前先绑定宿主 target=$pkg")
+            io.github.hypercar.carlife.CastHostService.startCarLifeSession(appContext() ?: return@runCatching, pkg)
+        }.onFailure { log("CASTHOST: 预绑定失败 ${it.message}") }
             if (isLocalPortListening(CARLIFE_CMD_PORT)) {
                 log("WAKE: CarLife 已在监听 7240——跳过拉起（避免触发单实例重启）")
                 _snapshots.value = _snapshots.value.copy(carLife = CarLifeState.Waiting())
@@ -904,6 +936,7 @@ object HyperCarRepo {
      * 既打扰车机，也会不断制造「ACL 断开」事件。
      */
     private fun releaseSessionResources() {
+        runCatching { io.github.hypercar.carlife.CastDisplay.release() }
         val wasDialMode = carLifeDialMode
         carLifeDialMode = false
         sessionMdHost = null
@@ -1660,6 +1693,52 @@ object HyperCarRepo {
         }
         log("WAKE: ⚠ 设备上没有 CarLife 系 app（候选：${carLifePackageCandidates.joinToString(", ")}）")
         return configured
+    }
+
+    /** 给调试广播用：返回当前实际可用的 CarLife 包名（优先已安装的候选）。 */
+    fun resolveInstalledCarLifePackage(context: Context): String {
+        init(context)
+        return resolveCarLifePackage()
+    }
+
+    /**
+     * 调试用：**只跑 CarLife 那一段**（绑宿主 → CMD 握手 → 读 8240 帧），完全不碰蓝牙/iAP2/AirPlay。
+     * 用 `am broadcast -a io.github.hypercar.PROBE_CARLIFE_ONLY -p io.github.hypercar` 触发。
+     * 判定标准：日志里 `CARLIFE-ONLY: 累计 N 帧` 是否持续增长。
+     */
+    fun startCarLifeOnly(context: Context, pkgOverride: String? = null) {
+        carLifeOnlyMode = true
+        userDisconnectRequested = false
+        // 先停掉可能还在跑的旧引擎，否则会和新会话互相踢（"停止信号 → VIDEO_ENCODER_PAUSE"）
+        runCatching { if (RustCoreBridge.nativeIsRunning()) RustCoreBridge.nativeStop() }
+        Thread.sleep(400)
+        io.github.hypercar.carlife.CastDisplay.release()
+        init(context)
+        val pkg = pkgOverride ?: resolveCastHostCarLifePackage()
+        log("CARLIFE-ONLY: 目标 $pkg；先绑定投屏宿主")
+        io.github.hypercar.carlife.CastHostService.startCarLifeSession(context, pkg)
+        val identity = context.filesDir.resolve("carlife_only_identity.txt")
+        ensurePairingIdentity(context, identity)
+        val pair = ParcelFileDescriptor.createSocketPair()
+        val fd = pair[0].detachFd()
+        pair[1].close()
+        val json = SettingsStore.engineConfigJson(
+            carIp = "127.0.0.1",
+            airplayPort = 1,
+            deviceBluetoothMac = SettingsStore.stableDeviceId,
+            identityPath = identity.absolutePath,
+            carlifeOnly = true,
+        )
+        val ok = RustCoreBridge.nativeStart(json, fd, socketProvider)
+        log("CARLIFE-ONLY: nativeStart=$ok（只跑 CarLife，不做 AirPlay）")
+    }
+
+    /** 投屏宿主绑定只认这两种包（CarWith 不实现我们的宿主 Service，绑了也没用）。 */
+    private fun resolveCastHostCarLifePackage(): String {
+        val ctx = appContext() ?: return "com.baidu.carlife.xiaomi"
+        return listOf("com.baidu.carlife", "com.baidu.carlife.xiaomi")
+            .firstOrNull { p -> runCatching { ctx.packageManager.getPackageInfo(p, 0) }.isSuccess }
+            ?: "com.baidu.carlife"
     }
 
     /**

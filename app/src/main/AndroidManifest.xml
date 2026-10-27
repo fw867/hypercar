@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
@@ -100,18 +100,32 @@
         </activity>
 
         <!-- 秒连链路：上车（车机蓝牙 ACL 连上）冷启动进程 → 前台服务 → 全自动协商 -->
-        <service
+                <!-- 投屏验证页：由 CastDisplay 启动到 CarLife 提供的虚显上 -->
+        <activity
+            android:name=".carlife.CastProbeActivity"
+            android:exported="false"
+            android:resizeableActivity="true"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+<service
             android:name=".autowake.HyperCarService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice|microphone" />
 
         <!-- ACL 广播在隐式广播例外清单内，清单静态注册可拉起被杀进程 -->
         <!-- 调试：adb 广播触发 CarLife 投屏 AIDL 探测（结果写 files/cast_probe.txt） -->
-        <receiver
+                <!-- CarLife 的投屏宿主（ICarLifeCastManager 实现）：CarLife 会 bindService 到这里，
+             所以必须 exported；不加 intent-filter，靠显式组件绑定。 -->
+        <service
+            android:name=".carlife.CastHostService"
+            android:exported="true"
+            android:foregroundServiceType="connectedDevice" />
+<receiver
             android:name=".session.DebugProbeReceiver"
             android:exported="true">
             <intent-filter>
                 <action android:name="io.github.hypercar.PROBE_CAST" />
+                <action android:name="io.github.hypercar.PROBE_CARLIFE_ONLY" />
+                <action android:name="io.github.hypercar.PROBE_RESET_RES" />
                 <action android:name="io.github.hypercar.PROBE_CONNECT" />
                 <action android:name="io.github.hypercar.PROBE_EXPERIMENT" />
                 <action android:name="io.github.hypercar.PROBE_DISCONNECT" />

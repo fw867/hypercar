@@ -714,6 +714,7 @@ async fn handle_cmd_client(
     let mut start_retries: u32 = 0;
     // 本会话重新计"首帧"：上一轮的 true 不能让这一轮的补发逻辑失效
     VIDEO_FIRST_FRAME_RECEIVED.store(false, std::sync::atomic::Ordering::Relaxed);
+    SESSION_STARTED.store(false, std::sync::atomic::Ordering::Relaxed);
 
     // Phase 1：HU 主动发协议版本
     if !send_cmd(&mut wr, CMD_HU_PROTOCOL_VERSION, &proto_version_payload()).await {
@@ -894,7 +895,7 @@ async fn handle_cmd_client(
                 }
                 CMD_MD_AUTHEN_RESULT => {
                     emit_log("CARLIFE: [Phase 5] ← MD_AUTHEN_RESULT —— 连接建立");
-                    if !hs.encoder_init_sent {
+                    if !hs.encoder_init_sent && !SESSION_STARTED.load(std::sync::atomic::Ordering::Relaxed) {
                         // 用**当前**编码分辨率（/info 已按车机真实尺寸写入），
                         // 但要先规整成手机编码器更稳的尺寸：宽度封顶 1920、宽高 16 对齐。
                         // 2560×744（744/16=46.5）这类值在部分机型上会让 MediaCodec 静默失败，
@@ -963,6 +964,7 @@ async fn handle_cmd_client(
                             return;
                         }
                         hs.encoder_start_sent = true;
+                        SESSION_STARTED.store(true, std::sync::atomic::Ordering::Relaxed);
                         emit_log("CARLIFE: [Phase 7] → VIDEO_ENCODER_START —— 握手完成，开始推流");
                         emit_state("carlife_active", "CarLife 已开始推流");
                         // 紧接着要求手机 CarLife 进入 Home（投屏）界面：
@@ -1409,6 +1411,12 @@ fn even(v: u32) -> u32 {
 /// 是否已经从 8240 收到过至少一帧 H.264（没收到前，CMD 侧会周期性补发
 /// VIDEO_ENCODER_START，避免"START 发出时 CarLife 还在后台、Surface 未就绪"被吞掉）。
 pub(crate) static VIDEO_FIRST_FRAME_RECEIVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 本轮会话是否已经发出过 VIDEO_ENCODER_START：
+/// CMD 通道被 MD 关掉后我们会重连，**重连时不能再发 INIT/START**——
+/// 那会重置 CarLife 的编码器（GL/渲染源跟着重建），表现为帧刚来就断、车机退回待机卡片。
+pub(crate) static SESSION_STARTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// 把请求的编码分辨率规整成手机硬件编码器更稳的尺寸：
