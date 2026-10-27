@@ -19,8 +19,7 @@ class DebugProbeReceiver : BroadcastReceiver() {
             when (intent.action) {
                 "io.github.hypercar.PROBE_EXPERIMENT" -> {
                     // 一键打开「CarLife 优先启动」实验并立刻连接，省得手动翻设置页
-                    io.github.hypercar.settings.SettingsStore.carlifeFirst = true
-                    HyperCarRepo.connect(context)
+                                HyperCarRepo.connect(context)
                 }
                 "io.github.hypercar.PROBE_CONNECT" -> HyperCarRepo.connect(context)
                 "io.github.hypercar.PROBE_RESET_RES" -> {

@@ -911,6 +911,42 @@ private fun ResolutionSection() {
     var heightText by rememberSaveable { mutableStateOf(SettingsStore.carlifeHeight.toString()) }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionLabel(text = "CarLife 编码分辨率（兜底值）")
+        // **档位选择**（2026-10-28）：公版 CarLife 只支持两种比例——
+        //   16:9（最高 1920×1080）、24:9（最高 1920×720）。
+        // 宝马车机中控原生就是 1920×720（8:3≈24:9），选「宝马」可做到 1:1 零拉伸。
+        val presets = listOf(
+            Triple("宝马 1920×720（24:9，零拉伸）", 1920, 720),
+            Triple("通用 1920×1080（16:9，最清晰）", 1920, 1080),
+        )
+        GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                presets.forEach { (label, w, h) ->
+                    val selected = widthText == w.toString() && heightText == h.toString()
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable {
+                                widthText = w.toString()
+                                heightText = h.toString()
+                                SettingsStore.carlifeWidth = w
+                                SettingsStore.carlifeHeight = h
+                                io.github.hypercar.settings.SettingsRevision.bump()
+                            }
+                            .padding(vertical = 8.dp, horizontal = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(selected = selected, onClick = null)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = label,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (selected) MintGreen else TextSecondary,
+                        )
+                    }
+                }
+            }
+        }
         GlassPanel(
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 16.dp),
         ) {

@@ -545,7 +545,7 @@ pub async fn run_engine(
                         // CarLife 每 26ms 送一块、速率精确 44100，数据源很稳；
                         // 200ms 预缓冲会在"队列抽空→重攒"时插入 200ms 静音，反而是最严重的卡顿来源。
                         const SAMPLES_PER_MS: usize = (TARGET_RATE as usize / 1000) * 2; // 立体声
-                        let prebuf = 40 * SAMPLES_PER_MS;
+                        let prebuf = 80 * SAMPLES_PER_MS;   // 吸收 CarLife 切后台/GC 时 130ms 的憋包间隔
                         if !audio_started {
                             if media_mix.len() >= prebuf {
                                 audio_started = true;
@@ -600,18 +600,22 @@ pub async fn run_engine(
                         // 接收端会表现为 late/discontinuity 增长、听感断续。
                         if rate_mark.elapsed() >= Duration::from_secs(1) {
                             let secs = rate_mark.elapsed().as_secs_f64().max(0.001);
+                            // **只在真异常时输出**（2026-10-28，用户反馈刷屏）：
+                            // 欠载（饿着车机）或整秒完全没收到 PCM。正常播放时完全静默。
+                            let abnormal = diag_underrun > 0;   // 只在真正欠载（饿着车机）时才报
+                            if abnormal {
                             emit_log(&format!(
-                                "AUDIO: 发包 {:.0}/s（应 {:.0}/s） 队列 media={}ms tts={}ms 欠载={} 最低={}ms 块={}({}B) 最大间隔={}ms",
+                                "AUDIO: 发包 {:.0}/s（应 {:.0}/s） 队列 media={}ms 欠载={} 最低={}ms 块={}({}B) 最大间隔={}ms",
                                 sent_packets as f64 / secs,
                                 TARGET_RATE as f64 / SPF as f64,
                                 media_mix.len() * 1000 / (TARGET_RATE as usize).max(1) / 2,
-                                tts_mix.len() * 1000 / (TARGET_RATE as usize).max(1) / 2,
                                 diag_underrun,
                                 if diag_min_q == u32::MAX { 0 } else { diag_min_q },
                                 diag_chunks,
                                 diag_bytes,
                                 diag_max_gap_ms
                             ));
+                            }
                             diag_underrun = 0;
                             diag_min_q = u32::MAX;
                             diag_chunks = 0;

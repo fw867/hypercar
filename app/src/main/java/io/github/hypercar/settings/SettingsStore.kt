@@ -126,7 +126,7 @@ object SettingsStore {
 
 
     var carlifeWidth: Int
-        get() = p().getInt(KEY_WIDTH, 2400)
+        get() = p().getInt(KEY_WIDTH, 1920)   // 公版 CarLife 宽上限 1920（16:9 支持到 1920x1080）
         set(v) = p().edit().putInt(KEY_WIDTH, v.coerceAtLeast(2)).apply()
 
     var carlifeHeight: Int
@@ -142,6 +142,7 @@ object SettingsStore {
         set(v) = p().edit().putBoolean(KEY_ENABLE_AUDIO, v).apply()
 
     /** 唤醒目标 CarLife 系 app 的包名（CarLife / CarWith 的 CarLife 兼容 / 荣耀车联）。 */
+    @Deprecated("已废弃：目标固定 com.baidu.carlife")
     var carlifePackage: String
         get() = p().getString(KEY_CARLIFE_PKG, "com.baidu.carlife") ?: "com.baidu.carlife"
         set(v) = p().edit().putString(KEY_CARLIFE_PKG, v).apply()

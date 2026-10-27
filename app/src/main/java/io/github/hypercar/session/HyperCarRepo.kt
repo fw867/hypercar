@@ -1,4 +1,4 @@
-package io.github.hypercar.session
+﻿package io.github.hypercar.session
 
 import android.bluetooth.BluetoothDevice
 import android.content.Context
@@ -98,35 +98,6 @@ object HyperCarRepo {
      * 用户看到的现象正是「装了新版本后车机上没有 CarPlay 图标了」。
      * 现在保留链路、按 2.5s 间隔重试 [AIRPLAY_MAX_ATTEMPTS] 次，仍不行才真失败。
      */
-    /**
-     * 实验（`SettingsStore.carlifeFirst`）：**先**把 CarLife 拉到前台，等它把蓝牙相关的
-     * 初始化折腾完，**再**启动 iAP2 监听/出站。
-     *
-     * 动机：2015 版协议明确"手机端 CarLife 在前台才产视频，不在前台只发 length=0 心跳包"，
-     * 这解释了 `Qin:0`；但 CarLife 一起前台就会抢蓝牙顶断 iAP2（2026-10-26 16:31 现场）。
-     * 如果它的抢蓝牙只是一次性启动动作，把顺序反过来两者就能共存。
-     */
-    private suspend fun experimentWakeCarLifeFirst() {
-        log("EXPERIMENT: 先拉 CarLife 到前台——等它做完蓝牙初始化，再起 iAP2")
-        val r = runCatching {
-            ShizukuTools.exec(
-                "am start -n com.baidu.carlife.xiaomi/com.baidu.carlife.CarlifeActivity",
-                8_000,
-            )
-        }.getOrNull()
-        log(
-            "EXPERIMENT: am start exit=${r?.code} " +
-                r?.out?.lineSequence()?.firstOrNull().orEmpty().take(100),
-        )
-        val adapter = runCatching { android.bluetooth.BluetoothAdapter.getDefaultAdapter() }.getOrNull()
-        for (i in 1..3) {
-            kotlinx.coroutines.delay(1_500)
-            val on = runCatching { adapter?.isEnabled }.getOrNull()
-            val bonded = runCatching { adapter?.bondedDevices?.size }.getOrNull()
-            log("EXPERIMENT: 第 ${i * 1500}ms —— BT enabled=$on 已配对=$bonded")
-        }
-        log("EXPERIMENT: 开始启动 iAP2（若紧接着出现 BT: 启动… 说明共存尝试开始）")
-    }
     private fun retryAirplayOrFail(detail: String) {
         // 车机主动关掉控制通道时**不要重试同一个端点**：它紧接着会把 7000 的监听也关掉，
         // 之后每次重试都是 ECONNREFUSED（2026-10-25 22:32 现场：6 轮 × 2.5s 全是拒连，
@@ -270,9 +241,6 @@ object HyperCarRepo {
     private var castBinder: android.os.IBinder? = null
 
     /** CarLife 的 IDisplayController（startDisplay/stopDisplay）。 */
-    @Volatile
-    private var castDisplayController: android.os.IBinder? = null
-
     /** 已推给车机的视频帧数（`onStats` 每秒刷新），自动取证用。 */
     @Volatile
     private var lastVideoFrames: Long = 0L
@@ -306,15 +274,8 @@ object HyperCarRepo {
         // 投屏宿主（ICarLifeCastManager）→ 统一日志与画布回调（见 carlife/CarLifeCastHostBinder.kt）
         io.github.hypercar.carlife.CarLifeCastHostBinder.logger = { line -> log(line) }
         io.github.hypercar.carlife.CarLifeCastHostBinder.onPrepareCast = { w, h, dpi, surface ->
-            log("CASTHOST: prepareCast 画布 ${w}x${h}@${dpi}dpi surface=${surface != null}")
-            // 建虚显（sink = CarLife 的编码面）并把验证页启动上去（carlife/CastDisplay.kt）
-            val ctx = appContext()
-            if (ctx != null && surface != null) {
-                runCatching { io.github.hypercar.carlife.CastDisplay.attach(ctx, w, h, dpi, surface) }
-                    .onFailure { log("CAST-DISPLAY: attach 失败 ${it.message}") }
-            } else {
-                log("CAST-DISPLAY: 跳过（ctx=${ctx != null} surface=${surface != null}）")
-            }
+            // 公版自渲染，不会走 prepareCast；留着只为日志可观测（小米版路线已放弃，见 docs/ARCHIVE-CARWITH-XIAMI.md）
+            log("CASTHOST: prepareCast 画布 ${w}x${h}@${dpi}dpi surface=${surface != null}（公版自渲染下不应出现）")
         }
         if (initialized) return
         synchronized(this) {
@@ -446,7 +407,6 @@ object HyperCarRepo {
         connectJob?.cancel()
         connectJob = null
         runCatching { RustCoreBridge.nativeStop() }
-        runCatching { io.github.hypercar.carlife.CastDisplay.release() }
         runCatching { iap2?.stop() }
         iap2 = null
         runCatching { ctrlAdvertiser?.stop() }
@@ -471,7 +431,6 @@ object HyperCarRepo {
         if (carLifeOnlyMode) {
             carLifeOnlyMode = false
             runCatching { RustCoreBridge.nativeStop() }
-            runCatching { io.github.hypercar.carlife.CastDisplay.release() }
             push(link = LinkState.Idle)
             log("CARLIFE-ONLY: 已停止并释放虚显")
             return
@@ -555,10 +514,6 @@ object HyperCarRepo {
                         "断HFP/A2DP=${p.dropProfilesBeforeIap2} 档案A退场=${p.abortWhenCarPlayWindowClosed} " +
                         "保iAP2=${p.keepIap2AliveOnly}",
                 )
-            }
-            // ---- 实验：先拉 CarLife，再起 iAP2（SettingsStore.carlifeFirst，默认关）----
-            if (SettingsStore.carlifeFirst) {
-                experimentWakeCarLifeFirst()
             }
             val coordinator = Iap2Coordinator(
                 context,
@@ -1006,7 +961,6 @@ object HyperCarRepo {
      * 既打扰车机，也会不断制造「ACL 断开」事件。
      */
     private fun releaseSessionResources() {
-        runCatching { io.github.hypercar.carlife.CastDisplay.release() }
         // **冻结/恢复小米定制版：只在"连接周期"结束时恢复一次**（2026-10-27 23:3x）。
         // 之前每次掉线都 `pm enable`，CarWith 立刻把小米版拉起来跟公版抢 7240，
         // 自动重连那一轮就必然撞车。现在：
@@ -1690,16 +1644,10 @@ object HyperCarRepo {
                 "carlife_waiting" -> push(carLife = CarLifeState.Waiting())
                 // Rust 侧 CarLife 14 步握手完成（VIDEO_ENCODER_START 已发）
                 "carlife_active" -> {
-                    // CarLife 收到 LAUNCH_MODE_NORMAL 会 `openHome()` 把自己的主页弹到前台
-                    // （反编译 CarlifeHsgHandler:293）。它需要这条命令才会进投屏态，
-                    // 但我们不需要用户看见它 → 过 3 秒用 Shizuku 把我们自己拉回前台，
-                    // CarLife 留在后台继续编码（视频通路不受影响，已实测）。
-                    scope.launch {
-                        kotlinx.coroutines.delay(3_000)
-                        runCatching {
-                            ShizukuTools.exec("am start -n io.github.hypercar/.ui.MainActivity", 5_000)
-                        }.onSuccess { log("CARLIFE: 已把 HyperCar 拉回前台（CarLife 留在后台继续推流）") }
-                    }
+                    // **不再抢回前台**（2026-10-28 用户反馈）：公版 CarLife 的**导航需要它
+                    // 自己在前台**（退到后台后地图不刷新）。我们之前 3 秒后用 Shizuku 把
+                    // HyperCar 拉回来，结果导航会停住。现在保持 CarLife 前台；
+                    // 用户要操作本 App 时自己切回去即可（后台推流不受影响）。
                     push(carLife = CarLifeState.Active())
                     carLifeActiveAt = SystemClock.uptimeMillis()
                     // CarWith 用 ICarLifeManager.register + IDisplayController.startDisplay 让
@@ -1774,7 +1722,7 @@ object HyperCarRepo {
 
     /** 实际可用的唤醒包名：设置里配的优先；没装就自动换一个装了的，并把换的结果写进日志。 */
     private fun resolveCarLifePackage(): String {
-        val configured = SettingsStore.carlifePackage
+        val configured = "com.baidu.carlife"
         val ctx = appContext() ?: return configured
         fun installed(p: String) = runCatching { ctx.packageManager.getPackageInfo(p, 0) }.isSuccess
         // **公版优先**（2026-10-27 22:53 实测）：只有公版 `com.baidu.carlife` 的
@@ -1822,7 +1770,6 @@ object HyperCarRepo {
         // 先停掉可能还在跑的旧引擎，否则会和新会话互相踢（"停止信号 → VIDEO_ENCODER_PAUSE"）
         runCatching { if (RustCoreBridge.nativeIsRunning()) RustCoreBridge.nativeStop() }
         Thread.sleep(400)
-        io.github.hypercar.carlife.CastDisplay.release()
         init(context)
         val pkg = pkgOverride ?: resolveCastHostCarLifePackage()
         log("CARLIFE-ONLY: 目标 $pkg；先绑定投屏宿主")
@@ -2182,7 +2129,7 @@ object HyperCarRepo {
      */
     private fun stopLocalCarLife(wasDialMode: Boolean) {
         val ctx = appContext() ?: return
-        val configured = SettingsStore.carlifePackage
+        val configured = "com.baidu.carlife"
         for (action in listOf(
             "com.baidu.carlife.Action.StopWireless",
             "com.baidu.carlife.Action.Disconnect",
@@ -2251,13 +2198,12 @@ object HyperCarRepo {
                     "「开始录制/投放」请点允许；没有弹窗时可在 Shizuku 里执行 " +
                     "`appops set com.baidu.carlife.xiaomi PROJECT_MEDIA allow`",
             )
-            dumpCarLifeDiag()
         }
     }
 
     /** 强杀本机 CarLife 后重新拉起（只用于空壳自愈）。 */
     private fun restartLocalCarLife() {
-        if (!SettingsStore.carlifeEnabled) return
+        // （carlifeEnabled 已废弃：CarLife 是画面唯一来源，永远启用）
         scope.launch {
             for (pkg in listOf("com.baidu.carlife.xiaomi", "com.baidu.carlife")) {
                 runCatching { ShizukuTools.exec("am force-stop $pkg", 4_000) }
@@ -2859,103 +2805,6 @@ object HyperCarRepo {
     }
 
     /**
-     * 诊断：把当前所有 display 打进行日志（判断有没有可投的副屏/虚拟屏）。
-     *
-     * 用途：排查副屏/虚拟屏（历史上的「CarLife 启动屏」设置已删除，这里只留诊断能力）——
-     * 在副屏（如 10）上跑。这里直接读 `dumpsys display`，把 id/名称/尺寸/flags 打出来，
-     * 就不用连电脑查了。仅当有 Shizuku 时可用（`dumpsys` 需要 shell 权限）。
-     */
-    fun dumpDisplays() {
-        if (!ShizukuTools.isReady) {
-            log("DISP: 需要 Shizuku 才能读 display 列表（dumpsys display）——先授权再点一次")
-            return
-        }
-        scope.launch {
-            val r = runCatching {
-                ShizukuTools.exec(
-                    "dumpsys display | grep -E 'mDisplayId=|DisplayDeviceInfo\\{|DisplayInfo\\{|mDisplayName=' | head -60",
-                    10_000,
-                )
-            }.getOrNull()
-            if (r == null || r.code != 0) {
-                log("DISP: dumpsys display 失败 exit=${r?.code} ${r?.out?.take(120).orEmpty()}")
-                return@launch
-            }
-            val lines = r.out
-                .lineSequence()
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .take(40)
-                .toList()
-            // 只认出 id 个数，先给一行结论，细节跟在后面
-            val ids = lines.mapNotNull { Regex("mDisplayId=(\\d+)").find(it)?.groupValues?.get(1) }
-                .distinct()
-            log(
-                "DISP: 共 ${lines.size} 行，含 display id = " +
-                    if (ids.isEmpty()) "（没解析到，往下看原始行）" else ids.joinToString(", ") +
-                        "；主屏=0，要投副屏就填上面出现的非 0 id",
-            )
-            lines.forEach { log("DISP: $it") }
-        }
-    }
-
-    /**
-     * 诊断：抓 CarLife 的"现场"，用来定位「握手全过、8240 一帧没有」这类问题。
-     *
-     * 抓三样东西（都只读，不改行为）：
-     *  ① Activity 是否真的在前台（`dumpsys activity activities`）；
-     *  ② 它有没有 Surface（`dumpsys SurfaceFlinger --list`——没有 Surface 就没有编码输入）；
-     *  ③ logcat 里 CarLife / MediaCodec / `video-debug` 相关最后几十行（编码器有没有输出）。
-     *
-     * 只在有 Shizuku 时可用；输出截断到 40 行、每行 200 字符，避免把环形日志刷满。
-     */
-    fun dumpCarLifeDiag() {
-        if (!ShizukuTools.isReady) {
-            log("DIAG: 需要 Shizuku 才能抓 CarLife 现场（dumpsys/logcat）——先授权再点一次")
-            return
-        }
-        scope.launch(Dispatchers.IO) {
-            suspend fun run(prefix: String, cmd: String, maxLines: Int) {
-                val r = runCatching { ShizukuTools.exec(cmd, 12_000) }.getOrNull()
-                if (r == null) {
-                    log("$prefix: 执行失败（无输出）")
-                    return
-                }
-                val lines = r.out.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
-                log("$prefix: exit=${r.code}，${lines.size} 行")
-                lines.take(maxLines).forEach { log("$prefix ${it.take(200)}") }
-            }
-            log("DIAG: ==== CarLife 现场开始 ====")
-            run(
-                "DIAG-ACT",
-                "dumpsys activity activities | grep -iE 'carlife|mResumedActivity|topResumedActivity' | head -6",
-                6,
-            )
-            run(
-                "DIAG-SF",
-                "dumpsys SurfaceFlinger --list | grep -iE 'carlife|SurfaceView|Video' | head -10",
-                10,
-            )
-            run(
-                "DIAG-ENC",
-                "logcat -d -t 2000 | grep -iE 'video-debug' | tail -6",
-                6,
-            )
-            run(
-                "DIAG-LOG",
-                "logcat -d -t 3000 | grep -iE 'carlife|video-debug|avcE_|MediaCodec' | tail -30",
-                30,
-            )
-            log("DIAG: ==== CarLife 现场结束 ====")
-            // 顺手探一下 CarLife 的投屏 AIDL（CarWith 就是靠它驱动投屏的）
-            probeCarLifeCastBinder()
-            // 顺便把 register/getDisplayController/startDisplay 这套也跑一遍：
-            // 不需要先连车机，点一次「CarLife」就能看到结果。
-            startCarLifeDisplay()
-        }
-    }
-
-    /**
      * 探测 CarLife 的投屏 AIDL 通道（`com.baidu.carlife.mixing.aidl.ICarLifeCastManager`）。
      *
      * 逆向 CarLife APK 得到：
@@ -3091,7 +2940,6 @@ object HyperCarRepo {
                                 val ctrl = displayController(service, tag)
                                 probeLog("CAST: getDisplayController(\"$tag\") = $ctrl")
                                 if (ctrl == null) continue
-                                castDisplayController = ctrl
                                 // startDisplay 的参数可能是 client 的 displayName（key）而不是 pkgName：
                                 // 两个都试，各看一次 displays。
                                 val keys = when (tag) {
@@ -3121,7 +2969,6 @@ object HyperCarRepo {
 
                     override fun onServiceDisconnected(name: android.content.ComponentName?) {
                         log("CAST: RemotePresentationService 断开")
-                        castDisplayController = null
                     }
                 },
                 android.content.Context.BIND_AUTO_CREATE,

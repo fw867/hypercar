@@ -1,4 +1,4 @@
-//! CarLife HU（车机）侧网关——严格按 CarLifeWirelessBox / apollo-DuerOS 的 HU 实现重构。
+﻿//! CarLife HU（车机）侧网关——严格按 CarLifeWirelessBox / apollo-DuerOS 的 HU 实现重构。
 //!
 //! 我们扮演「车机」，本机 CarLife / CarWith(CarLife 兼容) / 荣耀车联 作为「手机(MD)」连回
 //! 127.0.0.1 的一组标准端口。
@@ -1021,10 +1021,7 @@ async fn handle_cmd_client(
                         .map(|b| format!("{b:02X}"))
                         .collect::<Vec<_>>()
                         .join(" ");
-                    emit_log(&format!(
-                        "CARLIFE: [捕获] CMD 0x{other:08x}（{}B）：{hex}",
-                        payload.len()
-                    ));
+                    let _ = (&hex, other);   // 逐包 hex dump 已禁用（2026-10-28）
                 }
             }
         }
@@ -1282,7 +1279,7 @@ async fn handle_media_client(
     let is_video = matches!(kind, MediaKind::Video);
     let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
     let mut chunk = [0u8; 65536];
-    let mut rate: u32 = 48_000;
+    let mut rate: u32 = 44_100;   // CarLife 音乐默认 44100Hz（实测 43~44 块/秒 × 4096B）
     let mut channels: u8 = 2;
     // 视频通道诊断：CarLife 握手全过、音频 136/s 正常，但车机上一直是待机卡片
     // （2026-10-26 00:24 现场：没有任何 VideoFrame 产出）。这里把前几次读到的东西打出来，
@@ -1383,23 +1380,6 @@ async fn handle_media_client(
                             let _ = events.send(CarLifeEvent::AudioStop { tts });
                         }
                         MEDIA_DATA | TTS_DATA => {
-                            // **一次性取证**：CarLife 的 MEDIA 负载可能带 PCM 包头（SDK 里就有
-                            // `makePCMPackageHead`）。16bit 立体声每样本帧 4 字节，若长度不是 4 的
-                            // 整数倍，几乎可以断定包头混进了 PCM —— 车机听到的"破音"就是它。
-                            if !tts && media_probe < 3 {
-                                media_probe += 1;
-                                let head: Vec<String> = payload
-                                    .iter()
-                                    .take(16)
-                                    .map(|b| format!("{b:02X}"))
-                                    .collect();
-                                emit_log(&format!(
-                                    "CARLIFE: MEDIA 负载 {}B（%4={}）头: {}",
-                                    payload.len(),
-                                    payload.len() % 4,
-                                    head.join(" ")
-                                ));
-                            }
                             if !payload.is_empty() {
                                 // **剥掉 12 字节 PCM 包头**（2026-10-27 23:56 定案）：
                                 // 反编译 `PCMPackageHead` 明确 mMediaHeadLen=12/mTTSHeadLen=12，
@@ -1454,7 +1434,7 @@ pub(crate) static SESSION_STARTED: std::sync::atomic::AtomicBool =
 /// **不再压到 1920 宽**：CarWith 自己的分辨率设置里最大支持 2560×2560（2026-10-26 实测），
 /// 说明手机侧能直接出 2560 宽的流；压到 1920 反而白丢清晰度。
 /// 例：2560×744 → 2560×752（只做 16 对齐，宽高比 3.41 与 2560/744 基本一致）。
-const CARLIFE_ENCODER_MAX_WIDTH: u32 = 2560;
+const CARLIFE_ENCODER_MAX_WIDTH: u32 = 1920;   // 公版 CarLife 实测只支持 1920 宽（2026-10-28）
 /// 高度上限（CarWith 设置界面同样支持到 2560）。只用于防御异常值。
 const CARLIFE_ENCODER_MAX_HEIGHT: u32 = 2560;
 
@@ -1545,8 +1525,10 @@ fn parse_audio_init(bytes: &[u8]) -> (u32, u32) {
         }
     }
     let get = |f: u32| fields.iter().find(|(k, _)| *k == f).map(|(_, v)| *v as u32);
-    let rate = get(3).or_else(|| get(1)).unwrap_or(0);
-    let channels = get(4).or_else(|| get(2)).unwrap_or(0);
+    // 官方 CarlifeMusicInitProto：1=sampleRate 2=channelConfig 3=sampleFormat(16)
+    let rate = get(1).filter(|r| (8_000..=96_000).contains(r)).or_else(|| get(3).filter(|r| (8_000..=96_000).contains(r))).unwrap_or(44_100);
+    let raw_ch = get(2).or_else(|| get(4)).unwrap_or(2);
+    let channels = match raw_ch { 1 | 4 | 16 => 1, _ => 2 };
     (rate, channels)
 }
 

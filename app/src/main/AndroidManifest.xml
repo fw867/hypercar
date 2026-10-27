@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
@@ -101,11 +101,6 @@
 
         <!-- 秒连链路：上车（车机蓝牙 ACL 连上）冷启动进程 → 前台服务 → 全自动协商 -->
                 <!-- 投屏验证页：由 CastDisplay 启动到 CarLife 提供的虚显上 -->
-        <activity
-            android:name=".carlife.CastProbeActivity"
-            android:exported="false"
-            android:resizeableActivity="true"
-            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
 <service
             android:name=".autowake.HyperCarService"
             android:exported="false"

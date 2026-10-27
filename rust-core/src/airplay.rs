@@ -276,12 +276,21 @@ pub async fn negotiate(
     // 设置里的分辨率只是"用户以为的"，实际以 `/info` 为准：两侧不一致时
     // 车机要把小画面拉伸整屏（发虚），所以这里直接改成车机原生尺寸。
     if disp_w >= 320 && disp_h >= 240 {
-        let target = (even(disp_w.max(2)), even(disp_h.max(2)));
+        // **把车机尺寸换算成 CarLife 支持的档位**（2026-10-28）：
+        // 公版编码器只吃两种比例——16:9（≤1920×1080）和 24:9（≤1920×720），
+        // 直接下发 2400×1080 / 2732×794 会被它自己乱夹（实测 2400×1088 → 1920×720）。
+        // 所以这里按宽高比吸附到最近档位，并保持 1920 宽（它的上限）。
+        let aspect = disp_w as f64 / disp_h.max(1) as f64;
+        let target = if aspect >= 2.4 {
+            (1920u32, 720u32) // 24:9 —— 宝马 1920×720 正好命中，1:1 零拉伸
+        } else {
+            (1920u32, 1080u32) // 16:9 —— 更宽的车机（如 2732×794=3.44）会横向拉伸
+        };
         let prev = *p.encoder_size.lock();
         *p.encoder_size.lock() = target;
         emit_log(&format!(
-            "AIRPLAY: 分辨率来源 = 车机下发（/info {}x{}）→ 请求 CarLife 按 {}x{} 编码；App 设置 {}x{} 仅兜底",
-            disp_w, disp_h, target.0, target.1, p.width, p.height
+            "AIRPLAY: 分辨率来源 = 车机下发（/info {}x{}，比例 {:.2}）→ 吸附到 CarLife 档位 {}x{}（宽上限 1920）；App 设置 {}x{} 仅兜底",
+            disp_w, disp_h, aspect, target.0, target.1, p.width, p.height
         ));
         if prev != target {
             // CarLife 的 VIDEO_ENCODER_INIT 可能已经用旧尺寸发过（握手先后不定），
