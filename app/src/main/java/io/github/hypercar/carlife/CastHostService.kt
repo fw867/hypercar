@@ -16,6 +16,8 @@ class CastHostService : Service() {
 
     override fun onBind(intent: Intent?): IBinder {
         Log.i(TAG, "CASTHOST: onBind extras=${intent?.extras}")
+        boundAt = System.currentTimeMillis()
+        bound = true
         return CarLifeCastHost.binder()
     }
 
@@ -28,6 +30,30 @@ class CastHostService : Service() {
         private const val TAG = "HyperCar"
 
         const val ACTION_START = "io.github.hypercar.action.START_CAST_HOST"
+
+        /** 本次会话绑定的是哪个 CarLife 包（决定 GL 回答策略）。 */
+        @Volatile
+        var targetPackage: String = ""
+            internal set
+
+        /** 是否已经被 CarLife 绑定过（runConnect 会等它，保证"先绑宿主再握手"）。 */
+        @Volatile
+        var bound: Boolean = false
+            private set
+
+        @Volatile
+        var boundAt: Long = 0L
+            private set
+
+        /** 等 CarLife 调 onBind（最多 [timeoutMs]）。 */
+        fun awaitBound(timeoutMs: Long): Boolean {
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (System.currentTimeMillis() < deadline) {
+                if (bound) return true
+                Thread.sleep(100)
+            }
+            return bound
+        }
 
         /** CarLife 的会话入口 Service（exported=true，不需要权限）。 */
         const val CARLIFE_CONNECT_SERVICE = "com.baidu.carlife.service.CarlifeConnectService"
@@ -59,6 +85,7 @@ class CastHostService : Service() {
                 context.startService(Intent(context, CastHostService::class.java))
             }.onFailure { Log.w(TAG, "CASTHOST: 自身 Service 预启动失败 $it") }
 
+            targetPackage = carLifePackage
             val intent = Intent().apply {
                 setClassName(carLifePackage, CARLIFE_CONNECT_SERVICE)
                 putExtra("bindPackageName", pkg)
@@ -80,6 +107,7 @@ class CastHostService : Service() {
 
         /** 断开：让 CarLife 解绑宿主（它内部会 unBindService + 结束会话）。 */
         fun stopCarLifeSession(context: Context, carLifePackage: String): Boolean = runCatching {
+            targetPackage = carLifePackage
             val intent = Intent().apply {
                 setClassName(carLifePackage, CARLIFE_CONNECT_SERVICE)
                 action = "com.baidu.carlife.action.STOP_CAST"

@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.session
+package io.github.hypercar.session
 
 import android.bluetooth.BluetoothDevice
 import android.content.Context
@@ -674,18 +674,38 @@ object HyperCarRepo {
             // → 23.77 新实例、一直"握手进行中（Phase 1: 等版本匹配）"。
         // **顺序很关键**：CarLife 只在"编码器初始化"那一刻问宿主 use_carlife_opengl。
         // 所以必须在发 VIDEO_ENCODER_INIT 之前就把我们的宿主 Service 绑上（= 冒充 CarWith）。
-        runCatching {
-            // 注意：这里要绑的是真正提供投屏服务的 CarLife，不是 CarWith（CarWith 没有我们的宿主实现）
-            val pkg = resolveCastHostCarLifePackage()
-            log("CASTHOST: 会话开始前先绑定宿主 target=$pkg")
-            io.github.hypercar.carlife.CastHostService.startCarLifeSession(appContext() ?: return@runCatching, pkg)
-        }.onFailure { log("CASTHOST: 预绑定失败 ${it.message}") }
+        // 而且**必须先唤醒 CarLife 再绑定**：包在 force-stop/stopped 状态下，
+        // 别处的 startService 会被系统直接丢掉（2026-10-27 22:31 现场：Phase 7 都完成了，
+        // 我们的 onBind 一次都没发生 → CarLife 不问 use_carlife_opengl → 一帧不出）。
+            // **冻结小米定制版**（2026-10-27 22:53 实测）：只要它还活着，CarWith 就会把它
+            // 拉起来并占住 7240，公版 CarLife 的会话会被它抢走（表现为"公版连上但一帧不出"）。
+            // `am force-stop` 挡不住 CarWith 的 bindService/广播重启，必须 `pm disable-user` 冻结。
+            // 冻结后公版才能独占 7240。。恢复：pm enable --user 0 com.baidu.carlife.xiaomi
+            freezeXiaomiCarLifeIfPublicPresent()
             if (isLocalPortListening(CARLIFE_CMD_PORT)) {
                 log("WAKE: CarLife 已在监听 7240——跳过拉起（避免触发单实例重启）")
                 _snapshots.value = _snapshots.value.copy(carLife = CarLifeState.Waiting())
             } else {
                 wakeLocalCarLife()
             }
+
+        runCatching {
+            val bindPkg = resolveCastHostCarLifePackage()
+            if (bindPkg == "com.baidu.carlife") {
+                // **公版走 ScreenCarlifeImpl 自渲染，根本不需要宿主**（2026-10-27 22:55 实测成功：
+                // 车机上直接出现 CarLife 自己的车机界面）。它不会 bind 我们的 CastHostService，
+                // 所以这里什么都别做——否则白等 15 秒 awaitBound，还会打一条误导性的"超时未完成"。
+                log("CASTHOST: 公版 CarLife 自渲染，无需绑定宿主（跳过）")
+            } else {
+                log("CASTHOST: 绑定宿主 target=$bindPkg")
+                io.github.hypercar.carlife.CastHostService.startCarLifeSession(
+                    appContext() ?: return@runCatching,
+                    bindPkg,
+                )
+                val bound = io.github.hypercar.carlife.CastHostService.awaitBound(15_000)
+                log("CASTHOST: 宿主绑定 ${if (bound) "已完成" else "超时未完成（可能不渲染）"}")
+            }
+        }.onFailure { log("CASTHOST: 绑定失败 ${it.message}") }
 
             // ---- 连 AirPlay 控制端口并移交 FD ----
             push(link = LinkState.Negotiating("连接车机 AirPlay 端口"))
@@ -1686,11 +1706,20 @@ object HyperCarRepo {
         val configured = SettingsStore.carlifePackage
         val ctx = appContext() ?: return configured
         fun installed(p: String) = runCatching { ctx.packageManager.getPackageInfo(p, 0) }.isSuccess
-        // 小米这套的角色分工（2026-10-26 00:36 实测）：
+        // **公版优先**（2026-10-27 22:53 实测）：只有公版 `com.baidu.carlife` 的
+        // `isCarLifeApp()==true`，会走 `ScreenCarlifeImpl` **自己渲染车机界面**
+        // （百度地图/音乐/Dock），我们只负责转发 8240 —— 这条路才能真正免自绘。
+        // 小米定制版 `.xiaomi` 永远把编码面交给宿主（CarWith 或我们），拿不到原生界面；
+        // 而且它一旦在跑就会占住 7240，把公版的会话抢掉，所以公版存在时必须优先用公版。
+        if (installed("com.baidu.carlife")) {
+            if (configured != "com.baidu.carlife") {
+                log("WAKE: 装了公版 com.baidu.carlife → 优先用它（能自渲染车机界面），配置值=$configured 忽略")
+            }
+            return "com.baidu.carlife"
+        }
+        // 没公版时才退回小米这套：
         //   com.miui.carlink（CarWith）  = 有界面、能拉起，负责"CarLife 连接"入口；
-        //   com.baidu.carlife.xiaomi     = 真正的 CarLife 引擎，**没有 Launcher 界面**，
-        //                                  `monkey -p` 拉它什么都不会发生。
-        // 所以即使设置里填的是引擎包，只要同时装了 CarWith，就优先用 CarWith。
+        //   com.baidu.carlife.xiaomi     = 真正的 CarLife 引擎，**没有 Launcher 界面**。
         if (installed("com.miui.carlink") && configured != "com.miui.carlink") {
             log("WAKE: 配置的是 $configured（引擎包，无界面），改用它上层的 CarWith（com.miui.carlink）来拉起")
             return "com.miui.carlink"
@@ -1744,6 +1773,30 @@ object HyperCarRepo {
     }
 
     /** 投屏宿主绑定只认这两种包（CarWith 不实现我们的宿主 Service，绑了也没用）。 */
+    /**
+     * 公版 CarLife 在场时**冻结**小米定制版，避免它抢占 7240…
+     *
+     * 背景（2026-10-27 22:53 实测）：小米版只要还活着，CarWith 就会通过 bindService/广播
+     * 把它重新拉起来占住 7240 —— 我们的握手于是连到小米版，而小米版永远把画面交给宿主
+     * （不自渲染），表现就是"公版连上了却一帧不出 / 只出母帧"。
+     * `am force-stop` 挡不住 CarWith 的重启，必须 `pm disable-user` 冻结（可随时 `pm enable` 恢复）。
+     */
+    private suspend fun freezeXiaomiCarLifeIfPublicPresent() {
+        val ctx = appContext() ?: return
+        fun installed(p: String) = runCatching { ctx.packageManager.getPackageInfo(p, 0) }.isSuccess
+        if (!installed("com.baidu.carlife") || !installed("com.baidu.carlife.xiaomi")) return
+        if (!ShizukuTools.isReady) {
+            log("WAKE: ⚠ Shizuku 未就绪，无法冻结小米版 CarLife（它可能抢占 7240）")
+            return
+        }
+        val st = runCatching {
+            ShizukuTools.exec("pm disable-user --user 0 com.baidu.carlife.xiaomi", 8_000)
+        }.getOrNull()
+        log("WAKE: 冻结小米版 CarLife exit=${st?.code} " +
+            st?.out?.lineSequence()?.firstOrNull().orEmpty().take(80))
+        runCatching { ShizukuTools.exec("am force-stop com.baidu.carlife.xiaomi", 5_000) }
+    }
+
     private fun resolveCastHostCarLifePackage(): String {
         val ctx = appContext() ?: return "com.baidu.carlife.xiaomi"
         return listOf("com.baidu.carlife", "com.baidu.carlife.xiaomi")
@@ -1924,16 +1977,27 @@ object HyperCarRepo {
             //      → startTcpListener() → ConnectManager.startAcceptThread()
             //    也就是说：**进程一起来，7240/8240/… 就开始监听了**，不需要任何 Activity。
             //    这正是 CarWith 的做法（它从来不给用户看那个页面）。
-            val svc = "$pkg/com.baidu.carlife.service.CarlifeConnectService"
-            val hostPkg = appContext()?.packageName ?: "io.github.hypercar"
+            // ③ 拉起 CarLife 进程。
+            //    **公版 `com.baidu.carlife` 必须开它的界面**：它走 `ScreenCarlifeImpl`
+            //    （`createCarlifeSurface()` + `CarLifePresentationController.showCarlifePresentaion()`），
+            //    那个 Presentation 需要 Activity 存在才会被挂上；只 `startservice` 会让它
+            //    进程起来、7240 也监听，但**没有任何画面**（2026-10-27 22:53 实测：用
+            //    `monkey -p com.baidu.carlife` 拉起界面后编码器立刻 STARTED，8240 有帧）。
+            //    小米版则相反：它不需要界面，`startservice` 即可（避免它弹设置页）。
+            val isPublicBuild = (pkg == "com.baidu.carlife")
             val started = runCatching {
-                ShizukuTools.exec(
-                    "am startservice -n $svc --es bindPackageName $hostPkg " +
-                        "--es bindClassName io.github.hypercar.carlife.CastHostService --ei usb_type 0",
-                    8_000,
-                )
+                if (isPublicBuild) {
+                    ShizukuTools.exec("am start -n com.baidu.carlife/.CarlifeActivity", 8_000)
+                } else {
+                    ShizukuTools.exec(
+                        "am startservice -n $pkg/com.baidu.carlife.service.CarlifeConnectService " +
+                            "--es bindPackageName ${appContext()?.packageName ?: "io.github.hypercar"} " +
+                            "--es bindClassName io.github.hypercar.carlife.CastHostService --ei usb_type 0",
+                        8_000,
+                    )
+                }
             }.getOrNull()
-            log("WAKE: ③ 启动 CarLife 服务（不开界面）exit=${started?.code} " +
+            log("WAKE: ③ 拉起 CarLife(${if (isPublicBuild) "公版/界面" else "小米版/服务"}) exit=${started?.code} " +
                 started?.out?.lineSequence()?.firstOrNull().orEmpty().take(120))
             // 等端口起来；起不来才退回"打开引擎页"（这一步会露出 CarLife 的设置页，属兜底）
             var up = false

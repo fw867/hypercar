@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.carlife
+package io.github.hypercar.carlife
 
 import android.content.Intent
 import android.os.Bundle
@@ -102,14 +102,31 @@ class CarLifeCastHostBinder : android.os.Binder() {
      *
      * 其余动作先只记录、返回 null（= 宿主不支持），后续按需补。
      */
+    /** 8 位十六进制设备号（CarWith 用蓝牙 MAC 后 8 位；我们给稳定伪值即可）。 */
+    private fun deviceIdHex(): String =
+        (io.github.hypercar.settings.SettingsStore.stableDeviceId.replace(":", "").takeLast(8))
+            .ifEmpty { "00000000" }
+
     private fun answerAction(action: String?, extras: Bundle?): Bundle? {
         return when (action) {
             ACTION_USE_OPENGL -> Bundle().apply {
-                // 实验（0.1.0.232）：回答 0 = OPENGL_CLOSE。
-                // 这样 CarLife 走 ScreenRealImpl.getVirtualSurface() → 直接把【编码器输入面】
-                // 交给宿主，我们的 VirtualDisplay 就能绕过它的 GL 合成线程直接写像素。
-                putInt("use_opengl_type", 0)
-                putBoolean("use_opengl", false)
+                // 按目标包决定（2026-10-27 23:0x）：
+                //  · 公版 com.baidu.carlife：答 1（OPENGL_OPEN）→ 它 isCarLifeApp()=true，
+                //    走 ScreenCarlifeImpl **自己渲染车机界面**（我们不自绘）；
+                //  · 小米版 .xiaomi：答 0（OPENGL_CLOSE）→ 它把编码面交给宿主（自绘那条已被否，仅留兼容）。
+                val isPublic = !io.github.hypercar.carlife.CastHostService.targetPackage.endsWith(".xiaomi")
+                putInt("use_opengl_type", if (isPublic) 1 else 0)
+                putBoolean("use_opengl", isPublic)
+            }
+            // CarLife 会问宿主这两项（CarWith 的 k.r() 里就是这些 key）：
+            ACTION_REQUEST_DEVICE_ID -> Bundle().apply {
+                putString("device_id", deviceIdHex())
+            }
+            ACTION_ENCODE_FORMAT -> Bundle().apply {
+                // 横屏：给宿主画布尺寸 + I 帧间隔（CarWith 亦如此）
+                putInt("width", 1920)
+                putInt("height", 1080)
+                putInt("i-frame-interval", 2)
             }
             else -> null
         }
@@ -128,6 +145,9 @@ class CarLifeCastHostBinder : android.os.Binder() {
         private const val TRANSACTION_INVOKE_METHOD = 5
 
         /** `Actions.CarLife.CARLIFE_USE_OPENGL` */
+        /** `carlife_request_device_id` / `carlife_encode_format`（CarWith 的 k.r() 里同名 action） */
+        const val ACTION_REQUEST_DEVICE_ID = "carlife_request_device_id"
+        const val ACTION_ENCODE_FORMAT = "carlife_encode_format"
         const val ACTION_USE_OPENGL = "use_carlife_opengl"
 
         /** CarLife 事件回调（由 [CarLifeCastHost] 注入，避免这里直接依赖 Repo）。 */

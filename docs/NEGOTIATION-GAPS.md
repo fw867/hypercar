@@ -2105,3 +2105,99 @@ if !real_config_sent {
 1. 用 Shizuku 在**独立的虚拟屏**上启动 `CarlifeActivity`（`am start --display <id>`），它的 `openHome()` 就落在隐藏屏上，不打扰主屏；
 2. 或者继续深挖：`isLaunchInit` 为 true 时走的是 `dispatchMessage(4001, MSG_ARG_SHOW_FIRST_HOME)` + `openHome()`，
    看能否只在 `prepareCast` 之后驱动 `VIDEO_ENCODER_START` + 心跳而不发 LAUNCH_MODE。
+---
+
+## 27. 最终形态：公版 CarLife 自渲染 + 我们只做管道（2026-10-27 22:55 打通）
+
+> **结论**：车机上的界面是 **CarLife 自己画的**（`ScreenCarlifeImpl`），触摸也由 CarLife 自己处理
+> （车机 HID → 我们 → CarLife CTRL 9340 → 它自己点自己的界面）。我们这边**零 UI 代码**：
+> 只做「8240 取帧 → AirPlay 推流」和「HID 事件 → CarLife 触摸通道」。
+
+### 27.1 之前所有"母帧 / 无帧"的真正原因：小米定制版占着 7240
+
+小米这套里 CarWith 会**不停把 `com.baidu.carlife.xiaomi` 拉起来**（`CarlifeKeepAliveService`），
+它一旦在跑就占住 7240：
+
+```
+我们以为在跟公版握手 → 实际连的是小米版
+小米版 isCarLifeApp()=false → 永远把编码面交给宿主（它自己从不渲染）
+→ prepareCast 有了、宿主也绑了，但"车机界面"永远不会出现 → 母帧 / 闪屏
+```
+
+`am force-stop com.baidu.carlife.xiaomi` 挡不住 CarWith 的重启，**必须冻结**：
+
+```
+adb shell pm disable-user --user 0 com.baidu.carlife.xiaomi      # 恢复: pm enable --user 0 …
+```
+
+冻结后单独跑公版，编码器立刻开始工作（实测）：
+
+```
+MediaCodec: [avcE_610] state STARTED Stats 5033ms:Client:com.baidu.carlife,Component:c2.qti.avc.encoder
+CARLIFE-ONLY: VIDEO 读到 … ×10
+```
+
+### 27.2 公版为什么能自渲染（反编译）
+
+```java
+// MixPhoneStrategy.makeScreenImpl()
+needReal() = openglRenderType()==0 || ==2          // 公版非 mix 品牌 → openglRenderType() 返回 1 → false
+if (isCarLifeApp()) return new ScreenCarlifeImpl(); // 公版 true → 自己画
+// ScreenCarlifeImpl.prepareCarLifeCast():
+//   createCarlifeSurface() + CarLifePresentationController.showCarlifePresentaion()
+//   → 百度地图 / 音乐 / Dock 全由它渲染进它自己的编码器 → 8240
+```
+
+**注意：它需要自己的 Activity 存在**（`Presentation` 要挂在 Activity 上）。
+只 `startservice` 的话进程起来、7240 也监听，但**没有任何画面**——
+所以公版必须用 `am start -n com.baidu.carlife/.CarlifeActivity` 唤醒。
+
+代码上按包区分（`HyperCarRepo.wakeLocalCarLife()` 第③步）：
+
+```kotlin
+val isPublicBuild = (pkg == "com.baidu.carlife")
+if (isPublicBuild) "am start -n com.baidu.carlife/.CarlifeActivity"        // 公版：要界面
+else              "am startservice -n $pkg/…CarlifeConnectService …"      // 小米版：不要界面
+```
+
+### 27.3 公版不需要宿主（别再去绑它）
+
+公版走 `ScreenCarlifeImpl`，**不会 bind 我们的 `CastHostService`**。
+之前每次连接都白等 15 秒 `awaitBound` 并打一条误导性的"超时未完成"。现在跳过：
+
+```kotlin
+if (bindPkg == "com.baidu.carlife") log("CASTHOST: 公版 CarLife 自渲染，无需绑定宿主（跳过）")
+else { startCarLifeSession(...); awaitBound(15_000) }
+```
+
+### 27.4 CarWith 路线为何放弃（四条门，全在非 root 之外）
+
+| 门 | 证据 |
+|---|---|
+| 启动 `CarlinkService` 要签名权限 | manifest `permission="miui.carlink.permission.START_CARLINKSERVICE"`，`protectionLevel=0x3`(signatureOrSystem) |
+| `CarlifeConnService` 校验调用方 UID | `i()` 只认 `com.baidu.carlife(.xiaomi)`，否则 `SecurityException("Caller is not an authorized CarLife application")` |
+| 会开始投屏的界面全非导出 | `CastingActivity`/`TransparentActivity`/`CarLifeConnectActivity`… `exported=false` |
+| 私有虚显不能放别人 Activity | `createVirtualDisplay(PUBLIC)` 要 `ADD_MIRROR_DISPLAY`；`startActivity(launchDisplayId=私有屏)` 抛 SecurityException |
+
+（唯一例外：CarLife **确实能** bind CarWith 的 `CarlifeConnService`——`exported=true`，实测
+`Start proc … for bound-service {com.miui.carlink/com.xiaomi.ucar.carlife.CarlifeConnService}`；
+但它被绑上后只注册触摸/音频监听并把状态存库，**不会**去启 `CarlinkService`，所以拿不到界面。）
+
+### 27.5 成功现场（22:55，车机出现 CarLife 车机界面 + 触摸可用）
+
+```
+WAKE: 冻结小米版 CarLife exit=0  Package com.baidu.carlife.xiaomi new state: disabled-user
+WAKE: ③ 拉起 CarLife(公版/界面) exit=0  Starting: Intent { cmp=com.baidu.carlife/.CarlifeActivity }
+[Phase 7] → VIDEO_ENCODER_START —— 握手完成，开始推流
+VIDEO 读到 18438B（首次 2 次之一）：00 00 00 01 67 42 80 29 …   ← SPS
+VIDEO: 按真帧重发 VideoConfig（画布 Some((…))）                  ×2
+→ 车机：CarLife 车机界面（地图 + 音乐 + Dock），触摸正常
+```
+
+### 27.6 遗留 TODO
+
+1. **小米版兼容分支**保留（没装公版时退回），但要提示用户"小米版无法得到原生界面"；
+2. `overlay_display_devices`（`settings put global overlay_display_devices "1920x720/240"`）可作为后续
+   把 CarLife 的 Activity 投到**不占手机主屏**的 PUBLIC 虚显上（system_server 创建、天然 PUBLIC+TRUSTED），
+   解决"连接时 CarLife 会闪一下前台"；
+3. 音频链路（9240/9241）仍需实测确认能进 AirPlay 音频流。
