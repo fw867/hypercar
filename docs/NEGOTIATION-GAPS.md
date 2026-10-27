@@ -10,6 +10,24 @@
 > （hypercar）在采纳其骨架的同时做了两件事：① 协商整体下沉 Rust；② 按 cardeck
 > 实测协议逐项修正线格式与消息 ID。
 
+## 0. 必需环境（0.1.0.257 起的硬性前提）
+
+> 本版本的画面来自 **CarLife 自己渲染**（见 §27），因此下面两条**缺一不可**。
+> 应用在每次「启动连接」最前面就会检测（`HyperCarRepo.precheckRequiredEnvironment()`），
+> 缺任一条直接失败并给出可操作提示，日志前缀 `ENV:`。
+
+| 条件 | 为什么必须 | 缺失时的表现/提示 |
+|---|---|---|
+| **Shizuku 已启动并授权** | 只有 shell 身份能做三件事：① `pm disable-user com.baidu.carlife.xiaomi` 冻结小米定制版（否则 CarWith 不停把它拉起来抢 7240，公版永远拿不到会话）；② `am start` 拉起公版 Activity（公版的 `Presentation` 必须挂在 Activity 上）；③ 静默入网 / 读取真实蓝牙 MAC | 日志 `ENV: ✗ 环境未就绪：Shizuku 未启用。请先启动 Shizuku…`，连接不开始 |
+| **已安装公版 `com.baidu.carlife`**（应用宝「百度 CarLife+」） | 只有公版 `isCarLifeApp()==true`，走 `ScreenCarlifeImpl` **自己渲染车机界面**（地图/音乐/Dock + 触摸）；小米定制版 `.xiaomi` 永远把编码面交给宿主，拿不到原生界面 | 日志 `ENV: ✗ 环境未就绪：未安装公版 CarLife（com.baidu.carlife）…`，连接不开始 |
+
+补充说明：
+- 小米定制版 `com.baidu.carlife.xiaomi` **可以存在**（系统预装），程序会自动冻结它；
+  恢复命令：`pm enable --user 0 com.baidu.carlife.xiaomi`。
+- 冻结后 CarWith（`com.miui.carlink`）仍可正常运行，只是不再参与这条链路（它的四道门见 §27.4）。
+- 没有 Shizuku 时的降级模式（`WifiNetworkSpecifier` + 伪 MAC）**仅能连上 AirPlay**，
+  出不了 CarLife 车机界面——所以本版本把它判定为"环境未就绪"而不是"降级可用"。
+
 ## 1. 架构级差异：协商放哪边
 
 | | 参考文档 | cardeck 实测事实 | hypercar 决策 |

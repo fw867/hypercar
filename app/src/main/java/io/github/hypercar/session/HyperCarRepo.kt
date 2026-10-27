@@ -254,6 +254,13 @@ object HyperCarRepo {
     private var carLifeOnlyMode = false
     private var carLifeLaunchedAt: Long = 0L
 
+    /**
+     * 本次会话是否**冻结了小米定制版 CarLife**（`pm disable-user`）。
+     * 冻结是为了独占 7240；断开时必须 `pm enable` 恢复，否则用户连 CarWith 盒子会失效。
+     */
+    @Volatile
+    private var microXiaomiFrozen = false
+
     /** CarLife 握手完成（`carlife_active`）的时间戳，握手看门狗用它判断是否卡住。 */
     @Volatile
     private var carLifeActiveAt: Long = 0L
@@ -465,6 +472,9 @@ object HyperCarRepo {
 
     private suspend fun runConnect(context: Context) {
         try {
+            // **环境检测先于一切**：本版本（要出 CarLife 原生车机界面）必须
+            // Shizuku 就绪 + 装了公版 CarLife，缺一条就直接失败并说明怎么补。
+            if (!precheckRequiredEnvironment(context)) return
             // Shizuku 从「必须」降级为「可选增强」：没有它照样能连，只是两条路径降级——
             //  WiFi 走 WifiNetworkSpecifier（热点首连弹一次系统确认框）+ deviceID 用稳定伪 MAC。
             if (!ShizukuTools.isReady) {
@@ -957,6 +967,9 @@ object HyperCarRepo {
      */
     private fun releaseSessionResources() {
         runCatching { io.github.hypercar.carlife.CastDisplay.release() }
+        // **恢复被冻结的小米定制版 CarLife**：冻结是为了本次会话独占 7240（见 §27），
+        // 但小米版是用户"连 CarWith 盒子"时的必需品——不恢复的话断开后盒子就连不上了。
+        unfreezeXiaomiCarLifeIfNeeded()
         val wasDialMode = carLifeDialMode
         carLifeDialMode = false
         sessionMdHost = null
@@ -1792,9 +1805,34 @@ object HyperCarRepo {
         val st = runCatching {
             ShizukuTools.exec("pm disable-user --user 0 com.baidu.carlife.xiaomi", 8_000)
         }.getOrNull()
+        val ok = st != null && st.code == 0
+        if (ok) microXiaomiFrozen = true
         log("WAKE: 冻结小米版 CarLife exit=${st?.code} " +
             st?.out?.lineSequence()?.firstOrNull().orEmpty().take(80))
         runCatching { ShizukuTools.exec("am force-stop com.baidu.carlife.xiaomi", 5_000) }
+    }
+
+    /**
+     * 断开时把冻结的小米定制版**恢复**（`pm enable`）。
+     *
+     * 小米版是用户连 CarWith 盒子时的必需品：如果保持禁用，断开后想连盒子会直接连不上
+     * （用户 2026-10-27 提醒）。所以这里按"谁冻结谁恢复"的原则，在
+     * [releaseSessionResources] 里无条件收尾。
+     */
+    private fun unfreezeXiaomiCarLifeIfNeeded() {
+        if (!microXiaomiFrozen) return
+        microXiaomiFrozen = false
+        if (!ShizukuTools.isReady) {
+            log("WAKE: ⚠ Shizuku 不可用，无法恢复小米版 CarLife —— 需手动执行 pm enable --user 0 com.baidu.carlife.xiaomi")
+            return
+        }
+        scope.launch {
+            val st = runCatching {
+                ShizukuTools.exec("pm enable --user 0 com.baidu.carlife.xiaomi", 8_000)
+            }.getOrNull()
+            log("WAKE: 恢复小米版 CarLife（pm enable）exit=${st?.code} " +
+                st?.out?.lineSequence()?.firstOrNull().orEmpty().take(80))
+        }
     }
 
     private fun resolveCastHostCarLifePackage(): String {
@@ -2450,6 +2488,49 @@ object HyperCarRepo {
             return false
         }
         return true
+    }
+
+    /**
+     * **必选环境检测**（2026-10-27 定稿）：本版本要出车机界面，两个条件缺一不可。
+     *
+     * 1. **Shizuku 必须就绪** —— 只靠它才能：
+     *    · `pm disable-user com.baidu.carlife.xiaomi` 冻结小米定制版（否则 CarWith 会不停拉起它、
+     *      抢走 7240，公版永远拿不到会话 → 母帧/闪屏，见 §27）；
+     *    · `am start` 拉起公版 Activity（公版的 Presentation 必须挂在 Activity 上，只有它能开）；
+     *    · 静默入网 / 真实蓝牙 MAC。
+     * 2. **必须安装公版 CarLife（`com.baidu.carlife`）** —— 只有公版 `isCarLifeApp()==true`，
+     *    会走 `ScreenCarlifeImpl` **自己渲染车机界面**；小米定制版把编码面交给宿主，永远没有原生界面。
+     *
+     * 缺任一条就明确失败并给出可操作提示，不要带着错误前提去握手（那会以"母帧"告终，极难排查）。
+     */
+    private fun precheckRequiredEnvironment(context: Context): Boolean {
+        val pm = context.packageManager
+        fun installed(p: String) = runCatching { pm.getPackageInfo(p, 0) }.isSuccess
+        val hasPublic = installed("com.baidu.carlife")
+        val hasXiaomi = installed("com.baidu.carlife.xiaomi")
+        val shizukuOk = ShizukuTools.isReady
+        if (shizukuOk && hasPublic) {
+            log(
+                "ENV: ✓ 环境就绪（Shizuku 已启用 + 公版 CarLife" +
+                    (if (hasXiaomi) "；小米定制版会被自动冻结）" else "）"),
+            )
+            return true
+        }
+        val missing = buildList {
+            if (!shizukuOk) add("Shizuku 未启用")
+            if (!hasPublic) add("未安装公版 CarLife（com.baidu.carlife）")
+        }.joinToString("、")
+        val reason = "环境未就绪：$missing。" +
+            if (!shizukuOk && !hasPublic) {
+                "请先启动 Shizuku 并在设置里授予权限，再到应用宝安装「百度 CarLife+」公版。"
+            } else if (!shizukuOk) {
+                "请先启动 Shizuku（设置 → Shizuku 状态 → 启动）。当前版本靠它冻结小米定制版并拉起公版界面。"
+            } else {
+                "请安装公版「百度 CarLife+」（应用宝搜 CarLife）。小米定制版无法得到原生车机界面。"
+            }
+        log("ENV: ✗ $reason")
+        fail(reason)
+        return false
     }
 
     /** 降级模式成功连上车机热点后：标记首连已完成（系统确认框已批准，后续静默）。 */

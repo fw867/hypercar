@@ -1,32 +1,59 @@
-﻿# HyperCar
+# HyperCar
 
 **CarLife → AirPlay 零转码网关**：把手机上 CarLife 系应用（百度 CarLife、小米 CarWith、
 荣耀车联等）产出的 H.264 与 PCM，经 **Rust 核心层**零转码直推任意 AirPlay 接收端
 （宝马车机、Audi MIB3、WinPlay、其它 AirPlay 1/2 接收端）。
 
 
-- **手机侧**只要求它跑的是 CarLife 协议栈（iAP2 + 那 6 个标准端口），官方 CarLife、
-  小米 CarWith 的 CarLife 通道、荣耀车联都属于这一类；CarWith 只是其中一个「入口」。
+- **手机侧**只要求它跑的是 CarLife 协议栈（iAP2 + 那 6 个标准端口）。**当前版本必须用公版
+  百度 CarLife+**（`com.baidu.carlife`）：只有它的 `isCarLifeApp()==true`，会走
+  `ScreenCarlifeImpl` **自己渲染车机界面**（地图/音乐/Dock + 触摸全部由 CarLife 负责），
+  我们这边零 UI 代码。小米定制版（`com.baidu.carlife.xiaomi`）永远把编码面交给宿主，拿不到原生界面。
 - **车机侧**只要求它是 AirPlay 接收端；不同车机的行为差异（是否校验 deviceID、
   发不发 `0x4301`、端口怎么找、触摸报告几字节/指……）全部收敛在
   [车机档案](#车机档案按型号适配)里，加型号不改主流程。
 
+## 必需环境（缺一不可，App 启动连接前会自动检测）
+
+| 条件 | 为什么必须 | 缺失时 |
+|---|---|---|
+| **Shizuku 已启动并授权** | 只有 shell 身份能做三件事：① `pm disable-user com.baidu.carlife.xiaomi` 冻结小米定制版（否则 CarWith 会不停把它拉起来、抢走 7240，公版永远拿不到会话 → 母帧/闪屏）；② `am start` 拉起公版 CarLife 的 Activity（它的 `Presentation` 必须挂在 Activity 上）；③ 静默入网 / 读取真实蓝牙 MAC | 日志 `ENV: ✗ 环境未就绪：Shizuku 未启用…`，连接直接不开始 |
+| **已安装公版「百度 CarLife+」**（`com.baidu.carlife`，应用宝可下） | 只有公版会自己渲染车机界面（见上）；小米定制版没有原生界面 | 日志 `ENV: ✗ 环境未就绪：未安装公版 CarLife…`，连接直接不开始 |
+
+- 小米定制版可以存在（系统预装），程序在会话开始时**自动冻结它**、断开时**自动恢复**
+  （`pm enable --user 0 com.baidu.carlife.xiaomi`），不影响你之后用 CarWith 连盒子。
+- 没有 Shizuku 的降级模式（`WifiNetworkSpecifier` + 伪 MAC）只能连上 AirPlay，
+  **出不了 CarLife 车机界面**，所以本版本把它判定为"环境未就绪"。
+- 细节与反编译证据见 [docs/NEGOTIATION-GAPS.md](docs/NEGOTIATION-GAPS.md) §0 / §27。
+
+
 ## 两种部署形态（协议逻辑同一份）
 
 ```
-① 本机 HU（真车 / 手机自己当车机）
-   CarLife(CarWith) ──127.0.0.1──▶ hypercar_core(Rust, 在手机里) ──车机热点──▶ 车机 AirPlay
-                                        同一套协议栈                      （BMW / Audi / …）
+① 本机 HU（真车 / 手机自己当车机）——当前主线
+   公版 CarLife（自渲染界面）──127.0.0.1──▶ hypercar_core(Rust, 在手机里) ──车机热点──▶ 车机 AirPlay
+        触摸 ◀── 车机 HID ──────────────────────┘        同一套协议栈        （BMW / Audi / …）
 
 ② 盒子角色（PC 联调 / 没有真车时）
-   CarLife(CarWith) ◀──Wi-Fi── hypercar-hub(PC，当车机) ──127.0.0.1──▶ WinPlay
-                                        同一套协议栈              （任意 AirPlay 接收端）
+   CarLife ◀──Wi-Fi── hypercar-hub(PC，当车机) ──127.0.0.1──▶ WinPlay
+                        同一套协议栈                    （任意 AirPlay 接收端）
 ```
 
 > 连接方向不是写死的：**同机**时 HU 监听 `127.0.0.1:7240…`、MD 连入；
 > **盒子角色**（小米 CarWith「车辆热点 → 开始连接」实测）反过来是 **MD 监听**、
 > HU 逐个端口拨过去。两条路径分别对应 `CarLifeHub::start` / `CarLifeHub::connect`，
 > 见 [docs/CARLIFE-PROTOCOL.md](docs/CARLIFE-PROTOCOL.md)。
+
+## 首次使用（手机上要做的三件事）
+
+1. **装 Shizuku 并启动**（设置 → Shizuku 状态 → 启动/授权）。本 App 靠它冻结小米定制版、
+   拉起公版 CarLife、静默入网。
+2. **装公版「百度 CarLife+」**（`com.baidu.carlife`，应用宝搜 CarLife）。
+3. **车机端开始接收**（iDrive 里把本机选成 CarPlay 手机 / PC 联调先开 WinPlay）→
+   手机点「启动连接」。首次成功后同一台车会自动回连。
+
+App 在每次「启动连接」最前方会做环境检测（`ENV: ✓ / ✗`），缺 Shizuku 或公版 CarLife 时
+直接失败并给出补齐方式，不会带着错误前提去握手。
 
 ## 车机档案（按型号适配）
 
@@ -51,8 +78,10 @@
 
 ## 特性
 
-- **砍掉 VirtualDisplay / EGL 双屏合成**：不自绘车机桌面、无 MediaCodec、无虚拟屏，
-  手机不发热；CarLife 就是内容源，AirPlay 只差一次封帧。
+- **不自绘车机界面**：画面完全由 **CarLife 自己渲染**（公版 `ScreenCarlifeImpl` →
+  `CarlifePresentation` → 它自己的编码器），我们只做「8240 取帧 → AirPlay 推流」；
+  触摸也是「车机 HID → CarLife 的 CTRL 通道(9340) → 它自己点自己的界面」。
+  砍掉了 VirtualDisplay / EGL 双屏合成 / 自绘桌面，手机不额外发热。
 - **协商整体下沉 Rust**（/info → pair-verify → RTSP SETUP → RECORD → 三条心跳），
   Kotlin 只交「绑定车机网络的 socket FD」——协商状态机一份实现，见
   [docs/NEGOTIATION-GAPS.md](docs/NEGOTIATION-GAPS.md)。
@@ -132,8 +161,10 @@ PC 侧联调工具：
 
 ## 已知限制
 
-- **首次连接必须手动点一次**（CarWith 入口）：CarWith → CarLife 连接 → 无线连接 →
-  车辆热点 → 选车机蓝牙 → 下一步 → 开始连接。之后同一台车会自动回连（App 内有引导卡）。
+- **必须装公版 CarLife、必须开 Shizuku**（见 [必需环境](#必需环境缺一不可app-启动连接前会自动检测)）。
+  小米定制版即使存在也会被自动冻结（断开即恢复），所以不会影响你之后用 CarWith 连盒子。
+- **连接时公版 CarLife 的界面会短暂出现在手机上**：CarLife 自渲染的 `Presentation` 必须挂在它自己的
+  Activity 上，所以我们得先 `am start` 它的 Activity；画面起来后它退到后台继续编码，车机画面不受影响。
 - **部分 ROM 会把后台录音静音**：小米 HyperOS 把 CarWith 的 `RECORD_AUDIO` 锁在
   `foreground` 模式，语音助手在后台录音时拿到全静音数据（不报错但不响应）。
   真车请用「车机麦克风」让本 App 供麦（它跑前台服务）。
