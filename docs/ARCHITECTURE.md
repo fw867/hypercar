@@ -1,149 +1,72 @@
-# HyperCar 架构说明
+# 当前架构：Android 自绘车机 UI → CarPlay / AirPlay
 
-> CarDeck + CarLife **零转码**网关：砍掉耗电的 VirtualDisplay 与 EGL 双屏合成，
-> 把本机 CarLife / 荣耀车联 / 小米 CarWith（CarLife 兼容）产出的 H.264 与 PCM
-> 经 Rust 核心层零转码直推 **宝马 X6（2023）ID8.5** 的 AirPlay 接收端。
->
-> 两种部署形态（协议实现同一份，只是「谁监听」不同）：
-> - **本机 HU**：`hypercar_core` 跑在手机里，CarLife 连回 `127.0.0.1:7240…`；
-> - **盒子角色**：`rust-core/hub` 跑在车机侧（PC/WinPlay 联调），CarWith 的
->   「车辆热点 → 开始连接」让 MD 先监听，HU 再逐个端口拨过去。
->
-> 硬件环境：手机 = Android 17 / HyperOS 4；车机 = BMW iD8.5（MGU-86）。
+更新：2026-10-29。对应当前默认分支 `feat/carplay-only-ui`。
 
-## 1. 为什么砍掉 VirtualDisplay / EGL
+手机通过蓝牙 iAP2 与车机协商无线 CarPlay，再通过车机 Wi-Fi 网络建立 AirPlay 会话。
+HyperCar 自己绘制车机首页并编码视频，使用系统播放采集投送音乐。当前实现不依赖 CarLife、
+CarWith 或 PC hub，也不是将其他应用已有的 H.264 直接转发的“零转码网关”。
 
-cardeck 的老链路：手机自绘车机桌面（4 块 Shizuku 虚拟屏）→ EGL 合成 → MediaCodec
-编码 → ChaCha20 封帧推车机。这条链路的固有成本：
+## 数据路径
 
-- EGL 合成循环 + 多虚拟屏**持续烧 GPU/CPU**（车机熄火后手机照样发热）；
-- 虚拟屏/IME/方向覆盖需要一整套 Shizuku shell 维护（cardeck AGENTS 里一半的坑位
-  都在这条链上）；
-- 自绘桌面永远追不上 CarLife 生态里 App 的适配质量。
-
-hypercar 的替代：**本机 CarLife 当内容源**。手机上的 CarLife/CarWith 本来就产出
-H.264 Annex B 裸流 + PCM，与 AirPlay 推流所需的东西**只差一次封帧**——于是：
-
-```
-┌─────────────── 同一台手机 ───────────────┐
-│ CarLife / CarWith（发送端，官方 app）      │
-│      ↕ TCP 127.0.0.1（CarLife 回环）      │
-│ hypercar_core (Rust)                      │
-│   ├─ CarLife HU 服务端（7240/8240/9240…） │
-│   ├─ H.264 NAL 拆分 → avcC → 128B 头封帧  │
-│   ├─ PCM 重采样 48k → 闪避混音 → RTP      │
-│   └─ AirPlay 协商 + 推流（ChaCha20-Poly） │
-│      ↕ 车机热点 Wi-Fi（Shizuku 静默入网）  │
-└──────────────────→ 宝马 iD8.5 屏 ─────────┘
+```text
+Android 手机
+ ├─ Kotlin：iAP2 / Wi-Fi / 车机档案 / 网络绑定 socket
+ ├─ D1：CarHomeActivity（Compose 首页、设置、更多应用、关于）
+ │    ├─ 地图卡片：TextureView 接收 D2 高德画面
+ │    └─ 音乐卡片：MusicBridge / MediaSession
+ │         └─ MediaCodec Surface → H.264 Annex B → JNI
+ ├─ D2：安装版高德的同一个车联任务
+ │    ├─ 卡片态 → D1 的地图 TextureView
+ │    └─ 全屏态 → 地图编码器 Surface → H.264 Annex B → JNI
+ └─ Shizuku AudioRecord(REMOTE_SUBMIX) → PCM16 / 48kHz / 双声道 → JNI
+                         ↓
+ Rust：AirPlay 协商 / 屏幕与音频发送 / 事件接收
+                         ↓
+ 车机：无线 CarPlay 接收端
 ```
 
-零转码 = 无 MediaCodec、无 VirtualDisplay、无 EGL；CPU 只剩封帧与对称加密。
+首页与全屏地图切换时，新源等待关键帧再发送，旧源先停止推帧。全屏地图期间首页编码器暂停，
+避免同时持续编码两份画面。切回首页时保留高德任务和导航引擎，只调整窗口尺寸与输出 Surface，
+同一会话的地图 DPI 保持不变。
 
-## 2. 分层
+## Kotlin 与 Rust 的分工
 
-```
-Kotlin（薄壳 + 系统集成）
-├── session/HyperCarRepo        会话总管：秒连时序、状态快照（StateFlow→Compose）
-├── iap2/                       蓝牙 iAP2 协商：RFCOMM → 识别/MFi/0x5703/0x4301
-├── net/WifiJoiner              Shizuku 静默连车机热点 + bindProcessToNetwork
-├── net/BluetoothMac            真实蓝牙 MAC（SETUP deviceID / 0x4300 用）
-├── shizuku/ShizukuTools        shell 执行器（主线程硬守卫）
-├── autowake/                   ACL 广播唤醒 + FGS(connectedDevice)——上车秒连第一环
-└── ui/                         Compose 深空黑科技风 UI（状态监控 + 设置 + 诊断）
+| 层 | 主要职责 |
+|---|---|
+| `session/HyperCarRepo.kt` | 会话状态、连接与拆除、重连、日志、Rust 回调 |
+| `carui/CarUiCaster.kt` | 确定本次画布、启动 D1、首页编码器、触摸监听、音频采集 |
+| `carui/AmapPreview.kt` / `MapController.kt` | 保留高德任务、卡片／全屏输出切换、地图触摸 |
+| `carui/CarUiSettings.kt` / `MusicBridge.kt` | 主题壁纸、巡航偏好、播放器选择、断连暂停与重连恢复 |
+| `spike/SpikeShellService.kt` | Shizuku shell 身份建屏、更新 Surface、输入注入、系统播放采集 |
+| `spike/SpikeCaster.kt` | MediaCodec Surface 编码、输入端限帧、关键帧门控 |
+| `rust-core/src/airplay.rs` / `rtsp.rs` | `/info`、配对、SETUP、RECORD、加密控制通道、心跳与事件 |
+| `rust-core/src/engine.rs` | JNI 数据事件分发、视频泵、音频泵、原生系统 UI 请求 |
+| `rust-core/src/screen.rs` / `audio_out.rs` | H.264 配置和帧封装、PCM 音频发送 |
 
-Rust（rust-core，全部协商 + 数据面）
-├── lib.rs                      JNI 入口、运行时、引擎生命周期、回调（onState/onLog/onStats）
-├── engine.rs                   编排：CarLife 事件分发 → 视频泵/音频泵 → 统计
-├── carlife.rs                  CarLife 网关（6 标准端口；start=监听 / connect=拨 MD）
-├── airplay.rs                  AirPlay 会话：/info→pair-verify→SETUP→RECORD→心跳→HID
-├── rtsp.rs                     RTSP 通道：1422 MTU 密文帧、CSeq 异步派发、入向 200
-├── screen.rs                   屏幕流：VideoConfig/VideoFrame/keepAlive（128B 头）
-├── audio_out.rs                RTP 音频：352 SPF、SSRC=0、AAD=4..12、大端 PCM
-├── timing.rs                   NTP over RTCP 计时服务（pt 0xD2→0xD3）
-├── crypto.rs / tlv8.rs / bplist.rs / srp6a.rs / pairing.rs
-│                               HKDF/ChaCha/X25519/Ed25519、TLV8、bplist(根在字节8)、
-│                               SRP-6a(3072)、pair-setup/pair-verify 客户端
-└── iap2_nav.rs                 宝马 HUD 0x5200 导航报文构造器
-```
+## 显示尺寸、编码尺寸与触摸空间
 
-## 3. 上车秒连时序
+1. 车机 `/info` 的 `widthPixels/heightPixels` 优先，兼容旧 `width/height`。
+2. 缺失或无效时使用手机设置的 `videoWidth/videoHeight`；每次新会话清除上一接收端的临时上报值。
+3. `VideoEncodingPlan` 按此比例计算实际编码画布。当前上限为宽 1920、高 1080、约 110 万像素，
+   偶数对齐；这是软件策略，不代表手机硬件的编码极限。
+4. 默认 30 fps，用户可选 60 fps。尺寸与帧率在下次连接生效，运行中不把新设置冒充为实际编码尺寸。
+5. `nativeSetVideoSize` 回报实际编码尺寸，触摸从接收端显示空间映射到该画布。
 
-```
-拉开车门 → 车机蓝牙 ACL 连上手机
-  → CarBluetoothReceiver（清单静态，进程可被冷启动）
-  → HyperCarService.startForeground(connectedDevice)（SYSTEM_ALERT_WINDOW 豁免）
-  → AutoStart.handler → HyperCarRepo.connect
-  → Iap2Coordinator：RFCOMM（车机回连为主）→ 链路协商 → 0x1D01 → MFi 阶梯
-    → 0xAA05 后立即问候（BMW §9j）→ 0x5702 → 0x5703（热点凭据）→ 0x4301（AirPlay 端点）
-  → WifiJoiner：cmd wifi connect-network（0 弹窗）→ 轮询 status → requestNetwork 绑定
-  → Socket(车机IP:7000) connect → detachFd → RustCoreBridge.nativeStart
-  → Rust：GET /info → pair-verify → modesChanged → SETUP(/setup) → 事件通道
-    → 屏幕流 SETUP → 音频流 SETUP → RECORD → 三条心跳
-  → onState("connected") → 唤醒本机 CarLife（三级：应用内广播 → Shizuku shell 广播 →
-    monkey 拉起；包名自动纠错，HyperOS 上实际是 com.baidu.carlife.xiaomi）
-  → CarLife 连 127.0.0.1:7240… → 版本/鉴权握手 → 0x10007 下发编码尺寸
-    （默认 2560×744；手机回报实际尺寸后画布自动跟随）
-  → H.264 裸流泵入 ScreenSender；PCM 泵入混音器；车机 HID 触摸回注 CarLife
-下车：ACL 断开 → ACTION_STOP → nativeStop + iap2.stop + 网络释放
-```
+MediaCodec 在编码输入端限帧，输出端完整保留预测帧参考链。接收端能否稳定解码、持续温度和
+偶发花屏仍需实测，不能仅凭硬件能力声明或降低画质认定问题解决。
 
-断开链路的两个硬约束（2026-10-23 线上刷屏故障的教训）：
+## 原生系统 UI 与断开连接
 
-- **ACL 断开 ≠ 一定是下车**。iAP2 的「只配对、不连接」会主动断车机 HFP/A2DP
-  （个别 ROM 退到设备级断开），系统随即广播 `ACTION_ACL_DISCONNECTED`。`BtProfiles`
-  在真断开前打「自己断开」标记（6s 宽限），`CarBluetoothReceiver` 见到标记就不按
-  下车处理——否则每次建链都被自己的广播拆掉。
-- **拆除必须幂等、且 ACTION_STOP 只回灌一次**。`HyperCarRepo.runDisconnect` 用
-  `sessionLive` CAS 保证只真正拆一次；`HyperCarService` 只在 `isRunning` 由 true 变
-  false 的那次转交 handler(false)。两条缺一条就会形成
-  `handler(false) → startService(STOP) → onStartCommand → handler(false)` 自激回环：
-  每秒数百次 nativeStop，日志只剩「车机蓝牙 断开 / 会话已断开」两行，且下车后仍在刷。
-  日志层另有一道限流兜底（同一行 10s 内最多 4 次，其后折叠计数）。
+“返回车机”通过加密 AirPlay 控制通道发送 `POST /command`、`type=requestUI`，由接收端切回原生 UI。
+该操作保持 CarPlay 会话与音频通道，不调用断开，也不触发音乐暂停。WinPlay 已验证，宝马实车行为需复验。
 
-## 4. 数据面细节
+真正断连时先暂停正在播放的 MediaSession，再释放音频采集和路由。重连后等采集通道就绪再恢复。
+连接自动播放为独立偏好；手动播放控制优先。采集使用系统播放路由，不打开麦克风。
 
-- **视频**：CarLife 帧（len/ts/id + AnnexB）→ NAL 切分 → SPS/PPS 变化发
-  VideoConfig（avcC + Encrypted flag + w/h f32）→ VCL 打 4B BE 长度前缀序列 →
-  ChaCha20-Poly1305（AAD=128B 头、nonce=帧计数）→ TCP；每 400ms 节流补 keepAlive 帧。
-- **音频**：媒体（44.1k/48k 立体声）与 TTS（16k 单声道）各自线性重采样到 48k 立体声，
-  按 352 帧出包；TTS 活跃时媒体增益 0.25（400ms 尾音保持）；RTP 封包（PT=100、
-  SSRC=0、AAD=头 4..12、独立 nonce 计数、尾部 8B nonce、PCM 大端）；每秒同步包。
-- **触摸**：车机 hidSendReport（事件通道，**每指 6 字节** `[index][touch][X LE][Y LE]`，
-  最多 2 指）→ 接收端显示空间 → CarLife 编码空间缩放 → `CarlifeTouchAction`
-  **protobuf**（action/x/y/pointerx/pointery，0x68001）；iDrive 旋钮/媒体键 →
-  0x68008 硬按键（裸 u32 BE）。事件通道必须活到会话结束——`RtspChannel` 的
-  `Drop` 会关 socket（早期实现就是连上即被自己关掉，触摸全丢）。
-- **麦克风**：CarLife 语音助手要求「车机」供麦。本机 HU 用手机 `AudioRecord`
-  （16k mono）→ `nativeSendMic` → `carlife::inject_mic` → VR 通道
-  `VR_MIC_DATA 0x58001`（12 字节媒体头 + PCM）。盒子角色没有麦克风来源时，
-  在车机端设置把麦克风源切成「手机麦克风录音」。
+## 实现边界与历史文档
 
-## 5. 状态机（UI 视角）
-
-`Idle → Negotiating(步骤) → Connected(车名+时长) →（车机断开/热点消失）→ Idle`
-失败态 `Failed(原因)` 带自动重试语义；`CarLifeState: Idle → Waiting → Active`。
-所有状态由 Rust 回调 + iAP2/WiFi 层事件汇入 `HyperCarRepo.snapshots`。
-
-## 6. 与 cardeck 的关系
-
-- 继承：iAP2 协议栈与全部真车实测坑位（docs/PROTOCOL-NOTES §3/§4/§5/§9h/§9j）、
-  Shizuku 静默入网、ACL 秒连链路、AirPlay 线格式。
-- 删除：VirtualDisplay/虚拟屏、EGL 合成器、MediaCodec 编码、触摸三坐标路由、
-  隐形启动器、暗幕/真息屏（无屏可暗）、iAP2 隧道（MIB3 专属，BMW 不需要）。
-- 新增：CarLife HU 回环服务端、Rust 协商层、TTS 闪避混音、HUD 导航报文。
-
-## 7. 崩溃取证（为什么日志必须落盘）
-
-内存环形缓冲的日志在进程一死就清零——2026-10-23 20:30 连上 AirPlay 端口后 App 秒崩，
-用户「崩溃前快速点了导出」导出的也只是崩溃前的旧内容，现场全丢。现在的取证链：
-
-- `HyperCarRepo.log()` 每行同时追加到 `filesDir/hypercar-session.log` 并 flush（>1.5MB 转存 `.1`）；
-  重启时把上一轮最后 120 行带回环形缓冲，标一条「上次运行（进程重启/崩溃前）」。
-- Java 未捕获异常走 `installCrashHandler()` 写盘完整栈。
-- Rust 侧 `[profile.release]` **不用 `panic = "abort"`**：否则任何一个 `unwrap` 踩空都会让
-  进程直接消失且无痕。现在 panic 由 tokio 任务边界捕获，`lib.rs` 的看门狗把它报成
-  「引擎任务异常退出」；`nativeInitLogger` 装的 panic hook 再把 `PANIC:` 行打到 logcat。
-- 启动时（有 Shizuku 即可）`captureCrashArtifacts()` 用 shell 读 `logcat -s HyperCar-Core`
-  与 crash 缓冲区，把 `PANIC`/`Fatal signal` 行抓进日志，免 adb。
-
-
+- Shizuku 是车机虚拟屏、地图触摸注入和应用启动的必要条件；通知使用权用于音乐卡片。
+- 高德使用安装版应用的车联入口，并在不可用时回退；高德升级后需重新验证入口与窗口行为。
+- 车机档案包含 BMW、WinPlay、Audi 等适配差异，提供档案不等于所有车型均已实测。
+- `P1-CARUI.md`、`P2-MAP.md` 与早期 CarLife 协议记录保留历史排查过程；当前用户功能见
+  [README](../README.md)、[车机界面说明](CARUI-REDESIGN.md) 和 [推流检查记录](VIDEO-STREAM-REVIEW.md)。

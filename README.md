@@ -60,7 +60,7 @@ AirPlay 接收端的内容源：手机自己绘制车机界面、自己编码画
   保持 CarPlay 会话和音频通道；接收端需支持该命令。
 - **高德全屏**：D2 独立虚拟屏，高德按车机横屏布局；顶部下滑或右侧中间的悬浮主页按钮退出，
   退出后首页和高德任务都保留。
-- **音频直通**：`AudioPlaybackCapture`（REMOTE_SUBMIX）采集系统播放的 PCM，
+- **音频直通**：Shizuku 下的 `AudioRecord` / REMOTE_SUBMIX 采集系统播放的 PCM，
   经 Rust 重采样/混音后通过 AirPlay 推送；支持 QQ 音乐、汽水音乐、网易云、酷狗、酷我、
   Spotify、Apple Music、咪咕音乐等标准 MediaSession 播放器。
 - **音乐卡片**：真实封面、歌名、进度和上一首/播放/下一首；左上角图标可切换已安装的音乐 App，
@@ -115,6 +115,7 @@ docs/            架构、编译、车机档案、P1/P2 说明
 | 文档 | 内容 |
 |---|---|
 | [docs/BUILD.md](docs/BUILD.md) | 编译环境、出包、安装 |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 当前自绘 UI、地图、音频和 Rust 协议层架构 |
 | [docs/P1-CARUI.md](docs/P1-CARUI.md) | D1 自绘首页、触摸、编码器 |
 | [docs/P2-MAP.md](docs/P2-MAP.md) | D2 高德、卡片/全屏切换、触摸注入 |
 | [docs/CARUI-REDESIGN.md](docs/CARUI-REDESIGN.md) | 当前界面、截图、设置、导航与音频投送 |
