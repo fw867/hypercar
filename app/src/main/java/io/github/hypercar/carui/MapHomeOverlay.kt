@@ -16,11 +16,20 @@ import io.github.hypercar.session.HyperCarRepo
 /**
  * P2：地图全屏应用上的「返回主页」浮动按钮。
  *
- * 参照 CarLife：点全屏应用画面后，左下角浮出一个半透明圆钮；点它回 D1 首页。
- * 实现为 D2 上的 TYPE_APPLICATION_OVERLAY 小窗（只占左下角、FLAG_NOT_TOUCH_MODAL，
+ * 点全屏地图后，在左侧中间浮出一个半透明圆钮；点它回 D1 首页。
+ * 实现为地图副屏的 TYPE_APPLICATION_OVERLAY 小窗（FLAG_NOT_TOUCH_MODAL，
  * 其他区域触摸照常穿透给高德），显示 4 秒后自动收起。
  */
 object MapHomeOverlay {
+
+    private const val BUTTON_SIZE = 104
+    private const val LEFT_MARGIN = 36
+
+    /** HID hit box follows the visible button, leaving the navigation toolbar unobstructed. */
+    fun hitTest(x: Int, y: Int, displayHeight: Int): Boolean {
+        val top = (displayHeight - BUTTON_SIZE) / 2
+        return x in LEFT_MARGIN..(LEFT_MARGIN + BUTTON_SIZE) && y in top..(top + BUTTON_SIZE)
+    }
 
     private val main = Handler(Looper.getMainLooper())
 
@@ -86,17 +95,17 @@ object MapHomeOverlay {
                 }
             }
             val lp = WindowManager.LayoutParams(
-                104,
-                104,
+                BUTTON_SIZE,
+                BUTTON_SIZE,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                     WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                 PixelFormat.TRANSLUCENT,
             ).apply {
-                gravity = Gravity.BOTTOM or Gravity.START
-                x = 36
-                y = 36
+                gravity = Gravity.CENTER_VERTICAL or Gravity.START
+                x = LEFT_MARGIN
+                y = 0
             }
             manager.addView(button, lp)
             view = button

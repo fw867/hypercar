@@ -39,6 +39,7 @@ object MapController {
     private var downAt = 0L
     private var moved = false
     private var exitGesture = false
+    private var homeGesture = false
     private var touchLogs = 0
     private val touchExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
         Thread(r, "carui-map-touch").apply { isDaemon = true }
@@ -144,7 +145,7 @@ object MapController {
 
     /**
      * 高德界面实时跟手触摸：DOWN/MOVE/UP 立即异步注入 D2（mode=ASYNC），不再等松手重放。
-     * 顶部下滑（y<80 起手，下滑>120）退出地图；左下角 Home 圆钮区域直接回首页。
+     * 顶部下滑（y<80 起手，下滑>120）退出地图；左侧中间 Home 圆钮返回首页。
      */
     fun onTouch(action: Int, x: Int, y: Int): Boolean {
         if (!mapActive) return false
@@ -160,7 +161,8 @@ object MapController {
                 downAt = SystemClock.uptimeMillis()
                 moved = false
                 exitGesture = y < 80
-                if (x < 220 && y > 500) return true
+                homeGesture = MapHomeOverlay.hitTest(x, y, H)
+                if (homeGesture) return true
                 if (!exitGesture) {
                     val dt = downAt
                     touchExecutor.execute { inject(dId, 0, x, y, dt) }
@@ -172,6 +174,7 @@ object MapController {
                 if (kotlin.math.abs(x - downX) > 10 || kotlin.math.abs(y - downY) > 10) {
                     moved = true
                 }
+                if (homeGesture) return true
                 if (exitGesture) {
                     if (y - downY > 120) {
                         exitGesture = false
@@ -187,9 +190,9 @@ object MapController {
                 }
             }
             1 -> {
-                if (x < 220 && y > 500 && !moved) {
-                    MapHomeOverlay.detach()
-                    requestExit()
+                if (homeGesture) {
+                    homeGesture = false
+                    if (!moved && MapHomeOverlay.hitTest(x, y, H)) requestExit()
                     return true
                 }
                 if (exitGesture) {
@@ -209,6 +212,10 @@ object MapController {
                 touchExecutor.execute { inject(dId, 1, x, y, dt) }
             }
             3 -> {
+                if (homeGesture) {
+                    homeGesture = false
+                    return true
+                }
                 exitGesture = false
                 moved = false
                 val dt = downAt

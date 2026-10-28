@@ -33,6 +33,8 @@ object AmapPreview {
     private var height = 0
     private var fullscreen = false
     private var stopped = false
+    private var carMode = false
+    private var layoutMode = 2
 
     fun attach(texture: SurfaceTexture, w: Int, h: Int) {
         scope.launch {
@@ -44,7 +46,7 @@ object AmapPreview {
                 texture.setDefaultBufferSize(w, h)
                 cardSurface = Surface(texture)
                 if (!fullscreen && !stopped) {
-                    runCatching { route(cardSurface!!, w, h, 160) }.onFailure { failed(it) }
+                    runCatching { route(cardSurface!!, w, h, 2) }.onFailure { failed(it) }
                 }
                 previous?.release()
             }
@@ -70,7 +72,7 @@ object AmapPreview {
 
     suspend fun showFullscreen(surface: Surface, w: Int, h: Int, dpi: Int): Int = lock.withLock {
         check(!stopped) { "地图会话已停止" }
-        val id = route(surface, w, h, dpi)
+        val id = route(surface, w, h, 1)
         fullscreen = true
         id
     }
@@ -80,7 +82,7 @@ object AmapPreview {
         fullscreen = false
         val output = cardSurface
         if (output != null && output.isValid) {
-            runCatching { route(output, width, height, 160) }.onFailure { failed(it) }
+            runCatching { route(output, width, height, 2) }.onFailure { failed(it) }
         } else if (displayId > 0) {
             SpikeShell.updateDisplaySurface(displayId, null, 0, 0, 0)
         }
@@ -94,6 +96,7 @@ object AmapPreview {
                 val hadMap = displayId > 0
                 if (hadMap) SpikeShell.releaseDisplay(displayId)
                 displayId = -1
+                carMode = false
                 // The TextureView owns its SurfaceTexture until its destruction callback.
                 cardSurface?.release()
                 cardSurface = null
@@ -106,14 +109,19 @@ object AmapPreview {
         }
     }
 
-    private suspend fun route(output: Surface, w: Int, h: Int, dpi: Int): Int {
+    private suspend fun route(output: Surface, w: Int, h: Int, mode: Int): Int {
         if (displayId > 0) {
             // The installed Amap handles screen-size changes but not CONFIG_DENSITY.
             // Changing 160/240dpi recreates its activity; keep 240dpi when resizing the bounds.
             val update = SpikeShell.updateDisplaySurface(displayId, output, w, h, MAP_DPI)
             check(update.startsWith("OK")) { update }
+            if (carMode && mode != layoutMode) {
+                val layout = launchCarMap(mode, splash = false)
+                check(layout.ok && !layout.err.contains("Error")) { "车联布局切换失败: ${layout.err}" }
+                layoutMode = mode
+            }
             _status.value = ""
-            HyperCarRepo.log("CARUI-PREVIEW: 保留地图任务 $update")
+            HyperCarRepo.log("CARUI-PREVIEW: 保留地图任务 $update carMode=$carMode layout=$mode")
             return displayId
         }
         _status.value = "正在打开高德地图…"
@@ -123,23 +131,33 @@ object AmapPreview {
         val result = SpikeShell.createDisplay(output, MAP_WIDTH, MAP_HEIGHT, MAP_DPI, 0, "hypercar-map")
         displayId = Regex("id=(\\d+)").find(result)?.groupValues?.get(1)?.toIntOrNull() ?: -1
         check(displayId > 0) { "无法创建地图窗口: $result" }
-        val uri = "amapuri://drive/CarCruisePage?sourceApplication=io.github.hypercar&clearStack=1"
-        val launch = ShizukuTools.exec("am start --activity-clear-task " +
-            "-n $PKG/com.autonavi.map.activity.SplashActivity --display $displayId", 12000)
-        if (!launch.ok || launch.err.contains("Error")) {
-            SpikeShell.releaseDisplay(displayId)
-            displayId = -1
-            error("高德启动失败: ${launch.err}")
+        val carLaunch = launchCarMap(mode, splash = true)
+        carMode = carLaunch.ok && !carLaunch.err.contains("Error") && !carLaunch.out.contains("Error")
+        layoutMode = mode
+        if (!carMode) {
+            HyperCarRepo.log("CARUI-PREVIEW: 车联入口不可用，回退手机巡航 ${carLaunch.err}")
+            val launch = ShizukuTools.exec("am start --activity-clear-task " +
+                "-n $PKG/com.autonavi.map.activity.SplashActivity --display $displayId", 12000)
+            check(launch.ok && !launch.err.contains("Error")) { "高德启动失败: ${launch.err}" }
+            delay(1800)
+            val uri = "amapuri://drive/CarCruisePage?sourceApplication=io.github.hypercar&clearStack=1"
+            val cruise = ShizukuTools.exec("am start -a android.intent.action.VIEW -d '$uri' " +
+                "-p $PKG --display $displayId", 12000)
+            check(cruise.ok) { "无法打开巡航: ${cruise.err}" }
         }
-        // Keep the activity's launch intent as the normal launcher. Putting cruise in that
-        // intent causes configuration recreation to replay cruise over an active navigation.
-        delay(1800)
-        val cruise = ShizukuTools.exec("am start -a android.intent.action.VIEW -d '$uri' " +
-            "-p $PKG --display $displayId", 12000)
-        check(cruise.ok) { "无法打开巡航: ${cruise.err}" }
-        HyperCarRepo.log("CARUI-PREVIEW: 初次巡航 display=$displayId ${MAP_WIDTH}x$MAP_HEIGHT ${launch.out.take(300)}")
+        HyperCarRepo.log("CARUI-PREVIEW: 初次启动 display=$displayId carMode=$carMode layout=$mode")
         _status.value = ""
         return displayId
+    }
+
+    /** UcarMapActivity is singleTask; layout-only intents retain the current navigation. */
+    private suspend fun launchCarMap(mode: Int, splash: Boolean): io.github.hypercar.shizuku.ExecResult {
+        val activity = if (splash) "UcarSplashActivity" else "UcarMapActivity"
+        return ShizukuTools.exec("am start --activity-single-top " +
+            "-n $PKG/com.autonavi.map.activity.$activity " +
+            "-a com.ucar.intent.action.UCAR -c com.ucar.intent.category.UCAR " +
+            "--ez isUcarMode true --ei screenMode $mode --ei displayId $displayId " +
+            "--ez isUCarNaviUseVerticalScreenLayout false --display $displayId", 12000)
     }
 
     private fun failed(error: Throwable) {
