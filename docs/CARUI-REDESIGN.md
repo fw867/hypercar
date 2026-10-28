@@ -11,7 +11,9 @@
 - 更多应用复用音乐卡片的受支持音乐 App 列表，只显示已安装且有启动入口的应用；无重复的通用音乐入口。
 - “返回车机”在应用列表最后，通过 AirPlay `requestUI` 请求原生系统接管显示，保持 CarPlay 连接和音频通道。
 
-![首页：高德地图与音乐卡片](images/carui-home.png)
+首页截图的地图区域已做文档隐私遮罩，隐藏真实地理信息。
+
+![首页：地图位置已隐藏与音乐卡片](images/carui-home-redacted.png)
 
 ![设置：巡航与音乐偏好](images/carui-settings.png)
 
