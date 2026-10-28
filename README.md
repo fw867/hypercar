@@ -1,5 +1,48 @@
 # HyperCar
 
+当前自绘车机 UI 方案：Android 手机通过 CarPlay / AirPlay 向车机投送高德地图和音乐卡片，支持设置、主题壁纸、更多音乐应用及保持连接返回车机系统。
+
+> **开发分支：[feat/carplay-only-ui](https://github.com/fw867/hypercar/tree/feat/carplay-only-ui)**。
+> 下方截图和新版功能对应此分支；`main` 仍保留较早的 CarLife 网关代码。
+> 编译、安装和当前功能说明请阅读 [开发分支 README](https://github.com/fw867/hypercar/blob/feat/carplay-only-ui/README.md)。
+
+## 界面预览
+
+以下为 2026-10-29 从手机本地构建 0.1.0.377 的车机虚拟屏直接采集的截图，使用 WinPlay 联调。
+截图展示白天主题；实际布局会随接收端显示区域调整，地图和音乐内容为截图时的状态。
+
+### 车机首页
+
+高德地图预览与音乐双卡片，左侧 Dock 提供地图、音乐和设置入口，左下角切换更多应用。
+
+![车机首页：高德地图、专辑封面、播放进度与控制](docs/images/carui-home.png)
+
+### 车机设置
+
+支持导航自动巡航、默认音乐 App、连接自动播放，以及白天／暗夜／自动主题和三套壁纸。
+设置页可上下滚动，下方两张截图分别展示其上半部分和主题／壁纸区域。
+
+![车机设置：导航自动巡航、默认音乐与连接自动播放](docs/images/carui-settings.png)
+
+![车机设置：日夜主题与壁纸选择](docs/images/carui-settings-theme.png)
+
+### 更多应用
+
+自动显示手机已安装且受支持的音乐 App，点击图标切换播放器；“返回车机”固定放在最后，
+请求接收端切回原生系统界面并保持 CarPlay 连接。
+
+![更多应用：高德、设置、关于、已安装音乐 App 与返回车机](docs/images/carui-apps.png)
+
+## 当前 UI 文档
+
+- [功能、环境要求与本地构建](https://github.com/fw867/hypercar/blob/feat/carplay-only-ui/README.md)
+- [界面、设置、持续导航与音频投送](https://github.com/fw867/hypercar/blob/feat/carplay-only-ui/docs/CARUI-REDESIGN.md)
+- [分辨率兜底、帧率与推流检查](https://github.com/fw867/hypercar/blob/feat/carplay-only-ui/docs/VIDEO-STREAM-REVIEW.md)
+
+## 早期 CarLife 网关实现记录
+
+以下为 `main` 分支早期实现的说明，其 CarLife 依赖和部署方式不适用于上方的自绘 UI 开发分支。
+
 **CarLife → AirPlay 零转码网关**：把手机上 CarLife 系应用（百度 CarLife、小米 CarWith、
 荣耀车联等）产出的 H.264 与 PCM，经 **Rust 核心层**零转码直推任意 AirPlay 接收端
 （宝马车机、Audi MIB3、WinPlay、其它 AirPlay 1/2 接收端）。
