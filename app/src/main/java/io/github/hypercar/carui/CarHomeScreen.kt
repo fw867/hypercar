@@ -47,18 +47,24 @@ fun CarHomeScreen() {
         CompositionLocalProvider(
             LocalDensity provides Density(base.density * scale, base.fontScale),
         ) {
-            CarHomeContent()
+            CarHomeContent(isUltrawide = maxWidth > maxHeight * 2.7f)
         }
     }
 }
 
 @Composable
-private fun CarHomeContent() {
+private fun CarHomeContent(isUltrawide: Boolean) {
     val music by MusicBridge.state.collectAsStateWithLifecycle()
     var time by remember { mutableStateOf(LocalTime.now()) }
     var apps by remember { mutableStateOf(false) }
     var settings by remember { mutableStateOf(false) }
     var about by remember { mutableStateOf(false) }
+    val enterMap: () -> Unit = {
+        apps = false
+        settings = false
+        about = false
+        MapController.requestEnter()
+    }
     val context = LocalContext.current
     var battery by remember { mutableIntStateOf(0) }
     var charging by remember { mutableStateOf(false) }
@@ -98,20 +104,20 @@ private fun CarHomeContent() {
             drawCircle(Color(0x01000000), pulse, Offset.Zero)
         }
         Row(Modifier.fillMaxSize().padding(end = 22.dp, top = 22.dp, bottom = 22.dp)) {
-            Column(Modifier.width(110.dp).fillMaxHeight(), horizontalAlignment = Alignment.CenterHorizontally) {
+            Column(Modifier.width(120.dp).fillMaxHeight(), horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(time.format(DateTimeFormatter.ofPattern("HH:mm")), color = CarInk,
                     fontSize = 25.sp, fontWeight = FontWeight.Medium)
                 Spacer(Modifier.height(6.dp))
                 BatteryIndicator(battery, charging)
                 Spacer(Modifier.height(16.dp))
                 // Dock 4 个：高德 / 音乐 / 设置 / 更多（更多按钮在应用页和首页之间切换）
-                Column(verticalArrangement = Arrangement.spacedBy(20.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
                     DockButton(Icons.Rounded.Navigation, "高德地图",
-                        if (CarThemeState.dark) Color(0xFF12B5D2) else CarAccent) { MapController.requestEnter() }
-                    DockButton(Icons.Rounded.MusicNote, "音乐", Color(0xFF7B51EB)) {
+                        if (CarThemeState.dark) Color(0xFF12B5D2) else CarAccent, buttonSize = 76) { enterMap() }
+                    DockButton(Icons.Rounded.MusicNote, "音乐", Color(0xFF7B51EB), buttonSize = 76) {
                         launchMusic(context, music)
                     }
-                    DockButton(Icons.Rounded.Settings, "设置", Color(0xFF5B5675)) {
+                    DockButton(Icons.Rounded.Settings, "设置", Color(0xFF5B5675), buttonSize = 76) {
                         settings = true
                         apps = false
                     }
@@ -124,10 +130,10 @@ private fun CarHomeContent() {
                 } else if (about) {
                     CarAboutPage(Modifier.weight(1f)) { about = false }
                 } else if (apps) {
-                    AppsPage(Modifier.weight(1f), music, { settings = true }, { about = true })
+                    AppsPage(Modifier.weight(1f), music, { settings = true }, { about = true }, enterMap)
                 } else {
                     Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
-                        MapCard(Modifier.weight(1.5f).fillMaxHeight())
+                        MapCard(Modifier.weight(if (isUltrawide) 2f else 1.5f).fillMaxHeight(), enterMap)
                         MusicCard(music, Modifier.weight(1f).fillMaxHeight())
                     }
                 }
@@ -145,8 +151,8 @@ private fun CarHomeContent() {
         Box(
             Modifier
                 .align(Alignment.BottomStart)
-                .padding(start = 25.dp, bottom = 16.dp)
-                .size(60.dp)
+                .padding(start = 22.dp, bottom = 16.dp)
+                .size(76.dp)
                 .clickable {
                     if (onHome) {
                         apps = true
@@ -159,7 +165,7 @@ private fun CarHomeContent() {
             contentAlignment = Alignment.Center,
         ) {
             Icon(if (onHome) Icons.Rounded.Apps else Icons.Rounded.Home,
-                if (onHome) "更多应用" else "返回首页", tint = CarInk, modifier = Modifier.size(44.dp))
+                if (onHome) "更多应用" else "返回首页", tint = CarInk, modifier = Modifier.size(48.dp))
         }
     }
 }
@@ -203,21 +209,27 @@ private fun BatteryIndicator(level: Int, charging: Boolean) {
 }
 
 @Composable
-private fun DockButton(icon: ImageVector, label: String, color: Color, onClick: () -> Unit) {
-    Box(Modifier.size(60.dp).clip(RoundedCornerShape(18.dp))
+private fun DockButton(icon: ImageVector, label: String, color: Color, buttonSize: Int = 60, onClick: () -> Unit) {
+    Box(Modifier.size(buttonSize.dp).clip(RoundedCornerShape(if (buttonSize > 60) 22.dp else 18.dp))
         .background(Brush.linearGradient(listOf(color, color.copy(alpha = .65f))))
         .clickable(onClick = onClick), contentAlignment = Alignment.Center) {
-        Icon(icon, label, tint = White, modifier = Modifier.size(40.dp))
+        Icon(icon, label, tint = White, modifier = Modifier.size(
+            when {
+                buttonSize >= 84 -> 56.dp
+                buttonSize > 60 -> 48.dp
+                else -> 40.dp
+            },
+        ))
     }
 }
 
 @Composable
-private fun MapCard(modifier: Modifier) {
+private fun MapCard(modifier: Modifier, onMap: () -> Unit) {
     val status by AmapPreview.status.collectAsStateWithLifecycle()
     Box(modifier.clip(CardShape).background(Color(0xFF1B2637))) {
         AmapPreviewView(Modifier.fillMaxSize())
         // The card is an overview. Touch opens the fully interactive map on D2.
-        Box(Modifier.fillMaxSize().clickable(onClickLabel = "打开全屏高德地图") { MapController.requestEnter() })
+        Box(Modifier.fillMaxSize().clickable(onClickLabel = "打开全屏高德地图") { onMap() })
         if (status != "") {
             Column(Modifier.align(Alignment.Center).clip(RoundedCornerShape(18.dp))
                 .background(if (CarThemeState.dark) Color(0xDD10141F) else Color(0xEAF6FAFF)).padding(22.dp), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -383,32 +395,67 @@ private fun launchMusic(context: android.content.Context, music: NowPlaying) {
     else MusicBridge.openAccessSettings(context)
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun AppsPage(modifier: Modifier, music: NowPlaying, onSettings: () -> Unit = {}, onAbout: () -> Unit = {}) {
+private fun AppsPage(modifier: Modifier, music: NowPlaying, onSettings: () -> Unit = {}, onAbout: () -> Unit = {}, onMap: () -> Unit = {}) {
     val context = LocalContext.current
-    Column(modifier.fillMaxWidth().clip(CardShape).background(CarPanel).padding(28.dp)) {
-        Text("应用", color = CarInk, fontSize = 27.sp, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(28.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(42.dp)) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                DockButton(Icons.Rounded.Navigation, "高德地图", if (CarThemeState.dark) Color(0xFF12B5D2) else CarAccent) { MapController.requestEnter() }
-                Spacer(Modifier.height(12.dp))
-                Text("高德地图", color = CarInk, fontSize = 14.sp)
-            }
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                DockButton(Icons.Rounded.MusicNote, "音乐", Color(0xFF7B51EB)) { launchMusic(context, music) }
-                Spacer(Modifier.height(12.dp))
-                Text(music.appLabel.ifBlank { "音乐" }, color = CarInk, fontSize = 14.sp)
-            }
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                DockButton(Icons.Rounded.Settings, "设置", Color(0xFF5B5675), onSettings)
-                Spacer(Modifier.height(12.dp))
-                Text("设置", color = CarInk, fontSize = 14.sp)
-            }
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                DockButton(Icons.Rounded.Info, "关于应用", Color(0xFF2F80ED), onAbout)
-                Spacer(Modifier.height(12.dp))
-                Text("关于应用", color = CarInk, fontSize = 14.sp)
+    val musicApps = remember(context) { MusicApps.installed(context) }
+    Box(modifier.fillMaxWidth().clip(CardShape).background(CarPanel)) {
+        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(28.dp)) {
+            Text("应用", color = CarInk, fontSize = 27.sp, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(28.dp))
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(28.dp),
+                verticalArrangement = Arrangement.spacedBy(24.dp),
+            ) {
+                Column(Modifier.width(104.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    DockButton(Icons.Rounded.Navigation, "高德地图", if (CarThemeState.dark) Color(0xFF12B5D2) else CarAccent, buttonSize = 88) { onMap() }
+                    Spacer(Modifier.height(12.dp))
+                    Text("高德地图", color = CarInk, fontSize = 16.sp)
+                }
+                Column(Modifier.width(104.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    DockButton(Icons.Rounded.Settings, "设置", Color(0xFF5B5675), buttonSize = 88, onClick = onSettings)
+                    Spacer(Modifier.height(12.dp))
+                    Text("设置", color = CarInk, fontSize = 16.sp)
+                }
+                Column(Modifier.width(104.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    DockButton(Icons.Rounded.Info, "关于应用", Color(0xFF2F80ED), buttonSize = 88, onClick = onAbout)
+                    Spacer(Modifier.height(12.dp))
+                    Text("关于应用", color = CarInk, fontSize = 16.sp)
+                }
+                musicApps.forEach { app ->
+                    key(app.packageName) {
+                        Column(Modifier.width(104.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Box(
+                                Modifier.size(88.dp).clip(RoundedCornerShape(22.dp)).background(CarCard)
+                                    .clickable(onClickLabel = "打开${app.label}") {
+                                        MusicBridge.selectPackage(context, app.packageName)
+                                    },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                val icon = app.icon
+                                if (icon != null) {
+                                    Image(icon.asImageBitmap(), app.label, Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
+                                } else {
+                                    Icon(Icons.Rounded.MusicNote, app.label, tint = CarInk, modifier = Modifier.size(56.dp))
+                                }
+                            }
+                            Spacer(Modifier.height(12.dp))
+                            Text(app.label, color = CarInk, fontSize = 16.sp,
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                                maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                }
+                Column(Modifier.width(104.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    DockButton(Icons.Rounded.ExitToApp, "返回车机", Color(0xFF64748B), buttonSize = 88) {
+                        val queued = io.github.hypercar.core.RustCoreBridge.nativeRequestHostUi()
+                        io.github.hypercar.session.HyperCarRepo.log("CARUI: 返回车机请求 queued=$queued")
+                        if (!queued) android.widget.Toast.makeText(context, "尚未连接车机", android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Text("返回车机", color = CarInk, fontSize = 16.sp)
+                }
             }
         }
     }

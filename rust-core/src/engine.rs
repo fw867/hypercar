@@ -25,6 +25,7 @@ use crate::{emit_log, emit_stats, emit_state};
 
 /// 外部（Kotlin 侧）投喂给引擎的数据事件。
 pub enum SourceEvent {
+    RequestHostUi,
     /// 视频编码器产出一帧（H.264 Annex B，可能含 SPS/PPS/IDR）。
     VideoFrame { pts_us: u64, data: Vec<u8> },
     /// 编码器画布尺寸变化（对齐 AirPlay VideoConfig 宽高）。
@@ -55,7 +56,7 @@ pub struct EngineConfig {
     pub identity_path: String,
     /// 接收端 `/info` 报 0x0 时的**触摸显示空间**宽/高（0 = 用协商的屏幕尺寸）。
     ///
-    /// WinPlay 这类接收端固定报 0x0，但它的 HID 坐标按自己窗口像素算
+    /// 旧接收端未上报有效像素尺寸时，HID 坐标按其配置的窗口空间换算
     /// （实测 2732x794）；不指定就会整体缩放偏移，表现为「按钮很难点上」。
     #[serde(default)]
     pub touch_display_w: u32,
@@ -99,6 +100,7 @@ pub async fn run_engine(
     let _ = (&touch_tx, &key_tx);
 
     // ---- 分发器：外部事件 → 视频泵 / 音频泵 ----
+    let (host_ui_tx, mut host_ui_rx) = mpsc::channel::<()>(1);
     let (video_tx, video_rx) = mpsc::unbounded_channel::<SourceEvent>();
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<SourceEvent>();
     {
@@ -108,6 +110,7 @@ pub async fn run_engine(
                 tokio::select! {
                     _ = stop_d.notified() => return,
                     ev = source_rx.recv() => match ev {
+                        Some(SourceEvent::RequestHostUi) => { let _ = host_ui_tx.try_send(()); }
                         Some(ev) => {
                             let to_audio = matches!(
                                 ev,
@@ -393,6 +396,28 @@ pub async fn run_engine(
         stop.clone(),
     )
     .await?;
+
+    // Requests share the encrypted control channel, with their own CSeq; feedback continues independently.
+    let control = outcome.control;
+    let stop_ui = stop.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = stop_ui.notified() => return,
+                request = host_ui_rx.recv() => {
+                    if request.is_none() { return; }
+                    let body = crate::bplist::encode(&crate::bplist::Value::dict(vec![
+                        ("type", crate::bplist::Value::str("requestUI")),
+                    ]));
+                    match control.request("POST", "/command", &body, "application/x-apple-binary-plist", &[], Duration::from_secs(3)).await {
+                        Ok(reply) if reply.status() == 200 => emit_log("AIRPLAY: requestUI accepted; CarPlay session/audio retained"),
+                        Ok(reply) => emit_log(&format!("AIRPLAY: requestUI rejected: {}", reply.first_line)),
+                        Err(e) => emit_log(&format!("AIRPLAY: requestUI failed: {e}")),
+                    }
+                }
+            }
+        }
+    });
 
     // 屏幕/音频发送器交给泵
     let _ = screen_ready_tx.send(outcome.screen);

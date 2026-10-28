@@ -897,22 +897,37 @@ private fun DialogTextField(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ResolutionSection() {
-    // 分辨率改为自由输入（原三个预设已删除）：屏幕尺寸随机型而异，
-    // 写死选项反而逼用户改代码。输入即生效，偶数对齐在配置下发前完成。
+    // Presets describe receiver viewports; the encoder plan scales them proportionally on the next session.
     var widthText by rememberSaveable { mutableStateOf(SettingsStore.videoWidth.toString()) }
     var heightText by rememberSaveable { mutableStateOf(SettingsStore.videoHeight.toString()) }
+    var fps by rememberSaveable { mutableStateOf(SettingsStore.videoFps) }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        SectionLabel(text = "屏幕推送分辨率（兜底值）")
+        SectionLabel(text = "车机显示区域（兜底值）")
         GlassPanel(
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 16.dp),
         ) {
             Text(
-                text = "实际分辨率以车机 /info 回报为准——连上后会自动改成车机原生尺寸，" +
-                    "手机在编码器初始化完成后回报的实际值会再次覆盖它。" +
-                    "这里只在这两者都拿不到时使用；下发前按偶数对齐。",
+                text = "优先采用车机 /info 上报的像素尺寸；无法读取时才使用这里填写的显示区域尺寸。" +
+                    "按比例缩小到最长 1920 像素、约 110 万像素以内，默认 30 fps，可手动切换为 60 fps。" +
+                    "不拉伸画面；修改后下次连接生效。",
                 style = MaterialTheme.typography.bodySmall,
                 color = TextSecondary,
             )
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                listOf("宽屏 3.44:1" to (2560 to 744), "16:9" to (1920 to 1080), "8:3" to (1920 to 720)).forEach { (label, size) ->
+                    TextButton(onClick = {
+                        SettingsStore.videoWidth = size.first
+                        SettingsStore.videoHeight = size.second
+                        widthText = size.first.toString()
+                        heightText = size.second.toString()
+                    }) { Text(label) }
+                }
+            }
+            val preview = io.github.hypercar.settings.VideoEncodingPlan.fit(
+                widthText.toIntOrNull() ?: 2560, heightText.toIntOrNull() ?: 744, fps,
+            )
+            Text("预计推流 ${preview.width}×${preview.height} · 最高 ${preview.fps} fps",
+                style = MaterialTheme.typography.bodySmall, color = TextSecondary)
             Spacer(modifier = Modifier.height(12.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -955,15 +970,17 @@ private fun ResolutionSection() {
             }
             Spacer(modifier = Modifier.height(8.dp))
             Spacer(modifier = Modifier.height(16.dp))
-            FpsSegment()
+            FpsSegment(fps) { selected ->
+                fps = selected
+                SettingsStore.videoFps = selected
+            }
         }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun FpsSegment() {
-    var fps by rememberSaveable { mutableStateOf(SettingsStore.videoFps.coerceIn(30, 60)) }
+private fun FpsSegment(fps: Int, onFpsChanged: (Int) -> Unit) {
     Text(
         text = "帧率",
         style = MaterialTheme.typography.bodySmall,
@@ -974,10 +991,7 @@ private fun FpsSegment() {
         FpsOptions.forEachIndexed { index, option ->
             SegmentedButton(
                 selected = fps == option,
-                onClick = {
-                    fps = option
-                    SettingsStore.videoFps = option
-                },
+                onClick = { onFpsChanged(option) },
                 shape = SegmentedButtonDefaults.itemShape(index = index, count = FpsOptions.size),
                 label = {
                     Text(

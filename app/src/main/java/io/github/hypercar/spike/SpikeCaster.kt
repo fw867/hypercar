@@ -36,7 +36,7 @@ class SpikeCaster(
     private val context: Context,
     private val width: Int = 1920,
     private val height: Int = 720,
-    private val fps: Int = 60,
+    private val fps: Int = 30,
     private val bitrate: Int = 8_000_000,
     private val tag: String = "S3",
 ) {
@@ -64,8 +64,7 @@ class SpikeCaster(
     private var framesAtStats = 0L
     private var statsAtNs = System.nanoTime()
     private var startedAtNs = 0L
-    private var frameSeq = 0L
-    private var lastSourcePtsUs = 0L
+    private var awaitingKeyFrame = true
     private var sourceFrames = 0L
     private var sourceFramesAtStats = 0L
     private var sourceFps = 60.0
@@ -84,7 +83,10 @@ class SpikeCaster(
 
     /** P2：切源时暂停/恢复推帧；暂停期间仍排空编码器，恢复时先请求关键帧。 */
     fun setPushing(enabled: Boolean) {
-        pushing = enabled
+        synchronized(lock) {
+            if (enabled && !pushing) awaitingKeyFrame = true
+            pushing = enabled
+        }
     }
 
     /** P2：暂停/恢复编码器（MediaCodec suspend 丢帧，不释放 InputSurface/显示）。 */
@@ -118,9 +120,10 @@ class SpikeCaster(
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+            setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, fps.toFloat())
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
-            setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel51)
+            setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel42)
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
             setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
             // 低延迟：实时优先级、无 B 帧、0 帧输入缓冲；静止 100ms 补发上一帧，
@@ -266,22 +269,13 @@ class SpikeCaster(
                             val payload = if (prefix != null) prefix + data else data
                             val now = System.nanoTime()
                             sourceFrames++
-                            frameSeq++
-                            // 只有源帧间隔真的 <12.5ms（>80fps）时才抽帧；静止后第一次点击
-                            // 产生的那唯一一帧必须发出去，否则车机会等下一秒时钟才更新。
-                            val deltaUs = info.presentationTimeUs - lastSourcePtsUs
-                            val isBurst = lastSourcePtsUs > 0 && deltaUs in 1..12_500
-                            lastSourcePtsUs = info.presentationTimeUs
-                            val dropEvery = when {
-                                !isBurst -> 0
-                                sourceFps > 100.0 -> 2
-                                sourceFps > 75.0 -> 3
-                                else -> 0
-                            }
-                            val drop = !key && dropEvery > 0 && frameSeq % dropEvery == 0L
-                            if (!drop) {
-                                RustCoreBridge.nativePushVideoFrame(payload, info.presentationTimeUs)
-                                onFrame(info.presentationTimeUs, payload.size, now)
+                            // Never discard encoded reference frames. Rate limiting belongs before encoding.
+                            synchronized(lock) {
+                                if (pushing && (!awaitingKeyFrame || key)) {
+                                    awaitingKeyFrame = false
+                                    RustCoreBridge.nativePushVideoFrame(payload, info.presentationTimeUs)
+                                    onFrame(info.presentationTimeUs, payload.size, now)
+                                }
                             }
                         }
                     }
@@ -295,6 +289,7 @@ class SpikeCaster(
 
         override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
             SpikeReport.add(tag, "outputFormat: $format")
+            synchronized(lock) { csdFromFormat.reset(); csdFromConfig.reset() }
             for (name in listOf("csd-0", "csd-1")) {
                 val b = format.getByteBuffer(name) ?: continue
                 val dup = b.duplicate()

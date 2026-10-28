@@ -118,8 +118,16 @@ object SettingsStore {
         get() = p().getInt(KEY_HEIGHT, 744)
         set(v) = p().edit().putInt(KEY_HEIGHT, v.coerceAtLeast(2)).apply()
 
+    @Volatile var receiverViewport: Pair<Int, Int>? = null
+
+    val encodingPlan: VideoEncodingPlan
+        get() {
+            val viewport = receiverViewport ?: (videoWidth to videoHeight)
+            return VideoEncodingPlan.fit(viewport.first, viewport.second, videoFps)
+        }
+
     var videoFps: Int
-        get() = p().getInt(KEY_FPS, 60)
+        get() = p().getInt(KEY_FPS, 30)
         set(v) = p().edit().putInt(KEY_FPS, v.coerceIn(20, 60)).apply()
 
     var enableAudio: Boolean
@@ -202,16 +210,17 @@ object SettingsStore {
             ?.let { (it[0].toIntOrNull() ?: 0) to (it[1].toIntOrNull() ?: 0) }
             ?.takeIf { it.first > 0 && it.second > 0 }
             ?: (fallbackW to fallbackH)
+        val plan = VideoEncodingPlan.fit(width, height, videoFps)
         return buildString {
             append("{")
             append("\"device_id\":\"").append(esc(deviceBluetoothMac)).append("\",")
             append("\"car_ip\":\"").append(esc(carIp)).append("\",")
             append("\"airplay_port\":").append(airplayPort).append(",")
-            append("\"width\":").append(width.coerceAtLeast(2) / 2 * 2).append(",")
-            append("\"height\":").append(height.coerceAtLeast(2) / 2 * 2).append(",")
+            append("\"width\":").append(plan.width).append(",")
+            append("\"height\":").append(plan.height).append(",")
             append("\"touch_display_w\":").append(tdW).append(",")
             append("\"touch_display_h\":").append(tdH).append(",")
-            append("\"fps\":").append(videoFps).append(",")
+            append("\"fps\":").append(plan.fps).append(",")
             append("\"enable_audio\":").append(enableAudio).append(",")
             append("\"keep_alive_stats\":").append(keepAliveStats).append(",")
             append("\"identity_path\":\"").append(esc(identityPath)).append("\"")

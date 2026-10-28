@@ -42,8 +42,8 @@ fun CarSettingsPage(modifier: Modifier = Modifier, onBack: () -> Unit) {
             .padding(26.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = onBack, modifier = Modifier.size(40.dp)) {
-                Icon(Icons.Rounded.ArrowBack, "返回", tint = CarInk, modifier = Modifier.size(26.dp))
+            IconButton(onClick = onBack, modifier = Modifier.size(46.dp)) {
+                Icon(Icons.Rounded.ArrowBack, "返回", tint = CarInk, modifier = Modifier.size(31.dp))
             }
             Spacer(Modifier.width(8.dp))
             Text("设置", color = CarInk, fontSize = 27.sp, fontWeight = FontWeight.SemiBold)
@@ -83,15 +83,15 @@ fun CarSettingsPage(modifier: Modifier = Modifier, onBack: () -> Unit) {
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         if (app.icon != null) {
-                            Image(app.icon.asImageBitmap(), null, Modifier.size(28.dp).clip(CircleShape),
+                            Image(app.icon.asImageBitmap(), null, Modifier.size(32.dp).clip(CircleShape),
                                 contentScale = ContentScale.Crop)
                         } else {
-                            Icon(Icons.Rounded.MusicNote, null, tint = CarInk, modifier = Modifier.size(22.dp))
+                            Icon(Icons.Rounded.MusicNote, null, tint = CarInk, modifier = Modifier.size(26.dp))
                         }
                         Spacer(Modifier.width(12.dp))
                         Text(app.label, color = CarInk, fontSize = 15.sp, modifier = Modifier.weight(1f))
                         if (app.packageName == CarUiSettings.defaultMusicPackage) {
-                            Icon(Icons.Rounded.Check, "当前默认", tint = Color(0xFF22D3EE), modifier = Modifier.size(18.dp))
+                            Icon(Icons.Rounded.Check, "当前默认", tint = Color(0xFF22D3EE), modifier = Modifier.size(22.dp))
                         }
                     }
                 }
@@ -185,7 +185,7 @@ private fun WallpaperPicker() {
                                 .clip(CircleShape).background(Color(0xFF2F80ED)),
                             contentAlignment = Alignment.Center,
                         ) {
-                            Icon(Icons.Rounded.Check, "已选", tint = Color.White, modifier = Modifier.size(14.dp))
+                            Icon(Icons.Rounded.Check, "已选", tint = Color.White, modifier = Modifier.size(18.dp))
                         }
                     }
                 }
@@ -251,7 +251,7 @@ private fun MusicDefaultRow(
             .padding(vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(Icons.Rounded.MusicNote, null, tint = Color(0xFF8B6CFF), modifier = Modifier.size(24.dp))
+        Icon(Icons.Rounded.MusicNote, null, tint = Color(0xFF8B6CFF), modifier = Modifier.size(28.dp))
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text("默认音乐 App", color = CarInk, fontSize = 16.sp)
@@ -271,14 +271,14 @@ private fun ThemeButton(
 ) {
     Row(
         modifier
-            .height(42.dp)
+            .height(48.dp)
             .clip(RoundedCornerShape(12.dp))
             .background(if (selected) Color(0xFF22D3EE).copy(alpha = .22f) else CarMuted.copy(alpha = .10f))
             .clickable(onClick = onClick),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.Center,
     ) {
-        Icon(icon, null, tint = if (selected) Color(0xFF22D3EE) else CarMuted, modifier = Modifier.size(18.dp))
+        Icon(icon, null, tint = if (selected) Color(0xFF22D3EE) else CarMuted, modifier = Modifier.size(22.dp))
         Spacer(Modifier.width(6.dp))
         Text(text, color = if (selected) Color(0xFF22D3EE) else CarInk, fontSize = 14.sp)
     }

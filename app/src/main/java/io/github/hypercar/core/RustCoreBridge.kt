@@ -39,6 +39,8 @@ object RustCoreBridge {
 
         /** 车机日夜模式（AirPlay setNightMode）：true = 夜间。 */
         fun onNightMode(night: Boolean)
+
+        fun onDisplaySize(width: Int, height: Int) {}
     }
 
     /**
@@ -90,6 +92,9 @@ object RustCoreBridge {
     external fun nativeStart(configJson: String, controlFd: Int, socketProvider: SocketProvider): Boolean
 
     external fun nativeStop()
+
+    /** Request native head-unit UI without tearing down CarPlay or its audio route. */
+    external fun nativeRequestHostUi(): Boolean
 
     /** 投喂一帧 H.264（Annex B，本机 MediaCodec 编码输出）。[ptsUs] 为微秒时间戳。 */
     external fun nativePushVideoFrame(data: ByteArray, ptsUs: Long)

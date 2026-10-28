@@ -650,13 +650,7 @@ object HyperCarRepo {
                 return
             }
             streaming = true
-            // 引擎一启动就先把自绘 UI/编码器准备好（不等 AirPlay RECORD）：
-            // 这样 connected 后第一帧就是首页，不再出现黑屏/待机页。
-            scope.launch {
-                val result = runCatching { CarUiCaster.start(context) }
-                    .getOrElse { "启动失败: ${it.javaClass.simpleName}: ${it.message}" }
-                log("CARUI: $result")
-            }
+
         } catch (cancelled: CancellationException) {
             // disconnect() 掐掉在途连接：正常取消，不算失败（也不要把 Failed 写进快照）
             throw cancelled
@@ -1316,7 +1310,10 @@ object HyperCarRepo {
         override fun onState(state: String, detail: String) {
             log("CORE: [$state] $detail")
             when (state) {
-                "negotiating" -> push(link = LinkState.Negotiating(detail))
+                "negotiating" -> {
+                    SettingsStore.receiverViewport = null
+                    push(link = LinkState.Negotiating(detail))
+                }
                 "connected" -> {
                     MusicBridge.onCarConnected()
                     streaming = true
@@ -1351,6 +1348,10 @@ object HyperCarRepo {
         }
 
         override fun onLog(line: String) = log(line)
+
+        override fun onDisplaySize(width: Int, height: Int) {
+            SettingsStore.receiverViewport = (width to height).takeIf { width >= 320 && height >= 240 }
+        }
 
         override fun onNightMode(night: Boolean) {
             io.github.hypercar.carui.CarUiSettings.onCarNight(night)

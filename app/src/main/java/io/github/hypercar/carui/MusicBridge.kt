@@ -75,6 +75,7 @@ object MusicBridge {
     /** 用户在音乐卡片里选定的 App；有它的会话时优先显示它，而不是按“正在播放”抢焦点。 */
     private var preferredPackage: String? = null
     private var autoPlayPending = false
+    private var autoPlayDeadline = 0L
 
     /** Serialize MediaSession commands with metadata callbacks, before restoring the phone audio route. */
     private fun onMusicThread(wait: Boolean = true, action: () -> Unit) {
@@ -96,11 +97,25 @@ object MusicBridge {
     fun onCarConnected() = onMusicThread {
         carConnected = true
         carAudioReady = false
+        autoPlayPending = CarUiSettings.autoPlayOnConnect
+        autoPlayDeadline = 0L
     }
 
     fun onCarAudioReady() = onMusicThread(wait = false) {
         if (carConnected) {
             carAudioReady = true
+            if (autoPlayPending && CarUiSettings.autoPlayOnConnect && resumePackage == null) {
+                val pkg = CarUiSettings.defaultMusicPackage.takeIf { it.isNotBlank() }
+                    ?: preferredPackage ?: controller?.packageName
+                if (pkg != null) {
+                    resumePackage = pkg
+                    autoPlayDeadline = SystemClock.elapsedRealtime() + 15_000
+                    val ctx = service
+                    if (ctx != null && controller?.packageName != pkg) selectPackage(ctx, pkg)
+                    HyperCarRepo.log("MUSIC: 音频就绪，准备自动播放 $pkg")
+                }
+            }
+            autoPlayPending = false
             resumeAfterReconnect()
         }
     }
@@ -109,6 +124,8 @@ object MusicBridge {
         if (!carConnected) return@onMusicThread
         carConnected = false
         carAudioReady = false
+        autoPlayPending = false
+        autoPlayDeadline = 0L
         // 不要只信 controller：切 App 后它可能还指向旧的会话。断连时把所有
         // 正在播放的 MediaSession 都暂停，避免手机外放/后台继续响。
         val s = service
@@ -147,6 +164,11 @@ object MusicBridge {
 
     private fun resumeAfterReconnect() {
         if (!carConnected || !carAudioReady) return
+        if (autoPlayDeadline > 0 && SystemClock.elapsedRealtime() > autoPlayDeadline) {
+            resumePackage = null
+            autoPlayDeadline = 0L
+            HyperCarRepo.log("MUSIC: 自动播放等待媒体会话超时")
+        }
         val pkg = resumePackage ?: return
         val s = service ?: return
         val sessions = runCatching {
@@ -157,6 +179,7 @@ object MusicBridge {
         val target = sessions.firstOrNull { it.packageName == pkg } ?: return
         runCatching { target.transportControls.play() }.onSuccess {
             resumePackage = null
+            autoPlayDeadline = 0L
             playbackPrefs?.edit()?.remove("resume_package")?.apply()
             HyperCarRepo.log("MUSIC: 车机音频已就绪，恢复 $pkg")
         }.onFailure { HyperCarRepo.log("MUSIC: 恢复播放失败 ${it.message}") }
@@ -312,7 +335,8 @@ object MusicBridge {
         val withTitle = sessions.firstOrNull {
             !it.metadata?.getString(MediaMetadata.METADATA_KEY_TITLE).isNullOrBlank()
         }
-        val target = playing ?: withTitle ?: sessions.firstOrNull()
+        val target = sessions.firstOrNull { it.packageName == preferredPackage }
+            ?: playing ?: withTitle ?: sessions.firstOrNull()
         if (target !== controller) {
             runCatching { controller?.unregisterCallback(callback) }
             controller = target
@@ -369,6 +393,8 @@ object MusicBridge {
     }
 
     fun playPause() {
+        autoPlayPending = false
+        autoPlayDeadline = 0L
         // Explicit user playback controls supersede the saved automatic-resume request.
         resumePackage = null
         playbackPrefs?.edit()?.remove("resume_package")?.apply()

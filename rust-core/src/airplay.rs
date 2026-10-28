@@ -50,7 +50,7 @@ pub struct AirplayParams {
     pub width: u32,
     pub height: u32,
     /// **触摸的显示空间**（接收端屏幕像素）。`/info` 报 0x0 时用它；
-    /// 真车会给真实尺寸，WinPlay 这类接收端固定报 0x0（它按自己的窗口 2732x794 算 HID 坐标）。
+    /// 真车会给真实尺寸，未提供有效像素尺寸的接收端按手动指定的触摸空间换算。
     /// 给错会让触摸整体缩放偏移——越靠右/下越明显（"按钮很难点上"）。
     pub touch_display: Option<(u32, u32)>,
     /// PC 接收端窗口在桌面上的矩形（left,top,right,bottom），HID 全局坐标；
@@ -75,6 +75,7 @@ pub struct TouchInput {
 
 pub struct AirplayOutcome {
     pub screen: ScreenSender,
+    pub control: Arc<RtspChannel>,
     pub audio: Option<AudioOut>,
     pub keep_alive_stats: bool,
 }
@@ -263,14 +264,7 @@ pub async fn negotiate(
         .and_then(Value::as_array)
         .and_then(|a| a.first());
     let display_uuid = display.and_then(|d| uuid_text(d.get("uuid")));
-    let (disp_w, disp_h) = display
-        .map(|d| {
-            (
-                d.get("width").and_then(Value::as_int).unwrap_or(0) as u32,
-                d.get("height").and_then(Value::as_int).unwrap_or(0) as u32,
-            )
-        })
-        .unwrap_or((0, 0));
+    let (disp_w, disp_h) = display.map(read_display_size).unwrap_or((0, 0));
     // 车机能力位图：判断是否支持 HEVC 等能力，只能靠它（codec 由本机编码器决定）
     let car_features = info.get("features").and_then(Value::as_int).unwrap_or(0);
     emit_log(&format!(
@@ -278,24 +272,9 @@ pub async fn negotiate(
         display_uuid, disp_w, disp_h, car_features
     ));
 
-    // 车机真实显示分辨率 → 编码请求。
-    // 设置里的分辨率只是"用户以为的"，实际以 `/info` 为准：两侧不一致时
-    // 车机要把小画面拉伸整屏（发虚），所以这里直接改成车机原生尺寸。
-    if disp_w >= 320 && disp_h >= 240 {
-        let target = (even(disp_w.max(2)), even(disp_h.max(2)));
-        // 车机下发的屏幕参数：用于 VideoConfig/编码画布（保持原行为）。
-        // 触摸目标另行使用 actual_size，不再被这里覆盖。
-        *p.encoder_size.lock() = target;
-        emit_log(&format!(
-            "AIRPLAY: 车机实际 {}x{} → 请求按 {}x{} 编码（设置值 {}x{} 仅作兜底）",
-            disp_w, disp_h, target.0, target.1, p.width, p.height
-        ));
-    } else {
-        emit_log(&format!(
-            "AIRPLAY: /info 未提供有效显示器尺寸（{disp_w}x{disp_h}），沿用设置 {}x{}",
-            p.width, p.height
-        ));
-    }
+    // The receiver defines the viewport ratio, not the phone's encoding workload.
+    // Kotlin chooses a proportional capped canvas and reports the actual size before its first frame.
+    crate::emit_display_size(disp_w, disp_h);
 
     // ---- 3. modesChanged ----
     let modes = build_modes_changed();
@@ -371,8 +350,8 @@ pub async fn negotiate(
         key_tx,
         // 触摸的「显示空间」分母，优先级：
         //  ① /info 报的显示器尺寸（真车会给真实值）
-        //  ② `--touch-display` 手动指定（WinPlay 固定报 0x0，但它按自己窗口
-        //     2732x794 算 HID 坐标；给错就整体缩放偏移 →「按钮很难点上」）
+        //  ② `--touch-display` 手动指定（仅无有效上报时使用；历史 WinPlay 按窗口
+        //     2732x794 算 HID 坐标；这个历史兜底不是宝马的固定尺寸）
         //  ③ 协商的屏幕尺寸
         // 绝不能用 max(1) 当分母：x_raw*编码宽/1 溢出后被 clamp 到边界，
         // 表现是「每一下都落在右下角」（2026-10-23 23:38 定位）。
@@ -478,10 +457,36 @@ pub async fn negotiate(
     );
 
     Ok(AirplayOutcome {
+        control: channel,
         screen,
         audio,
         keep_alive_stats,
     })
+}
+
+/// CarPlay uses widthPixels/heightPixels; older receivers may use width/height.
+fn read_display_size(display: &Value) -> (u32, u32) {
+    fn dimension(display: &Value, pixels: &str, legacy: &str) -> u32 {
+        [pixels, legacy].iter().filter_map(|key| display.get(key).and_then(Value::as_int))
+            .find(|&value| (1..=16384).contains(&value)).unwrap_or(0) as u32
+    }
+    (dimension(display, "widthPixels", "width"), dimension(display, "heightPixels", "height"))
+}
+
+#[cfg(test)]
+mod display_size_tests {
+    use super::*;
+    #[test]
+    fn pixel_dimensions_take_precedence_over_legacy_fields() {
+        let display = Value::dict(vec![("widthPixels", Value::Int(2880)), ("heightPixels", Value::Int(1080)),
+            ("width", Value::Int(0)), ("height", Value::Int(0))]);
+        assert_eq!(read_display_size(&display), (2880, 1080));
+    }
+    #[test]
+    fn legacy_dimensions_and_invalid_values() {
+        assert_eq!(read_display_size(&Value::dict(vec![("width", Value::Int(2560)), ("height", Value::Int(744))])), (2560, 744));
+        assert_eq!(read_display_size(&Value::dict(vec![("widthPixels", Value::Int(-1)), ("heightPixels", Value::Int(999999))])), (0, 0));
+    }
 }
 
 // ---------------------------------------------------------------- /info
@@ -1057,11 +1062,6 @@ fn consumer_key_of(report: &[u8]) -> Option<u32> {
 }
 
 // ---------------------------------------------------------------- 工具
-
-/// 偶数对齐：H.264 4:2:0 要求宽高为偶数（奇数会让编解码器首帧进错误态）。
-fn even(v: u32) -> u32 {
-    (v / 2) * 2
-}
 
 /// RtspTransport 适配：pairing 层是同步 trait，跑在多线程 runtime 的 worker 上，
 /// 用 block_in_place + block_on 桥接（配对只有 M1..M4 四次往返，代价可忽略）。

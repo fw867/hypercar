@@ -144,6 +144,12 @@ pub(crate) fn emit_night_mode(night: bool) {
     });
 }
 
+pub(crate) fn emit_display_size(width: u32, height: u32) {
+    call_listener("onDisplaySize", |env, obj| {
+        env.call_method(obj, "onDisplaySize", "(II)V", &[(width as jint).into(), (height as jint).into()]).map(|_| ())
+    });
+}
+
 fn with_env<T>(
     f: impl FnOnce(&mut JNIEnv) -> jni::errors::Result<T>,
 ) -> Option<T> {
@@ -605,6 +611,16 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeIsRunni
     } else {
         JNI_FALSE
     }
+}
+
+/// Ask the accessory to show its own UI; never stop the session or the audio pump.
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeRequestHostUi(
+    _env: JNIEnv, _class: JClass,
+) -> jboolean {
+    if ENGINE.lock().as_ref().map(|h| h.source_tx.send(engine::SourceEvent::RequestHostUi).is_ok()).unwrap_or(false) {
+        JNI_TRUE
+    } else { JNI_FALSE }
 }
 
 /// 构造宝马 HUD 导航报文（iAP2 0x5200）；返回 jbyteArray（Rust 分配、JNI 拷贝）。

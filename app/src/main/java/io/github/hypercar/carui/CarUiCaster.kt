@@ -32,7 +32,9 @@ object CarUiCaster {
     private const val TAG = "HyperCar-CarUI"
     private var width = 1920
     private var height = 720
-    const val DPI = 240
+    @Volatile var plan = io.github.hypercar.settings.VideoEncodingPlan.fit(2560, 744)
+        private set
+    val DPI: Int get() = plan.densityDpi
 
     private val main = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -50,8 +52,6 @@ object CarUiCaster {
     val currentDisplayId: Int get() = displayId
 
     suspend fun start(context: Context): String {
-        width = SettingsStore.videoWidth.coerceAtLeast(2) / 2 * 2
-        height = SettingsStore.videoHeight.coerceAtLeast(2) / 2 * 2
         if (running || starting) {
             // stop 可能清掉监听器后卡住；重连分支必须补装，否则触摸静默丢失
             installTouchListener()
@@ -70,8 +70,12 @@ object CarUiCaster {
             return "已经在跑（display=$displayId，已重新上报 ${width}x$height）"
         }
         starting = true
+        plan = SettingsStore.encodingPlan
+        width = plan.width
+        height = plan.height
+        HyperCarRepo.log("CARUI: viewport=${SettingsStore.receiverViewport ?: (SettingsStore.videoWidth to SettingsStore.videoHeight)} stream=${width}x${height}@${plan.fps} dpi=$DPI")
         try {
-        val c = SpikeCaster(context, width = width, height = height, tag = TAG)
+        val c = SpikeCaster(context, width = width, height = height, fps = plan.fps, bitrate = plan.bitrate, tag = TAG)
         caster = c
         val encoder = runCatching { c.startEncoder() }.getOrElse { t ->
             caster = null
@@ -82,9 +86,9 @@ object CarUiCaster {
             caster = null
             return "编码器没有 InputSurface"
         }
-        // APK 更新后 Shizuku UserService 可能仍是旧进程（旧包名/旧显示还在），
-        // 新进程再建屏会报 packageName must match owner uid。建屏前先清掉旧服务。
-        if (ShizukuTools.isReady) {
+        // Old APK services can retain displays whose encoder surface has died. Only clean
+        // processes before binding; killing an already bound service leaves a stale Binder.
+        if (!SpikeShell.isConnected() && ShizukuTools.isReady) {
             runCatching { ShizukuTools.exec("pkill -f 'io.github.hypercar:spike'", 2_000) }
             kotlinx.coroutines.delay(150)
         }

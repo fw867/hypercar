@@ -22,7 +22,7 @@ object AmapPreview {
     private const val PKG = "com.autonavi.minimap"
     private const val MAP_WIDTH = 1920
     private const val MAP_HEIGHT = 720
-    private const val MAP_DPI = 240
+    private val MAP_DPI: Int get() = CarUiCaster.DPI
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val lock = Mutex()
     private val _status = MutableStateFlow("正在打开高德地图…")
@@ -129,8 +129,8 @@ object AmapPreview {
         val compat = MapCompat.enable(PKG)
         HyperCarRepo.log("CARUI-PREVIEW: $compat")
         // Only the first launch of the driving session opens cruise. Surface switches never relaunch Amap.
-        val mapW = SettingsStore.videoWidth.coerceAtLeast(2) / 2 * 2
-        val mapH = SettingsStore.videoHeight.coerceAtLeast(2) / 2 * 2
+        val mapW = CarUiCaster.plan.width
+        val mapH = CarUiCaster.plan.height
         val result = SpikeShell.createDisplay(output, mapW, mapH, MAP_DPI, 0, "hypercar-map")
         displayId = Regex("id=(\\d+)").find(result)?.groupValues?.get(1)?.toIntOrNull() ?: -1
         check(displayId > 0) { "无法创建地图窗口: $result" }

@@ -160,7 +160,7 @@ object HeadUnitProfiles {
         preferMdnsAirplay = false,
         fallbackAirplayPorts = listOf(7000),
         dropProfilesBeforeIap2 = false,
-        // WinPlay 的 /info 固定报 0x0，HID 坐标按它自己的窗口像素算（实测值）
+        // 历史 WinPlay 联调的触摸兜底；优先使用 /info 的 widthPixels/heightPixels，非宝马规格。
         touchDisplay = "2732x794",
         pairingHint = "先在 WinPlay 点「开始接收」，再让手机连（它不监听时连不上）",
     )

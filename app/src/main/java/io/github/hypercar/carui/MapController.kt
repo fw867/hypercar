@@ -18,7 +18,7 @@ object MapController {
     private const val MAP_PKG = "com.autonavi.minimap"
     private var W = 1920
     private var H = 720
-    private const val DPI = 240
+    private val DPI: Int get() = CarUiCaster.DPI
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -49,8 +49,8 @@ object MapController {
     fun init(context: Context, home: SpikeCaster) {
         appContext = context.applicationContext
         homeCaster = home
-        W = io.github.hypercar.settings.SettingsStore.videoWidth.coerceAtLeast(2) / 2 * 2
-        H = io.github.hypercar.settings.SettingsStore.videoHeight.coerceAtLeast(2) / 2 * 2
+        W = CarUiCaster.plan.width
+        H = CarUiCaster.plan.height
         scope.launch { AmapPreview.resumePreview() }
     }
 
@@ -94,7 +94,7 @@ object MapController {
         val home = homeCaster ?: return "home caster 不在"
         if (!installed(ctx)) return "高德未安装（$MAP_PKG）"
 
-        val c = SpikeCaster(ctx, width = W, height = H, tag = "CARUI-MAP")
+        val c = SpikeCaster(ctx, width = W, height = H, fps = CarUiCaster.plan.fps, bitrate = CarUiCaster.plan.bitrate, tag = "CARUI-MAP")
         mapCaster = c
         c.setPushing(false)
         try {
@@ -104,10 +104,10 @@ object MapController {
             val id = AmapPreview.showFullscreen(surface, W, H, DPI)
             mapDisplayId = id
             delay(350)
+            home.setPushing(false)
+            home.setSuspended(true)
             c.setPushing(true)
             c.requestSyncFrame()
-            home.setSuspended(true)
-            home.setPushing(false)
             mapActive = true
             MapHomeOverlay.attach(ctx, id) { requestExit() }
             return "ok display=$id（保留高德任务）"
@@ -131,8 +131,8 @@ object MapController {
         // 回首页后触摸目标必须切回 D1 画布；否则地图尺寸残留会让音乐卡点不中。
         runCatching {
             io.github.hypercar.core.RustCoreBridge.nativeSetVideoSize(
-                io.github.hypercar.settings.SettingsStore.videoWidth.coerceAtLeast(2) / 2 * 2,
-                io.github.hypercar.settings.SettingsStore.videoHeight.coerceAtLeast(2) / 2 * 2,
+                CarUiCaster.plan.width,
+                CarUiCaster.plan.height,
             )
         }
         runCatching { mapCaster?.stop() }
