@@ -28,6 +28,12 @@ object SpikeShell {
 
     fun isConnected(): Boolean = service != null
 
+    fun startAudioCapture(owner: IBinder): android.os.ParcelFileDescriptor? = service?.startAudioCapture(owner)
+    fun stopAudioCapture() { service?.stopAudioCapture() }
+    fun audioCaptureStatus(): String = service?.audioCaptureStatus() ?: "shell disconnected"
+    fun updateDisplaySurface(id: Int, surface: Surface?, width: Int, height: Int, dpi: Int): String =
+        service?.updateDisplaySurface(id, surface, width, height, dpi) ?: "ERR shell disconnected"
+
     /** 绑定（幂等）。返回人话结果，写进 spike 报告。 */
     suspend fun connect(context: Context): String {
         service?.let { return "已连接" }

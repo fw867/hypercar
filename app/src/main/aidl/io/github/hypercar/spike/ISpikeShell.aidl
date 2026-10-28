@@ -3,6 +3,7 @@
 package io.github.hypercar.spike;
 
 import android.view.Surface;
+import android.os.ParcelFileDescriptor;
 
 interface ISpikeShell {
     /** 返回 "OK id=<n> flags=0x<hex>" 或 "ERR ..."。 */
@@ -35,4 +36,11 @@ interface ISpikeShell {
 
     /** 输入通道是否可用（反射注入是否成功）。 */
     String inputState();
+
+    /** Shell REMOTE_SUBMIX playback capture, 48 kHz stereo PCM16, bound to the caller's life. */
+    ParcelFileDescriptor startAudioCapture(IBinder owner);
+    void stopAudioCapture();
+    String audioCaptureStatus();
+    /** Keep the task/display alive while switching between the card texture and full-screen encoder. */
+    String updateDisplaySurface(int displayId, in Surface surface, int width, int height, int dpi);
 }

@@ -10,6 +10,7 @@ import android.os.SystemClock
 import io.github.hypercar.autowake.AutoStart
 import io.github.hypercar.autowake.HyperCarService
 import io.github.hypercar.carui.CarUiCaster
+import io.github.hypercar.carui.MusicBridge
 import io.github.hypercar.core.AudioStats
 import io.github.hypercar.core.LinkState
 import io.github.hypercar.core.RustCoreBridge
@@ -340,6 +341,7 @@ object HyperCarRepo {
     }
 
     fun disconnect() {
+        MusicBridge.onCarDisconnected()
         // 用户主动断开：不再自动重连
         userDisconnectRequested = true
         reconnectJob?.cancel()
@@ -782,6 +784,7 @@ object HyperCarRepo {
      * 既打扰车机，也会不断制造「ACL 断开」事件。
      */
     private fun releaseSessionResources() {
+        MusicBridge.onCarDisconnected()
         streaming = false
         // P1：先停自绘界面（释放 D1 显示/编码器），再停引擎。
         // 清理涉及 shell binder/编码器释放，可能卡住；异步执行，断开流程不等它。
@@ -1340,6 +1343,7 @@ object HyperCarRepo {
             when (state) {
                 "negotiating" -> push(link = LinkState.Negotiating(detail))
                 "connected" -> {
+                    MusicBridge.onCarConnected()
                     streaming = true
                     sessionHadLink = true
                     reconnectAttempts = 0
@@ -1361,8 +1365,12 @@ object HyperCarRepo {
                         }
                     }
                 }
-                "failed" -> retryAirplayOrFail(detail)
+                "failed" -> {
+                    MusicBridge.onCarDisconnected()
+                    retryAirplayOrFail(detail)
+                }
                 "ended" -> {
+                    MusicBridge.onCarDisconnected()
                     scope.launch { runDisconnect(detail) }
                 }
                 "stopping" -> { /* runDisconnect 内处理 */ }

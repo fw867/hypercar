@@ -1,56 +1,17 @@
 package io.github.hypercar.carui
 
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxScope
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.BatteryManager
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Apps
-import androidx.compose.material.icons.rounded.ArrowBack
-import androidx.compose.material.icons.rounded.LibraryMusic
-import androidx.compose.material.icons.rounded.Navigation
-import androidx.compose.material.icons.rounded.Radio
-import androidx.compose.material.icons.rounded.DirectionsCar
-import androidx.compose.material.icons.rounded.Map
-import androidx.compose.material.icons.rounded.MusicNote
-import androidx.compose.material.icons.rounded.Pause
-import androidx.compose.material.icons.rounded.Phone
-import androidx.compose.material.icons.rounded.PlayArrow
-import androidx.compose.material.icons.rounded.Search
-import androidx.compose.material.icons.rounded.Settings
-import androidx.compose.material.icons.rounded.SkipNext
-import androidx.compose.material.icons.rounded.SkipPrevious
-import androidx.compose.material.icons.rounded.Wifi
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.compose.material.icons.rounded.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -58,97 +19,89 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import io.github.hypercar.ui.theme.CoralError
-import io.github.hypercar.ui.theme.DeepSpace
-import io.github.hypercar.ui.theme.ElectricCyan
-import io.github.hypercar.ui.theme.MintGreen
-import io.github.hypercar.ui.theme.PanelGlass
-import io.github.hypercar.ui.theme.StrokeGlass
-import io.github.hypercar.ui.theme.TextPrimary
-import io.github.hypercar.ui.theme.TextSecondary
 import kotlinx.coroutines.delay
-import java.time.LocalDateTime
+import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 
-private val hhmm: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
+private val White = Color(0xFFF5F5FA)
+private val Muted = Color(0xFFB4B5C5)
+private val CardShape = RoundedCornerShape(22.dp)
 
 @Composable
 fun CarHomeScreen() {
-    val nowPlaying by MusicBridge.state.collectAsStateWithLifecycle()
-    var now by remember { mutableStateOf(LocalDateTime.now()) }
-    var showApps by remember { mutableStateOf(false) }
-
+    val music by MusicBridge.state.collectAsStateWithLifecycle()
+    var time by remember { mutableStateOf(LocalTime.now()) }
+    var apps by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    var battery by remember { mutableIntStateOf(0) }
+    var charging by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         while (true) {
-            now = LocalDateTime.now()
-            delay(1_000)
+            time = LocalTime.now()
+            context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))?.let {
+                val scale = it.getIntExtra(BatteryManager.EXTRA_SCALE, 100).coerceAtLeast(1)
+                battery = it.getIntExtra(BatteryManager.EXTRA_LEVEL, 0) * 100 / scale
+                charging = it.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0
+            }
+            delay(1000)
         }
     }
-
-    HomeContent(
-        now = now,
-        nowPlaying = nowPlaying,
-        showApps = showApps,
-        onToggleApps = { showApps = !showApps },
-        onMapClick = { MapController.requestEnter() },
+    // Keep the encoder's display rendering even while the application page is idle.
+    val pulse by rememberInfiniteTransition(label = "homeFrames").animateFloat(
+        0.3f, 1f, infiniteRepeatable(tween(1200), RepeatMode.Reverse), label = "frame",
     )
-}
-
-@Composable
-private fun HomeContent(
-    now: LocalDateTime,
-    nowPlaying: NowPlaying,
-    showApps: Boolean,
-    onToggleApps: () -> Unit,
-    onMapClick: () -> Unit,
-) {
-    // 顶层帧脉冲：切到 AppsPage 后 MapCard 被移出组合树，否则整屏只剩 1s 时钟，
-    // 编码 Surface 会掉到 1fps，点图标要等半秒~1 秒才看到反馈。
-    val frameKeepAlive by rememberInfiniteTransition(label = "d1KeepAlive").animateFloat(
-        initialValue = 0.55f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(tween(1200), RepeatMode.Reverse),
-        label = "d1Pulse",
-    )
-    Box(
-        Modifier
-            .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    listOf(Color(0xFF05070C), Color(0xFF09131E), Color(0xFF05070C)),
-                ),
-            ),
-    ) {
-        Canvas(Modifier.size(1.dp)) {
-            drawCircle(Color(0x0100E5FF), radius = frameKeepAlive)
+    Box(Modifier.fillMaxSize().background(Color(0xFF05050C))) {
+        Canvas(Modifier.fillMaxSize()) {
+            drawRect(Brush.radialGradient(listOf(Color(0xFF25116A), Color.Transparent),
+                center = Offset(size.width * .48f, size.height * 1.15f), radius = size.width * .6f))
+            drawRect(Brush.radialGradient(listOf(Color(0xFF191647), Color.Transparent),
+                center = Offset(size.width * .85f, 0f), radius = size.width * .45f))
+            drawCircle(Color(0x01000000), pulse, Offset.Zero)
         }
-        Row(Modifier.fillMaxSize().padding(horizontal = 18.dp, vertical = 14.dp)) {
-            DockRail(
-                Modifier.width(96.dp).fillMaxHeight(),
-                showApps = showApps,
-                onToggleApps = onToggleApps,
-                onMapClick = onMapClick,
-            )
-            Spacer(Modifier.width(16.dp))
+        Row(Modifier.fillMaxSize().padding(end = 22.dp, top = 22.dp, bottom = 22.dp)) {
+            Column(Modifier.width(110.dp).fillMaxHeight(), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(time.format(DateTimeFormatter.ofPattern("HH:mm")), color = White,
+                    fontSize = 25.sp, fontWeight = FontWeight.Medium)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(if (charging) Icons.Rounded.BatteryChargingFull else Icons.Rounded.BatteryStd,
+                        "手机电量", tint = Muted, modifier = Modifier.size(17.dp))
+                    Text("$battery%", color = Muted, fontSize = 11.sp)
+                }
+                Spacer(Modifier.weight(1f))
+                Column(verticalArrangement = Arrangement.spacedBy(18.dp)) {
+                    DockButton(Icons.Rounded.Navigation, "高德地图", Color(0xFF12B5D2)) { MapController.requestEnter() }
+                    DockButton(Icons.Rounded.MusicNote, "音乐", Color(0xFF7B51EB)) {
+                        launchMusic(context, music)
+                    }
+                }
+                Spacer(Modifier.weight(1f))
+                IconButton(onClick = { apps = !apps }, modifier = Modifier.size(52.dp)) {
+                    Icon(if (apps) Icons.Rounded.Home else Icons.Rounded.Apps,
+                        if (apps) "返回主页" else "应用", tint = White, modifier = Modifier.size(32.dp))
+                }
+            }
             Column(Modifier.weight(1f).fillMaxHeight()) {
-                TopBar(now)
-                Spacer(Modifier.height(10.dp))
-                if (showApps) {
-                    AppsPage(Modifier.weight(1f), onMapClick = onMapClick)
+                if (apps) {
+                    AppsPage(Modifier.weight(1f), music)
                 } else {
-                    Row(Modifier.weight(1f)) {
-                        MapCard(Modifier.weight(1.62f).fillMaxHeight(), onClick = onMapClick)
-                        Spacer(Modifier.width(16.dp))
-                        MusicCard(nowPlaying, Modifier.weight(1f).fillMaxHeight())
+                    Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+                        MapCard(Modifier.weight(1.5f).fillMaxHeight())
+                        MusicCard(music, Modifier.weight(1f).fillMaxHeight())
+                    }
+                }
+                Row(Modifier.fillMaxWidth().height(15.dp), horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.Bottom) {
+                    repeat(2) { index ->
+                        Box(Modifier.padding(horizontal = 4.dp).size(5.dp).clip(CircleShape)
+                            .background(if ((index == 1) == apps) White else White.copy(alpha = .3f)))
                     }
                 }
             }
@@ -157,302 +110,86 @@ private fun HomeContent(
 }
 
 @Composable
-private fun TopBar(now: LocalDateTime) {
-    Row(
-        Modifier.fillMaxWidth().height(64.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(Modifier.weight(1f)) {
-            Text(
-                "HYPERCAR",
-                color = ElectricCyan,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Bold,
-                letterSpacing = 4.sp,
-            )
-            Text("CarPlay 无线投屏 · 自绘车机界面", color = TextSecondary, fontSize = 11.sp)
-        }
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(
-                now.format(hhmm),
-                color = TextPrimary,
-                fontSize = 44.sp,
-                fontWeight = FontWeight.Light,
-                fontFamily = FontFamily.Monospace,
-            )
-            Text(
-                "${now.monthValue}月${now.dayOfMonth}日 ${weekdayCn(now)}",
-                color = TextSecondary,
-                fontSize = 11.sp,
-            )
-        }
-        Row(
-            Modifier.weight(1f),
-            horizontalArrangement = Arrangement.End,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            StatusChip("CarPlay 在线", accent = true)
-            Spacer(Modifier.width(8.dp))
-            StatusChip("1920×720")
-            Spacer(Modifier.width(8.dp))
-            StatusChip("60 fps")
-        }
+private fun DockButton(icon: ImageVector, label: String, color: Color, onClick: () -> Unit) {
+    Box(Modifier.size(52.dp).clip(RoundedCornerShape(15.dp))
+        .background(Brush.linearGradient(listOf(color, color.copy(alpha = .65f))))
+        .clickable(onClick = onClick), contentAlignment = Alignment.Center) {
+        Icon(icon, label, tint = White, modifier = Modifier.size(32.dp))
     }
 }
 
 @Composable
-private fun ConnectionCard(modifier: Modifier = Modifier) {
-    GlassCard(modifier) {
-        Row(
-            Modifier.fillMaxSize().padding(horizontal = 18.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Box(
-                Modifier.size(40.dp).clip(CircleShape).background(MintGreen.copy(alpha = 0.14f)),
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(Icons.Rounded.Wifi, null, tint = MintGreen, modifier = Modifier.size(22.dp))
-            }
-            Spacer(Modifier.width(12.dp))
-            Column {
-                Text("CarPlay 已连接", color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                Text("无线投屏 · 车机端实时画面", color = TextSecondary, fontSize = 11.sp)
-            }
-            Spacer(Modifier.weight(1f))
-            Icon(Icons.Rounded.DirectionsCar, null, tint = ElectricCyan.copy(alpha = 0.8f), modifier = Modifier.size(28.dp))
-        }
-    }
-}
-
-@Composable
-private fun MapCard(modifier: Modifier = Modifier, onClick: () -> Unit) {
-    val pulse by rememberInfiniteTransition(label = "mapPulse").animateFloat(
-        initialValue = 0.55f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(tween(1200), RepeatMode.Reverse),
-        label = "pulse",
-    )
-    GlassCard(modifier.clickable { onClick() }) {
-        Canvas(Modifier.fillMaxSize()) { drawMapBackdrop(pulse) }
-        Column(
-            Modifier.fillMaxSize().padding(18.dp),
-            verticalArrangement = Arrangement.SpaceBetween,
-        ) {
-            SearchPill("搜索目的地")
-            Column {
-                Text("地图", color = TextPrimary, fontSize = 30.sp, fontWeight = FontWeight.Bold)
-                Text("点击打开高德地图 · 顶部下滑返回", color = TextSecondary, fontSize = 13.sp)
-            }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Pill("实时路况")
-                Spacer(Modifier.width(8.dp))
-                Pill("车机导航")
-                Spacer(Modifier.weight(1f))
-                Text("全屏 ›", color = ElectricCyan, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+private fun MapCard(modifier: Modifier) {
+    val status by AmapPreview.status.collectAsStateWithLifecycle()
+    Box(modifier.clip(CardShape).background(Color(0xFF1B2637))) {
+        AmapPreviewView(Modifier.fillMaxSize())
+        // The card is an overview. Touch opens the fully interactive map on D2.
+        Box(Modifier.fillMaxSize().clickable(onClickLabel = "打开全屏高德地图") { MapController.requestEnter() })
+        if (status != "") {
+            Column(Modifier.align(Alignment.Center).clip(RoundedCornerShape(18.dp))
+                .background(Color(0xDD10141F)).padding(22.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Icon(Icons.Rounded.Navigation, null, tint = Color(0xFF60B5FF), modifier = Modifier.size(40.dp))
+                Spacer(Modifier.height(12.dp))
+                Text(status, color = White, fontSize = 15.sp)
             }
         }
     }
 }
 
 @Composable
-private fun MusicCard(nowPlaying: NowPlaying, modifier: Modifier = Modifier) {
-    val context = androidx.compose.ui.platform.LocalContext.current
-    val clickToGrant = if (!nowPlaying.available) {
-        Modifier.clickable { MusicBridge.openAccessSettings(context) }
-    } else {
-        Modifier
-    }
-    GlassCard(modifier.then(clickToGrant)) {
-        Column(Modifier.fillMaxSize().padding(horizontal = 22.dp, vertical = 18.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("正在播放", color = TextSecondary, fontSize = 12.sp, letterSpacing = 1.sp)
-                Spacer(Modifier.weight(1f))
-                if (nowPlaying.available) {
-                    Text(nowPlaying.appLabel, color = ElectricCyan, fontSize = 12.sp)
-                }
-            }
-            Spacer(Modifier.height(14.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    Modifier
-                        .size(150.dp)
-                        .clip(RoundedCornerShape(20.dp))
-                        .background(Color(0xFF0B1622))
-                        .border(1.dp, StrokeGlass, RoundedCornerShape(20.dp)),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    val art = nowPlaying.albumArt
-                    if (art != null) {
-                        Image(
-                            bitmap = art.asImageBitmap(),
-                            contentDescription = null,
-                            modifier = Modifier.fillMaxSize(),
-                            contentScale = ContentScale.Crop,
-                        )
-                    } else {
-                        Icon(
-                            Icons.Rounded.MusicNote,
-                            null,
-                            tint = TextSecondary,
-                            modifier = Modifier.size(56.dp),
-                        )
-                    }
-                }
-                Spacer(Modifier.width(18.dp))
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        nowPlaying.title.ifBlank { "未在播放" },
-                        color = TextPrimary,
-                        fontSize = 26.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        nowPlaying.artist.ifBlank {
-                            nowPlaying.reason.ifBlank { "打开手机音乐 App 播放一首" }
-                        },
-                        color = TextSecondary,
-                        fontSize = 14.sp,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-            }
-            Spacer(Modifier.height(12.dp))
-            if (nowPlaying.available) {
-                Text(
-                    "${formatTime(nowPlaying.positionMs)} / ${formatTime(nowPlaying.durationMs)}",
-                    color = TextSecondary,
-                    fontSize = 13.sp,
-                )
-                Spacer(Modifier.weight(1f))
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(34.dp, Alignment.CenterHorizontally),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    IconButton(onClick = { MusicBridge.previous() }, modifier = Modifier.size(52.dp)) {
-                        Icon(
-                            Icons.Rounded.SkipPrevious,
-                            "上一首",
-                            tint = TextPrimary,
-                            modifier = Modifier.size(34.dp),
-                        )
-                    }
-                    IconButton(
-                        onClick = { MusicBridge.playPause() },
-                        modifier = Modifier.size(68.dp).clip(CircleShape).background(ElectricCyan),
-                    ) {
-                        Icon(
-                            if (nowPlaying.playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                            "播放/暂停",
-                            tint = DeepSpace,
-                            modifier = Modifier.size(36.dp),
-                        )
-                    }
-                    IconButton(onClick = { MusicBridge.next() }, modifier = Modifier.size(52.dp)) {
-                        Icon(
-                            Icons.Rounded.SkipNext,
-                            "下一首",
-                            tint = TextPrimary,
-                            modifier = Modifier.size(34.dp),
-                        )
-                    }
-                }
-                Spacer(Modifier.height(4.dp))
-            } else {
-                Spacer(Modifier.weight(1f))
-                Text(
-                    nowPlaying.reason.ifBlank { "打开手机音乐 App 播放一首" },
-                    color = TextSecondary,
-                    fontSize = 14.sp,
-                )
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    "需要授予「通知使用权」才能读取 QQ音乐 / 汽水音乐 的播放状态（点卡片去系统设置）",
-                    color = TextSecondary.copy(alpha = 0.8f),
-                    fontSize = 11.sp,
-                )
-            }
+private fun MusicCard(music: NowPlaying, modifier: Modifier) {
+    val context = LocalContext.current
+    Box(modifier.clip(CardShape).background(Brush.verticalGradient(
+        listOf(Color(0xFF484265), Color(0xFF25203A), Color(0xFF171623))))) {
+        music.albumArt?.let {
+            Image(it.asImageBitmap(), "专辑封面", Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
         }
-    }
-}
-@Composable
-private fun DockRail(
-    modifier: Modifier,
-    showApps: Boolean,
-    onToggleApps: () -> Unit,
-    onMapClick: () -> Unit,
-) {
-    GlassCard(modifier) {
-        Column(
-            Modifier.fillMaxSize().padding(vertical = 16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.SpaceBetween,
-        ) {
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
-                DockRailItem(Icons.Rounded.Map, "地图", active = !showApps, onClick = onMapClick)
-                DockRailItem(Icons.Rounded.MusicNote, "音乐", onClick = {})
-                DockRailItem(Icons.Rounded.Phone, "电话", onClick = {})
-                DockRailItem(Icons.Rounded.Settings, "设置", onClick = {})
-            }
-            DockRailItem(
-                Icons.Rounded.Apps,
-                if (showApps) "首页" else "更多",
-                active = showApps,
-                onClick = onToggleApps,
-            )
-        }
-    }
-}
-
-private data class CarApp(
-    val icon: ImageVector,
-    val label: String,
-    val onClick: (() -> Unit)? = null,
-)
-
-@Composable
-private fun AppsPage(modifier: Modifier, onMapClick: () -> Unit) {
-    val apps = listOf(
-        CarApp(Icons.Rounded.Map, "地图", onMapClick),
-        CarApp(Icons.Rounded.MusicNote, "音乐"),
-        CarApp(Icons.Rounded.Phone, "电话"),
-        CarApp(Icons.Rounded.Settings, "设置"),
-        CarApp(Icons.Rounded.Navigation, "高德", onMapClick),
-        CarApp(Icons.Rounded.LibraryMusic, "QQ音乐"),
-        CarApp(Icons.Rounded.Radio, "收音机"),
-        CarApp(Icons.Rounded.Apps, "更多"),
-    )
-    GlassCard(modifier) {
+        Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(
+            Color.Black.copy(alpha = .08f), Color.Black.copy(alpha = .26f),
+            Color.Black.copy(alpha = .76f), Color.Black.copy(alpha = .84f)))))
         Column(Modifier.fillMaxSize().padding(24.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("应用", color = TextPrimary, fontSize = 28.sp, fontWeight = FontWeight.Bold)
+                Box(Modifier.size(28.dp).clip(CircleShape).background(White.copy(alpha = .92f)),
+                    contentAlignment = Alignment.Center) {
+                    Icon(Icons.Rounded.MusicNote, null, tint = Color(0xFF7461D9), modifier = Modifier.size(18.dp))
+                }
+                Spacer(Modifier.width(8.dp))
+                Text(music.appLabel.ifBlank { "音乐" }, color = White.copy(alpha = .85f), fontSize = 12.sp)
                 Spacer(Modifier.weight(1f))
-                Text("D1 自绘 · 点击打开", color = TextSecondary, fontSize = 12.sp)
+                if (music.playing) Icon(Icons.Rounded.GraphicEq, "正在播放", tint = White, modifier = Modifier.size(22.dp))
             }
-            Spacer(Modifier.height(18.dp))
-            Column(
-                Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(16.dp),
-            ) {
-                apps.chunked(4).forEach { rowApps ->
-                    Row(
-                        Modifier.weight(1f),
-                        horizontalArrangement = Arrangement.spacedBy(16.dp),
-                    ) {
-                        rowApps.forEach { app ->
-                            AppTile(app, Modifier.weight(1f).fillMaxHeight())
-                        }
-                        repeat(4 - rowApps.size) {
-                            Spacer(Modifier.weight(1f))
-                        }
-                    }
+            Spacer(Modifier.weight(1f))
+            Text(music.title.ifBlank { "听点喜欢的" }, color = White, fontSize = 27.sp,
+                fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            Spacer(Modifier.height(8.dp))
+            Text(music.artist.ifBlank { if (music.available) "选择一首音乐，开始旅程" else "连接你的音乐" },
+                color = White.copy(alpha = .65f), fontSize = 17.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Spacer(Modifier.height(28.dp))
+            if (music.available) {
+                val progress = if (music.durationMs > 0) (music.positionMs.toFloat() / music.durationMs).coerceIn(0f, 1f) else 0f
+                Canvas(Modifier.fillMaxWidth().height(4.dp)) {
+                    drawRoundRect(White.copy(alpha = .18f), cornerRadius = androidx.compose.ui.geometry.CornerRadius(5f))
+                    if (progress > 0) drawRoundRect(White.copy(alpha = .85f),
+                        size = androidx.compose.ui.geometry.Size(size.width * progress, size.height),
+                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(5f))
+                }
+                Row(Modifier.fillMaxWidth().padding(top = 7.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+                    Text(formatTime(music.positionMs), color = White.copy(alpha = .5f), fontSize = 10.sp)
+                    Text(formatTime(music.durationMs), color = White.copy(alpha = .5f), fontSize = 10.sp)
+                }
+                Spacer(Modifier.height(10.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically) {
+                    PlayerButton(Icons.Rounded.SkipPrevious, "上一首", 38) { MusicBridge.previous() }
+                    PlayerButton(if (music.playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                        if (music.playing) "暂停" else "播放", 48) { MusicBridge.playPause() }
+                    PlayerButton(Icons.Rounded.SkipNext, "下一首", 38) { MusicBridge.next() }
+                }
+            } else {
+                Text("在手机上播放音乐，即可在这里控制", color = White.copy(alpha = .6f), fontSize = 12.sp)
+                Spacer(Modifier.height(12.dp))
+                TextButton(onClick = { MusicBridge.openAccessSettings(context) }) {
+                    Text("连接音乐", color = White, fontSize = 15.sp)
                 }
             }
         }
@@ -460,169 +197,44 @@ private fun AppsPage(modifier: Modifier, onMapClick: () -> Unit) {
 }
 
 @Composable
-private fun AppTile(app: CarApp, modifier: Modifier) {
-    Column(
-        modifier
-            .clip(RoundedCornerShape(20.dp))
-            .background(Color(0x99101826))
-            .border(1.dp, StrokeGlass, RoundedCornerShape(20.dp))
-            .clickable { app.onClick?.invoke() },
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
-    ) {
-        Box(
-            Modifier
-                .size(64.dp)
-                .clip(RoundedCornerShape(18.dp))
-                .background(ElectricCyan.copy(alpha = 0.10f)),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(
-                app.icon,
-                app.label,
-                tint = ElectricCyan,
-                modifier = Modifier.size(32.dp),
-            )
+private fun PlayerButton(icon: ImageVector, label: String, size: Int, click: () -> Unit) {
+    IconButton(onClick = click, modifier = Modifier.size(58.dp)) {
+        Icon(icon, label, tint = White, modifier = Modifier.size(size.dp))
+    }
+}
+
+private fun launchMusic(context: android.content.Context, music: NowPlaying) {
+    val intent = music.packageName.takeIf { it.isNotBlank() }
+        ?.let { context.packageManager.getLaunchIntentForPackage(it) }
+    if (intent != null) runCatching {
+        val options = android.app.ActivityOptions.makeBasic().setLaunchDisplayId(0)
+        context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), options.toBundle())
+    }
+    else MusicBridge.openAccessSettings(context)
+}
+
+@Composable
+private fun AppsPage(modifier: Modifier, music: NowPlaying) {
+    val context = LocalContext.current
+    Column(modifier.fillMaxWidth().clip(CardShape).background(Color(0xFF151426)).padding(28.dp)) {
+        Text("应用", color = White, fontSize = 27.sp, fontWeight = FontWeight.SemiBold)
+        Spacer(Modifier.height(28.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(42.dp)) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                DockButton(Icons.Rounded.Navigation, "高德地图", Color(0xFF12B5D2)) { MapController.requestEnter() }
+                Spacer(Modifier.height(12.dp))
+                Text("高德地图", color = White, fontSize = 14.sp)
+            }
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                DockButton(Icons.Rounded.MusicNote, "音乐", Color(0xFF7B51EB)) { launchMusic(context, music) }
+                Spacer(Modifier.height(12.dp))
+                Text(music.appLabel.ifBlank { "音乐" }, color = White, fontSize = 14.sp)
+            }
         }
-        Spacer(Modifier.height(8.dp))
-        Text(app.label, color = TextPrimary, fontSize = 13.sp)
     }
-}
-@Composable
-private fun DockRailItem(
-    icon: ImageVector,
-    label: String,
-    active: Boolean = false,
-    onClick: () -> Unit,
-) {
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .clickable { onClick() }
-            .padding(vertical = 9.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Icon(
-            icon,
-            label,
-            tint = if (active) ElectricCyan else TextSecondary,
-            modifier = Modifier.size(26.dp),
-        )
-        Spacer(Modifier.height(4.dp))
-        Text(label, color = if (active) ElectricCyan else TextSecondary, fontSize = 10.sp)
-    }
-}
-
-@Composable
-private fun SearchPill(text: String, modifier: Modifier = Modifier) {
-    Row(
-        modifier
-            .height(46.dp)
-            .clip(RoundedCornerShape(23.dp))
-            .background(Color(0xCC0B1622))
-            .border(1.dp, StrokeGlass, RoundedCornerShape(23.dp))
-            .padding(horizontal = 16.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(Icons.Rounded.Search, null, tint = TextSecondary, modifier = Modifier.size(20.dp))
-        Spacer(Modifier.width(10.dp))
-        Text(text, color = TextSecondary, fontSize = 14.sp)
-    }
-}
-
-@Composable
-private fun StatusChip(text: String, accent: Boolean = false) {
-    Box(
-        Modifier
-            .clip(RoundedCornerShape(12.dp))
-            .background(if (accent) MintGreen.copy(alpha = 0.10f) else Color(0x99101826))
-            .border(
-                1.dp,
-                if (accent) MintGreen.copy(alpha = 0.35f) else StrokeGlass,
-                RoundedCornerShape(12.dp),
-            )
-            .padding(horizontal = 12.dp, vertical = 6.dp),
-    ) {
-        Text(text, color = if (accent) MintGreen else TextSecondary, fontSize = 11.sp)
-    }
-}
-
-@Composable
-private fun Pill(text: String) {
-    Box(
-        Modifier
-            .clip(RoundedCornerShape(12.dp))
-            .background(Color(0x99101826))
-            .padding(horizontal = 10.dp, vertical = 5.dp),
-    ) {
-        Text(text, color = ElectricCyan.copy(alpha = 0.85f), fontSize = 11.sp)
-    }
-}
-
-@Composable
-private fun GlassCard(modifier: Modifier = Modifier, content: @Composable BoxScope.() -> Unit) {
-    Box(
-        modifier
-            .clip(RoundedCornerShape(22.dp))
-            .background(PanelGlass)
-            .border(1.dp, StrokeGlass, RoundedCornerShape(22.dp)),
-        content = content,
-    )
-}
-
-private fun DrawScope.drawMapBackdrop(pulse: Float = 1f) {
-    drawRect(Color(0xFF08131C))
-    val road = Color(0xFF15303B)
-    for (i in 1..8) {
-        drawLine(road, Offset(size.width * i / 9f, 0f), Offset(size.width * i / 9f, size.height), 2f)
-    }
-    for (i in 1..5) {
-        drawLine(road, Offset(0f, size.height * i / 6f), Offset(size.width, size.height * i / 6f), 2f)
-    }
-    drawLine(
-        Color(0xFF1C4557),
-        Offset(0f, size.height * 0.74f),
-        Offset(size.width, size.height * 0.30f),
-        10f,
-    )
-    drawLine(
-        Color(0xFF1C4557),
-        Offset(size.width * 0.16f, size.height),
-        Offset(size.width * 0.55f, 0f),
-        6f,
-    )
-    drawLine(
-        ElectricCyan.copy(alpha = 0.5f),
-        Offset(0f, size.height * 0.74f),
-        Offset(size.width * 0.56f, size.height * 0.47f),
-        5f,
-    )
-    drawCircle(
-        ElectricCyan.copy(alpha = 0.10f + 0.12f * pulse),
-        radius = 20f + 22f * pulse,
-        center = Offset(size.width * 0.56f, size.height * 0.47f),
-    )
-    drawCircle(
-        ElectricCyan,
-        radius = 11f,
-        center = Offset(size.width * 0.56f, size.height * 0.47f),
-    )
 }
 
 private fun formatTime(ms: Long): String {
-    if (ms <= 0) return "0:00"
-    val total = ms / 1_000
-    return "%d:%02d".format(total / 60, total % 60)
+    val seconds = ms.coerceAtLeast(0) / 1000
+    return "%d:%02d".format(seconds / 60, seconds % 60)
 }
-
-private fun weekdayCn(time: LocalDateTime): String = when (time.dayOfWeek.value) {
-    1 -> "周一"
-    2 -> "周二"
-    3 -> "周三"
-    4 -> "周四"
-    5 -> "周五"
-    6 -> "周六"
-    else -> "周日"
-}
-

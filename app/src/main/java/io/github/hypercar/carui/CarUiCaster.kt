@@ -55,6 +55,9 @@ object CarUiCaster {
         if (running || starting) {
             // stop 可能清掉监听器后卡住；重连分支必须补装，否则触摸静默丢失
             installTouchListener()
+            scope.launch {
+                if (SettingsStore.enableAudio) CarAudioCapture.start() else CarAudioCapture.stop()
+            }
             // 引擎重连会新建一个 encoder_size（初始值来自设置，可能是 2560x744）；
             // 画面尺寸必须重新上报，否则 Rust 触摸坐标按 2560x744 缩放，D1/D2 上点不动。
             runCatching { RustCoreBridge.nativeSetVideoSize(WIDTH, HEIGHT) }
@@ -119,6 +122,7 @@ object CarUiCaster {
 
         panelOff = screenOff
         running = true
+        if (SettingsStore.enableAudio) CarAudioCapture.start()
         // 引擎刚起时 nativeSetVideoSize 可能落在 ENGINE 句柄安装之前；延迟补报一次
         scope.launch {
             kotlinx.coroutines.delay(900)
@@ -165,6 +169,7 @@ object CarUiCaster {
     }
 
     fun stop() {
+        CarAudioCapture.stop()
         if (!running && displayId < 0) return
         // 先收地图（释放 D2/复原横屏覆盖），再收 D1
         MapController.stop()

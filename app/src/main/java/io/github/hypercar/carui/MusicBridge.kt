@@ -65,10 +65,83 @@ object MusicBridge {
     private var controller: MediaController? = null
     private var sessionsListener: MediaSessionManager.OnActiveSessionsChangedListener? = null
     private var permissionDenied = false
+    private var resumePackage: String? = null
+    private var carConnected = false
+    private var carAudioReady = false
+    private var playbackPrefs: android.content.SharedPreferences? = null
+    private var manualPauseRequested = false
+
+    /** Serialize MediaSession commands with metadata callbacks, before restoring the phone audio route. */
+    private fun onMusicThread(wait: Boolean = true, action: () -> Unit) {
+        if (Looper.myLooper() == main.looper) {
+            action()
+        } else {
+            if (!wait) {
+                main.post(action)
+                return
+            }
+            val completed = java.util.concurrent.CountDownLatch(1)
+            main.post { try { action() } finally { completed.countDown() } }
+            if (!completed.await(1500, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                HyperCarRepo.log("MUSIC: 等待连接播放状态处理超时")
+            }
+        }
+    }
+
+    fun onCarConnected() = onMusicThread {
+        carConnected = true
+        carAudioReady = false
+    }
+
+    fun onCarAudioReady() = onMusicThread(wait = false) {
+        if (carConnected) {
+            carAudioReady = true
+            resumeAfterReconnect()
+        }
+    }
+
+    fun onCarDisconnected() = onMusicThread {
+        if (!carConnected) return@onMusicThread
+        carConnected = false
+        carAudioReady = false
+        val c = controller
+        val wasPlaying = !manualPauseRequested && c?.playbackState?.state in listOf(
+            PlaybackState.STATE_PLAYING, PlaybackState.STATE_BUFFERING, PlaybackState.STATE_CONNECTING,
+        )
+        resumePackage = if (wasPlaying) c?.packageName else null
+        playbackPrefs?.edit()?.putString("resume_package", resumePackage)?.apply()
+        if (wasPlaying) {
+            runCatching { c?.transportControls?.pause() }
+                .onFailure { HyperCarRepo.log("MUSIC: 断连暂停失败 ${it.message}") }
+            HyperCarRepo.log("MUSIC: 车机断开，已暂停 ${c?.packageName}，下次音频就绪后恢复")
+        }
+    }
+
+    private fun resumeAfterReconnect() {
+        if (!carConnected || !carAudioReady) return
+        val pkg = resumePackage ?: return
+        val s = service ?: return
+        val sessions = runCatching {
+            s.getSystemService(MediaSessionManager::class.java)?.getActiveSessions(
+                ComponentName(s, MusicNotificationListener::class.java),
+            )
+        }.getOrNull().orEmpty()
+        val target = sessions.firstOrNull { it.packageName == pkg } ?: return
+        runCatching { target.transportControls.play() }.onSuccess {
+            resumePackage = null
+            playbackPrefs?.edit()?.remove("resume_package")?.apply()
+            HyperCarRepo.log("MUSIC: 车机音频已就绪，恢复 $pkg")
+        }.onFailure { HyperCarRepo.log("MUSIC: 恢复播放失败 ${it.message}") }
+    }
 
     private val callback = object : MediaController.Callback() {
         override fun onMetadataChanged(metadata: MediaMetadata?) = publish()
-        override fun onPlaybackStateChanged(state: PlaybackState?) = publish()
+        override fun onPlaybackStateChanged(state: PlaybackState?) {
+            if (state?.state == PlaybackState.STATE_PAUSED || state?.state == PlaybackState.STATE_STOPPED) {
+                manualPauseRequested = false
+            }
+            publish()
+        }
         override fun onSessionDestroyed() {
             controller = null
             choose()
@@ -78,6 +151,7 @@ object MusicBridge {
     private val ticker = object : Runnable {
         override fun run() {
             if (controller != null) publish()
+            resumeAfterReconnect()
             main.postDelayed(this, 1_000)
         }
     }
@@ -99,6 +173,8 @@ object MusicBridge {
 
     fun attach(service: NotificationListenerService) {
         this.service = service
+        playbackPrefs = service.getSharedPreferences("car_playback", Context.MODE_PRIVATE)
+        resumePackage = playbackPrefs?.getString("resume_package", null)
         permissionDenied = false
         val msm = service.getSystemService(MediaSessionManager::class.java)
         val component = ComponentName(service, MusicNotificationListener::class.java)
@@ -201,10 +277,15 @@ object MusicBridge {
     }
 
     fun playPause() {
+        // Explicit user playback controls supersede the saved automatic-resume request.
+        resumePackage = null
+        playbackPrefs?.edit()?.remove("resume_package")?.apply()
         val c = controller ?: return
         if (c.playbackState?.state == PlaybackState.STATE_PLAYING) {
+            manualPauseRequested = true
             c.transportControls.pause()
         } else {
+            manualPauseRequested = false
             c.transportControls.play()
         }
     }

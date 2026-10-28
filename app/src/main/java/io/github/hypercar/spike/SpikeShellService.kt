@@ -28,6 +28,22 @@ import java.lang.reflect.Method
  */
 class SpikeShellService : ISpikeShell.Stub {
 
+    private val playbackAudio = ShellPlaybackAudio()
+
+    override fun startAudioCapture(owner: IBinder): android.os.ParcelFileDescriptor? {
+        val identity = android.os.Binder.clearCallingIdentity()
+        return try { appContext?.let { playbackAudio.start(it, owner) } }
+        finally { android.os.Binder.restoreCallingIdentity(identity) }
+    }
+
+    override fun stopAudioCapture() {
+        val identity = android.os.Binder.clearCallingIdentity()
+        try { playbackAudio.stop() }
+        finally { android.os.Binder.restoreCallingIdentity(identity) }
+    }
+
+    override fun audioCaptureStatus(): String = playbackAudio.status
+
     constructor() : super() {
         bindContext(null)
     }
@@ -125,6 +141,15 @@ class SpikeShellService : ISpikeShell.Stub {
             runCatching { setPhysicalScreenPower(true) }
         }
         "OK released=$had"
+    }
+
+    override fun updateDisplaySurface(displayId: Int, surface: Surface?, width: Int, height: Int, dpi: Int): String = synchronized(lock) {
+        val vd = displays[displayId] ?: return@synchronized "ERR display=$displayId missing"
+        runCatching {
+            if (width > 0 && height > 0 && dpi > 0) vd.resize(width, height, dpi)
+            vd.surface = surface
+            "OK display=$displayId ${width}x$height surface=${surface != null}"
+        }.getOrElse { "ERR ${it.message}" }
     }
 
     override fun releaseDisplayById(displayId: Int): String = synchronized(lock) {

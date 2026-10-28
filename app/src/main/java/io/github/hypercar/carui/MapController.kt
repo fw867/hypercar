@@ -3,10 +3,7 @@ package io.github.hypercar.carui
 import android.content.Context
 import android.os.SystemClock
 import io.github.hypercar.session.HyperCarRepo
-import io.github.hypercar.shizuku.ShizukuTools
-import io.github.hypercar.spike.MapCompat
 import io.github.hypercar.spike.SpikeCaster
-import io.github.hypercar.spike.SpikeDisplay
 import io.github.hypercar.spike.SpikeShell
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -14,23 +11,11 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
-/**
- * P2：D2 高德地图 + D1/D2 切源。
- *
- * 结构：
- *  - D1 首页（[CarUiCaster] 的 caster）常驻，`pushing=true`；
- *  - 进地图时：MapCompat 横屏 → shell 建 D2（1920×720，独立显示组/免锁屏）→
- *    `am start --display D2` 启高德 → 新 caster 编码 D2；
- *  - 两个编码器都在跑，但只有 active 的 `pushing=true`，切源只切推送 + 关键帧，不重建显示；
- *  - 触摸：高德界面用 Shizuku 按 displayId 注入；顶部下滑手势退出地图；
- *  - 退出：切回 D1、释放 D2/地图 caster、复原 MapCompat。
- */
+/** Fullscreen encoding and touch routing for Amap's persistent display, shared with the home card. */
 object MapController {
 
     private const val TAG = "CARUI-MAP"
     private const val MAP_PKG = "com.autonavi.minimap"
-    private const val MAP_COMPONENT =
-        "com.autonavi.minimap/com.autonavi.map.activity.SplashActivity"
     private const val W = 1920
     private const val H = 720
     private const val DPI = 240
@@ -63,6 +48,7 @@ object MapController {
     fun init(context: Context, home: SpikeCaster) {
         appContext = context.applicationContext
         homeCaster = home
+        scope.launch { AmapPreview.resumePreview() }
     }
 
     fun reset() {
@@ -105,78 +91,55 @@ object MapController {
         val home = homeCaster ?: return "home caster 不在"
         if (!installed(ctx)) return "高德未安装（$MAP_PKG）"
 
-        val compat = MapCompat.enable(MAP_PKG)
-        HyperCarRepo.log("CARUI-MAP: $compat")
-        runCatching { ShizukuTools.exec("am force-stop $MAP_PKG", 5_000) }
-
         val c = SpikeCaster(ctx, width = W, height = H, tag = "CARUI-MAP")
         mapCaster = c
         c.setPushing(false)
-        val enc = runCatching { c.startEncoder() }.getOrElse { t ->
-            cleanupFailed("地图编码器启动失败: ${t.javaClass.simpleName}: ${t.message}")
-            return "编码器失败: ${t.message}"
+        try {
+            c.startEncoder()
+            val surface = c.encoderSurface ?: error("地图编码器没有 InputSurface")
+            // Retarget the same display at the same density, preserving its navigation engine.
+            val id = AmapPreview.showFullscreen(surface, W, H, DPI)
+            mapDisplayId = id
+            delay(350)
+            c.setPushing(true)
+            c.requestSyncFrame()
+            home.setSuspended(true)
+            home.setPushing(false)
+            mapActive = true
+            MapHomeOverlay.attach(ctx, id) { requestExit() }
+            return "ok display=$id（保留高德任务）"
+        } catch (e: Exception) {
+            cleanupFailed("全屏切换失败: ${e.message}")
+            return "切换失败: ${e.message}"
         }
-        val surface = c.encoderSurface ?: run {
-            cleanupFailed("地图编码器没有 InputSurface")
-            return "没有 InputSurface"
-        }
-        val created = SpikeShell.createDisplay(surface, W, H, DPI, 0, "hypercar-d2")
-        val id = Regex("id=(\\d+)").find(created)?.groupValues?.get(1)?.toIntOrNull() ?: -1
-        if (id <= 0) {
-            cleanupFailed("shell 建 D2 失败: $created")
-            return "建屏失败: $created"
-        }
-        mapDisplayId = id
-        val launch = SpikeDisplay.amStartComponentOnDisplay(id, MAP_COMPONENT, clearTask = true)
-        HyperCarRepo.log("CARUI-MAP: 高德上 D2（$id）: $launch")
-        if (!launch.contains("exit=0")) {
-            cleanupFailed("高德启动失败: $launch")
-            return "高德启动失败: $launch"
-        }
-
-        // 高德冷启动先出 splash/白屏；等它画出首帧再切源，避免车机看到 1.8s 空白
-        delay(1_800)
-        c.setPushing(true)
-        c.requestSyncFrame()
-        home.setSuspended(true)
-        home.setPushing(false)
-        mapActive = true
-        MapHomeOverlay.attach(ctx, id) { requestExit() }
-        HyperCarRepo.log("CARUI-MAP: 已切到 D2（$enc）")
-        return "ok display=$id"
     }
 
     private suspend fun exit(): String {
         if (!mapActive) return "not active"
-        val home = homeCaster
-        mapCaster?.setPushing(false)
-        home?.setSuspended(false)
-        home?.setPushing(true)
-        home?.requestSyncFrame()
-        runCatching { ShizukuTools.exec("am force-stop $MAP_PKG", 5_000) }
+        // Attach the card surface before releasing the encoder surface, without restarting the app.
+        AmapPreview.resumePreview()
         MapHomeOverlay.detach()
-        val id = mapDisplayId
-        if (id > 0) SpikeShell.releaseDisplay(id)
-        mapDisplayId = -1
-        runCatching { mapCaster?.stop() }
-        mapCaster = null
-        val compat = MapCompat.disable(MAP_PKG)
         mapActive = false
-        HyperCarRepo.log("CARUI-MAP: $compat")
-        return "ok"
-    }
-
-    private fun cleanupFailed(reason: String) {
-        HyperCarRepo.log("CARUI-MAP: $reason")
-        runCatching { mapCaster?.stop() }
-        mapCaster = null
-        val id = mapDisplayId
         mapDisplayId = -1
-        MapHomeOverlay.detach()
-        if (id > 0) SpikeShell.releaseDisplay(id)
+        mapCaster?.setPushing(false)
         homeCaster?.setSuspended(false)
         homeCaster?.setPushing(true)
-        scope.launch { runCatching { MapCompat.disable(MAP_PKG) } }
+        homeCaster?.requestSyncFrame()
+        runCatching { mapCaster?.stop() }
+        mapCaster = null
+        return "ok（导航继续显示在首页卡片）"
+    }
+
+    private suspend fun cleanupFailed(reason: String) {
+        HyperCarRepo.log("CARUI-MAP: $reason")
+        AmapPreview.resumePreview()
+        MapHomeOverlay.detach()
+        mapActive = false
+        mapDisplayId = -1
+        runCatching { mapCaster?.stop() }
+        mapCaster = null
+        homeCaster?.setSuspended(false)
+        homeCaster?.setPushing(true)
     }
 
     /**
@@ -268,23 +231,14 @@ object MapController {
 
     /** 首页 caster 停止时的同步收尾（会话断开）：释放 D2、复原横屏覆盖。 */
     fun stop() {
-        val wasActive = mapActive || mapCaster != null || mapDisplayId > 0
+        AmapPreview.stop()
         mapActive = false
         mapCaster?.setPushing(false)
         runCatching { mapCaster?.stop() }
         mapCaster = null
-        val id = mapDisplayId
         mapDisplayId = -1
         MapHomeOverlay.detach()
-        if (id > 0) SpikeShell.releaseDisplay(id)
         homeCaster?.setSuspended(false)
         homeCaster?.setPushing(true)
-        // 没进过地图就不要碰手机上的高德/横屏覆盖
-        if (wasActive) {
-            scope.launch {
-                runCatching { ShizukuTools.exec("am force-stop $MAP_PKG", 4_000) }
-                runCatching { MapCompat.disable(MAP_PKG) }
-            }
-        }
     }
 }

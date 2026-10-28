@@ -45,6 +45,7 @@ class CarUiService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.getStringExtra("action") ?: "start"
         if (action == "stop") {
+            MusicBridge.onCarDisconnected()
             CarUiCaster.stop()
             stopSelf()
             return START_NOT_STICKY
@@ -57,8 +58,7 @@ class CarUiService : Service() {
                 HyperCarRepo.log("CARUI: shot 失败——CarHomeActivity 不在")
             } else {
                 activity.runOnUiThread {
-                    val path = activity.captureToFile()
-                    HyperCarRepo.log("CARUI: shot → $path")
+                    activity.captureWindow { path -> HyperCarRepo.log("CARUI: shot → $path") }
                 }
             }
             return START_NOT_STICKY

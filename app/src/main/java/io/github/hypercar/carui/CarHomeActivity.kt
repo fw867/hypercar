@@ -105,6 +105,29 @@ class CarHomeActivity : ComponentActivity() {
         }.getOrNull()
     }
 
+    /** PixelCopy includes the TextureView map; software View.draw cannot capture its GPU texture. */
+    fun captureWindow(onResult: (String?) -> Unit) {
+        val view = window.decorView
+        if (view.width <= 0 || view.height <= 0) {
+            onResult(null)
+            return
+        }
+        val bitmap = android.graphics.Bitmap.createBitmap(view.width, view.height,
+            android.graphics.Bitmap.Config.ARGB_8888)
+        runCatching {
+            android.view.PixelCopy.request(window, bitmap, { result ->
+                val path = if (result == android.view.PixelCopy.SUCCESS) {
+                    io.github.hypercar.spike.SpikeReport.writePng(this, "carui-home", bitmap)
+                } else null
+                bitmap.recycle()
+                onResult(path)
+            }, android.os.Handler(mainLooper))
+        }.onFailure {
+            bitmap.recycle()
+            onResult(null)
+        }
+    }
+
     companion object {
         @Volatile
         var instance: CarHomeActivity? = null
