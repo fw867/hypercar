@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.headunit
+package io.github.hypercar.headunit
 
 import android.content.Context
 
@@ -192,7 +192,6 @@ object RemoteProfiles {
             preferMdnsAirplay = o.optBoolean("preferMdnsAirplay", defaults.preferMdnsAirplay),
             fallbackAirplayPorts = readPorts(o, defaults.fallbackAirplayPorts),
             touchDisplay = o.optString("touchDisplay", "").ifBlank { defaults.touchDisplay },
-            keepIap2AliveOnly = o.optBoolean("keepIap2AliveOnly", defaults.keepIap2AliveOnly),
             pairingHint = o.optString("pairingHint", "").ifBlank { null },
         )
     }
@@ -224,7 +223,6 @@ object RemoteProfiles {
                     put("preferMdnsAirplay", p.preferMdnsAirplay)
                     put("fallbackAirplayPorts", JSONArray(p.fallbackAirplayPorts))
                     p.touchDisplay?.let { put("touchDisplay", it) }
-                    put("keepIap2AliveOnly", p.keepIap2AliveOnly)
                     p.pairingHint?.let { put("pairingHint", it) }
                 },
             )

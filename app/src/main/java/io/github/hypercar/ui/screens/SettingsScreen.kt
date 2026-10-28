@@ -588,6 +588,11 @@ private fun PermissionSettingsSection() {
                 onClick = { AppPermissions.openOverlaySettings(context) },
             )
             InfoRow(
+                label = "音乐卡片通知使用权",
+                value = if (io.github.hypercar.carui.MusicBridge.hasAccess(context)) "已授予" else "去设置",
+                onClick = { io.github.hypercar.carui.MusicBridge.openAccessSettings(context) },
+            )
+            InfoRow(
                 label = "系统权限页",
                 value = "打开",
                 onClick = { AppPermissions.openAppDetails(context) },
@@ -991,9 +996,6 @@ private fun FpsSegment() {
 private fun BehaviorSection() {
     var autoConnect by rememberSaveable { mutableStateOf(SettingsStore.autoConnect) }
     var enableAudio by rememberSaveable { mutableStateOf(SettingsStore.enableAudio) }
-    var carUi by rememberSaveable { mutableStateOf(SettingsStore.carUiEnabled) }
-    var phoneScreenOff by rememberSaveable { mutableStateOf(SettingsStore.phoneScreenOff) }
-    val context = androidx.compose.ui.platform.LocalContext.current
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionLabel(text = "行为")
@@ -1019,65 +1021,6 @@ private fun BehaviorSection() {
                     SettingsStore.enableAudio = it
                 },
             )
-            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-            SwitchRow(
-                title = "自绘车机首页",
-                subtitle = "D1 显示自绘首页（地图/音乐卡片）；需 Shizuku + 手机亮屏解锁",
-                checked = carUi,
-                onCheckedChange = {
-                    carUi = it
-                    SettingsStore.carUiEnabled = it
-                    if (!it) io.github.hypercar.carui.CarUiCaster.stop()
-                },
-            )
-            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-            SwitchRow(
-                title = "连接时关闭手机屏幕",
-                subtitle = "默认关：连接不熄屏；开启后连接即断面板电源，系统保持唤醒（按电源键两次恢复）",
-                checked = phoneScreenOff,
-                onCheckedChange = {
-                    phoneScreenOff = it
-                    SettingsStore.phoneScreenOff = it
-                    if (!it) {
-                        io.github.hypercar.spike.SpikeShell.setPhysicalScreenPower(true)
-                    } else if (io.github.hypercar.carui.CarUiCaster.running) {
-                        io.github.hypercar.spike.SpikeShell.setPhysicalScreenPower(false)
-                    }
-                },
-            )
-            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-            val musicAccess = io.github.hypercar.carui.MusicBridge.hasAccess(context)
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { io.github.hypercar.carui.MusicBridge.openAccessSettings(context) }
-                    .heightIn(min = 56.dp)
-                    .padding(vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "音乐卡片通知使用权",
-                        style = MaterialTheme.typography.titleSmall,
-                        color = TextPrimary,
-                    )
-                    Text(
-                        text = if (musicAccess) {
-                            "已授予（QQ音乐 / 汽水音乐可读）"
-                        } else {
-                            "未授予——点此去系统设置开启"
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = if (musicAccess) MintGreen else AmberWarning,
-                    )
-                }
-                Spacer(modifier = Modifier.width(12.dp))
-                Text(
-                    text = "›",
-                    style = MaterialTheme.typography.titleLarge,
-                    color = TextSecondary,
-                )
-            }
         }
     }
 }
@@ -1160,12 +1103,8 @@ private fun HeadUnitSection(connected: Boolean = false) {
     val profiles = io.github.hypercar.headunit.HeadUnitProfiles.all
     val current = io.github.hypercar.headunit.HeadUnitProfiles.byId(selectedId)
 
-    // 选中即生效的副作用统一走这里（含「联调/只保 iAP2」的联动，见 profile.keepIap2AliveOnly）
     fun applyProfile(profile: io.github.hypercar.headunit.HeadUnitProfile) {
         SettingsStore.headUnitProfileId = profile.id
-        // 原来设置里有个独立的「联调：只保持 iAP2 链路」开关，现在由档案联动：
-        // 选 WinPlay 自动打开（AirPlay 由 PC 侧 hub 推），选真车自动关闭。
-        SettingsStore.iap2KeepAliveOnly = profile.keepIap2AliveOnly
         // 换车机型号时把「目标车机」重置为自动发现：上一台的名字/MAC 留着，
         // 新车型会因「目标对不上」直接失败，而用户常常忘了改（现场反馈）。
         SettingsStore.targetCarMac = null
@@ -1255,17 +1194,6 @@ private fun HeadUnitSection(connected: Boolean = false) {
                                         maxLines = 2,
                                         overflow = TextOverflow.Ellipsis,
                                     )
-                                    if (profile.keepIap2AliveOnly) {
-                                        // 原来这句放在列表下方的页脚，容易看漏；
-                                        // 挪进 WinPlay 这一条里，选中前就能看到后果
-                                        Text(
-                                            text = "选它会进入「只保 iAP2 链路」模式：AirPlay 由 PC 侧 hub 推送",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = AmberWarning,
-                                            maxLines = 2,
-                                            overflow = TextOverflow.Ellipsis,
-                                        )
-                                    }
                                 }
                             },
                             onClick = {

@@ -40,10 +40,8 @@ object CarUiCaster {
     private var caster: SpikeCaster? = null
     private var displayId = -1
     private var cpuLock: PowerManager.WakeLock? = null
-    private var savedScreenOffTimeout = -1
     private var appContext: Context? = null
     @Volatile private var starting = false
-    private var panelOff = false
 
     @Volatile
     var running: Boolean = false
@@ -99,7 +97,8 @@ object CarUiCaster {
         MapController.init(context, c)
         appContext = context.applicationContext
 
-        // 会话期 CPU 常醒：面板断电后系统不能进 Doze
+        // 会话期 CPU 常醒 + 虚拟屏独立显示组：锁屏/息屏后车机 UI 仍保持 60fps，
+        // 这是防冻结的关键，不能再删。
         runCatching {
             cpuLock = (context.getSystemService(Context.POWER_SERVICE) as? PowerManager)
                 ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "hypercar:carui-cpu")
@@ -109,18 +108,6 @@ object CarUiCaster {
                 }
         }
 
-        // 仅当用户显式开启「真息屏」时才断面板/拉长超时；默认保持正常亮屏与触摸唤醒。
-        val screenOff = if (SettingsStore.phoneScreenOff) {
-            savedScreenOffTimeout = runCatching {
-                Settings.System.getInt(context.contentResolver, Settings.System.SCREEN_OFF_TIMEOUT, 60_000)
-            }.getOrDefault(60_000)
-            runCatching { ShizukuTools.exec("settings put system screen_off_timeout 2147483647") }
-            SpikeShell.setPhysicalScreenPower(false)
-        } else {
-            false
-        }
-
-        panelOff = screenOff
         running = true
         if (SettingsStore.enableAudio) CarAudioCapture.start()
         // 引擎刚起时 nativeSetVideoSize 可能落在 ENGINE 句柄安装之前；延迟补报一次
@@ -129,8 +116,7 @@ object CarUiCaster {
             runCatching { RustCoreBridge.nativeSetVideoSize(WIDTH, HEIGHT) }
             if (MapController.mapActive) MapController.refreshVideoSize()
         }
-        val msg = "启动 ok display=$id | $encoder | bind=$bind | create=$created | " +
-            "launch=$launch | screenOff=$screenOff"
+        val msg = "启动 ok display=$id | $encoder | bind=$bind | create=$created | launch=$launch"
         HyperCarRepo.log("CARUI: $msg")
         return msg
         } finally {
@@ -174,11 +160,6 @@ object CarUiCaster {
         // 先收地图（释放 D2/复原横屏覆盖），再收 D1
         MapController.stop()
         MapController.reset()
-        // 只有我们真断过面板才去点亮；默认没断过，省掉一次可能卡住的 shell binder
-        if (panelOff) {
-            runCatching { SpikeShell.setPhysicalScreenPower(true) }
-            panelOff = false
-        }
         RustCoreBridge.setTouchListener(null)
         if (displayId > 0) SpikeShell.releaseDisplay()
         displayId = -1
@@ -186,27 +167,8 @@ object CarUiCaster {
         caster = null
         running = false
 
-        val ctx = appContext
-        if (savedScreenOffTimeout > 0 && ctx != null) {
-            val restored = runCatching {
-                Settings.System.putInt(
-                    ctx.contentResolver,
-                    Settings.System.SCREEN_OFF_TIMEOUT,
-                    savedScreenOffTimeout,
-                )
-            }.getOrDefault(false)
-            if (!restored) {
-                val timeout = savedScreenOffTimeout
-                scope.launch {
-                    runCatching {
-                        ShizukuTools.exec("settings put system screen_off_timeout $timeout")
-                    }
-                }
-            }
-        }
-        savedScreenOffTimeout = -1
         runCatching { cpuLock?.takeIf { it.isHeld }?.release() }
         cpuLock = null
-        HyperCarRepo.log("CARUI: 已停止（显示/编码器已释放，物理屏已恢复）")
+        HyperCarRepo.log("CARUI: 已停止（显示/编码器已释放）")
     }
 }

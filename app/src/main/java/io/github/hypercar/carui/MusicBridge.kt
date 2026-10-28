@@ -15,8 +15,10 @@ import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import androidx.core.app.NotificationManagerCompat
 import io.github.hypercar.session.HyperCarRepo
+import io.github.hypercar.shizuku.ShizukuTools
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.runBlocking
 
 /**
  * 音乐卡片的数据源：NotificationListenerService 权限 + MediaSessionManager.getActiveSessions。
@@ -70,6 +72,8 @@ object MusicBridge {
     private var carAudioReady = false
     private var playbackPrefs: android.content.SharedPreferences? = null
     private var manualPauseRequested = false
+    /** 用户在音乐卡片里选定的 App；有它的会话时优先显示它，而不是按“正在播放”抢焦点。 */
+    private var preferredPackage: String? = null
 
     /** Serialize MediaSession commands with metadata callbacks, before restoring the phone audio route. */
     private fun onMusicThread(wait: Boolean = true, action: () -> Unit) {
@@ -104,16 +108,39 @@ object MusicBridge {
         if (!carConnected) return@onMusicThread
         carConnected = false
         carAudioReady = false
-        val c = controller
-        val wasPlaying = !manualPauseRequested && c?.playbackState?.state in listOf(
-            PlaybackState.STATE_PLAYING, PlaybackState.STATE_BUFFERING, PlaybackState.STATE_CONNECTING,
+        // 不要只信 controller：切 App 后它可能还指向旧的会话。断连时把所有
+        // 正在播放的 MediaSession 都暂停，避免手机外放/后台继续响。
+        val s = service
+        val sessions = runCatching {
+            s?.getSystemService(MediaSessionManager::class.java)?.getActiveSessions(
+                ComponentName(s, MusicNotificationListener::class.java),
+            )
+        }.getOrNull().orEmpty()
+        val playingStates = listOf(
+            PlaybackState.STATE_PLAYING,
+            PlaybackState.STATE_BUFFERING,
+            PlaybackState.STATE_CONNECTING,
         )
-        resumePackage = if (wasPlaying) c?.packageName else null
-        playbackPrefs?.edit()?.putString("resume_package", resumePackage)?.apply()
-        if (wasPlaying) {
-            runCatching { c?.transportControls?.pause() }
-                .onFailure { HyperCarRepo.log("MUSIC: 断连暂停失败 ${it.message}") }
-            HyperCarRepo.log("MUSIC: 车机断开，已暂停 ${c?.packageName}，下次音频就绪后恢复")
+        val playing = buildList {
+            addAll(sessions.filter { it.playbackState?.state in playingStates })
+            val c = controller
+            if (c != null && c.playbackState?.state in playingStates && none { it.packageName == c.packageName }) {
+                add(c)
+            }
+        }
+        val target = playing.firstOrNull { it.packageName == controller?.packageName }
+            ?: playing.firstOrNull()
+        if (!manualPauseRequested && playing.isNotEmpty()) {
+            resumePackage = target?.packageName
+            playbackPrefs?.edit()?.putString("resume_package", resumePackage)?.apply()
+            playing.forEach { session ->
+                runCatching { session.transportControls.pause() }
+                    .onFailure { HyperCarRepo.log("MUSIC: 断连暂停失败 ${it.message}") }
+            }
+            HyperCarRepo.log("MUSIC: 车机断开，已暂停 ${playing.joinToString { it.packageName }}")
+        } else {
+            resumePackage = null
+            playbackPrefs?.edit()?.remove("resume_package")?.apply()
         }
     }
 
@@ -171,10 +198,66 @@ object MusicBridge {
         }
     }
 
+    /** 音乐卡片左上角切换 App：记住选择并把目标 App 拉到手机前台（车机只显示媒体卡片）。 */
+    fun selectPackage(context: Context, packageName: String) {
+        if (packageName.isBlank()) return
+        // 切换前先停掉/关掉上一个 App（即使它已暂停，也一并清掉，避免后台残留）。
+        val previous = controller?.packageName
+        val previousPlaying = controller?.playbackState?.state == PlaybackState.STATE_PLAYING
+        if (!previous.isNullOrBlank() && previous != packageName) {
+            if (previousPlaying) {
+                runCatching { controller?.transportControls?.pause() }
+                HyperCarRepo.log("MUSIC: 停止上一个播放器 $previous")
+            }
+            closePackage(context, previous)
+        }
+        preferredPackage = packageName
+        val prefs = playbackPrefs
+            ?: context.getSharedPreferences("car_playback", Context.MODE_PRIVATE)
+        prefs.edit().putString("preferred_package", packageName).apply()
+        val intent = context.packageManager.getLaunchIntentForPackage(packageName)
+        val component = intent?.component
+        if (component != null && ShizukuTools.isReady) {
+            // 走 shell 拉起：MIUI 对后台 startActivity 会弹「是否允许启动」确认页，
+            // 车机上点一下切歌不该把手机前台让给系统确认框。
+            val cmd = "am start -n ${component.flattenToShortString()} --display 0"
+            Thread({
+                runBlocking { runCatching { ShizukuTools.exec(cmd, 4_000) } }
+            }, "music-launch").apply { isDaemon = true }.start()
+        } else if (intent != null) {
+            runCatching {
+                val options = android.app.ActivityOptions.makeBasic().setLaunchDisplayId(0)
+                context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), options.toBundle())
+            }.onFailure {
+                HyperCarRepo.log("MUSIC: 切换 ${packageName} 失败 ${it.message}")
+            }
+        }
+        HyperCarRepo.log("MUSIC: 切换音乐 App -> $packageName")
+        main.post { choose() }
+    }
+
+    /** 关闭上一个音乐 App：优先 shell force-stop（与 MIUI 后台限制无关）。 */
+    private fun closePackage(context: Context, packageName: String) {
+        if (packageName.isBlank()) return
+        if (ShizukuTools.isReady) {
+            Thread({
+                // 给 pause 一点时间落到 MediaSession，再杀进程，避免它又被通知栏拉起来。
+                Thread.sleep(250)
+                runBlocking { runCatching { ShizukuTools.exec("am force-stop $packageName", 4_000) } }
+            }, "music-close").apply { isDaemon = true }.start()
+        } else {
+            runCatching {
+                (context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager)
+                    .killBackgroundProcesses(packageName)
+            }
+        }
+    }
+
     fun attach(service: NotificationListenerService) {
         this.service = service
         playbackPrefs = service.getSharedPreferences("car_playback", Context.MODE_PRIVATE)
         resumePackage = playbackPrefs?.getString("resume_package", null)
+        preferredPackage = playbackPrefs?.getString("preferred_package", null)
         permissionDenied = false
         val msm = service.getSystemService(MediaSessionManager::class.java)
         val component = ComponentName(service, MusicNotificationListener::class.java)

@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.ui.components
+package io.github.hypercar.ui.components
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -58,8 +58,6 @@ import java.util.Locale
 fun StatGrid(
     snapshot: SessionSnapshot,
     modifier: Modifier = Modifier,
-    /** 联调模式（PC 侧当 HU）：本机引擎不跑，视频/音频统计无从更新，芯片改为说明来源。 */
-    externalMode: Boolean = false,
     onOpenShizuku: (() -> Unit)? = null,
     /** 降级模式说明（原首页下方那张大卡，已并到 Shizuku 芯片）。 */
     degradedHint: String? = null,
@@ -72,8 +70,8 @@ fun StatGrid(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            VideoChip(snapshot.video, externalMode, Modifier.weight(1f))
-            AudioChip(snapshot.audio, externalMode, Modifier.weight(1f))
+            VideoChip(snapshot.video, Modifier.weight(1f))
+            AudioChip(snapshot.audio, Modifier.weight(1f))
         }
         Spacer(modifier = Modifier.height(10.dp))
         ShizukuChip(
@@ -139,11 +137,11 @@ private fun StatChip(
 /* ---------- 各链路状态 → 芯片 ---------- */
 
 @Composable
-private fun VideoChip(video: VideoStats, external: Boolean = false, modifier: Modifier = Modifier) {
+private fun VideoChip(video: VideoStats, modifier: Modifier = Modifier) {
     val idle = video.fps <= 0
     val accent = if (idle) TextSecondary else ElectricCyan
     val value = if (idle) {
-        if (external) "PC 侧推流" else "未推流"
+        "未推流"
     } else {
         buildString {
             append(video.fps).append(" fps")
@@ -165,11 +163,11 @@ private fun VideoChip(video: VideoStats, external: Boolean = false, modifier: Mo
 }
 
 @Composable
-private fun AudioChip(audio: AudioStats, external: Boolean = false, modifier: Modifier = Modifier) {
+private fun AudioChip(audio: AudioStats, modifier: Modifier = Modifier) {
     val (accent, value) = when {
         audio.ducking -> AmberWarning to "导航闪避中"
         audio.playing -> MintGreen to "播放中"
-            else -> TextSecondary to if (external) "PC 侧播放" else "待机"
+            else -> TextSecondary to "待机"
     }
     StatChip(
         label = "音频",

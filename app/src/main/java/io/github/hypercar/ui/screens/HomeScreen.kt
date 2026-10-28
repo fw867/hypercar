@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.ui.screens
+package io.github.hypercar.ui.screens
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -101,7 +101,6 @@ fun HomeScreen(
                     )
                     StatGrid(
                         snapshot = snapshot,
-                        externalMode = io.github.hypercar.settings.SettingsStore.iap2KeepAliveOnly,
                         onOpenShizuku = onOpenShizukuSettings,
                         degradedHint = degradedChipHint(snapshot),
                     )
@@ -137,7 +136,6 @@ fun HomeScreen(
                 // 四枚状态芯片改成 2×2：原来单行横滑，Shizuku 在窄屏上被挤出屏幕
                 StatGrid(
                     snapshot = snapshot,
-                    externalMode = io.github.hypercar.settings.SettingsStore.iap2KeepAliveOnly,
                     onOpenShizuku = onOpenShizukuSettings,
                     degradedHint = degradedChipHint(snapshot),
                 )
@@ -310,10 +308,9 @@ internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
         }
         Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = "① 车机侧开始接收（PC/WinPlay 联调时先在 PC 上起 hub）\n" +
-                "② 手机点「启动连接」，等状态到「已连接」\n" +
-                "③ 车机侧打开 Apple CarPlay（首次会在车机屏幕上确认）\n" +
-                "④ 点列表里的车机蓝牙名称 → 下一步 → 开始连接",
+            text = "① 车机侧打开 Apple CarPlay（首次需在车机屏幕点确认）\n" +
+                "② 手机点「启动连接」，等状态变为「已连接」\n" +
+                "③ 在车机列表选择本机蓝牙名称，完成一次配对",
             style = MaterialTheme.typography.bodySmall,
             color = TextSecondary,
         )
@@ -326,7 +323,11 @@ internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
             )
         }
         Spacer(modifier = Modifier.height(8.dp))
-        // 适配新车型的说明在仓库文档里：给一个可点的入口
+        Text(
+            text = "首次手动确认后，同一台车会自动回连。",
+            style = MaterialTheme.typography.labelSmall,
+            color = TextSecondary,
+        )
         Spacer(modifier = Modifier.height(6.dp))
         val context = androidx.compose.ui.platform.LocalContext.current
         Text(
@@ -345,12 +346,6 @@ internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
                     )
                 }
             },
-        )
-        Text(
-            text = "做完这一次，同一台车以后会自动回连。第 ④ 步「开始连接」" +
-                "只有在 CarWith 检测到车机蓝牙时才可用；列表为空就回第 ① 步确认车机在接收。",
-            style = MaterialTheme.typography.labelSmall,
-            color = MintGreen,
         )
     }
 }

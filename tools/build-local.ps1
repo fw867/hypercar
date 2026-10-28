@@ -21,8 +21,6 @@
 .PARAMETER SkipRust
   跳过 Rust 交叉编译（只改 Kotlin 时用，直接复用上次编好的 .so）。
 
-.PARAMETER SkipHub
-跳过 PC 侧 hub 的宿主构建（默认会重新构建并覆盖 tools\hypercar-hub.exe）
 .PARAMETER BuildNumber
   正式包构建号（同 CI 的 run_number）：versionName 变成 0.1.0.<N>、versionCode=10000+N。
   本地出正式包时给一个不小于当前线上版本的号，才能覆盖安装。需要 keystore.properties。
@@ -35,7 +33,6 @@
 param(
   [switch]$Release,
   [switch]$SkipRust,
-  [switch]$SkipHub,
   [int]$BuildNumber = 0
 )
 
@@ -133,35 +130,6 @@ if (-not $SkipRust) {
   if (-not (Test-Path $so)) { throw "Rust 产物缺失: $so" }
   Write-Host ("so     : {0:N0} KB  {1}" -f ((Get-Item $so).Length / 1KB), (Get-Item $so).LastWriteTime)
 
-  # ---- PC 侧联调工具：宿主（Windows）构建，产物直接落到 tools\ 供入库/双击 ----
-  # 与 Android 的 arm64 交叉编译互不影响（不同 target、不同 CARGO_TARGET_DIR），
-  # 放这里是为了「改了 Rust 就不会忘带更新 exe」——之前 el repo 里的 exe 就是这样过期的。
-$hubDir = Join-Path $root 'rust-core\hub'
-if ((-not $SkipHub) -and (Test-Path $hubDir)) {
-    Write-Host "`n==> cargo build --release（hub，宿主 Windows）" -ForegroundColor Cyan
-    $hubTarget = Join-Path $devtools 'build\hypercar-hub'
-    New-Item -ItemType Directory -Force -Path $hubTarget | Out-Null
-    # embed-resource 需要 windres（MinGW）：优先用 HYPERCAR_MINGW，其次常见路径
-    $mingw = if ($env:HYPERCAR_MINGW) { $env:HYPERCAR_MINGW } else { Join-Path $devtools 'mingw64\mingw64\bin' }
-    if (Test-Path $mingw) { $env:PATH = "$mingw;$env:PATH" }
-    $savedTarget = $env:CARGO_TARGET_DIR
-    $env:CARGO_TARGET_DIR = $hubTarget
-    Push-Location (Join-Path $root 'rust-core\hub')
-    try {
-      $code = Invoke-Native 'cargo' @('build', '--release')
-      if ($code -ne 0) { throw "hub 构建失败（exit=$code）。缺 windres 时设 HYPERCAR_MINGW，或用 -SkipHub 跳过" }
-    } finally {
-      Pop-Location
-      $env:CARGO_TARGET_DIR = $savedTarget
-    }
-    $hubExe = Join-Path $hubTarget 'release\hypercar-hub.exe'
-    if (-not (Test-Path $hubExe)) { throw "hub 产物缺失: $hubExe" }
-    $hubDest = Join-Path $root 'tools\hypercar-hub.exe'
-    Copy-Item $hubExe $hubDest -Force
-    Write-Host ("hub    : {0:N0} KB  {1}  → tools\hypercar-hub.exe" -f ((Get-Item $hubDest).Length / 1KB), (Get-Item $hubDest).LastWriteTime)
-  } else {
-    Write-Host "`n==> 跳过 hub 构建（-SkipHub 或 hub 源码已移除）" -ForegroundColor Yellow
-  }
 } else {
   Write-Host "`n==> 跳过 Rust（-SkipRust）" -ForegroundColor Yellow
 }

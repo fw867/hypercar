@@ -161,7 +161,7 @@ object MapController {
                 downAt = SystemClock.uptimeMillis()
                 moved = false
                 exitGesture = y < 80
-                homeGesture = MapHomeOverlay.hitTest(x, y, H)
+                homeGesture = MapHomeOverlay.hitTest(x, y, W, H)
                 if (homeGesture) return true
                 if (!exitGesture) {
                     val dt = downAt
@@ -192,7 +192,7 @@ object MapController {
             1 -> {
                 if (homeGesture) {
                     homeGesture = false
-                    if (!moved && MapHomeOverlay.hitTest(x, y, H)) requestExit()
+                    if (!moved && MapHomeOverlay.hitTest(x, y, W, H)) requestExit()
                     return true
                 }
                 if (exitGesture) {

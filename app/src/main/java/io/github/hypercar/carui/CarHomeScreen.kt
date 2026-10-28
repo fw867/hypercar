@@ -139,6 +139,9 @@ private fun MapCard(modifier: Modifier) {
 @Composable
 private fun MusicCard(music: NowPlaying, modifier: Modifier) {
     val context = LocalContext.current
+    val installed = remember(context) { MusicApps.installed(context) }
+    var picker by remember { mutableStateOf(false) }
+    val currentIcon = remember(music.packageName) { MusicApps.iconFor(context, music.packageName) }
     Box(modifier.clip(CardShape).background(Brush.verticalGradient(
         listOf(Color(0xFF484265), Color(0xFF25203A), Color(0xFF171623))))) {
         music.albumArt?.let {
@@ -148,13 +151,29 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
             Color.Black.copy(alpha = .08f), Color.Black.copy(alpha = .26f),
             Color.Black.copy(alpha = .76f), Color.Black.copy(alpha = .84f)))))
         Column(Modifier.fillMaxSize().padding(24.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                Modifier
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable(enabled = installed.isNotEmpty()) { picker = true }
+                    .padding(horizontal = 4.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
                 Box(Modifier.size(28.dp).clip(CircleShape).background(White.copy(alpha = .92f)),
                     contentAlignment = Alignment.Center) {
-                    Icon(Icons.Rounded.MusicNote, null, tint = Color(0xFF7461D9), modifier = Modifier.size(18.dp))
+                    if (currentIcon != null) {
+                        Image(currentIcon.asImageBitmap(), null, Modifier.fillMaxSize().clip(CircleShape),
+                            contentScale = ContentScale.Crop)
+                    } else {
+                        Icon(Icons.Rounded.MusicNote, null, tint = Color(0xFF7461D9), modifier = Modifier.size(18.dp))
+                    }
                 }
                 Spacer(Modifier.width(8.dp))
                 Text(music.appLabel.ifBlank { "音乐" }, color = White.copy(alpha = .85f), fontSize = 12.sp)
+                if (installed.isNotEmpty()) {
+                    Spacer(Modifier.width(4.dp))
+                    Icon(Icons.Rounded.ExpandMore, "切换音乐应用", tint = White.copy(alpha = .8f),
+                        modifier = Modifier.size(18.dp))
+                }
                 Spacer(Modifier.weight(1f))
                 if (music.playing) Icon(Icons.Rounded.GraphicEq, "正在播放", tint = White, modifier = Modifier.size(22.dp))
             }
@@ -190,6 +209,52 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
                 Spacer(Modifier.height(12.dp))
                 TextButton(onClick = { MusicBridge.openAccessSettings(context) }) {
                     Text("连接音乐", color = White, fontSize = 15.sp)
+                }
+            }
+        }
+        if (picker) {
+            // 直接画在卡片内，不用 Popup：D1 虚拟屏上 Popup 可能落在别的窗口，
+            // 编码器只采到 Activity 这一层，切换列表就看不到。
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = .45f))
+                    .clickable { picker = false },
+            )
+            Column(
+                Modifier
+                    .align(Alignment.TopStart)
+                    .padding(18.dp)
+                    .width(300.dp)
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(Color(0xF21B1930))
+                    .padding(vertical = 8.dp),
+            ) {
+                Text("切换音乐应用", color = White.copy(alpha = .7f), fontSize = 12.sp,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+                installed.forEach { app ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                picker = false
+                                MusicBridge.selectPackage(context, app.packageName)
+                            }
+                            .padding(horizontal = 16.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        if (app.icon != null) {
+                            Image(app.icon.asImageBitmap(), null, Modifier.size(28.dp).clip(CircleShape),
+                                contentScale = ContentScale.Crop)
+                        } else {
+                            Icon(Icons.Rounded.MusicNote, null, tint = White, modifier = Modifier.size(24.dp))
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Text(app.label, color = White, fontSize = 15.sp, modifier = Modifier.weight(1f))
+                        if (app.packageName == music.packageName) {
+                            Icon(Icons.Rounded.Check, "当前", tint = Color(0xFF6EE7B7), modifier = Modifier.size(18.dp))
+                        }
+                    }
                 }
             }
         }

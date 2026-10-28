@@ -34,27 +34,6 @@ pwsh -File tools\build-local.ps1 -Release -SkipRust          # 只改 Kotlin 时
 脚本自动处理：非 ASCII 路径（建 ASCII junction 后再构建）、`CARGO_TARGET_DIR`
 外置、NDK 环境变量，并把 `.so` 拷到 `app/src/main/jniLibs`。
 
-### 1.2 PC 侧 HU（盒子角色 / 联调）
-
-> 仓库里带了一个**预编译好的** `tools/hypercar-hub.exe`（约 1.5 MB，Windows x64）：
-> **双击它直接打开原生 Win32 参数面板**（Rust + `native-windows-gui`，不依赖 PowerShell），
-> 可填参数、点「自动检测」经 adb 取值、保存到 `%LOCALAPPDATA%\hypercar-hub\gui.ini`、
-> 点「启动」跑 headless 子进程并把日志实时显示在窗口里。
-> 带参数启动仍是命令行模式（`--no-gui` 可强制）。
-> 改了 Rust 代码后记得用下面的命令重新构建并覆盖它。
-
-独立 crate `rust-core/hub`，用 `#[path]` 复用同一批协议源码（不含 JNI/android_logger），
-**不影响 Android 构建**：
-
-```powershell
-cd rust-core\hub
-cargo build --release      # 产物 target/release/hypercar-hub.exe
-
-# 典型联调：先让 WinPlay 点「开始接收」（它才会监听 17000）
-.\target\release\hypercar-hub.exe --device-id <手机蓝牙MAC> --airplay 127.0.0.1:17000 `
-    --md-host <手机IP> --touch-display 2732x794 --voice 0
-```
-
 ## 2. 编译 Android 应用
 
 ```bash

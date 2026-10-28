@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.headunit
+package io.github.hypercar.headunit
 
 import io.github.hypercar.settings.SettingsStore
 
@@ -77,15 +77,6 @@ data class HeadUnitProfile(
 
     /** 接收端 HID 像素空间（"WxH"）；null = 用 /info 回报或协商尺寸。 */
     val touchDisplay: String? = null,
-
-    /**
-     * 是否进入「只保持 iAP2 链路」模式（联调/盒子角色）。
-     *
-     * true = 手机只维持 iAP2（AirPlay 由 PC 侧 `hypercar-hub` 推送）。
-     * 原来设置里有个独立开关，现在**由车机档案联动**：选 WinPlay 自动打开，
-     * 选真车自动关闭——少一个容易忘的开关。
-     */
-    val keepIap2AliveOnly: Boolean = false,
 
     /** 首次连接引导里这个车机额外要提示的一句；null = 不提。 */
     val pairingHint: String? = null,
@@ -169,7 +160,6 @@ object HeadUnitProfiles {
         preferMdnsAirplay = false,
         fallbackAirplayPorts = listOf(7000),
         dropProfilesBeforeIap2 = false,
-        keepIap2AliveOnly = true,
         // WinPlay 的 /info 固定报 0x0，HID 坐标按它自己的窗口像素算（实测值）
         touchDisplay = "2732x794",
         pairingHint = "先在 WinPlay 点「开始接收」，再让手机连（它不监听时连不上）",

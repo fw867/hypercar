@@ -232,6 +232,7 @@ pub async fn run_engine(
             let mut media_mix: VecDeque<i16> = VecDeque::with_capacity(48_000 * 2);
             let mut tts_mix: VecDeque<i16> = VecDeque::with_capacity(48_000 * 2);
             let mut duck_hold: u32 = 0;
+            let mut last_audio_at: Option<std::time::Instant> = None;
             let mut gain: f32 = 1.0;
             // 音频发包节拍：**绝不漂移**。
             //
@@ -271,7 +272,7 @@ pub async fn run_engine(
                             stats.lock().playing = true;
                         }
                         Some(SourceEvent::AudioStop { tts }) => {
-                            if tts { tts_mix.clear(); } else { media_mix.clear(); }
+                            if tts { tts_mix.clear(); } else { media_mix.clear(); last_audio_at = None; }
                         }
                         Some(SourceEvent::AudioData { tts, rate, channels, data }) => {
                             let (fmt, remain, mix) = if tts {
@@ -281,6 +282,12 @@ pub async fn run_engine(
                             };
                             if rate > 0 && rate != fmt.0 { fmt.0 = rate; }
                             if channels >= 1 && channels <= 2 && channels != fmt.1 { fmt.1 = channels; }
+                            // 采集流在暂停/静音时仍会持续送 0 PCM；只有真有信号才刷新
+                            // “播放中”，否则 3s 后自动回待机，音频芯片不会卡在播放中。
+                            if pcm_has_signal(&data) {
+                                stats.lock().playing = true;
+                                last_audio_at = Some(std::time::Instant::now());
+                            }
                             push_resampled(&data, fmt.0, fmt.1, remain, mix);
                             // 缓冲上限 ~0.5s：过载丢旧（导航长语音不至于拖垮媒体）
                             let cap = (TARGET_RATE as usize) * 2 / 2;
@@ -290,6 +297,10 @@ pub async fn run_engine(
                         None => return,
                     },
                     _ = sync_tick.tick() => {
+                        // 2s 没有新 PCM 就回待机，避免停止播放后芯片一直显示播放中
+                        if last_audio_at.map(|t| t.elapsed() >= Duration::from_secs(3)).unwrap_or(true) {
+                            stats.lock().playing = false;
+                        }
                         // RTP↔NTP 同步包（每秒；缺它车机照收 UDP 但喇叭无声）。
                         // 时间基与 TimingServer 的 timesync 应答同源（进程级单调钟）。
                         if let Some(a) = out.as_mut() {
@@ -424,11 +435,15 @@ pub async fn run_engine(
 
 // ---------------------------------------------------------------- 音频重采样
 
+/// 判断一段 PCM16LE 是否有实际信号（忽略采集链路的底噪/全 0 静音）。
+fn pcm_has_signal(raw: &[u8]) -> bool {
+    raw.chunks_exact(2).any(|c| {
+        let s = i16::from_le_bytes([c[0], c[1]]);
+        s == i16::MIN || s.unsigned_abs() > 300
+    })
+}
+
 /// 把一包 PCM（LE i16 交错）线性重采样为 48kHz 立体声，推入混音缓冲。
-///
-/// 注：参考文档用简单线性插值；44.1k→48k 的镜像抑制对车机喇叭听感足够
-/// （音源本身已是有损压缩后的 PCM，抗混叠收益有限）。后续如需
-/// 更好音质可换 windowed-sinc（此函数是唯一改动点）。
 fn push_resampled(
     raw: &[u8],
     src_rate: u32,

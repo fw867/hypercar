@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.ui
+package io.github.hypercar.ui
 
 import android.content.Intent
 import android.net.Uri
@@ -310,7 +310,6 @@ private fun MainContent() {
                         onToggleRecording = { HyperCarRepo.setLogRecording(it) },
                         onClearLogs = { HyperCarRepo.clearLogs() },
                         onExport = { HyperCarRepo.exportLogs() },
-                        onDumpDisplays = { HyperCarRepo.dumpDisplays() },
                     )
 
                     AppTab.About -> AboutScreen()

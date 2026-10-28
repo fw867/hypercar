@@ -410,15 +410,12 @@ object HyperCarRepo {
             push(link = LinkState.Negotiating("等待车机蓝牙 iAP2 协商"))
             // 档案自述：现场日志第一眼就能看出「用的是哪份车机档案、几个关键开关是什么」，
             // 省得再靠日志反推（2026-10-25 图标回归就是被档案里三个布尔左右的）。
-            run {
-                val p = headUnitProfile
-                log(
-                    "PROFILE: ${p.id}（${p.label}）0x4300=${p.sendCarPlayAvailability} " +
-                        "EA=${p.openEaSessions} 0x4E0E=${p.sendTransportIdentifier} " +
-                        "断HFP/A2DP=${p.dropProfilesBeforeIap2} 档案A退场=${p.abortWhenCarPlayWindowClosed} " +
-                        "保iAP2=${p.keepIap2AliveOnly}",
-                )
-            }
+            val p = headUnitProfile
+            log(
+                "PROFILE: ${p.id}（${p.label}）0x4300=${p.sendCarPlayAvailability} " +
+                    "EA=${p.openEaSessions} 0x4E0E=${p.sendTransportIdentifier} " +
+                    "断HFP/A2DP=${p.dropProfilesBeforeIap2} 档案A退场=${p.abortWhenCarPlayWindowClosed} "
+            )
             val coordinator = Iap2Coordinator(
                 context,
                 // 目标优先级：设置里显式指定 > 本轮 ACL 连上的车机 > 自动（全部已配对）。
@@ -477,28 +474,6 @@ object HyperCarRepo {
                     )
                     push(link = LinkState.Negotiating("等车机 CarPlay（保持 iAP2，不拆链）"))
                 }
-            }
-
-            // ---- 联调开关：只保 iAP2 链路，不起 AirPlay ----
-            // 目的：WinPlay 这类接收端的「接收会话」与蓝牙 iAP2 强绑定（链路一断就整进程退出）。
-            // 于是让手机只当 iAP2 保活端，AirPlay 由 PC 侧 hypercar-hub 去推，
-            // 两边就不会抢同一条 AirPlay 会话。
-            // 现场 2026-10-23 22:37：手机引擎与 PC hub 同时连 17000，WinPlay 画面被后者顶掉。
-            //
-            // 读**档案**而不是 SettingsStore 的派生开关：那个值只是「选档案时的副作用」，
-            // 旧版本/手动改过设置的情况下会和当前档案不一致（真车档案却停在联调模式，
-            // 表现为「一直连不上 AirPlay」）。档案是唯一事实源。
-            if (headUnitProfile.keepIap2AliveOnly) {
-                log("联调: 只保持 iAP2 链路（不启动 AirPlay 引擎）——端点 ips=${endpoint.ipAddresses} port=${endpoint.airPlayPort}")
-                // 不 fail、不 return 前关闭协调器：iAP2 链路由 coordinator 自己的保活定时器维持，
-                // 这样接收端（WinPlay）的 BT 桥接不会因链路关闭而退出。
-                push(
-                    link = LinkState.Connected(
-                        carName = SettingsStore.targetCarName ?: "BMW ID8.5",
-                        sinceMillis = System.currentTimeMillis(),
-                    ),
-                )
-                return
             }
 
             // ---- 静默入车机热点 + 绑网 ----
@@ -677,12 +652,10 @@ object HyperCarRepo {
             streaming = true
             // 引擎一启动就先把自绘 UI/编码器准备好（不等 AirPlay RECORD）：
             // 这样 connected 后第一帧就是首页，不再出现黑屏/待机页。
-            if (SettingsStore.carUiEnabled) {
-                scope.launch {
-                    val result = runCatching { CarUiCaster.start(context) }
-                        .getOrElse { "启动失败: ${it.javaClass.simpleName}: ${it.message}" }
-                    log("CARUI: $result")
-                }
+            scope.launch {
+                val result = runCatching { CarUiCaster.start(context) }
+                    .getOrElse { "启动失败: ${it.javaClass.simpleName}: ${it.message}" }
+                log("CARUI: $result")
             }
         } catch (cancelled: CancellationException) {
             // disconnect() 掐掉在途连接：正常取消，不算失败（也不要把 Failed 写进快照）
@@ -1337,6 +1310,8 @@ object HyperCarRepo {
 
     // ---------------------------------------------------------------- Rust 回调
 
+    private var lastAudioPlaying = false
+
     private val rustListener = object : RustCoreBridge.EventListener {
         override fun onState(state: String, detail: String) {
             log("CORE: [$state] $detail")
@@ -1353,15 +1328,13 @@ object HyperCarRepo {
                             sinceMillis = System.currentTimeMillis(),
                         ),
                     )
-                    // P1：AirPlay RECORD 完成 → 自绘车机首页接管屏幕流（替换待机卡片）
-                    if (SettingsStore.carUiEnabled) {
-                        val ctx = appContext()
-                        if (ctx != null) {
-                            scope.launch {
-                                val result = runCatching { CarUiCaster.start(ctx) }
-                                    .getOrElse { "启动失败: ${it.javaClass.simpleName}: ${it.message}" }
-                                log("CARUI: $result")
-                            }
+                    // P1：AirPlay RECORD 完成 → 自绘车机首页接管屏幕流
+                    val ctx = appContext()
+                    if (ctx != null) {
+                        scope.launch {
+                            val result = runCatching { CarUiCaster.start(ctx) }
+                                .getOrElse { "启动失败: ${it.javaClass.simpleName}: ${it.message}" }
+                            log("CARUI: $result")
                         }
                     }
                 }
@@ -1380,6 +1353,10 @@ object HyperCarRepo {
         override fun onLog(line: String) = log(line)
 
         override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {
+            if (audioPlaying != lastAudioPlaying) {
+                lastAudioPlaying = audioPlaying
+                log("AUDIO: playing=$audioPlaying ducking=$ducking")
+            }
             // 用 update（CAS）而不是读-改-写：每秒一次，与 log() 的读-改-写并发会吞掉日志行。
             _snapshots.update { s ->
                 s.copy(
@@ -1918,47 +1895,6 @@ object HyperCarRepo {
         SettingsStore.debugLogEnabled = enabled
         _snapshots.value = _snapshots.value.copy(logRecording = enabled)
         log("LOG: 日志记录已${if (enabled) "开启" else "暂停"}")
-    }
-
-    /**
-     * 诊断：把当前所有 display 打进行日志（判断有没有可投的副屏/虚拟屏）。
-     *
-     * 用途：排查副屏/虚拟屏（如以后要把自绘界面投到副屏）——这里直接读
-     * `dumpsys display`，把 id/名称/尺寸/flags 打出来，就不用连电脑查了。
-     * 仅当有 Shizuku 时可用（`dumpsys` 需要 shell 权限）。
-     */
-    fun dumpDisplays() {
-        if (!ShizukuTools.isReady) {
-            log("DISP: 需要 Shizuku 才能读 display 列表（dumpsys display）——先授权再点一次")
-            return
-        }
-        scope.launch {
-            val r = runCatching {
-                ShizukuTools.exec(
-                    "dumpsys display | grep -E 'mDisplayId=|DisplayDeviceInfo\\{|DisplayInfo\\{|mDisplayName=' | head -60",
-                    10_000,
-                )
-            }.getOrNull()
-            if (r == null || r.code != 0) {
-                log("DISP: dumpsys display 失败 exit=${r?.code} ${r?.out?.take(120).orEmpty()}")
-                return@launch
-            }
-            val lines = r.out
-                .lineSequence()
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .take(40)
-                .toList()
-            // 只认出 id 个数，先给一行结论，细节跟在后面
-            val ids = lines.mapNotNull { Regex("mDisplayId=(\\d+)").find(it)?.groupValues?.get(1) }
-                .distinct()
-            log(
-                "DISP: 共 ${lines.size} 行，含 display id = " +
-                    if (ids.isEmpty()) "（没解析到，往下看原始行）" else ids.joinToString(", ") +
-                        "；主屏=0，要投副屏就填上面出现的非 0 id",
-            )
-            lines.forEach { log("DISP: $it") }
-        }
     }
 
     /**
