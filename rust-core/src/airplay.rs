@@ -914,6 +914,10 @@ fn spawn_event_dispatcher(
                         emit_log("EVENT: setNightMode 未解析出 nightMode 字段");
                     }
                 }
+                "forceKeyFrame" => {
+                    emit_log("EVENT: 车机请求关键帧 forceKeyFrame → requestSyncFrame");
+                    crate::emit_force_keyframe();
+                }
                 "hidSetInputMode" | "ping" | "fps" => {}
                 other => {
                     if bad_commands <= 8 {

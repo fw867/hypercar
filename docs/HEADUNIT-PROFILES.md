@@ -1,13 +1,14 @@
 # 车机档案（HeadUnitProfile）：新增品牌怎么做
 
-这套协议在不同车机上的差异**不小**，而且大多是实测出来的（宝马从不发 0x4301、WinPlay 校验
-deviceID……）。为了让"加一个品牌"不去动主流程，所有差异都收敛在一处：
+> 2026-10-29 核对：档案是兼容策略，不是车型协议规范；旧文中的品牌绝对结论需要限定样本。握手问题和新增 ID7 档案的判断见 [iAP2 握手审计](IAP2-HANDSHAKE-AUDIT-2026-10-29.md)。以运行时最终合并的档案和源码为准，远程档案可能覆盖内置值。
+
+这套协议在不同车机上的差异**不小**，现有档案主要来自特定型号和固件的实测。配置集中在：
 
 ```
 app/src/main/java/io/github/hypercar/headunit/HeadUnitProfile.kt   ← 档案定义 + 内置档案表
 ```
 
-会话层（`Iap2SenderSession`）、连接层（`HyperCarRepo`）只读档案，代码里**不出现品牌名**。
+会话层（`Iap2SenderSession`）、连接层（`HyperCarRepo`）读取档案；部分历史能力判断仍包含车型经验规则，尚未全部收口。
 
 ## 1. 字段含义
 
@@ -22,14 +23,14 @@ app/src/main/java/io/github/hypercar/headunit/HeadUnitProfile.kt   ← 档案定
 | `openEaSessions` | 是否开 `0xEA00` EA 会话 | 宝马车机 `true`（0.27 行为）；真 iPhone 一个都不发，但停发与图标消失同时发生，暂按现场 A/B 保留 |
 | `sendTransportIdentifier` | 是否发 `0x4E0E` 传输标识 | 同上，宝马 `true`（与 0x4300 携带同一个传输标识） |
 | `replyPowerUpdates` | 车机发 `0xAE00` 时是否回 `0xAE01` | 真 iPhone **必回**（3 条）；默认 `true` |
-| `dropProfilesBeforeIap2` | 发 iAP2 前是否主动断开该车机的 HFP/A2DP（「只配对、不连接」） | 奥迪那种「已连接就不开 iAP2 窗口」的车机要 `true`；**宝马要 `false`**——它的 HFP/A2DP 在线时本来就会主动连入 iAP2，主动断开反而把 ACL 一起拽掉，车机反而不发起 CarPlay；`通用（0.27）` 取 `true`（0.27 与 cardeck 都这么做） |
+| `dropProfilesBeforeIap2` | 发 iAP2 前是否主动断开该车机的 HFP/A2DP | 当前内置 BMW_ID85 和通用档案为 `true`，WinPlay 为 `false`。这是兼容开关，不能按品牌推导必选值；需核对远程覆盖及实车 A/B，观察是否连带断开 ACL。历史“宝马必须 false”的结论与当前实现不一致 |
 | `abortWhenCarPlayWindowClosed` | 0x1D01 判为「档案 A」（车机没开无线 CarPlay 窗口）时是否主动结束会话 | **一律 `false`**：2026-10-25 现场 A/B——0.27 保持链路时车机显示 CarPlay 图标，0.28 加了「档案 A 立即结束」后图标消失、车机不再发起 iAP2（拆链会让车机收起图标）。空转轮次改由「车机新连入顶替」处理，不靠拆链 |
 | `preferMdnsAirplay` | 端口策略：`true` = 先查 mDNS `_airplay._tcp` | 车机广播该服务（抓包/Bonjour 浏览可见）→ `true`；普通接收端（WinPlay）→ `false` |
 | `fallbackAirplayPorts` | mDNS 拿不到时的试连顺序 | AirPlay 惯例 `7000`，其次 `7001` / `7100` |
 | `touchDisplay` | 接收端 HID 像素空间（`"WxH"`） | 车机 `/info` 报 `0x0` 而坐标总是偏 → 填接收端真实像素 |
 | `pairingHint` | 首次连接引导里这台车额外的提示 | 例如"首次要在 iDrive 里选成 CarPlay 手机" |
 
-> 默认值全部取「真 iPhone 实测行为」。新档案**只覆盖确实不同**的项。
+> 默认值混合了历史实测与兼容措施，不应统称为真 iPhone 的标准行为。新档案只覆盖有证据的差异；未经实车验证保持 `verified=false`。
 
 ## 2. 新增一个品牌：四步
 

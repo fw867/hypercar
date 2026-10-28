@@ -388,20 +388,10 @@ class Iap2LinkEngine(
                 (control and CONTROL_SYNCHRONIZE) == 0 &&
                 (control and CONTROL_EXTENDED_ACKNOWLEDGEMENT) == 0
         if (isDataFrame) {
-            // 控制消息的会话 ID：本表 10 或采纳表（Audi=1；BMW/DiPlay 两者一致）
-            if (sessionId == SESSION_CONTROL || sessionId == adoptedPeerControlSessionId) {
-                // 收到对端的数据即代表对端认为链路可用；ACK 帧若丢失/被跳过，这里兜底进入 NORMAL
-                completeNegotiationIfPending(nowMillis)
-                handleData(sequence, payload!!)
-            } else {
-                // EA/文件传输等其它会话的数据帧：ACK 掉（否则对端窗口卡死）但不上抛——
-                // 触摸/HID 由 Rust 侧经 AirPlay 事件通道处理，iAP2 层不消费。
-                // **载荷必须交给上层 dump**：BMW 的 EA 协议（de.bmw.a4a.pairing 等）
-                // 若要把热点凭据送过来，唯一通道就是某条 EA 会话的数据帧（2026-10-24）。
-                unknownSessionDropped++
-                if (unknownSessionDropped <= 5) onUnknownSessionData?.invoke(sessionId, payload!!)
-                sendAcknowledgement()
-            }
+            // 序号属于整条链路；控制、EA、文件会话共同推进接收水位后再分派。
+            // 但协商状态只能由控制会话推进：EA/文件会话早到不能把链路提前切到 NORMAL。
+            if (sessionId == controlSessionId()) completeNegotiationIfPending(nowMillis)
+            handleData(sequence, payload!!, sessionId)
         }
     }
 
@@ -465,6 +455,7 @@ class Iap2LinkEngine(
     private fun handleData(
         sequence: Int,
         payload: ByteArray,
+        sessionId: Int,
     ) {
         val distance = sequenceDistance(sequence, lastReceivedInOrder)
         val peerWindow = peerSynchronization?.maxOutgoing ?: maxOutgoing
@@ -475,11 +466,17 @@ class Iap2LinkEngine(
         // RFCOMM 为可靠有序流，不会丢包；序号跳变只可能是对端把 ACK/SYN 也计入了序号
         // （各家实现账法不一致）。因此接受任意前进量并推进水位，避免死锁式丢帧。
         lastReceivedInOrder = sequence
-        if (pendingEvents.size >= 256) {
-            die("event queue overflow")
-            return
+        if (sessionId == controlSessionId()) {
+            if (pendingEvents.size >= 256) {
+                die("event queue overflow")
+                return
+            }
+            pendingEvents += Event.Control(payload)
+        } else {
+            // 上层不消费该会话，仍须累计确认且对重复帧去重，不能让对端窗口被占满。
+            unknownSessionDropped++
+            if (unknownSessionDropped <= 5) onUnknownSessionData?.invoke(sessionId, payload)
         }
-        pendingEvents += Event.Control(payload)
         sendAcknowledgement()
     }
 

@@ -122,6 +122,8 @@ object SettingsStore {
 
     val encodingPlan: VideoEncodingPlan
         get() {
+            // 有 /info 时用它；没有 /info 才回退设置。编码画布与引擎必须同源，
+            // 但最终比例要跟车机实际 viewport 一致，否则接收端会横向压缩。
             val viewport = receiverViewport ?: (videoWidth to videoHeight)
             return VideoEncodingPlan.fit(viewport.first, viewport.second, videoFps)
         }
@@ -210,7 +212,11 @@ object SettingsStore {
             ?.let { (it[0].toIntOrNull() ?: 0) to (it[1].toIntOrNull() ?: 0) }
             ?.takeIf { it.first > 0 && it.second > 0 }
             ?: (fallbackW to fallbackH)
-        val plan = VideoEncodingPlan.fit(width, height, videoFps)
+        val plan = VideoEncodingPlan.fit(
+            (receiverViewport?.first ?: width),
+            (receiverViewport?.second ?: height),
+            videoFps,
+        )
         return buildString {
             append("{")
             append("\"device_id\":\"").append(esc(deviceBluetoothMac)).append("\",")

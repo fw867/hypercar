@@ -144,6 +144,14 @@ pub(crate) fn emit_night_mode(night: bool) {
     });
 }
 
+/// 车机 forceKeyFrame → Kotlin，让 MediaCodec 立刻产出一个 IDR。
+pub(crate) fn emit_force_keyframe() {
+    call_listener("onForceKeyFrame", |env, obj| {
+        env.call_method(obj, "onForceKeyFrame", "()V", &[])
+            .map(|_| ())
+    });
+}
+
 pub(crate) fn emit_display_size(width: u32, height: u32) {
     call_listener("onDisplaySize", |env, obj| {
         env.call_method(obj, "onDisplaySize", "(II)V", &[(width as jint).into(), (height as jint).into()]).map(|_| ())

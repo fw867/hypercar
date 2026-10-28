@@ -152,6 +152,10 @@ object MapController {
         homeCaster?.setPushing(true)
     }
 
+    fun requestKeyFrame() {
+        mapCaster?.requestSyncFrame()
+    }
+
     /**
      * 高德界面实时跟手触摸：DOWN/MOVE/UP 立即异步注入 D2（mode=ASYNC），不再等松手重放。
      * 顶部下滑（y<80 起手，下滑>120）退出地图；左侧中间 Home 圆钮返回首页。

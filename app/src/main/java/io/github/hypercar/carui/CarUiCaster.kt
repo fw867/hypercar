@@ -136,6 +136,13 @@ object CarUiCaster {
         }
     }
 
+    fun requestKeyFrame() {
+        main.post {
+            if (MapController.mapActive) MapController.requestKeyFrame()
+            else caster?.requestSyncFrame()
+        }
+    }
+
     /**
      * 安装 Rust 触摸监听。stop() 会先 setTouchListener(null)；若上一次 stop 卡在
      * shell binder/编码器释放里，running 仍是 true，重连走「已经在跑」分支时必须重装，

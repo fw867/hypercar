@@ -16,7 +16,8 @@ import android.content.Context
  *
  *  - [Entry.succeeded]：最近一次**成功拿到签名**的长度 → 下次直接首选，省掉试探；
  *  - [Entry.silent]：窗口内无应答的长度 → 排到后面（但仍保留为兜底，车机固件可能变）；
- *  - [Entry.rejected]：0xAA04 明确拒绝或**导致拆链**的长度 → 排到最后。
+ *  - [Entry.rejected]：旧版本留下的失败推断，仅用于排序，不视为协议拒绝证据。
+ *  - [Entry.lastDisconnected]：最近一次挑战期间断链的候选 → 下次连接从下一候选开始。
  *
  * 排序规则见 [orderAttempts]（纯函数）：成功档位永远第一；其余沿用调用方给的基线顺序，
  * 最后才是 silent 与 rejected。若基线里所有档位都被判过 rejected，则全部照常尝试，
@@ -28,14 +29,16 @@ object MfiLengthMemory {
         val succeeded: Int? = null,
         val silent: Set<Int> = emptySet(),
         val rejected: Set<Int> = emptySet(),
+        val lastDisconnected: Int? = null,
     ) {
-        val isEmpty: Boolean get() = succeeded == null && silent.isEmpty() && rejected.isEmpty()
+        val isEmpty: Boolean get() = succeeded == null && silent.isEmpty() && rejected.isEmpty() && lastDisconnected == null
     }
 
     private const val FILE = "mfi_length_memory"
     private const val KEY_OK = "ok_"
     private const val KEY_SILENT = "silent_"
     private const val KEY_REJECTED = "rejected_"
+    private const val KEY_DISCONNECTED = "disconnected_"
 
     /** 车机身份 → 存储键。只用稳定字段，避免蓝牙名里的可变后缀影响命中。 */
     fun receiverKey(identityText: String): String =
@@ -61,6 +64,7 @@ object MfiLengthMemory {
             succeeded = ok,
             silent = readLengths(prefs.getString(KEY_SILENT + key, null)),
             rejected = readLengths(prefs.getString(KEY_REJECTED + key, null)),
+            lastDisconnected = prefs.getInt(KEY_DISCONNECTED + key, 0).takeIf { it > 0 },
         )
     }
 
@@ -89,39 +93,17 @@ object MfiLengthMemory {
         }
     }
 
-    fun recordRejected(
-        context: Context?,
-        identityText: String,
-        length: Int,
-    ) {
-        update(context, identityText) { entry ->
-            if (entry.succeeded == length) {
-                entry
-            } else {
-                entry.copy(rejected = entry.rejected + length, silent = entry.silent - length)
-            }
-        }
-    }
-
     /**
-     * **硬拒绝**：链路在该长度的挑战期间被对端直接断开（区别于 0xAA04 拒绝字/静默）。
-     *
-     * 这是强证据——即使该长度等于已记「成功」也必须推翻（cardeck 2026-10-24 实测）：
-     * MFi 应答存在归属歧义——上一档超窗后才到的迟到应答会被记到当前档头上
-     * （DiPlay：32B 迟到 1.3s 应答被记成 20B 成功 → 之后每轮 20B 被断链、永不触及 32B，
-     * 记忆永久锁死）。链路被断 = 该长度确实不被接受，必须清掉 succeeded 并记 rejected。
+     * 只记录传输层观察，不把断链等同于“不支持该长度”。保留以前的成功记录，
+     * 但断链后的试探轮次暂时让位于跨连接轮换，直到再次收到可归属的响应。
      */
-    fun recordHardRejected(
+    fun recordDisconnected(
         context: Context?,
         identityText: String,
         length: Int,
     ) {
         update(context, identityText) { entry ->
-            Entry(
-                succeeded = if (entry.succeeded == length) null else entry.succeeded,
-                silent = entry.silent - length,
-                rejected = entry.rejected + length,
-            )
+            entry.copy(lastDisconnected = length)
         }
     }
 
@@ -131,9 +113,10 @@ object MfiLengthMemory {
             "无"
         } else {
             buildList {
-                entry.succeeded?.let { add("成功=${it}B") }
+                entry.succeeded?.let { add("曾收到响应=${it}B") }
                 if (entry.silent.isNotEmpty()) add("静默=${entry.silent.sorted().joinToString("/")}B")
-                if (entry.rejected.isNotEmpty()) add("被拒=${entry.rejected.sorted().joinToString("/")}B")
+                if (entry.rejected.isNotEmpty()) add("历史失败推断=${entry.rejected.sorted().joinToString("/")}B")
+                entry.lastDisconnected?.let { add("上次断链挑战=${it}B（原因未定，下轮换候选）") }
             }.joinToString("，")
         }
 
@@ -148,6 +131,11 @@ object MfiLengthMemory {
         baseline: List<Int>,
         entry: Entry,
     ): List<Int> {
+        // 即使所有旧候选都标记过 rejected，也不能每轮又从 32B 开始。
+        // 在独立连接间轮换，避免第一候选立即断链时永远触及不了后面的长度。
+        val candidates = baseline.distinct()
+        val last = candidates.indexOf(entry.lastDisconnected)
+        if (last >= 0) return candidates.drop(last + 1) + candidates.take(last + 1)
         // 「成功但又被硬拒绝」= 记忆矛盾（迟到应答误记），不能继续享受第一名——
         // 降级为普通档参与排序（排在被拒档之前，仍留候选内：车机固件可能变）
         val succeeded = entry.succeeded?.takeIf { it !in entry.rejected }
@@ -186,6 +174,7 @@ object MfiLengthMemory {
                     if (next.succeeded != null) putInt(KEY_OK + key, next.succeeded) else remove(KEY_OK + key)
                     putString(KEY_SILENT + key, next.silent.sorted().joinToString(","))
                     putString(KEY_REJECTED + key, next.rejected.sorted().joinToString(","))
+                    if (next.lastDisconnected != null) putInt(KEY_DISCONNECTED + key, next.lastDisconnected) else remove(KEY_DISCONNECTED + key)
                 }.apply()
         }
     }

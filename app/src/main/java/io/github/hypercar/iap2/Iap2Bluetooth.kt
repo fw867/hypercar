@@ -16,6 +16,7 @@ import android.os.SystemClock
 import io.github.hypercar.bluetooth.BtProfiles
 import java.io.Closeable
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.io.InputStream
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -533,8 +534,13 @@ class Iap2Bluetooth(
             log("$tag ${profileA.message}——结束本轮，等车机下一次连入")
             onSessionEnded(profileA.message ?: "档案 A")
         } catch (error: IOException) {
-            log("$tag SESSION 失败: ${error.message}")
-            onSessionEnded(error.message ?: "IO 错误")
+            if (error is InterruptedIOException) {
+                log("$tag SESSION 已取消: ${error.message}")
+                onSessionEnded("已取消")
+            } else {
+                log("$tag SESSION 失败: ${error.message}")
+                onSessionEnded(error.message ?: "IO 错误")
+            }
         } catch (error: Throwable) {
             // 协议解析/异常路径不能只落 logcat（本机型 logcat 受限）——收进会话结束回调
             log("$tag SESSION 异常: ${error.javaClass.simpleName}: ${error.message}")
@@ -601,6 +607,15 @@ private class RfcommLinkChannel(
     @Volatile
     private var terminated = false
 
+    @Volatile
+    private var terminationReason: String? = null
+
+    @Volatile
+    private var locallyCancelled = false
+
+    override val closeReason: String? get() = terminationReason
+    override val isCancelled: Boolean get() = locallyCancelled
+
     private var readySignalled = false
 
     /** 逐帧摘要日志预算（每方向每连接，防刷屏）。 */
@@ -649,7 +664,12 @@ private class RfcommLinkChannel(
     }
 
     override fun awaitReady(timeoutMillis: Long): Boolean {
-        if (!readyLatch.await(timeoutMillis, TimeUnit.MILLISECONDS)) return false
+        try {
+            if (!readyLatch.await(timeoutMillis, TimeUnit.MILLISECONDS)) return false
+        } catch (error: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw InterruptedIOException("iAP2 链路协商已取消").apply { initCause(error) }
+        }
         return !terminated
     }
 
@@ -682,7 +702,10 @@ private class RfcommLinkChannel(
     }
 
     override fun close() {
-        finishLocked(null)
+        synchronized(lock) {
+            if (!terminated) locallyCancelled = true
+            finishLocked(null)
+        }
     }
 
     // ---- 内部 ----
@@ -698,7 +721,7 @@ private class RfcommLinkChannel(
             while (true) {
                 val count = input.read(buffer)
                 if (count < 0) {
-                    finishLocked(null)
+                    finishLocked(IOException("RFCOMM 对端关闭（EOF）"))
                     return
                 }
                 if (count == 0) continue
@@ -783,6 +806,7 @@ private class RfcommLinkChannel(
     private fun finishLocked(reason: Throwable?) {
         synchronized(lock) {
             if (terminated) return
+            terminationReason = reason?.message ?: if (locallyCancelled) "本地取消" else "链路结束"
             terminated = true
             controls.offer(POISON) // 哨兵：唤醒阻塞的接收方（LBQ 不接受 null）
             readyLatch.countDown()

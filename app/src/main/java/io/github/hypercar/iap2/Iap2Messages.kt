@@ -57,7 +57,7 @@ object Iap2MessageIds {
     const val MFI_RESPONSE = 0xAA03 // 配件 → 手机（参数0=签名）
     const val MFI_AUTHENTICATION_FAILED = 0xAA04 // 手机 → 配件（或配件拒绝挑战）
     const val MFI_AUTHENTICATION_SUCCEEDED = 0xAA05 // 手机 → 配件（自报结果）
-    const val MFI_EXTENDED_INITIATE = 0xAA06 // 配件 → 手机（BMW 档案 B 声明，收下记日志即可）
+    const val ACCESSORY_AUTHENTICATION_SERIAL_NUMBER = 0xAA06 // 配件 → 手机，认证序列号通知
 
     // ---- 配件 bring-up 期间发来的订阅请求（接收并记录即可）----
     const val START_NOW_PLAYING_UPDATES = 0x5000
@@ -101,7 +101,7 @@ object Iap2MessageIds {
             MFI_RESPONSE -> "MFiResponse"
             MFI_AUTHENTICATION_FAILED -> "MFiAuthenticationFailed"
             MFI_AUTHENTICATION_SUCCEEDED -> "MFiAuthenticationSucceeded"
-            MFI_EXTENDED_INITIATE -> "MFiExtendedInitiate"
+            ACCESSORY_AUTHENTICATION_SERIAL_NUMBER -> "AccessoryAuthenticationSerialNumber"
             EA_OPEN_SESSION -> "StartEASession"
             EA_CLOSE_SESSION -> "StopEASession"
             EA_SESSION_STATUS -> "EASessionStatus"

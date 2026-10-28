@@ -1,6 +1,7 @@
 package io.github.hypercar.iap2
 
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.security.SecureRandom
 import java.util.Date
 import java.util.TimeZone
@@ -27,6 +28,10 @@ interface Iap2LinkChannel {
     fun recvControl(timeoutMillis: Long): ByteArray?
 
     val isAlive: Boolean
+
+    /** 传输层保留的关闭原因；不包含认证报文或密钥。 */
+    val closeReason: String? get() = null
+    val isCancelled: Boolean get() = false
 
     fun close()
 }
@@ -71,6 +76,8 @@ class Iap2SenderSession(
     /** 车机档案：品牌特有的行为差异都从这里读（见 `headunit/HeadUnitProfile.kt`）。 */
     private val profile: io.github.hypercar.headunit.HeadUnitProfile =
         io.github.hypercar.headunit.HeadUnitProfiles.BMW_ID85,
+    /** 单调时钟，可在时序回归测试中控制超时。 */
+    private val nanoTime: () -> Long = System::nanoTime,
 ) {
     private val parser = Iap2Csm.Parser()
 
@@ -154,6 +161,7 @@ class Iap2SenderSession(
         /** 0x5703 分段等待：1.5s 未到先重发问候，再 1.3s 未到重发一次 0x5702（§9j 处置 3/4）。 */
         const val WIFI_RESCUE_GREETING_MILLIS = 1_500L
         const val WIFI_RESCUE_RETRY_MILLIS = 1_300L
+        const val WIFI_EXCHANGE_BUDGET_MILLIS = 5_000L
 
         /** 保活期空闲轮询间隔：必须短于重探周期，否则「一个包都不来」时轮不到重探。 */
         const val IDLE_POLL_MILLIS = 1_000L
@@ -197,7 +205,7 @@ class Iap2SenderSession(
      * @throws IOException 识别/链路超时（链路本身不可用）
      */
     fun run(timeoutMillis: Long = 60_000L): CarPlayEndpoint {
-        val deadline = System.nanoTime() + timeoutMillis * 1_000_000L
+        val deadline = nanoTime() + timeoutMillis * 1_000_000L
         if (!channel.awaitReady(remainingMillis(deadline))) {
             throw IOException("iAP2 链路协商超时")
         }
@@ -218,9 +226,10 @@ class Iap2SenderSession(
         send(Iap2MessageIds.MFI_REQUEST_CERTIFICATE)
         val certificate = expect(Iap2MessageIds.MFI_CERTIFICATE, deadline)
         log("iap2 rx=0xaa01 certificate bytes=${certificate.body.size}（跳过校验）")
-        runMfiChallenge(deadline, receiverKey = MfiLengthMemory.receiverKey(identityText))
+        val mfiResult = runMfiChallenge(deadline, receiverKey = MfiLengthMemory.receiverKey(identityText))
+        ensureActive("MFi 结果发送前")
         send(Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED)
-        log("iap2 tx=0xaa05 authentication-succeeded（自报）")
+        log("iap2 tx=0xaa05 compatibility-result=$mfiResult（未做证书/签名验证，不代表标准认证通过）")
 
         // ---- 设备状态问候：必须**紧贴** 0xAA05 突发（§9j 核心修复）----
         // 真 iPhone 在 0xAA05 之后立刻发 0x4E0C/0x4E0A/0x4E0B/0x4E09，然后才轮到
@@ -253,9 +262,9 @@ class Iap2SenderSession(
                 log("iap2 tx=0xea00 startEASession protocol=${protocol.protocolId} name=${protocol.name}")
             }
         }
-        if (eaProtocols.isNotEmpty() && ident.declaresSend(Iap2MessageIds.EA_SESSION_STATUS) != false) {
+        if (profile.openEaSessions && eaProtocols.isNotEmpty() && ident.declaresSend(Iap2MessageIds.EA_SESSION_STATUS) != false) {
             // 探 800ms 的 0xEA03 并记日志——回没回一眼可见（§9j 处置 1）
-            val status = expectOrNull(Iap2MessageIds.EA_SESSION_STATUS, minOf(deadline, System.nanoTime() + 800_000_000L))
+            val status = expectOrNull(Iap2MessageIds.EA_SESSION_STATUS, minOf(deadline, nanoTime() + 800_000_000L))
             if (status != null) {
                 handleEaSessionStatus(status, phase1 = true)
             } else {
@@ -311,21 +320,26 @@ class Iap2SenderSession(
                 null
             } else {
                 send(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION)
-                // 0x5703 分段等待（§9j 处置 3/4/5）：1.5s 未到强制重发问候 →
-                // 再 1.3s 未到重发一次 0x5702 → 之后按原窗口继续等。
-                var parsed = expectOrNull(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION, rescueDeadline(deadline, WIFI_RESCUE_GREETING_MILLIS))
+                // 只占用本阶段预算，为 0x4300/0x4301 留出时间；4301 早到也立即结束等待。
+                val wifiDeadline = rescueDeadline(deadline, WIFI_EXCHANGE_BUDGET_MILLIS)
+                val credentialMessages = setOf(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION, Iap2MessageIds.CARPLAY_START_SESSION)
+                var parsed = expectAnyOrNull(credentialMessages, rescueDeadline(wifiDeadline, WIFI_RESCUE_GREETING_MILLIS))
                 if (parsed == null) {
                     sendDeviceStateGreetings(force = true)
                     log("iap2 0x5703 1.5s 未到——强制重发设备状态问候，继续等待")
-                    parsed = expectOrNull(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION, rescueDeadline(deadline, WIFI_RESCUE_RETRY_MILLIS))
+                    parsed = expectAnyOrNull(credentialMessages, rescueDeadline(wifiDeadline, WIFI_RESCUE_RETRY_MILLIS))
                 }
                 if (parsed == null) {
                     send(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION)
                     log("iap2 0x5702 重发一次（首次仅链路 ACK）")
-                    parsed = expectOrNull(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION, deadline)
+                    parsed = expectAnyOrNull(credentialMessages, wifiDeadline)
                 }
                 if (parsed == null) {
                     log("iap2 0x5703 未在窗口内到达——改走 0x4300/0x4301（新版协议自带 AP 信息）")
+                    null
+                } else if (parsed.messageId == Iap2MessageIds.CARPLAY_START_SESSION) {
+                    pendingFrames.addFirst(parsed)
+                    log("iap2 0x4301 先到——立即转入端点处理，不再等待 0x5703")
                     null
                 } else {
                     val wifiConfiguration = Iap2Messages.parseWifiConfiguration(parsed.body)
@@ -368,11 +382,11 @@ class Iap2SenderSession(
         val startSessionWindow =
             if (wifiFromExchange == null) START_SESSION_WAIT_NEW_PROTOCOL_NANOS else START_SESSION_WAIT_NANOS
         val startSession =
-            if (declaresStartSession == false) {
+            if (declaresStartSession == false && pendingFrames.none { it.messageId == Iap2MessageIds.CARPLAY_START_SESSION }) {
                 log("iap2 车机未声明会发 0x4301——跳过等待（上层可用 mDNS/网关兜底）")
                 null
             } else {
-                expectOrNull(Iap2MessageIds.CARPLAY_START_SESSION, minOf(deadline, System.nanoTime() + startSessionWindow))
+                expectOrNull(Iap2MessageIds.CARPLAY_START_SESSION, minOf(deadline, nanoTime() + startSessionWindow))
             }
 
         val endpoint =
@@ -581,7 +595,7 @@ class Iap2SenderSession(
      */
     private fun pokeWhileWaiting() {
         if (hasAccessoryEndpoint()) return
-        val now = System.nanoTime()
+        val now = nanoTime()
         // 前 12 次每 5s（覆盖上车点屏幕的一分钟），之后退到 30s（长等不刷屏）
         val interval = if (pokeCount < 12) POKE_INTERVAL_NANOS else POKE_INTERVAL_SLOW_NANOS
         if (lastPokeNanos != 0L && now - lastPokeNanos < interval) return
@@ -672,9 +686,9 @@ class Iap2SenderSession(
             log("iap2 车机未声明会发 0x6800 StartHID——跳过等待")
             return
         }
-        val window = minOf(deadline, System.nanoTime() + HID_WAIT_NANOS)
+        val window = minOf(deadline, nanoTime() + HID_WAIT_NANOS)
         while (true) {
-            val remaining = (window - System.nanoTime()) / 1_000_000L
+            val remaining = (window - nanoTime()) / 1_000_000L
             if (remaining <= 0) {
                 log("iap2 未收到 0x6800（可选，继续）")
                 return
@@ -804,17 +818,13 @@ class Iap2SenderSession(
 
     // ---- MFi 挑战 ----
 
-    /**
-     * MFi 挑战应答：按「对端可接受的长度」依次尝试 32B(3s) → 20B(6s) → 16B(3s)，
-     * 每次失败（0xAA04 / 静默超时 / 断链）换下一档；[MfiLengthMemory] 命中则首选记忆档。
-     *
-     * 全部无应答时不抛异常直接返回——我们跳过签名校验（0xAA05 自报成功），由后续
-     * 0x5702/0x4301 是否获得应答判定对端是否放行（真车实测无应答后仍可推进）。
-     */
+    private enum class MfiResult { RESPONSE_RECEIVED_UNVERIFIED, TIMEOUT_COMPATIBILITY }
+
+    /** 保留已跑通接收端的超时兼容策略；断链/取消绝不能作为正常认证结果返回。 */
     private fun runMfiChallenge(
         deadline: Long,
         receiverKey: String,
-    ) {
+    ): MfiResult {
         val baseline = MFI_ATTEMPTS.map { it.first }
         val windowOf = MFI_ATTEMPTS.toMap()
         val memory = MfiLengthMemory.load(context, receiverKey)
@@ -826,6 +836,7 @@ class Iap2SenderSession(
             )
         }
         for ((position, size) in order.withIndex()) {
+            ensureActive("MFi 挑战发送前")
             // 已知「静默过」的档位缩短窗口：它已经失败过一次，没必要再等满
             val baseWindow = windowOf[size] ?: MFI_ATTEMPTS.last().second
             val windowMillis =
@@ -835,21 +846,29 @@ class Iap2SenderSession(
                     baseWindow
                 }
             val challenge = ByteArray(size).also(random::nextBytes)
-            send(Iap2MessageIds.MFI_REQUEST_CHALLENGE, Iap2Csm.param(0, challenge))
+            val started = nanoTime()
+            try {
+                send(Iap2MessageIds.MFI_REQUEST_CHALLENGE, Iap2Csm.param(0, challenge))
+            } catch (error: IOException) {
+                if (error !is InterruptedIOException && !channel.isCancelled && !channel.isAlive) {
+                    MfiLengthMemory.recordDisconnected(context, receiverKey, size)
+                }
+                throw error
+            }
             log("iap2 tx=0xaa02 challenge=${size}B（第 ${position + 1} 次，窗口 ${windowMillis}ms）")
-            val window = minOf(System.nanoTime() + windowMillis * 1_000_000L, deadline)
+            val window = minOf(nanoTime() + windowMillis * 1_000_000L, deadline)
             var gotResponse = false
             var gotFailure = false
             while (true) {
-                val remaining = (window - System.nanoTime()) / 1_000_000L
+                val remaining = (window - nanoTime()) / 1_000_000L
                 if (remaining <= 0) break
                 val frame = recvFrame(remaining)
                 if (frame == null) {
+                    if (Thread.currentThread().isInterrupted || channel.isCancelled) throw InterruptedIOException("MFi 挑战已取消")
                     if (!channel.isAlive) {
-                        log("iap2 MFi 挑战期间链路断开（${size}B，对端不接受该长度）——记入该车机被拒档位")
-                        // 硬拒绝：链路级证据，推翻「该长度=上次成功」的记忆（防迟到应答误记锁死）
-                        MfiLengthMemory.recordHardRejected(context, receiverKey, size)
-                        return
+                        MfiLengthMemory.recordDisconnected(context, receiverKey, size)
+                        val elapsed = (nanoTime() - started) / 1_000_000L
+                        throw IOException("MFi 等待 0xaa03 时链路关闭：挑战=${size}B，经过=${elapsed}ms，原因=${channel.closeReason ?: "未知"}；下次连接轮换候选，未发送 0xaa05")
                     }
                     continue
                 }
@@ -860,7 +879,7 @@ class Iap2SenderSession(
                     }
 
                     Iap2MessageIds.MFI_AUTHENTICATION_FAILED -> {
-                        log("iap2 rx=0xaa04 挑战 ${size}B 被拒")
+                        log("iap2 rx=0xaa04 AuthenticationFailed（非预期方向，不推断为长度被拒）")
                         gotFailure = true
                     }
 
@@ -872,11 +891,16 @@ class Iap2SenderSession(
                 if (gotResponse || gotFailure) break
             }
             if (gotResponse) {
-                MfiLengthMemory.recordSuccess(context, receiverKey, size)
-                return
+                ensureActive("MFi 响应接收后")
+                if (position == 0) {
+                    MfiLengthMemory.recordSuccess(context, receiverKey, size)
+                } else {
+                    log("iap2 AA03 可能属于先前超时挑战——不把 ${size}B 写成成功长度")
+                }
+                return MfiResult.RESPONSE_RECEIVED_UNVERIFIED
             }
             if (gotFailure) {
-                MfiLengthMemory.recordRejected(context, receiverKey, size)
+                throw IOException("MFi 收到非预期 0xaa04，停止本轮（不能据此判定挑战长度）")
             } else {
                 MfiLengthMemory.recordSilent(context, receiverKey, size)
             }
@@ -886,6 +910,8 @@ class Iap2SenderSession(
                 log("iap2 MFi 挑战全部无应答——跳过校验直接发 0xaa05（由后续消息判定车机是否放行）")
             }
         }
+        ensureActive("MFi 超时兼容处理前")
+        return MfiResult.TIMEOUT_COMPATIBILITY
     }
 
     // ---- 设备状态问候 ----
@@ -942,7 +968,7 @@ class Iap2SenderSession(
     private fun rescueDeadline(
         deadlineNanos: Long,
         millis: Long,
-    ): Long = minOf(deadlineNanos, System.nanoTime() + millis * 1_000_000L)
+    ): Long = minOf(deadlineNanos, nanoTime() + millis * 1_000_000L)
 
     private fun send(
         messageId: Int,
@@ -971,6 +997,7 @@ class Iap2SenderSession(
         messageId: Int,
         awaitAck: Boolean,
     ) {
+        ensureActive("发送 0x${messageId.toString(16)} 前")
         val limit = channel.peerMaxControlPayload() ?: (frame.size - 1).coerceAtLeast(1)
         var offset = 0
         while (offset < frame.size) {
@@ -1003,20 +1030,26 @@ class Iap2SenderSession(
     private fun expectOrNull(
         messageId: Int,
         deadlineNanos: Long,
+    ): Iap2Csm.Frame? = expectAnyOrNull(setOf(messageId), deadlineNanos)
+
+    private fun expectAnyOrNull(
+        messageIds: Set<Int>,
+        deadlineNanos: Long,
     ): Iap2Csm.Frame? {
-        pendingFrames.firstOrNull { it.messageId == messageId }?.let {
+        ensureActive("等待控制消息")
+        pendingFrames.firstOrNull { it.messageId in messageIds }?.let {
             pendingFrames.remove(it)
             return it
         }
         while (true) {
-            val remaining = (deadlineNanos - System.nanoTime()) / 1_000_000L
+            val remaining = (deadlineNanos - nanoTime()) / 1_000_000L
             if (remaining <= 0) return null
             val frame = recvNewFrame(remaining)
             if (frame == null) {
-                if (!channel.isAlive) return null
+                ensureActive("等待控制消息")
                 continue
             }
-            if (frame.messageId == messageId) return frame
+            if (frame.messageId in messageIds) return frame
             log(
                 "iap2 rx=0x${frame.messageId.toString(16).padStart(4, '0')} " +
                     "(${Iap2MessageIds.nameOf(frame.messageId)})，非预期，暂存待后续消费",
@@ -1049,6 +1082,7 @@ class Iap2SenderSession(
 
     /** 只取新帧（先已解析队列、再读 socket）；绝不返回暂存区的帧。 */
     private fun recvNewFrame(timeoutMillis: Long): Iap2Csm.Frame? {
+        if (Thread.currentThread().isInterrupted || channel.isCancelled) throw InterruptedIOException("iAP2 接收已取消")
         receivedFrames.firstOrNull()?.let {
             receivedFrames.removeFirst()
             return it
@@ -1090,8 +1124,13 @@ class Iap2SenderSession(
     }
 
     private fun remainingMillis(deadlineNanos: Long): Long {
-        val remaining = (deadlineNanos - System.nanoTime()) / 1_000_000L
+        val remaining = (deadlineNanos - nanoTime()) / 1_000_000L
         return remaining.coerceIn(0, 60_000L)
+    }
+
+    private fun ensureActive(stage: String) {
+        if (Thread.currentThread().isInterrupted || channel.isCancelled) throw InterruptedIOException("iAP2 已取消（$stage）")
+        if (!channel.isAlive) throw IOException("iAP2 链路已关闭（$stage）：${channel.closeReason ?: "未知原因"}")
     }
 }
 

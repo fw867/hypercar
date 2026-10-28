@@ -40,6 +40,9 @@ object RustCoreBridge {
         /** 车机日夜模式（AirPlay setNightMode）：true = 夜间。 */
         fun onNightMode(night: Boolean)
 
+        /** 车机 forceKeyFrame：请求编码器立刻产出 IDR。 */
+        fun onForceKeyFrame() {}
+
         fun onDisplaySize(width: Int, height: Int) {}
     }
 
