@@ -191,15 +191,17 @@ object SettingsStore {
         height: Int = videoHeight,
     ): String {
         fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
-        // 触摸兜底空间：车机档案若给了 touchDisplay 就用它；否则 PC 接收端
-        // （DiPlay 2400×1080）兜底。真车 /info 有尺寸时 airplay.rs 优先用 /info。
+        // 触摸兜底空间：车机档案若给了 touchDisplay 就用它；否则用设置里的
+        // 屏幕推送分辨率（与视频编码一致）。真车 /info 有尺寸时仍优先 /info。
         val profileTouch = io.github.hypercar.headunit.HeadUnitProfiles.current().touchDisplay
+        val fallbackW = width.coerceAtLeast(2) / 2 * 2
+        val fallbackH = height.coerceAtLeast(2) / 2 * 2
         val (tdW, tdH) = profileTouch
             ?.split('x', 'X')
             ?.takeIf { it.size == 2 }
             ?.let { (it[0].toIntOrNull() ?: 0) to (it[1].toIntOrNull() ?: 0) }
             ?.takeIf { it.first > 0 && it.second > 0 }
-            ?: (2400 to 1080)
+            ?: (fallbackW to fallbackH)
         return buildString {
             append("{")
             append("\"device_id\":\"").append(esc(deviceBluetoothMac)).append("\",")

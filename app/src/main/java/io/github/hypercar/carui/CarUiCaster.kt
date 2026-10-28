@@ -30,8 +30,8 @@ import kotlinx.coroutines.launch
 object CarUiCaster {
 
     private const val TAG = "HyperCar-CarUI"
-    const val WIDTH = 1920
-    const val HEIGHT = 720
+    private var width = 1920
+    private var height = 720
     const val DPI = 240
 
     private val main = Handler(Looper.getMainLooper())
@@ -50,6 +50,8 @@ object CarUiCaster {
     val currentDisplayId: Int get() = displayId
 
     suspend fun start(context: Context): String {
+        width = SettingsStore.videoWidth.coerceAtLeast(2) / 2 * 2
+        height = SettingsStore.videoHeight.coerceAtLeast(2) / 2 * 2
         if (running || starting) {
             // stop 可能清掉监听器后卡住；重连分支必须补装，否则触摸静默丢失
             installTouchListener()
@@ -58,18 +60,18 @@ object CarUiCaster {
             }
             // 引擎重连会新建一个 encoder_size（初始值来自设置，可能是 2560x744）；
             // 画面尺寸必须重新上报，否则 Rust 触摸坐标按 2560x744 缩放，D1/D2 上点不动。
-            runCatching { RustCoreBridge.nativeSetVideoSize(WIDTH, HEIGHT) }
+            runCatching { RustCoreBridge.nativeSetVideoSize(width, height) }
             if (MapController.mapActive) MapController.refreshVideoSize()
             scope.launch {
                 kotlinx.coroutines.delay(900)
-                runCatching { RustCoreBridge.nativeSetVideoSize(WIDTH, HEIGHT) }
+                runCatching { RustCoreBridge.nativeSetVideoSize(width, height) }
                 if (MapController.mapActive) MapController.refreshVideoSize()
             }
-            return "已经在跑（display=$displayId，已重新上报 ${WIDTH}x$HEIGHT）"
+            return "已经在跑（display=$displayId，已重新上报 ${width}x$height）"
         }
         starting = true
         try {
-        val c = SpikeCaster(context, width = WIDTH, height = HEIGHT, tag = TAG)
+        val c = SpikeCaster(context, width = width, height = height, tag = TAG)
         caster = c
         val encoder = runCatching { c.startEncoder() }.getOrElse { t ->
             caster = null
@@ -80,10 +82,16 @@ object CarUiCaster {
             caster = null
             return "编码器没有 InputSurface"
         }
+        // APK 更新后 Shizuku UserService 可能仍是旧进程（旧包名/旧显示还在），
+        // 新进程再建屏会报 packageName must match owner uid。建屏前先清掉旧服务。
+        if (ShizukuTools.isReady) {
+            runCatching { ShizukuTools.exec("pkill -f 'io.github.hypercar:spike'", 2_000) }
+            kotlinx.coroutines.delay(150)
+        }
         val bind = SpikeShell.connect(context)
         // 清掉上一进程/上次会话残留的副屏（shell UserService 独立存活，不随 App 进程退出）
         runCatching { SpikeShell.releaseDisplay() }
-        val created = SpikeShell.createDisplay(surface, WIDTH, HEIGHT, DPI, 0, "hypercar-d1")
+        val created = SpikeShell.createDisplay(surface, width, height, DPI, 0, "hypercar-d1")
         val id = Regex("id=(\\d+)").find(created)?.groupValues?.get(1)?.toIntOrNull() ?: -1
         if (id <= 0) {
             c.stop()
@@ -113,10 +121,10 @@ object CarUiCaster {
         // 引擎刚起时 nativeSetVideoSize 可能落在 ENGINE 句柄安装之前；延迟补报一次
         scope.launch {
             kotlinx.coroutines.delay(900)
-            runCatching { RustCoreBridge.nativeSetVideoSize(WIDTH, HEIGHT) }
+            runCatching { RustCoreBridge.nativeSetVideoSize(width, height) }
             if (MapController.mapActive) MapController.refreshVideoSize()
         }
-        val msg = "启动 ok display=$id | $encoder | bind=$bind | create=$created | launch=$launch"
+        val msg = "启动 ok display=$id | ${width}x${height} | $encoder | bind=$bind | create=$created | launch=$launch"
         HyperCarRepo.log("CARUI: $msg")
         return msg
         } finally {

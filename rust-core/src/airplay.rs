@@ -890,6 +890,25 @@ fn spawn_event_dispatcher(
                         );
                     }
                 }
+                "setNightMode" => {
+                    // 车机日夜信号：宝马/CarPlay 接收端会随大灯/中控日夜模式下发。
+                    // 兼容 params.nightMode 与顶层 nightMode；bool / 0/1 都认。
+                    let night = command
+                        .get("nightMode")
+                        .and_then(value_as_bool)
+                        .or_else(|| {
+                            command
+                                .get("params")
+                                .and_then(|p| p.get("nightMode"))
+                                .and_then(value_as_bool)
+                        });
+                    if let Some(night) = night {
+                        emit_log(&format!("EVENT: 车机日夜模式 nightMode={night}"));
+                        crate::emit_night_mode(night);
+                    } else {
+                        emit_log("EVENT: setNightMode 未解析出 nightMode 字段");
+                    }
+                }
                 "hidSetInputMode" | "ping" | "fps" => {}
                 other => {
                     if bad_commands <= 8 {
@@ -899,6 +918,10 @@ fn spawn_event_dispatcher(
             }
         }
     });
+}
+
+fn value_as_bool(v: &bplist::Value) -> Option<bool> {
+    v.as_bool().or_else(|| v.as_int().map(|n| n != 0))
 }
 
 /// HID 触摸报告 → 本机界面触摸事件。

@@ -1352,6 +1352,11 @@ object HyperCarRepo {
 
         override fun onLog(line: String) = log(line)
 
+        override fun onNightMode(night: Boolean) {
+            io.github.hypercar.carui.CarUiSettings.onCarNight(night)
+            log("CARUI: 车机日夜模式 night=$night")
+        }
+
         override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {
             if (audioPlaying != lastAudioPlaying) {
                 lastAudioPlaying = audioPlaying

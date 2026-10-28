@@ -4,6 +4,7 @@ import android.app.Application
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
+import io.github.hypercar.carui.CarUiSettings
 import io.github.hypercar.core.RustCoreBridge
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.settings.SettingsStore
@@ -13,6 +14,7 @@ class HyperCarApp : Application() {
     override fun onCreate() {
         super.onCreate()
         SettingsStore.init(this)
+        CarUiSettings.init(this)
         createNotificationChannel()
         // 会话总管：注入 ACL 唤醒 handler + Rust 回调监听（秒连链路的第一环）
         HyperCarRepo.init(this)

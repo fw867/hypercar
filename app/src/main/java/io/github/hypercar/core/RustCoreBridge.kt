@@ -36,6 +36,9 @@ object RustCoreBridge {
 
         /** 统计心跳（约 1s 一次）：fps/frames/kbps/音频闪避。 */
         fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean)
+
+        /** 车机日夜模式（AirPlay setNightMode）：true = 夜间。 */
+        fun onNightMode(night: Boolean)
     }
 
     /**

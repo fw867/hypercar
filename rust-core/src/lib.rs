@@ -131,6 +131,19 @@ pub(crate) fn emit_stats(
     });
 }
 
+/// 车机日夜信号（AirPlay `setNightMode`）→ Kotlin，用于自动主题。
+pub(crate) fn emit_night_mode(night: bool) {
+    call_listener("onNightMode", |env, obj| {
+        env.call_method(
+            obj,
+            "onNightMode",
+            "(Z)V",
+            &[jni::sys::jboolean::from(night).into()],
+        )
+        .map(|_| ())
+    });
+}
+
 fn with_env<T>(
     f: impl FnOnce(&mut JNIEnv) -> jni::errors::Result<T>,
 ) -> Option<T> {

@@ -7,6 +7,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import io.github.hypercar.session.HyperCarRepo
+import io.github.hypercar.settings.SettingsStore
 import io.github.hypercar.shizuku.ShizukuTools
 import io.github.hypercar.spike.MapCompat
 import io.github.hypercar.spike.SpikeShell
@@ -128,7 +129,9 @@ object AmapPreview {
         val compat = MapCompat.enable(PKG)
         HyperCarRepo.log("CARUI-PREVIEW: $compat")
         // Only the first launch of the driving session opens cruise. Surface switches never relaunch Amap.
-        val result = SpikeShell.createDisplay(output, MAP_WIDTH, MAP_HEIGHT, MAP_DPI, 0, "hypercar-map")
+        val mapW = SettingsStore.videoWidth.coerceAtLeast(2) / 2 * 2
+        val mapH = SettingsStore.videoHeight.coerceAtLeast(2) / 2 * 2
+        val result = SpikeShell.createDisplay(output, mapW, mapH, MAP_DPI, 0, "hypercar-map")
         displayId = Regex("id=(\\d+)").find(result)?.groupValues?.get(1)?.toIntOrNull() ?: -1
         check(displayId > 0) { "无法创建地图窗口: $result" }
         val carLaunch = launchCarMap(mode, splash = true)
@@ -140,14 +143,26 @@ object AmapPreview {
                 "-n $PKG/com.autonavi.map.activity.SplashActivity --display $displayId", 12000)
             check(launch.ok && !launch.err.contains("Error")) { "高德启动失败: ${launch.err}" }
             delay(1800)
-            val uri = "amapuri://drive/CarCruisePage?sourceApplication=io.github.hypercar&clearStack=1"
-            val cruise = ShizukuTools.exec("am start -a android.intent.action.VIEW -d '$uri' " +
-                "-p $PKG --display $displayId", 12000)
-            check(cruise.ok) { "无法打开巡航: ${cruise.err}" }
+            if (CarUiSettings.autoCruise) {
+                val cruise = openCruise()
+                check(cruise.ok) { "无法打开巡航: ${cruise.err}" }
+            }
+        } else if (CarUiSettings.autoCruise) {
+            // 车联模式默认进地图首页；开了「自动巡航」才额外下发巡航页。
+            delay(1200)
+            openCruise()
         }
         HyperCarRepo.log("CARUI-PREVIEW: 初次启动 display=$displayId carMode=$carMode layout=$mode")
         _status.value = ""
         return displayId
+    }
+
+    private suspend fun openCruise(): io.github.hypercar.shizuku.ExecResult {
+        val uri = "amapuri://drive/CarCruisePage?sourceApplication=io.github.hypercar&clearStack=1"
+        return ShizukuTools.exec(
+            "am start -a android.intent.action.VIEW -d '$uri' -p $PKG --display $displayId",
+            12000,
+        )
     }
 
     /** UcarMapActivity is singleTask; layout-only intents retain the current navigation. */

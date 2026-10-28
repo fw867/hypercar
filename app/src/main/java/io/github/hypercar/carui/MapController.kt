@@ -16,8 +16,8 @@ object MapController {
 
     private const val TAG = "CARUI-MAP"
     private const val MAP_PKG = "com.autonavi.minimap"
-    private const val W = 1920
-    private const val H = 720
+    private var W = 1920
+    private var H = 720
     private const val DPI = 240
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -49,6 +49,8 @@ object MapController {
     fun init(context: Context, home: SpikeCaster) {
         appContext = context.applicationContext
         homeCaster = home
+        W = io.github.hypercar.settings.SettingsStore.videoWidth.coerceAtLeast(2) / 2 * 2
+        H = io.github.hypercar.settings.SettingsStore.videoHeight.coerceAtLeast(2) / 2 * 2
         scope.launch { AmapPreview.resumePreview() }
     }
 
@@ -126,6 +128,13 @@ object MapController {
         homeCaster?.setSuspended(false)
         homeCaster?.setPushing(true)
         homeCaster?.requestSyncFrame()
+        // 回首页后触摸目标必须切回 D1 画布；否则地图尺寸残留会让音乐卡点不中。
+        runCatching {
+            io.github.hypercar.core.RustCoreBridge.nativeSetVideoSize(
+                io.github.hypercar.settings.SettingsStore.videoWidth.coerceAtLeast(2) / 2 * 2,
+                io.github.hypercar.settings.SettingsStore.videoHeight.coerceAtLeast(2) / 2 * 2,
+            )
+        }
         runCatching { mapCaster?.stop() }
         mapCaster = null
         return "ok（导航继续显示在首页卡片）"

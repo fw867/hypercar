@@ -74,6 +74,7 @@ object MusicBridge {
     private var manualPauseRequested = false
     /** 用户在音乐卡片里选定的 App；有它的会话时优先显示它，而不是按“正在播放”抢焦点。 */
     private var preferredPackage: String? = null
+    private var autoPlayPending = false
 
     /** Serialize MediaSession commands with metadata callbacks, before restoring the phone audio route. */
     private fun onMusicThread(wait: Boolean = true, action: () -> Unit) {
@@ -236,6 +237,13 @@ object MusicBridge {
         main.post { choose() }
     }
 
+    /** 设置里改默认音乐 App：只改偏好，不立即播放。 */
+    fun setDefaultPackage(packageName: String) {
+        preferredPackage = packageName.takeIf { it.isNotBlank() }
+        playbackPrefs?.edit()?.putString("preferred_package", packageName)?.apply()
+        main.post { choose() }
+    }
+
     /** 关闭上一个音乐 App：优先 shell force-stop（与 MIUI 后台限制无关）。 */
     private fun closePackage(context: Context, packageName: String) {
         if (packageName.isBlank()) return
@@ -257,7 +265,8 @@ object MusicBridge {
         this.service = service
         playbackPrefs = service.getSharedPreferences("car_playback", Context.MODE_PRIVATE)
         resumePackage = playbackPrefs?.getString("resume_package", null)
-        preferredPackage = playbackPrefs?.getString("preferred_package", null)
+        preferredPackage = CarUiSettings.defaultMusicPackage.takeIf { it.isNotBlank() }
+            ?: playbackPrefs?.getString("preferred_package", null)
         permissionDenied = false
         val msm = service.getSystemService(MediaSessionManager::class.java)
         val component = ComponentName(service, MusicNotificationListener::class.java)
