@@ -15,7 +15,6 @@ import kotlinx.coroutines.launch
 object MapController {
 
     private const val TAG = "CARUI-MAP"
-    private const val MAP_PKG = "com.autonavi.minimap"
     private var W = 1920
     private var H = 720
     private val DPI: Int get() = CarUiCaster.DPI
@@ -48,10 +47,11 @@ object MapController {
 
     fun init(context: Context, home: SpikeCaster) {
         appContext = context.applicationContext
+        MapPreview.init(context)
         homeCaster = home
         W = CarUiCaster.plan.width
         H = CarUiCaster.plan.height
-        scope.launch { AmapPreview.resumePreview() }
+        scope.launch { MapPreview.resumePreview() }
     }
 
     fun reset() {
@@ -83,16 +83,11 @@ object MapController {
         }
     }
 
-    private fun installed(ctx: Context): Boolean = runCatching {
-        ctx.packageManager.getPackageInfo(MAP_PKG, 0)
-        true
-    }.getOrDefault(false)
-
     private suspend fun enter(): String {
         if (mapActive) return "already active"
         val ctx = appContext ?: return "未初始化"
         val home = homeCaster ?: return "home caster 不在"
-        if (!installed(ctx)) return "高德未安装（$MAP_PKG）"
+        val provider = MapApps.selected(ctx) ?: return "请在手机安装高德地图或百度地图"
 
         val c = SpikeCaster(ctx, width = W, height = H, fps = CarUiCaster.plan.fps, bitrate = CarUiCaster.plan.bitrate, tag = "CARUI-MAP")
         mapCaster = c
@@ -101,7 +96,7 @@ object MapController {
             c.startEncoder()
             val surface = c.encoderSurface ?: error("地图编码器没有 InputSurface")
             // Retarget the same display at the same density, preserving its navigation engine.
-            val id = AmapPreview.showFullscreen(surface, W, H, DPI)
+            val id = MapPreview.showFullscreen(surface, W, H, DPI)
             mapDisplayId = id
             delay(350)
             home.setPushing(false)
@@ -110,7 +105,7 @@ object MapController {
             c.requestSyncFrame()
             mapActive = true
             MapHomeOverlay.attach(ctx, id) { requestExit() }
-            return "ok display=$id（保留高德任务）"
+            return "ok display=$id（保留${provider.label}任务）"
         } catch (e: Exception) {
             cleanupFailed("全屏切换失败: ${e.message}")
             return "切换失败: ${e.message}"
@@ -120,7 +115,7 @@ object MapController {
     private suspend fun exit(): String {
         if (!mapActive) return "not active"
         // Attach the card surface before releasing the encoder surface, without restarting the app.
-        AmapPreview.resumePreview()
+        MapPreview.resumePreview()
         MapHomeOverlay.detach()
         mapActive = false
         mapDisplayId = -1
@@ -142,7 +137,7 @@ object MapController {
 
     private suspend fun cleanupFailed(reason: String) {
         HyperCarRepo.log("CARUI-MAP: $reason")
-        AmapPreview.resumePreview()
+        MapPreview.resumePreview()
         MapHomeOverlay.detach()
         mapActive = false
         mapDisplayId = -1
@@ -239,6 +234,7 @@ object MapController {
     }
 
     private fun inject(displayId: Int, action: Int, x: Int, y: Int, downTimeMs: Long) {
+        if (action == 0) MapPreview.onMapInteraction()
         val result = SpikeShell.motion(displayId, action, x, y, downTimeMs)
         if (!result.startsWith("OK")) {
             if (touchLogs++ < 12) {
@@ -251,7 +247,7 @@ object MapController {
 
     /** 首页 caster 停止时的同步收尾（会话断开）：释放 D2、复原横屏覆盖。 */
     fun stop() {
-        AmapPreview.stop()
+        MapPreview.stop()
         mapActive = false
         mapCaster?.setPushing(false)
         runCatching { mapCaster?.stop() }

@@ -31,6 +31,8 @@ import androidx.compose.ui.unit.sp
 fun CarSettingsPage(modifier: Modifier = Modifier, onBack: () -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val installed = remember(context) { MusicApps.installed(context) }
+    val maps = MapApps.installed(context)
+    val selectedMap = MapApps.resolve(CarUiSettings.defaultMap, maps)
     var musicPicker by remember { mutableStateOf(false) }
 
     Column(
@@ -51,11 +53,35 @@ fun CarSettingsPage(modifier: Modifier = Modifier, onBack: () -> Unit) {
         Spacer(Modifier.height(18.dp))
 
         SettingsGroup("导航") {
+            Text("默认地图", color = CarInk, fontSize = 16.sp)
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                maps.forEach { provider ->
+                    FilterChip(
+                        selected = provider == selectedMap,
+                        onClick = { CarUiSettings.updateDefaultMap(provider) },
+                        label = { Text(provider.label, fontSize = 16.sp) },
+                        modifier = Modifier.heightIn(min = 48.dp),
+                    )
+                }
+            }
+            Text(
+                when (maps.size) {
+                    0 -> "请先在手机安装高德地图或百度地图"
+                    1 -> "当前使用${maps.first().label}"
+                    else -> "切换后返回首页生效，当前地图导航将结束"
+                }, color = CarMuted, fontSize = 12.sp,
+            )
+            Spacer(Modifier.height(8.dp))
+            HorizontalDivider(color = CarMuted.copy(alpha = .18f))
             SettingSwitch(
                 title = "导航自动巡航",
-                subtitle = "启动高德后自动进入巡航页",
+                subtitle = "首页地图稳定显示 10 秒后，空闲时自动进入巡航",
                 checked = CarUiSettings.autoCruise,
-                onCheckedChange = { CarUiSettings.updateAutoCruise(it) },
+                onCheckedChange = {
+                    CarUiSettings.updateAutoCruise(it)
+                    MapPreview.onAutoCruiseChanged(it)
+                },
             )
         }
 

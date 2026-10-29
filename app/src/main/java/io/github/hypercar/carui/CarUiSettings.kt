@@ -21,6 +21,8 @@ object CarUiSettings {
 
     var autoCruise: Boolean by mutableStateOf(true)
         private set
+    var defaultMap: MapProvider by mutableStateOf(MapProvider.AMAP)
+        private set
     var defaultMusicPackage: String by mutableStateOf("")
         private set
     var autoPlayOnConnect: Boolean by mutableStateOf(false)
@@ -38,6 +40,7 @@ object CarUiSettings {
         val p = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         prefs = p
         autoCruise = p.getBoolean("auto_cruise", true)
+        defaultMap = MapApps.fromId(p.getString("default_map", MapProvider.AMAP.id))
         defaultMusicPackage = p.getString("default_music", "").orEmpty()
         autoPlayOnConnect = p.getBoolean("auto_play", false)
         themeMode = runCatching {
@@ -49,6 +52,11 @@ object CarUiSettings {
     fun updateAutoCruise(value: Boolean) {
         autoCruise = value
         prefs?.edit()?.putBoolean("auto_cruise", value)?.apply()
+    }
+
+    fun updateDefaultMap(provider: MapProvider) {
+        defaultMap = provider
+        prefs?.edit()?.putString("default_map", provider.id)?.apply()
     }
 
     fun updateDefaultMusicPackage(packageName: String) {

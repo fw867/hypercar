@@ -7,7 +7,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import io.github.hypercar.session.HyperCarRepo
-import io.github.hypercar.settings.SettingsStore
 import io.github.hypercar.shizuku.ShizukuTools
 import io.github.hypercar.spike.MapCompat
 import io.github.hypercar.spike.SpikeShell
@@ -17,15 +16,15 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
-/** One persistent Amap task, responsive display bounds, and a constant density across card/fullscreen. */
-object AmapPreview {
-    private const val PKG = "com.autonavi.minimap"
-    private const val MAP_WIDTH = 1920
-    private const val MAP_HEIGHT = 720
+/** One persistent map task, responsive display bounds, and constant density across card/fullscreen. */
+object MapPreview {
+    private var appContext: android.content.Context? = null
+    private var activeProvider: MapProvider? = null
+    fun init(context: android.content.Context) { appContext = context.applicationContext }
     private val MAP_DPI: Int get() = CarUiCaster.DPI
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val lock = Mutex()
-    private val _status = MutableStateFlow("正在打开高德地图…")
+    private val _status = MutableStateFlow("正在打开地图…")
     val status: StateFlow<String> = _status
     private var displayId = -1
     private var cardSurface: Surface? = null
@@ -36,6 +35,53 @@ object AmapPreview {
     private var stopped = false
     private var carMode = false
     private var layoutMode = 2
+    private var cruiseJob: Job? = null
+    @Volatile private var mapInteracted = false
+    private var cruiseRequested = false
+
+    fun onAutoCruiseChanged(enabled: Boolean) {
+        scope.launch {
+            lock.withLock {
+                cancelCruise()
+                if (enabled) scheduleCruise()
+            }
+        }
+    }
+
+    /** Without a reliable Amap navigation-state API, user interaction makes idle state unknown. */
+    fun onMapInteraction() { mapInteracted = true }
+
+    private fun cancelCruise() {
+        cruiseJob?.cancel()
+        cruiseJob = null
+    }
+
+    private fun scheduleCruise() {
+        cancelCruise()
+        val provider = activeProvider ?: return
+        val id = displayId
+        val texture = target ?: return
+        if (!CarUiSettings.autoCruise || stopped || fullscreen || layoutMode != 2 || id <= 0) return
+        cruiseJob = scope.launch {
+            delay(AutoCruisePolicy.DELAY_MS)
+            lock.withLock {
+                if (!CarUiSettings.autoCruise || stopped || fullscreen || target !== texture ||
+                    displayId != id || activeProvider != provider || cardSurface?.isValid != true) return@withLock
+                val idle = if (provider == MapProvider.BAIDU) {
+                    val state = ShizukuTools.exec("dumpsys activity ${provider.packageName}", 5000)
+                    state.ok && AutoCruisePolicy.baiduIsIdle(state.out)
+                } else !mapInteracted && !cruiseRequested
+                if (!idle) {
+                    HyperCarRepo.log("CARUI-PREVIEW: ${provider.label}自动巡航跳过：已在巡航、导航或状态未确认")
+                    return@withLock
+                }
+                val result = openCruise()
+                cruiseRequested = result.ok && !result.err.contains("Error") && !result.out.contains("Error")
+                HyperCarRepo.log("CARUI-PREVIEW: ${provider.label}首页稳定 10 秒后请求巡航 success=$cruiseRequested")
+            }
+        }
+        HyperCarRepo.log("CARUI-PREVIEW: ${provider.label}首页自动巡航计时 10 秒")
+    }
 
     fun attach(texture: SurfaceTexture, w: Int, h: Int) {
         scope.launch {
@@ -58,6 +104,7 @@ object AmapPreview {
         scope.launch {
             lock.withLock {
                 if (target === texture) {
+                    cancelCruise()
                     if (!fullscreen && displayId > 0) {
                         // Keep the task/navigation alive while the applications page hides the card.
                         SpikeShell.updateDisplaySurface(displayId, null, 0, 0, 0)
@@ -73,8 +120,9 @@ object AmapPreview {
 
     suspend fun showFullscreen(surface: Surface, w: Int, h: Int, dpi: Int): Int = lock.withLock {
         check(!stopped) { "地图会话已停止" }
-        val id = route(surface, w, h, 1)
+        cancelCruise()
         fullscreen = true
+        val id = route(surface, w, h, 1)
         id
     }
 
@@ -94,41 +142,43 @@ object AmapPreview {
             lock.withLock {
                 stopped = true
                 fullscreen = false
-                val hadMap = displayId > 0
-                if (hadMap) SpikeShell.releaseDisplay(displayId)
-                displayId = -1
-                carMode = false
+                releaseMapTask()
                 // The TextureView owns its SurfaceTexture until its destruction callback.
                 cardSurface?.release()
                 cardSurface = null
                 target = null
-                if (hadMap) {
-                    ShizukuTools.exec("am force-stop $PKG", 5000)
-                    MapCompat.disable(PKG)
-                }
             }
         }
     }
 
     private suspend fun route(output: Surface, w: Int, h: Int, mode: Int): Int {
+        val context = appContext ?: error("地图未初始化")
+        val provider = MapApps.selected(context) ?: error("请在手机安装高德地图或百度地图")
+        if (activeProvider != null && activeProvider != provider) releaseMapTask()
+        activeProvider = provider
         if (displayId > 0) {
             // The installed Amap handles screen-size changes but not CONFIG_DENSITY.
             // Changing 160/240dpi recreates its activity; keep 240dpi when resizing the bounds.
             val update = SpikeShell.updateDisplaySurface(displayId, output, w, h, MAP_DPI)
             check(update.startsWith("OK")) { update }
-            if (carMode && mode != layoutMode) {
+            if (carMode && provider.supportsLayoutIntent && mode != layoutMode) {
                 val layout = launchCarMap(mode, splash = false)
                 check(layout.ok && !layout.err.contains("Error")) { "车联布局切换失败: ${layout.err}" }
-                layoutMode = mode
             }
+            layoutMode = mode
+            if (mode == 2) scheduleCruise()
             _status.value = ""
             HyperCarRepo.log("CARUI-PREVIEW: 保留地图任务 $update carMode=$carMode layout=$mode")
             return displayId
         }
-        _status.value = "正在打开高德地图…"
-        val compat = MapCompat.enable(PKG)
+        _status.value = "正在打开${provider.label}…"
+        val compat = MapCompat.enable(provider.packageName)
         HyperCarRepo.log("CARUI-PREVIEW: $compat")
-        // Only the first launch of the driving session opens cruise. Surface switches never relaunch Amap.
+        if (!SpikeShell.isConnected()) {
+            val binding = SpikeShell.connect(context)
+            check(SpikeShell.isConnected()) { binding }
+        }
+        // Cruise is a separate delayed request, after the card has been bound.
         val mapW = CarUiCaster.plan.width
         val mapH = CarUiCaster.plan.height
         val result = SpikeShell.createDisplay(output, mapW, mapH, MAP_DPI, 0, "hypercar-map")
@@ -138,63 +188,71 @@ object AmapPreview {
         carMode = carLaunch.ok && !carLaunch.err.contains("Error") && !carLaunch.out.contains("Error")
         layoutMode = mode
         if (!carMode) {
+            check(provider == MapProvider.AMAP) { "${provider.label}车联入口不可用，请检查地图版本或首次授权：${carLaunch.err}" }
             HyperCarRepo.log("CARUI-PREVIEW: 车联入口不可用，回退手机巡航 ${carLaunch.err}")
             val launch = ShizukuTools.exec("am start --activity-clear-task " +
-                "-n $PKG/com.autonavi.map.activity.SplashActivity --display $displayId", 12000)
-            check(launch.ok && !launch.err.contains("Error")) { "高德启动失败: ${launch.err}" }
-            delay(1800)
-            if (CarUiSettings.autoCruise) {
-                val cruise = openCruise()
-                check(cruise.ok) { "无法打开巡航: ${cruise.err}" }
-            }
-        } else if (CarUiSettings.autoCruise) {
-            // 车联模式默认进地图首页；开了「自动巡航」才额外下发巡航页。
-            delay(1200)
-            openCruise()
+                "-n ${provider.packageName}/com.autonavi.map.activity.SplashActivity --display $displayId", 12000)
+            check(launch.ok && !launch.err.contains("Error")) { "${provider.label}启动失败: ${launch.err}" }
         }
-        HyperCarRepo.log("CARUI-PREVIEW: 初次启动 display=$displayId carMode=$carMode layout=$mode")
+        // 第一次以编码画布创建后也要立即适配卡片边界，避免首帧上下留边。
+        val update = SpikeShell.updateDisplaySurface(displayId, output, w, h, MAP_DPI)
+        check(update.startsWith("OK")) { update }
+        if (mode == 2) scheduleCruise()
+        HyperCarRepo.log("CARUI-PREVIEW: ${provider.label}初次启动 display=$displayId carMode=$carMode layout=$mode")
         _status.value = ""
         return displayId
     }
 
     private suspend fun openCruise(): io.github.hypercar.shizuku.ExecResult {
-        val uri = "amapuri://drive/CarCruisePage?sourceApplication=io.github.hypercar&clearStack=1"
+        val provider = activeProvider ?: error("地图任务不存在")
         return ShizukuTools.exec(
-            "am start -a android.intent.action.VIEW -d '$uri' -p $PKG --display $displayId",
+            provider.cruiseCommand(displayId),
             12000,
         )
     }
 
     /** UcarMapActivity is singleTask; layout-only intents retain the current navigation. */
     private suspend fun launchCarMap(mode: Int, splash: Boolean): io.github.hypercar.shizuku.ExecResult {
-        val activity = if (splash) "UcarSplashActivity" else "UcarMapActivity"
-        return ShizukuTools.exec("am start --activity-single-top " +
-            "-n $PKG/com.autonavi.map.activity.$activity " +
-            "-a com.ucar.intent.action.UCAR -c com.ucar.intent.category.UCAR " +
-            "--ez isUcarMode true --ei screenMode $mode --ei displayId $displayId " +
-            "--ez isUCarNaviUseVerticalScreenLayout false --display $displayId", 12000)
+        val provider = activeProvider ?: error("地图任务不存在")
+        return ShizukuTools.exec(provider.carLaunchCommand(displayId, mode, splash), 12000)
     }
 
-    private fun failed(error: Throwable) {
-        _status.value = "地图暂不可用，点击重试全屏"
+    private suspend fun releaseMapTask() {
+        cancelCruise()
+        mapInteracted = false
+        cruiseRequested = false
+        if (displayId > 0) SpikeShell.releaseDisplay(displayId)
+        displayId = -1
+        carMode = false
+        activeProvider?.let { provider ->
+            ShizukuTools.exec("am force-stop ${provider.packageName}", 5000)
+            MapCompat.disable(provider.packageName)
+        }
+        activeProvider = null
+    }
+
+    private suspend fun failed(error: Throwable) {
+        runCatching { releaseMapTask() }
+        _status.value = "地图暂不可用：${error.message.orEmpty().take(100)}"
         HyperCarRepo.log("CARUI-PREVIEW: ${error.message}")
     }
 }
 
 @Composable
-fun AmapPreviewView(modifier: Modifier = Modifier) {
+fun MapPreviewView(modifier: Modifier = Modifier) {
     AndroidView(modifier = modifier, factory = { context ->
+        MapPreview.init(context)
         TextureView(context).apply {
             isOpaque = false
             surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                 override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
-                    AmapPreview.attach(texture, width, height)
+                    MapPreview.attach(texture, width, height)
                 }
                 override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {
-                    AmapPreview.attach(texture, width, height)
+                    MapPreview.attach(texture, width, height)
                 }
                 override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
-                    AmapPreview.detach(texture)
+                    MapPreview.detach(texture)
                     return false
                 }
                 override fun onSurfaceTextureUpdated(texture: SurfaceTexture) = Unit

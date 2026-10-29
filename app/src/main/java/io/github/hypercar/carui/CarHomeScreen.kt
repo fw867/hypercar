@@ -112,7 +112,7 @@ private fun CarHomeContent(isUltrawide: Boolean) {
                 Spacer(Modifier.height(16.dp))
                 // Dock 4 个：高德 / 音乐 / 设置 / 更多（更多按钮在应用页和首页之间切换）
                 Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                    DockButton(Icons.Rounded.Navigation, "高德地图",
+                    DockButton(Icons.Rounded.Navigation, MapApps.selected(context)?.label ?: "地图",
                         if (CarThemeState.dark) Color(0xFF12B5D2) else CarAccent, buttonSize = 76) { enterMap() }
                     DockButton(Icons.Rounded.MusicNote, "音乐", Color(0xFF7B51EB), buttonSize = 76) {
                         launchMusic(context, music)
@@ -225,11 +225,11 @@ private fun DockButton(icon: ImageVector, label: String, color: Color, buttonSiz
 
 @Composable
 private fun MapCard(modifier: Modifier, onMap: () -> Unit) {
-    val status by AmapPreview.status.collectAsStateWithLifecycle()
+    val status by MapPreview.status.collectAsStateWithLifecycle()
     Box(modifier.clip(CardShape).background(Color(0xFF1B2637))) {
-        AmapPreviewView(Modifier.fillMaxSize())
+        MapPreviewView(Modifier.fillMaxSize())
         // The card is an overview. Touch opens the fully interactive map on D2.
-        Box(Modifier.fillMaxSize().clickable(onClickLabel = "打开全屏高德地图") { onMap() })
+        Box(Modifier.fillMaxSize().clickable(onClickLabel = "打开全屏地图") { onMap() })
         if (status != "") {
             Column(Modifier.align(Alignment.Center).clip(RoundedCornerShape(18.dp))
                 .background(if (CarThemeState.dark) Color(0xDD10141F) else Color(0xEAF6FAFF)).padding(22.dp), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -400,6 +400,7 @@ private fun launchMusic(context: android.content.Context, music: NowPlaying) {
 private fun AppsPage(modifier: Modifier, music: NowPlaying, onSettings: () -> Unit = {}, onAbout: () -> Unit = {}, onMap: () -> Unit = {}) {
     val context = LocalContext.current
     val musicApps = remember(context) { MusicApps.installed(context) }
+    val mapLabel = MapApps.selected(context)?.label ?: "地图"
     Box(modifier.fillMaxWidth().clip(CardShape).background(CarPanel)) {
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(28.dp)) {
             Text("应用", color = CarInk, fontSize = 27.sp, fontWeight = FontWeight.SemiBold)
@@ -409,9 +410,9 @@ private fun AppsPage(modifier: Modifier, music: NowPlaying, onSettings: () -> Un
                 verticalArrangement = Arrangement.spacedBy(24.dp),
             ) {
                 Column(Modifier.width(104.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                    DockButton(Icons.Rounded.Navigation, "高德地图", if (CarThemeState.dark) Color(0xFF12B5D2) else CarAccent, buttonSize = 88) { onMap() }
+                    DockButton(Icons.Rounded.Navigation, mapLabel, if (CarThemeState.dark) Color(0xFF12B5D2) else CarAccent, buttonSize = 88) { onMap() }
                     Spacer(Modifier.height(12.dp))
-                    Text("高德地图", color = CarInk, fontSize = 16.sp)
+                    Text(mapLabel, color = CarInk, fontSize = 16.sp)
                 }
                 Column(Modifier.width(104.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                     DockButton(Icons.Rounded.Settings, "设置", Color(0xFF5B5675), buttonSize = 88, onClick = onSettings)
