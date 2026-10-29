@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -26,6 +27,7 @@ pub const CIPHER_MAX_PAYLOAD: usize = 1422;
 
 const HEADER_SIZE: usize = 2;
 const TAG_SIZE: usize = 16;
+static CHANNEL_IDS: AtomicU64 = AtomicU64::new(1);
 
 /// 控制通道密文帧编解码（每方向独立密钥与计数器）。
 pub struct ControlCipher {
@@ -176,6 +178,7 @@ fn find_head_separator(buf: &[u8]) -> Option<usize> {
 /// - 入向请求（车机发来的 POST /command 等）：一律立即回 200 OK，
 ///   `/command` 的 body 经 [RtspChannel::inbound] 交给上层分发。
 pub struct RtspChannel {
+    trace_id: u64,
     /// 写半部：必须用 tokio Mutex——写+flush 是 await 点，parking_lot 的 guard
     /// 跨 await 会让 future 非 Send，tokio::spawn 拒收（CI 首编实证）。
     write: Arc<tokio::sync::Mutex<OwnedWriteHalf>>,
@@ -199,6 +202,7 @@ impl RtspChannel {
         let pending: Arc<Mutex<HashMap<i32, oneshot::Sender<RtspMessage>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let (inbound_tx, inbound) = mpsc::unbounded_channel();
+        let trace_id = CHANNEL_IDS.fetch_add(1, Ordering::Relaxed);
 
         let reader = tokio::spawn(reader_loop(
             read,
@@ -206,9 +210,11 @@ impl RtspChannel {
             cipher.clone(),
             pending.clone(),
             inbound_tx,
+            trace_id,
         ));
 
         let this = Arc::new(Self {
+            trace_id,
             write,
             cipher,
             cseq,
@@ -221,7 +227,10 @@ impl RtspChannel {
     /// pair-verify 完成后切换到密文帧（读写计数从 0 开始）。
     pub fn set_cipher(&self, cipher: ControlCipher) {
         *self.cipher.lock() = Some(cipher);
+        crate::emit_log(&format!("RTSP#{} ENCRYPT enabled（不记录密钥）", self.trace_id));
     }
+
+    pub fn trace_id(&self) -> u64 { self.trace_id }
 
     pub fn is_encrypted(&self) -> bool {
         self.cipher.lock().is_some()
@@ -244,6 +253,12 @@ impl RtspChannel {
         timeout: Duration,
     ) -> Result<RtspMessage, String> {
         let cseq = self.next_cseq();
+        let started = std::time::Instant::now();
+        let trace = path != "/feedback";
+        if trace {
+            let encrypted = self.cipher.lock().is_some();
+            crate::emit_log(&format!("RTSP#{} TXQ CSeq={cseq} {method} {path} body={}B encrypted={} timeout={}ms", self.trace_id, body.len(), encrypted, timeout.as_millis()));
+        }
         let (tx, rx) = oneshot::channel();
         self.pending.lock().insert(cseq, tx);
 
@@ -273,23 +288,32 @@ impl RtspChannel {
         };
         {
             let mut w = self.write.lock().await;
-            w.write_all(&wire)
-                .await
-                .map_err(|e| format!("控制通道写失败: {e}"))?;
+            if let Err(error) = w.write_all(&wire).await {
+                self.pending.lock().remove(&cseq);
+                let detail = format!("RTSP#{} CSeq={cseq} {method} {path} 写失败: {error}", self.trace_id);
+                crate::emit_log(&detail);
+                return Err(detail);
+            }
             w.flush().await.ok();
         }
 
-        match tokio::time::timeout(timeout, rx).await {
+        let result = match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(msg)) => Ok(msg),
             Ok(Err(_)) => {
                 self.pending.lock().remove(&cseq);
-                Err("控制通道已关闭".to_string())
+                Err(format!("控制通道已关闭（等待 CSeq={cseq} {method} {path}）"))
             }
             Err(_) => {
                 self.pending.lock().remove(&cseq);
                 Err(format!("RTSP 超时（{timeout:?}，CSeq={cseq} {method} {path}）"))
             }
+        };
+        match &result {
+            Ok(message) if trace || message.status() != 200 => crate::emit_log(&format!("RTSP#{} RX CSeq={cseq} status={} body={}B elapsed={}ms", self.trace_id, message.status(), message.body.len(), started.elapsed().as_millis())),
+            Err(error) => crate::emit_log(&format!("RTSP#{} ERROR CSeq={cseq} elapsed={}ms {error}", self.trace_id, started.elapsed().as_millis())),
+            _ => {}
         }
+        result
     }
 
     /// 事件通道 fire-and-forget：POST /command（不等应答，DiPlay 同款）。
@@ -347,15 +371,22 @@ async fn reader_loop(
     cipher: SharedCipher,
     pending: PendingMap,
     inbound_tx: mpsc::UnboundedSender<RtspMessage>,
+    trace_id: u64,
 ) {
     let mut raw: Vec<u8> = Vec::with_capacity(8192);
     let mut plain: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 4096];
     loop {
         let n = match read.read(&mut chunk).await {
-            Ok(0) => break,
+            Ok(0) => {
+                crate::emit_log(&format!("RTSP#{trace_id}: 对端 EOF，未完成事务={}，残留密文={}B 明文={}B", pending.lock().len(), raw.len(), plain.len()));
+                break;
+            }
             Ok(n) => n,
-            Err(_) => break,
+            Err(error) => {
+                crate::emit_log(&format!("RTSP#{trace_id}: 读取失败：{error}，未完成事务={}", pending.lock().len()));
+                break;
+            }
         };
         raw.extend_from_slice(&chunk[..n]);
 
@@ -370,6 +401,7 @@ async fn reader_loop(
                     }
                     Err(e) => {
                         log::error!("EVENT/CTRL: {e}——关闭通道");
+                        crate::emit_log(&format!("RTSP#{trace_id}: 本地解密失败：{e}，关闭通道，未完成事务={}", pending.lock().len()));
                         break;
                     }
                 },

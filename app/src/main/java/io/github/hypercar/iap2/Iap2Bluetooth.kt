@@ -59,6 +59,8 @@ class Iap2Bluetooth(
      * 反而不再发起 CarPlay）。
      */
     private val dropProfilesBeforeIap2: Boolean = true,
+    private val allowOutboundIap2: Boolean = true,
+    private val preferredProvider: () -> String? = { null },
     private val log: (String) -> Unit,
     /** 每次拿到/更新端点即回调（0x5703 凭据与 0x4301 端点都会触发，可能多次）。 */
     private val onEndpoint: (CarPlayEndpoint) -> Unit,
@@ -66,6 +68,7 @@ class Iap2Bluetooth(
     private val onSessionEnded: (String) -> Unit,
 ) {
     companion object {
+        private val HANDSHAKE_IDS = java.util.concurrent.atomic.AtomicLong(0)
         /** 手机侧（我们监听）的 iAP2 服务 UUID；配件端（车机监听）是 …decacaff。 */
         val IPHONE_IAP2_UUID: UUID = UUID.fromString("00000000-deca-fade-deca-deafdecacafe")
         val ACCESSORY_IAP2_UUID: UUID = UUID.fromString("00000000-deca-fade-deca-deafdecacaff")
@@ -98,6 +101,7 @@ class Iap2Bluetooth(
 
     /** 当前会话占用的 socket（stop/notifyBluetoothLost 关它来打断阻塞读写）。 */
     private val currentSocket = AtomicReference<BluetoothSocket?>(null)
+    private val pendingDial = AtomicReference<BluetoothSocket?>(null)
 
     /** 当前会话的链路通道（主动结束会话用）。 */
     private val activeChannel = AtomicReference<RfcommLinkChannel?>(null)
@@ -177,11 +181,12 @@ class Iap2Bluetooth(
         val myGeneration = generation.incrementAndGet()
         val target = targetProvider()
         log(
-            "BT: 启动——监听 $SDP_NAME（…cafe，等车机连入）+ 出站尝试车机 iAP2 服务（…caff）" +
+            "BT: 启动——监听 $SDP_NAME（…cafe，等车机连入）" +
+                (if (allowOutboundIap2) " + 出站尝试车机 iAP2 服务（…caff）" else "，仅被动监听") +
                 if (target != null) {
                     "，目标：$target（只连/只收该设备）"
                 } else {
-                    "（自动：只尝试已配对且声明 iAP2 服务的设备）"
+                    if (allowOutboundIap2) "（自动：只尝试已配对且声明 iAP2 服务的设备）" else "（等车机发起，不操作其它已配对设备）"
                 },
         )
         try {
@@ -196,10 +201,14 @@ class Iap2Bluetooth(
             serverThread = this
             start()
         }
-        Thread({ connectLoop(myGeneration) }, "iap2-bt-client").apply {
-            isDaemon = true
-            clientThread = this
-            start()
+        if (allowOutboundIap2) {
+            Thread({ connectLoop(myGeneration) }, "iap2-bt-client").apply {
+                isDaemon = true
+                clientThread = this
+                start()
+            }
+        } else {
+            log("BT: 被动监听模式——保留系统蓝牙连接，不扫描、不出站拨号、不主动断开配置文件")
         }
         return true
     }
@@ -226,8 +235,15 @@ class Iap2Bluetooth(
      * 车机蓝牙断开后，旧 RFCOMM socket 的读会卡在半开连接上不返回——必须主动关。
      */
     fun dropCurrentSession() {
+        pendingDial.getAndSet(null)?.let { socket -> runCatching { socket.close() } }
         activeChannel.getAndSet(null)?.let { channel -> runCatching { channel.close() } }
         currentSocket.getAndSet(null)?.let { socket -> runCatching { socket.close() } }
+    }
+
+    fun onTargetChanged() {
+        // 不碰 currentSocket：入站会话可能恰好在此时建立，只取消尚在 connect() 的拨号。
+        pendingDial.getAndSet(null)?.let { runCatching { it.close() } }
+        log("BT: 目标已更新 explicit=${targetProvider() ?: "自动"} hint=${preferredProvider() ?: "无"} active=${sessionActive.get()}")
     }
 
     // ---- 入站：车机连入 ----
@@ -250,7 +266,7 @@ class Iap2Bluetooth(
             // 指定了目标车机时拒绝其它设备的连入（多台车机场景：非目标的控制器
             // 也会周期回连，放行会抢占/误建会话）。地址比对，大小写不敏感。
             val target = targetProvider()
-            if (target != null && !peerAddress.equals(target, ignoreCase = true)) {
+            if (!io.github.hypercar.bluetooth.CarTargetPolicy.acceptsIncoming(target, peerAddress)) {
                 log("BT-S: 忽略非目标设备连入 addr=${peerAddress ?: "?"}（当前目标：$target）")
                 runCatching { socket.close() }
                 continue
@@ -309,7 +325,9 @@ class Iap2Bluetooth(
                 if (sessionActive.get() || !running || generation.get() != myGeneration) continue
                 log("BT-C: ${INBOUND_GRACE_MILLIS / 1000}s 内车机未主动连入——改走出站（会先断开该车机的 HFP/A2DP）")
             }
-            val target = targetProvider()
+            val explicitTarget = targetProvider()
+            val preferred = preferredProvider()
+            val target = io.github.hypercar.bluetooth.CarTargetPolicy.outgoingTarget(explicitTarget, preferred)
             val candidates = candidateDevices(adapter, target)
             if (candidates.isEmpty()) {
                 if (target != null) {
@@ -325,13 +343,21 @@ class Iap2Bluetooth(
             for (device in candidates) {
                 if (!running || generation.get() != myGeneration) return
                 if (sessionActive.get()) break
+                // SDP 等待期间目标可能由 ACL 广播锁定；旧候选不能继续拨号。
+                if (targetProvider() != explicitTarget || preferredProvider() != preferred) break
+                if (device.bondState != BluetoothDevice.BOND_BONDED) continue
                 val name = safeName(device) ?: device.address
-                runCatching { adapter.cancelDiscovery() }
+                // 系统正进行发现/配对时让路，不能由后台循环全局取消发现。
+                if (adapter.isDiscovering) {
+                    sleepQuietly(RETRY_DELAY_MILLIS)
+                    break
+                }
                 // 「只配对、不连接」：断开该车机的 HFP/A2DP/LeAudio——车机在音频配置
                 // 文件在线时不开放 iAP2 服务窗口（奥迪 MIB3 实测每 3s 连接失败）。
                 // **宝马档案不做这一步**：它的 HFP/A2DP 在线时照样主动连入 iAP2，而断开
                 // 会连带把 ACL 拽掉（车机反复重连），反而再也不发起 CarPlay。
-                if (dropProfilesBeforeIap2) {
+                val evidence = io.github.hypercar.session.PairingEvidence.read(appContext.filesDir, device.address)
+                if (dropProfilesBeforeIap2 && evidence.mayDropProfiles) {
                     // 注意：BtProfiles.disconnect 内部会打「自己断开」归因标记——断开
                     // 配置文件（个别 ROM 退到设备级断开）会让系统广播 ACL 断开，接收器
                     // 靠那个标记认出「这是我们干的」，不按「下车」拆会话。
@@ -349,7 +375,7 @@ class Iap2Bluetooth(
                     }
                 } else if (!profileDropSkippedLogged) {
                     profileDropSkippedLogged = true
-                    log("BT-C: 车机档案要求保留 HFP/A2DP（不断配置文件，等车机自己连入 iAP2）")
+                    log("BT-C: 保留 HFP/A2DP：档案允许断开=$dropProfilesBeforeIap2 身份=${evidence.identityPresent} 本车凭证=${evidence.receiverCredentialPresent}；首配/未知状态不主动断配置文件")
                 }
                 val socket = tryConnect(device)
                 if (socket != null) {
@@ -476,6 +502,7 @@ class Iap2Bluetooth(
         // 连接前就登记：connect() 是阻塞调用（SDP 查询 + 建链最长可达数十秒），
         // stop()/dropCurrentSession() 只有拿到 socket 引用才能 close() 打断它。
         currentSocket.set(socket)
+        pendingDial.set(socket)
         return try {
             socket.connect()
             socket
@@ -483,6 +510,8 @@ class Iap2Bluetooth(
             currentSocket.compareAndSet(socket, null)
             runCatching { socket.close() }
             null
+        } finally {
+            pendingDial.compareAndSet(socket, null)
         }
     }
 
@@ -503,12 +532,18 @@ class Iap2Bluetooth(
         currentSocket.set(socket)
         // 记住本轮对端车机（ACL 广播可能没收到，记录「已配对车机」要靠它拿 MAC）
         runCatching { Iap2Peer.remember(safeAddress(socket.remoteDevice), safeName(socket.remoteDevice)) }
-        val channel = RfcommLinkChannel(socket, log)
+        val handshakeId = HANDSHAKE_IDS.incrementAndGet()
+        val started = SystemClock.elapsedRealtime()
+        val sessionLog: (String) -> Unit = { line -> log("HS#$handshakeId +${SystemClock.elapsedRealtime() - started}ms $line") }
+        val evidence = io.github.hypercar.session.PairingEvidence.read(appContext.filesDir, safeAddress(socket.remoteDevice))
+        sessionLog("BEGIN direction=$tag target=${targetProvider() ?: "自动"} identity=${evidence.identityPresent} receiverCredential=${evidence.receiverCredentialPresent}；无本车凭证=首次或未知，不主动断系统配置文件")
+        sessionLog("ROLE: iAP2 Device/iPhone，SDP=…cafe，deviceName=iPhone，保留无线可用性/传输身份声明")
+        val channel = RfcommLinkChannel(socket, sessionLog)
         activeChannel.set(channel)
         val session =
             Iap2SenderSession(
                 channel = channel,
-                log = log,
+                log = sessionLog,
                 bluetoothMac = bluetoothMacProvider(),
                 deviceName = "iPhone",
                 // 端点回调顺手标记「本轮已拿到凭据」：acceptLoop 用它决定是否允许
@@ -548,6 +583,7 @@ class Iap2Bluetooth(
             log("$tag SESSION 异常: ${error.javaClass.simpleName}: ${error.message}")
             onSessionEnded("异常: ${error.javaClass.simpleName}")
         } finally {
+            sessionLog("END alive=${channel.isAlive} cancelled=${channel.isCancelled} reason=${channel.closeReason ?: "会话层退出"}")
             activeChannel.compareAndSet(channel, null)
             currentSocket.compareAndSet(socket, null)
             runCatching { channel.close() }
@@ -823,7 +859,7 @@ private class RfcommLinkChannel(
         const val PACER_POLL_MILLIS = 20L
 
         /** 逐帧摘要日志上限（每方向每连接）。 */
-        const val FRAME_LOG_LIMIT = 40
+        const val FRAME_LOG_LIMIT = 128
 
         /** 链路终结哨兵；真实控制载荷至少包含一段 CSM 帧，不会为空。 */
         val POISON = ByteArray(0)

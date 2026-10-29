@@ -89,14 +89,12 @@ logs/Bluetooth/bluetoothd-hci-YYYY-MM-DD-*.pklg    ← 同一次抓包的滚动�
 ```
 
 - `type` 决定 `data` 的语义（HCI 命令/ACL/SCO 事件等）；
-- iAP2 帧在 ACL 里的形态是 `40 40 | len(u16 BE) | msgID(u16 BE) | params…`
-  （`len` 只覆盖 msgID+params 之后的部分）；
-- `ts` 存的是**本地时间当 UTC**，换算回本地要减时区；
+- `len`（容器第一个 u32）包含后面的时间戳 8 字节、type 1 字节和 data，**下一条记录位置是 `offset + 4 + len`**，不能用 `offset + 12 + len`。2026-10-29 严格解析现有文件得到 19,886 条记录，恰好消费全部 868,966 字节；旧脚本的跳字节扫描会漏帧或错误归属时间。
+- iAP2 CSM 在 ACL 中的形态是 `40 40 | total_len(u16 BE) | msgID(u16 BE) | params…`，`total_len` **包含 6 字节 CSM 头**。实际还要处理 ACL/L2CAP/RFCOMM 和链路分片，不能把一次字节搜索当成完整的协议解码。
+- `ts_sec/ts_usec` 应按原始时间戳处理；跨设备时钟未校准时，先比较相对握手起点的间隔，不能先假定它被错误加减过时区。
 - 参数按 `[len u16][id u16][value]` 或 TLV8（`<type><len><value>`）解析。
 
-以上规则就是
-[docs/NEGOTIATION-GAPS.md §10.1](NEGOTIATION-GAPS.md#101-数据来源与解析方式)
-里那份对照表的生成方式。
+2026-10-29 的重新核对与后台蓝牙干扰分析见 [当日连接排查](BMW-CONNECTION-2026-10-29.md)。旧表位于 [NEGOTIATION-GAPS.md §10.1](NEGOTIATION-GAPS.md#101-数据来源与解析方式)，历史结论需按上述边界重新校验。
 
 ## 隐私与合规
 

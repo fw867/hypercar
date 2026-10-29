@@ -23,7 +23,8 @@ app/src/main/java/io/github/hypercar/headunit/HeadUnitProfile.kt   ← 档案定
 | `openEaSessions` | 是否开 `0xEA00` EA 会话 | 宝马车机 `true`（0.27 行为）；真 iPhone 一个都不发，但停发与图标消失同时发生，暂按现场 A/B 保留 |
 | `sendTransportIdentifier` | 是否发 `0x4E0E` 传输标识 | 同上，宝马 `true`（与 0x4300 携带同一个传输标识） |
 | `replyPowerUpdates` | 车机发 `0xAE00` 时是否回 `0xAE01` | 真 iPhone **必回**（3 条）；默认 `true` |
-| `dropProfilesBeforeIap2` | 发 iAP2 前是否主动断开该车机的 HFP/A2DP | 当前内置 BMW_ID85 和通用档案为 `true`，WinPlay 为 `false`。这是兼容开关，不能按品牌推导必选值；需核对远程覆盖及实车 A/B，观察是否连带断开 ACL。历史“宝马必须 false”的结论与当前实现不一致 |
+| `dropProfilesBeforeIap2` | 发 iAP2 前是否主动断开该车机的 HFP/A2DP | 当前 BMW_ID85 与 WinPlay 为 `false`，通用为 `true`。2026-10-29 日志确认主动断配置文件干扰系统首连，BMW 改为仅入站监听；配置文件失败不再升级为整个设备断开 |
+| `allowOutboundIap2` | 是否启动 SDP 探测与主动 RFCOMM 连接 | BMW_ID85 为 `false`，由车机发起；通用/WinPlay 保持 `true`。远程 schema 已升为 3，旧缓存不会覆盖这一修复；参见[当日排查](BMW-CONNECTION-2026-10-29.md) |
 | `abortWhenCarPlayWindowClosed` | 0x1D01 判为「档案 A」（车机没开无线 CarPlay 窗口）时是否主动结束会话 | **一律 `false`**：2026-10-25 现场 A/B——0.27 保持链路时车机显示 CarPlay 图标，0.28 加了「档案 A 立即结束」后图标消失、车机不再发起 iAP2（拆链会让车机收起图标）。空转轮次改由「车机新连入顶替」处理，不靠拆链 |
 | `preferMdnsAirplay` | 端口策略：`true` = 先查 mDNS `_airplay._tcp` | 车机广播该服务（抓包/Bonjour 浏览可见）→ `true`；普通接收端（WinPlay）→ `false` |
 | `fallbackAirplayPorts` | mDNS 拿不到时的试连顺序 | AirPlay 惯例 `7000`，其次 `7001` / `7100` |

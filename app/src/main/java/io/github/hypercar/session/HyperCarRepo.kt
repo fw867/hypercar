@@ -141,7 +141,8 @@ object HyperCarRepo {
             val identityFile = context.filesDir.resolve("controller_identity.txt")
             ensurePairingIdentity(context, identityFile)
             val identityPath = identityFile.absolutePath
-            val json = SettingsStore.engineConfigJson(host, port, sessionDeviceMac, identityPath)
+            val json = SettingsStore.engineConfigJson(host, port, sessionDeviceMac, identityPath,
+                receiverBluetoothMac = io.github.hypercar.iap2.Iap2Peer.address)
             log("CORE: 重试 nativeStart（$host:$port fd=$fd，第 $attempt 次）")
             val started = RustCoreBridge.nativeStart(json, fd, socketProvider)
             log("CORE: 重试 nativeStart 返回 $started")
@@ -357,6 +358,16 @@ object HyperCarRepo {
         return PairingReset.run(ctx, ::log)
     }
 
+    /** 切换目标立即更新后续入站过滤；只取消尚未建立会话的出站拨号。 */
+    fun updateTargetCar(mac: String?, name: String?) {
+        val target = mac?.trim()?.takeIf { it.isNotEmpty() }?.uppercase(java.util.Locale.ROOT)
+        SettingsStore.setTargetCar(target, name?.takeIf { target != null && it.isNotBlank() })
+        aclCarMac = null
+        iap2?.onTargetChanged()
+        io.github.hypercar.settings.SettingsRevision.bump()
+        log("TARGET: 用户目标=${target ?: "自动"}，已清除旧 ACL 候选；入站过滤立即生效，已建立会话保持")
+    }
+
     /** 诊断：把「已配对车机」记录打进日志（调试广播 `PROBE_PAIRED` 用）。 */
     fun debugDumpPairedCars() {
         val list = SettingsStore.pairedCars
@@ -450,18 +461,20 @@ object HyperCarRepo {
             log(
                 "PROFILE: ${p.id}（${p.label}）0x4300=${p.sendCarPlayAvailability} " +
                     "EA=${p.openEaSessions} 0x4E0E=${p.sendTransportIdentifier} " +
-                    "断HFP/A2DP=${p.dropProfilesBeforeIap2} 档案A退场=${p.abortWhenCarPlayWindowClosed} "
+                    "断HFP/A2DP=${p.dropProfilesBeforeIap2} 主动拨号=${p.allowOutboundIap2} 档案A退场=${p.abortWhenCarPlayWindowClosed} "
             )
             val coordinator = Iap2Coordinator(
                 context,
                 // 目标优先级：设置里显式指定 > 本轮 ACL 连上的车机 > 自动（全部已配对）。
                 // 带上 ACL 车机可以避免每轮去拨 HI-BOX 之类旧 dongle（10 分钟日志里一半是
                 // 它们的连接失败），也让入站只收这台车。
-                targetMac = { SettingsStore.targetCarMac ?: aclCarMac },
+                targetMac = { SettingsStore.targetCarMac },
+                preferredMac = { aclCarMac },
                 // force=true：resolve() 有 10s 静默窗，上下层几乎同时解析时非 force 调用
                 // 会返回 null → 退回稳定伪 MAC（2026-10-25 现场：同一轮出现两个身份）。
                 deviceMacProvider = { BluetoothMac.resolveOrStable(force = true) },
                 dropProfilesBeforeIap2 = headUnitProfile.dropProfilesBeforeIap2,
+                allowOutboundIap2 = headUnitProfile.allowOutboundIap2,
                 log = ::log,
             )
             iap2 = coordinator
@@ -665,7 +678,8 @@ object HyperCarRepo {
             // 画面与音频由本机自绘界面自采自编，经 nativePushVideoFrame /
             // nativePushAudioPcm 投喂给引擎；这里只负责下发会话参数。
             val identityPath = context.filesDir.resolve("controller_identity.txt").absolutePath
-            val json = SettingsStore.engineConfigJson(apHost, port, deviceMac, identityPath)
+            val json = SettingsStore.engineConfigJson(apHost, port, deviceMac, identityPath,
+                receiverBluetoothMac = io.github.hypercar.iap2.Iap2Peer.address)
             // 下发配置原样打一行（不含密钥）：分辨率/帧率一目了然，
             // 免得再靠猜「这次到底请求了多大尺寸」
             log("CORE +${stageMs()}ms 引擎配置：$json")
@@ -2113,7 +2127,7 @@ object HyperCarRepo {
     private const val AIRPLAY_CONNECT_RETRY_TIMEOUT_MILLIS = 1_200L
 
     /** 环形日志保留行数（诊断页展示 + 导出）。 */
-    private const val LOG_KEEP_LINES = 300
+    private const val LOG_KEEP_LINES = 1600
 
     /** 单行日志限流：窗口内最多落盘次数。 */
     private const val LOG_RATE_MAX = 4
@@ -2129,7 +2143,7 @@ object HyperCarRepo {
     private const val DISK_LOG_MAX_BYTES = 1_500_000L
 
     /** 重启时从落盘日志带回环形缓冲的行数（够覆盖崩溃前的一段现场）。 */
-    private const val DISK_LOG_TAIL_LINES = 120
+    private const val DISK_LOG_TAIL_LINES = 400
 }
 
 

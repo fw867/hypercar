@@ -58,6 +58,9 @@ data class HeadUnitProfile(
      */
     val dropProfilesBeforeIap2: Boolean = true,
 
+    /** false = 只监听车机主动连入，不做 SDP 扫描、出站拨号或配置文件断开。 */
+    val allowOutboundIap2: Boolean = true,
+
     /**
      * 0x1D01 判为「档案 A」（车机没开无线 CarPlay 窗口）时是否**主动结束会话**。
      *
@@ -92,15 +95,15 @@ object HeadUnitProfiles {
         id = "bmw_id85",
         label = "BMW iD8.5",
         model = "MGU-86 / MGU-55",
-        notes = "真车实测：车机永不发 0x4301、不回报 0xEA03；0x4300 / 0xEA00 / 0x4E0E 必须发" +
-            "（0.27 图标出现、0.29 停发后图标消失的现场 A/B），且绝不能主动拆 iAP2 链路。",
+        notes = "兼容 MGU-86 / MGU-55；保持系统蓝牙连接，由车机发起 CarPlay。首次连接请在 iDrive 确认授权。",
         validatesDeviceId = false,
         // ↓ 这三项 2026-10-25 现场 A/B 恢复为 0.27 值：0.27 有 CarPlay 图标，停发后图标消失
         sendCarPlayAvailability = true,
         openEaSessions = true,
         sendTransportIdentifier = true,
         replyPowerUpdates = true,
-        dropProfilesBeforeIap2 = true,
+        dropProfilesBeforeIap2 = false,
+        allowOutboundIap2 = false,
         abortWhenCarPlayWindowClosed = false,
         preferMdnsAirplay = true,
         fallbackAirplayPorts = listOf(7000, 7001, 7100, 17000),

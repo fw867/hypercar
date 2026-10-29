@@ -54,6 +54,10 @@ pub struct EngineConfig {
     #[serde(default)]
     pub keep_alive_stats: bool,
     pub identity_path: String,
+    #[serde(default)]
+    pub receiver_id: Option<String>,
+    #[serde(default)]
+    pub receiver_previously_connected: bool,
     /// 接收端 `/info` 报 0x0 时的**触摸显示空间**宽/高（0 = 用协商的屏幕尺寸）。
     ///
     /// 旧接收端未上报有效像素尺寸时，HID 坐标按其配置的窗口空间换算
@@ -368,6 +372,8 @@ pub async fn run_engine(
         airplay_port: cfg.airplay_port,
         device_id: cfg.device_id.clone(),
         identity_path: cfg.identity_path.clone(),
+        receiver_id: cfg.receiver_id.clone(),
+        receiver_previously_connected: cfg.receiver_previously_connected,
         enable_audio: cfg.enable_audio,
         keep_alive_stats: cfg.keep_alive_stats,
         width: cfg.width,

@@ -47,10 +47,12 @@ class Iap2Coordinator(
     context: Context,
     /** 用户选定车机 MAC；null = 自动（连任意声明 iAP2 服务的已配对设备）。 */
     private val targetMac: () -> String?,
+    private val preferredMac: () -> String? = { null },
     /** 本机真实蓝牙 MAC（Shizuku 解析，由上层注入；0x4300/0x4E0C/0x4E0E 用）。 */
     private val deviceMacProvider: suspend () -> String,
     /** 车机档案：发 iAP2 前是否主动断开该车机的 HFP/A2DP（宝马=false，奥迪=true）。 */
     private val dropProfilesBeforeIap2: Boolean = true,
+    private val allowOutboundIap2: Boolean = true,
     private val log: (String) -> Unit,
 ) {
     companion object {
@@ -73,6 +75,8 @@ class Iap2Coordinator(
 
     /** 本次启动以来成功建过几轮 iAP2 会话（0 = 车机一次都没连进来）。 */
     val sessionStartCount: Int get() = bluetooth?.sessionStartCount ?: 0
+
+    fun onTargetChanged() = bluetooth?.onTargetChanged()
 
     /**
      * 开始监听/出站；拿到或更新端点即回调（可能多次：0x5703 凭据一次、
@@ -99,8 +103,10 @@ class Iap2Coordinator(
                 Iap2Bluetooth(
                     context = appContext,
                     targetProvider = targetMac,
+                    preferredProvider = preferredMac,
                     bluetoothMacProvider = ::currentBluetoothMac,
                     dropProfilesBeforeIap2 = dropProfilesBeforeIap2,
+                    allowOutboundIap2 = allowOutboundIap2,
                     log = log,
                     onEndpoint = { endpoint -> endpointCallback?.invoke(endpoint) },
                     onSessionEnded = { reason -> log("IAP2: 会话结束（$reason），继续监听/出站等待重连") },

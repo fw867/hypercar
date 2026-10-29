@@ -9,6 +9,7 @@ import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import io.github.hypercar.bluetooth.BtProfiles
+import io.github.hypercar.bluetooth.CarAclPolicy
 import io.github.hypercar.settings.SettingsStore
 
 /**
@@ -43,6 +44,12 @@ class CarBluetoothReceiver : BroadcastReceiver() {
         val device = deviceOf(intent)
         if (device == null) {
             Log.i(TAG, "ACL 广播缺少 EXTRA_DEVICE——放弃")
+            return
+        }
+        val transport = intent.getIntExtra(BluetoothDevice.EXTRA_TRANSPORT, BluetoothDevice.TRANSPORT_AUTO)
+        val deviceType = runCatching { device.type }.getOrDefault(BluetoothDevice.DEVICE_TYPE_UNKNOWN)
+        if (!CarAclPolicy.isClassicCarLink(transport, deviceType)) {
+            Log.i(TAG, "忽略 LE ACL：数字钥匙/近场连接不触发或结束 CarPlay")
             return
         }
         // address/name 都要 BLUETOOTH_CONNECT；拿不到（或拿到占位 MAC）无法判断是否目标车机

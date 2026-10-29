@@ -1,14 +1,14 @@
 {
-  "version": 2,
-  "_schema": 2,
-  "updated": "2026-10-25",
+  "version": 3,
+  "_schema": 3,
+  "updated": "2026-10-29",
   "_comment": "HyperCar 车机档案下发文件。新增车型改这里 + push 即可，App 端「从 GitHub 更新车型列表」后立即出现。字段含义见 docs/HEADUNIT-PROFILES.md；除 id/label 外都可省略（省略 = 用同 id 内置档案的值）。_schema 必须 >= App 端 SCHEMA 才会覆盖内置档案（旧缓存不能把内置修复顶回去）。",
   "profiles": [
     {
       "id": "bmw_id85",
       "label": "BMW iD8.5",
       "model": "MGU-86 / MGU-55",
-      "notes": "真车实测：车机永不发 0x4301、不回报 0xEA03；0x4300/0xEA00/0x4E0E 必须发（0.27 图标出现、0.29 停发后图标消失的现场 A/B），且不能主动拆 iAP2、不能主动断它的 HFP/A2DP。",
+      "notes": "兼容 MGU-86 / MGU-55；保持系统蓝牙连接，由车机发起 CarPlay。首次连接请在 iDrive 确认授权。",
       "verified": true,
       "validatesDeviceId": false,
       "sendCarPlayAvailability": true,
@@ -16,6 +16,7 @@
       "sendTransportIdentifier": true,
       "replyPowerUpdates": true,
       "dropProfilesBeforeIap2": false,
+      "allowOutboundIap2": false,
       "abortWhenCarPlayWindowClosed": false,
       "preferMdnsAirplay": true,
       "fallbackAirplayPorts": [

@@ -80,6 +80,16 @@ class Iap2SenderSession(
     private val nanoTime: () -> Long = System::nanoTime,
 ) {
     private val parser = Iap2Csm.Parser()
+    private var phaseName = "IDLE"
+    private var phaseStarted = nanoTime()
+    private var tracedReceivedFrames = 0
+
+    private fun enterPhase(name: String) {
+        val now = nanoTime()
+        log("PHASE $phaseName -> $name previousElapsed=${(now - phaseStarted) / 1_000_000L}ms")
+        phaseName = name
+        phaseStarted = now
+    }
 
     /** 刚解析、尚未分类的帧（到达顺序）。 */
     private val receivedFrames = ArrayDeque<Iap2Csm.Frame>()
@@ -205,6 +215,7 @@ class Iap2SenderSession(
      * @throws IOException 识别/链路超时（链路本身不可用）
      */
     fun run(timeoutMillis: Long = 60_000L): CarPlayEndpoint {
+        enterPhase("LINK_NEGOTIATION")
         val deadline = nanoTime() + timeoutMillis * 1_000_000L
         if (!channel.awaitReady(remainingMillis(deadline))) {
             throw IOException("iAP2 链路协商超时")
@@ -212,6 +223,7 @@ class Iap2SenderSession(
         log("iap2 link ready peerMaxControl=${channel.peerMaxControlPayload()}")
 
         // ---- 识别 ----
+        enterPhase("IDENTIFICATION")
         send(Iap2MessageIds.START_IDENTIFICATION)
         val identFrame = expect(Iap2MessageIds.IDENTIFICATION_INFORMATION, deadline)
         val ident = Iap2Messages.parseIdentification(identFrame.body)
@@ -222,6 +234,7 @@ class Iap2SenderSession(
         log("iap2 tx=0x1d02 identification-accepted")
 
         // ---- MFi（跳过校验：0xAA05 自报成功）----
+        enterPhase("MFI_EXCHANGE")
         val identityText = listOfNotNull(ident.name, ident.model, ident.manufacturer).joinToString(" ").lowercase()
         send(Iap2MessageIds.MFI_REQUEST_CERTIFICATE)
         val certificate = expect(Iap2MessageIds.MFI_CERTIFICATE, deadline)
@@ -236,6 +249,7 @@ class Iap2SenderSession(
         // 订阅/请求。旧实现排在 0x5703 等待之后：BMW 等问候、我们等 0x5703，
         // 两轮实测稳定 5.37~5.45s 后车机拆 RFCOMM（另一台 MGU-86 五轮全败同签名）。
         sendDeviceStateGreetings()
+        enterPhase("EA_AND_HID")
 
         // ---- EA 会话（MFi 完成后发；认证前发会噎死 DiPlay）----
         // BMW iD8.5 档案 B 声明 com.bmw.carplay protocol=8；档案 A 声明 de.bmw.a4a.bt。
@@ -302,8 +316,9 @@ class Iap2SenderSession(
         // 清单只能证明「有」，不能证明「没有」。奥迪 3315 的可收清单只有 5 项、不含
         // 0x5702，但它完整支持 0x5702→0x5703，而且**要靠收到 0x5702 才把 AirPlay 服务
         // 拉起来**——按清单跳过的那一版：0 次 0x5702 → 端口 7000 全程 ECONNREFUSED。
-        // 只有「两清单合计 ≥10 项仍无 0x57xx」（BMW iD9 形态）才判 NEW、跳过 0x5702。
+        // 明确声明 0x4301 且未声明 0x57xx 才优先新路径，不按清单数量推断完整性。
         val wifiGen = ReceiverProfile.classifyWifiGen(ident.sendIds, ident.receiveIds)
+        enterPhase("WIFI_CREDENTIALS")
         log("iap2 车机画像 wifiGen=${ReceiverProfile.describe(wifiGen)}")
         val declaresReceiveWifi = ident.declaresReceive(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION)
         val declaresSendWifi = ident.declaresSend(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION)
@@ -356,6 +371,7 @@ class Iap2SenderSession(
             }
 
         // ---- CarPlay 会话启动 ----
+        enterPhase("CARPLAY_START_SESSION")
         // 0x4300 发后不管：Audi 实测车机曾对它停止 ACK（其余包毫秒级 ACK），
         // 计入重传清单会让看门狗在 +20s 杀掉整条蓝牙链路。
         //
@@ -509,6 +525,7 @@ class Iap2SenderSession(
      *    必须落进日志，下一轮现场才有得解。
      */
     fun pumpIncomingForever() {
+        enterPhase("MAINTAIN_LINK")
         log("SESSION 保活中（链路保持打开，持续处理配件消息）")
         // 同一消息 ID 连续到达时限流：车机进入媒体播放后会周期性发 NowPlaying 更新，
         // 逐条打日志会把文件日志撑爆（文件超限被删 = 丢掉真正有用的上下文）。
@@ -999,6 +1016,7 @@ class Iap2SenderSession(
     ) {
         ensureActive("发送 0x${messageId.toString(16)} 前")
         val limit = channel.peerMaxControlPayload() ?: (frame.size - 1).coerceAtLeast(1)
+        log("TX phase=$phaseName id=0x${messageId.toString(16)} bytes=${frame.size} maxPayload=$limit awaitAck=$awaitAck")
         var offset = 0
         while (offset < frame.size) {
             val end = minOf(offset + limit, frame.size)
@@ -1037,19 +1055,29 @@ class Iap2SenderSession(
         deadlineNanos: Long,
     ): Iap2Csm.Frame? {
         ensureActive("等待控制消息")
+        val waitStarted = nanoTime()
+        val expected = messageIds.joinToString("/") { "0x${it.toString(16)}" }
+        log("WAIT phase=$phaseName ids=$expected budget=${((deadlineNanos - waitStarted) / 1_000_000L).coerceAtLeast(0)}ms pending=${pendingFrames.size}")
         pendingFrames.firstOrNull { it.messageId in messageIds }?.let {
             pendingFrames.remove(it)
+            log("MATCH phase=$phaseName id=0x${it.messageId.toString(16)} source=pending")
             return it
         }
         while (true) {
             val remaining = (deadlineNanos - nanoTime()) / 1_000_000L
-            if (remaining <= 0) return null
+            if (remaining <= 0) {
+                log("TIMEOUT phase=$phaseName ids=$expected elapsed=${(nanoTime() - waitStarted) / 1_000_000L}ms alive=${channel.isAlive}")
+                return null
+            }
             val frame = recvNewFrame(remaining)
             if (frame == null) {
                 ensureActive("等待控制消息")
                 continue
             }
-            if (frame.messageId in messageIds) return frame
+            if (frame.messageId in messageIds) {
+                log("MATCH phase=$phaseName id=0x${frame.messageId.toString(16)} elapsed=${(nanoTime() - waitStarted) / 1_000_000L}ms")
+                return frame
+            }
             log(
                 "iap2 rx=0x${frame.messageId.toString(16).padStart(4, '0')} " +
                     "(${Iap2MessageIds.nameOf(frame.messageId)})，非预期，暂存待后续消费",
@@ -1090,6 +1118,13 @@ class Iap2SenderSession(
         if (timeoutMillis <= 0) return null
         val bytes = channel.recvControl(timeoutMillis) ?: return null
         val frames = parser.offer(bytes)
+        for (frame in frames) {
+            if (tracedReceivedFrames++ < 192) {
+                log("RX phase=$phaseName id=0x${frame.messageId.toString(16)} bytes=${frame.body.size}（不记录凭据/签名内容）")
+            } else if (tracedReceivedFrames == 193) {
+                log("RX: 逐帧摘要达到 192 条，后续保留阶段/错误日志")
+            }
+        }
         if (frames.isEmpty()) return null
         frames.forEachIndexed { index, frame -> if (index > 0) receivedFrames += frame }
         return frames.first()

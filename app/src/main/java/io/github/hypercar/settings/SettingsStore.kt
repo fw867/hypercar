@@ -57,6 +57,10 @@ object SettingsStore {
         get() = p().getString(KEY_TARGET_NAME, null)
         set(v) = p().edit().putString(KEY_TARGET_NAME, v).apply()
 
+    fun setTargetCar(mac: String?, name: String?) {
+        p().edit().putString(KEY_TARGET_MAC, mac).putString(KEY_TARGET_NAME, name).apply()
+    }
+
     /** 上车自动连接（ACL 广播唤醒），默认开。 */
     var autoConnect: Boolean
         get() = p().getBoolean(KEY_AUTO_CONNECT, true)
@@ -240,6 +244,7 @@ object SettingsStore {
         identityPath: String,
         width: Int = videoWidth,
         height: Int = videoHeight,
+        receiverBluetoothMac: String? = null,
     ): String {
         fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
         // 触摸兜底空间：车机档案若给了 touchDisplay 就用它；否则用设置里的
@@ -271,6 +276,10 @@ object SettingsStore {
             append("\"enable_audio\":").append(enableAudio).append(",")
             append("\"keep_alive_stats\":").append(keepAliveStats).append(",")
             append("\"identity_path\":\"").append(esc(identityPath)).append("\"")
+            io.github.hypercar.session.PairingEvidence.receiverKey(receiverBluetoothMac)?.let {
+                append(",\"receiver_id\":\"").append(it).append("\"")
+                append(",\"receiver_previously_connected\":").append(isCarPaired(receiverBluetoothMac.orEmpty()))
+            }
             append("}")
         }
     }

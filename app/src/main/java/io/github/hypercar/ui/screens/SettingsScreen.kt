@@ -699,8 +699,7 @@ private fun TargetCarSection() {
                             }
                         },
                         onClick = {
-                            SettingsStore.targetCarMac = null
-                            SettingsStore.targetCarName = null
+                            HyperCarRepo.updateTargetCar(null, null)
                             expanded = false
                         },
                     )
@@ -745,8 +744,7 @@ private fun TargetCarSection() {
                                     }
                                 },
                                 onClick = {
-                                    SettingsStore.targetCarMac = mac
-                                    SettingsStore.targetCarName = name
+                                    HyperCarRepo.updateTargetCar(mac, name)
                                     expanded = false
                                 },
                             )
@@ -820,13 +818,11 @@ private fun TargetCarSection() {
             initialName = SettingsStore.targetCarName.orEmpty(),
             onDismiss = { dialogVisible = false },
             onCleared = {
-                SettingsStore.targetCarMac = null
-                SettingsStore.targetCarName = null
+                HyperCarRepo.updateTargetCar(null, null)
                 dialogVisible = false
             },
             onSaved = { mac, name ->
-                SettingsStore.targetCarMac = mac.ifBlank { null }
-                SettingsStore.targetCarName = name.ifBlank { null }
+                HyperCarRepo.updateTargetCar(mac, name)
                 dialogVisible = false
             },
         )
@@ -1260,8 +1256,7 @@ private fun HeadUnitSection(connected: Boolean = false) {
         SettingsStore.headUnitProfileId = profile.id
         // 换车机型号时把「目标车机」重置为自动发现：上一台的名字/MAC 留着，
         // 新车型会因「目标对不上」直接失败，而用户常常忘了改（现场反馈）。
-        SettingsStore.targetCarMac = null
-        SettingsStore.targetCarName = null
+        HyperCarRepo.updateTargetCar(null, null)
         io.github.hypercar.settings.SettingsRevision.bump()
         selectedId = profile.id
     }

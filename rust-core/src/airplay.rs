@@ -44,6 +44,8 @@ pub struct AirplayParams {
     /// 本机真实蓝牙 MAC（WinPlay 等接收端按 SETUP deviceID 过滤，占位值必 403）。
     pub device_id: String,
     pub identity_path: String,
+    pub receiver_id: Option<String>,
+    pub receiver_previously_connected: bool,
     pub enable_audio: bool,
     pub keep_alive_stats: bool,
     /// 设置里的编码分辨率（仅作 `/info` 无显示器信息时的兜底）。
@@ -91,6 +93,7 @@ pub async fn negotiate(
     stop: Arc<Notify>,
 ) -> Result<AirplayOutcome, String> {
     let (mut channel, _control_inbound) = RtspChannel::spawn(read, write, None);
+    emit_log(&format!("AIRPLAY: 控制连接 RTSP#{} 开始", channel.trace_id()));
 
     // ---- 1. /info（**best-effort**，不可用不致命）----
     //
@@ -138,12 +141,18 @@ pub async fn negotiate(
     //   同一台手机可以连多台接收端，IP 常常一样（192.168.1.35 / 172.16.222.97），
     //   用 IP 当键会把"另一台没配过的接收端"误判成已配对；公钥指纹则是每台接收端唯一且稳定。
     // 标记文件与身份文件同目录（每台手机各自一份），不会跨设备互相覆盖。
-    let receiver_tag = match receiver_pk {
+    let legacy_receiver_tag = match receiver_pk {
         Some(pk) => format!("{:02x}{:02x}{:02x}{:02x}", pk[0], pk[1], pk[2], pk[3]),
         None => p.car_ip.replace('.', "_"),
     };
+    let receiver_tag = credential_tag(p.receiver_id.as_deref(), &legacy_receiver_tag);
     let paired_marker = format!("{}.paired-{}", p.identity_path, receiver_tag);
-    let paired_before = std::path::Path::new(&paired_marker).exists();
+    let legacy_marker = format!("{}.paired-{}", p.identity_path, legacy_receiver_tag);
+    // 旧 IP 标记不能证明当前车机已授权。只有匹配到当前 /info 公钥时才可使用旧标记。
+    let paired_before = std::path::Path::new(&paired_marker).exists()
+        || ((receiver_pk.is_some() || p.receiver_previously_connected) && std::path::Path::new(&legacy_marker).exists());
+    emit_log(&format!("PAIR-EVIDENCE: 本机身份=存在 本车凭证={} 曾成功会话={} 来源={}；凭证仅是本地历史，仍须 verify 通过", paired_before, p.receiver_previously_connected,
+        if p.receiver_id.is_some() { "蓝牙车机身份" } else { "公钥/IP兼容键" }));
     emit_log(&format!(
         "PAIR: 身份 {}… / 接收端 {}（{}）——{}",
         format!("{:02x}{:02x}", identity.public_key[0], identity.public_key[1]),
@@ -159,6 +168,7 @@ pub async fn negotiate(
             Ok(keys) => {
                 channel.set_cipher(ControlCipher::new(keys.read_key, keys.write_key));
                 emit_log("AIRPLAY: ✓ pair-verify 直接用上次配对完成（跳过 pair-setup，不再重复注册）");
+                    let _ = std::fs::write(&paired_marker, b"1");
                 shared_secret = Some(keys.shared_secret);
             }
             Err(e) => {
@@ -329,6 +339,7 @@ pub async fn negotiate(
         .ok_or_else(|| format!("事件通道连接失败 {}:{event_port}", p.car_ip))?;
     let (ev_r, ev_w) = event_stream.into_split();
     let (event_channel, event_rx) = RtspChannel::spawn(ev_r, ev_w, None);
+    emit_log(&format!("AIRPLAY: 事件连接 RTSP#{} 建立，port={event_port}", event_channel.trace_id()));
     if let Some(shared) = &shared_secret {
         let (read_key, write_key) = derive_event_keys(shared);
         event_channel.set_cipher(ControlCipher::new(read_key, write_key));
@@ -425,6 +436,7 @@ pub async fn negotiate(
     // 若这段时间还在做音频 SETUP，RECORD 永远发不出去（21:13 现场）。
 
     // ---- 8. RECORD + 心跳 ----
+    emit_log("AIRPLAY: 开始 RECORD（等待车机激活会话）");
     let rec = channel
         .request(
             "RECORD",
@@ -477,6 +489,13 @@ fn read_display_size(display: &Value) -> (u32, u32) {
 mod display_size_tests {
     use super::*;
     #[test]
+    fn bluetooth_credential_key_stays_stable_when_receiver_ip_changes() {
+        assert_eq!(credential_tag(Some("bt_aabbccddee01"), "172_16_1_1"), "bt_aabbccddee01");
+        assert_eq!(credential_tag(Some("bt_aabbccddee01"), "192_168_1_1"), "bt_aabbccddee01");
+        assert_ne!(credential_tag(Some("bt_aabbccddee02"), "192_168_1_1"), "bt_aabbccddee01");
+        assert_eq!(credential_tag(Some("../../other"), "receiver_pk"), "receiver_pk");
+    }
+    #[test]
     fn pixel_dimensions_take_precedence_over_legacy_fields() {
         let display = Value::dict(vec![("widthPixels", Value::Int(2880)), ("heightPixels", Value::Int(1080)),
             ("width", Value::Int(0)), ("height", Value::Int(0))]);
@@ -487,9 +506,45 @@ mod display_size_tests {
         assert_eq!(read_display_size(&Value::dict(vec![("width", Value::Int(2560)), ("height", Value::Int(744))])), (2560, 744));
         assert_eq!(read_display_size(&Value::dict(vec![("widthPixels", Value::Int(-1)), ("heightPixels", Value::Int(999999))])), (0, 0));
     }
+
+    #[tokio::test]
+    async fn rejected_info_never_sends_state_changing_pairing_probes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            let mut methods = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = socket.read(&mut chunk).await {
+                if n == 0 { break; }
+                buffer.extend_from_slice(&chunk[..n]);
+                for request in crate::rtsp::parse_rtsp_messages(&mut buffer) {
+                    methods.push(request.first_line.clone());
+                    assert!(!request.first_line.contains("/pair-"), "diagnostic changed pairing state");
+                    let response = format!("RTSP/1.0 455 Method Not Valid In This State\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n", request.cseq().unwrap());
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            }
+            methods
+        });
+        let socket = TcpStream::connect(addr).await.unwrap();
+        let (read, write) = socket.into_split();
+        let (channel, _) = RtspChannel::spawn(read, write, None);
+        assert!(fetch_info(&channel).await.is_err());
+        drop(channel);
+        let methods = peer.await.unwrap();
+        assert_eq!(methods, vec!["GET /info RTSP/1.0", "POST /info RTSP/1.0", "GET /info RTSP/1.0"]);
+    }
 }
 
 // ---------------------------------------------------------------- /info
+
+fn credential_tag<'a>(receiver_id: Option<&'a str>, fallback: &'a str) -> &'a str {
+    receiver_id.filter(|id| id.starts_with("bt_") && id.len() == 15 && id[3..].bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or(fallback)
+}
 
 async fn fetch_info(channel: &Arc<RtspChannel>) -> Result<Value, String> {
     let body = bplist::encode(&Value::dict(vec![]));
@@ -534,42 +589,8 @@ async fn fetch_info(channel: &Arc<RtspChannel>) -> Result<Value, String> {
         }
         return bplist::parse(&resp.body).map_err(|e| format!("/info 解析失败: {e}"));
     }
-    // ---- 侦察：这台车机到底认什么 ----
-    // 455 只说明「这个状态下不接受 /info」，但没告诉我们它接受什么。
-    // 依次试 AirPlay 1 的经典入口，把每次的状态行原样记进日志——下一次上车就能定位。
-    // 只做记录，不改变后续流程（后面照样按失败返回）。
-    let probes: [(&str, &str); 4] = [
-        ("OPTIONS", "*"),
-        ("GET", "/server-info"),
-        ("POST", "/pair-setup"),
-        ("POST", "/pair-verify"),
-    ];
-    let mut recon = Vec::new();
-    for (method, path) in probes {
-        let body = if method == "POST" { bplist::encode(&Value::dict(vec![])) } else { Vec::new() };
-        let probe_extra: Vec<(&str, String)> = vec![
-            ("X-Apple-ProtocolVersion", "1".to_string()),
-            ("X-Apple-Device-ID", "0x0".to_string()),
-        ];
-        match channel
-            .request(method, path, &body, "application/x-apple-binary-plist", &probe_extra, Duration::from_secs(5))
-            .await
-        {
-            Ok(r) => {
-                let mut head: Vec<String> = r.headers.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                head.sort();
-                let note = format!("{method} {path} → [{}] 头部[{}]", r.first_line, if head.is_empty() { "无".to_string() } else { head.join(", ") });
-                emit_log(&format!("AIRPLAY 侦察: {note}"));
-                recon.push(note);
-            }
-            Err(e) => {
-                let note = format!("{method} {path} → 传输错误: {e}");
-                emit_log(&format!("AIRPLAY 侦察: {note}"));
-                recon.push(note);
-            }
-        }
-    }
-    emit_log(&format!("AIRPLAY 侦察结论: {}", recon.join(" | ")));
+    // /info 只做能力读取；禁止用空 pair-setup/pair-verify 请求探测状态。
+    // 配对事务有状态且会注册身份，诊断不能污染当前连接。
     Err(format!("/info 三次尝试都被拒：{}", failures.join("；")))
 }
 

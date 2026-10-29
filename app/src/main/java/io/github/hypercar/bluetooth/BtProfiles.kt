@@ -105,12 +105,9 @@ object BtProfiles {
             if (profileName(id) !in before) continue
             proxy(context, id)?.let { disconnectProfile(it, device) }
         }
-        if (!awaitDisconnected(context, address, 1_500L)) {
-            // 配置级断开未生效（个别 ROM 限流）：设备级断开兜底（@hide，同样只要求
-            // BLUETOOTH_CONNECT）。车机侧看是「设备整体断开」，属预期。
-            runCatching { BluetoothDevice::class.java.getMethod("disconnect").invoke(device) }
-            awaitDisconnected(context, address, 500L)
-        }
+        // 只允许配置文件级操作，不能升级成 BluetoothDevice.disconnect()：
+        // 整个设备的断开可能连带影响系统配对及同设备的其它连接。
+        awaitDisconnected(context, address, 1_500L)
         return before
     }
 

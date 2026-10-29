@@ -37,7 +37,7 @@ object RemoteProfiles {
      * 规则：**`_schema` 低于本常量的远程条目，只能新增车型，不能覆盖内置档案**
      * ——这样"修内置档案"必须显式升 schema 才会生效，旧缓存不会把修复顶回去。
      */
-    const val SCHEMA = 2
+    const val SCHEMA = 3
 
     /** 档案列表地址（raw.githubusercontent.com，改 `main` 为其它分支即可灰度）。 */
     const val DEFAULT_URL =
@@ -187,6 +187,7 @@ object RemoteProfiles {
             replyPowerUpdates = o.optBoolean("replyPowerUpdates", defaults.replyPowerUpdates),
             dropProfilesBeforeIap2 =
                 o.optBoolean("dropProfilesBeforeIap2", defaults.dropProfilesBeforeIap2),
+            allowOutboundIap2 = o.optBoolean("allowOutboundIap2", defaults.allowOutboundIap2),
             abortWhenCarPlayWindowClosed =
                 o.optBoolean("abortWhenCarPlayWindowClosed", defaults.abortWhenCarPlayWindowClosed),
             preferMdnsAirplay = o.optBoolean("preferMdnsAirplay", defaults.preferMdnsAirplay),
@@ -219,6 +220,7 @@ object RemoteProfiles {
                     put("sendTransportIdentifier", p.sendTransportIdentifier)
                     put("replyPowerUpdates", p.replyPowerUpdates)
                     put("dropProfilesBeforeIap2", p.dropProfilesBeforeIap2)
+                    put("allowOutboundIap2", p.allowOutboundIap2)
                     put("abortWhenCarPlayWindowClosed", p.abortWhenCarPlayWindowClosed)
                     put("preferMdnsAirplay", p.preferMdnsAirplay)
                     put("fallbackAirplayPorts", JSONArray(p.fallbackAirplayPorts))
