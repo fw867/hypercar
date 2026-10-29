@@ -501,6 +501,8 @@ class Iap2Bluetooth(
         sessionStarts.incrementAndGet()
         sessionProductive = false
         currentSocket.set(socket)
+        // 记住本轮对端车机（ACL 广播可能没收到，记录「已配对车机」要靠它拿 MAC）
+        runCatching { Iap2Peer.remember(safeAddress(socket.remoteDevice), safeName(socket.remoteDevice)) }
         val channel = RfcommLinkChannel(socket, log)
         activeChannel.set(channel)
         val session =

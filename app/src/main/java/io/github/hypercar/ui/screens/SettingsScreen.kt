@@ -707,14 +707,36 @@ private fun TargetCarSection() {
                     if (bonded.isNotEmpty()) {
                         HorizontalDivider(color = StrokeGlass)
                         bonded.forEach { (name, mac) ->
+                            val pairedAt = SettingsStore.pairedCarAt(mac)
+                            val paired = pairedAt != null
                             DropdownMenuItem(
                                 text = {
                                     Column {
-                                        Text(
-                                            text = name,
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            color = if (targetName == name) ElectricCyan else TextPrimary,
-                                        )
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Text(
+                                                text = name,
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                color = if (targetName == name) ElectricCyan else TextPrimary,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                modifier = Modifier.weight(1f, fill = false),
+                                            )
+                                            if (paired) {
+                                                Spacer(modifier = Modifier.width(6.dp))
+                                                Text(
+                                                    text = "已配对 · " + agoText(pairedAt!!),
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = ElectricCyan,
+                                                    maxLines = 1,
+                                                    modifier = Modifier
+                                                        .background(
+                                                            ElectricCyan.copy(alpha = 0.14f),
+                                                            RoundedCornerShape(6.dp),
+                                                        )
+                                                        .padding(horizontal = 6.dp, vertical = 1.dp),
+                                                )
+                                            }
+                                        }
                                         Text(
                                             text = mac,
                                             style = MaterialTheme.typography.labelSmall,
@@ -749,6 +771,49 @@ private fun TargetCarSection() {
         }
     }
 
+    // ---- 重置配对身份（车机端/手机端删过连接、两边状态对不上时用） ----
+    var resetConfirm by remember { mutableStateOf(false) }
+    GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp)) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .clickable { resetConfirm = true }
+                .padding(vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "重置配对身份",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = AmberWarning,
+                )
+                Text(
+                    text = "清掉本机的 AirPlay 身份 / 配对标记 / 端点记忆 / MFi 记忆。" +
+                        "车机端或手机端删过连接后两边对不上时用它（需先断开连接）。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary,
+                )
+            }
+            Text("›", style = MaterialTheme.typography.titleLarge, color = AmberWarning)
+        }
+    }
+    if (resetConfirm) {
+        ResetPairingDialog(
+            onDismiss = { resetConfirm = false },
+            onConfirm = {
+                resetConfirm = false
+                val result = HyperCarRepo.resetPairingIdentity()
+                android.widget.Toast.makeText(
+                    context,
+                    result,
+                    android.widget.Toast.LENGTH_LONG,
+                ).show()
+                io.github.hypercar.settings.SettingsRevision.bump()
+            },
+        )
+    }
+
     if (dialogVisible) {
         TargetCarDialog(
             initialMac = SettingsStore.targetCarMac.orEmpty(),
@@ -765,6 +830,80 @@ private fun TargetCarSection() {
                 dialogVisible = false
             },
         )
+    }
+}
+
+/** 「重置配对身份」确认弹窗：写清会删什么、以及车机端也要删。 */
+@Composable
+private fun ResetPairingDialog(
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(
+            usePlatformDefaultWidth = false,
+            decorFitsSystemWindows = false,
+        ),
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color(0xB302040A))
+                .pointerInput(Unit) { detectTapGestures { onDismiss() } }
+                .padding(20.dp)
+                .navigationBarsPadding(),
+            contentAlignment = Alignment.Center,
+        ) {
+            GlassPanel(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .pointerInput(Unit) { detectTapGestures { } },
+                contentPadding = PaddingValues(20.dp),
+            ) {
+                Text(
+                    text = "重置配对身份",
+                    style = MaterialTheme.typography.titleLarge,
+                    color = TextPrimary,
+                )
+                Text(
+                    text = "会清除本机的：\n" +
+                        "· AirPlay 长期身份（下次连接重新生成，车机会当成新设备）\n" +
+                        "· 每台接收端的「已配对」标记\n" +
+                        "· 设置里的身份备份、上次成功的 AirPlay 端点\n" +
+                        "· MFi 挑战长度记忆\n\n" +
+                        "不受影响：分辨率、车机型号、目标车机、上车自动连接等设置。\n\n" +
+                        "⚠ 车机端也要把本机删除后重新配对，否则车机上会留下同名的旧记录。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+                Spacer(modifier = Modifier.height(20.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Spacer(modifier = Modifier.weight(1f))
+                    CapsuleButton(
+                        text = "取消",
+                        onClick = onDismiss,
+                        modifier = Modifier.height(44.dp),
+                        filled = false,
+                        contentColor = TextSecondary,
+                        borderColor = StrokeGlass,
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    CapsuleButton(
+                        text = "确认重置",
+                        onClick = onConfirm,
+                        modifier = Modifier.height(44.dp),
+                        filled = true,
+                        contentColor = Color(0xFF12060A),
+                        borderColor = AmberWarning,
+                    )
+                }
+            }
+        }
     }
 }
 

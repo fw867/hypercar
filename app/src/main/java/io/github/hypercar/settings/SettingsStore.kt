@@ -1,4 +1,4 @@
-package io.github.hypercar.settings
+﻿package io.github.hypercar.settings
 
 import android.content.Context
 import android.content.SharedPreferences
@@ -43,6 +43,7 @@ object SettingsStore {
     private const val KEY_DEGRADED_FIRST_CONNECT = "degraded_first_connect_done"
     private const val KEY_LAST_AIRPLAY_ENDPOINT = "last_airplay_endpoint"
     private const val KEY_PAIRING_IDENTITY = "pairing_identity"
+    private const val KEY_PAIRED_CARS = "paired_cars"
 
     /** MAC 格式（字段写入前先大写归一，再按此校验；不合法直接存 null）。 */
     private val MAC_PATTERN = Regex("([0-9A-F]{2}:){5}[0-9A-F]{2}")
@@ -109,6 +110,46 @@ object SettingsStore {
         get() = p().getString(KEY_PAIRING_IDENTITY, "") ?: ""
         set(v) = p().edit().putString(KEY_PAIRING_IDENTITY, v).apply()
 
+    /**
+     * 成功配对过（AirPlay 会话曾经激活）的车机记录，元素格式 `MAC|名称|时间戳`。
+     *
+     * 用途：设置页「目标车机」的已配对设备列表里给这些车机打「已配对」标记——
+     * 蓝牙已配对 ≠ CarPlay 配对成功过（后者才需要本机保存的 AirPlay 身份）。
+     * 由 [markCarPaired] 在会话进入 connected 时写入，最多保留 12 条。
+     */
+    var pairedCars: Set<String>
+        get() = p().getStringSet(KEY_PAIRED_CARS, emptySet())?.toSet().orEmpty()
+        private set(v) = p().edit().putStringSet(KEY_PAIRED_CARS, v).apply()
+
+    /** 记录一台"配对成功过"的车机（同 MAC 覆盖，保留最近 12 台）。 */
+    fun markCarPaired(mac: String, name: String) {
+        val m = mac.trim().uppercase()
+        if (m.isEmpty() || !m.contains(':')) return
+        val safeName = name.replace('|', '/').ifBlank { "车机" }.take(48)
+        val now = System.currentTimeMillis()
+        val kept = pairedCars.filterNot { it.substringBefore('|').equals(m, ignoreCase = true) }
+        pairedCars = (kept + "$m|$safeName|$now")
+            .sortedByDescending { it.substringAfterLast('|').toLongOrNull() ?: 0L }
+            .take(12)
+            .toSet()
+    }
+
+    /** 这台车机是否曾经配对成功过。 */
+    fun isCarPaired(mac: String): Boolean {
+        val m = mac.trim()
+        if (m.isEmpty()) return false
+        return pairedCars.any { it.substringBefore('|').equals(m, ignoreCase = true) }
+    }
+
+    /** 记录的配对时间（毫秒；没有记录返回 null）。 */
+    fun pairedCarAt(mac: String): Long? {
+        val m = mac.trim()
+        val hit = pairedCars.firstOrNull { it.substringBefore('|').equals(m, ignoreCase = true) } ?: return null
+        return hit.substringAfterLast('|').toLongOrNull()
+    }
+
+    /** 清空「已配对」记录（重置配对身份时调用）。 */
+    fun clearPairedCars() = p().edit().remove(KEY_PAIRED_CARS).apply()
     /** 屏幕推送分辨率**兜底值**（车机 `/info` 没回报尺寸时才用）。 */
     var videoWidth: Int
         get() = p().getInt(KEY_WIDTH, 2560)

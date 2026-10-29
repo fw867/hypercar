@@ -1,4 +1,4 @@
-package io.github.hypercar.iap2
+﻿package io.github.hypercar.iap2
 
 import android.content.Context
 
@@ -155,6 +155,21 @@ object MfiLengthMemory {
 
     private val memory = HashMap<String, Entry>()
 
+    /**
+     * 清空所有车机的记忆（「重置配对身份」用：换新配对后长度偏好可能变，留着反而多绕一次）。
+     * @return 是否真的清掉了东西
+     */
+    fun clearAll(context: Context?): Boolean {
+        val hadMemory = synchronized(memory) {
+            val nonEmpty = memory.isNotEmpty()
+            memory.clear()
+            nonEmpty
+        }
+        val prefs = prefs(context) ?: return hadMemory
+        val hadPrefs = prefs.all.isNotEmpty()
+        prefs.edit().clear().apply()
+        return hadMemory || hadPrefs
+    }
     private fun prefs(context: Context?): android.content.SharedPreferences? = context?.getSharedPreferences(FILE, Context.MODE_PRIVATE)
 
     private fun update(

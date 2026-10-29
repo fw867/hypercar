@@ -340,6 +340,42 @@ object HyperCarRepo {
         connectJob = scope.launch { runConnect(context.applicationContext) }
     }
 
+    /**
+     * 重置配对身份（设置页「重置配对身份」按钮）。
+     *
+     * 连接进行中不允许重置：身份文件在引擎启动时已被读进 Rust，删了也不会立刻生效，
+     * 反而会让"这次连接用的旧身份、下次用新身份"造成两边状态错位。
+     *
+     * @return 给用户看的摘要（成功或拒绝原因）。
+     */
+    fun resetPairingIdentity(): String {
+        if (sessionLive.get() || connecting || streaming) {
+            log("PAIR-RESET: 拒绝——当前会话还在（先点「断开连接」再重置）")
+            return "请先断开连接，再重置配对身份"
+        }
+        val ctx = appContext() ?: return "应用上下文未就绪，稍后再试"
+        return PairingReset.run(ctx, ::log)
+    }
+
+    /** 诊断：把「已配对车机」记录打进日志（调试广播 `PROBE_PAIRED` 用）。 */
+    fun debugDumpPairedCars() {
+        val list = SettingsStore.pairedCars
+        if (list.isEmpty()) {
+            log("PAIRED-DUMP: 记录为空（还没有一次成功配对被记下来）")
+            return
+        }
+        log("PAIRED-DUMP: 共 ${list.size} 条")
+        val fmt = java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.US)
+        list
+            .sortedByDescending { it.substringAfterLast('|').toLongOrNull() ?: 0L }
+            .forEach { row ->
+                val mac = row.substringBefore('|')
+                val name = row.substringBeforeLast('|').substringAfter('|')
+                val at = row.substringAfterLast('|').toLongOrNull() ?: 0L
+                val bonded = bondedNameOf(mac) != null
+                log("PAIRED-DUMP: $mac | $name | ${fmt.format(java.util.Date(at))} | 蓝牙列表可见=$bonded")
+            }
+    }
     fun disconnect() {
         MusicBridge.onCarDisconnected()
         // 用户主动断开：不再自动重连
@@ -1230,6 +1266,14 @@ object HyperCarRepo {
      *  - 文件缺失 + 有备份 → 写回文件（**不会**重新生成，保住车机那边的配对）
      *  - 文件存在 → 更新备份（升级/换机后仍可恢复）
      */
+    /** 按 MAC 查已配对蓝牙设备的名称（缺 BLUETOOTH_CONNECT 时返回 null）。 */
+    @android.annotation.SuppressLint("MissingPermission")
+    private fun bondedNameOf(mac: String): String? = runCatching {
+        android.bluetooth.BluetoothAdapter.getDefaultAdapter()
+            ?.bondedDevices
+            ?.firstOrNull { it.address.equals(mac, ignoreCase = true) }
+            ?.name
+    }.getOrNull()
     private fun ensurePairingIdentity(context: Context, path: java.io.File) {
         runCatching {
             if (!path.exists()) {
@@ -1319,6 +1363,35 @@ object HyperCarRepo {
                     streaming = true
                     sessionHadLink = true
                     reconnectAttempts = 0
+                    // 配对成功过 → 记一笔（设置页「目标车机」列表给它打「已配对」标记）。
+                    // 蓝牙已配对 ≠ CarPlay 配对过：只有会话真正激活（RECORD 完成）才算。
+                    runCatching {
+                        // 车机 MAC 三个来源（ACL 广播可能没收到，用户手点「连接」时尤其常见）：
+                        //   ① ACL 回调记下的 aclCarMac；② 本轮 iAP2 socket 的对端；③ 设置里选定的目标
+                        val peer = io.github.hypercar.iap2.Iap2Peer.address
+                        val mac = aclCarMac ?: peer ?: SettingsStore.targetCarMac
+                        if (mac.isNullOrBlank()) {
+                            log(
+                                "PAIR: ⚠ 会话成功但拿不到车机 MAC（ACL / iAP2 对端 / 目标车机都为空）" +
+                                    "——本次不写「已配对」标记",
+                            )
+                        } else {
+                            val carName = bondedNameOf(mac)
+                                ?: io.github.hypercar.iap2.Iap2Peer.name
+                                ?: SettingsStore.targetCarName
+                                ?: "车机"
+                            SettingsStore.markCarPaired(mac, carName)
+                            val from = when {
+                                aclCarMac != null -> "ACL 广播"
+                                peer != null -> "iAP2 对端"
+                                else -> "目标车机设置"
+                            }
+                            log(
+                                "PAIR: 已记录配对车机 $carName（$mac，来源=$from）" +
+                                    "——「目标车机」列表会标「已配对」",
+                            )
+                        }
+                    }
                     push(
                         link = LinkState.Connected(
                             carName = SettingsStore.targetCarName ?: "BMW ID8.5",
