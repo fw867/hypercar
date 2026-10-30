@@ -1,43 +1,25 @@
-# HyperCar
+# HyperCar（存档分支 · 已停止维护）
 
-当前自绘车机 UI 方案：Android 手机通过 CarPlay / AirPlay 向车机投送高德地图和音乐卡片，支持设置、主题壁纸、更多音乐应用及保持连接返回车机系统。
+> ## ⚠️ 本分支仅作存档，已停止维护与开发
+>
+> 这里保存的是**早期「自绘车机 UI + CarPlay 投送」**方向的完整实现与文档（2026-10 前后）。
+> 该方向已**不再继续开发**：维护者现已转向 **CarLife 原生界面经 AirPlay 转发** 的方案，
+> 因为它不需要自绘、也不需要维护地图/音乐卡片等界面代码。
+>
+> **请使用 [`main` 分支](https://github.com/fw867/hypercar/tree/main) 获取当前版本。**
+> 本分支不会再接收修复、适配或发版；保留它只为查阅历史实现与踩坑记录。
 
-> **开发分支：[feat/carplay-only-ui](https://github.com/fw867/hypercar/tree/feat/carplay-only-ui)**。
-> 下方截图和新版功能对应此分支；`main` 仍保留较早的 CarLife 网关代码。
-> 编译、安装和当前功能说明请阅读 [开发分支 README](https://github.com/fw867/hypercar/blob/feat/carplay-only-ui/README.md)。
+相关历史文档：
 
-## 界面预览
+- [`docs/ARCHIVE-CARWITH-XIAMI.md`](docs/ARCHIVE-CARWITH-XIAMI.md) —— 小米 CarWith / 小米定制版 CarLife 路线（已放弃）的反编译结论与四道门
+- [`docs/IPHONE-HCI-CAPTURE.md`](docs/IPHONE-HCI-CAPTURE.md) —— iPhone HCI 抓包手册（本分支方向下整理）
 
-以下为 2026-10-29 从手机本地构建 0.1.0.377 的车机虚拟屏直接采集的截图，使用 WinPlay 联调。
-截图展示白天主题；实际布局会随接收端显示区域调整。首页地图区域已替换为隐私占位图，隐藏真实道路、地标和定位信息；音乐内容为截图时的状态。
-
-### 车机首页
-
-高德地图预览与音乐双卡片，左侧 Dock 提供地图、音乐和设置入口，左下角切换更多应用。
-
-![车机首页：地图位置已隐藏、专辑封面、播放进度与控制](docs/images/carui-home-redacted.png)
-
-### 车机设置
-
-支持导航自动巡航、默认音乐 App、连接自动播放，以及白天／暗夜／自动主题和三套壁纸。
-设置页可上下滚动，下方两张截图分别展示其上半部分和主题／壁纸区域。
-
-![车机设置：导航自动巡航、默认音乐与连接自动播放](docs/images/carui-settings.png)
-
-![车机设置：日夜主题与壁纸选择](docs/images/carui-settings-theme.png)
-
-### 更多应用
-
-自动显示手机已安装且受支持的音乐 App，点击图标切换播放器；“返回车机”固定放在最后，
-请求接收端切回原生系统界面并保持 CarPlay 连接。
-
-![更多应用：高德、设置、关于、已安装音乐 App 与返回车机](docs/images/carui-apps.png)
 
 ## 当前 UI 文档
 
-- [功能、环境要求与本地构建](https://github.com/fw867/hypercar/blob/feat/carplay-only-ui/README.md)
-- [界面、设置、持续导航与音频投送](https://github.com/fw867/hypercar/blob/feat/carplay-only-ui/docs/CARUI-REDESIGN.md)
-- [分辨率兜底、帧率与推流检查](https://github.com/fw867/hypercar/blob/feat/carplay-only-ui/docs/VIDEO-STREAM-REVIEW.md)
+- [功能、环境要求与本地构建](https://github.com/fw867/hypercar/blob/carplay-to-carlife/README.md)
+- [界面、设置、持续导航与音频投送](https://github.com/fw867/hypercar/blob/carplay-to-carlife/docs/CARUI-REDESIGN.md)
+- [分辨率兜底、帧率与推流检查](https://github.com/fw867/hypercar/blob/carplay-to-carlife/docs/VIDEO-STREAM-REVIEW.md)
 
 ## 早期 CarLife 网关实现记录
 
