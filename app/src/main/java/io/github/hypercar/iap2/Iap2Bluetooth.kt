@@ -147,6 +147,12 @@ class Iap2Bluetooth(
     /** 「无 iAP2 服务→跳过」日志去重（每地址一次即可，重复轮询不刷屏）。 */
     private val skippedNoService: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet())
 
+    @Volatile private var wifiHandoff = false
+    fun setWifiHandoff(active: Boolean) {
+        wifiHandoff = active
+        if (active) dropCurrentSession()
+    }
+
     val isRunning: Boolean get() = running
 
     /** 当前是否有会话在跑（上层诊断用）。 */
@@ -262,6 +268,7 @@ class Iap2Bluetooth(
                 runCatching { socket.close() }
                 return
             }
+            if (wifiHandoff) { runCatching { socket.close() }; continue }
             val peerAddress = safeAddress(socket.remoteDevice)
             // 指定了目标车机时拒绝其它设备的连入（多台车机场景：非目标的控制器
             // 也会周期回连，放行会抢占/误建会话）。地址比对，大小写不敏感。
@@ -307,7 +314,7 @@ class Iap2Bluetooth(
         var inboundGraceDone = false
         while (running && generation.get() == myGeneration) {
             // 会话期间静默：两条 RFCOMM 会互相踩（见 sessionActive 注释）
-            if (sessionActive.get()) {
+            if (wifiHandoff || sessionActive.get()) {
                 sleepQuietly(2_000)
                 continue
             }
@@ -546,6 +553,7 @@ class Iap2Bluetooth(
                 log = sessionLog,
                 bluetoothMac = bluetoothMacProvider(),
                 deviceName = "iPhone",
+                onIdentification = { Iap2Peer.rememberIdentification(safeAddress(socket.remoteDevice), it) },
                 // 端点回调顺手标记「本轮已拿到凭据」：acceptLoop 用它决定是否允许
                 // 车机的新连入顶替本轮（空转轮次可顶替，有凭据的不许抢）
                 onEndpoint = { endpoint ->

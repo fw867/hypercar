@@ -78,6 +78,7 @@ class Iap2SenderSession(
         io.github.hypercar.headunit.HeadUnitProfiles.BMW_ID85,
     /** 单调时钟，可在时序回归测试中控制超时。 */
     private val nanoTime: () -> Long = System::nanoTime,
+    private val onIdentification: (String) -> Unit = {},
 ) {
     private val parser = Iap2Csm.Parser()
     private var phaseName = "IDLE"
@@ -228,6 +229,7 @@ class Iap2SenderSession(
         val identFrame = expect(Iap2MessageIds.IDENTIFICATION_INFORMATION, deadline)
         val ident = Iap2Messages.parseIdentification(identFrame.body)
         peerIdentification = ident
+        onIdentification(listOfNotNull(ident.name, ident.model, ident.manufacturer).joinToString(" "))
         logIdentification(ident, identFrame)
         logWirelessCarPlayProfile(ident)
         send(Iap2MessageIds.IDENTIFICATION_ACCEPTED)
@@ -674,6 +676,7 @@ class Iap2SenderSession(
     private fun handleReidentification(frame: Iap2Csm.Frame) {
         val ident = Iap2Messages.parseIdentification(frame.body)
         peerIdentification = ident
+        onIdentification(listOfNotNull(ident.name, ident.model, ident.manufacturer).joinToString(" "))
         log(
             "iap2 rx=0x1d01（重新识别）name=${ident.name} 发送清单=${ident.sendIds?.sorted()?.joinToString { "0x%04x".format(it) }} " +
                 "可收清单=${ident.receiveIds?.sorted()?.joinToString { "0x%04x".format(it) }}",

@@ -1043,7 +1043,7 @@ private fun ResolutionSection() {
         ) {
             Text(
                 text = "优先采用车机 /info 上报的像素尺寸；无法读取时才使用这里填写的显示区域尺寸。" +
-                    "按比例缩小到最长 1920 像素、约 110 万像素以内，默认 30 fps，可手动切换为 60 fps。" +
+                    "使用车机上报的原生尺寸，仅做偶数对齐，默认 60 fps，也可手动降低帧率。" +
                     "不拉伸画面；修改后下次连接生效。",
                 style = MaterialTheme.typography.bodySmall,
                 color = TextSecondary,

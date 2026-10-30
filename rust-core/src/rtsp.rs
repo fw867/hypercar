@@ -196,6 +196,13 @@ impl RtspChannel {
         write: OwnedWriteHalf,
         cipher: Option<ControlCipher>,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<RtspMessage>) {
+        Self::spawn_with_reply(read, write, cipher, None)
+    }
+
+    pub fn spawn_with_reply(
+        read: OwnedReadHalf, write: OwnedWriteHalf, cipher: Option<ControlCipher>,
+        reply: Option<CommandReply>,
+    ) -> (Arc<Self>, mpsc::UnboundedReceiver<RtspMessage>) {
         let write = Arc::new(tokio::sync::Mutex::new(write));
         let cipher = Arc::new(Mutex::new(cipher));
         let cseq = Arc::new(Mutex::new(0));
@@ -211,6 +218,7 @@ impl RtspChannel {
             pending.clone(),
             inbound_tx,
             trace_id,
+            reply,
         ));
 
         let this = Arc::new(Self {
@@ -362,6 +370,8 @@ impl Drop for RtspChannel {
     }
 }
 
+pub type CommandReply = Arc<dyn Fn(&RtspMessage) -> Option<Vec<u8>> + Send + Sync>;
+
 type SharedWrite = Arc<tokio::sync::Mutex<OwnedWriteHalf>>;
 type SharedCipher = Arc<Mutex<Option<ControlCipher>>>;
 type PendingMap = Arc<Mutex<HashMap<i32, oneshot::Sender<RtspMessage>>>>;
@@ -373,6 +383,7 @@ async fn reader_loop(
     pending: PendingMap,
     inbound_tx: mpsc::UnboundedSender<RtspMessage>,
     trace_id: u64,
+    reply: Option<CommandReply>,
 ) {
     let mut raw: Vec<u8> = Vec::with_capacity(8192);
     let mut plain: Vec<u8> = Vec::with_capacity(8192);
@@ -428,8 +439,9 @@ async fn reader_loop(
                 // 先立刻把车机触摸/命令投递给上层（零等待），再回 200 OK。
                 // 先写 TCP 会把触摸分发卡在 Wi-Fi 抖动/锁竞争上。
                 let cseq = msg.cseq();
+                let body = reply.as_ref().and_then(|f| f(&msg)).unwrap_or_default();
                 let _ = inbound_tx.send(msg);
-                respond_ok(&write, &cipher, cseq).await;
+                respond_ok(&write, &cipher, cseq, &body).await;
             }
         }
     }
@@ -437,17 +449,19 @@ async fn reader_loop(
     pending.lock().clear();
 }
 
-async fn respond_ok(write: &SharedWrite, cipher: &SharedCipher, cseq: Option<i32>) {
-    let head = match cseq {
-        Some(c) => format!("RTSP/1.0 200 OK\r\nContent-Length: 0\r\nCSeq: {c}\r\n\r\n"),
-        None => "RTSP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(),
-    };
+async fn respond_ok(write: &SharedWrite, cipher: &SharedCipher, cseq: Option<i32>, body: &[u8]) {
+    let mut head = format!("RTSP/1.0 200 OK\r\nContent-Length: {}\r\n", body.len());
+    if let Some(c) = cseq { head.push_str(&format!("CSeq: {c}\r\n")); }
+    if !body.is_empty() { head.push_str("Content-Type: application/x-apple-binary-plist\r\n"); }
+    head.push_str("\r\n");
+    let mut plaintext = head.into_bytes();
+    plaintext.extend_from_slice(body);
     let mut w = write.lock().await;
     let wire = {
         let mut guard = cipher.lock();
         match guard.as_mut() {
-            Some(c) => c.encrypt(head.as_bytes()),
-            None => head.into_bytes(),
+            Some(c) => c.encrypt(&plaintext),
+            None => plaintext,
         }
     };
     let _ = w.write_all(&wire).await;
@@ -457,6 +471,29 @@ async fn respond_ok(write: &SharedWrite, cipher: &SharedCipher, cseq: Option<i32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn command_response_contains_business_status_and_matching_cseq() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut car = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (phone, _) = listener.accept().await.unwrap();
+        let (r,w) = phone.into_split();
+        let body = crate::bplist::encode(&crate::bplist::Value::dict(vec![("status", crate::bplist::Value::int(0))]));
+        let expected = body.clone();
+        let (_channel, mut inbound) = RtspChannel::spawn_with_reply(r,w,None,Some(Arc::new(move |_| Some(body.clone()))));
+        car.write_all(b"POST /command RTSP/1.0\r\nCSeq: 19\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+        assert!(inbound.recv().await.is_some());
+        let mut buffer = Vec::new(); let mut chunk = [0;1024];
+        let response = loop {
+            let n = car.read(&mut chunk).await.unwrap(); assert!(n>0);
+            buffer.extend_from_slice(&chunk[..n]);
+            if let Some(message) = parse_rtsp_messages(&mut buffer).pop() { break message; }
+        };
+        assert_eq!(response.cseq(), Some(19));
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.body, expected);
+    }
 
     #[tokio::test]
     async fn cancelled_queued_write_does_not_consume_an_encryption_nonce() {

@@ -23,12 +23,16 @@ mod bplist;
 mod crypto;
 mod engine;
 mod iap2_nav;
+mod modes;
 mod pairing;
 mod rtsp;
 mod screen;
 mod srp6a;
 mod tlv8;
 mod timing;
+mod wifi_iap2;
+mod auth_setup;
+mod display_layout;
 
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;
@@ -152,9 +156,59 @@ pub(crate) fn emit_force_keyframe() {
     });
 }
 
+pub(crate) fn emit_iap2_start(id: u64, device: &str) {
+    call_listener("onIap2Start", |env, obj| {
+        let name = env.new_string(device)?;
+        env.call_method(obj, "onIap2Start", "(JLjava/lang/String;)V", &[(id as jlong).into(), (&name).into()]).map(|_| ())
+    });
+}
+
+pub(crate) fn emit_iap2_bytes(id: u64, bytes: &[u8]) {
+    call_listener("onIap2Bytes", |env, obj| {
+        let data = env.byte_array_from_slice(bytes)?;
+        env.call_method(obj, "onIap2Bytes", "(J[B)V", &[(id as jlong).into(), (&data).into()]).map(|_| ())
+    });
+}
+
+pub(crate) fn emit_iap2_stop(id: u64) {
+    call_listener("onIap2Stop", |env, obj| {
+        env.call_method(obj, "onIap2Stop", "(J)V", &[(id as jlong).into()]).map(|_| ())
+    });
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendIap2(
+    env: JNIEnv, _class: JClass, id: jlong, bytes: JByteArray,
+) -> jboolean {
+    if id <= 0 { return JNI_FALSE; }
+    match env.convert_byte_array(&bytes) {
+        Ok(data) => if wifi_iap2::send(id as u64, data) { JNI_TRUE } else { JNI_FALSE },
+        _ => JNI_FALSE,
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeMarkWifiIap2Ready(
+    _env: JNIEnv, _class: JClass, id: jlong, ready: jboolean,
+) { wifi_iap2::mark_ready(id as u64, ready != JNI_FALSE); }
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeCanKeepWifiSession(
+    _env: JNIEnv, _class: JClass,
+) -> jboolean { if wifi_iap2::can_keep_session() { JNI_TRUE } else { JNI_FALSE } }
+
 pub(crate) fn emit_display_size(width: u32, height: u32) {
     call_listener("onDisplaySize", |env, obj| {
         env.call_method(obj, "onDisplaySize", "(II)V", &[(width as jint).into(), (height as jint).into()]).map(|_| ())
+    });
+}
+
+pub(crate) fn emit_display_layout(width: u32, height: u32, layout: &display_layout::Layout) {
+    let v=layout.view; let s=layout.safe;
+    call_listener("onDisplayLayout", |env,obj| {
+        env.call_method(obj,"onDisplayLayout","(IIIIIIIIIIZ)V", &[
+            (width as jint).into(),(height as jint).into(),v.x.into(),v.y.into(),v.w.into(),v.h.into(),
+            s.x.into(),s.y.into(),s.w.into(),s.h.into(),(if layout.draw_outside { JNI_TRUE } else { JNI_FALSE }).into(),
+        ]).map(|_| ())
     });
 }
 

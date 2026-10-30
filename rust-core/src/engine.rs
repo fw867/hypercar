@@ -53,6 +53,8 @@ pub struct EngineConfig {
     pub enable_audio: bool,
     #[serde(default)]
     pub keep_alive_stats: bool,
+    #[serde(default)]
+    pub bmw_box_bootstrap: bool,
     pub identity_path: String,
     #[serde(default)]
     pub receiver_id: Option<String>,
@@ -166,6 +168,8 @@ pub async fn run_engine(
                                 s.set_size(w, h);
                             }
                             sender = Some(s);
+                            crate::emit_force_keyframe();
+                            emit_log("VIDEO: sender ready; request fresh SPS/PPS/IDR");
                         }
                         ready = None;
                     }
@@ -182,7 +186,8 @@ pub async fn run_engine(
                         }
                         Some(SourceEvent::VideoFrame { pts_us, data }) => {
                             if let Some(s) = sender.as_mut() {
-                                let len = data.len() as u64;
+                                let before_frames = s.frames_sent();
+                                let before_bytes = s.bytes_per_second();
                                 // 编码尺寸变化时先切画布，保证随后 send_config 标注正确。
                                 if let Some((w, h)) = encoder_size {
                                     if s.size() != (w, h) {
@@ -196,13 +201,14 @@ pub async fn run_engine(
                                 } else {
                                     pts_us
                                 };
-                                if s.send_video_annexb(&data, pts).await.is_err() {
+                                if let Err(error) = s.send_video_annexb(&data, pts).await {
+                                    emit_log(&format!("VIDEO: write failed: {error}"));
                                     emit_state("ended", "屏幕流写失败（车机侧断开）");
                                     return;
                                 }
                                 let mut st = stats.lock();
-                                st.frames += 1;
-                                st.bytes += len;
+                                st.frames += s.frames_sent() - before_frames;
+                                st.bytes += s.bytes_per_second() - before_bytes;
                             }
                             // 屏幕流未就绪：丢帧（AirPlay 会话可能晚于画面就绪）
                         }
@@ -212,7 +218,11 @@ pub async fn run_engine(
                     _ = tick.tick() => {
                         // 屏幕流 keepAlive 帧（明文、1s 节流；缺它 Audi MMI 3315 10.2s 拆轮）
                         if let Some(s) = sender.as_mut() {
-                            let _ = s.maybe_send_keep_alive().await;
+                            if let Err(error) = s.maybe_send_keep_alive().await {
+                                emit_log(&format!("VIDEO: keepAlive failed: {error}"));
+                                emit_state("ended", "屏幕保活写失败");
+                                return;
+                            }
                         }
                     }
                 }
@@ -376,6 +386,7 @@ pub async fn run_engine(
         receiver_previously_connected: cfg.receiver_previously_connected,
         enable_audio: cfg.enable_audio,
         keep_alive_stats: cfg.keep_alive_stats,
+        bmw_box_bootstrap: cfg.bmw_box_bootstrap,
         width: cfg.width,
         height: cfg.height,
         // 接收端 /info 报 0x0 时的触摸显示空间（PC 侧联调用 --touch-display 指定）
@@ -400,6 +411,7 @@ pub async fn run_engine(
         touch_tx,
         key_tx,
         stop.clone(),
+        screen_ready_tx,
     )
     .await?;
 
@@ -427,7 +439,6 @@ pub async fn run_engine(
     });
 
     // 屏幕/音频发送器交给泵
-    let _ = screen_ready_tx.send(outcome.screen);
     if let Some(audio) = outcome.audio {
         let _ = audio_out_tx.send(audio);
     }

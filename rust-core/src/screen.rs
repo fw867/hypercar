@@ -100,6 +100,9 @@ pub struct ScreenSender {
     logged_first_frame: bool,
     /** HEVC 告警只打印一次。 */
     logged_hevc: bool,
+    waiting_idr: bool,
+    last_sync_request: Option<tokio::time::Instant>,
+    ownership: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl ScreenSender {
@@ -131,6 +134,9 @@ impl ScreenSender {
             last_pps: None,
             logged_first_frame: false,
             logged_hevc: false,
+            waiting_idr: true,
+            last_sync_request: None,
+            ownership: None,
         }
     }
 
@@ -143,6 +149,8 @@ impl ScreenSender {
         (self.width as u32, self.height as u32)
     }
 
+    pub fn set_ownership(&mut self, owner: std::sync::Arc<std::sync::atomic::AtomicBool>) { self.ownership = Some(owner); }
+
     pub fn set_size(&mut self, width: u32, height: u32) {
         let w = (width / 2) * 2;
         let h = (height / 2) * 2;
@@ -154,6 +162,9 @@ impl ScreenSender {
                 "VIDEO: 画布 {}x{} → {w}x{h}（跟随手机实际编码分辨率）",
                 self.width as u32, self.height as u32
             ));
+            self.config_sent = false;
+            self.waiting_idr = true;
+            self.last_sync_request = None;
             self.width = w as f32;
             self.height = h as f32;
         }
@@ -176,6 +187,8 @@ impl ScreenSender {
         wire.extend_from_slice(avcc);
         self.w.write_all(&wire).await?;
         self.config_sent = true;
+        self.waiting_idr = true;
+        crate::emit_log(&format!("VIDEO: config written {}B {}x{} flags=0x04", avcc.len(), self.width, self.height));
         Ok(())
     }
 
@@ -186,6 +199,11 @@ impl ScreenSender {
     ///
     /// config 尚未发出时丢帧（对齐参考实现：车机没有 avcC 就无从解码）。
     pub async fn send_video_annexb(&mut self, annexb: &[u8], pts_us: u64) -> std::io::Result<()> {
+        if self.ownership.as_ref().map(|v| !v.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(false) {
+            self.waiting_idr = true;
+            self.last_sync_request = None;
+            return Ok(());
+        }
         let nals = annexb_nals(annexb);
         if nals.is_empty() {
             return Ok(());
@@ -228,7 +246,7 @@ impl ScreenSender {
         }
         if let (Some(s), Some(p)) = (sps, pps) {
             let changed = self.last_sps.as_deref() != Some(s) || self.last_pps.as_deref() != Some(p);
-            if changed {
+            if changed || !self.config_sent {
                 let avcc = build_avcc(s, p);
                 if !avcc.is_empty() {
                     self.last_sps = Some(s.to_vec());
@@ -237,8 +255,18 @@ impl ScreenSender {
                 }
             }
         }
-        if !self.config_sent {
-            return Ok(()); // config 未发（本帧也没带 SPS/PPS）：丢弃
+        let is_idr = nals.iter().any(|nal| nal_type(nal) == 5);
+        if !self.config_sent || (self.waiting_idr && !is_idr) {
+            if self.last_sync_request.map(|t| t.elapsed() >= Duration::from_secs(1)).unwrap_or(true) {
+                self.last_sync_request = Some(tokio::time::Instant::now());
+                crate::emit_force_keyframe();
+                crate::emit_log(&format!("VIDEO: awaiting config/IDR config={} idr={is_idr}; requested sync frame", self.config_sent));
+            }
+            return Ok(());
+        }
+        if self.waiting_idr {
+            crate::emit_log(&format!("VIDEO: first IDR ready pts={pts_us}us clock={}us", crate::timing::monotonic_nanos() / 1000));
+            self.waiting_idr = false;
         }
 
         // 打包「4 字节 BE 长度前缀 NAL 序列」（SPS/PPS 已经走 VideoConfig，不进帧体）
@@ -330,7 +358,11 @@ impl ScreenSender {
         let mut wire = Vec::with_capacity(HEADER_LEN + body.len());
         wire.extend_from_slice(&header);
         wire.extend_from_slice(&body);
-        self.w.write_all(&wire).await
+        self.w.write_all(&wire).await?;
+        if self.keep_alive_count == 1 || self.keep_alive_count % 10 == 0 {
+            crate::emit_log(&format!("VIDEO: keepAlive written opcode={opcode} body={}B count={} frames={}", body.len(), self.keep_alive_count, self.frames));
+        }
+        Ok(())
     }
 
     /// 已发送帧总数（对外统计，如英雄卡实时帧率取差值）。
@@ -434,6 +466,67 @@ pub fn build_avcc(sps: &[u8], pps: &[u8]) -> Vec<u8> {
     avcc.extend_from_slice(&(pps.len() as u16).to_be_bytes());
     avcc.extend_from_slice(pps);
     avcc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn fresh_stream_waits_for_config_and_idr_then_encrypts_with_actual_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let (_r, write) = client.into_split();
+        let mut sender = ScreenSender::new(write, ScreenCipher::ChaCha([7; 32]), 1920, 560, true);
+        sender.send_video_annexb(&[0, 0, 0, 1, 0x41, 9], 1000).await.unwrap();
+        assert_eq!(sender.frames_sent(), 0);
+        let access_unit = [0,0,0,1,0x67,0x42,0,0x1f, 0,0,0,1,0x68,1, 0,0,0,1,0x65,2];
+        sender.send_video_annexb(&access_unit, 2000).await.unwrap();
+        let mut header = [0u8; 128];
+        peer.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[4], OP_CONFIG);
+        assert_eq!(header[6], SCREEN_FLAG_ENCRYPTED);
+        assert_eq!(f32::from_le_bytes(header[20..24].try_into().unwrap()), 560.0);
+        let mut config = vec![0; u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize];
+        peer.read_exact(&mut config).await.unwrap();
+        assert_eq!(config, build_avcc(&[0x67,0x42,0,0x1f], &[0x68,1]));
+        peer.read_exact(&mut header).await.unwrap();
+        let mut cipher = vec![0; u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize];
+        peer.read_exact(&mut cipher).await.unwrap();
+        let plain = crate::crypto::chacha_open(&[7;32], &nonce64(0), &cipher, &header).unwrap();
+        assert_eq!(plain, vec![0,0,0,2,0x65,2]);
+        assert_eq!(sender.frames_sent(), 1);
+        // Borrowing the screen pauses video, not its independent keepAlive.
+        let owned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        sender.set_ownership(owned.clone());
+        sender.send_video_annexb(&access_unit, 3000).await.unwrap();
+        assert_eq!(sender.frames_sent(), 1);
+        owned.store(true, std::sync::atomic::Ordering::Release);
+        sender.send_video_annexb(&[0,0,0,1,0x41,9], 4000).await.unwrap();
+        assert_eq!(sender.frames_sent(), 1);
+        sender.send_video_annexb(&access_unit, 5000).await.unwrap();
+        assert_eq!(sender.frames_sent(), 2);
+    }
+
+    #[tokio::test]
+    async fn stats_keepalive_remains_plaintext_before_any_video() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let (_, write) = client.into_split();
+        let mut s = ScreenSender::new(write, ScreenCipher::ChaCha([7;32]), 1920, 560, true);
+        s.last_keep_alive = tokio::time::Instant::now() - Duration::from_secs(2);
+        s.maybe_send_keep_alive().await.unwrap();
+        let mut header = [0;128]; peer.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[4], OP_KEEP_ALIVE_WITH_BODY);
+        let n = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+        assert_eq!(f32::from_le_bytes(header[124..].try_into().unwrap()), n as f32);
+        let mut body = vec![0;n]; peer.read_exact(&mut body).await.unwrap();
+        assert!(crate::bplist::parse(&body).unwrap().get("encoderCurrentFPS").is_some());
+        assert_eq!(s.frame_counter, 0);
+    }
 }
 
 

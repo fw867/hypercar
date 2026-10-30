@@ -24,14 +24,11 @@ import io.github.hypercar.session.HyperCarRepo
 object MapHomeOverlay {
 
     private const val TAG = "HyperCar-Overlay"
-    private const val BUTTON_SIZE = 104
-    private const val RIGHT_MARGIN = 36
 
     /** HID hit box 跟随右侧按钮，避开导航列表/工具条。 */
     fun hitTest(x: Int, y: Int, displayWidth: Int, displayHeight: Int): Boolean {
-        val top = (displayHeight - BUTTON_SIZE) / 2
-        val left = displayWidth - BUTTON_SIZE - RIGHT_MARGIN
-        return x in left..(left + BUTTON_SIZE) && y in top..(top + BUTTON_SIZE)
+        val bounds = CarDisplayLayout.homeButtonBounds(displayWidth, displayHeight)
+        return x >= bounds.x && x < bounds.right && y >= bounds.y && y < bounds.bottom
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -120,18 +117,20 @@ object MapHomeOverlay {
                     onHome?.invoke()
                 }
             }
+            val metrics = displayContext.resources.displayMetrics
+            val bounds = CarDisplayLayout.homeButtonBounds(metrics.widthPixels, metrics.heightPixels)
             val layout = WindowManager.LayoutParams(
-                BUTTON_SIZE,
-                BUTTON_SIZE,
+                bounds.width,
+                bounds.height,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                     WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                 PixelFormat.TRANSLUCENT,
             ).apply {
-                gravity = Gravity.CENTER_VERTICAL or Gravity.END
-                x = RIGHT_MARGIN
-                y = 0
+                gravity = Gravity.TOP or Gravity.LEFT
+                x = bounds.x
+                y = bounds.y
             }
             manager.addView(button, layout)
             view = button

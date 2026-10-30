@@ -14,6 +14,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
@@ -42,18 +43,29 @@ fun CarHomeScreen() {
     // 以 1920x720@240dpi（Compose 1280x480dp）为设计基准；
     // 分辨率变化时整体按比例缩放，而不是让 Dock/卡片在高分屏上显得越来越小。
     BoxWithConstraints(Modifier.fillMaxSize()) {
+        val layout by CarDisplayLayout.state.collectAsStateWithLifecycle()
+        val canvasWidth = constraints.maxWidth
+        val canvasHeight = constraints.maxHeight
+        val full = DisplayRect(0, 0, canvasWidth, canvasHeight)
+        val safe = layout?.contentBounds(canvasWidth, canvasHeight) ?: full
+        val background = layout?.backgroundBounds(canvasWidth, canvasHeight) ?: full
         val base = LocalDensity.current
         val scale = minOf(maxWidth.value / 1280f, maxHeight.value / 480f).coerceIn(0.75f, 2.0f)
         CompositionLocalProvider(
             LocalDensity provides Density(base.density * scale, base.fontScale),
         ) {
-            CarHomeContent(isUltrawide = maxWidth > maxHeight * 2.7f)
+            CarHomeContent(isUltrawide = safe.width > safe.height * 2.7f, safe = safe, background = background)
         }
     }
 }
 
 @Composable
-private fun CarHomeContent(isUltrawide: Boolean) {
+private fun CarHomeContent(isUltrawide: Boolean, safe: DisplayRect, background: DisplayRect) {
+    val density = LocalDensity.current
+    fun bounds(rect: DisplayRect): Modifier = with(density) {
+        Modifier.absoluteOffset(rect.x.toDp(), rect.y.toDp())
+            .requiredSize(rect.width.toDp(), rect.height.toDp()).clipToBounds()
+    }
     val music by MusicBridge.state.collectAsStateWithLifecycle()
     var time by remember { mutableStateOf(LocalTime.now()) }
     var apps by remember { mutableStateOf(false) }
@@ -93,7 +105,8 @@ private fun CarHomeContent(isUltrawide: Boolean) {
     val pulse by rememberInfiniteTransition(label = "homeFrames").animateFloat(
         0.3f, 1f, infiniteRepeatable(tween(1200), RepeatMode.Reverse), label = "frame",
     )
-    Box(Modifier.fillMaxSize().background(CarBg)) {
+    Box(Modifier.fillMaxSize().background(Color.Black)) {
+      Box(bounds(background).background(CarBg)) {
         wallpaper?.let {
             Image(it.asImageBitmap(), "壁纸", Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
         }
@@ -103,6 +116,8 @@ private fun CarHomeContent(isUltrawide: Boolean) {
         Canvas(Modifier.fillMaxSize()) {
             drawCircle(Color(0x01000000), pulse, Offset.Zero)
         }
+      }
+      Box(bounds(safe)) {
         Row(Modifier.fillMaxSize().padding(end = 22.dp, top = 22.dp, bottom = 22.dp)) {
             Column(Modifier.width(120.dp).fillMaxHeight(), horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(time.format(DateTimeFormatter.ofPattern("HH:mm")), color = CarInk,
@@ -167,6 +182,7 @@ private fun CarHomeContent(isUltrawide: Boolean) {
             Icon(if (onHome) Icons.Rounded.Apps else Icons.Rounded.Home,
                 if (onHome) "更多应用" else "返回首页", tint = CarInk, modifier = Modifier.size(48.dp))
         }
+      }
     }
 }
 

@@ -8,6 +8,7 @@ description = "HyperCar 核心层：本机自绘画面 → AirPlay 推流（宝�
 crate-type = ["cdylib"]
 
 [dependencies]
+libc = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 bytes = "1"
 jni = "0.21"

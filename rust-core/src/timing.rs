@@ -14,12 +14,22 @@ use tokio::net::UdpSocket;
 
 use once_cell::sync::Lazy;
 
-/// 进程级单调时间基：timesync 应答与音频同步包**必须共用同一原点**，
+/// 非 Android 测试环境的时间基。Android 直接使用 CLOCK_MONOTONIC。
+/// timesync、音频同步包和视频 PTS **必须共用同一原点**，
 /// 否则车机算出的媒体时钟锚点会带一个常量偏移（音画不同步）。
 static PROCESS_START: Lazy<std::time::Instant> = Lazy::new(std::time::Instant::now);
 
-/// 进程启动以来的纳秒数（timesync / 音频同步包共用时间基）。
+/// Android 与 Java System.nanoTime/MediaCodec PTS 同源的单调纳秒数。
 pub fn monotonic_nanos() -> u64 {
+    #[cfg(target_os = "android")]
+    {
+        // MediaCodec Surface PTS and Java System.nanoTime use CLOCK_MONOTONIC.
+        // A process-relative Instant here makes timing/audio disagree with video by device uptime.
+        let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } == 0 {
+            return (time.tv_sec as u64).saturating_mul(1_000_000_000) + time.tv_nsec as u64;
+        }
+    }
     PROCESS_START.elapsed().as_nanos() as u64
 }
 
@@ -111,7 +121,7 @@ impl TimingServer {
                     Ok(v) => v,
                     Err(_) => break, // socket 关闭/致命错误：退出循环
                 };
-                // 进程级时间基（与音频同步包同源，见 monotonic_nanos）
+                // 与音频/视频共用时间基（见 monotonic_nanos）
                 let now_nanos = monotonic_nanos();
                 // 非 timesync 报文静默丢弃（Kotlin 侧只计数不回包）
                 if let Some(response) = build_timesync_response(&buf[..len], now_nanos) {
@@ -127,4 +137,8 @@ impl TimingServer {
     pub fn stop(&mut self) {
         self.task.abort();
     }
+}
+
+impl Drop for TimingServer {
+    fn drop(&mut self) { self.task.abort(); }
 }

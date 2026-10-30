@@ -22,15 +22,30 @@ object Iap2Peer {
     var at: Long = 0L
         private set
 
+    private var softwareIdentity: String? = null
+
+    @Synchronized
+    fun rememberIdentification(address: String?, identity: String) {
+        if (address != null && address.equals(this.address, ignoreCase = true)) softwareIdentity = identity
+    }
+
+    @Synchronized
+    fun softwareIdentityFor(address: String?): String? =
+        if (address != null && address.equals(this.address, ignoreCase = true)) softwareIdentity else null
+
+    @Synchronized
     fun remember(address: String?, name: String?) {
         val mac = address?.trim().orEmpty()
         if (mac.isEmpty()) return
+        softwareIdentity = null
         this.address = mac
         this.name = name?.takeIf { it.isNotBlank() }
         at = System.currentTimeMillis()
     }
 
+    @Synchronized
     fun clear() {
+        softwareIdentity = null
         address = null
         name = null
         at = 0L

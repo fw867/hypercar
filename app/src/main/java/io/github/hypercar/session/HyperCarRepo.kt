@@ -276,6 +276,14 @@ object HyperCarRepo {
                         connectAutomatically(app)
                     }
                 } else {
+                    // BMW retires Bluetooth after Wi-Fi takes over. Only keep a live, authenticated
+                    // Wi-Fi iAP2 session with a recent successful RTSP feedback response.
+                    if (sessionLive.get() && RustCoreBridge.nativeCanKeepWifiSession()) {
+                        iap2?.retireForWifi()
+                        log("HANDOFF: 蓝牙 ACL 已退场，Wi-Fi iAP2 就绪且控制保活正常，继续 CarPlay")
+                        logAclEvent(device, connected)
+                        return@handler
+                    }
                     // 真正离开车机后允许下一轮 ACL 自动连接；服务停止不回灌 ACL 事件。
                     userDisconnectRequested = false
                     runCatching { device.address }.getOrNull()?.let { address ->
@@ -1457,6 +1465,7 @@ object HyperCarRepo {
             when (state) {
                 "negotiating" -> {
                     SettingsStore.receiverViewport = null
+                    io.github.hypercar.carui.CarDisplayLayout.state.value = null
                     push(link = LinkState.Negotiating(detail))
                 }
                 "connected" -> {
@@ -1523,8 +1532,21 @@ object HyperCarRepo {
 
         override fun onLog(line: String) = log(line)
 
+        override fun onForceKeyFrame() {
+            io.github.hypercar.carui.CarUiCaster.requestKeyFrame()
+        }
+
         override fun onDisplaySize(width: Int, height: Int) {
             SettingsStore.receiverViewport = (width to height).takeIf { width >= 320 && height >= 240 }
+        }
+
+        override fun onDisplayLayout(width: Int, height: Int, viewX: Int, viewY: Int, viewWidth: Int, viewHeight: Int,
+                                     safeX: Int, safeY: Int, safeWidth: Int, safeHeight: Int, drawOutside: Boolean) {
+            io.github.hypercar.carui.CarDisplayLayout.state.value = io.github.hypercar.carui.DisplayLayout(
+                width, height,
+                io.github.hypercar.carui.DisplayRect(viewX, viewY, viewWidth, viewHeight),
+                io.github.hypercar.carui.DisplayRect(safeX, safeY, safeWidth, safeHeight), drawOutside,
+            )
         }
 
         override fun onNightMode(night: Boolean) {

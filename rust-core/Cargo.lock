@@ -356,6 +356,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "jni",
+ "libc",
  "log",
  "num-bigint",
  "num-traits",

@@ -36,6 +36,8 @@ class Iap2LinkEngine(
     private val maxOutgoing: Int = 4,
     private val retransmissionTimeoutMillis: Long = 4_000L,
     private val maxRetransmissions: Int = 4,
+    private val reliableTransport: Boolean = false,
+    private val declaredWindow: Int = PHONE_DECLARED_MAX_OUTGOING,
 ) {
     enum class State { IDLE, NEGOTIATING, NORMAL, DEAD }
 
@@ -176,13 +178,19 @@ class Iap2LinkEngine(
 
     /** 最近一次出向帧时刻（NORMAL 态裸 ACK 保活的基准）。 */
     private var lastOutputMillis: Long = 0
+    private var passiveNegotiation = false
 
     val isDead: Boolean get() = state == State.DEAD
 
     /** 进入协商：发 marker + 同步包（发送端=发起方）。 */
-    fun start(nowMillis: Long) {
+    fun start(nowMillis: Long, passive: Boolean = false) {
         if (state != State.IDLE) return
         state = State.NEGOTIATING
+        if (passive) {
+            passiveNegotiation = true
+            lastOutputMillis = nowMillis
+            return // Reliable Wi-Fi peer initiates SYN; never open a competing negotiation.
+        }
         appendOutput(MARKER)
         markerDeadline = nowMillis + MARKER_RESEND_MILLIS
         sendSynchronization()
@@ -292,6 +300,15 @@ class Iap2LinkEngine(
         while (receive.size >= 2 &&
             !(receive[0] == 0xFF.toByte() && receive[1] == 0x5A.toByte())
         ) {
+            if (passiveNegotiation && state == State.NEGOTIATING && peerSynchronization == null &&
+                receive[0] == 0xFF.toByte() && receive[1] == 0x55.toByte()) {
+                if (receive.size < MARKER.size) return false
+                if (receive.peek(MARKER.size).contentEquals(MARKER)) {
+                    receive.discard(MARKER.size)
+                    appendOutput(MARKER)
+                    return true
+                }
+            }
             receive.discard(1)
         }
         if (receive.size < HEADER_BYTES) return false
@@ -436,8 +453,8 @@ class Iap2LinkEngine(
      * 0x7F）。maxLength 保持对端值（=我们的收包上限，勿放大）。
      */
     private fun ownSyncOf(peer: SynchronizationPayload): SynchronizationPayload =
-        peer.copy(maxOutgoing = PHONE_DECLARED_MAX_OUTGOING).also {
-            declaredMaxOutgoing = PHONE_DECLARED_MAX_OUTGOING
+        peer.copy(maxOutgoing = declaredWindow).also {
+            declaredMaxOutgoing = declaredWindow
         }
 
     private fun handleAcknowledgement(
@@ -547,6 +564,7 @@ class Iap2LinkEngine(
 
     /** NORMAL 态保活截止时刻：对端声明的 ackTimeout（无对端值/未进 NORMAL 时为 null）。 */
     private fun keepAliveDeadlineMillis(): Long? {
+        if (reliableTransport) return null
         if (state != State.NORMAL) return null
         val interval = (peerSynchronization?.acknowledgementTimeoutMillis ?: DEFAULT_ACK_TIMEOUT_MILLIS).coerceIn(100, 10_000)
         return lastOutputMillis + interval

@@ -85,6 +85,7 @@ class Iap2Coordinator(
      * 可重复调用：已在运行时只更新回调，不重建蓝牙栈。
      */
     fun start(onEndpoint: (CarPlayEndpoint) -> Unit) {
+        bluetooth?.setWifiHandoff(false)
         endpointCallback = onEndpoint
         synchronized(this) {
             bluetooth?.let { existing ->
@@ -133,6 +134,8 @@ class Iap2Coordinator(
      * 车机蓝牙断开后旧 RFCOMM socket 的读会卡在半开连接上不返回——必须主动关，
      * 否则会话线程滞留、下一轮「秒连」被旧会话占位。
      */
+    fun retireForWifi() { bluetooth?.setWifiHandoff(true) }
+
     fun endCurrentSession() { bluetooth?.dropCurrentSession() }
 
     fun notifyBluetoothLost() {

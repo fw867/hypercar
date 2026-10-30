@@ -4,7 +4,7 @@
 //!  1. 配对前 /info best-effort 读取身份；pair-setup / pair-verify 建立加密控制通道。
 //!  2. 会话 SETUP /setup → 会话内 /info（真实显示 UUID / 能力）。
 //!  3. 连接事件通道，启动 UDP keepAlive（首发立即、后续 5s）及 /feedback（1s）。
-//!  4. modesChanged 声明资源 → 屏幕流 SETUP / → 连接数据口 → 无请求体 RECORD /。
+//!  4. RECORD 激活 → modesChanged 声明资源 → 屏幕流 SETUP / → 连接数据口。
 //!  5. 激活后协商音频；视频 pump 维持独立的屏幕流 keepAlive（1s）。
 //!  6. 事件通道 hidSendReport → 触摸坐标换算 → 本机自绘界面。
 
@@ -42,6 +42,7 @@ pub struct AirplayParams {
     pub receiver_previously_connected: bool,
     pub enable_audio: bool,
     pub keep_alive_stats: bool,
+    pub bmw_box_bootstrap: bool,
     /// 设置里的编码分辨率（仅作 `/info` 无显示器信息时的兜底）。
     pub width: u32,
     pub height: u32,
@@ -70,7 +71,6 @@ pub struct TouchInput {
 }
 
 pub struct AirplayOutcome {
-    pub screen: ScreenSender,
     pub control: Arc<RtspChannel>,
     pub audio: Option<AudioOut>,
     pub keep_alive_stats: bool,
@@ -86,6 +86,7 @@ pub async fn negotiate(
     touch_tx: mpsc::UnboundedSender<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
     stop: Arc<Notify>,
+    screen_ready: tokio::sync::oneshot::Sender<ScreenSender>,
 ) -> Result<AirplayOutcome, String> {
     let (mut channel, _control_inbound) = RtspChannel::spawn(read, write, None);
     emit_log(&format!("AIRPLAY: 控制连接 RTSP#{} 开始", channel.trace_id()));
@@ -238,12 +239,18 @@ pub async fn negotiate(
         }
     }
 
+    let mut box_bootstrap = use_box_bootstrap(p.bmw_box_bootstrap, &info);
+    if box_bootstrap { crate::auth_setup::run(&channel).await?; }
+
     // CatPlay bootstrap: 会话 SETUP → /info → 事件通道/保活 → 资源声明 → 屏幕流。
     let timing = TimingServer::start().map_err(|e| format!("计时服务启动失败: {e}"))?;
     let (root, session_info) = setup_and_read_info(
         &channel, &p.device_id, timing.port, shared_secret.is_some(), info,
     ).await?;
     info = session_info;
+    // SETUP may be the first point at which /info reveals the real receiver identity.
+    box_bootstrap = use_box_bootstrap(box_bootstrap, &info);
+    emit_log(&format!("AIRPLAY: effective BMW box bootstrap={box_bootstrap} requested={}", p.bmw_box_bootstrap));
     let event_port = port_of(root.get("eventPort"));
     let keep_alive_port = port_of(root.get("keepAlivePort"));
     emit_log(&format!(
@@ -273,6 +280,10 @@ pub async fn negotiate(
     // The receiver defines the viewport ratio, not the phone's encoding workload.
     // Kotlin chooses a proportional capped canvas and reports the actual size before its first frame.
     crate::emit_display_size(disp_w, disp_h);
+    if let Some(layout) = crate::display_layout::read(&info, disp_w, disp_h, display_uuid.as_deref()) {
+        emit_log(&format!("DISPLAY: canvas={disp_w}x{disp_h} view={:?} safe={:?} drawOutside={}", layout.view,layout.safe,layout.draw_outside));
+        crate::emit_display_layout(disp_w,disp_h,&layout);
+    }
 
     // ---- 5. 事件通道 ----
     if event_port == 0 {
@@ -282,7 +293,23 @@ pub async fn negotiate(
         .open_tcp(&p.car_ip, event_port, 5_000)
         .ok_or_else(|| format!("事件通道连接失败 {}:{event_port}", p.car_ip))?;
     let (ev_r, ev_w) = event_stream.into_split();
-    let (event_channel, event_rx) = RtspChannel::spawn(ev_r, ev_w, None);
+    let modes = Arc::new(Mutex::new(if box_bootstrap { crate::modes::Modes::box_initial() } else { crate::modes::Modes::initial() }));
+    let screen_owned = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let audio_owned = Arc::new(std::sync::atomic::AtomicBool::new(modes.lock().audio_owned()));
+    let reply_audio = audio_owned.clone();
+    let reply_modes = modes.clone();
+    let reply_owner = screen_owned.clone();
+    let (event_channel, event_rx) = RtspChannel::spawn_with_reply(ev_r, ev_w, None, Some(Arc::new(move |message| {
+        if !message.first_line.contains("/command") { return None; }
+        let command = bplist::parse(&message.body).ok()?;
+        let mut modes = reply_modes.lock();
+        if command.get("type").and_then(Value::as_str) == Some("requestUI") { modes.request_ui(); }
+        let response = modes.response(&command);
+        reply_owner.store(modes.screen_owned(), std::sync::atomic::Ordering::Release);
+        reply_audio.store(modes.audio_owned(), std::sync::atomic::Ordering::Release);
+        response
+    })));
+
     emit_log(&format!("AIRPLAY: 事件连接 RTSP#{} 建立，port={event_port}", event_channel.trace_id()));
     if let Some(shared) = &shared_secret {
         let (read_key, write_key) = derive_event_keys(shared);
@@ -299,8 +326,13 @@ pub async fn negotiate(
             stop_ev.notified().await;
         });
     }
+    let wifi_iap = crate::wifi_iap2::WifiIap2::start(channel.clone(), &p.device_id, stop.clone());
+    let wifi_iap_id = wifi_iap.id;
     spawn_event_dispatcher(
         event_rx,
+        channel.clone(),
+        wifi_iap_id,
+        modes.clone(),
         touch_tx,
         key_tx,
         // 触摸的「显示空间」分母，优先级：
@@ -325,11 +357,15 @@ pub async fn negotiate(
 
     // 激活等待与后续音频协商期间也必须保持会话存活。
     // 句柄由协商结果持有；协商失败/取消时 Drop 自动停止本轮任务。
-    let keepalive = spawn_keepalive_loops(
-        channel.clone(), factory.clone(), keep_alive_port, p.car_ip.clone(), stop.clone(),
+    let mut keepalive = spawn_keepalive_loops(
+        channel.clone(), factory.clone(), keep_alive_port, p.car_ip.clone(), stop.clone(), Some(wifi_iap_id),
     );
     emit_log("AIRPLAY: 事件通道已建立，UDP/feedback 保活已启动（RECORD 前）");
-    require_modes_changed(&channel).await?;
+    keepalive.1 = Some(wifi_iap);
+    keepalive.2 = Some(timing);
+    // BMW box activates the session before resource negotiation and video SETUP.
+    let declaration = modes.lock().declaration();
+    activate_session(&channel, &declaration).await?;
 
     // ---- 6. 屏幕流 SETUP ----
     let conn_id_screen = random_positive_i64();
@@ -384,27 +420,54 @@ pub async fn negotiate(
         "AIRPLAY: ✓ 主屏流就绪 dataPort={data_port} connId={conn_id_screen} {enc_w}x{enc_h}"
     ));
     let mut screen = screen;
+    screen.set_ownership(screen_owned);
 
     // ---- 7. （音频挪到 RECORD 之后，见第 8 步）----
     // 宝马这台（AirTunes/450.14）在屏幕流 SETUP 后约 1.5s 就关控制通道；
     // 若这段时间还在做音频 SETUP，RECORD 永远发不出去（21:13 现场）。
 
-    // ---- 8. RECORD（会话保活已在开流前启动）----
-    emit_log("AIRPLAY: 开始 RECORD（等待车机激活会话）");
-    record_session(&channel).await?;
-    emit_log("AIRPLAY: ✓ RECORD 完成——会话已激活");
-    emit_state("connected", "AirPlay 会话已激活");
+    // Deliver the sender before publishing connected or waiting for audio SETUP.
+    // Otherwise the encoder's initial SPS/PPS/IDR can be discarded during slow audio negotiation.
+    screen_ready.send(screen).map_err(|_| "视频泵已退出".to_string())?;
+    emit_state("connected", "AirPlay 会话及屏幕流已激活");
+    if box_bootstrap {
+        let control = channel.clone(); let stop_h = stop.clone(); let device = p.device_id.clone();
+        keepalive.0.push(tokio::spawn(async move {
+            for _ in 0..150 {
+                tokio::select! { _ = stop_h.notified() => return, _ = tokio::time::sleep(Duration::from_millis(100)) => {} }
+                if crate::wifi_iap2::can_keep_generation(wifi_iap_id) {
+                    let command = bplist::encode(&Value::dict(vec![
+                        ("type", Value::str("disableBluetooth")),
+                        ("params", Value::dict(vec![("deviceID", Value::str(&device))])),
+                    ]));
+                    emit_log("HANDOFF: Wi-Fi iAP2 ready + feedback healthy; requesting receiver Bluetooth retirement");
+                    match control.request("POST", "/command", &command, "application/x-apple-binary-plist", &[], Duration::from_secs(3)).await {
+                        Ok(reply) => emit_log(&format!("HANDOFF: disableBluetooth status={}", reply.status())),
+                        Err(e) => emit_log(&format!("HANDOFF: disableBluetooth failed: {e}; keep existing transport")),
+                    }
+                    return;
+                }
+            }
+            emit_log("HANDOFF: Wi-Fi readiness timeout; no Bluetooth retirement requested");
+        }));
+    }
 
     // ---- 9. 音频流 SETUP（会话已激活后再试；失败只记录）----
-    let audio = if p.enable_audio {
+    let audio_allowed = if p.enable_audio && box_bootstrap {
+        request_main_audio(&channel, &modes).await
+    } else { p.enable_audio };
+    audio_owned.store(modes.lock().audio_owned(), std::sync::atomic::Ordering::Release);
+    emit_log(&format!("AUDIO: enabled={} box_bootstrap={box_bootstrap} resource_granted={audio_allowed}", p.enable_audio));
+    let mut audio = if audio_allowed {
         negotiate_audio(&channel, &factory, shared_secret.as_ref(), p).await
     } else {
         None
     };
 
+    if let Some(audio) = audio.as_mut() { audio.set_ownership(audio_owned); }
+
     Ok(AirplayOutcome {
         control: channel,
-        screen,
         audio,
         keep_alive_stats,
         keepalive,
@@ -423,6 +486,17 @@ fn read_display_size(display: &Value) -> (u32, u32) {
 #[cfg(test)]
 mod display_size_tests {
     use super::*;
+    #[test]
+    fn desktop_info_overrides_bmw_bootstrap_without_weakening_real_car_grants() {
+        for key in ["name", "model", "manufacturer"] {
+            for identity in ["DiPlay", "WINPLAY"] {
+                assert!(!use_box_bootstrap(true, &Value::dict(vec![(key, Value::str(identity))])));
+            }
+        }
+        assert!(use_box_bootstrap(true, &Value::dict(vec![])));
+        assert!(use_box_bootstrap(true, &Value::dict(vec![("manufacturer", Value::str("BMW"))])));
+        assert!(!use_box_bootstrap(false, &Value::dict(vec![])));
+    }
     #[test]
     fn bluetooth_credential_key_stays_stable_when_receiver_ip_changes() {
         assert_eq!(credential_tag(Some("bt_aabbccddee01"), "172_16_1_1"), "bt_aabbccddee01");
@@ -443,7 +517,40 @@ mod display_size_tests {
     }
 
     #[tokio::test]
-    async fn session_setup_precedes_info_and_resource_declaration() {
+    async fn audio_setup_requires_explicit_resource_grant() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new(); let mut chunk = [0;4096]; let mut count = 0;
+            while count < 3 {
+                let n = socket.read(&mut chunk).await.unwrap(); assert!(n>0); buffer.extend_from_slice(&chunk[..n]);
+                for request in crate::rtsp::parse_rtsp_messages(&mut buffer) {
+                    count += 1;
+                    let command = bplist::parse(&request.body).unwrap();
+                    assert_eq!(command.get("type").and_then(Value::as_str), Some(if count < 3 { "changeModes" } else { "modesChanged" }));
+                    if count < 3 {
+                        let resources = command.get("params").unwrap().get("resources").unwrap().as_array().unwrap();
+                        assert_eq!(resources[0].get("resourceID").and_then(Value::as_int), Some(2));
+                        assert_eq!(resources[0].get("transferPriority").and_then(Value::as_int), Some(500));
+                    }
+                    let body = bplist::encode(&Value::dict(vec![("status", Value::int(if count == 1 { 1 } else { 0 }))]));
+                    let header = format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: {}\r\n\r\n", request.cseq().unwrap(), body.len());
+                    socket.write_all(header.as_bytes()).await.unwrap();socket.write_all(&body).await.unwrap();
+                }
+            }
+        });
+        let socket = TcpStream::connect(addr).await.unwrap(); let (r,w) = socket.into_split();
+        let (channel, _) = RtspChannel::spawn(r,w,None);
+        let modes = Arc::new(Mutex::new(crate::modes::Modes::box_initial()));
+        assert!(!request_main_audio(&channel,&modes).await); assert!(!modes.lock().audio_owned());
+        assert!(request_main_audio(&channel,&modes).await); assert!(modes.lock().audio_owned());
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_setup_and_info_precede_record_then_resource_declaration() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -457,7 +564,14 @@ mod display_size_tests {
                 buffer.extend_from_slice(&chunk[..n]);
                 for request in crate::rtsp::parse_rtsp_messages(&mut buffer) {
                     requests.push(request.first_line.clone());
-                    let body = match requests.len() {
+                    let body = match requests.len() - 1 {
+                        0 => {
+                            assert_eq!(request.first_line, "POST /auth-setup RTSP/1.0");
+                            assert_eq!(request.body.len(), 33); assert_eq!(request.body[0], 1);
+                            let mut body = crate::crypto::X25519KeyPair::generate().public.to_vec();
+                            body.extend(3u32.to_be_bytes()); body.extend([1,2,3]);
+                            body.extend(64u32.to_be_bytes()); body.extend([0x37;64]); body
+                        }
                         1 => {
                             assert_eq!(request.first_line, "SETUP /setup RTSP/1.0");
                             bplist::encode(&Value::dict(vec![("eventPort", Value::int(5001))]))
@@ -470,6 +584,11 @@ mod display_size_tests {
                             ])]))]))
                         }
                         3 => {
+                            assert_eq!(request.first_line, "RECORD / RTSP/1.0");
+                            assert!(request.body.is_empty());
+                            Vec::new()
+                        }
+                        4 => {
                             assert_eq!(request.first_line, "POST /command RTSP/1.0");
                             assert_eq!(bplist::parse(&request.body).unwrap().get("type").and_then(Value::as_str), Some("modesChanged"));
                             Vec::new()
@@ -486,13 +605,14 @@ mod display_size_tests {
         let socket = TcpStream::connect(addr).await.unwrap();
         let (read, write) = socket.into_split();
         let (channel, _) = RtspChannel::spawn(read, write, None);
+        crate::auth_setup::run(&channel).await.unwrap();
         let (_, info) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", 12345, true, Value::dict(vec![])).await.unwrap();
         let display = &info.get("displays").unwrap().as_array().unwrap()[0];
         assert_eq!(uuid_text(display.get("uuid")).as_deref(), Some("actual-bmw-display"));
         assert_eq!(read_display_size(display), (2560, 744));
-        require_modes_changed(&channel).await.unwrap();
+        activate_session(&channel, &build_modes_changed()).await.unwrap();
         drop(channel);
-        assert_eq!(peer.await.unwrap().len(), 3);
+        assert_eq!(peer.await.unwrap().len(), 5);
     }
 
     #[tokio::test]
@@ -542,7 +662,7 @@ mod display_size_tests {
         let socket = TcpStream::connect(addr).await.unwrap();
         let (read, write) = socket.into_split();
         let (channel, _) = RtspChannel::spawn(read, write, None);
-        let tasks = spawn_keepalive_loops(channel.clone(), Arc::new(LocalSockets), udp_port, "127.0.0.1".to_string(), Arc::new(Notify::new()));
+        let tasks = spawn_keepalive_loops(channel.clone(), Arc::new(LocalSockets), udp_port, "127.0.0.1".to_string(), Arc::new(Notify::new()), None);
         let handles: Vec<_> = tasks.0.iter().map(|task| task.abort_handle()).collect();
         let record = record_session(&channel);
         let ping = async {
@@ -694,6 +814,47 @@ fn build_session_setup(device_id: &str, timing_port: u16, encrypted: bool) -> Ve
         fields.push(("et", Value::int(1)));
     }
     bplist::encode(&Value::dict(fields))
+}
+
+fn use_box_bootstrap(requested: bool, info: &Value) -> bool {
+    requested && !["name", "model", "manufacturer"].iter().any(|key| {
+        let value = info.get(key).and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
+        value.contains("winplay") || value.contains("diplay")
+    })
+}
+
+async fn request_main_audio(channel: &Arc<RtspChannel>, modes: &Arc<Mutex<crate::modes::Modes>>) -> bool {
+    let command = bplist::encode(&Value::dict(vec![
+        ("type", Value::str("changeModes")),
+        ("params", Value::dict(vec![("resources", Value::array(vec![Value::dict(vec![
+            ("resourceID", Value::int(2)), ("transferType", Value::int(1)),
+            ("transferPriority", Value::int(500)), ("takeConstraint", Value::int(500)),
+            ("borrowConstraint", Value::int(500)),
+        ])]))])),
+    ]));
+    match channel.request("POST", "/command", &command, "application/x-apple-binary-plist", &[], Duration::from_secs(3)).await {
+        Ok(reply) if reply.status() == 200 => {
+            let status = bplist::parse(&reply.body).ok().and_then(|v| v.get("status").and_then(Value::as_int));
+            if status != Some(0) { emit_log(&format!("MODES: main audio resource not granted status={status:?}")); return false; }
+            modes.lock().claim_audio();
+            let declaration = modes.lock().declaration();
+            match channel.request("POST", "/command", &declaration, "application/x-apple-binary-plist", &[], Duration::from_secs(3)).await {
+                Ok(reply) if reply.status() == 200 => { emit_log("MODES: main audio granted, publishing snapshot before audio SETUP"); true },
+                _ => { emit_log("MODES: main audio snapshot not acknowledged; skip audio SETUP"); false },
+            }
+        }
+        other => { emit_log(&format!("MODES: main audio request failed: {}", match other { Ok(r) => r.first_line, Err(e) => e })); false }
+    }
+}
+
+async fn activate_session(channel: &Arc<RtspChannel>, declaration: &[u8]) -> Result<(), String> {
+    emit_log("AIRPLAY: 开始 RECORD（屏幕流建立前）");
+    record_session(channel).await?;
+    emit_log("AIRPLAY: ✓ RECORD 完成；声明资源后建立屏幕流");
+    let reply = channel.request("POST", "/command", declaration, "application/x-apple-binary-plist", &[], Duration::from_secs(5)).await?;
+    if reply.status() != 200 { return Err(format!("资源声明被拒 {}", reply.first_line)); }
+    emit_log("MODES: initial resource snapshot accepted");
+    Ok(())
 }
 
 async fn send_modes_changed(channel: &Arc<RtspChannel>) -> Option<u16> {
@@ -879,7 +1040,7 @@ async fn negotiate_audio(
 /// 三条心跳里的前两条（屏幕 keepAlive 帧在视频 pump 里按 1s 节流）：
 ///  - UDP keepAlive：4B 随机、5s（10s 与车机看门狗等长必输——奥迪 3315 实测 10.001s 被拆）
 ///  - RTSP /feedback：1s 空体 POST（车机 ~3s 看门狗）
-pub struct KeepaliveTasks(Vec<tokio::task::JoinHandle<()>>);
+pub struct KeepaliveTasks(Vec<tokio::task::JoinHandle<()>>, Option<crate::wifi_iap2::WifiIap2>, Option<TimingServer>);
 
 impl Drop for KeepaliveTasks {
     fn drop(&mut self) {
@@ -893,6 +1054,7 @@ fn spawn_keepalive_loops(
     keep_alive_port: u16,
     car_ip: String,
     stop: Arc<Notify>,
+    wifi_iap_id: Option<u64>,
 ) -> KeepaliveTasks {
     let mut tasks = Vec::new();
     if keep_alive_port != 0 {
@@ -931,22 +1093,27 @@ fn spawn_keepalive_loops(
                 "POST", "/feedback", &[], "application/octet-stream", &[], Duration::from_secs(3),
             ).await {
                 Ok(reply) => {
+                    if let Some(id) = wifi_iap_id { crate::wifi_iap2::feedback(id, reply.status() == 200); }
+                    if reply.status() != 200 { emit_log(&format!("AIRPLAY: feedback rejected status={}", reply.status())); return; }
                     if first_reply {
                         emit_log(&format!("AIRPLAY: feedback 首次应答 status={}", reply.status()));
                         first_reply = false;
                     }
                 }
-                Err(_) => return,
+                Err(error) => { if let Some(id) = wifi_iap_id { crate::wifi_iap2::feedback(id, false); } emit_log(&format!("AIRPLAY: feedback stopped: {error}")); if wifi_iap_id.map(crate::wifi_iap2::is_active).unwrap_or(false) { emit_state("ended", "控制保活失败"); } return; },
             }
         }
     }));
-    KeepaliveTasks(tasks)
+    KeepaliveTasks(tasks, None, None)
 }
 
 // ---------------------------------------------------------------- 事件通道分发
 
 fn spawn_event_dispatcher(
     mut inbound: tokio::sync::mpsc::UnboundedReceiver<crate::rtsp::RtspMessage>,
+    control: Arc<RtspChannel>,
+    wifi_iap_id: u64,
+    modes: Arc<Mutex<crate::modes::Modes>>,
     touch_tx: mpsc::UnboundedSender<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
     display_size: (u32, u32),
@@ -966,7 +1133,10 @@ fn spawn_event_dispatcher(
                 _ = stop.notified() => return,
                 m = inbound.recv() => match m {
                     Some(m) => m,
-                    None => return,
+                    None => {
+                        crate::wifi_iap2::mark_ready(wifi_iap_id, false);
+                        if crate::wifi_iap2::is_active(wifi_iap_id) { emit_state("ended", "事件通道关闭"); } return;
+                    },
                 },
             };
             if !msg.first_line.contains("/command") {
@@ -1007,6 +1177,28 @@ fn spawn_event_dispatcher(
                 emit_log(&format!("EVENT: 车机命令 type={cmd_type}（首次）"));
             }
             match cmd_type {
+                "iAPSendMessage" => {
+                    let data = command.get("params").and_then(|p| p.get("data")).and_then(Value::as_bytes);
+                    if let Some(data) = data.filter(|d| !d.is_empty() && d.len() <= 65535) {
+                        crate::emit_iap2_bytes(wifi_iap_id, data);
+                    } else { emit_log("WIFI-IAP: missing/oversized params.data"); }
+                }
+                "changeModes" => {
+                    // Already applied synchronously while building the request's status+params reply.
+                    let body = modes.lock().declaration();
+                    match control.request("POST", "/command", &body, "application/x-apple-binary-plist", &[], Duration::from_secs(3)).await {
+                        Ok(reply) => emit_log(&format!("MODES: modesChanged feedback status={}", reply.status())),
+                        Err(error) => emit_log(&format!("MODES: modesChanged feedback failed {error}")),
+                    }
+                }
+                "requestUI" => {
+                    emit_log("EVENT: requestUI received; local car UI available");
+                    let body = modes.lock().declaration();
+                    if let Err(error) = control.request("POST", "/command", &body, "application/x-apple-binary-plist", &[], Duration::from_secs(3)).await {
+                        emit_log(&format!("MODES: requestUI state feedback failed {error}"));
+                    }
+                    crate::emit_force_keyframe();
+                }
                 "hidSendReport" => {
                     // 两种布局都要认：
                     //  - 苹果/真车常见：{ params: { report: <data> } }
@@ -1068,6 +1260,7 @@ fn spawn_event_dispatcher(
                 }
                 "hidSetInputMode" | "ping" | "fps" => {}
                 other => {
+                    bad_commands += 1;
                     if bad_commands <= 8 {
                         emit_log(&format!("EVENT: 未处理的车机命令 type={other}"));
                     }

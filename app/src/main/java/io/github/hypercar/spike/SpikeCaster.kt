@@ -36,7 +36,7 @@ class SpikeCaster(
     private val context: Context,
     private val width: Int = 1920,
     private val height: Int = 720,
-    private val fps: Int = 30,
+    private val fps: Int = 60,
     private val bitrate: Int = 8_000_000,
     private val tag: String = "S3",
 ) {
@@ -123,7 +123,7 @@ class SpikeCaster(
             setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, fps.toFloat())
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
-            setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel42)
+            // Let MediaCodec choose the level required by the native size and frame rate.
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
             setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
             // 低延迟：实时优先级、无 B 帧、0 帧输入缓冲；静止 100ms 补发上一帧，

@@ -64,6 +64,7 @@ pub struct AudioOut {
     sync_seq: u16,
     /** 首包 Marker 待打标记（打完即清）。 */
     marker_pending: bool,
+    ownership: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl AudioOut {
@@ -85,6 +86,7 @@ impl AudioOut {
             packets: 0,
             sync_seq: 0,
             marker_pending: true,
+            ownership: None,
         }
     }
 
@@ -95,7 +97,10 @@ impl AudioOut {
     /// byteSwap 回小端喂 AudioTrack（DiPlay AndroidMediaSink 同款）；Android
     /// 采集是原生小端，漏换序实测得到「沙沙声」（cardeck 2026-10-10 真车验证）。
     /// AAC 通路不换序（比特流语义），本项目只走 PCM 故恒换序。
+    pub fn set_ownership(&mut self, ownership: std::sync::Arc<std::sync::atomic::AtomicBool>) { self.ownership = Some(ownership); }
+
     pub async fn send_pcm(&mut self, frames: &[i16]) -> std::io::Result<()> {
+        if self.ownership.as_ref().map(|v| !v.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(false) { self.marker_pending = true; return Ok(()); }
         let samples_per_packet = SAMPLES_PER_PACKET * CHANNELS;
         for chunk in frames.chunks_exact(samples_per_packet) {
             // PCM 负载（交错立体声 16bit **BE**）

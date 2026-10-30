@@ -192,7 +192,7 @@ object SettingsStore {
         }
 
     var videoFps: Int
-        get() = p().getInt(KEY_FPS, 30)
+        get() = p().getInt(KEY_FPS, 60)
         set(v) = p().edit().putInt(KEY_FPS, v.coerceIn(20, 60)).apply()
 
     var enableAudio: Boolean
@@ -293,6 +293,8 @@ object SettingsStore {
             append("\"fps\":").append(plan.fps).append(",")
             append("\"enable_audio\":").append(enableAudio).append(",")
             append("\"keep_alive_stats\":").append(keepAliveStats).append(",")
+            append("\"bmw_box_bootstrap\":").append(io.github.hypercar.headunit.ReceiverCompatibility.useBmwBootstrap(
+                headUnitProfileId, io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(receiverBluetoothMac))).append(",")
             append("\"identity_path\":\"").append(esc(identityPath)).append("\"")
             io.github.hypercar.session.PairingEvidence.receiverKey(receiverBluetoothMac)?.let {
                 append(",\"receiver_id\":\"").append(it).append("\"")
