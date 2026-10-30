@@ -279,15 +279,16 @@ impl RtspChannel {
         plaintext.extend_from_slice(head.as_bytes());
         plaintext.extend_from_slice(body);
 
-        let wire = {
-            let mut guard = self.cipher.lock();
-            match guard.as_mut() {
-                Some(cipher) => cipher.encrypt(&plaintext),
-                None => plaintext,
-            }
-        };
         {
             let mut w = self.write.lock().await;
+            // 心跳与 RECORD 可并发等待应答；加密 nonce 的分配顺序必须等于上线路序。
+            let wire = {
+                let mut guard = self.cipher.lock();
+                match guard.as_mut() {
+                    Some(cipher) => cipher.encrypt(&plaintext),
+                    None => plaintext,
+                }
+            };
             if let Err(error) = w.write_all(&wire).await {
                 self.pending.lock().remove(&cseq);
                 let detail = format!("RTSP#{} CSeq={cseq} {method} {path} 写失败: {error}", self.trace_id);
@@ -334,6 +335,7 @@ impl RtspChannel {
         let mut plaintext = Vec::with_capacity(head.len() + body.len());
         plaintext.extend_from_slice(head.as_bytes());
         plaintext.extend_from_slice(body);
+        let mut w = self.write.lock().await;
         let wire = {
             let mut guard = self.cipher.lock();
             match guard.as_mut() {
@@ -341,7 +343,6 @@ impl RtspChannel {
                 None => plaintext,
             }
         };
-        let mut w = self.write.lock().await;
         w.write_all(&wire)
             .await
             .map_err(|e| format!("事件通道写失败: {e}"))?;
@@ -441,6 +442,7 @@ async fn respond_ok(write: &SharedWrite, cipher: &SharedCipher, cseq: Option<i32
         Some(c) => format!("RTSP/1.0 200 OK\r\nContent-Length: 0\r\nCSeq: {c}\r\n\r\n"),
         None => "RTSP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(),
     };
+    let mut w = write.lock().await;
     let wire = {
         let mut guard = cipher.lock();
         match guard.as_mut() {
@@ -448,7 +450,50 @@ async fn respond_ok(write: &SharedWrite, cipher: &SharedCipher, cseq: Option<i32
             None => head.into_bytes(),
         }
     };
-    let mut w = write.lock().await;
     let _ = w.write_all(&wire).await;
     let _ = w.flush().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_queued_write_does_not_consume_an_encryption_nonce() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut cipher = ControlCipher::new([2; 32], [1; 32]);
+            let mut wire = Vec::new();
+            let mut plain = Vec::new();
+            let mut chunk = [0u8; 2048];
+            loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                wire.extend_from_slice(&chunk[..n]);
+                let (decoded, used) = cipher.decrypt(&wire).expect("wire order must match nonce order");
+                wire.drain(..used);
+                plain.extend_from_slice(&decoded);
+                if let Some(request) = parse_rtsp_messages(&mut plain).pop() {
+                    assert_eq!(request.first_line, "RECORD / RTSP/1.0");
+                    let response = format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n", request.cseq().unwrap());
+                    socket.write_all(&cipher.encrypt(response.as_bytes())).await.unwrap();
+                    break;
+                }
+            }
+        });
+        let socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (read, write) = socket.into_split();
+        let (channel, _) = RtspChannel::spawn(read, write, Some(ControlCipher::new([1; 32], [2; 32])));
+        let busy_writer = channel.write.lock().await;
+        let cancelled = tokio::time::timeout(Duration::from_millis(20), channel.request(
+            "POST", "/feedback", &[], "application/octet-stream", &[], Duration::from_secs(2),
+        )).await;
+        assert!(cancelled.is_err());
+        assert_eq!(channel.cipher.lock().as_ref().unwrap().write_counter, 0);
+        drop(busy_writer);
+        assert_eq!(channel.request("RECORD", "/", &[], "application/octet-stream", &[], Duration::from_secs(2)).await.unwrap().status(), 200);
+        peer.await.unwrap();
+    }
 }

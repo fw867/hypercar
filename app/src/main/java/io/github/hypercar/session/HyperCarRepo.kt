@@ -2,6 +2,7 @@ package io.github.hypercar.session
 
 import android.bluetooth.BluetoothDevice
 import android.content.Context
+import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -250,9 +251,14 @@ object HyperCarRepo {
             scope.launch { captureCrashArtifacts() }
             // ACL 广播唤醒入口（receiver → handler）：优先经 FGS 拿前台豁免与持锁，
             // 服务起来后再触发真正会话（handler 幂等，service 二次进入走直连分支）
-            AutoStart.handler = { ctx, device, connected ->
+            AutoStart.handler = handler@{ ctx, device, connected ->
                 val app = ctx.applicationContext
                 if (connected) {
+                    if (userDisconnectRequested) {
+                        log("AUTO: 用户已断开本轮会话，忽略重复 ACL 连接；手动连接或下次上车可恢复")
+                        runCatching { app.stopService(Intent(app, HyperCarService::class.java)) }
+                        return@handler
+                    }
                     // 记住刚连上 ACL 的车机：本轮 iAP2 只拨/只收这台，别再去碰
                     // HI-BOX 之类已配对的旧 dongle（每次 RFCOMM 失败都白占栈、添噪音，
                     // 2026-10-25 现场日志里 10 分钟里一半是它们的连接失败）
@@ -274,19 +280,12 @@ object HyperCarRepo {
                         connect(app)
                     }
                 } else {
-                    // 收摊路径必须幂等，且**只在服务确实在跑时**投 ACTION_STOP：
-                    // 服务收到 ACTION_STOP 会反向调本 handler(false)（见 HyperCarService），
-                    // 若这里无条件再投 ACTION_STOP，就形成
-                    //   handler(false) → startService(STOP) → onStartCommand(STOP) → handler(false) …
-                    // 的自激回环——实测每秒数百轮，只有「车机蓝牙 断开 + 会话已断开」两种日志，
-                    // 且车机不在场也照刷（进程自己把自己钉在前台）。
-                    if (HyperCarService.isRunning) {
-                        runCatching { app.startService(HyperCarService.stopIntent(app, device)) }
-                    }
+                    // 真正离开车机后允许下一轮 ACL 自动连接；服务停止不回灌 ACL 事件。
+                    userDisconnectRequested = false
                     runCatching { device.address }.getOrNull()?.let { address ->
                         if (address == aclCarMac) aclCarMac = null
                     }
-                    disconnect()
+                    disconnect(userInitiated = false)
                 }
                 logAclEvent(device, connected)
             }
@@ -387,10 +386,11 @@ object HyperCarRepo {
                 log("PAIRED-DUMP: $mac | $name | ${fmt.format(java.util.Date(at))} | 蓝牙列表可见=$bonded")
             }
     }
-    fun disconnect() {
+    fun disconnect() = disconnect(userInitiated = true)
+
+    private fun disconnect(userInitiated: Boolean) {
         MusicBridge.onCarDisconnected()
-        // 用户主动断开：不再自动重连
-        userDisconnectRequested = true
+        if (userInitiated) userDisconnectRequested = true
         reconnectJob?.cancel()
         reconnectJob = null
         // 先掐在途连接：否则它会一直阻塞在「等 iAP2 端点」上，`connecting` 恒 true，
@@ -402,7 +402,9 @@ object HyperCarRepo {
         pending?.cancel()
         scope.launch {
             withTimeoutOrNull(JOIN_TIMEOUT_MILLIS) { pending?.join() }
-            runDisconnect("用户/系统断开")
+            runDisconnect(if (userInitiated) "用户断开" else "车机 ACL 断开")
+            // 即使会话已失败/已清理，仍需收摊遗留前台服务。
+            stopForegroundService()
         }
     }
 
@@ -795,12 +797,16 @@ object HyperCarRepo {
         }
     }
 
-    /**
-     * 释放 iap2 / Rust / WiFi 绑定（不碰 UI 状态位；拆除与失败路径共用）。
-     * 必须把 iAP2 停掉：只要它在跑，出站循环就每 3s 断一次车机的音频配置文件，
-     * 既打扰车机，也会不断制造「ACL 断开」事件。
-     */
+    /** 直接停止服务，避免 ACTION_STOP 再回灌 ACL 断开事件。 */
+    private fun stopForegroundService() {
+        val context = appContext() ?: return
+        runCatching { context.stopService(Intent(context, HyperCarService::class.java)) }
+            .onFailure { log("SERVICE: 停止前台保活失败：${it.message}") }
+    }
+
+    /** 释放保活服务、iAP2、Rust 和 WiFi 绑定；拆除与失败路径共用。 */
     private fun releaseSessionResources() {
+        stopForegroundService()
         MusicBridge.onCarDisconnected()
         streaming = false
         // P1：先停自绘界面（释放 D1 显示/编码器），再停引擎。
@@ -1616,12 +1622,15 @@ object HyperCarRepo {
                                 usable = probed
                                 continue
                             }
+                            // 邀请可能在 cmd wifi / 网关探测期间到达，避免错过后再花十余秒扫 /20。
+                            if (advertiser.lastInvitePeerIp != null) continue
                             // 网关拿不到（宝马 DIRECT 热点 gw=0.0.0.0）时，改在网段里主动找 —— 这是唯一出路
                             if (ssid == lastSeen.get()?.ssid && localScanned.add(ssid)) {
                                 // 先试 mDNS（车机若广播 _airplay._tcp，这一步就能定端点，比扫网段快）
                                 val mdnsHere = runCatching {
                                     AirplayServiceProbe(context, ::log).browse(boundNetwork)
                                 }.getOrNull()
+                                if (advertiser.lastInvitePeerIp != null) continue
                                 if (mdnsHere != null) {
                                     log("MDNS: ✓ 等待期间直接查到 _airplay._tcp → ${mdnsHere.host}:${mdnsHere.port}")
                                     usable = CarPlayEndpoint(
@@ -1719,6 +1728,7 @@ object HyperCarRepo {
     }
 
     private fun fail(reason: String) {
+        if (!sessionLive.compareAndSet(true, false)) return
         log("SESSION 失败: $reason")
         val hadLink = sessionHadLink
         // 失败即停蓝牙/WiFi 侧（保留 Failed 状态给 UI）：否则 iAP2 出站循环会继续每 3s

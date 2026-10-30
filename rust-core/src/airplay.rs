@@ -1,18 +1,12 @@
 //! AirPlay 发送端会话（协商整体下沉 Rust —— 与参考文档的关键差异，见 docs/NEGOTIATION-GAPS.md）。
 //!
-//! 流程（cardeck 真车验证的顺序，Audi MIB3 / BMW iD8.5 通用骨架）：
-//!  1. `GET /info`（带空 bplist 体 + plist Content-Type，老固件对缺体的 /info 回 400/455）
-//!  2. `/pair-verify` M1..M4（本机 ed25519 长期身份）→ 控制通道密钥
-//!  3. modesChanged（声明持有主屏/主音频资源；跳过它 Audi 对屏幕流 SETUP 直接 400）
-//!  4. 会话级 `SETUP /setup`（deviceID 必须是本机真实蓝牙 MAC；et 仅未配对会话带）
-//!  5. 连接事件通道（SETUP 应答 eventPort；车机在此通道 POST /command）
-//!  6. 屏幕流 `SETUP /`（type 110，uuid 必须取 /info displays[].uuid）→ dataPort
-//!  7. 音频流 `SETUP /`（type 100 PCM 48k，spf=352）→ dataPort/controlPort
-//!  8. `RECORD` 激活 → 三条相互独立的心跳：
-//!     UDP keepAlive 5s（4B；间隔必须小于车机 10s 看门狗——等长必输）
-//!     RTSP /feedback 1s（车机 ~3s 看门狗）
-//!     屏幕流 keepAlive 帧 1s（在视频 pump 内节流；缺它 Audi MMI 3315 10.2s 拆轮）
-//!  9. 事件通道 hidSendReport → 触摸坐标换算 → 交给本机自绘界面
+//! 流程（参照 CatPlay bootstrap，保留已验证的配对与流参数）：
+//!  1. 配对前 /info best-effort 读取身份；pair-setup / pair-verify 建立加密控制通道。
+//!  2. 会话 SETUP /setup → 会话内 /info（真实显示 UUID / 能力）。
+//!  3. 连接事件通道，启动 UDP keepAlive（首发立即、后续 5s）及 /feedback（1s）。
+//!  4. modesChanged 声明资源 → 屏幕流 SETUP / → 连接数据口 → 无请求体 RECORD /。
+//!  5. 激活后协商音频；视频 pump 维持独立的屏幕流 keepAlive（1s）。
+//!  6. 事件通道 hidSendReport → 触摸坐标换算 → 本机自绘界面。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,6 +74,7 @@ pub struct AirplayOutcome {
     pub control: Arc<RtspChannel>,
     pub audio: Option<AudioOut>,
     pub keep_alive_stats: bool,
+    pub keepalive: KeepaliveTasks,
 }
 
 /// 跑完整个 AirPlay 协商，返回屏幕/音频发送器（交给 pump 任务）。
@@ -95,20 +90,14 @@ pub async fn negotiate(
     let (mut channel, _control_inbound) = RtspChannel::spawn(read, write, None);
     emit_log(&format!("AIRPLAY: 控制连接 RTSP#{} 开始", channel.trace_id()));
 
-    // ---- 1. /info（**best-effort**，不可用不致命）----
-    //
-    // 2026-10-25 车友日志（BMW 17713 / MGU-86，AirTunes/450.14）定谳：
-    // 在**未配对的连接**上 GET/POST /info 全部回 `455 Method Not Valid In This State`，
-    // 旧实现把这里当致命错误直接退出引擎（6 轮重试、每轮 3 次 /info、全部 455）。
-    // cardeck 的真车记录同样如此：「车机对未配对连接上的 /info 应答 455」，
-    // 正确顺序是 **先 pair-setup/pair-verify，再查 /info**（配对后的 /info 也常被
-    // 455/403 拒，所以它只是"增强"：拿不到显示尺寸/features 就用设置值）。
+    // 保留配对前的 best-effort 身份读取，供旧凭证公钥索引兼容使用。
+    // 此阶段的 455 不表示缺少显示能力；显示信息在会话 SETUP 成功后重新读取。
     let mut info = match fetch_info(&channel).await {
         Ok(v) => v,
         Err(e) => {
             emit_log(&format!(
                 "AIRPLAY: /info 不可用（{e}）——未配对连接上被 455 拒是已知行为，\
-                 继续走 pair-verify（显示尺寸/能力先用设置值），配对后会再试一次"
+                 继续走 pair-verify（显示尺寸/能力先用设置值），会话 SETUP 成功后再读取能力"
             ));
             Value::dict(vec![])
         }
@@ -249,21 +238,20 @@ pub async fn negotiate(
         }
     }
 
-    // ---- 2.5 /info 兜底：配对后再试一次 ----
-    // 配对前被 455 拒是常态（2026-10-25 日志：3 次尝试 455）；配对成功后车机状态机
-    // 才允许 /info 的场景存在（cardeck 记录：活跃会话内的 /info 也常被 455/403 拒，
-    // 所以这里只当"可能补全"，失败不影响后续 SETUP）。
-    if info.as_dict().map(|d| d.is_empty()).unwrap_or(true) {
-        match fetch_info(&channel).await {
-            Ok(v) if v.as_dict().map(|d| !d.is_empty()).unwrap_or(false) => {
-                info = v;
-                emit_log("AIRPLAY: 配对后 /info 成功——补全显示尺寸/能力");
-            }
-            _ => emit_log("AIRPLAY: 配对后 /info 仍不可用——沿用设置分辨率与默认能力继续"),
-        }
-    }
+    // CatPlay bootstrap: 会话 SETUP → /info → 事件通道/保活 → 资源声明 → 屏幕流。
+    let timing = TimingServer::start().map_err(|e| format!("计时服务启动失败: {e}"))?;
+    let (root, session_info) = setup_and_read_info(
+        &channel, &p.device_id, timing.port, shared_secret.is_some(), info,
+    ).await?;
+    info = session_info;
+    let event_port = port_of(root.get("eventPort"));
+    let keep_alive_port = port_of(root.get("keepAlivePort"));
+    emit_log(&format!(
+        "AIRPLAY: ✓ 会话 SETUP eventPort={event_port} keepAlive={keep_alive_port:?} enabledFeatures={:?}",
+        root.get("enabledFeatures").and_then(Value::as_array)
+    ));
 
-    // ---- 2.6 用 /info 结果校准显示尺寸与能力（上面拿不到就全用兜底）----
+    // 按会话 SETUP 后的 /info 选择显示 UUID、坐标空间和屏幕保活格式。
     let keep_alive_stats = p.keep_alive_stats
         || info
             .get("keepAliveSendStatsAsBody")
@@ -285,50 +273,6 @@ pub async fn negotiate(
     // The receiver defines the viewport ratio, not the phone's encoding workload.
     // Kotlin chooses a proportional capped canvas and reports the actual size before its first frame.
     crate::emit_display_size(disp_w, disp_h);
-
-    // ---- 3. modesChanged ----
-    let modes = build_modes_changed();
-    match channel
-        .request(
-            "POST",
-            "/command",
-            &modes,
-            "application/x-apple-binary-plist",
-            &[],
-            Duration::from_secs(5),
-        )
-        .await
-    {
-        Ok(resp) => emit_log(&format!("AIRPLAY: modesChanged [{}]", resp.first_line)),
-        Err(e) => emit_log(&format!("AIRPLAY: modesChanged 失败 - {e}")),
-    }
-
-    // ---- 4. 计时服务 + 会话级 SETUP ----
-    let timing = TimingServer::start().map_err(|e| format!("计时服务启动失败: {e}"))?;
-    let body = build_session_setup(&p.device_id, timing.port, shared_secret.is_some());
-    let resp = channel
-        .request(
-            "SETUP",
-            "/setup",
-            &body,
-            "application/x-apple-binary-plist",
-            &[],
-            Duration::from_secs(10),
-        )
-        .await?;
-    if resp.status() != 200 {
-        return Err(format!(
-            "会话 SETUP 被拒 [{}]（deviceID={}；接收端若启用设备过滤请选择该地址）",
-            resp.first_line,
-            p.device_id
-        ));
-    }
-    let root = bplist::parse(&resp.body).map_err(|e| format!("SETUP 应答解析失败: {e}"))?;
-    let event_port = port_of(root.get("eventPort"));
-    let keep_alive_port = port_of(root.get("keepAlivePort"));
-    emit_log(&format!(
-        "AIRPLAY: ✓ 会话 SETUP eventPort={event_port} keepAlive={keep_alive_port:?}"
-    ));
 
     // ---- 5. 事件通道 ----
     if event_port == 0 {
@@ -379,11 +323,21 @@ pub async fn negotiate(
         stop.clone(),
     );
 
+    // 激活等待与后续音频协商期间也必须保持会话存活。
+    // 句柄由协商结果持有；协商失败/取消时 Drop 自动停止本轮任务。
+    let keepalive = spawn_keepalive_loops(
+        channel.clone(), factory.clone(), keep_alive_port, p.car_ip.clone(), stop.clone(),
+    );
+    emit_log("AIRPLAY: 事件通道已建立，UDP/feedback 保活已启动（RECORD 前）");
+    require_modes_changed(&channel).await?;
+
     // ---- 6. 屏幕流 SETUP ----
     let conn_id_screen = random_positive_i64();
     let stream_uuid = display_uuid
         .clone()
         .unwrap_or_else(|| "6E4E3B31-0E5B-4A8F-9F1B-2C5D7E9A0C11".to_string());
+    emit_log(&format!("AIRPLAY: 屏幕流 uuid={stream_uuid} 来源={}",
+        if display_uuid.is_some() { "车机显示能力" } else { "兼容兜底（未取得有效显示 UUID）" }));
     let screen_body = build_screen_setup(conn_id_screen, &stream_uuid);
     let resp = channel
         .request(
@@ -435,21 +389,9 @@ pub async fn negotiate(
     // 宝马这台（AirTunes/450.14）在屏幕流 SETUP 后约 1.5s 就关控制通道；
     // 若这段时间还在做音频 SETUP，RECORD 永远发不出去（21:13 现场）。
 
-    // ---- 8. RECORD + 心跳 ----
+    // ---- 8. RECORD（会话保活已在开流前启动）----
     emit_log("AIRPLAY: 开始 RECORD（等待车机激活会话）");
-    let rec = channel
-        .request(
-            "RECORD",
-            "/",
-            &bplist::encode(&Value::dict(vec![])),
-            "application/x-apple-binary-plist",
-            &[],
-            Duration::from_secs(5),
-        )
-        .await?;
-    if rec.status() != 200 {
-        return Err(format!("RECORD 被拒 [{}]", rec.first_line));
-    }
+    record_session(&channel).await?;
     emit_log("AIRPLAY: ✓ RECORD 完成——会话已激活");
     emit_state("connected", "AirPlay 会话已激活");
 
@@ -460,19 +402,12 @@ pub async fn negotiate(
         None
     };
 
-    spawn_keepalive_loops(
-        channel.clone(),
-        factory.clone(),
-        keep_alive_port,
-        p.car_ip.clone(),
-        stop.clone(),
-    );
-
     Ok(AirplayOutcome {
         control: channel,
         screen,
         audio,
         keep_alive_stats,
+        keepalive,
     })
 }
 
@@ -505,6 +440,122 @@ mod display_size_tests {
     fn legacy_dimensions_and_invalid_values() {
         assert_eq!(read_display_size(&Value::dict(vec![("width", Value::Int(2560)), ("height", Value::Int(744))])), (2560, 744));
         assert_eq!(read_display_size(&Value::dict(vec![("widthPixels", Value::Int(-1)), ("heightPixels", Value::Int(999999))])), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn session_setup_precedes_info_and_resource_declaration() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            let mut requests = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = socket.read(&mut chunk).await {
+                if n == 0 { break; }
+                buffer.extend_from_slice(&chunk[..n]);
+                for request in crate::rtsp::parse_rtsp_messages(&mut buffer) {
+                    requests.push(request.first_line.clone());
+                    let body = match requests.len() {
+                        1 => {
+                            assert_eq!(request.first_line, "SETUP /setup RTSP/1.0");
+                            bplist::encode(&Value::dict(vec![("eventPort", Value::int(5001))]))
+                        }
+                        2 => {
+                            assert_eq!(request.first_line, "GET /info RTSP/1.0");
+                            bplist::encode(&Value::dict(vec![("displays", Value::array(vec![Value::dict(vec![
+                                ("uuid", Value::str("actual-bmw-display")),
+                                ("widthPixels", Value::int(2560)), ("heightPixels", Value::int(744)),
+                            ])]))]))
+                        }
+                        3 => {
+                            assert_eq!(request.first_line, "POST /command RTSP/1.0");
+                            assert_eq!(bplist::parse(&request.body).unwrap().get("type").and_then(Value::as_str), Some("modesChanged"));
+                            Vec::new()
+                        }
+                        _ => panic!("unexpected extra request"),
+                    };
+                    let response = format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: {}\r\n\r\n", request.cseq().unwrap(), body.len());
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                    socket.write_all(&body).await.unwrap();
+                }
+            }
+            requests
+        });
+        let socket = TcpStream::connect(addr).await.unwrap();
+        let (read, write) = socket.into_split();
+        let (channel, _) = RtspChannel::spawn(read, write, None);
+        let (_, info) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", 12345, true, Value::dict(vec![])).await.unwrap();
+        let display = &info.get("displays").unwrap().as_array().unwrap()[0];
+        assert_eq!(uuid_text(display.get("uuid")).as_deref(), Some("actual-bmw-display"));
+        assert_eq!(read_display_size(display), (2560, 744));
+        require_modes_changed(&channel).await.unwrap();
+        drop(channel);
+        assert_eq!(peer.await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn keepalive_runs_while_record_waits_and_stops_with_its_owner() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct LocalSockets;
+        impl SocketProvider for LocalSockets {
+            fn open_tcp(&self, _: &str, _: u16, _: u32) -> Option<TcpStream> { None }
+            fn open_udp(&self, host: &str, port: u16) -> Option<UdpSocket> {
+                let socket = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
+                socket.connect((host, port)).ok()?;
+                socket.set_nonblocking(true).ok()?;
+                UdpSocket::from_std(socket).ok()
+            }
+        }
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = udp.local_addr().unwrap().port();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let mut record_cseq = None;
+            loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                buffer.extend_from_slice(&chunk[..n]);
+                for request in crate::rtsp::parse_rtsp_messages(&mut buffer) {
+                    match request.first_line.as_str() {
+                        "RECORD / RTSP/1.0" => {
+                            assert!(request.body.is_empty(), "CatPlay RECORD has no plist body");
+                            record_cseq = request.cseq();
+                        }
+                        "POST /feedback RTSP/1.0" => {
+                            let record_cseq = record_cseq.expect("feedback must run during pending RECORD");
+                            let response = format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\nRTSP/1.0 200 OK\r\nCSeq: {record_cseq}\r\nContent-Length: 0\r\n\r\n", request.cseq().unwrap());
+                            socket.write_all(response.as_bytes()).await.unwrap();
+                            // Hold the socket until the test aborts the receiver task.
+                            std::future::pending::<()>().await;
+                        }
+                        other => panic!("unexpected request: {other}"),
+                    }
+                }
+            }
+        });
+        let socket = TcpStream::connect(addr).await.unwrap();
+        let (read, write) = socket.into_split();
+        let (channel, _) = RtspChannel::spawn(read, write, None);
+        let tasks = spawn_keepalive_loops(channel.clone(), Arc::new(LocalSockets), udp_port, "127.0.0.1".to_string(), Arc::new(Notify::new()));
+        let handles: Vec<_> = tasks.0.iter().map(|task| task.abort_handle()).collect();
+        let record = record_session(&channel);
+        let ping = async {
+            let mut bytes = [0u8; 8];
+            let (len, _) = tokio::time::timeout(Duration::from_secs(1), udp.recv_from(&mut bytes)).await.unwrap().unwrap();
+            assert_eq!(len, 4, "UDP keepalive must precede RECORD completion");
+        };
+        let (record_result, ()) = tokio::join!(record, ping);
+        record_result.unwrap();
+        drop(tasks);
+        tokio::task::yield_now().await;
+        assert!(handles.iter().all(|handle| handle.is_finished()));
+        peer.abort();
     }
 
     #[tokio::test]
@@ -645,6 +696,70 @@ fn build_session_setup(device_id: &str, timing_port: u16, encrypted: bool) -> Ve
     bplist::encode(&Value::dict(fields))
 }
 
+async fn send_modes_changed(channel: &Arc<RtspChannel>) -> Option<u16> {
+    match channel.request(
+        "POST", "/command", &build_modes_changed(),
+        "application/x-apple-binary-plist", &[], Duration::from_secs(5),
+    ).await {
+        Ok(resp) => {
+            emit_log(&format!("AIRPLAY: modesChanged [{}]", resp.first_line));
+            Some(resp.status())
+        }
+        Err(e) => {
+            emit_log(&format!("AIRPLAY: modesChanged 失败 - {e}"));
+            None
+        }
+    }
+}
+
+async fn require_modes_changed(channel: &Arc<RtspChannel>) -> Result<(), String> {
+    match send_modes_changed(channel).await {
+        Some(200) => Ok(()),
+        status => Err(format!("会话 SETUP 后 modesChanged 未获确认（status={status:?}），停止流激活")),
+    }
+}
+
+async fn record_session(channel: &Arc<RtspChannel>) -> Result<(), String> {
+    // CatPlay AirPlayRtspClient::record 使用无请求体的 RECORD /。
+    let reply = channel.request(
+        "RECORD", "/", &[], "application/x-apple-binary-plist", &[], Duration::from_secs(5),
+    ).await?;
+    if reply.status() != 200 {
+        return Err(format!("RECORD 被拒 [{}]", reply.first_line));
+    }
+    Ok(())
+}
+
+async fn setup_and_read_info(
+    channel: &Arc<RtspChannel>, device_id: &str, timing_port: u16, encrypted: bool, previous_info: Value,
+) -> Result<(Value, Value), String> {
+    let body = build_session_setup(device_id, timing_port, encrypted);
+    let reply = channel.request(
+        "SETUP", "/setup", &body, "application/x-apple-binary-plist", &[], Duration::from_secs(10),
+    ).await?;
+    if reply.status() != 200 {
+        return Err(format!("会话 SETUP 被拒 [{}]（deviceID={device_id}；接收端若启用设备过滤请选择该地址）", reply.first_line));
+    }
+    let setup = bplist::parse(&reply.body).map_err(|e| format!("SETUP 应答解析失败: {e}"))?;
+    // SETUP 前的 455 只说明阶段未就绪，不能据此认定车机没有显示能力。
+    emit_log("AIRPLAY: 会话 SETUP 已接受——读取会话内 /info");
+    let info = match fetch_info(channel).await {
+        Ok(value) if value.as_dict().map(|d| !d.is_empty()).unwrap_or(false) => {
+            emit_log("AIRPLAY: 会话内 /info 成功，采用本轮车机显示能力");
+            value
+        }
+        Ok(_) => {
+            emit_log("AIRPLAY: 会话内 /info 为空，保留先前能力或设置兜底");
+            previous_info
+        }
+        Err(error) => {
+            emit_log(&format!("AIRPLAY: 会话内 /info 仍不可用（{error}），保留先前能力或设置兜底"));
+            previous_info
+        }
+    };
+    Ok((setup, info))
+}
+
 fn build_modes_changed() -> Vec<u8> {
     let app_states = Value::array(vec![
         Value::dict(vec![("appStateID", Value::int(2)), ("entity", Value::int(0))]),
@@ -764,56 +879,68 @@ async fn negotiate_audio(
 /// 三条心跳里的前两条（屏幕 keepAlive 帧在视频 pump 里按 1s 节流）：
 ///  - UDP keepAlive：4B 随机、5s（10s 与车机看门狗等长必输——奥迪 3315 实测 10.001s 被拆）
 ///  - RTSP /feedback：1s 空体 POST（车机 ~3s 看门狗）
+pub struct KeepaliveTasks(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for KeepaliveTasks {
+    fn drop(&mut self) {
+        for task in &self.0 { task.abort(); }
+    }
+}
+
 fn spawn_keepalive_loops(
     channel: Arc<RtspChannel>,
     factory: Arc<dyn SocketProvider>,
     keep_alive_port: u16,
     car_ip: String,
     stop: Arc<Notify>,
-) {
+) -> KeepaliveTasks {
+    let mut tasks = Vec::new();
     if keep_alive_port != 0 {
         let stop_k = stop.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             let Some(udp) = factory.open_udp(&car_ip, keep_alive_port) else {
                 emit_log("AIRPLAY: keepAlive UDP 端口不可用");
                 return;
             };
             let mut n: u32 = 0;
+            // 与 CatPlay 一致，连接后立即首发；后续保留已采用的 5s 间隔。
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = stop_k.notified() => return,
-                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    _ = tick.tick() => {}
                 }
                 n = n.wrapping_add(1);
                 if udp.send(&n.to_be_bytes()).await.is_err() {
                     return;
                 }
+                if n == 1 { emit_log("AIRPLAY: keepAlive UDP 首包已发送"); }
             }
-        });
+        }));
     }
 
-    tokio::spawn(async move {
+    tasks.push(tokio::spawn(async move {
+        let mut first_reply = true;
         loop {
             tokio::select! {
                 _ = stop.notified() => return,
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
-            if channel
-                .request(
-                    "POST",
-                    "/feedback",
-                    &[],
-                    "application/octet-stream",
-                    &[],
-                    Duration::from_secs(3),
-                )
-                .await
-                .is_err()
-            {
-                return; // 控制通道已断
+            match channel.request(
+                "POST", "/feedback", &[], "application/octet-stream", &[], Duration::from_secs(3),
+            ).await {
+                Ok(reply) => {
+                    if first_reply {
+                        emit_log(&format!("AIRPLAY: feedback 首次应答 status={}", reply.status()));
+                        first_reply = false;
+                    }
+                }
+                Err(_) => return,
             }
         }
-    });
+    }));
+    KeepaliveTasks(tasks)
 }
 
 // ---------------------------------------------------------------- 事件通道分发

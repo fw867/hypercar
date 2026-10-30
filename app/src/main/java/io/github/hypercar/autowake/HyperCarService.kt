@@ -82,7 +82,9 @@ class HyperCarService : Service() {
 
     override fun onDestroy() {
         isRunning = false
+        stopForeground(STOP_FOREGROUND_REMOVE)
         releaseLocks()
+        Log.i(TAG, "前台保活已停止，通知与唤醒锁已释放")
         super.onDestroy()
     }
 

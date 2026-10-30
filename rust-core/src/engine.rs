@@ -404,6 +404,7 @@ pub async fn run_engine(
     .await?;
 
     // Requests share the encrypted control channel, with their own CSeq; feedback continues independently.
+    let _keepalive = outcome.keepalive;
     let control = outcome.control;
     let stop_ui = stop.clone();
     tokio::spawn(async move {
