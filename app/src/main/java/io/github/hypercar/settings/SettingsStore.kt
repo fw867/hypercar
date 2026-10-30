@@ -61,6 +61,24 @@ object SettingsStore {
         p().edit().putString(KEY_TARGET_MAC, mac).putString(KEY_TARGET_NAME, name).apply()
     }
 
+    /** 清理临时排查版留下的组件禁用；正式行为仅由 autoConnect 控制。 */
+    fun migrateLegacyListeningMode(context: Context) {
+        if (!p().contains("listening_disabled")) return
+        if (p().getBoolean("listening_disabled", false)) autoConnect = false
+        for (name in listOf(
+            "io.github.hypercar.autowake.CarBluetoothReceiver",
+            "io.github.hypercar.carui.MusicNotificationListener",
+            "io.github.hypercar.autowake.HyperCarService",
+        )) {
+            context.packageManager.setComponentEnabledSetting(
+                android.content.ComponentName(context.packageName, name),
+                android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DEFAULT,
+                android.content.pm.PackageManager.DONT_KILL_APP,
+            )
+        }
+        p().edit().remove("listening_disabled").apply()
+    }
+
     /** 上车自动连接（ACL 广播唤醒），默认开。 */
     var autoConnect: Boolean
         get() = p().getBoolean(KEY_AUTO_CONNECT, true)

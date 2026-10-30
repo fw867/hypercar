@@ -253,12 +253,8 @@ object HyperCarRepo {
             // 服务起来后再触发真正会话（handler 幂等，service 二次进入走直连分支）
             AutoStart.handler = handler@{ ctx, device, connected ->
                 val app = ctx.applicationContext
+                if (!SettingsStore.autoConnect) return@handler
                 if (connected) {
-                    if (userDisconnectRequested) {
-                        log("AUTO: 用户已断开本轮会话，忽略重复 ACL 连接；手动连接或下次上车可恢复")
-                        runCatching { app.stopService(Intent(app, HyperCarService::class.java)) }
-                        return@handler
-                    }
                     // 记住刚连上 ACL 的车机：本轮 iAP2 只拨/只收这台，别再去碰
                     // HI-BOX 之类已配对的旧 dongle（每次 RFCOMM 失败都白占栈、添噪音，
                     // 2026-10-25 现场日志里 10 分钟里一半是它们的连接失败）
@@ -274,10 +270,10 @@ object HyperCarRepo {
                         }.onFailure {
                             // FGS 被系统拦（未授悬浮窗等）：降级直接连接（进程可能被回收）
                             log("AUTO: FGS 启动被拦（${it.message}）——降级直接拉起会话")
-                            connect(app)
+                            connectAutomatically(app)
                         }
                     } else {
-                        connect(app)
+                        connectAutomatically(app)
                     }
                 } else {
                     // 真正离开车机后允许下一轮 ACL 自动连接；服务停止不回灌 ACL 事件。
@@ -320,7 +316,23 @@ object HyperCarRepo {
 
     // ---------------------------------------------------------------- 对 UI
 
-    fun connect(context: Context) {
+    val hasCurrentSession: Boolean get() = sessionLive.get() || connecting || streaming
+
+    fun connect(context: Context) = requestConnect(context, manual = true)
+
+    private fun connectAutomatically(context: Context) = requestConnect(context, manual = false)
+
+    private fun requestConnect(context: Context, manual: Boolean) {
+        init(context)
+        scope.launch {
+            autoConnectChanges.lock()
+            try {
+                if (AutomaticConnectionPolicy.mayStart(manual, SettingsStore.autoConnect)) beginConnect(context)
+            } finally { autoConnectChanges.unlock() }
+        }
+    }
+
+    private fun beginConnect(context: Context) {
         init(context)
         if (connecting || streaming) {
             log("CONNECT: 已在连接/已连接，忽略重复触发")
@@ -333,6 +345,8 @@ object HyperCarRepo {
         sessionHadLink = false
         connecting = true
         sessionLive.set(true)
+        runCatching { context.startForegroundService(HyperCarService.sessionIntent(context)) }
+            .onFailure { log("SERVICE: 会话保活启动失败：${it.message}") }
         // 阶段计时基准：之后每条 CONNECT 日志都带 +Nms，一眼看出卡在哪一步
         sessionStageStart = System.currentTimeMillis()
         push(link = LinkState.Negotiating("检查 Shizuku"))
@@ -362,7 +376,9 @@ object HyperCarRepo {
         val target = mac?.trim()?.takeIf { it.isNotEmpty() }?.uppercase(java.util.Locale.ROOT)
         SettingsStore.setTargetCar(target, name?.takeIf { target != null && it.isNotBlank() })
         aclCarMac = null
+        standbyEndpoint.set(null)
         iap2?.onTargetChanged()
+        appContext()?.let { startAutomaticListening(it) }
         io.github.hypercar.settings.SettingsRevision.bump()
         log("TARGET: 用户目标=${target ?: "自动"}，已清除旧 ACL 候选；入站过滤立即生效，已建立会话保持")
     }
@@ -389,23 +405,95 @@ object HyperCarRepo {
     fun disconnect() = disconnect(userInitiated = true)
 
     private fun disconnect(userInitiated: Boolean) {
-        MusicBridge.onCarDisconnected()
-        if (userInitiated) userDisconnectRequested = true
+        scope.launch {
+            autoConnectChanges.lock()
+            try {
+                // 自动模式下手动停止只拆当前会话，后台监听/重连策略继续有效。
+                userDisconnectRequested = !SettingsStore.autoConnect
+                reconnectJob?.cancel()
+                reconnectJob = null
+                val pending = connectJob
+                connectJob = null
+                pending?.cancel()
+                withTimeoutOrNull(JOIN_TIMEOUT_MILLIS) { pending?.join() }
+                val keepListening = AutomaticConnectionPolicy.keepListeningAfterStop(SettingsStore.autoConnect)
+                runDisconnect(if (userInitiated) "用户断开当前会话" else "车机 ACL 断开", keepListening)
+                if (keepListening) startStandbyListening()
+                else stopStandbyListening()
+            } finally { autoConnectChanges.unlock() }
+        }
+    }
+
+    fun setAutoConnect(context: Context, enabled: Boolean) {
+        SettingsStore.autoConnect = enabled
+        io.github.hypercar.settings.SettingsRevision.bump()
+        if (!enabled) { reconnectJob?.cancel(); reconnectJob = null }
+        startAutomaticListening(context)
+    }
+
+    /** 只处理待机监听；当前手动/自动会话不随开关切换被拆除。 */
+    fun startAutomaticListening(context: Context) {
+        init(context)
+        scope.launch {
+            autoConnectChanges.lock()
+            try {
+                when (AutomaticConnectionPolicy.modeChanged(SettingsStore.autoConnect, hasCurrentSession)) {
+                    AutomaticConnectionPolicy.IdleAction.KEEP_SESSION ->
+                        log("AUTO: 自动模式=${SettingsStore.autoConnect}；保留当前会话")
+                    AutomaticConnectionPolicy.IdleAction.START_LISTENING -> startStandbyListening()
+                    AutomaticConnectionPolicy.IdleAction.STOP_LISTENING -> stopStandbyListening()
+                }
+            } finally { autoConnectChanges.unlock() }
+        }
+    }
+
+    private val autoConnectChanges = kotlinx.coroutines.sync.Mutex()
+    private val standbyEndpoint = AtomicReference<CarPlayEndpoint?>(null)
+
+    private var coordinatorProfile: io.github.hypercar.headunit.HeadUnitProfile? = null
+
+    private fun coordinatorFor(context: Context): Iap2Coordinator {
+        val profile = headUnitProfile
+        val existing = iap2
+        if (existing != null && coordinatorProfile == profile) return existing
+        existing?.stop()
+        standbyEndpoint.set(null)
+        coordinatorProfile = profile
+        return Iap2Coordinator(
+            context,
+            targetMac = { SettingsStore.targetCarMac },
+            preferredMac = { aclCarMac },
+            deviceMacProvider = { BluetoothMac.resolveOrStable(force = true) },
+            dropProfilesBeforeIap2 = profile.dropProfilesBeforeIap2,
+            allowOutboundIap2 = profile.allowOutboundIap2,
+            log = ::log,
+        ).also { iap2 = it }
+    }
+
+    private fun startStandbyListening() {
+        if (!SettingsStore.autoConnect || hasCurrentSession) return
+        val context = appContext() ?: return
+        val coordinator = coordinatorFor(context)
+        coordinator.start { endpoint ->
+            standbyEndpoint.updateAndGet { mergeEndpoint(it, endpoint) }
+            if (SettingsStore.autoConnect) connectAutomatically(context)
+        }
+        if (coordinator.isRunning) {
+            runCatching { context.startForegroundService(HyperCarService.listenIntent(context)) }
+                .onFailure { log("SERVICE: 后台监听保活启动失败：${it.message}") }
+            log("AUTO: 待机监听已启用，等待车机；尚未发起 AirPlay 会话")
+        }
+    }
+
+    private fun stopStandbyListening() {
+        if (hasCurrentSession) return
         reconnectJob?.cancel()
         reconnectJob = null
-        // 先掐在途连接：否则它会一直阻塞在「等 iAP2 端点」上，`connecting` 恒 true，
-        // 之后再上车也进不来（表现为「连了一次就再也连不上」）。
-        // 拆除等它在途协程真正退出后再动资源（join），避免「拆到一半新连接又建起来」；
-        // join 有上限——连接可能正卡在 WiFi 入网轮询这类不可中断的等待里。
-        val pending = connectJob
-        connectJob = null
-        pending?.cancel()
-        scope.launch {
-            withTimeoutOrNull(JOIN_TIMEOUT_MILLIS) { pending?.join() }
-            runDisconnect(if (userInitiated) "用户断开" else "车机 ACL 断开")
-            // 即使会话已失败/已清理，仍需收摊遗留前台服务。
-            stopForegroundService()
-        }
+        iap2?.stop()
+        iap2 = null
+        standbyEndpoint.set(null)
+        stopForegroundService()
+        log("AUTO: 待机监听与自动重连已停止；手动连接仍可用")
     }
 
     fun clearLogs() {
@@ -465,21 +553,7 @@ object HyperCarRepo {
                     "EA=${p.openEaSessions} 0x4E0E=${p.sendTransportIdentifier} " +
                     "断HFP/A2DP=${p.dropProfilesBeforeIap2} 主动拨号=${p.allowOutboundIap2} 档案A退场=${p.abortWhenCarPlayWindowClosed} "
             )
-            val coordinator = Iap2Coordinator(
-                context,
-                // 目标优先级：设置里显式指定 > 本轮 ACL 连上的车机 > 自动（全部已配对）。
-                // 带上 ACL 车机可以避免每轮去拨 HI-BOX 之类旧 dongle（10 分钟日志里一半是
-                // 它们的连接失败），也让入站只收这台车。
-                targetMac = { SettingsStore.targetCarMac },
-                preferredMac = { aclCarMac },
-                // force=true：resolve() 有 10s 静默窗，上下层几乎同时解析时非 force 调用
-                // 会返回 null → 退回稳定伪 MAC（2026-10-25 现场：同一轮出现两个身份）。
-                deviceMacProvider = { BluetoothMac.resolveOrStable(force = true) },
-                dropProfilesBeforeIap2 = headUnitProfile.dropProfilesBeforeIap2,
-                allowOutboundIap2 = headUnitProfile.allowOutboundIap2,
-                log = ::log,
-            )
-            iap2 = coordinator
+            val coordinator = coordinatorFor(context)
 
             // 等「可用」端点（有 IP），而不是等第一个回调：iAP2 两条消息分工不同——
             // 0x5703 只带热点凭据（无 IP/端口），0x4301 才带 AirPlay 端口与车机地址，
@@ -720,7 +794,7 @@ object HyperCarRepo {
      * 每调一次都 nativeStop + 重建快照 + 记一行日志，历史版本正是在这里配合
      * ACTION_STOP 回灌，把「断开」刷成了每秒几百条。
      */
-    private suspend fun runDisconnect(reason: String) {
+    private suspend fun runDisconnect(reason: String, keepListening: Boolean = false) {
         // 幂等：重复的断开事件（ACL 断开广播 + 引擎 ended + service 转交）只真正拆一次。
         // 但**状态必须回 Idle**——曾经这里直接 return，导致链路已断、界面还显示"已连接"。
         if (!sessionLive.compareAndSet(true, false)) {
@@ -735,7 +809,7 @@ object HyperCarRepo {
         }
         push(link = LinkState.Stopping)
         val hadLink = sessionHadLink
-        releaseSessionResources()
+        releaseSessionResources(keepListening)
         log("SESSION: 已断开（$reason）")
         _snapshots.update { s ->
             s.copy(
@@ -747,6 +821,7 @@ object HyperCarRepo {
             )
         }
         scheduleAutoReconnect(reason, hadLink)
+        if (!keepListening && SettingsStore.autoConnect) scheduleStandbyAfterCleanup()
     }
 
     /**
@@ -793,7 +868,7 @@ object HyperCarRepo {
                 return@launch
             }
             reconnectAttempts = attempt
-            connect(ctx)
+            connectAutomatically(ctx)
         }
     }
 
@@ -805,16 +880,22 @@ object HyperCarRepo {
     }
 
     /** 释放保活服务、iAP2、Rust 和 WiFi 绑定；拆除与失败路径共用。 */
-    private fun releaseSessionResources() {
-        stopForegroundService()
+    private fun releaseSessionResources(keepListening: Boolean = false) {
+        if (!keepListening) stopForegroundService()
         MusicBridge.onCarDisconnected()
         streaming = false
         // P1：先停自绘界面（释放 D1 显示/编码器），再停引擎。
         // 清理涉及 shell binder/编码器释放，可能卡住；异步执行，断开流程不等它。
         CarUiCaster.stopAsync()
         runCatching { RustCoreBridge.nativeStop() }
-        runCatching { iap2?.stop() }
-        iap2 = null
+        if (keepListening) {
+            standbyEndpoint.set(null)
+            runCatching { iap2?.endCurrentSession() }
+        } else {
+            runCatching { iap2?.stop() }
+            iap2 = null
+            standbyEndpoint.set(null)
+        }
         runCatching { ctrlAdvertiser?.stop() }
         ctrlAdvertiser = null
         runCatching { wifiJoiner?.release() }
@@ -1585,7 +1666,8 @@ object HyperCarRepo {
             // 网段主动扫描也只在「当前 SSID 就是车机热点」且还没扫过时做一次
             val localScanned = HashSet<String>()
             while (usable == null) {
-                val next = withTimeoutOrNull(ENDPOINT_TICK_MILLIS) { callbacks.receive() }
+                val next = standbyEndpoint.getAndSet(null)
+                    ?: withTimeoutOrNull(ENDPOINT_TICK_MILLIS) { callbacks.receive() }
                 if (next == null) {
                     ticks++
                     // ① 车机已经来邀请过（GET /ctrl-int/1/connect）→ 直接用邀请方 IP 当端点。
@@ -1740,6 +1822,17 @@ object HyperCarRepo {
         // 失败也走自动重连（同样受 hadLink / 用户断开 / 自动连接开关 / 次数上限约束），
         // 否则"车机主动关控制通道"这类场景会一直停在 Failed 等人点。
         scheduleAutoReconnect("失败: $reason", hadLink)
+        if (SettingsStore.autoConnect) scheduleStandbyAfterCleanup()
+    }
+
+    private fun scheduleStandbyAfterCleanup() {
+        val previous = connectJob
+        scope.launch {
+            withTimeoutOrNull(JOIN_TIMEOUT_MILLIS) { previous?.join() }
+            autoConnectChanges.lock()
+            try { startStandbyListening() }
+            finally { autoConnectChanges.unlock() }
+        }
     }
 
     private fun push(link: LinkState? = null) {

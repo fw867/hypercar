@@ -62,13 +62,17 @@ fun PermissionChecklistCard(
     onOpenOverlay: () -> Unit,
     onBattery: () -> Unit,
     onAutostart: () -> Unit,
+    /** 跳系统「通知使用权」页（音乐卡片必需；不在运行时权限体系里）。 */
+    onNotificationAccess: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val requiredMissing = buildList {
-        if (!summary.nearby) add(PermGroup.Nearby)
-        if (summary.locationRequired && !summary.location) add(PermGroup.Location)
-        if (summary.notificationRequired && !summary.notification) add(PermGroup.Notification)
-    }.size
+    val requiredMissing = listOf(
+        !summary.nearby,
+        summary.locationRequired && !summary.location,
+        summary.notificationRequired && !summary.notification,
+        // 通知使用权：音乐卡片的数据源，属于"必须"
+        !summary.notificationAccess,
+    ).count { it }
 
     // 卡片是否显示：必需项缺失，或还有可优化的项
     val overlayMissing = !summary.overlay
@@ -146,6 +150,14 @@ fun PermissionChecklistCard(
                 onClick = { onRequest(PermGroup.Notification) },
             )
         }
+        // 通知使用权（必做）：音乐卡片靠它读系统播放信息。只能深链系统页，无法弹窗申请。
+        StatusRow(
+            title = "通知使用权（音乐卡片）",
+            detail = "车机音乐卡片读取系统播放信息必需；只读媒体会话，不读取通知内容",
+            granted = summary.notificationAccess,
+            required = true,
+            onClick = onNotificationAccess,
+        )
 
         // ---- 可选优化 ----
         Spacer(modifier = Modifier.height(6.dp))

@@ -14,10 +14,13 @@ class HyperCarApp : Application() {
     override fun onCreate() {
         super.onCreate()
         SettingsStore.init(this)
+        // 兼容已安装的临时排查版：恢复被禁用的组件，将旧停用状态迁移至自动连接开关。
+        SettingsStore.migrateLegacyListeningMode(this)
         CarUiSettings.init(this)
         createNotificationChannel()
         // 会话总管：注入 ACL 唤醒 handler + Rust 回调监听（秒连链路的第一环）
         HyperCarRepo.init(this)
+        if (SettingsStore.autoConnect) HyperCarRepo.startAutomaticListening(this)
         // 触发 RustCoreBridge 类加载（loadLibrary + nativeInitLogger）。
         // 注意：这里绝不能再 setListener(null)——Repo 刚注册的监听会被清掉。
         RustCoreBridge.nativeIsRunning()

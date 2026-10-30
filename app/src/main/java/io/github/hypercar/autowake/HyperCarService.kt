@@ -17,67 +17,43 @@ import io.github.hypercar.HyperCarApp
 import io.github.hypercar.R
 
 /**
- * 秒连链路的前台保活服务（foregroundServiceType=connectedDevice，manifest 已配）。
- *
- * 职责边界：**只负责前台豁免与持锁**，会话重活全部转交 [AutoStart.handler]。
- *
- * cardeck 两条铁律（内化）：
- *  ① Android 12+ 后台 FGS 启动豁免**没有「蓝牙广播」这一项**；本项目靠 SYSTEM_ALERT_WINDOW
- *     （manifest 已声明）满足官方豁免项。被拦时（用户没授悬浮窗）startForegroundService 抛
- *     ForegroundServiceStartNotAllowedException——只记日志，别崩；用户手动打开 App 连一次即可
- *     （那次有可见 Activity，不受后台启动限制）。
- *  ② 停止用 startService 投递 ACTION_STOP：服务在跑时进程已是前台服务态，允许 startService
- *     （不受后台启动限制）。
- *
- * 循环防护：onStartCommand 置 [isRunning]=true **早于**转交 handler；handler 据此区分
- * 「receiver 首次拉起（isRunning=false→startForegroundService）」与「service 触发会话
- * （isRunning=true→做重活）」，不会形成 receiver↔service 无限循环。停止侧同理：
- * ACTION_STOP 只在 **isRunning 由 true 变 false 的那一次**转交 handler(false)——
- * handler(false) 内部又会投 ACTION_STOP 收摊前台，无此判据就会 handler↔service 互相
- * startService 刷屏（历史 bug）。
+ * 自动待机与当前会话的前台保活。待机只保持监听，不持 CPU / WiFi 锁；
+ * 当前会话（含自动模式关闭时的手动连接）独立持锁。
+ * ACTION_START 用于 ACL 唤醒，ACTION_LISTEN 只更新待机通知，ACTION_SESSION 保活当前会话。
+ * 停止不回灌 ACL 事件，避免服务和会话层相互触发。
  */
 class HyperCarService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
+    private var listeningOnly = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val device = deviceOf(intent)
-        when (intent?.action) {
-            ACTION_STOP -> {
-                // 只在「服务确实在跑」的这一次停止里转交会话层收尾。
-                // 会话层的 handler(connected=false) 自己也会投 ACTION_STOP（收摊前台），
-                // 若这里无条件回灌 handler，就形成
-                //   onStartCommand(STOP) → handler(false) → startService(STOP) → onStartCommand …
-                // 的自激循环：每秒数百次 nativeStop + 快照重置 + 两条日志，且与车机是否在
-                // 场无关（下车后进程还在循环里刷）。wasRunning 判据把循环卡在第一圈。
-                val wasRunning = isRunning
-                isRunning = false
-                if (device != null && wasRunning) {
-                    runCatching { AutoStart.handler?.invoke(applicationContext, device, false) }
-                        .onFailure { Log.e(TAG, "转交停止失败", it) }
-                }
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                releaseLocks()
-                stopSelf()
-                return START_NOT_STICKY
-            }
-            else -> {
-                // 必须用显式 connectedDevice 类型：2 参 startForeground 会拾取 manifest 声明的
-                // 全部类型，Android 14 对 mediaProjection 校验 AppOps 会直接崩（本服务无投影）。
-                startForegroundSafe()
-                acquireLocks()
-                isRunning = true
-                // 转交 handler 触发会话（重活在 handler 内）。receiver 路径已在 handler 里
-                // startForegroundService 过；这里 service 已前台，handler 见 isRunning=true 直接做会话。
-                if (intent?.action == ACTION_START && device != null) {
-                    runCatching { AutoStart.handler?.invoke(applicationContext, device, true) }
-                        .onFailure { Log.e(TAG, "触发会话失败", it) }
-                }
-            }
+        val automatic = intent?.action != ACTION_SESSION
+        val autoEnabled = io.github.hypercar.settings.SettingsStore.autoConnect
+        if (intent?.action == ACTION_STOP ||
+            (automatic && !autoEnabled && !io.github.hypercar.session.HyperCarRepo.hasCurrentSession)) {
+            isRunning = false
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            releaseLocks()
+            stopSelf()
+            return START_NOT_STICKY
         }
-        return START_STICKY
+        if (automatic && !autoEnabled) return START_NOT_STICKY
+        listeningOnly = intent == null || intent.action == ACTION_LISTEN
+        startForegroundSafe()
+        if (listeningOnly) releaseLocks() else acquireLocks()
+        isRunning = true
+        val device = deviceOf(intent)
+        if (intent?.action == ACTION_START && device != null) {
+            runCatching { AutoStart.handler?.invoke(applicationContext, device, true) }
+                .onFailure { Log.e(TAG, "触发会话失败", it) }
+        } else if (intent == null && autoEnabled) {
+            // 系统回收后只恢复自动待机，不能凭空重建一轮手动会话。
+            io.github.hypercar.session.HyperCarRepo.startAutomaticListening(applicationContext)
+        }
+        return if (autoEnabled) START_STICKY else START_NOT_STICKY
     }
 
     override fun onDestroy() {
@@ -154,7 +130,7 @@ class HyperCarService : Service() {
         NotificationCompat.Builder(this, HyperCarApp.CHANNEL_LINK)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentTitle(getString(R.string.notification_link_title))
-            .setContentText("正在保持与车机的连接")
+            .setContentText(if (listeningOnly) "正在监听车机，等待自动连接" else "正在保持与车机的连接")
             .setOngoing(true)
             .setAutoCancel(false)
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -176,6 +152,8 @@ class HyperCarService : Service() {
 
         /** 上车：车机 ACL 连上时（经 AutoStart.handler）拉起本服务。 */
         const val ACTION_START = "io.github.hypercar.action.AUTO_START"
+        private const val ACTION_LISTEN = "io.github.hypercar.action.LISTEN"
+        private const val ACTION_SESSION = "io.github.hypercar.action.SESSION"
 
         /** 下车：ACL 断开时（经 startService）收摊。 */
         const val ACTION_STOP = "io.github.hypercar.action.AUTO_STOP"
@@ -187,6 +165,12 @@ class HyperCarService : Service() {
         @Volatile
         var isRunning: Boolean = false
             private set
+
+        fun listenIntent(context: Context): Intent =
+            Intent(context, HyperCarService::class.java).setAction(ACTION_LISTEN)
+
+        fun sessionIntent(context: Context): Intent =
+            Intent(context, HyperCarService::class.java).setAction(ACTION_SESSION)
 
         fun startIntent(context: Context, device: BluetoothDevice): Intent =
             Intent(context, HyperCarService::class.java)

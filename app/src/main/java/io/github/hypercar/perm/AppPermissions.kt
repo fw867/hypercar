@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.perm
+package io.github.hypercar.perm
 
 import android.Manifest
 import android.app.AppOpsManager
@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 
 /**
@@ -59,6 +60,13 @@ data class PermissionSummary(
     val optionalDismissed: Boolean = false,
     /** 自启动状态：true/false 为读到；**null = 系统没有公开接口，未知**。 */
     val autostart: Boolean? = null,
+    /**
+     * **通知使用权**（`NotificationListenerService` 被用户勾选）。
+     *
+     * 不在运行时权限体系里，只能深链系统「通知使用权」页；车机音乐卡片靠它拿
+     * `MediaSessionManager.getActiveSessions`，没有它就是空的。
+     */
+    val notificationAccess: Boolean = false,
 )
 
 object AppPermissions {
@@ -182,7 +190,13 @@ object AppPermissions {
         batteryWhitelisted = isBatteryWhitelisted(context),
         optionalDismissed = isOptionalDismissed(context),
         autostart = autostartState(context),
+        notificationAccess = hasNotificationAccess(context),
     )
+
+    /** 通知使用权（只能深链系统页授权，无法用 requestPermissions 申请）。 */
+    fun hasNotificationAccess(context: Context): Boolean = runCatching {
+        NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName)
+    }.getOrDefault(false)
 
     // ------------------------------------------------------------ 深链
 

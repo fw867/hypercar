@@ -132,3 +132,47 @@ RECORD 空体、RECORD 暂不应答期间仍能收到 UDP/feedback，以及取�
 最终 Rust Android 测试二进制在 USB 手机执行，7 项通过（含上述时序/保活/加密排队回归）。
 确认 APK 内 arm64 Rust 库与此次构建产物一致；ADB 保留应用数据覆盖安装成功，
 手机已报告 versionName=0.1.0.400 / versionCode=10400。尚无真车复测结果。
+
+## DiPlay 接收端 500 根因确认（2026-10-30 16:22）
+
+USB ADB 接入 Redmi 21091116AC（evergo），包 com.shihab.diplay，版本 0.2.22 / versionCode 41。
+读取系统 logcat 后确认 /feedback 500 是接收端构造反馈响应时的异常：
+
+```text
+airplay rx POST /feedback cseq=25 body=0
+java.lang.ArrayIndexOutOfBoundsException: src.length=6 srcPos=-2 dst.length=8 dstPos=0 length=8
+  at com.shilapi.xcertplay.airplay.BplistCodec.encodeUnsignedInt(BplistCodec.kt:259)
+  at com.shilapi.xcertplay.airplay.BplistCodec.encode(BplistCodec.kt:85)
+  at com.shilapi.xcertplay.airplay.AirPlaySession.handle(AirPlaySession.kt:619)
+airplay tx status=500 cseq=25 body=0
+```
+
+16:21:27 起每秒重现。公开源码同位置为：
+`raw.copyOfRange(raw.size - size, raw.size)`；本次数值的 BigInteger 原始表示为 6 字节，
+plist 根据位数选择 8 字节，导致起始下标变为 -2，抛异常后被控制处理器转成 500。
+接收端应将较短的正整数大端表示左侧补零到目标宽度，而不是从负下标截取。
+尚未修改或安装 DiPlay；HyperCar 的反馈请求格式无需为此故障添加特殊载荷。
+完整接收端日志保存在本机临时诊断目录，不提交仓库。
+
+## 上车自动连接开关立即生效（0.1.0.402）
+
+按用户确认的范围，仅用设置原有“上车自动连接”开关控制 HyperCar 自身蓝牙会话。
+关闭时持久保存偏好，取消在途连接/重连，关闭当前 iAP2 RFCOMM 和监听 socket，清理当前
+CarPlay 会话与保活通知；新 ACL 广播、服务启动和手动连接也受同一开关约束。
+开启时恢复被动监听。快速切换串行处理，避免旧关闭任务清理新连接。
+
+不结束 App 进程、不禁用通知音乐服务，不修改系统蓝牙开关或数字钥匙。
+独立的“关闭监听并退出/恢复监听”卡片及其进程退出代码已移除；旧临时版持久停用状态
+迁移至原开关，并恢复旧版禁用的组件，避免升级后仍无法唤醒。
+首页关闭态明确显示蓝牙会话已暂停。
+
+验证：正式签名构建与 27 项 Android 单元测试通过。USB 真机先关闭、再开启、再关闭：
+日志确认 iAP2 被动监听恢复与停止，关闭时无自动重连；前后 App PID 均为 31312。
+最终保留开关关闭状态，供用户进行钥匙 A/B。数字钥匙恢复与否仍需车旁观察。
+
+## 手动 / 自动控制语义校正（0.1.0.403）
+
+0.1.0.402 将自动开关同时限制手动连接的做法已撤销。
+自动模式仅控制待机监听与自动重连，手动启动始终可用；手动停止时根据自动模式保留或关闭
+后台监听。正在进行的会话不因开关切换被拆除，待机监听也不再占用“正在协商”状态。
+具体状态表与验证见 [会话控制](SESSION-CONTROL.md)。

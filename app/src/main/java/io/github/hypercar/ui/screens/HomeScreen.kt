@@ -63,9 +63,13 @@ fun HomeScreen(
     onOpenShizukuSettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val autoConnect = remember(io.github.hypercar.settings.SettingsRevision.value) {
+        io.github.hypercar.settings.SettingsStore.autoConnect
+    }
     // 权限检查卡在两种布局里共用
     @Composable
     fun Checklist() {
+        val ctx = androidx.compose.ui.platform.LocalContext.current
         PermissionChecklistCard(
             summary = permissions,
             locationServiceOn = locationServiceOn,
@@ -74,6 +78,9 @@ fun HomeScreen(
             onOpenOverlay = onOpenOverlay,
             onBattery = onBatteryOptimization,
             onAutostart = onAutostart,
+            onNotificationAccess = {
+                io.github.hypercar.carui.MusicBridge.openAccessSettings(ctx)
+            },
         )
     }
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
@@ -94,6 +101,7 @@ fun HomeScreen(
                 ) {
                     StatusHeroCard(
                         link = snapshot.link,
+                        autoConnectEnabled = autoConnect,
                         onStartClick = onStart,
                         onStopClick = onStop,
                         onOpenLogs = onOpenDiagnostics,
@@ -128,6 +136,7 @@ fun HomeScreen(
                 // 第一张卡：实时步骤（Negotiating 时显示 link.step）
                 StatusHeroCard(
                     link = snapshot.link,
+                    autoConnectEnabled = autoConnect,
                     onStartClick = onStart,
                     onStopClick = onStop,
                     onOpenLogs = onOpenDiagnostics,

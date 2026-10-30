@@ -73,6 +73,7 @@ import kotlinx.coroutines.delay
 @Composable
 fun StatusHeroCard(
     link: LinkState,
+    autoConnectEnabled: Boolean = true,
     onStartClick: () -> Unit,
     onStopClick: () -> Unit,
     /** 右上角日志图标（原来首页底部那行「查看全部日志」文字链接）。 */
@@ -111,7 +112,7 @@ fun StatusHeroCard(
                     animationSpec = tween(300),
                     label = "hero-state",
                 ) { state ->
-                    HeroHeadline(link = state, nowMillis = nowMillis, profileLabel = profileLabel)
+                    HeroHeadline(link = state, nowMillis = nowMillis, profileLabel = profileLabel, autoConnectEnabled = autoConnectEnabled)
                 }
                 HeroAction(link = link, onStartClick = onStartClick, onStopClick = onStopClick)
             }
@@ -134,7 +135,7 @@ fun StatusHeroCard(
 /* ---------- 头部：图形 + 文案 ---------- */
 
 @Composable
-private fun HeroHeadline(link: LinkState, nowMillis: Long, profileLabel: String? = null) {
+private fun HeroHeadline(link: LinkState, nowMillis: Long, profileLabel: String? = null, autoConnectEnabled: Boolean = true) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
@@ -148,12 +149,12 @@ private fun HeroHeadline(link: LinkState, nowMillis: Long, profileLabel: String?
             when (link) {
                 is LinkState.Idle -> {
                     Text(
-                        text = "等待上车",
+                        text = if (autoConnectEnabled) "等待上车" else "手动连接",
                         style = MaterialTheme.typography.titleLarge,
                         color = TextPrimary,
                     )
                     Text(
-                        text = "车机蓝牙连上手机后将自动秒连建链",
+                        text = if (autoConnectEnabled) "正在监听车机，也可手动启动连接" else "自动监听已关闭，仍可手动启动连接",
                         style = MaterialTheme.typography.bodyMedium,
                         color = TextSecondary,
                     )

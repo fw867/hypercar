@@ -133,6 +133,8 @@ class Iap2Coordinator(
      * 车机蓝牙断开后旧 RFCOMM socket 的读会卡在半开连接上不返回——必须主动关，
      * 否则会话线程滞留、下一轮「秒连」被旧会话占位。
      */
+    fun endCurrentSession() { bluetooth?.dropCurrentSession() }
+
     fun notifyBluetoothLost() {
         log("IAP2: 蓝牙 ACL 断开——结束当前 iAP2 会话（监听保留）")
         bluetooth?.dropCurrentSession()

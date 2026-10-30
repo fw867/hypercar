@@ -1143,7 +1143,8 @@ private fun FpsSegment(fps: Int, onFpsChanged: (Int) -> Unit) {
 
 @Composable
 private fun BehaviorSection() {
-    var autoConnect by rememberSaveable { mutableStateOf(SettingsStore.autoConnect) }
+    val context = LocalContext.current
+    var autoConnect by remember(io.github.hypercar.settings.SettingsRevision.value) { mutableStateOf(SettingsStore.autoConnect) }
     var enableAudio by rememberSaveable { mutableStateOf(SettingsStore.enableAudio) }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1153,11 +1154,11 @@ private fun BehaviorSection() {
         ) {
             SwitchRow(
                 title = "上车自动连接",
-                subtitle = "车机蓝牙 ACL 连上手机即唤醒协商",
+                subtitle = "控制待机监听与自动重连，不影响手动连接或当前会话",
                 checked = autoConnect,
                 onCheckedChange = {
                     autoConnect = it
-                    SettingsStore.autoConnect = it
+                    HyperCarRepo.setAutoConnect(context, it)
                 },
             )
             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
