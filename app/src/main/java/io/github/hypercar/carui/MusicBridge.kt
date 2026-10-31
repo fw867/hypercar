@@ -13,6 +13,7 @@ import android.media.session.PlaybackState
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import kotlinx.coroutines.launch
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import androidx.core.app.NotificationManagerCompat
@@ -104,6 +105,9 @@ object MusicBridge {
     private var sessionsListener: MediaSessionManager.OnActiveSessionsChangedListener? = null
     /** 上一次「选中」日志的 key，避免断连后 session 抖动导致刷屏（2026-10-31）。 */
     private var lastChoiceKey = ""
+    /** 拉起音乐 App 用（Shizuku exec 挂起，需脱离音乐线程）。 */
+    private val launchScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO)
     private var permissionDenied = false
     private var resumePackage: String? = null
     private var carConnected = false
@@ -140,22 +144,223 @@ object MusicBridge {
     }
 
     fun onCarAudioReady() = onMusicThread(wait = false) {
+        // 诊断：把参与判断的几个开关都打出来，便于定位"自动播放没触发"（2026-10-31）
+        HyperCarRepo.log("MUSIC: 音频就绪检查 carConnected=$carConnected pending=$autoPlayPending autoPlayCfg=${CarUiSettings.autoPlayOnConnect} defaultPkg=${CarUiSettings.defaultMusicPackage} resume=$resumePackage")
         if (carConnected) {
             carAudioReady = true
-            if (autoPlayPending && CarUiSettings.autoPlayOnConnect && resumePackage == null) {
+            // **去掉 `resumePackage == null` 这个门槛**（2026-10-31 实测）：
+            // 上次断连时会把当时的播放器写进 resume_package 并在 attach() 时读回，
+            // 于是冷启动时 resumePackage 一开始就非空 → 自动播放整段被跳过，
+            // 而 resumeAfterReconnect() 又因为没有会话直接 return，结果永远不拉。
+            // 现在只要「开了自动播放」就执行；resumePackage 只作为 pkg 的兜底来源。
+            if (autoPlayPending && CarUiSettings.autoPlayOnConnect) {
                 val pkg = CarUiSettings.defaultMusicPackage.takeIf { it.isNotBlank() }
-                    ?: preferredPackage ?: controller?.packageName
+                    ?: preferredPackage ?: resumePackage ?: controller?.packageName
                 if (pkg != null) {
                     resumePackage = pkg
                     autoPlayDeadline = SystemClock.elapsedRealtime() + 15_000
                     val ctx = service
                     if (ctx != null && controller?.packageName != pkg) selectPackage(ctx, pkg)
+                    // **冷启动时把音乐 App 真的拉起来**（2026-10-31）：
+                    // 之前只调 selectPackage()，它只是"选中偏好"，App 没在跑就没有 MediaSession，
+                    // 于是 resumeAfterReconnect() 找不到会话、音乐卡片一直停在"连接你的音乐"。
+                    // 这里主动启动默认音乐 App，再等它的会话出现（15s 超时）。
+                    if (ctx != null && controller?.packageName != pkg) {
+                        // 异步拉起（Shizuku exec 是挂起函数，不能占住音乐线程）
+                        launchScope.launch {
+                            val r = runCatching { launchMusicApp(ctx, pkg) }.getOrElse { "err" }
+                            HyperCarRepo.log("MUSIC: 自动播放 → 拉起 $pkg（$r）")
+                        }
+                    }
                     HyperCarRepo.log("MUSIC: 音频就绪，准备自动播放 $pkg")
                 }
             }
             autoPlayPending = false
             resumeAfterReconnect()
         }
+    }
+
+    /**
+     * 启动指定音乐 App（2026-10-31）。
+     *
+     * 车机界面在虚拟屏上，App 本身多半处于后台，直接 startActivity 会被
+     * Android 的后台启动限制拦掉；所以优先走 Shizuku 的 `am start`，
+     * 失败再退回普通 startActivity（有前台可见性时仍可用）。
+     */
+    /**
+     * 启动指定音乐 App（2026-10-31）。**优先把它放到一块不可见的虚显上**，
+     * 和地图（D2）一样在后台跑，不再把音乐 App 拉到手机前台。
+     *
+     * 做法：用 ImageReader 造一个 1080×1920 的 Surface（只给虚显当输出，不读帧、不编码），
+     * 交给 shell 建一块 PUBLIC 虚显，然后 `am start --display N`。
+     * 虚显常驻复用，切 App 时只换 display 上的 Activity。
+     */
+    /**
+     * **把音乐 App 拉到手机屏幕**（2026-10-31）。
+     *
+     * 自动播放时我们把它放在不可见虚显上（不抢前台），但用户想改播放列表/音效时必须能在手机上操作。
+     * 由于 App 的 task 已经在虚拟屏上，单纯 `am start --display 0` 不一定能把 task 迁过去，
+     * 所以这里做"强制重启到默认屏"：force-stop（清掉虚显上的实例）→ 普通 am start（落主屏）。
+     * 下一次连接/自动播放会重新把它放回虚显。
+     */
+    fun openOnPhone(pkg: String) {
+        if (pkg.isBlank()) return
+        launchScope.launch {
+            val ctx = service
+            val intent = ctx?.packageManager?.getLaunchIntentForPackage(pkg)
+            val comp = intent?.component
+            if (io.github.hypercar.shizuku.ShizukuTools.isReady && comp != null) {
+                runCatching {
+                    io.github.hypercar.shizuku.ShizukuTools.exec("am force-stop $pkg", 6_000)
+                }
+                val r = runCatching {
+                    io.github.hypercar.shizuku.ShizukuTools.exec(
+                        "am start -n ${comp.flattenToShortString()}", 8_000)
+                }.getOrNull()
+                HyperCarRepo.log("MUSIC: 拉到手机屏幕 $pkg（${if (r?.ok == true) "ok" else r?.err?.take(60)}）")
+            } else if (intent != null && ctx != null) {
+                runCatching {
+                    ctx.startActivity(intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+                    HyperCarRepo.log("MUSIC: 拉到手机屏幕 $pkg（startActivity）")
+                }
+            }
+        }
+    }
+
+    private suspend fun launchMusicApp(ctx: android.content.Context, pkg: String): String {
+        val intent = runCatching { ctx.packageManager.getLaunchIntentForPackage(pkg) }.getOrNull()
+            ?: return "no-launch-intent"
+        val comp = intent.component
+        if (comp != null && io.github.hypercar.shizuku.ShizukuTools.isReady) {
+            // ① 复用/新建一块不可见虚显（1080×1920：窗口越小播放器解码的封面越小、显得模糊）
+            val dId = ensureIdleDisplay()
+            if (dId > 0) {
+                val r = runCatching {
+                    io.github.hypercar.shizuku.ShizukuTools.exec(
+                        "am start -n ${comp.flattenToShortString()} --display $dId", 8_000)
+                }.getOrNull()
+                if (r != null && r.ok) return "display-$dId"
+                HyperCarRepo.log("MUSIC: 虚显 $dId 启动失败（${r?.err?.take(80)}），回退普通启动")
+            }
+            // ② 虚显不可用 → 退回普通 am start（会短暂跳到前台）
+            val r = runCatching {
+                io.github.hypercar.shizuku.ShizukuTools.exec(
+                    "am start -n ${comp.flattenToShortString()}", 8_000)
+            }.getOrNull()
+            if (r != null && r.ok) return "am-start-ok(前台)"
+        }
+        return runCatching {
+            ctx.startActivity(intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+            "activity-ok(前台)"
+        }.getOrElse { "fail:${it.javaClass.simpleName}" }
+    }
+
+    /** 音乐 App 用的不可见虚显（8×8）；建好后整场复用。 */
+    private var idleDisplayId = -1
+    /** 卡片里那块 TextureView 的 Surface（关闭时要释放）。 */
+    private var viewSurface: android.view.Surface? = null
+    /** 卡片里那块视图的实际像素尺寸（触摸换算要用它，和虚显一致）。 */
+    @Volatile var viewW = 1080; private set
+    @Volatile var viewH = 1920; private set
+    private var idleReader: android.media.ImageReader? = null
+
+    // ---- 音乐 App 在卡片里显示（2026-11-01）----
+    /** 音乐虚显的逻辑尺寸（触摸换算、建屏都用它）。 */
+    val MUSIC_DISPLAY_W = 1080
+    val MUSIC_DISPLAY_H = 1920
+
+    /** 音乐 App 的虚显 id（未创建时为 -1）。 */
+    fun musicDisplayId(): Int = idleDisplayId
+
+    /** 把音乐虚显的输出面换成卡片里的 TextureView，画面就"搬进"音乐卡。 */
+    /**
+     * 把音乐 App 显示在音乐卡里（2026-11-01 第二版）。
+     *
+     * 关键变化：**按卡片的真实像素尺寸重建虚显**（而不是把 1080×1920 的画面硬塞进横卡），
+     * 这样宽高比和卡片一致 —— 既不变形，也不会黑屏（上一次黑屏是因为把竖屏虚显的
+     * 输出面直接换到了比例完全不同的卡面上）。
+     */
+    fun showInView(texture: android.graphics.SurfaceTexture, w: Int, h: Int) {
+        if (w <= 0 || h <= 0) return
+        texture.setDefaultBufferSize(w, h)
+        viewW = w; viewH = h    // 触摸换算要用卡片真实像素（2026-11-01）
+        val surface = android.view.Surface(texture)
+        viewSurface = surface
+        launchScope.launch {
+            // 先释放后台虚显，再按卡片尺寸建一块新的
+            releaseIdleDisplay()
+            val created = runCatching {
+                io.github.hypercar.spike.SpikeShell.createDisplay(surface, w, h, 160, 0, "hypercar-music-view")
+            }.getOrNull().orEmpty()
+            val id = Regex("id=(\\d+)").find(created)?.groupValues?.get(1)?.toIntOrNull() ?: -1
+            if (id <= 0) {
+                HyperCarRepo.log("MUSIC: 建卡片虚显失败：${created.take(100)}")
+                return@launch
+            }
+            idleDisplayId = id
+            HyperCarRepo.log("MUSIC: 音乐画面进卡片 display=$id ${w}x$h")
+            // 把当前 App 拉到这块新虚显上（原来的实例随旧虚显一起没了）
+            val pkg = controller?.packageName
+                ?: CarUiSettings.defaultMusicPackage.takeIf { it.isNotBlank() }
+            if (pkg != null) {
+                val comp = runCatching {
+                    service?.packageManager?.getLaunchIntentForPackage(pkg)?.component
+                }.getOrNull()
+                if (comp != null) {
+                    val r = runCatching {
+                        io.github.hypercar.shizuku.ShizukuTools.exec(
+                            "am start -n ${comp.flattenToShortString()} --display $id", 8_000)
+                    }.getOrNull()
+                    HyperCarRepo.log("MUSIC: 卡片内拉起 $pkg（${if (r?.ok == true) "ok" else r?.err?.take(60)}）")
+                }
+            }
+        }
+    }
+
+    /** 卡片收起：拆掉卡片虚显，重建后台虚显并让 App 继续在后台跑（不中断播放）。 */
+    fun hideFromView() {
+        launchScope.launch {
+            viewSurface = null
+            val pkg = controller?.packageName
+            releaseIdleDisplay()
+            val id = ensureIdleDisplay()
+            HyperCarRepo.log("MUSIC: 音乐 App 回到后台 display=$id")
+        }
+    }
+
+    fun touch(action: Int, x: Int, y: Int) {
+        val id = idleDisplayId
+        if (id <= 0) return
+        runCatching { io.github.hypercar.spike.SpikeShell.motion(id, action, x, y, SystemClock.uptimeMillis()) }
+    }
+
+    private suspend fun ensureIdleDisplay(): Int {
+        if (idleDisplayId > 0) return idleDisplayId
+        val reader = runCatching {
+            android.media.ImageReader.newInstance(MUSIC_DISPLAY_W, MUSIC_DISPLAY_H, android.graphics.PixelFormat.RGBA_8888, 2)
+        }.getOrNull() ?: return -1
+        val created = runCatching {
+            io.github.hypercar.spike.SpikeShell.createDisplay(
+                reader.surface, MUSIC_DISPLAY_W, MUSIC_DISPLAY_H, 160, 0, "hypercar-music")
+        }.getOrNull().orEmpty()
+        val id = Regex("id=(\\d+)").find(created)?.groupValues?.get(1)?.toIntOrNull() ?: -1
+        if (id <= 0) {
+            HyperCarRepo.log("MUSIC: 建音乐虚显失败：${created.take(120)}")
+            runCatching { reader.close() }
+            return -1
+        }
+        idleReader = reader       // 保持引用，避免 Surface 被回收
+        idleDisplayId = id
+        HyperCarRepo.log("MUSIC: 音乐虚显就绪 display=$id（${created.take(80)}）")
+        return id
+    }
+
+    /** 会话结束/切换时释放音乐虚显（由 detach 调用）。 */
+    private fun releaseIdleDisplay() {
+        if (idleDisplayId > 0) runCatching { io.github.hypercar.spike.SpikeShell.releaseDisplay(idleDisplayId) }
+        idleDisplayId = -1
+        runCatching { idleReader?.close() }
+        idleReader = null
     }
 
     fun onCarDisconnected() = onMusicThread {

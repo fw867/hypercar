@@ -14,6 +14,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.pointerInteropFilter
+import androidx.compose.foundation.Image
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -218,7 +222,9 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
                         buttonSize = 68, bitmap = mapIcon) { enterMap() }
                     DockButton(Icons.Rounded.MusicNote, "音乐", Color(0xFF7B51EB),
                         buttonSize = 68, bitmap = musicIcon) {
-                        launchMusic(context, music)
+                        // Dock 音乐按钮 = 在音乐卡里打开当前音乐 App（2026-11-01）
+                        MusicUiState.appView = music.packageName.isNotBlank()
+                        if (music.packageName.isBlank()) launchMusic(context, music)
                     }
                     DockButton(Icons.Rounded.Settings, "设置", Color(0xFF5B5675), buttonSize = 68) {
                         settings = true
@@ -374,6 +380,8 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
     var picker by remember { mutableStateOf(false) }
     var queueOpen by remember(music.packageName) { mutableStateOf(false) }
     var modesOpen by remember(music.packageName) { mutableStateOf(false) }
+    // 是否把音乐 App 的界面直接显示在这张卡片里（2026-11-01）
+    // 共享状态：Dock 的音乐按钮 / 卡片右上角 ⤢ 都通过它切换
     val mode = music.dedicatedMode ?: MusicPlaybackModes.current(music.repeatMode, music.shuffleMode)
     val modes = if (music.dedicatedMode != null) listOf(MusicPlaybackMode.ALL, MusicPlaybackMode.ONE, MusicPlaybackMode.SHUFFLE)
         else MusicPlaybackModes.available(music.canRepeat, music.canShuffle, music.repeatMode, music.shuffleMode)
@@ -385,6 +393,12 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
     Box(modifier.clip(CardShape).background(Brush.verticalGradient(
         if (dark) listOf(Color(0xFF484265), Color(0xFF25203A), Color(0xFF171623))
         else listOf(Color(0xFFD6E5F5), Color(0xFFF1F7FE), Color(0xFFE4EFFA))))) {
+        // **音乐 App 直接显示在这张卡片里**（2026-11-01）：打开后可直接在车机上操作它的
+        // 播放列表/设置；右上角关闭按钮收起、回到常规音乐卡。画面来自音乐虚显，触摸经 shell 注入。
+        if (MusicUiState.appView) {
+            MusicAppPanel(Modifier.fillMaxSize()) { MusicUiState.appView = false }
+            return@Box
+        }
         music.albumArt?.let {
             Image(it.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
         }
@@ -401,10 +415,24 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
                 Color(0xFFF2F7FD).copy(alpha = .10f), Color(0xFFF2F7FD).copy(alpha = .32f),
                 Color(0xFFF2F7FD).copy(alpha = .86f), Color(0xFFF2F7FD).copy(alpha = .95f)))
         }))
+        // **右上角 ⤢**（2026-11-01）：在卡片内打开音乐 App（原来放在应用名旁边，位置不直观）
+        if (music.packageName.isNotBlank()) {
+            Box(
+                Modifier.align(Alignment.TopEnd).padding(top = 10.dp, end = 10.dp).size(34.dp)
+                    .clip(CircleShape).background(ink.copy(alpha = .10f))
+                    .clickable(onClickLabel = "在卡片里操作音乐 App") { MusicUiState.appView = true },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(Icons.Rounded.OpenInFull, "在卡片里打开音乐 App",
+                    tint = ink.copy(alpha = .85f), modifier = Modifier.size(18.dp))
+            }
+        }
         Column(Modifier.fillMaxSize().padding(18.dp)) {
             Row(
                 Modifier
                     .clip(RoundedCornerShape(12.dp))
+                    // 只让"图标 + 应用名"这一小段可点（原来整行/整条顶部都能点，容易误触）
+                    .widthIn(max = 150.dp)
                     .clickable(enabled = installed.isNotEmpty()) { picker = true }
                     .padding(horizontal = 4.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -420,11 +448,6 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
                 }
                 Spacer(Modifier.width(8.dp))
                 Text(music.appLabel.ifBlank { "音乐" }, color = ink.copy(alpha = .85f), fontSize = 12.sp)
-                if (installed.isNotEmpty()) {
-                    Spacer(Modifier.width(4.dp))
-                    Icon(Icons.Rounded.ExpandMore, "切换音乐应用", tint = ink.copy(alpha = .8f),
-                        modifier = Modifier.size(18.dp))
-                }
                 Spacer(Modifier.weight(1f))
                 if (music.playing) Icon(Icons.Rounded.GraphicEq, "正在播放", tint = ink, modifier = Modifier.size(22.dp))
             }
@@ -619,13 +642,16 @@ private fun PlayerButton(
 }
 
 private fun launchMusic(context: android.content.Context, music: NowPlaying) {
-    val intent = music.packageName.takeIf { it.isNotBlank() }
-        ?.let { context.packageManager.getLaunchIntentForPackage(it) }
-    if (intent != null) runCatching {
-        val options = android.app.ActivityOptions.makeBasic().setLaunchDisplayId(0)
-        context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), options.toBundle())
+    // **在手机屏幕上打开当前音乐 App**（2026-10-31）：自动播放把它放在不可见虚显上，
+    // 用户要改播放列表/音效时必须能把它调回手机；走 MusicBridge.openOnPhone()，
+    // 它会 force-stop 虚显上的实例再在默认屏启动（单纯 am start --display 0 不一定能迁 task）。
+    if (music.packageName.isNotBlank() &&
+        context.packageManager.getLaunchIntentForPackage(music.packageName) != null
+    ) {
+        MusicBridge.openOnPhone(music.packageName)
+        return
     }
-    else MusicBridge.openAccessSettings(context)
+    MusicBridge.openAccessSettings(context)
 }
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -761,6 +787,72 @@ private fun AppTile(
             maxLines = 2, overflow = TextOverflow.Ellipsis)
         if (label2 != null) {
             Text(label2, color = CarAccent, fontSize = 12.sp)
+        }
+    }
+}
+
+/**
+ * 音乐 App 面板（2026-11-01）：把音乐虚显的画面直接铺在这张卡片里，
+ * 触摸按比例换算成虚显像素后经 SpikeShell 注入，于是可以在车机上操作它的
+ * 播放列表/设置；右上角「关闭」收起回到常规音乐卡。
+ */
+@Composable
+private fun MusicAppPanel(modifier: Modifier, onClose: () -> Unit) {
+    Box(modifier.background(Color.Black)) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { context ->
+                android.view.TextureView(context).apply {
+                    // **触摸转发**（2026-11-01）：用 View 自己的 MotionEvent 坐标换算成虚显像素。
+                    // 之前事件根本没进来（TextureView 不消费触摸），所以怎么改换算都没反应。
+                    setOnTouchListener { v, ev ->
+                        val w = v.width; val h = v.height
+                        if (w > 0 && h > 0) {
+                            val x = (ev.x / w * MusicBridge.viewW).toInt()
+                            val y = (ev.y / h * MusicBridge.viewH).toInt()
+                            val action = when (ev.actionMasked) {
+                                android.view.MotionEvent.ACTION_DOWN -> 0
+                                android.view.MotionEvent.ACTION_MOVE -> 2
+                                android.view.MotionEvent.ACTION_UP,
+                                android.view.MotionEvent.ACTION_CANCEL -> 1
+                                else -> -1
+                            }
+                            if (action >= 0) {
+                                if (ev.actionMasked == android.view.MotionEvent.ACTION_DOWN) {
+                                    io.github.hypercar.session.HyperCarRepo.log(
+                                        "MUSIC-TOUCH: v=(${ev.x.toInt()},${ev.y.toInt()}) view=${w}x$h d=($x,$y)")
+                                }
+                                MusicBridge.touch(action, x, y)
+                            }
+                        }
+                        true
+                    }
+                    surfaceTextureListener = object : android.view.TextureView.SurfaceTextureListener {
+                        override fun onSurfaceTextureAvailable(
+                            texture: android.graphics.SurfaceTexture, width: Int, height: Int,
+                        ) = MusicBridge.showInView(texture, width, height)
+
+                        override fun onSurfaceTextureSizeChanged(
+                            texture: android.graphics.SurfaceTexture, width: Int, height: Int,
+                        ) = MusicBridge.showInView(texture, width, height)
+
+                        override fun onSurfaceTextureDestroyed(texture: android.graphics.SurfaceTexture): Boolean {
+                            MusicBridge.hideFromView(); return true
+                        }
+
+                        override fun onSurfaceTextureUpdated(texture: android.graphics.SurfaceTexture) = Unit
+                    }
+                }
+            },
+        )
+        // 关闭按钮
+        Box(
+            Modifier.align(Alignment.TopEnd).padding(10.dp).size(38.dp).clip(CircleShape)
+                .background(Color(0xCC1B1930))
+                .clickable(onClickLabel = "关闭音乐 App 视图") { MusicBridge.hideFromView(); onClose() },
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(Icons.Rounded.Close, "关闭", tint = White, modifier = Modifier.size(20.dp))
         }
     }
 }
