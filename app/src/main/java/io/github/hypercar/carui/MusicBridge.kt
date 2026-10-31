@@ -262,6 +262,8 @@ object MusicBridge {
     /** 卡片里那块视图的实际像素尺寸（触摸换算要用它，和虚显一致）。 */
     @Volatile var viewW = 1080; private set
     @Volatile var viewH = 1920; private set
+    private var baseW = 1080; private var baseH = 1920
+    private var viewTexture: android.graphics.SurfaceTexture? = null
     private var idleReader: android.media.ImageReader? = null
 
     // ---- 音乐 App 在卡片里显示（2026-11-01）----
@@ -283,36 +285,35 @@ object MusicBridge {
     fun showInView(texture: android.graphics.SurfaceTexture, w: Int, h: Int) {
         if (w <= 0 || h <= 0) return
         texture.setDefaultBufferSize(w, h)
-        viewW = w; viewH = h    // 触摸换算要用卡片真实像素（2026-11-01）
+        viewW = w; viewH = h
         val surface = android.view.Surface(texture)
         viewSurface = surface
-        launchScope.launch {
-            // 先释放后台虚显，再按卡片尺寸建一块新的
-            releaseIdleDisplay()
-            val created = runCatching {
-                io.github.hypercar.spike.SpikeShell.createDisplay(surface, w, h, 160, 0, "hypercar-music-view")
-            }.getOrNull().orEmpty()
-            val id = Regex("id=(\\d+)").find(created)?.groupValues?.get(1)?.toIntOrNull() ?: -1
-            if (id <= 0) {
-                HyperCarRepo.log("MUSIC: 建卡片虚显失败：${created.take(100)}")
-                return@launch
-            }
-            idleDisplayId = id
-            HyperCarRepo.log("MUSIC: 音乐画面进卡片 display=$id ${w}x$h")
-            // 把当前 App 拉到这块新虚显上（原来的实例随旧虚显一起没了）
-            val pkg = controller?.packageName
-                ?: CarUiSettings.defaultMusicPackage.takeIf { it.isNotBlank() }
-            if (pkg != null) {
-                val comp = runCatching {
-                    service?.packageManager?.getLaunchIntentForPackage(pkg)?.component
+        launchScope.launch { createViewDisplay(surface, w, h) }
+    }
+
+    private suspend fun createViewDisplay(surface: android.view.Surface, dw: Int, dh: Int) {
+        releaseIdleDisplay()
+        val created = runCatching {
+            io.github.hypercar.spike.SpikeShell.createDisplay(surface, dw, dh, 160, 0, "hypercar-music-view")
+        }.getOrNull().orEmpty()
+        val id = Regex("id=(\\d+)").find(created)?.groupValues?.get(1)?.toIntOrNull() ?: -1
+        if (id <= 0) {
+            HyperCarRepo.log("MUSIC: 建卡片虚显失败：${created.take(100)}")
+            return
+        }
+        idleDisplayId = id
+        HyperCarRepo.log("MUSIC: 音乐画面进卡片 display=$id ${dw}x$dh")
+        val pkg = controller?.packageName ?: CarUiSettings.defaultMusicPackage.takeIf { it.isNotBlank() }
+        if (pkg != null) {
+            val comp = runCatching {
+                service?.packageManager?.getLaunchIntentForPackage(pkg)?.component
+            }.getOrNull()
+            if (comp != null) {
+                val r = runCatching {
+                    io.github.hypercar.shizuku.ShizukuTools.exec(
+                        "am start -n ${comp.flattenToShortString()} --display $id", 8_000)
                 }.getOrNull()
-                if (comp != null) {
-                    val r = runCatching {
-                        io.github.hypercar.shizuku.ShizukuTools.exec(
-                            "am start -n ${comp.flattenToShortString()} --display $id", 8_000)
-                    }.getOrNull()
-                    HyperCarRepo.log("MUSIC: 卡片内拉起 $pkg（${if (r?.ok == true) "ok" else r?.err?.take(60)}）")
-                }
+                HyperCarRepo.log("MUSIC: 卡片内拉起 $pkg（${if (r?.ok == true) "ok" else r?.err?.take(60)}）")
             }
         }
     }
