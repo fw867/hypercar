@@ -6,6 +6,8 @@ import android.os.BatteryManager
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -54,14 +56,15 @@ fun CarHomeScreen() {
         CompositionLocalProvider(
             LocalDensity provides Density(base.density * scale, base.fontScale),
         ) {
-            CarHomeContent(isUltrawide = safe.width > safe.height * 2.7f, safe = safe, background = background)
+            CarHomeContent(safe = safe, background = background)
         }
     }
 }
 
 @Composable
-private fun CarHomeContent(isUltrawide: Boolean, safe: DisplayRect, background: DisplayRect) {
+private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
     val density = LocalDensity.current
+    val musicCardWidth = with(density) { (safe.width * .25f).toDp() }
     fun bounds(rect: DisplayRect): Modifier = with(density) {
         Modifier.absoluteOffset(rect.x.toDp(), rect.y.toDp())
             .requiredSize(rect.width.toDp(), rect.height.toDp()).clipToBounds()
@@ -148,8 +151,8 @@ private fun CarHomeContent(isUltrawide: Boolean, safe: DisplayRect, background: 
                     AppsPage(Modifier.weight(1f), music, { settings = true }, { about = true }, enterMap)
                 } else {
                     Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
-                        MapCard(Modifier.weight(if (isUltrawide) 2f else 1.5f).fillMaxHeight(), enterMap)
-                        MusicCard(music, Modifier.weight(1f).fillMaxHeight())
+                        MapCard(Modifier.weight(1f).fillMaxHeight(), enterMap)
+                        MusicCard(music, Modifier.width(musicCardWidth).fillMaxHeight())
                     }
                 }
                 Row(Modifier.fillMaxWidth().height(15.dp), horizontalArrangement = Arrangement.Center,
@@ -262,6 +265,11 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
     val context = LocalContext.current
     val installed = remember(context) { MusicApps.installed(context) }
     var picker by remember { mutableStateOf(false) }
+    var queueOpen by remember(music.packageName) { mutableStateOf(false) }
+    var modesOpen by remember(music.packageName) { mutableStateOf(false) }
+    val mode = music.dedicatedMode ?: MusicPlaybackModes.current(music.repeatMode, music.shuffleMode)
+    val modes = if (music.dedicatedMode != null) listOf(MusicPlaybackMode.ALL, MusicPlaybackMode.ONE, MusicPlaybackMode.SHUFFLE)
+        else MusicPlaybackModes.available(music.canRepeat, music.canShuffle, music.repeatMode, music.shuffleMode)
     val currentIcon = remember(music.packageName) { MusicApps.iconFor(context, music.packageName) }
     val dark = CarThemeState.dark
     val ink = if (dark) White else Color(0xFF1B1730)
@@ -271,7 +279,7 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
         if (dark) listOf(Color(0xFF484265), Color(0xFF25203A), Color(0xFF171623))
         else listOf(Color(0xFFD6E5F5), Color(0xFFF1F7FE), Color(0xFFE4EFFA))))) {
         music.albumArt?.let {
-            Image(it.asImageBitmap(), "专辑封面", Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+            Image(it.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
         }
         Box(Modifier.fillMaxSize().background(if (dark) {
             Brush.verticalGradient(listOf(
@@ -283,7 +291,7 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
                 Color(0xFFF2F7FD).copy(alpha = .55f), Color(0xFFF2F7FD).copy(alpha = .72f),
                 Color(0xFFF2F7FD).copy(alpha = .90f), Color(0xFFF2F7FD).copy(alpha = .95f)))
         }))
-        Column(Modifier.fillMaxSize().padding(24.dp)) {
+        Column(Modifier.fillMaxSize().padding(18.dp)) {
             Row(
                 Modifier
                     .clip(RoundedCornerShape(12.dp))
@@ -311,12 +319,20 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
                 if (music.playing) Icon(Icons.Rounded.GraphicEq, "正在播放", tint = ink, modifier = Modifier.size(22.dp))
             }
             Spacer(Modifier.weight(1f))
-            Text(music.title.ifBlank { "听点喜欢的" }, color = ink, fontSize = 27.sp,
-                fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            Spacer(Modifier.height(8.dp))
-            Text(music.artist.ifBlank { if (music.available) "选择一首音乐，开始旅程" else "连接你的音乐" },
-                color = sub, fontSize = 17.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Spacer(Modifier.height(28.dp))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(music.title.ifBlank { "听点喜欢的" }, color = ink, fontSize = 21.sp,
+                        fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Spacer(Modifier.height(4.dp))
+                    Text(music.artist.ifBlank { if (music.available) "选择一首音乐" else "连接你的音乐" },
+                        color = sub, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                PlayerButton(if (music.liked) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
+                    if (music.liked) "取消喜欢" else "喜欢", 26,
+                    if (music.liked) Color(0xFFE65E79) else ink,
+                    enabled = music.canLike, touchSize = 44) { MusicBridge.toggleFavorite() }
+            }
+            Spacer(Modifier.height(16.dp))
             if (music.available) {
                 val progress = if (music.durationMs > 0) (music.positionMs.toFloat() / music.durationMs).coerceIn(0f, 1f) else 0f
                 Canvas(Modifier.fillMaxWidth().height(4.dp)) {
@@ -332,10 +348,17 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
                 Spacer(Modifier.height(10.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically) {
-                    PlayerButton(Icons.Rounded.SkipPrevious, "上一首", 38, ink) { MusicBridge.previous() }
+                    PlayerButton(Icons.Rounded.QueueMusic, "播放列表", 25, ink, touchSize = 44) {
+                        queueOpen = true; MusicBridge.loadMusicQueue()
+                    }
+                    PlayerButton(Icons.Rounded.SkipPrevious, "上一首", 31, ink, touchSize = 44) { MusicBridge.previous() }
                     PlayerButton(if (music.playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                        if (music.playing) "暂停" else "播放", 48, ink) { MusicBridge.playPause() }
-                    PlayerButton(Icons.Rounded.SkipNext, "下一首", 38, ink) { MusicBridge.next() }
+                        if (music.playing) "暂停" else "播放", 40, ink, touchSize = 52) { MusicBridge.playPause() }
+                    PlayerButton(Icons.Rounded.SkipNext, "下一首", 31, ink, touchSize = 44) { MusicBridge.next() }
+                    PlayerButton(mode?.icon() ?: Icons.Rounded.Repeat,
+                        mode?.label ?: "播放模式", 25, ink, touchSize = 44) {
+                        modesOpen = true; MusicBridge.refreshPlaybackMode()
+                    }
                 }
             } else {
                 Text("在手机上播放音乐，即可在这里控制", color = sub, fontSize = 12.sp)
@@ -358,7 +381,7 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
                 Modifier
                     .align(Alignment.TopStart)
                     .padding(18.dp)
-                    .width(300.dp)
+                    .fillMaxWidth()
                     .clip(RoundedCornerShape(18.dp))
                     .background(pickerBg)
                     .padding(vertical = 8.dp),
@@ -391,13 +414,97 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
                 }
             }
         }
+        if (queueOpen || modesOpen) {
+            Column(Modifier.fillMaxSize().background(pickerBg).padding(14.dp)) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(if (queueOpen) "播放列表" else "播放模式", color = ink, fontSize = 19.sp,
+                        fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                    IconButton(onClick = { queueOpen = false; modesOpen = false }) {
+                        Icon(Icons.Rounded.Close, "关闭", tint = ink)
+                    }
+                }
+                if (queueOpen) {
+                    if (music.queue.isEmpty()) {
+                        Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                            Text(if (music.queueLoading) "正在获取播放列表…" else music.queueError.ifBlank { "当前播放器暂未提供播放列表" }, color = sub, fontSize = 14.sp)
+                        }
+                        if (music.packageName == QqMusicAdapter.PACKAGE) TextButton(onClick = { MusicBridge.loadMusicQueue() }) { Text("重试", color = ink) }
+                        TextButton(onClick = { launchMusic(context, music) }) { Text("在手机播放器中查看", color = ink) }
+                    } else LazyColumn(Modifier.weight(1f)) {
+                        items(music.queue) { song ->
+                            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                                .background(if (song.id == music.activeQueueId) ink.copy(alpha = .08f) else Color.Transparent)
+                                .clickable(enabled = music.canSelectQueue) {
+                                    MusicBridge.playQueueItem(music.packageName, song.id, song.sourceId); queueOpen = false
+                                }.padding(horizontal = 12.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(song.title.ifBlank { "未知歌曲" }, color = ink, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    if (song.artist.isNotBlank()) Text(song.artist, color = sub, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                                if (song.id == music.activeQueueId) Icon(Icons.Rounded.GraphicEq, "当前歌曲", tint = ink, modifier = Modifier.size(20.dp))
+                            }
+                        }
+                        if (music.queueError.isNotBlank()) item { Text(music.queueError, color = sub, modifier = Modifier.padding(12.dp)) }
+                        if (music.queueHasMore) item {
+                            TextButton(onClick = { MusicBridge.loadMusicQueue(more = true) }, enabled = !music.queueLoading) {
+                                Text(if (music.queueLoading) "正在加载…" else "加载更多", color = ink)
+                            }
+                        }
+                    }
+                } else if (modes.isEmpty()) {
+                    Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        Text(music.modeError.ifBlank { "当前播放器暂不支持切换播放模式" }, color = sub, fontSize = 14.sp)
+                    }
+                    if (music.packageName == QqMusicAdapter.PACKAGE) TextButton(onClick = { MusicBridge.refreshPlaybackMode() }) { Text("重试", color = ink) }
+                    TextButton(onClick = { launchMusic(context, music) }) { Text("在手机播放器中切换", color = ink) }
+                } else modes.forEach { option ->
+                    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                        .clickable { MusicBridge.setPlaybackMode(option); modesOpen = false }
+                        .padding(horizontal = 12.dp, vertical = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        // **每种模式都有独立图标**（2026-10-31）：之前这一列只有文字，
+                        // 四种模式看起来一模一样，用户以为图标画错了。
+                        Icon(option.icon(), option.label, tint = ink, modifier = Modifier.size(22.dp))
+                        Spacer(Modifier.width(12.dp))
+                        Text(option.label, color = ink, fontSize = 17.sp, modifier = Modifier.weight(1f))
+                        if (option == mode) Icon(Icons.Rounded.Check, "当前模式", tint = ink)
+                    }
+                }
+            }
+        }
     }
 }
 
+/**
+ * 播放模式 → 图标（2026-10-31 修正）。
+ *
+ * 四种模式各用不同图标，彼此一眼可区分：
+ *  · 顺序播放 → PlaylistPlay（列表播完即停）
+ *  · 列表循环 → Repeat（首尾相接的循环箭头）
+ *  · 单曲循环 → RepeatOne（循环箭头 + 数字 1）
+ *  · 随机播放 → Shuffle（交叉箭头）
+ *
+ * 之前模式面板里只有文字、没有任何图标，按钮上「顺序/列表循环」的图标又都很像，
+ * 于是看起来像"列表播放模式的图标做错了"。
+ */
+private fun MusicPlaybackMode.icon() = when (this) {
+    MusicPlaybackMode.SEQUENTIAL -> Icons.Rounded.PlaylistPlay
+    MusicPlaybackMode.ALL -> Icons.Rounded.Repeat
+    MusicPlaybackMode.ONE -> Icons.Rounded.RepeatOne
+    MusicPlaybackMode.SHUFFLE -> Icons.Rounded.Shuffle
+}
+
 @Composable
-private fun PlayerButton(icon: ImageVector, label: String, size: Int, tint: Color, click: () -> Unit) {
-    IconButton(onClick = click, modifier = Modifier.size(58.dp)) {
-        Icon(icon, label, tint = tint, modifier = Modifier.size(size.dp))
+private fun PlayerButton(
+    icon: ImageVector,
+    label: String,
+    size: Int,
+    tint: Color,
+    enabled: Boolean = true,
+    touchSize: Int = 58,
+    click: () -> Unit,
+) {
+    IconButton(onClick = click, enabled = enabled, modifier = Modifier.size(touchSize.dp)) {
+        Icon(icon, label, tint = if (enabled) tint else tint.copy(alpha = .3f), modifier = Modifier.size(size.dp))
     }
 }
 
