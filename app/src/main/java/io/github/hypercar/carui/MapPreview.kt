@@ -35,54 +35,6 @@ object MapPreview {
     private var stopped = false
     private var carMode = false
     private var layoutMode = 2
-    private var cruiseJob: Job? = null
-    @Volatile private var mapInteracted = false
-    private var cruiseRequested = false
-
-    fun onAutoCruiseChanged(enabled: Boolean) {
-        scope.launch {
-            lock.withLock {
-                cancelCruise()
-                if (enabled) scheduleCruise()
-            }
-        }
-    }
-
-    /** Without a reliable Amap navigation-state API, user interaction makes idle state unknown. */
-    fun onMapInteraction() { mapInteracted = true }
-
-    private fun cancelCruise() {
-        cruiseJob?.cancel()
-        cruiseJob = null
-    }
-
-    private fun scheduleCruise() {
-        cancelCruise()
-        val provider = activeProvider ?: return
-        val id = displayId
-        val texture = target ?: return
-        if (!CarUiSettings.autoCruise || stopped || fullscreen || layoutMode != 2 || id <= 0) return
-        cruiseJob = scope.launch {
-            delay(AutoCruisePolicy.DELAY_MS)
-            lock.withLock {
-                if (!CarUiSettings.autoCruise || stopped || fullscreen || target !== texture ||
-                    displayId != id || activeProvider != provider || cardSurface?.isValid != true) return@withLock
-                val idle = if (provider == MapProvider.BAIDU) {
-                    val state = ShizukuTools.exec("dumpsys activity ${provider.packageName}", 5000)
-                    state.ok && AutoCruisePolicy.baiduIsIdle(state.out)
-                } else !mapInteracted && !cruiseRequested
-                if (!idle) {
-                    HyperCarRepo.log("CARUI-PREVIEW: ${provider.label}自动巡航跳过：已在巡航、导航或状态未确认")
-                    return@withLock
-                }
-                val result = openCruise()
-                cruiseRequested = result.ok && !result.err.contains("Error") && !result.out.contains("Error")
-                HyperCarRepo.log("CARUI-PREVIEW: ${provider.label}首页稳定 10 秒后请求巡航 success=$cruiseRequested")
-            }
-        }
-        HyperCarRepo.log("CARUI-PREVIEW: ${provider.label}首页自动巡航计时 10 秒")
-    }
-
     fun attach(texture: SurfaceTexture, w: Int, h: Int) {
         scope.launch {
             lock.withLock {
@@ -104,7 +56,6 @@ object MapPreview {
         scope.launch {
             lock.withLock {
                 if (target === texture) {
-                    cancelCruise()
                     if (!fullscreen && displayId > 0) {
                         // Keep the task/navigation alive while the applications page hides the card.
                         SpikeShell.updateDisplaySurface(displayId, null, 0, 0, 0)
@@ -120,7 +71,6 @@ object MapPreview {
 
     suspend fun showFullscreen(surface: Surface, w: Int, h: Int, dpi: Int): Int = lock.withLock {
         check(!stopped) { "地图会话已停止" }
-        cancelCruise()
         fullscreen = true
         val id = route(surface, w, h, 1)
         id
@@ -166,7 +116,6 @@ object MapPreview {
                 check(layout.ok && !layout.err.contains("Error")) { "车联布局切换失败: ${layout.err}" }
             }
             layoutMode = mode
-            if (mode == 2) scheduleCruise()
             _status.value = ""
             HyperCarRepo.log("CARUI-PREVIEW: 保留地图任务 $update carMode=$carMode layout=$mode")
             return displayId
@@ -178,7 +127,7 @@ object MapPreview {
             val binding = SpikeShell.connect(context)
             check(SpikeShell.isConnected()) { binding }
         }
-        // Cruise is a separate delayed request, after the card has been bound.
+        // Auto-cruise belongs to the map app's own projection settings.
         val mapW = CarUiCaster.plan.width
         val mapH = CarUiCaster.plan.height
         val result = SpikeShell.createDisplay(output, mapW, mapH, MAP_DPI, 0, "hypercar-map")
@@ -189,7 +138,7 @@ object MapPreview {
         layoutMode = mode
         if (!carMode) {
             check(provider == MapProvider.AMAP) { "${provider.label}车联入口不可用，请检查地图版本或首次授权：${carLaunch.err}" }
-            HyperCarRepo.log("CARUI-PREVIEW: 车联入口不可用，回退手机巡航 ${carLaunch.err}")
+            HyperCarRepo.log("CARUI-PREVIEW: 车联入口不可用，回退手机地图 ${carLaunch.err}")
             val launch = ShizukuTools.exec("am start --activity-clear-task " +
                 "-n ${provider.packageName}/com.autonavi.map.activity.SplashActivity --display $displayId", 12000)
             check(launch.ok && !launch.err.contains("Error")) { "${provider.label}启动失败: ${launch.err}" }
@@ -197,18 +146,10 @@ object MapPreview {
         // 第一次以编码画布创建后也要立即适配卡片边界，避免首帧上下留边。
         val update = SpikeShell.updateDisplaySurface(displayId, output, w, h, MAP_DPI)
         check(update.startsWith("OK")) { update }
-        if (mode == 2) scheduleCruise()
         HyperCarRepo.log("CARUI-PREVIEW: ${provider.label}初次启动 display=$displayId carMode=$carMode layout=$mode")
+        HyperCarRepo.log("CARUI-PREVIEW: 自动巡航跟随${provider.label}原生设置")
         _status.value = ""
         return displayId
-    }
-
-    private suspend fun openCruise(): io.github.hypercar.shizuku.ExecResult {
-        val provider = activeProvider ?: error("地图任务不存在")
-        return ShizukuTools.exec(
-            provider.cruiseCommand(displayId),
-            12000,
-        )
     }
 
     /** UcarMapActivity is singleTask; layout-only intents retain the current navigation. */
@@ -218,9 +159,6 @@ object MapPreview {
     }
 
     private suspend fun releaseMapTask() {
-        cancelCruise()
-        mapInteracted = false
-        cruiseRequested = false
         if (displayId > 0) SpikeShell.releaseDisplay(displayId)
         displayId = -1
         carMode = false

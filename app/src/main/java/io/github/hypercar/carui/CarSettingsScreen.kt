@@ -74,14 +74,12 @@ fun CarSettingsPage(modifier: Modifier = Modifier, onBack: () -> Unit) {
             )
             Spacer(Modifier.height(8.dp))
             HorizontalDivider(color = CarMuted.copy(alpha = .18f))
-            SettingSwitch(
-                title = "导航自动巡航",
-                subtitle = "首页地图稳定显示 10 秒后，空闲时自动进入巡航",
-                checked = CarUiSettings.autoCruise,
-                onCheckedChange = {
-                    CarUiSettings.updateAutoCruise(it)
-                    MapPreview.onAutoCruiseChanged(it)
-                },
+            Spacer(Modifier.height(12.dp))
+            Text("自动巡航跟随地图", color = CarInk, fontSize = 16.sp)
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "请在高德或百度地图的车机设置中，调整“投屏后自动巡航”。",
+                color = CarMuted, fontSize = 14.sp,
             )
         }
 

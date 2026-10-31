@@ -234,7 +234,6 @@ object MapController {
     }
 
     private fun inject(displayId: Int, action: Int, x: Int, y: Int, downTimeMs: Long) {
-        if (action == 0) MapPreview.onMapInteraction()
         val result = SpikeShell.motion(displayId, action, x, y, downTimeMs)
         if (!result.startsWith("OK")) {
             if (touchLogs++ < 12) {

@@ -21,40 +21,28 @@ class MapAppsTest {
         assertEquals(MapProvider.AMAP, MapApps.fromId("removed-provider"))
     }
 
-    @Test fun baiduUsesInstalledCarInterfaceAndCarCruiseUriOnTheSameDisplay() {
+    @Test fun baiduUsesInstalledCarInterfaceOnTheSameDisplay() {
         val launch = MapProvider.BAIDU.carLaunchCommand(42, 2, true)
         assertTrue(launch.contains("com.baidu.BaiduMap/com.baidu.hicar.HiCarWelcomeScreen"))
         assertTrue(launch.contains("-a com.ucar.intent.action.UCAR"))
         assertTrue(launch.contains("--ei screenMode 1"))
         assertTrue(launch.endsWith("--display 42"))
-        assertTrue(MapProvider.BAIDU.cruiseCommand(42).contains("baidumap://hicarmap/cruiserPage"))
         assertFalse(MapProvider.BAIDU.supportsLayoutIntent)
     }
 
-    @Test fun amapKeepsExistingUcarLayoutAndCruiseContract() {
+    @Test fun amapKeepsExistingUcarLayoutContract() {
         assertTrue(MapProvider.AMAP.carLaunchCommand(42, 2, true).contains("UcarSplashActivity"))
         val update = MapProvider.AMAP.carLaunchCommand(42, 1, false)
         assertTrue(update.contains("UcarMapActivity"))
         assertTrue(update.contains("--ei screenMode 1"))
         assertTrue(MapProvider.AMAP.supportsLayoutIntent)
-        assertTrue(MapProvider.AMAP.cruiseCommand(42).contains("amapuri://drive/CarCruisePage"))
     }
 
-    @Test fun coldLaunchNeverStartsCruiseBeforeTheSharedDelay() {
+    @Test fun launchAndLayoutUpdatesLetMapControlItsOwnCruise() {
         for (provider in MapProvider.entries) {
             assertFalse(provider.carLaunchCommand(42, 2, true).contains("-d "))
             assertFalse(provider.carLaunchCommand(42, 1, false).contains("-d "))
         }
-        assertEquals(10_000L, AutoCruisePolicy.DELAY_MS)
     }
 
-    @Test fun automaticCruiseRetainsNavigationProtection() {
-        assertTrue(MapProvider.BAIDU.cruiseCommand(42).contains("src=autoCruise"))
-        assertFalse(MapProvider.AMAP.cruiseCommand(42).contains("clearStack=1"))
-        assertFalse(AutoCruisePolicy.baiduIsIdle(""))
-        assertFalse(AutoCruisePolicy.baiduIsIdle("Active Fragments: HiCarCruiserFragment{123}"))
-        assertTrue(AutoCruisePolicy.baiduIsIdle("Active Fragments: HiCarMapFramePage{123} Added Fragments:"))
-        assertFalse(AutoCruisePolicy.baiduIsIdle("Active Fragments: HiCarMapFramePage{123} HiCarNaviPage{456} Added Fragments:"))
-        assertFalse(AutoCruisePolicy.baiduIsIdle("Active Fragments: HiCarCruiserFragment{123} Added Fragments: HiCarMapFramePage{456}"))
-    }
 }

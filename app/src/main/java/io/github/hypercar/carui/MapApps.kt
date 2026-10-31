@@ -21,15 +21,7 @@ enum class MapProvider(val id: String, val label: String, val packageName: Strin
             "--ez isUCarNaviUseVerticalScreenLayout false --display $displayId"
     }
 
-    fun cruiseCommand(displayId: Int): String {
-        return "am start -a android.intent.action.VIEW -d '$cruiseUri' -p $packageName --display $displayId"
-    }
 
-    val cruiseUri: String get() = when (this) {
-            AMAP -> "amapuri://drive/CarCruisePage?sourceApplication=io.github.hypercar&clearStack=0"
-            // 百度识别这个来源后，只从地图首页进入巡航；正在导航/规划时会拒绝覆盖。
-            BAIDU -> "baidumap://hicarmap/cruiserPage?src=autoCruise"
-    }
 }
 
 object MapApps {
