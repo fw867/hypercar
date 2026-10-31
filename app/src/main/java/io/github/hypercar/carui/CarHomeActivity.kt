@@ -22,9 +22,38 @@ class CarHomeActivity : ComponentActivity() {
 
     private var downTime = 0L
     private var touchLogs = 0
+    /** 本 Activity 应所在的虚显 id（2026-10-31）。 */
+    private var expectedDisplayId = -1
+    private var displayListener: android.hardware.display.DisplayManager.DisplayListener? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val dId = display?.displayId ?: 0
+        // **绝不在手机主屏显示车机界面**（2026-10-31）：两个来源会让它跑到主屏——
+        // ① `am start --display N` 失败时系统回退到 display 0；
+        // ② 虚显被销毁（会话结束 / 建屏失败 / shell 重建）后，系统把残留 task 迁回默认屏。
+        // 这里直接结束自己：手机端只应有 MainActivity，车机 UI 只存在于虚显上。
+        if (dId == android.view.Display.DEFAULT_DISPLAY) {
+            HyperCarRepo.log("CARUI: CarHomeActivity 落在主屏（display=0）→ 立即结束，避免手机端出现车机界面")
+            finishAndRemoveTask()
+            return
+        }
+        expectedDisplayId = dId
+        val dm = getSystemService(android.hardware.display.DisplayManager::class.java)
+        if (dm != null) {
+            val listener = object : android.hardware.display.DisplayManager.DisplayListener {
+                override fun onDisplayAdded(displayId: Int) = Unit
+                override fun onDisplayChanged(displayId: Int) = Unit
+                override fun onDisplayRemoved(displayId: Int) {
+                    if (displayId == expectedDisplayId) {
+                        HyperCarRepo.log("CARUI: 虚显 $displayId 已移除 → 结束车机界面")
+                        runOnUiThread { finishAndRemoveTask() }
+                    }
+                }
+            }
+            dm.registerDisplayListener(listener, null)
+            displayListener = listener
+        }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContent {
@@ -47,6 +76,13 @@ class CarHomeActivity : ComponentActivity() {
 
     override fun onDestroy() {
         if (instance === this) instance = null
+        displayListener?.let { l ->
+            runCatching {
+                getSystemService(android.hardware.display.DisplayManager::class.java)
+                    ?.unregisterDisplayListener(l)
+            }
+        }
+        displayListener = null
         HyperCarRepo.log("CARUI: CarHomeActivity onDestroy display=${display?.displayId}")
         super.onDestroy()
     }

@@ -43,7 +43,7 @@ internal object MusicArtwork {
             ?: runCatching { metadata?.description?.iconBitmap }.getOrNull()
         if (embedded != null) {
             cached=embedded
-            if (reportedSource != "metadata") HyperCarRepo.log("MUSIC-ART: app=$pkg source=metadata bitmap=${embedded.width}x${embedded.height}")
+            if (reportedSource != "metadata" && CarUiCaster.running) HyperCarRepo.log("MUSIC-ART: app=$pkg source=metadata bitmap=${embedded.width}x${embedded.height}")
             reportedSource="metadata"
             return embedded
         }
@@ -75,7 +75,8 @@ internal object MusicArtwork {
                 if (generation != requestGeneration || key != requestKey) return@post
                 job=null
                 if (image != null) { cached=image; reportedSource=source }
-                HyperCarRepo.log("MUSIC-ART: app=$pkg source=$source bitmap=${image?.width ?: 0}x${image?.height ?: 0}")
+                // 车机 UI 不在跑时静默：断连后系统仍会反复改 session，会把日志刷满（2026-10-31）
+                if (CarUiCaster.running) HyperCarRepo.log("MUSIC-ART: app=$pkg source=$source bitmap=${image?.width ?: 0}x${image?.height ?: 0}")
                 if (image != null) changed()
             }
         }

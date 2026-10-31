@@ -126,15 +126,33 @@ class HyperCarService : Service() {
     }
 
     /** 渠道已在 HyperCarApp 创建（CHANNEL_LINK + R.string.notification_channel_link）。 */
-    private fun buildNotification(): Notification =
-        NotificationCompat.Builder(this, HyperCarApp.CHANNEL_LINK)
+    private fun buildNotification(): Notification {
+        // **点通知回 App 首页**（2026-10-31）：之前这条例行通知点了没反应。
+        // 用 MainActivity 的 launcher intent，FLAG_ACTIVITY_SINGLE_TOP+RESET_TASK_IF_NEEDED
+        // 保证不叠任务栈、回到已存在的实例（不会重建界面丢状态）。
+        val open = Intent(this, io.github.hypercar.ui.MainActivity::class.java).apply {
+            addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                    Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED,
+            )
+        }
+        val pending = android.app.PendingIntent.getActivity(
+            this,
+            0,
+            open,
+            android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE,
+        )
+        return NotificationCompat.Builder(this, HyperCarApp.CHANNEL_LINK)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentTitle(getString(R.string.notification_link_title))
             .setContentText(if (listeningOnly) "正在监听车机，等待自动连接" else "正在保持与车机的连接")
+            .setContentIntent(pending)
             .setOngoing(true)
             .setAutoCancel(false)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
+    }
 
     @Suppress("DEPRECATION")
     private fun deviceOf(intent: Intent?): BluetoothDevice? {

@@ -102,6 +102,8 @@ object MusicBridge {
         override fun onShuffleModeChanged(shuffleMode: Int) = publish()
     }
     private var sessionsListener: MediaSessionManager.OnActiveSessionsChangedListener? = null
+    /** 上一次「选中」日志的 key，避免断连后 session 抖动导致刷屏（2026-10-31）。 */
+    private var lastChoiceKey = ""
     private var permissionDenied = false
     private var resumePackage: String? = null
     private var carConnected = false
@@ -393,7 +395,13 @@ object MusicBridge {
                 }.getOrNull()
             }
             runCatching { target?.registerCallback(callback, main) }
-            HyperCarRepo.log("MUSIC: 选中 ${target?.packageName ?: "-"}（共 ${sessions.size} 个会话）")
+            // 只在「车机界面在跑」且「选择结果变了」时记录：断连后 session 会反复变化，
+            // 之前每变一次就打一行，后台日志被刷满（2026-10-31）。
+            val key = "${target?.packageName ?: "-"}|${sessions.size}"
+            if (CarUiCaster.running && key != lastChoiceKey) {
+                lastChoiceKey = key
+                HyperCarRepo.log("MUSIC: 选中 ${target?.packageName ?: "-"}（共 ${sessions.size} 个会话）")
+            }
         }
         publish()
     }
