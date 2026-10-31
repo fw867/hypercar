@@ -1,4 +1,4 @@
-package io.github.hypercar.carui
+﻿package io.github.hypercar.carui
 
 import android.content.ComponentName
 import android.content.Context
@@ -90,6 +90,7 @@ object MusicBridge {
     private val main = Handler(Looper.getMainLooper())
 
     private val _state = MutableStateFlow(NowPlaying())
+    /** 歌词缓存（2026-10-31）：只有 QQ 音乐通过第三方 API 能拿到 LRC。 */
     val state: StateFlow<NowPlaying> = _state
 
     private var service: NotificationListenerService? = null
@@ -323,6 +324,7 @@ object MusicBridge {
     }
 
     fun attach(service: NotificationListenerService) {
+        HyperCarRepo.log("MUSIC: 通知监听已接入（attach）")
         this.service = service
         playbackPrefs = service.getSharedPreferences("car_playback", Context.MODE_PRIVATE)
         resumePackage = playbackPrefs?.getString("resume_package", null)
@@ -429,13 +431,16 @@ object MusicBridge {
         val rating = md?.getRating(MediaMetadata.METADATA_KEY_USER_RATING)?.takeIf { it.isRated }
         val likeAction = favoriteAction(ps)
         val actions = ps?.actions ?: 0L
+        val title = md?.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty()
+        val artist = md?.getString(MediaMetadata.METADATA_KEY_ARTIST)
+            ?: md?.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST).orEmpty()
         _state.value = NowPlaying(
             available = true,
             packageName = pkg,
             appLabel = label,
-            title = md?.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty(),
-            artist = md?.getString(MediaMetadata.METADATA_KEY_ARTIST)
-                ?: md?.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST).orEmpty(),
+            title = title,
+            artist = artist,
+
             albumArt = art,
             playing = ps?.state == PlaybackState.STATE_PLAYING,
             positionMs = positionOf(ps),

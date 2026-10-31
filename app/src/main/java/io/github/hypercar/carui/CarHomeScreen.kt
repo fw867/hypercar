@@ -1,10 +1,11 @@
-package io.github.hypercar.carui
+﻿package io.github.hypercar.carui
 
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.BatteryManager
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -27,6 +28,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
@@ -94,6 +96,47 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
             delay(1000)
         }
     }
+    // **蜂窝信号**（2026-10-31）：Dock 顶部只显示「信号柱 + 制式(4G/5G)」，不显示 Wi-Fi。
+    // 电平与制式都靠 Shizuku 读 telephony.registry，避开 READ_PHONE_STATE 权限。
+    var cellLevel by remember { mutableIntStateOf(0) }      // 0..4
+    var cellKnown by remember { mutableStateOf(false) }
+    var cellLabel by remember { mutableStateOf("") }        // 5G / 4G / 3G / 2G
+    LaunchedEffect(Unit) {
+        while (true) {
+            if (io.github.hypercar.shizuku.ShizukuTools.isReady) {
+                // **必须切到 IO 线程**：ShizukuTools.exec 有主线程保护，在 Compose 的
+                // LaunchedEffect（Main）里直接调会被拒绝（日志："调用 shell（第 N 次）…
+                // ——必须切到后台线程"），于是信号永远读不到、指示器不显示（2026-10-31）。
+                val r = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching {
+                        io.github.hypercar.shizuku.ShizukuTools.exec(
+                            "dumpsys telephony.registry | grep -m1 mSignalStrength; " +
+                            "dumpsys telephony.registry | grep -m1 mNetworkType", 4_000)
+                    }.getOrNull()
+                }
+                val raw = r?.out.orEmpty()
+                if (raw.isNotBlank()) {
+                    // MIUI 用 miuiLevel，AOSP 用 level；两者都试
+                    val m = Regex("miuiLevel = (\\d+)").find(raw)
+                        ?: Regex("level = (\\d+)").find(raw)
+                    m?.groupValues?.getOrNull(1)?.toIntOrNull()?.let {
+                        cellLevel = it.coerceIn(0, 4); cellKnown = true
+                    }
+                    // 制式 → 显示文本（mNetworkType=NR / LTE / HSPA / GSM …）
+                    Regex("mNetworkType=([A-Z_]+)").find(raw)?.groupValues?.getOrNull(1)?.let { rat ->
+                        cellLabel = when (rat) {
+                            "NR" -> "5G"
+                            "LTE" -> "4G"
+                            "HSPAP", "HSPA", "HSDPA", "HSUPA", "UMTS", "TD_SCDMA", "EVDO" -> "3G"
+                            "EDGE", "GPRS", "GSM", "CDMA" -> "2G"
+                            else -> ""
+                        }
+                    }
+                }
+            }
+            delay(15_000)
+        }
+    }
     val systemDark = androidx.compose.foundation.isSystemInDarkTheme()
     val dark = when (CarUiSettings.themeMode) {
         CarThemeMode.LIGHT -> false
@@ -121,28 +164,93 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
         }
       }
       Box(bounds(safe)) {
-        Row(Modifier.fillMaxSize().padding(end = 22.dp, top = 22.dp, bottom = 22.dp)) {
-            Column(Modifier.width(120.dp).fillMaxHeight(), horizontalAlignment = Alignment.CenterHorizontally) {
+        Row(Modifier.fillMaxSize().padding(end = 22.dp)) {
+            // **Dock 玻璃底板**（2026-10-31）：以前 Dock 直接浮在地图上，没有承托。
+            // 参考 CarWith 的磨砂玻璃观感——Compose 做不到"背景模糊"（需要系统级 backdrop），
+            // 所以用三层叠加模拟：半透明渐变底 + 细描边高光 + 圆角裁切，
+            // 地图在下面移动时能透出来，视觉上就是一块玻璃条。
+            val dockShape = RoundedCornerShape(topEnd = 30.dp, bottomEnd = 30.dp)   // 左侧齐边，只有右侧圆角
+            Column(
+                Modifier
+                    .width(100.dp)
+                    .fillMaxHeight()
+                    .clip(dockShape)
+                    .background(
+                        Brush.verticalGradient(
+                            if (CarThemeState.dark) listOf(
+                                Color.White.copy(alpha = .12f), Color.White.copy(alpha = .05f))
+                            else listOf(
+                                Color.White.copy(alpha = .58f), Color.White.copy(alpha = .30f))
+                        )
+                    )
+                    .border(
+                        width = 1.dp,
+                        color = if (CarThemeState.dark) Color.White.copy(alpha = .14f)
+                        else Color.White.copy(alpha = .70f),
+                        shape = dockShape,
+                    )
+                    .padding(vertical = 12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
                 Text(time.format(DateTimeFormatter.ofPattern("HH:mm")), color = CarInk,
                     fontSize = 25.sp, fontWeight = FontWeight.Medium)
+                Spacer(Modifier.height(6.dp))
+                NetworkIndicator(cellLevel = cellLevel, cellKnown = cellKnown, label = cellLabel)
                 Spacer(Modifier.height(6.dp))
                 BatteryIndicator(battery, charging)
                 Spacer(Modifier.height(16.dp))
                 // Dock 4 个：高德 / 音乐 / 设置 / 更多（更多按钮在应用页和首页之间切换）
                 Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                    DockButton(Icons.Rounded.Navigation, MapApps.selected(context)?.label ?: "地图",
-                        if (CarThemeState.dark) Color(0xFF12B5D2) else CarAccent, buttonSize = 76) { enterMap() }
-                    DockButton(Icons.Rounded.MusicNote, "音乐", Color(0xFF7B51EB), buttonSize = 76) {
+                    // **地图/音乐用当前 App 的真实图标**（2026-10-31）：
+                    // 之前是固定的「导航针 / 音符」矢量图，切到高德/百度、QQ音乐/汽水后
+                    // 图标不变，看不出当前用的是谁。这里按包名取 PackageManager 图标，
+                    // 取不到（未选/未安装）才退回内置矢量图。
+                    val mapProvider = MapApps.selected(context)
+                    val mapIcon = remember(mapProvider?.packageName) {
+                        mapProvider?.let { MusicApps.iconFor(context, it.packageName) }
+                    }
+                    val musicIcon = remember(music.packageName) {
+                        music.packageName.takeIf { it.isNotBlank() }
+                            ?.let { MusicApps.iconFor(context, it) }
+                    }
+                    DockButton(Icons.Rounded.Navigation, mapProvider?.label ?: "地图",
+                        if (CarThemeState.dark) Color(0xFF12B5D2) else CarAccent,
+                        buttonSize = 68, bitmap = mapIcon) { enterMap() }
+                    DockButton(Icons.Rounded.MusicNote, "音乐", Color(0xFF7B51EB),
+                        buttonSize = 68, bitmap = musicIcon) {
                         launchMusic(context, music)
                     }
-                    DockButton(Icons.Rounded.Settings, "设置", Color(0xFF5B5675), buttonSize = 76) {
+                    DockButton(Icons.Rounded.Settings, "设置", Color(0xFF5B5675), buttonSize = 68) {
                         settings = true
                         apps = false
                     }
                 }
                 Spacer(Modifier.weight(1f))
+                // **底部「更多应用 / 返回首页」移进 Dock 列**（2026-10-31）：
+                // 之前是外面单独一个 BottomStart 的 Box，和 Dock 列的中轴对不齐（偏右约 10dp）。
+                // 放进同一列后由 CenterHorizontally 统一对齐。
+                val onHome = !apps && !settings && !about
+                Box(
+                    Modifier
+                        .size(68.dp)
+                        .clip(RoundedCornerShape(22.dp))
+                        .clickable {
+                            if (onHome) {
+                                apps = true
+                            } else {
+                                apps = false; settings = false; about = false
+                            }
+                        },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(if (onHome) Icons.Rounded.Apps else Icons.Rounded.Home,
+                        if (onHome) "更多应用" else "返回首页", tint = CarInk,
+                        modifier = Modifier.size(38.dp))
+                }
             }
-            Column(Modifier.weight(1f).fillMaxHeight()) {
+            // 与「地图卡 ↔ 音乐卡」相同的 20dp 间距
+            Spacer(Modifier.width(20.dp))
+            Column(Modifier.weight(1f).fillMaxHeight().padding(top = 22.dp, bottom = 22.dp)) {
                 if (settings) {
                     CarSettingsPage(Modifier.weight(1f)) { settings = false }
                 } else if (about) {
@@ -164,30 +272,9 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
                 }
             }
         }
-        // 左下角：首页显示“更多应用”，应用/设置/关于页显示“首页”
-        val onHome = !apps && !settings && !about
-        Box(
-            Modifier
-                .align(Alignment.BottomStart)
-                .padding(start = 22.dp, bottom = 16.dp)
-                .size(76.dp)
-                .clickable {
-                    if (onHome) {
-                        apps = true
-                    } else {
-                        apps = false
-                        settings = false
-                        about = false
-                    }
-                },
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(if (onHome) Icons.Rounded.Apps else Icons.Rounded.Home,
-                if (onHome) "更多应用" else "返回首页", tint = CarInk, modifier = Modifier.size(48.dp))
-        }
-      }
     }
 }
+    }
 
 @Composable
 private fun BatteryIndicator(level: Int, charging: Boolean) {
@@ -228,17 +315,37 @@ private fun BatteryIndicator(level: Int, charging: Boolean) {
 }
 
 @Composable
-private fun DockButton(icon: ImageVector, label: String, color: Color, buttonSize: Int = 60, onClick: () -> Unit) {
-    Box(Modifier.size(buttonSize.dp).clip(RoundedCornerShape(if (buttonSize > 60) 22.dp else 18.dp))
-        .background(Brush.linearGradient(listOf(color, color.copy(alpha = .65f))))
-        .clickable(onClick = onClick), contentAlignment = Alignment.Center) {
-        Icon(icon, label, tint = White, modifier = Modifier.size(
-            when {
-                buttonSize >= 84 -> 56.dp
-                buttonSize > 60 -> 48.dp
-                else -> 40.dp
-            },
-        ))
+private fun DockButton(
+    icon: ImageVector,
+    label: String,
+    color: Color,
+    buttonSize: Int = 68,
+    /** 当前 App 的图标（2026-10-31）；为 null 时退回内置矢量图标。 */
+    bitmap: android.graphics.Bitmap? = null,
+    onClick: () -> Unit,
+) {
+    // **统一图标尺寸**（2026-10-31，对齐 CarWith 观感）：
+    // 三种按钮的可视块统一 56dp —— App 图标直接画 56dp；
+    // 内置矢量图标（设置齿轮）画在 56dp 实色圆角块上、齿轮 30dp。
+    // 外框 68dp 只作为点击热区。这样三个图标外轮廓一致，不再一大一小。
+    val visual = 56.dp
+    val visualShape = RoundedCornerShape(15.dp)
+    Box(
+        modifier = Modifier.size(buttonSize.dp).clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (bitmap != null) {
+            Image(bitmap.asImageBitmap(), label,
+                modifier = Modifier.size(visual).clip(visualShape),
+                contentScale = ContentScale.Crop)
+        } else {
+            Box(
+                modifier = Modifier.size(visual).clip(visualShape).background(color),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(icon, label, tint = White, modifier = Modifier.size(30.dp))
+            }
+        }
     }
 }
 
@@ -282,14 +389,17 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
             Image(it.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
         }
         Box(Modifier.fillMaxSize().background(if (dark) {
+            // 标题以上的区域尽量透（2026-10-31 第二轮）：顶部几乎不压暗，封面原色可见；
+            // 到标题附近才迅速收紧，保证文字/进度条对比度不受影响。
             Brush.verticalGradient(listOf(
-                Color.Black.copy(alpha = .08f), Color.Black.copy(alpha = .26f),
-                Color.Black.copy(alpha = .76f), Color.Black.copy(alpha = .84f)))
+                Color.Black.copy(alpha = .02f), Color.Black.copy(alpha = .12f),
+                Color.Black.copy(alpha = .72f), Color.Black.copy(alpha = .85f)))
         } else {
-            // CarLife 白天卡：封面保留但压成浅蓝白，标题/歌手保持深色可读。
+            // CarLife 白天卡：标题以上只留极淡的雾（原来 .22/.50 仍然偏白），
+            // 下方文字区保持高不透明度以维持深色文字可读。
             Brush.verticalGradient(listOf(
-                Color(0xFFF2F7FD).copy(alpha = .55f), Color(0xFFF2F7FD).copy(alpha = .72f),
-                Color(0xFFF2F7FD).copy(alpha = .90f), Color(0xFFF2F7FD).copy(alpha = .95f)))
+                Color(0xFFF2F7FD).copy(alpha = .10f), Color(0xFFF2F7FD).copy(alpha = .32f),
+                Color(0xFFF2F7FD).copy(alpha = .86f), Color(0xFFF2F7FD).copy(alpha = .95f)))
         }))
         Column(Modifier.fillMaxSize().padding(18.dp)) {
             Row(
@@ -532,53 +642,43 @@ private fun AppsPage(modifier: Modifier, music: NowPlaying, onSettings: () -> Un
                 horizontalArrangement = Arrangement.spacedBy(28.dp),
                 verticalArrangement = Arrangement.spacedBy(24.dp),
             ) {
-                Column(Modifier.width(104.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                    DockButton(Icons.Rounded.Navigation, mapLabel, if (CarThemeState.dark) Color(0xFF12B5D2) else CarAccent, buttonSize = 88) { onMap() }
-                    Spacer(Modifier.height(12.dp))
-                    Text(mapLabel, color = CarInk, fontSize = 16.sp)
-                }
-                Column(Modifier.width(104.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                    DockButton(Icons.Rounded.Settings, "设置", Color(0xFF5B5675), buttonSize = 88, onClick = onSettings)
-                    Spacer(Modifier.height(12.dp))
-                    Text("设置", color = CarInk, fontSize = 16.sp)
-                }
-                Column(Modifier.width(104.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                    DockButton(Icons.Rounded.Info, "关于应用", Color(0xFF2F80ED), buttonSize = 88, onClick = onAbout)
-                    Spacer(Modifier.height(12.dp))
-                    Text("关于应用", color = CarInk, fontSize = 16.sp)
-                }
-                musicApps.forEach { app ->
-                    key(app.packageName) {
-                        Column(Modifier.width(104.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                            Box(
-                                Modifier.size(88.dp).clip(RoundedCornerShape(22.dp)).background(CarCard)
-                                    .clickable(onClickLabel = "打开${app.label}") {
-                                        MusicBridge.selectPackage(context, app.packageName)
-                                    },
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                val icon = app.icon
-                                if (icon != null) {
-                                    Image(icon.asImageBitmap(), app.label, Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
-                                } else {
-                                    Icon(Icons.Rounded.MusicNote, app.label, tint = CarInk, modifier = Modifier.size(56.dp))
-                                }
-                            }
-                            Spacer(Modifier.height(12.dp))
-                            Text(app.label, color = CarInk, fontSize = 16.sp,
-                                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                                maxLines = 2, overflow = TextOverflow.Ellipsis)
+                // **顺序（2026-10-31）**：自动获取的地图 → 自动获取的音乐 → 设置 → 关于 → 返回车机
+                val installedMaps = remember(context) { MapApps.installed(context) }
+                val selectedMap = MapApps.selected(context)
+                installedMaps.forEach { provider ->
+                    key(provider.id) {
+                        val icon = remember(provider.packageName) {
+                            MusicApps.iconFor(context, provider.packageName)
+                        }
+                        AppTile(bitmap = icon, fallback = Icons.Rounded.Navigation,
+                            color = if (CarThemeState.dark) Color(0xFF12B5D2) else CarAccent,
+                            label = provider.label,
+                            onClickLabel = "使用${provider.label}",
+                            label2 = if (provider == selectedMap) "当前" else null) {
+                            // 点哪个地图就把哪个设为默认，并直接进全屏地图
+                            CarUiSettings.updateDefaultMap(provider)
+                            onMap()
                         }
                     }
                 }
-                Column(Modifier.width(104.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                    DockButton(Icons.Rounded.ExitToApp, "返回车机", Color(0xFF64748B), buttonSize = 88) {
-                        val queued = io.github.hypercar.core.RustCoreBridge.nativeRequestHostUi()
-                        io.github.hypercar.session.HyperCarRepo.log("CARUI: 返回车机请求 queued=$queued")
-                        if (!queued) android.widget.Toast.makeText(context, "尚未连接车机", android.widget.Toast.LENGTH_SHORT).show()
+                musicApps.forEach { app ->
+                    key(app.packageName) {
+                        AppTile(bitmap = app.icon, fallback = Icons.Rounded.MusicNote,
+                            color = CarCard, label = app.label,
+                            onClickLabel = "打开${app.label}") {
+                            MusicBridge.selectPackage(context, app.packageName)
+                        }
                     }
-                    Spacer(Modifier.height(12.dp))
-                    Text("返回车机", color = CarInk, fontSize = 16.sp)
+                }
+                AppTile(icon = Icons.Rounded.Settings, color = Color(0xFF5B5675),
+                    label = "设置") { onSettings() }
+                AppTile(icon = Icons.Rounded.Info, color = Color(0xFF2F80ED),
+                    label = "关于应用") { onAbout() }
+                AppTile(icon = Icons.Rounded.ExitToApp, color = Color(0xFF64748B),
+                    label = "返回车机") {
+                    val queued = io.github.hypercar.core.RustCoreBridge.nativeRequestHostUi()
+                    io.github.hypercar.session.HyperCarRepo.log("CARUI: 返回车机请求 queued=$queued")
+                    if (!queued) android.widget.Toast.makeText(context, "尚未连接车机", android.widget.Toast.LENGTH_SHORT).show()
                 }
             }
         }
@@ -588,4 +688,79 @@ private fun AppsPage(modifier: Modifier, music: NowPlaying, onSettings: () -> Un
 private fun formatTime(ms: Long): String {
     val seconds = ms.coerceAtLeast(0) / 1000
     return "%d:%02d".format(seconds / 60, seconds % 60)
+}
+
+
+/**
+ * 蜂窝信号指示（2026-10-31）：左侧四格信号柱，右侧制式文字（5G / 4G / 3G / 2G）。
+ * 不显示 Wi-Fi；读不到（无 SIM / Shizuku 未启动）时整块不画。
+ */
+@Composable
+private fun NetworkIndicator(cellLevel: Int, cellKnown: Boolean, label: String) {
+    if (!cellKnown) return
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Canvas(Modifier.width(24.dp).height(14.dp)) {
+            val bars = 4
+            val gap = 2f
+            val barW = (size.width - gap * (bars - 1)) / bars
+            for (i in 0 until bars) {
+                val h = size.height * (0.32f + 0.22f * i)
+                drawRoundRect(
+                    color = CarInk.copy(alpha = if (i < cellLevel) .9f else .22f),
+                    topLeft = Offset(i * (barW + gap), size.height - h),
+                    size = androidx.compose.ui.geometry.Size(barW, h),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(1.5f),
+                )
+            }
+        }
+        if (label.isNotBlank()) {
+            Spacer(Modifier.width(4.dp))
+            Text(label, color = CarInk.copy(alpha = .8f), fontSize = 11.sp,
+                fontWeight = FontWeight.Medium)
+        }
+    }
+}
+
+/**
+ * 「更多应用」里的单个应用磁贴（2026-10-31）。
+ *
+ * 统一规格：88dp 圆角方块 + 下方文字。有系统 App 图标就整块铺满（Crop），
+ * 没有就画内置矢量图标（52dp），保证所有磁贴视觉尺寸一致。
+ */
+@Composable
+private fun AppTile(
+    label: String,
+    color: Color,
+    icon: ImageVector? = null,
+    fallback: ImageVector? = null,
+    bitmap: android.graphics.Bitmap? = null,
+    onClickLabel: String? = null,
+    /** 小标记，例如地图的「当前」（2026-10-31）。 */
+    label2: String? = null,
+    onClick: () -> Unit,
+) {
+    Column(Modifier.width(104.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(
+            // 有系统图标时不铺底色：Adaptive Icon 边缘透明，底色会透出来变成"外框"
+            Modifier.size(88.dp).clip(RoundedCornerShape(22.dp))
+                .background(if (bitmap == null) color else Color.Transparent)
+                .clickable(onClickLabel = onClickLabel, onClick = onClick),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (bitmap != null) {
+                Image(bitmap.asImageBitmap(), label, Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop)
+            } else {
+                Icon(icon ?: fallback ?: Icons.Rounded.MusicNote, label, tint = White,
+                    modifier = Modifier.size(52.dp))
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+        Text(label, color = CarInk, fontSize = 16.sp,
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+            maxLines = 2, overflow = TextOverflow.Ellipsis)
+        if (label2 != null) {
+            Text(label2, color = CarAccent, fontSize = 12.sp)
+        }
+    }
 }

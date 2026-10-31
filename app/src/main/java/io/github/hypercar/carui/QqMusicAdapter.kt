@@ -1,4 +1,4 @@
-package io.github.hypercar.carui
+﻿package io.github.hypercar.carui
 
 import android.content.ComponentName
 import android.content.Context
@@ -115,6 +115,7 @@ internal object QqMusicAdapter {
                 else if (mode == null) "QQ音乐返回未知播放模式" else ""))
         }
     }
+
 
     fun loadQueue(more: Boolean = false) {
         if (queueJob?.isActive == true || (more && !state.hasMore)) return

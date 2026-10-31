@@ -152,6 +152,30 @@ object MapPreview {
         return displayId
     }
 
+    /**
+     * 更新地图显示面；**display 已失效时自愈**（2026-10-31）。
+     *
+     * 冷启动/全屏切换的竞态里，shell 侧可能已经释放了这块 display，
+     * 此时 updateDisplaySurface 返回 "ERR display=N missing"，
+     * 之前会直接把"地图暂不可用"抛给用户。现在把它当成"需要重建"：
+     * 清掉本地句柄（displayId = -1），下一次 resumePreview 就会重新建屏。
+     */
+    private suspend fun updateSurfaceOrHeal(id: Int, output: android.view.Surface, w: Int, h: Int): String {
+        val r = SpikeShell.updateDisplaySurface(id, output, w, h, MAP_DPI)
+        if (r.startsWith("OK")) {
+            // 成功后必须清掉旧错误文案：否则一次失败会把"地图暂不可用：ERR …"永久留在卡片上，
+            // 而地图其实已经正常出图了（2026-10-31 现场）。
+            if (_status.value.isNotEmpty()) _status.value = ""
+            return r
+        }
+        if (r.contains("missing")) {
+            HyperCarRepo.log("CARUI-PREVIEW: display $id 已失效（$r）→ 清句柄，下一轮重建")
+            runCatching { SpikeShell.releaseDisplay(id) }
+            displayId = -1
+            carMode = false
+        }
+        return r
+    }
     /** UcarMapActivity is singleTask; layout-only intents retain the current navigation. */
     private suspend fun launchCarMap(mode: Int, splash: Boolean): io.github.hypercar.shizuku.ExecResult {
         val provider = activeProvider ?: error("地图任务不存在")
@@ -171,7 +195,15 @@ object MapPreview {
 
     private suspend fun failed(error: Throwable) {
         runCatching { releaseMapTask() }
-        _status.value = "地图暂不可用：${error.message.orEmpty().take(100)}"
+        // **display 失效不算"地图不可用"**（2026-10-31）：调整尺寸/切全屏时旧 display 被释放
+        // 是正常现象，下一轮 resumePreview 会自动重建。这类错误只记日志、不在卡片上打扰用户，
+        // 否则会出现"地图明明已经出图，中间却盖着 ERR display=133 missing"。
+        val msg = error.message.orEmpty()
+        if (msg.contains("missing")) {
+            HyperCarRepo.log("CARUI-PREVIEW: 忽略 display 失效（自愈中）：$msg")
+            return
+        }
+        _status.value = "地图暂不可用：${msg.take(100)}"
         HyperCarRepo.log("CARUI-PREVIEW: ${error.message}")
     }
 }
