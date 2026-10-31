@@ -89,7 +89,7 @@ class WifiIap2ProtocolTest {
         val car=Car(window=1);car.start()
         val accepted=car.message(0x1d01)
         assertEquals(listOf(0x1d02),accepted.map { it.messageId })
-        assertEquals(listOf(9,16),car.commandSizes.last())
+        assertEquals(listOf(16),car.commandSizes.last())
         // Time passing must not fabricate acceptance or retransmit a zero-retry link.
         assertTrue(car.protocol.advance(car.time+500).isEmpty())
         val cert=messages(car.feed(packet(0x40,car.sequence,car.ack)))
@@ -100,8 +100,66 @@ class WifiIap2ProtocolTest {
     @Test fun identificationAckCannotHideFollowingAuthenticationMessagesInOneCommand() {
         val car=Car();car.start()
         assertEquals(listOf(0x1d02,0xaa00),car.message(0x1d01).map { it.messageId })
-        assertEquals(listOf(9,16,16),car.commandSizes.last())
+        assertEquals(listOf(16,16),car.commandSizes.last())
         assertFalse(car.protocol.ready)
+    }
+
+    @Test fun bmwAdvertisedSerialUsesBoxFramesWithPiggybackAckThenDirectCertificate() {
+        val car = Car(window=5)
+        car.start()
+        // IdentificationInformation parameter 6: accessory's sent-message list contains AA06.
+        val identification = Iap2Csm.param(6, byteArrayOf(0xaa.toByte(), 6))
+        val commands = WifiIap2Framing.split(car.protocol.feed(
+            packet(0x40, ++car.sequence, car.ack, 1, Iap2Csm.encode(0x1d01, identification)), car.time++))
+        // Independently encoded wire fixtures: local seq 102/103, peer seq 87, control session 1.
+        fun hex(s: String) = s.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+        assertEquals(2, commands.size)
+        assertArrayEquals(hex("ff5a00104066570199404000061d025b"), commands[0])
+        assertArrayEquals(hex("ff5a001440675701944040000aaa0000040000c8"), commands[1])
+        car.ack = 103
+        val certificate = car.message(0xaa06).single()
+        assertEquals(0xaa00, certificate.messageId)
+        assertTrue(certificate.body.isEmpty())
+        assertEquals(listOf(16), car.commandSizes.last())
+        assertEquals(0xaa02, car.message(0xaa01, Iap2Csm.param(0, byteArrayOf(1))).single().messageId)
+        car.message(0xaa03, Iap2Csm.param(0, ByteArray(64)))
+        assertFalse(car.protocol.ready) // Five-packet peer window leaves the last greeting queued.
+        assertEquals(listOf(0x4e0b), messages(car.feed(packet(0x40, car.sequence, car.ack))).map { it.messageId })
+        assertTrue(car.protocol.ready)
+    }
+
+    @Test fun wifiStillAcknowledgesRequestsWithoutBusinessReplyAndDuplicates() {
+        val car = Car(); car.start()
+        car.message(0x1d01)
+        val request = packet(0x40, ++car.sequence, car.ack, 1, Iap2Csm.encode(0xae00))
+        val ack = car.feed(request).single()
+        assertEquals(0, ack.session)
+        assertTrue(ack.body.isEmpty())
+        assertEquals(car.sequence, car.protocol.feed(request, car.time++)[6].toInt() and 255)
+        assertFalse(car.protocol.ready)
+    }
+
+    @Test fun fullWifiSendWindowStillFlushesReceiveAckWithoutSendingQueuedCertificate() {
+        val car = Car(window=1); car.start()
+        car.message(0x1d01) // 1D02 fills the window; AA00 remains queued.
+        val frames = car.feed(packet(0x40, ++car.sequence, car.ack - 1, 1, Iap2Csm.encode(0x4154)))
+        assertEquals(1, frames.size)
+        assertEquals(0, frames.single().session)
+        assertTrue(frames.single().body.isEmpty())
+        val certificate = messages(car.feed(packet(0x40, car.sequence, car.ack)))
+        assertEquals(listOf(0xaa00), certificate.map { it.messageId })
+        assertFalse(car.protocol.ready)
+    }
+
+    @Test fun advertisedSerialPeerMayReturnCertificateDirectlyWithoutRestartOnLateSerial() {
+        val car = Car(); car.start()
+        val request = car.message(0x1d01, Iap2Csm.param(6, byteArrayOf(0xaa.toByte(), 6))).last()
+        assertEquals(listOf(0), Iap2Csm.parseParams(request.body).map { it.id })
+        assertEquals(0xaa02, car.message(0xaa01, Iap2Csm.param(0, byteArrayOf(1))).single().messageId)
+        assertTrue(car.message(0xaa06).isEmpty())
+        assertFalse(car.protocol.ready)
+        car.message(0xaa03, Iap2Csm.param(0, ByteArray(64)))
+        assertTrue(car.protocol.ready)
     }
 
     @Test fun boxWifiSequenceUsesNegotiatedControlSessionAndRespondsToSubscriptions() {

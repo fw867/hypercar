@@ -86,13 +86,15 @@ internal class WifiIap2Protocol(
         }
         when (id) {
             0x1d01 -> if (phase == "IDENTIFICATION") {
+                val serialSupported = Iap2Messages.parseIdentification(frame.body).declaresSend(0xaa06) == true
                 send(0x1d02)
                 phase = "CERTIFICATE"
                 deadline = now + 10_000
                 nextWaitLog = now + 2_000
-                // CatPlay RequestAuthenticationCertificate::default() omits the serial-number flag.
-                // A silent serial request previously stalled until BMW closed the session (~8s).
-                send(0xaa00)
+                // Box firmware 0x60a74/0x634b8 checks AA06 support and adds empty parameter 0.
+                // Unknown/unsupported peers retain CatPlay's default direct certificate request.
+                log("AUTH certificate request=${if (serialSupported) "serial-first (peer declares AA06)" else "direct (AA06 not declared)"}")
+                if (serialSupported) send(0xaa00, Iap2Csm.param(0, ByteArray(0))) else send(0xaa00)
             }
             0xaa06 -> if (phase == "CERTIFICATE" && !retriedCertificate) {
                 retriedCertificate = true

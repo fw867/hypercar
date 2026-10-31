@@ -599,7 +599,7 @@ object HyperCarRepo {
             if (!SettingsStore.autoConnect || hasCurrentSession || wifiNetworks(context).isEmpty()) return@launch
             val ssid = currentWifiSsid(context)
             if (knownWifiReceiver(ssid) == null || ssid == null || knownWifiNetwork(context, ssid) == null) return@launch
-            log("WIFI-RESUME: 已接入已配对车机网络，自动恢复 AirPlay，无需等待蓝牙 iAP2")
+            log("WIFI-RESUME: 已接入已配对车机网络，恢复 ctrl 广播与监听，按车机激活状态建立 AirPlay")
             connectAutomatically(context)
         }
     }
@@ -702,7 +702,7 @@ object HyperCarRepo {
                         if (seen == null) {
                             if (coordinator.sessionStartCount == 0) {
                                 "车机未发起 iAP2（ACL 已连但收不到 …cafe 连入）——" +
-                                    "请在 iDrive 里删除本机重新配对 / 确认 Apple CarPlay 已启用"
+                                    "请在车机确认 Apple CarPlay 已启用；继续保留广播与监听"
                             } else {
                                 "车机连入了 iAP2 但没给 0x5703/0x4301——请在车机上点一次 Apple CarPlay"
                             }
@@ -1132,6 +1132,7 @@ object HyperCarRepo {
         context: Context,
         seen: CarPlayEndpoint?,
     ): CarPlayEndpoint? {
+        if (headUnitProfile.requireAirplayActivation) return null
         val gateway = wifiGateway(context) ?: return null
         log(
             "SESSION: 车机未给可用 AirPlay 地址" +
@@ -1725,10 +1726,9 @@ object HyperCarRepo {
         lastSeen: AtomicReference<CarPlayEndpoint?>,
         advertiser: CarPlayCtrlAdvertiser,
     ): CarPlayEndpoint? = withTimeoutOrNull(ENDPOINT_TIMEOUT_MILLIS) {
-        // ⓿ 记住的端点优先：与上次成功时同一个热点就直接试它。
-        //    宝马盒子实测就是这样连上的（docs/NEGOTIATION-GAPS.md §14）：它不在连接时
-        //    做发现，而是直连记住的 IP:端口。我们照抄这一条，能把"第二次起"的耗时
-        //    从几十秒（等 0x4301/扫网段）压到一次 TCP 连接。
+        // BMW's second-entry box trace still obtains Bluetooth credentials and a fresh ctrl invite.
+        // Retain the network/identity shortcut, but never confuse a remembered/open port with activation.
+        val requireActivation = headUnitProfile.requireAirplayActivation
         val resumeSsid = currentWifiSsid(context)
         val resumeMac = knownWifiReceiver(resumeSsid)
         if (resumeMac != null && !resumeSsid.isNullOrBlank()) {
@@ -1745,8 +1745,12 @@ object HyperCarRepo {
                 log("WIFI-RESUME: 绑定已知车机 Wi-Fi 并恢复 ctrl 广播，使用本车凭证")
             }
         }
+        if (requireActivation) {
+            log("SESSION: 等待本轮 ctrl 邀请或 iAP2 端点；保持蓝牙监听与 Wi-Fi 广播，不预连记忆/扫描端口")
+            push(link = LinkState.Negotiating("等待车机开启 CarPlay"))
+        }
         val remembered = SettingsStore.lastAirplayEndpoint
-        if (remembered.contains('|')) {
+        if (!requireActivation && remembered.contains('|')) {
             val (endpointPart, ssidPart) = remembered.split('|', limit = 2)
             // 只认 IPv4 的端点：老版本可能把 fe80:: 写进来（那种地址不带 scope 必然 EINVAL），
             // 读到就丢弃，走正常发现流程。
@@ -1851,7 +1855,7 @@ object HyperCarRepo {
                     // ① 静默网关试探：手机刚连上（或本来就该连）车机热点时，不用等 0x4301——
                     //    车机的 AirPlay 控制面通常就在热点网关的 7000 端口。
                     val ssid = currentWifiSsid(context)
-                    if (!ssid.isNullOrBlank() && ssid !in probedSsid) {
+                    if (!requireActivation && !ssid.isNullOrBlank() && ssid !in probedSsid) {
                         val changed = observedSsid != null && observedSsid != ssid
                         val isCarHotspot = ssid == lastSeen.get()?.ssid || knownWifiReceiver(ssid) != null
                         if (changed || isCarHotspot) {
@@ -1900,11 +1904,13 @@ object HyperCarRepo {
                         val waited = ticks * ENDPOINT_TICK_MILLIS / 1000
                         // 区分「车机根本没连进来」与「连进来了但没给凭据」——前者是车机
                         // 侧的问题（iDrive 里没把本机当 CarPlay 手机），后者才是协议问题。
-                        if (seen == null && coordinator.sessionStartCount == 0 && wifiReceiverMac == null) {
+                        if (requireActivation) {
+                            log("SESSION: 等待本轮车机邀请/0x4301，已等 ${waited}s；" +
+                                "蓝牙会话次数=${coordinator.sessionStartCount} 已收Wi-Fi凭据=${seen?.ssid != null}，保持广播与监听")
+                        } else if (seen == null && coordinator.sessionStartCount == 0 && wifiReceiverMac == null) {
                             log(
                                 "SESSION: ${waited}s 内车机一次都没发起 iAP2（ACL 已连但收不到 …cafe 连入）——" +
-                                    "这是车机侧状态：请在 iDrive「移动设备」里删除本机后重新配对，" +
-                                    "或确认「Apple CarPlay」已为该设备启用（设置里可手动指定目标车机）",
+                                    "请确认「Apple CarPlay」已为该设备启用，继续保持监听",
                             )
                         } else {
                             log(

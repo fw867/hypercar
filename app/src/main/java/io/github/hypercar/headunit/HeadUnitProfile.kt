@@ -75,6 +75,9 @@ data class HeadUnitProfile(
     /** 端点端口策略：true = 先查 mDNS `_airplay._tcp`，false = 直接用 [fallbackAirplayPorts]。 */
     val preferMdnsAirplay: Boolean = true,
 
+    /** Wait for this connection's ctrl invite or iAP2 endpoint; an open port is not activation. */
+    val requireAirplayActivation: Boolean = false,
+
     /** mDNS 拿不到（或不用 mDNS）时的兜底端口，按顺序试连。 */
     val fallbackAirplayPorts: List<Int> = listOf(7000, 7001, 7100, 17000),
 
@@ -106,6 +109,7 @@ object HeadUnitProfiles {
         allowOutboundIap2 = false,
         abortWhenCarPlayWindowClosed = false,
         preferMdnsAirplay = true,
+        requireAirplayActivation = true,
         fallbackAirplayPorts = listOf(7000, 7001, 7100, 17000),
         touchDisplay = null,
         pairingHint = "首次要在 iDrive 里把这个设备选成 CarPlay 手机（车机会弹确认）",

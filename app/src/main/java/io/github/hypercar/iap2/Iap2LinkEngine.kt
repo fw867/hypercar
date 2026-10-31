@@ -184,6 +184,8 @@ class Iap2LinkEngine(
     /** 最近一次出向帧时刻（NORMAL 态裸 ACK 保活的基准）。 */
     private var lastOutputMillis: Long = 0
     private var passiveNegotiation = false
+    // Reliable Wi-Fi drains CSM responses before falling back to a bare ACK (CatPlay/box).
+    private var pendingReliableAck = false
 
     val isDead: Boolean get() = state == State.DEAD
 
@@ -227,6 +229,7 @@ class Iap2LinkEngine(
     fun feedEof() = die(null)
 
     fun takeOutput(): ByteArray {
+        if (pendingReliableAck) writePacket(null, sentSequence, CONTROL_ACKNOWLEDGEMENT, 0)
         val bytes = output.toByteArray()
         output.reset()
         return bytes
@@ -567,6 +570,10 @@ class Iap2LinkEngine(
     }
 
     private fun sendAcknowledgement() {
+        if (reliableTransport) {
+            pendingReliableAck = true
+            return
+        }
         writePacket(null, sentSequence, CONTROL_ACKNOWLEDGEMENT, 0)
     }
 
@@ -585,6 +592,8 @@ class Iap2LinkEngine(
         sessionId: Int,
     ) {
         if (state == State.DEAD) return
+        // Every ACK-bearing packet confirms the current receive watermark, including CSM replies.
+        if (control and CONTROL_ACKNOWLEDGEMENT != 0) pendingReliableAck = false
         onFrameSent?.invoke(control, sequence, lastReceivedInOrder, sessionId, payload?.size ?: 0)
         val length = payload?.size?.plus(HEADER_BYTES + 1) ?: HEADER_BYTES
         val frame = ByteArray(length)
@@ -621,6 +630,7 @@ class Iap2LinkEngine(
         output.reset()
         pendingEvents.clear()
         sendBacklog.clear()
+        pendingReliableAck = false
         pendingEvents += Event.Dead(reason)
     }
 
