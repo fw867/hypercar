@@ -142,11 +142,16 @@ class Iap2LinkEngine(
     private var adoptedSynchronization: SynchronizationPayload? = null
 
     /**
-     * **本方声明的发送窗口**（LSP maxOutgoing 语义 = 声明方自己的未确认包上限）：
-     * 发送窗口按此计，而非对端声明值——回显时我们会声明 0x7F（ownSyncOf），
-     * 按对端值计窗会把突发消息卡死在对端的小窗口里（MIB3 突发 8 条 × 对端 4）。
+     * 本方声明的接收窗口：限制对端向本端的未确认发送量。
+     * Wi-Fi 出站按对端声明窗口计数，与 CatPlay 相同；蓝牙保留历史兼容行为，
+     * 暂不改变已实车跑通的突发发送策略。
      */
     private var declaredMaxOutgoing = maxOutgoing
+
+    /** Wi-Fi flow control follows the receiver's offer, independently of retransmission policy. */
+    val peerReceiveWindow: Int? get() = peerSynchronization?.maxOutgoing
+    val queuedControlPackets: Int get() = sendBacklog.size
+    val outstandingPackets: Int get() = lastSentAcknowledged?.let { sequenceDistance(sentSequence,it) } ?: 0
 
     /** 诊断：首次采纳对端会话表时回调（打印对端提议的会话表，便于真车排查）。 */
     var onPeerSynchronizationAdopted: ((SynchronizationPayload) -> Unit)? = null
@@ -503,8 +508,10 @@ class Iap2LinkEngine(
         if (state != State.NORMAL) return
         while (sendBacklog.isNotEmpty()) {
             val packet = sendBacklog.first()
+            val sendWindow = if (reliableTransport) (peerSynchronization?.maxOutgoing ?: maxOutgoing).coerceIn(1,127)
+                else declaredMaxOutgoing // Preserve the established Bluetooth compatibility policy.
             if (lastSentAcknowledged != null &&
-                sequenceDistance(sentSequence, lastSentAcknowledged!!) >= declaredMaxOutgoing
+                sequenceDistance(sentSequence, lastSentAcknowledged!!) >= sendWindow
             ) {
                 return
             }
@@ -518,9 +525,10 @@ class Iap2LinkEngine(
             if (peer == null || peer.maxRetransmissions > 0) {
                 unacknowledged += packet
                 retransmitDeadline = packet.deadlineMillis
-            } else {
+            } else if (!reliableTransport) {
                 lastSentAcknowledged = sentSequence
             }
+            // A peer's zero-retry offer disables retransmission, not ACK-based Wi-Fi flow control.
         }
     }
 

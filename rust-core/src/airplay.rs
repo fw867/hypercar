@@ -43,6 +43,7 @@ pub struct AirplayParams {
     pub enable_audio: bool,
     pub keep_alive_stats: bool,
     pub bmw_box_bootstrap: bool,
+    pub desktop_receiver: bool,
     /// 设置里的编码分辨率（仅作 `/info` 无显示器信息时的兜底）。
     pub width: u32,
     pub height: u32,
@@ -460,7 +461,8 @@ pub async fn negotiate(
     audio_owned.store(modes.lock().audio_owned(), std::sync::atomic::Ordering::Release);
     emit_log(&format!("AUDIO: enabled={} box_bootstrap={box_bootstrap} setup_enabled={audio_allowed} owner_controller={}", p.enable_audio, modes.lock().audio_owned()));
     let mut audio = if audio_allowed {
-        negotiate_audio(&channel, &factory, shared_secret.as_ref(), p).await
+        let desktop = p.desktop_receiver || !use_box_bootstrap(true, &info);
+        negotiate_audio(&channel, &factory, shared_secret.as_ref(), p, desktop).await
     } else {
         None
     };
@@ -487,6 +489,17 @@ fn read_display_size(display: &Value) -> (u32, u32) {
 #[cfg(test)]
 mod display_size_tests {
     use super::*;
+    #[test]
+    fn desktop_pcm_setup_uses_positive_latency_and_keeps_car_parameters() {
+        for desktop in [false,true] {
+            let body=bplist::parse(&build_audio_setup(42,desktop)).unwrap();
+            let stream=&body.get("streams").unwrap().as_array().unwrap()[0];
+            assert_eq!(stream.get("audioLatencyMs").and_then(Value::as_int),Some(if desktop {250} else {0}));
+            assert_eq!(stream.get("spf").and_then(Value::as_int),Some(352));
+            assert_eq!(stream.get("audioFormat").and_then(Value::as_int),Some(1<<15));
+            assert_eq!(stream.get("streamConnectionID").and_then(Value::as_int),Some(42));
+        }
+    }
     #[test]
     fn desktop_info_overrides_bmw_bootstrap_without_weakening_real_car_grants() {
         for key in ["name", "model", "manufacturer"] {
@@ -956,26 +969,34 @@ fn build_screen_setup(conn_id: i64, uuid: &str) -> Vec<u8> {
     )]))
 }
 
-async fn negotiate_audio(
-    channel: &Arc<RtspChannel>,
-    factory: &Arc<dyn SocketProvider>,
-    shared: Option<&[u8; 32]>,
-    p: &AirplayParams,
-) -> Option<AudioOut> {
-    let conn_id = random_positive_i64();
-    let body = bplist::encode(&Value::dict(vec![(
+/// WinPlay treats zero latency as 1000 ms; 352-frame PCM then approaches its 128-packet limit.
+/// A positive 250 ms keeps its reorder queue below capacity without changing physical-car timing.
+fn build_audio_setup(conn_id: i64, desktop: bool) -> Vec<u8> {
+    bplist::encode(&Value::dict(vec![(
         "streams",
         Value::array(vec![Value::dict(vec![
             ("type", Value::int(100)),          // 主音频
             ("streamConnectionID", Value::int(conn_id)),
             ("audioFormat", Value::int(1 << 15)), // PCM 48k 立体声位图
             ("audioType", Value::str("media")),   // 必须 media（compatibility 档无声）
-            ("audioLatencyMs", Value::int(0)),
+            ("audioLatencyMs", Value::int(if desktop { 250 } else { 0 })),
             ("input", Value::bool(false)),
             ("supportsRTPPacketRedundancy", Value::bool(false)),
             ("spf", Value::int(352)), // AirPlay 标准 SPF（512 在真车无声）
         ])]),
-    )]));
+    )]))
+}
+
+async fn negotiate_audio(
+    channel: &Arc<RtspChannel>,
+    factory: &Arc<dyn SocketProvider>,
+    shared: Option<&[u8; 32]>,
+    p: &AirplayParams,
+    desktop: bool,
+) -> Option<AudioOut> {
+    let conn_id = random_positive_i64();
+    let body = build_audio_setup(conn_id, desktop);
+    emit_log(&format!("AUDIO: SETUP PCM48k stereo SPF352 desktop={desktop} latencyMs={}", if desktop {250} else {0}));
     // 音频 SETUP 必须用**绝对 URI**（cardeck runAudioStream 同款：`rtsp://host:port/`）；
     // 屏幕流与初始 SETUP 才用相对路径。URI 用反会 400/404。
     let audio_uri = format!("rtsp://{}:{}/", p.car_ip, p.airplay_port);

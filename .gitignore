@@ -45,3 +45,7 @@ sysdiagnose*
 *.pcap
 *.pcapng
 *.etl
+
+# Python tooling cache
+__pycache__/
+*.py[cod]

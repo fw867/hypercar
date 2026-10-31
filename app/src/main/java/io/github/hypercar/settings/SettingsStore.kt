@@ -305,6 +305,8 @@ object SettingsStore {
             append("\"keep_alive_stats\":").append(keepAliveStats).append(",")
             append("\"bmw_box_bootstrap\":").append(io.github.hypercar.headunit.ReceiverCompatibility.useBmwBootstrap(
                 headUnitProfileId, io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(receiverBluetoothMac))).append(",")
+            append("\"desktop_receiver\":").append(io.github.hypercar.headunit.ReceiverCompatibility.isDesktopReceiver(
+                headUnitProfileId, io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(receiverBluetoothMac))).append(",")
             append("\"identity_path\":\"").append(esc(identityPath)).append("\"")
             io.github.hypercar.session.PairingEvidence.receiverKey(receiverBluetoothMac)?.let {
                 append(",\"receiver_id\":\"").append(it).append("\"")

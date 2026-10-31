@@ -32,16 +32,21 @@ class WifiIap2ProtocolTest {
     }
     private fun messages(frames: List<Wire>) = frames.filter { it.session != 0 }.flatMap { Iap2Csm.Parser().offer(it.body) }
 
-    private inner class Car {
+    private inner class Car(val window: Int = 32) {
         val logs = mutableListOf<String>()
         val protocol = WifiIap2Protocol("test-device", { logs += it }, { ByteArray(32) { 7 } })
         var sequence = 86
         var ack = 0
         var time = 1L
-        fun feed(bytes: ByteArray): List<Wire> = split(protocol.feed(bytes, time++)).also { out -> out.lastOrNull()?.let { ack = it.seq } }
+        val commandSizes = mutableListOf<List<Int>>()
+        fun feed(bytes: ByteArray): List<Wire> {
+            val commands = WifiIap2Framing.split(protocol.feed(bytes,time++))
+            commandSizes += commands.map { it.size }
+            return commands.flatMap { split(it) }.also { out -> out.lastOrNull()?.let { ack=it.seq } }
+        }
         fun start(): List<Iap2Csm.Frame> {
             assertArrayEquals(Iap2LinkEngine.MARKER, protocol.feed(Iap2LinkEngine.MARKER, time++))
-            val sync = Iap2LinkEngine.SynchronizationPayload(5, 65535, 0, 0, 0, 0,
+            val sync = Iap2LinkEngine.SynchronizationPayload(window, 65535, 0, 0, 0, 0,
                 listOf(Iap2LinkEngine.SessionDescriptor(1, 0, 2), Iap2LinkEngine.SessionDescriptor(2, 1, 2))).encode()
             val syn = packet(0x80, sequence, 0, body = sync)
             assertTrue(feed(syn.copyOfRange(0, 6)).isEmpty())
@@ -65,6 +70,38 @@ class WifiIap2ProtocolTest {
                 message(0xaa03, Iap2Csm.param(0, ByteArray(64) { 9 })).map { it.messageId })
             assertFalse(protocol.failed)
         }
+    }
+
+    @Test fun readyWaitsForPostAuthenticationGreetingsToLeaveTheLinkBacklog() {
+        val car=Car(window=1);car.start();car.message(0x1d01)
+        assertEquals(listOf(0xaa00),messages(car.feed(packet(0x40,car.sequence,car.ack))).map { it.messageId })
+        assertEquals(0xaa02,car.message(0xaa01,Iap2Csm.param(0,byteArrayOf(1))).single().messageId)
+        assertEquals(listOf(0xaa05),car.message(0xaa03,Iap2Csm.param(0,ByteArray(64))).map { it.messageId })
+        assertFalse(car.protocol.ready)
+        val greetings=listOf(0x4e0c,0xa100,0x4e0a,0x4e09,0x4e0b)
+        greetings.forEachIndexed { index,id ->
+            assertEquals(listOf(id),messages(car.feed(packet(0x40,car.sequence,car.ack))).map { it.messageId })
+            assertEquals(index==greetings.lastIndex,car.protocol.ready)
+        }
+    }
+
+    @Test fun wifiWaitsForRealAckEvenWhenPeerDisablesRetransmission() {
+        val car=Car(window=1);car.start()
+        val accepted=car.message(0x1d01)
+        assertEquals(listOf(0x1d02),accepted.map { it.messageId })
+        assertEquals(listOf(9,16),car.commandSizes.last())
+        // Time passing must not fabricate acceptance or retransmit a zero-retry link.
+        assertTrue(car.protocol.advance(car.time+500).isEmpty())
+        val cert=messages(car.feed(packet(0x40,car.sequence,car.ack)))
+        assertEquals(listOf(0xaa00),cert.map { it.messageId })
+        assertFalse(car.protocol.ready)
+    }
+
+    @Test fun identificationAckCannotHideFollowingAuthenticationMessagesInOneCommand() {
+        val car=Car();car.start()
+        assertEquals(listOf(0x1d02,0xaa00),car.message(0x1d01).map { it.messageId })
+        assertEquals(listOf(9,16,16),car.commandSizes.last())
+        assertFalse(car.protocol.ready)
     }
 
     @Test fun boxWifiSequenceUsesNegotiatedControlSessionAndRespondsToSubscriptions() {

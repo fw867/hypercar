@@ -15,13 +15,14 @@ internal class WifiIap2Protocol(
     private var started = false
     private var phase = "LINK"
     private var deadline = 0L
+    private var nextWaitLog = 0L
     private var retriedCertificate = false
     private var tracedFrames = 0
     private var now = 0L
     private val seen = mutableSetOf<Int>()
     private val unknown = mutableSetOf<Int>()
     private val deferred = linkedMapOf<Int, Iap2Csm.Frame>()
-    val ready: Boolean get() = phase == "READY" && !failed
+    val ready: Boolean get() = phase == "READY" && !failed && engine.queuedControlPackets == 0
     var failed = false
         private set
 
@@ -30,7 +31,7 @@ internal class WifiIap2Protocol(
         engine.onFrameReceived = { ctl, seq, ack, session, size -> trace("RX", ctl, seq, ack, session, size) }
         engine.onFrameSent = { ctl, seq, ack, session, size -> trace("TX", ctl, seq, ack, session, size) }
         engine.onPeerSynchronizationAdopted = { sync ->
-            log("LINK sessions=${sync.sessions.joinToString { "${it.id}/${it.kind}/${it.version}" }} retry=${sync.retransmissionTimeoutMillis} ack=${sync.acknowledgementTimeoutMillis}")
+            log("LINK sessions=${sync.sessions.joinToString { "${it.id}/${it.kind}/${it.version}" }} peerWindow=${sync.maxOutgoing} localWindow=32 maxLength=${sync.maxLength} retry=${sync.retransmissionTimeoutMillis} maxRetries=${sync.maxRetransmissions} ack=${sync.acknowledgementTimeoutMillis}")
         }
     }
 
@@ -62,6 +63,10 @@ internal class WifiIap2Protocol(
                 is Iap2LinkEngine.Event.Dead -> fail(event.reason ?: "link closed")
             }
         }
+        if (phase in listOf("CERTIFICATE", "CHALLENGE") && !failed && now >= nextWaitLog) {
+            log("WAIT phase=$phase remaining=${(deadline-now).coerceAtLeast(0)}ms pending=${engine.queuedControlPackets} outstanding=${engine.outstandingPackets}; RTSP write/200 does not prove peer link acceptance")
+            nextWaitLog = now + 2_000
+        }
         if (started && phase != "READY" && now > deadline) fail("phase=$phase timeout")
         return engine.takeOutput()
     }
@@ -84,6 +89,7 @@ internal class WifiIap2Protocol(
                 send(0x1d02)
                 phase = "CERTIFICATE"
                 deadline = now + 10_000
+                nextWaitLog = now + 2_000
                 // CatPlay RequestAuthenticationCertificate::default() omits the serial-number flag.
                 // A silent serial request previously stalled until BMW closed the session (~8s).
                 send(0xaa00)
@@ -99,6 +105,7 @@ internal class WifiIap2Protocol(
                 }
                 phase = "CHALLENGE"
                 deadline = now + 10_000
+                nextWaitLog = now + 2_000
                 val challenge = nonce()
                 require(challenge.size == 32)
                 send(0xaa02, Iap2Csm.param(0, challenge))
@@ -154,7 +161,7 @@ internal class WifiIap2Protocol(
         if (failed) return
         val body = parts.fold(ByteArray(0)) { a, b -> a + b }
         if (!engine.sendControl(Iap2Csm.encode(id, body), now)) fail("link refused id=0x${id.toString(16)}")
-        else log("TX phase=$phase id=0x${id.toString(16)} body=${body.size}B")
+        else log("QUEUED phase=$phase id=0x${id.toString(16)} body=${body.size}B pending=${engine.queuedControlPackets} outstanding=${engine.outstandingPackets}")
     }
 
     private fun trace(direction: String, ctl: Int, seq: Int, ack: Int, session: Int, size: Int) {

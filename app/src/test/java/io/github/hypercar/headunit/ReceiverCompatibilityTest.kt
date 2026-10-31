@@ -4,6 +4,13 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ReceiverCompatibilityTest {
+    @Test fun desktopAudioCompatibilityRequiresDesktopProfileOrCurrentIdentity() {
+        assertTrue(ReceiverCompatibility.isDesktopReceiver("winplay", null))
+        assertTrue(ReceiverCompatibility.isDesktopReceiver("bmw_id85", "WinPlay receiver"))
+        assertTrue(ReceiverCompatibility.isDesktopReceiver("bmw_id85", "DiPlay"))
+        assertFalse(ReceiverCompatibility.isDesktopReceiver("bmw_id85", "BMW MGU"))
+        assertFalse(ReceiverCompatibility.isDesktopReceiver("generic", null))
+    }
     @Test fun desktopIdentityOverridesRetainedBmwProfile() {
         assertFalse(ReceiverCompatibility.useBmwBootstrap("bmw_id85", "DiPlay DiPlay DiPlay"))
         assertFalse(ReceiverCompatibility.useBmwBootstrap("bmw_id85", "WinPlay PC receiver"))

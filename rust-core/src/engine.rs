@@ -55,6 +55,8 @@ pub struct EngineConfig {
     pub keep_alive_stats: bool,
     #[serde(default)]
     pub bmw_box_bootstrap: bool,
+    #[serde(default)]
+    pub desktop_receiver: bool,
     pub identity_path: String,
     #[serde(default)]
     pub receiver_id: Option<String>,
@@ -387,6 +389,7 @@ pub async fn run_engine(
         enable_audio: cfg.enable_audio,
         keep_alive_stats: cfg.keep_alive_stats,
         bmw_box_bootstrap: cfg.bmw_box_bootstrap,
+        desktop_receiver: cfg.desktop_receiver,
         width: cfg.width,
         height: cfg.height,
         // 接收端 /info 报 0x0 时的触摸显示空间（PC 侧联调用 --touch-display 指定）

@@ -8,10 +8,31 @@ use tokio::sync::{mpsc, Notify};
 use crate::{bplist::{self, Value}, rtsp::RtspChannel};
 
 #[derive(Default)]
-struct Handoff { id: u64, ready: bool, health: Option<std::time::Instant> }
+struct Handoff { id: u64, ready: bool, health: Option<std::time::Instant>, ready_token: u64 }
 static HANDOFF: Lazy<Mutex<Handoff>> = Lazy::new(|| Mutex::new(Handoff::default()));
 pub fn is_active(id: u64) -> bool { HANDOFF.lock().id == id }
-pub fn mark_ready(id: u64, ready: bool) { let mut s = HANDOFF.lock(); if s.id == id { s.ready = ready; } }
+pub fn mark_ready(id: u64, ready: bool) {
+    let token = {
+        let mut state = HANDOFF.lock();
+        if state.id != id { return; }
+        state.ready = false;
+        state.ready_token = state.ready_token.wrapping_add(1);
+        if !ready { return; }
+        state.ready_token
+    };
+    // FIFO barrier: only become transport-ready after earlier authentication/greeting writes.
+    let queued = OUTPUT.lock().as_ref().filter(|(current,_)| *current == id)
+        .map(|(_,tx)| tx.try_send(Outbound::Ready(token)).is_ok()).unwrap_or(false);
+    if !queued { crate::emit_log(&format!("WIFI-IAP#{id}: readiness barrier could not be queued")); }
+}
+fn ready_written(id: u64, token: u64) {
+    let accepted = {
+        let mut state = HANDOFF.lock();
+        if state.id != id || state.ready_token != token { false }
+        else { state.ready=true; true }
+    };
+    if accepted { crate::emit_log(&format!("WIFI-IAP#{id}: READY transport barrier reached (peer authentication acceptance is separate)")); }
+}
 pub fn feedback(id: u64, healthy: bool) { let mut s = HANDOFF.lock(); if s.id == id { s.health = if healthy { Some(std::time::Instant::now()) } else { None }; } }
 pub fn can_keep_session() -> bool {
     let s = HANDOFF.lock(); s.id != 0 && s.ready && s.health.map(|t| t.elapsed() < Duration::from_secs(5)).unwrap_or(false)
@@ -22,13 +43,14 @@ pub fn can_keep_generation(id: u64) -> bool {
 fn clear_handoff(id: u64) { let mut s = HANDOFF.lock(); if s.id == id { *s = Handoff::default(); } }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-static OUTPUT: Lazy<Mutex<Option<(u64, mpsc::Sender<Vec<u8>>)>>> = Lazy::new(|| Mutex::new(None));
+enum Outbound { Frame(Vec<u8>), Ready(u64) }
+static OUTPUT: Lazy<Mutex<Option<(u64, mpsc::Sender<Outbound>)>>> = Lazy::new(|| Mutex::new(None));
 
 pub fn send(id: u64, data: Vec<u8>) -> bool {
     if data.is_empty() || data.len() > 65535 { return false; }
     let output = OUTPUT.lock();
     output.as_ref().filter(|(current, _)| *current == id)
-        .map(|(_, tx)| tx.try_send(data).is_ok()).unwrap_or(false)
+        .map(|(_, tx)| tx.try_send(Outbound::Frame(data)).is_ok()).unwrap_or(false)
 }
 
 pub struct WifiIap2 {
@@ -39,7 +61,7 @@ pub struct WifiIap2 {
 impl WifiIap2 {
     pub fn start(channel: Arc<RtspChannel>, device: &str, stop: Arc<Notify>) -> Self {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = mpsc::channel::<Outbound>(64);
         *OUTPUT.lock() = Some((id, tx));
         *HANDOFF.lock() = Handoff { id, ..Handoff::default() };
         let task = tokio::spawn(async move {
@@ -49,6 +71,11 @@ impl WifiIap2 {
                     _ = stop.notified() => break,
                     bytes = rx.recv() => match bytes { Some(b) => b, None => break },
                 };
+                let data = match data {
+                    Outbound::Frame(data) => data,
+                    Outbound::Ready(token) => { ready_written(id,token); continue; }
+                };
+                let frame_bytes = data.len();
                 let body = bplist::encode(&Value::dict(vec![
                     ("type", Value::str("iAPSendMessage")),
                     ("params", Value::dict(vec![("data", Value::Data(data))])),
@@ -60,7 +87,7 @@ impl WifiIap2 {
                 )).await {
                     Ok(Ok(cseq)) => {
                         sent += 1;
-                        if sent <= 16 || sent % 50 == 0 { crate::emit_log(&format!("WIFI-IAP#{id}: control POST written CSeq={cseq} count={sent}")); }
+                        if sent <= 16 || sent % 50 == 0 { crate::emit_log(&format!("WIFI-IAP#{id}: control POST written CSeq={cseq} frameBytes={frame_bytes} count={sent}")); }
                     }
                     other => {
                         crate::emit_log(&format!("WIFI-IAP#{id}: control transport failed {}", match other {
@@ -129,14 +156,24 @@ mod tests {
 
     #[test]
     fn bluetooth_retirement_requires_current_ready_and_fresh_health() {
+        let (tx,mut rx)=mpsc::channel(4);
+        *OUTPUT.lock()=Some((77,tx));
         *HANDOFF.lock() = Handoff { id: 77, ..Handoff::default() };
         assert!(!can_keep_session()); feedback(77, true); assert!(!can_keep_session());
         mark_ready(76, true); assert!(!can_keep_session());
-        mark_ready(77, true); assert!(can_keep_generation(77)); assert!(!can_keep_generation(76));
+        assert!(send(77,vec![1,2,3]));
+        mark_ready(77, true); assert!(!can_keep_session());
+        match rx.try_recv().unwrap() { Outbound::Frame(data)=>assert_eq!(data,vec![1,2,3]), _=>panic!("barrier overtook frame") }
+        let token=match rx.try_recv().unwrap() { Outbound::Ready(t)=>t, _=>panic!("expected barrier") };
+        ready_written(77,token);
+        assert!(can_keep_generation(77)); assert!(!can_keep_generation(76));
         clear_handoff(76); assert!(can_keep_session());
         HANDOFF.lock().health = Some(std::time::Instant::now() - Duration::from_secs(6));
         assert!(!can_keep_session()); feedback(77, true); mark_ready(77, false); assert!(!can_keep_session());
-        clear_handoff(77); assert!(!can_keep_session());
+        mark_ready(77,true);
+        let token=match rx.try_recv().unwrap() { Outbound::Ready(t)=>t, _=>panic!("expected barrier") };
+        mark_ready(77,false); ready_written(77,token); assert!(!can_keep_session());
+        clear_handoff(77); assert!(!can_keep_session()); *OUTPUT.lock()=None;
     }
     #[test]
     fn stale_generation_and_queue_overflow_are_rejected() {

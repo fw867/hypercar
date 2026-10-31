@@ -49,6 +49,14 @@ class MusicNotificationListener : NotificationListenerService() {
         MusicBridge.attach(this)
     }
 
+    override fun onNotificationPosted(notification: android.service.notification.StatusBarNotification?) {
+        notification?.let { MusicBridge.onNotificationChanged(it.packageName) }
+    }
+
+    override fun onNotificationRemoved(notification: android.service.notification.StatusBarNotification?) {
+        notification?.let { MusicBridge.onNotificationChanged(it.packageName) }
+    }
+
     override fun onListenerDisconnected() {
         MusicBridge.detach()
         super.onListenerDisconnected()
@@ -311,6 +319,7 @@ object MusicBridge {
     }
 
     fun detach() {
+        MusicArtwork.clear()
         main.removeCallbacks(ticker)
         runCatching { controller?.unregisterCallback(callback) }
         controller = null
@@ -346,9 +355,16 @@ object MusicBridge {
         publish()
     }
 
+    fun onNotificationChanged(packageName: String) {
+        main.post {
+            if (controller?.packageName == packageName) { MusicArtwork.invalidate(); publish() }
+        }
+    }
+
     private fun publish() {
         val c = controller
         if (c == null) {
+            MusicArtwork.clear()
             _state.value = NowPlaying(
                 reason = when {
                     permissionDenied -> "请在系统设置里授予「通知使用权」"
@@ -365,9 +381,7 @@ object MusicBridge {
             val ai = ctx!!.packageManager.getApplicationInfo(pkg, 0)
             ctx.packageManager.getApplicationLabel(ai).toString()
         }.getOrDefault(pkg)
-        val art = md?.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
-            ?: md?.getBitmap(MediaMetadata.METADATA_KEY_ART)
-            ?: md?.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
+        val art = MusicArtwork.resolve(ctx, pkg, md) { publish() }
         _state.value = NowPlaying(
             available = true,
             packageName = pkg,
