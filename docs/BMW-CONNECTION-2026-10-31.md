@@ -161,3 +161,112 @@ CatPlay 提供了证书默认编码、资源命令方向及状态发布顺序的
 实车仍需分别观察：Wi-Fi AA01/AA03/READY、音频 SETUP/dataPort 与实际 136–137 包/秒、视频持续输出，以及是否超过原约 8 秒断连窗口。
 
 最终签名包已覆盖安装到 HyperCar 手机，版本 0.1.0.414 / 10414；启动正常，自动模式保持原先关闭状态，未启动会话前台服务。未在宝马热点进行本轮实车复测。
+
+
+## 当前 HyperCar 与 CatPlay 的 iAP2 流程对照（0.1.0.415）
+
+### 对照版本与结论边界
+
+本节按当前工作区源码复核，基线为 HyperCar `1ebe00c`（0.1.0.415）；415 的地图自动巡航调整没有改变 iAP2。CatPlay 固定为 `fc52bac7910a07ff3b6d94712175db6013528aa9`，避免用后续 master 的行为解释当前差异。用户所称 ipa2 在本节统一写为 iAP2。
+
+**两者的识别和证书交换主干相似，但并非完整流程对齐。** HyperCar 已有更多宝马无线引导、已知 Wi-Fi 恢复及 Android 生命周期处理；CatPlay 通用链路实现的乱序、恢复与多会话能力更广。CatPlay 手机模拟端仍有无线会话 TODO，不能作为完整宝马连接成功方案。今天的旧版日志只验证到 Wi-Fi AA00，后面的代码差异应当作为待验证项，不能全部归为约 8 秒断连原因。
+
+必须分开使用 CatPlay 的四类参考：
+
+| CatPlay 部分 | 实际角色 | 本次可以参考什么 |
+|---|---|---|
+| `core/catplay_iap2_link`、`async/catplay_iap2_client` | 通用链路、CSM 与异步传输框架 | DETECT/SYN、序号、窗口、重传、业务分发；不是完整手机业务 |
+| `catplay_carplay_tx_gadget/.../carplay_client_session.rs` | 手机模拟端；gadget 入口走 USB | 1D00/AA00 默认编码、认证后通知及订阅回应；不能据此推定宝马无线复连已实现 |
+| `carplay_rx/sink/receiver.rs` | AirPlay 接收端的可选 Wi-Fi iAP2 隧道 | `iAPSendMessage` 与独立异步链路的组合；收发角色与 HyperCar 手机端不同 |
+| `c2a/.../rx_bridge.rs` | c2a 接收桥 | 此版本 `open_iap2()` 直接返回 `None`，不能把它当作正在运行 Wi-Fi iAP2 的成功范例 |
+
+此外，`tokio/session_helper.rs::handle_auth` 是配件侧应答助手：有 MFi 芯片时读取证书、签署挑战，无芯片时还允许 mock 数据。它不是手机侧验证证书/签名的实现。此前对比的实体盒子固件也是另一份证据，不能把盒子抓包与 CatPlay 的所有代码行为画等号。
+
+### 两条 HyperCar 链路的实际顺序
+
+蓝牙入口（`Iap2Bluetooth.kt`、`Iap2SenderSession.kt`）：
+
+1. 宝马档案等待车机建立 RFCOMM；接入后手机链路引擎主动开始 DETECT/SYN。**被动接蓝牙 socket 不等于被动进行 iAP2 握手。**
+2. 链路 NORMAL → 发 1D00 → 收 1D01 并解析身份/能力 → 发 1D02。
+3. 发无参数 AA00 → 收 AA01 → AA02 挑战候选默认 32/20/16 字节，依据车机记忆调整顺序与等待时间 → 收 AA03 后发 AA05；另保留“链路仍活着、挑战全部静默后发 AA05”的历史兼容分支。断链或取消不走该分支。
+4. 立即发设备问候：4E0D → 4E0C → 4E0A → 4E0B → 4E09；再按档案/能力执行可选 EA、HID。
+5. 按协议与档案尝试 5702/5703、4300/4301、4E0E，取得或更新热点和 AirPlay 端点；允许凭据、端点及重新识别晚到，不因第一轮没有拿到它们就关闭蓝牙。
+6. 保持消息循环，处理晚到 4301、5703、EA03、1D01 和电源请求；AirPlay 连接与它并行运行。
+
+Wi-Fi 入口（`WifiIap2Protocol.kt`、`WifiIap2Bridge.kt`、`rust-core/src/wifi_iap2.rs`）：
+
+1. AirPlay SETUP、事件通道建立后启动本代 Wi-Fi 桥；收到 `iAPSendMessage` 字节才被动回应 DETECT、等待车机 SYN。它是在已有 AirPlay 通道内建立另一条 iAP2 链路，不是在热点上直接搜索独立 iAP2 服务端口。
+2. 链路 NORMAL → 1D00 → 1D01 → 1D02 → **无参数 AA00**；收到 AA06 可再补一次无参数 AA00。
+3. AA01 的参数 0 非空 → 发随机 **32 字节** AA02 → AA03 的参数 0 非空 → 发 AA05 → 本地标记 READY。无 20/16 字节回退，无认证超时放行；拒绝或超时结束本条虚拟链路。链路/识别各有 15 秒阶段预算，证书/挑战各 10 秒。
+4. 发 4E0C → A100 → 4E0A → 4E09 → 4E0B，再补发认证前暂存的支持订阅。这里没有重新索取热点，也没有执行蓝牙那套 EA/HID 引导。
+5. 屏幕流可先于 iAP2 READY 工作。宝马路径在屏幕流启动后，等待本代 READY 且最近 5 秒内有成功 feedback，才请求车机 `disableBluetooth`；约 15 秒未满足条件便不请求退场。该命令不是关闭手机整个蓝牙适配器。
+
+AirPlay 的 pair-verify、`auth-setup` 与这里 AA00～AA05 的交换属于不同步骤。前者和 `/info`、RECORD 成功，不能证明后者已完成；出现画面也不能证明 Wi-Fi iAP2 READY。
+
+### 逐阶段差异及影响
+
+| 阶段 | 当前 HyperCar | 固定版本 CatPlay | 判断与处置 |
+|---|---|---|---|
+| 链路同步参数 | 使用简化引擎；采纳对端会话表并覆盖声明窗口，蓝牙 127、Wi-Fi 32；Wi-Fi 被动握手保留宝马观测到的参数行为 | 通用库有分别配置的 Bluetooth/USB/AirPlay LSP 预设；例如蓝牙窗口 5、最大包 2048、重传 1500 ms，AirPlay 窗口 5、最大包 65535、重传 2000 ms | 预设不同不等于必须复制。宝马已实际进入 session=1 的识别阶段，应保留已工作的同步路径，再对原始 SYN 核验 |
+| 发送窗口 | `drainSendWindow` 按本方 `declaredMaxOutgoing` 限制未确认包数 | `is_window_writable` 使用 `peer_lsp.max_outgoing`；其字段说明也按接收方声明约束对方发送来解释 | **存在实质语义冲突。** HyperCar 注释与 CatPlay 相反，不能只凭本方注释认定正确；应比较双方 SYN、连续发送量与 ACK 后再修正，不能直接把 127 改为 5 |
+| 序号与恢复 | 在容许范围内接受前进序号并推进水位；重复包 ACK；没有对应的乱序缓存/EAK 恢复；只向上分发控制会话 | 有乱序缓存、EAK、Recovery 状态及多会话机制，仍存在 TODO，不能称为完整规范实现 | HyperCar 针对可靠字节流做了兼容简化，但对端逻辑缺帧仍可能暴露差异；没有日志证明它导致本次 AA00 静默 |
+| 重传与 ACK | 本地重传默认 4 秒/4 次；对端声明 maxRetransmissions=0 时不追踪重传；指定消息还能 fire-and-forget；Wi-Fi 关闭空闲裸 ACK 定时器 | 通用链路有独立 ACK/重传/恢复调度，依据配置和协商处理 | “可靠传输”不代表 HyperCar 所有情况下都禁止重传；需区分对端零重传参数与本地消息豁免 |
+| 控制消息分片 | 蓝牙 `sendOrThrow` 按对端最大控制载荷切分；Wi-Fi 直接交引擎，过大的单条 CSM 不能靠同一路径自动分片 | 框架含 CSM、文件与会话分层支持 | 当前短握手消息未显示触及限制；未来扩展长元数据时须单独补齐 Wi-Fi 出站分片，不能误称蓝牙也完全没有分片 |
+| 识别 | 两条链路均 1D00→1D01→1D02；蓝牙解析能力并支持晚到重新识别；Wi-Fi 未用能力表过滤问候 | 手机模拟端保存 IdentificationInformation，并用 `wants_rx()` 决定部分问候是否发送 | 相同主干，能力使用不同。不能因模拟端按清单过滤就删掉宝马档案明确要求的探测 |
+| 首次证书请求 | 两条链路现均为无参数 AA00；Wi-Fi 还支持 AA06 后补发 | 模拟端 `RequestAuthenticationCertificate::default()` 不编码序列号请求 flag | 当前已对齐；今天 0.412 的 4 字节 flag 请求属于修正前行为，不能再当作当前实现 |
+| 挑战与校验 | 蓝牙随机 32/20/16 字节加车机记忆；Wi-Fi 随机 32 字节；均未做证书链及签名密码学验证 | 模拟端固定 `0x42 × 20` 字节挑战，收到 AuthenticationResponse 后即发成功；未实现完整验证 | CatPlay 也是模拟流程。Wi-Fi 与它的 32/20 字节差异值得后续验证，但今天尚未收到 AA01、尚未发 AA02，**不能解释今日已经发生的断点** |
+| 认证超时 | 蓝牙保留静默后 AA05 兼容；Wi-Fi 必须收到非空证书和回应，超时失败 | 模拟端在收到 AuthenticationResponse 后发送 AA05，没有对应的多长度静默放行分支 | 蓝牙与 Wi-Fi 的成功语义不同，是现有技术债；本次仅记录，不动已工作的初配 |
+| 认证后问候 | 蓝牙发无线可用性、真实 MAC 派生 UUID、语言、时间、设备名；Wi-Fi 用 deviceId 派生 UUID，另发 A100，名称固定 iPhone，不发蓝牙那组全部通知 | 模拟端按能力发 UUID/语言/设备名/传输标识，包含测试固定值；时间和 WirelessCarPlayUpdate 被注释 | 三套顺序与字段均不相同。应核验蓝牙与 Wi-Fi 的 UUID/传输身份关联，不能复制模拟端的固定 UUID/MAC，也不能推定每条通知都必须跨传输重复 |
+| 热点与启动会话 | 有 5702/5703、4300/4301、档案探测、晚到端点及已知车机 Wi-Fi 恢复 | 模拟端对热点信息主要记日志，无线启动相关代码仍有 TODO/注释 | HyperCar 已做得更多；CatPlay 不能直接回答宝马二次上车如何完整重连 |
+| 蓝牙交接 | READY + feedback 新鲜度门控；本地还有已知 Wi-Fi 会话的独立存活策略 | 上述框架/模拟端没有可直接对应的 Android 宝马交接状态机 | 此处依据实际宝马与盒子行为验证，不声称 CatPlay 已提供同款修复 |
+
+### 订阅回应并非完全相同
+
+| 消息/业务 | 当前 HyperCar | CatPlay 手机模拟端 | 本次证据与限制 |
+|---|---|---|---|
+| AE00 电源 | 蓝牙每次回复 3 条原始抓包 AE01；Wi-Fi 回复 3 条结构化 AE01（参数 4、5、6） | 回复 5 条独立参数，含最大电流、充电意愿、外接电源、充电状态及电量 | **相同条数不代表相同内容：蓝牙原始字节与 Wi-Fi 参数编码也不一致。** 蓝牙字节的现有注释还保留语义未定说明，需按 TLV 和成功抓包重验；不能拿 CatPlay 的测试电量代替手机真实状态 |
+| AE02 停止电源 | Wi-Fi 撤销早到的 AE00；没有独立 CSM 回包，链路 ACK 正常 | 不能仅因缺少业务回包判失败 | 今日蓝牙 AE00 四次均得到后续三条 AE01；没有证据要求先改这条已应答路径 |
+| 4154/4157/4170 | Wi-Fi 在 READY 后回空通话、通信状态及空列表；认证前按 ID 合并暂存；蓝牙保活循环没有对应的完整业务回应 | 有类型化通话/通信/列表回应，部分为模拟运营商等测试状态 | Wi-Fi 比原先 ACK-only 完整，但未对接真实手机电话业务；蓝牙与 Wi-Fi 覆盖仍不统一 |
+| 5000 NowPlaying | Wi-Fi 回结构化空媒体/停止状态；蓝牙持续循环主要记录这类消息 | `send_now_playing` 构造更广的媒体状态并使用文件传输接口 | 都不能据此宣称接好了 Android 真实音乐元数据、控制及封面；这与投屏音频 RTP 是否发出是两件事 |
+| AD00 | Wi-Fi 按既有盒子证据回 AD01 参数 0=1 | 本次没有把模拟端当作该回复的直接依据 | 明确保留证据来源，不能称为所有回应都从 CatPlay 移植 |
+| HID/位置/车辆等 | 蓝牙在可选 HID 阶段处理 6800→6801；Wi-Fi 未实现完整 CSM 业务；未支持内容主要链路 ACK | 模拟端认证后发 StartLocationInformation 紧接 StopLocationInformation，另有通用类型/会话能力 | 不等于必须照抄一次开关位置订阅。今日 AirPlay hidSendReport 已正常，不能与 CSM HID 支持混为一谈 |
+
+消息分发还有一个阶段差异：蓝牙 `expectAnyOrNull` 会暂存非目标消息，但 `runMfiChallenge` 对 AA03/AA04 之外的消息仅记日志，没有统一重新入队。如果 AE00 等恰在这个挑战窗口到达，存在只记不答的可能；进入保活后才到达的 AE00 则会回应。Wi-Fi 对上述六种支持订阅已做认证前暂存。**这是代码发现的潜在时序缺口，不是今天四次 AE00 漏答的证据**，那四次已有明确回复记录。后续应优先补阶段交错用例，再决定统一分发方式。
+
+### READY 与“确实交接成功”的证据差距
+
+当前 Wi-Fi READY 是本地业务状态：收到非空 AA03，生成 AA05 和问候后即可置位。桥接线程先 `nativeMarkWifiIap2Ready`，再把本轮输出提交给 native 队列；随后才由异步任务写 RTSP。即使之后失败会清 READY，仍存在本地状态领先于实际写出、车机 RTSP 应答及链路 ACK 的窗口。
+
+因此必须区分：生成 AA05 → 入队/写出 → 车机对应 CSeq 返回 200 → 链路 ACK → 后续业务/持续存活。前面的任一步都不能单独证明后面的步骤，RTSP 200 也不等于密码学认证通过。现有 READY + feedback 门控比只看“出画面”更严格，但仍不是对 AA05/问候交付的完整确认。CatPlay 的异步框架可以参考职责拆分，不能替代本项目补上这一证据链。
+
+### 对当前故障的优先级判断
+
+1. **P0：实车验证已做的最小修正。** 首先看 413～415 是否以无参数 AA00 收到 AA01，再看 AA02/AA03/AA05、业务回应、交接及持续播放。今天三轮 0.412 都未走到挑战，不能继续把认证后的每个差异当作同等可能的根因。没有新日志前，不声称约 8 秒断连已解决。
+2. **P1：核对链路窗口与交付证据。** 对双方 SYN、未确认包数、序号/ACK、CSeq 逐项关联；优先确认窗口语义冲突、本地 READY 领先于实际发送的问题。保留宝马已经跑通的参数路径，不在没有抓包依据时整体替换引擎。
+3. **P1：统一两条链路的阶段语义。** 核验 Wi-Fi 32 字节与模拟端 20 字节的兼容性、跨传输身份、设备问候的能力约束、电源 TLV，以及挑战期间旁路消息的暂存。蓝牙静默放行只能称兼容分支，不能称标准认证成功；任何调整都应有新的成功/失败样本支撑。
+4. **P2：按实际请求补业务。** 真实电源状态、音乐/封面、电话、位置、车辆及文件会话尚非完整移植；有请求且能确认语义再接线。没有出现在本次断点之前的业务，不作为先改动稳定初配的理由。
+
+今日“有画无声”仍应沿已记录的反向 changeModes/422、资源所有权与音频 SETUP/实际发包排查；不能用 iAP2 握手对照替代音频证据，也不能把“无声音”与“随后断连”未经证明合并为同一个原因。
+
+### 源码定位与复核方式
+
+HyperCar 本地定位：
+
+- `app/src/main/java/io/github/hypercar/iap2/Iap2Bluetooth.kt`：RFCOMM 与链路启动。
+- `app/src/main/java/io/github/hypercar/iap2/Iap2LinkEngine.kt`：`ownSyncOf`、`drainSendWindow`、`handleData` 的接收处理、重传及控制会话分发。
+- `app/src/main/java/io/github/hypercar/iap2/Iap2SenderSession.kt`：`run`、`runMfiChallenge`、`sendDeviceStateGreetings`、`pumpIncomingForever`、`sendOrThrow`。
+- `app/src/main/java/io/github/hypercar/iap2/Iap2Messages.kt::powerUpdates`：蓝牙原始电源字节；`WifiIap2Protocol.kt::handle/greetings`：Wi-Fi 状态机与结构化回应。
+- `app/src/main/java/io/github/hypercar/iap2/WifiIap2Bridge.kt`、`rust-core/src/wifi_iap2.rs`：队列、代际隔离、READY 和 feedback 状态。
+- `rust-core/src/airplay.rs`、`app/src/main/java/io/github/hypercar/session/HyperCarRepo.kt`：AirPlay 内的 iAP 隧道、交接与已知 Wi-Fi 恢复。
+
+CatPlay 固定版本原始依据：
+
+- [手机模拟端的识别、认证与订阅](https://github.com/catplay-labs/catplay/blob/fc52bac7910a07ff3b6d94712175db6013528aa9/catplay_carplay_tx_gadget/src/carplay_client_session.rs)
+- [通用链路窗口、序号、ACK 与恢复](https://github.com/catplay-labs/catplay/blob/fc52bac7910a07ff3b6d94712175db6013528aa9/core/catplay_iap2_link/src/link_layer.rs)
+- [LSP 字段语义、会话表与传输预设](https://github.com/catplay-labs/catplay/blob/fc52bac7910a07ff3b6d94712175db6013528aa9/core/catplay_iap2_link/src/payload/lsp_payload.rs)
+- [异步链路与 CSM 分发](https://github.com/catplay-labs/catplay/blob/fc52bac7910a07ff3b6d94712175db6013528aa9/async/catplay_iap2_client/src/tokio/async_client.rs)
+- [配件侧 MFi 与 mock 应答助手](https://github.com/catplay-labs/catplay/blob/fc52bac7910a07ff3b6d94712175db6013528aa9/async/catplay_iap2_client/src/tokio/session_helper.rs)
+- [接收端可选 Wi-Fi iAP2 隧道](https://github.com/catplay-labs/catplay/blob/fc52bac7910a07ff3b6d94712175db6013528aa9/carplay/catplay_carplay/src/carplay_rx/sink/receiver.rs)
+- [c2a 的 open_iap2 返回 None](https://github.com/catplay-labs/catplay/blob/fc52bac7910a07ff3b6d94712175db6013528aa9/c2a/catplay_c2a/src/proxy_rpc/rx_bridge.rs)
+
+本节仅做当前源码与既有日志的对照分析，未修改运行代码、构建或安装，也没有新增实车认证成功的结论。
