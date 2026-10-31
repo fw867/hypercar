@@ -58,14 +58,14 @@ impl WifiIap2 {
                 match tokio::time::timeout(Duration::from_secs(3), channel.post_fire_and_forget(
                     "/command", &body, "application/x-apple-binary-plist",
                 )).await {
-                    Ok(Ok(())) => {
+                    Ok(Ok(cseq)) => {
                         sent += 1;
-                        if sent == 1 || sent % 50 == 0 { crate::emit_log(&format!("WIFI-IAP#{id}: control POST written count={sent}")); }
+                        if sent <= 16 || sent % 50 == 0 { crate::emit_log(&format!("WIFI-IAP#{id}: control POST written CSeq={cseq} count={sent}")); }
                     }
                     other => {
                         crate::emit_log(&format!("WIFI-IAP#{id}: control transport failed {}", match other {
                             Ok(Err(error)) => error, Err(_) => "write timeout".to_string(),
-                            Ok(Ok(())) => unreachable!(),
+                            Ok(Ok(_)) => unreachable!(),
                         }));
                         break;
                     }

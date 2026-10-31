@@ -54,7 +54,9 @@ class WifiIap2ProtocolTest {
             messages(feed(packet(0x40, ++sequence, ack, 1, Iap2Csm.encode(id, body))))
         fun ready() {
             assertEquals(listOf(0x1d00), start().map { it.messageId })
-            assertEquals(listOf(0x1d02, 0xaa00), message(0x1d01).map { it.messageId })
+            val identification = message(0x1d01)
+            assertEquals(listOf(0x1d02, 0xaa00), identification.map { it.messageId })
+            assertTrue(identification.last().body.isEmpty()) // CatPlay default: request certificate, not serial.
             assertEquals(listOf(0xaa00), message(0xaa06).map { it.messageId })
             val challenge = message(0xaa01, Iap2Csm.param(0, byteArrayOf(1, 2, 3))).single()
             assertEquals(0xaa02, challenge.messageId)
@@ -94,6 +96,37 @@ class WifiIap2ProtocolTest {
         car.protocol.advance(20_000)
         assertTrue(car.protocol.failed)
         assertTrue(car.message(0xaa01, Iap2Csm.param(0, byteArrayOf(1))).isEmpty())
+    }
+
+    @Test fun earlySubscriptionsAreAnsweredAfterAuthenticationAndCanBeCancelled() {
+        for (cancel in listOf(false, true)) {
+            val car = Car()
+            car.start()
+            car.message(0x1d01)
+            assertTrue(car.message(0xae00).isEmpty())
+            assertTrue(car.message(0x4154).isEmpty())
+            if (cancel) assertTrue(car.message(0xae02).isEmpty())
+            car.message(0xaa01, Iap2Csm.param(0, byteArrayOf(1)))
+            val result = car.message(0xaa03, Iap2Csm.param(0, ByteArray(64) { 1 }))
+            assertTrue(car.protocol.ready)
+            assertEquals(if (cancel) 0 else 3, result.count { it.messageId == 0xae01 })
+            assertEquals(1, result.count { it.messageId == 0x4155 })
+            assertTrue(car.logs.any { it.startsWith("DEFER") })
+            car.message(0x1234)
+            assertTrue(car.logs.any { it.startsWith("ACK-only id=0x1234") })
+        }
+    }
+
+    @Test fun certificateCanArriveDirectlyWithoutSerialRoundTrip() {
+        val car = Car()
+        car.start()
+        val request = car.message(0x1d01).last()
+        assertEquals(0xaa00, request.messageId)
+        assertTrue(request.body.isEmpty())
+        assertEquals(0xaa02, car.message(0xaa01, Iap2Csm.param(0, byteArrayOf(1))).single().messageId)
+        assertTrue(car.message(0xaa06).isEmpty()) // Late serial must not restart challenge.
+        car.message(0xaa03, Iap2Csm.param(0, ByteArray(64) { 1 }))
+        assertTrue(car.protocol.ready)
     }
 
     @Test fun splitAndRepeatedDetectionMarkersAreAnsweredWithoutCompetingSyn() {

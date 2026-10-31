@@ -16,13 +16,19 @@ internal class WifiIap2Protocol(
     private var phase = "LINK"
     private var deadline = 0L
     private var retriedCertificate = false
+    private var tracedFrames = 0
     private var now = 0L
+    private val seen = mutableSetOf<Int>()
     private val unknown = mutableSetOf<Int>()
+    private val deferred = linkedMapOf<Int, Iap2Csm.Frame>()
     val ready: Boolean get() = phase == "READY" && !failed
     var failed = false
         private set
 
     init {
+        // Metadata only: never log CSM certificate/challenge/signature payloads.
+        engine.onFrameReceived = { ctl, seq, ack, session, size -> trace("RX", ctl, seq, ack, session, size) }
+        engine.onFrameSent = { ctl, seq, ack, session, size -> trace("TX", ctl, seq, ack, session, size) }
         engine.onPeerSynchronizationAdopted = { sync ->
             log("LINK sessions=${sync.sessions.joinToString { "${it.id}/${it.kind}/${it.version}" }} retry=${sync.retransmissionTimeoutMillis} ack=${sync.acknowledgementTimeoutMillis}")
         }
@@ -63,14 +69,24 @@ internal class WifiIap2Protocol(
     private fun handle(frame: Iap2Csm.Frame) {
         if (failed) return
         val id = frame.messageId
-        if (phase != "READY" || unknown.add(id)) log("RX phase=$phase id=0x${id.toString(16)} body=${frame.body.size}B")
+        if (phase != "READY" || seen.add(id)) log("RX phase=$phase id=0x${id.toString(16)} body=${frame.body.size}B")
+        if (id == 0xae02) {
+            deferred.remove(0xae00) // StopPowerUpdates cancels an early subscription as well.
+            return // No CSM reply defined; link ACK was already emitted.
+        }
+        if (phase != "READY" && id in listOf(0xae00, 0x4154, 0x4157, 0x4170, 0xad00, 0x5000)) {
+            deferred[id] = frame
+            log("DEFER phase=$phase id=0x${id.toString(16)} until authentication completes")
+            return
+        }
         when (id) {
             0x1d01 -> if (phase == "IDENTIFICATION") {
                 send(0x1d02)
                 phase = "CERTIFICATE"
                 deadline = now + 10_000
-                // Box asks for authentication serial first; AA06 triggers a bare certificate request.
-                send(0xaa00, Iap2Csm.param(0, ByteArray(0)))
+                // CatPlay RequestAuthenticationCertificate::default() omits the serial-number flag.
+                // A silent serial request previously stalled until BMW closed the session (~8s).
+                send(0xaa00)
             }
             0xaa06 -> if (phase == "CERTIFICATE" && !retriedCertificate) {
                 retriedCertificate = true
@@ -96,6 +112,9 @@ internal class WifiIap2Protocol(
                 phase = "READY"
                 log("READY challenge response received; compatibility result only, certificate/signature not verified")
                 greetings()
+                val pending = deferred.values.toList()
+                deferred.clear()
+                pending.forEach(::handle)
             }
             0xaa04, 0x1d03 -> fail("peer rejected id=0x${id.toString(16)}")
             0xae00 -> if (phase == "READY") {
@@ -136,6 +155,10 @@ internal class WifiIap2Protocol(
         val body = parts.fold(ByteArray(0)) { a, b -> a + b }
         if (!engine.sendControl(Iap2Csm.encode(id, body), now)) fail("link refused id=0x${id.toString(16)}")
         else log("TX phase=$phase id=0x${id.toString(16)} body=${body.size}B")
+    }
+
+    private fun trace(direction: String, ctl: Int, seq: Int, ack: Int, session: Int, size: Int) {
+        if (tracedFrames++ < 32) log("LINK $direction ctl=0x${ctl.toString(16)} seq=$seq ack=$ack session=$session bytes=$size")
     }
 
     private fun fail(reason: String) {

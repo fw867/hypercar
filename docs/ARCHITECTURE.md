@@ -1,6 +1,6 @@
 # 当前架构：Android 自绘车机 UI → CarPlay / AirPlay
 
-更新：2026-10-29。对应当前默认分支 `feat/carplay-only-ui`。
+更新：2026-10-31。对应当前默认分支 `main`（原 `feat/carplay-only-ui` 已改名）。
 
 手机通过蓝牙 iAP2 与车机协商无线 CarPlay，再通过车机 Wi-Fi 网络建立 AirPlay 会话。
 HyperCar 自己绘制车机首页并编码视频，使用系统播放采集投送音乐。当前实现不依赖 CarLife、

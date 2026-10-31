@@ -293,8 +293,8 @@ pub async fn negotiate(
         .open_tcp(&p.car_ip, event_port, 5_000)
         .ok_or_else(|| format!("事件通道连接失败 {}:{event_port}", p.car_ip))?;
     let (ev_r, ev_w) = event_stream.into_split();
-    let modes = Arc::new(Mutex::new(if box_bootstrap { crate::modes::Modes::box_initial() } else { crate::modes::Modes::initial() }));
-    let screen_owned = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let modes = Arc::new(Mutex::new(crate::modes::Modes::from_info(&info, p.enable_audio, box_bootstrap)));
+    let screen_owned = Arc::new(std::sync::atomic::AtomicBool::new(modes.lock().screen_owned()));
     let audio_owned = Arc::new(std::sync::atomic::AtomicBool::new(modes.lock().audio_owned()));
     let reply_audio = audio_owned.clone();
     let reply_modes = modes.clone();
@@ -453,11 +453,12 @@ pub async fn negotiate(
     }
 
     // ---- 9. 音频流 SETUP（会话已激活后再试；失败只记录）----
-    let audio_allowed = if p.enable_audio && box_bootstrap {
-        request_main_audio(&channel, &modes).await
-    } else { p.enable_audio };
+    // The phone is the resource arbiter. CatPlay marks changeModes FromAccessory;
+    // sending it to BMW returned 422. Initial local ownership was already published via
+    // modesChanged before stream SETUP. Receiver borrow/take requests still gate packets.
+    let audio_allowed = p.enable_audio;
     audio_owned.store(modes.lock().audio_owned(), std::sync::atomic::Ordering::Release);
-    emit_log(&format!("AUDIO: enabled={} box_bootstrap={box_bootstrap} resource_granted={audio_allowed}", p.enable_audio));
+    emit_log(&format!("AUDIO: enabled={} box_bootstrap={box_bootstrap} setup_enabled={audio_allowed} owner_controller={}", p.enable_audio, modes.lock().audio_owned()));
     let mut audio = if audio_allowed {
         negotiate_audio(&channel, &factory, shared_secret.as_ref(), p).await
     } else {
@@ -516,37 +517,52 @@ mod display_size_tests {
         assert_eq!(read_display_size(&Value::dict(vec![("widthPixels", Value::Int(-1)), ("heightPixels", Value::Int(999999))])), (0, 0));
     }
 
+    #[test]
+    fn local_audio_is_declared_and_receiver_can_borrow_it() {
+        let mut modes = crate::modes::Modes::initial();
+        let command = bplist::parse(&modes.declaration()).unwrap();
+        assert_eq!(command.get("type").and_then(Value::as_str), Some("modesChanged"));
+        assert!(modes.audio_owned());
+        let request = Value::dict(vec![("resources", Value::array(vec![Value::dict(vec![
+            ("resourceID", Value::int(2)), ("transferType", Value::int(3)),
+            ("transferPriority", Value::int(500)), ("unborrowConstraint", Value::int(100)),
+        ])]))]);
+        assert!(modes.change(&request)); assert!(!modes.audio_owned());
+        let release = Value::dict(vec![("resources", Value::array(vec![Value::dict(vec![
+            ("resourceID", Value::int(2)), ("transferType", Value::int(4)),
+        ])]))]);
+        assert!(modes.change(&release)); assert!(modes.audio_owned());
+    }
+
     #[tokio::test]
-    async fn audio_setup_requires_explicit_resource_grant() {
+    async fn slow_modes_feedback_does_not_block_iap_and_coalesces_latest_state() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let peer = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut buffer = Vec::new(); let mut chunk = [0;4096]; let mut count = 0;
-            while count < 3 {
-                let n = socket.read(&mut chunk).await.unwrap(); assert!(n>0); buffer.extend_from_slice(&chunk[..n]);
-                for request in crate::rtsp::parse_rtsp_messages(&mut buffer) {
-                    count += 1;
-                    let command = bplist::parse(&request.body).unwrap();
-                    assert_eq!(command.get("type").and_then(Value::as_str), Some(if count < 3 { "changeModes" } else { "modesChanged" }));
-                    if count < 3 {
-                        let resources = command.get("params").unwrap().get("resources").unwrap().as_array().unwrap();
-                        assert_eq!(resources[0].get("resourceID").and_then(Value::as_int), Some(2));
-                        assert_eq!(resources[0].get("transferPriority").and_then(Value::as_int), Some(500));
-                    }
-                    let body = bplist::encode(&Value::dict(vec![("status", Value::int(if count == 1 { 1 } else { 0 }))]));
-                    let header = format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: {}\r\n\r\n", request.cseq().unwrap(), body.len());
-                    socket.write_all(header.as_bytes()).await.unwrap();socket.write_all(&body).await.unwrap();
-                }
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut car,_) = listener.accept().await.unwrap();
+        let (r,w) = socket.into_split(); let (control,_) = RtspChannel::spawn(r,w,None);
+        let stop = Arc::new(Notify::new());
+        let feedback = spawn_mode_feedback(control.clone(), stop.clone());
+        let snapshot = crate::modes::Modes::initial().declaration();
+        feedback.send(Some(snapshot.clone())).unwrap();
+        let read_request = |mut car: tokio::net::TcpStream| async move {
+            let mut buffer=Vec::new(); let mut chunk=[0;4096];
+            loop { let n=car.read(&mut chunk).await.unwrap(); assert!(n>0); buffer.extend_from_slice(&chunk[..n]);
+                let messages=crate::rtsp::parse_rtsp_messages(&mut buffer);
+                if !messages.is_empty() { assert_eq!(messages.len(),1); return (car,messages.into_iter().next().unwrap()); }
             }
-        });
-        let socket = TcpStream::connect(addr).await.unwrap(); let (r,w) = socket.into_split();
-        let (channel, _) = RtspChannel::spawn(r,w,None);
-        let modes = Arc::new(Mutex::new(crate::modes::Modes::box_initial()));
-        assert!(!request_main_audio(&channel,&modes).await); assert!(!modes.lock().audio_owned());
-        assert!(request_main_audio(&channel,&modes).await); assert!(modes.lock().audio_owned());
-        peer.await.unwrap();
+        };
+        let (socket,first)=tokio::time::timeout(Duration::from_secs(1),read_request(car)).await.unwrap(); car=socket;
+        // Keep the first mode reply pending while subsequent state updates and iAP output arrive.
+        feedback.send(Some(vec![1])).unwrap(); feedback.send(Some(snapshot.clone())).unwrap();
+        let cseq=control.post_fire_and_forget("/command",b"iap-probe","application/octet-stream").await.unwrap();
+        let (socket,iap)=tokio::time::timeout(Duration::from_secs(1),read_request(car)).await.unwrap(); car=socket;
+        assert_eq!(iap.cseq(),Some(cseq)); assert_eq!(iap.body,b"iap-probe");
+        let reply=format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",first.cseq().unwrap());
+        car.write_all(reply.as_bytes()).await.unwrap();
+        let (socket,latest)=tokio::time::timeout(Duration::from_secs(1),read_request(car)).await.unwrap(); car=socket;
+        assert_eq!(latest.body,snapshot);
+        drop(feedback); stop.notify_waiters(); drop(car);
     }
 
     #[tokio::test]
@@ -823,30 +839,6 @@ fn use_box_bootstrap(requested: bool, info: &Value) -> bool {
     })
 }
 
-async fn request_main_audio(channel: &Arc<RtspChannel>, modes: &Arc<Mutex<crate::modes::Modes>>) -> bool {
-    let command = bplist::encode(&Value::dict(vec![
-        ("type", Value::str("changeModes")),
-        ("params", Value::dict(vec![("resources", Value::array(vec![Value::dict(vec![
-            ("resourceID", Value::int(2)), ("transferType", Value::int(1)),
-            ("transferPriority", Value::int(500)), ("takeConstraint", Value::int(500)),
-            ("borrowConstraint", Value::int(500)),
-        ])]))])),
-    ]));
-    match channel.request("POST", "/command", &command, "application/x-apple-binary-plist", &[], Duration::from_secs(3)).await {
-        Ok(reply) if reply.status() == 200 => {
-            let status = bplist::parse(&reply.body).ok().and_then(|v| v.get("status").and_then(Value::as_int));
-            if status != Some(0) { emit_log(&format!("MODES: main audio resource not granted status={status:?}")); return false; }
-            modes.lock().claim_audio();
-            let declaration = modes.lock().declaration();
-            match channel.request("POST", "/command", &declaration, "application/x-apple-binary-plist", &[], Duration::from_secs(3)).await {
-                Ok(reply) if reply.status() == 200 => { emit_log("MODES: main audio granted, publishing snapshot before audio SETUP"); true },
-                _ => { emit_log("MODES: main audio snapshot not acknowledged; skip audio SETUP"); false },
-            }
-        }
-        other => { emit_log(&format!("MODES: main audio request failed: {}", match other { Ok(r) => r.first_line, Err(e) => e })); false }
-    }
-}
-
 async fn activate_session(channel: &Arc<RtspChannel>, declaration: &[u8]) -> Result<(), String> {
     emit_log("AIRPLAY: 开始 RECORD（屏幕流建立前）");
     record_session(channel).await?;
@@ -1121,6 +1113,7 @@ fn spawn_event_dispatcher(
     target_size: Arc<Mutex<(u32, u32)>>,
     stop: Arc<Notify>,
 ) {
+    let mode_feedback = spawn_mode_feedback(control.clone(), stop.clone());
     tokio::spawn(async move {
         let mut bad_commands = 0usize;
         let mut tip_down = false; // 上一次报告的按下状态（down/move/up 边沿检测）
@@ -1186,17 +1179,12 @@ fn spawn_event_dispatcher(
                 "changeModes" => {
                     // Already applied synchronously while building the request's status+params reply.
                     let body = modes.lock().declaration();
-                    match control.request("POST", "/command", &body, "application/x-apple-binary-plist", &[], Duration::from_secs(3)).await {
-                        Ok(reply) => emit_log(&format!("MODES: modesChanged feedback status={}", reply.status())),
-                        Err(error) => emit_log(&format!("MODES: modesChanged feedback failed {error}")),
-                    }
+                    let _ = mode_feedback.send(Some(body));
                 }
                 "requestUI" => {
                     emit_log("EVENT: requestUI received; local car UI available");
                     let body = modes.lock().declaration();
-                    if let Err(error) = control.request("POST", "/command", &body, "application/x-apple-binary-plist", &[], Duration::from_secs(3)).await {
-                        emit_log(&format!("MODES: requestUI state feedback failed {error}"));
-                    }
+                    let _ = mode_feedback.send(Some(body));
                     crate::emit_force_keyframe();
                 }
                 "hidSendReport" => {
@@ -1268,6 +1256,33 @@ fn spawn_event_dispatcher(
             }
         }
     });
+}
+
+/// Dirty-state worker, like CatPlay's tx_queue: waiting for a mode response must never
+/// stop event dispatch (Wi-Fi iAP2 certificate exchange, touch and forceKeyFrame).
+/// A watch channel keeps only the latest snapshot while a previous response is pending.
+fn spawn_mode_feedback(
+    control: Arc<RtspChannel>, stop: Arc<Notify>,
+) -> tokio::sync::watch::Sender<Option<Vec<u8>>> {
+    let (tx, mut rx) = tokio::sync::watch::channel::<Option<Vec<u8>>>(None);
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = stop.notified() => return,
+                changed = rx.changed() => if changed.is_err() { return; },
+            }
+            let Some(body) = rx.borrow_and_update().clone() else { continue; };
+            let response = tokio::select! {
+                _ = stop.notified() => return,
+                reply = control.request("POST", "/command", &body, "application/x-apple-binary-plist", &[], Duration::from_secs(3)) => reply,
+            };
+            match response {
+                Ok(reply) => emit_log(&format!("MODES: modesChanged feedback status={}", reply.status())),
+                Err(error) => emit_log(&format!("MODES: modesChanged feedback failed {error}")),
+            }
+        }
+    });
+    tx
 }
 
 fn value_as_bool(v: &bplist::Value) -> Option<bool> {

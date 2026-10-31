@@ -55,6 +55,11 @@ object PairingReset {
             deleted += "上次端点"
         }
 
+        if (SettingsStore.knownCarNetworks.isNotEmpty()) {
+            SettingsStore.knownCarNetworks = emptySet()
+            deleted += "车机 Wi-Fi 关联"
+        }
+
         val mfiCleared = MfiLengthMemory.clearAll(context)
         if (mfiCleared) deleted += "MFi 长度记忆"
 

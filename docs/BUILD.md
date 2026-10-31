@@ -1,6 +1,6 @@
 # 编译、安装与发布
 
-更新：2026-10-29。当前默认分支为 `feat/carplay-only-ui`，使用 Android 自绘车机 UI 与 CarPlay / AirPlay。
+更新：2026-10-31。当前默认分支为 `main`（原 `feat/carplay-only-ui` 已改名），使用 Android 自绘车机 UI 与 CarPlay / AirPlay。
 当前版本不需要安装 CarLife、CarWith，也不需要 PC hub。
 
 ## 构建环境

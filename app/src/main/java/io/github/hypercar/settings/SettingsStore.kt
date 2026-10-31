@@ -120,6 +120,16 @@ object SettingsStore {
         get() = p().getString(KEY_LAST_AIRPLAY_ENDPOINT, "") ?: ""
         set(v) = p().edit().putString(KEY_LAST_AIRPLAY_ENDPOINT, v).apply()
 
+    /** Known Wi-Fi/receiver associations survive an expired AirPlay IP/port. No passwords. */
+    var knownCarNetworks: Set<String>
+        get() = p().getStringSet("known_car_networks", emptySet())?.toSet().orEmpty()
+        set(value) = p().edit().putStringSet("known_car_networks", value).apply()
+
+    fun rememberCarNetwork(ssid: String, mac: String) {
+        if (ssid.isBlank() || io.github.hypercar.session.PairingEvidence.receiverKey(mac) == null) return
+        knownCarNetworks = knownCarNetworks + "$ssid|${mac.uppercase(java.util.Locale.ROOT)}"
+    }
+
     /**
      * 配对身份（AirPlay pair-setup 的长期身份）**备份**，格式与 `controller_identity.txt` 相同：
      * `pairingId hex私钥`。

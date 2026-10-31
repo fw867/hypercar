@@ -331,7 +331,7 @@ impl RtspChannel {
         path: &str,
         body: &[u8],
         content_type: &str,
-    ) -> Result<(), String> {
+    ) -> Result<i32, String> {
         let cseq = self.next_cseq();
         let head = format!(
             "POST {path} RTSP/1.0\r\n\
@@ -355,7 +355,7 @@ impl RtspChannel {
             .await
             .map_err(|e| format!("事件通道写失败: {e}"))?;
         w.flush().await.ok();
-        Ok(())
+        Ok(cseq)
     }
 
     pub fn close(&self) {
@@ -388,6 +388,7 @@ async fn reader_loop(
     let mut raw: Vec<u8> = Vec::with_capacity(8192);
     let mut plain: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 4096];
+    let mut unsolicited_responses = 0u64;
     loop {
         let n = match read.read(&mut chunk).await {
             Ok(0) => {
@@ -433,15 +434,32 @@ async fn reader_loop(
                 if let Some(c) = msg.cseq() {
                     if let Some(tx) = pending.lock().remove(&c) {
                         let _ = tx.send(msg);
+                    } else {
+                        // iAP output intentionally does not await RTSP replies; still expose rejection.
+                        unsolicited_responses += 1;
+                        if msg.status() != 200 || unsolicited_responses <= 16 {
+                            crate::emit_log(&format!("RTSP#{trace_id} async RX CSeq={c} status={} body={}B", msg.status(), msg.body.len()));
+                        }
                     }
                 }
             } else {
-                // 先立刻把车机触摸/命令投递给上层（零等待），再回 200 OK。
-                // 先写 TCP 会把触摸分发卡在 Wi-Fi 抖动/锁竞争上。
                 let cseq = msg.cseq();
                 let body = reply.as_ref().and_then(|f| f(&msg)).unwrap_or_default();
-                let _ = inbound_tx.send(msg);
-                respond_ok(&write, &cipher, cseq, &body).await;
+                if body.is_empty() {
+                    // Touch/iAP delivery remains immediate; it must not wait for a socket write.
+                    let _ = inbound_tx.send(msg);
+                    if let Err(error)=respond_ok(&write, &cipher, cseq, &body).await {
+                        crate::emit_log(&format!("RTSP#{trace_id}: response write failed CSeq={cseq:?}: {error}"));
+                    }
+                } else {
+                    // Complete changeModes' business reply before dispatch can schedule the next
+                    // modesChanged. CSeq/status are metadata; never dump private command bodies.
+                    match respond_ok(&write, &cipher, cseq, &body).await {
+                        Ok(()) => crate::emit_log(&format!("RTSP#{trace_id}: business response written CSeq={cseq:?} body={}B",body.len())),
+                        Err(error) => crate::emit_log(&format!("RTSP#{trace_id}: business response failed CSeq={cseq:?}: {error}")),
+                    }
+                    let _ = inbound_tx.send(msg);
+                }
             }
         }
     }
@@ -449,7 +467,7 @@ async fn reader_loop(
     pending.lock().clear();
 }
 
-async fn respond_ok(write: &SharedWrite, cipher: &SharedCipher, cseq: Option<i32>, body: &[u8]) {
+async fn respond_ok(write: &SharedWrite, cipher: &SharedCipher, cseq: Option<i32>, body: &[u8]) -> std::io::Result<()> {
     let mut head = format!("RTSP/1.0 200 OK\r\nContent-Length: {}\r\n", body.len());
     if let Some(c) = cseq { head.push_str(&format!("CSeq: {c}\r\n")); }
     if !body.is_empty() { head.push_str("Content-Type: application/x-apple-binary-plist\r\n"); }
@@ -464,8 +482,8 @@ async fn respond_ok(write: &SharedWrite, cipher: &SharedCipher, cseq: Option<i32
             None => plaintext,
         }
     };
-    let _ = w.write_all(&wire).await;
-    let _ = w.flush().await;
+    w.write_all(&wire).await?;
+    w.flush().await
 }
 
 #[cfg(test)]

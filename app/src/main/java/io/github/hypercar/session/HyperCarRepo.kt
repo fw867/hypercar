@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkRequest
 import android.net.NetworkCapabilities
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
@@ -143,7 +144,7 @@ object HyperCarRepo {
             ensurePairingIdentity(context, identityFile)
             val identityPath = identityFile.absolutePath
             val json = SettingsStore.engineConfigJson(host, port, sessionDeviceMac, identityPath,
-                receiverBluetoothMac = io.github.hypercar.iap2.Iap2Peer.address)
+                receiverBluetoothMac = wifiReceiverMac ?: io.github.hypercar.iap2.Iap2Peer.address)
             log("CORE: 重试 nativeStart（$host:$port fd=$fd，第 $attempt 次）")
             val started = RustCoreBridge.nativeStart(json, fd, socketProvider)
             log("CORE: 重试 nativeStart 返回 $started")
@@ -202,6 +203,13 @@ object HyperCarRepo {
      */
     @Volatile
     private var aclCarMac: String? = null
+
+    /** Identity pinned to a known Wi-Fi resume; never reuse another receiver's Bluetooth identity. */
+    @Volatile private var wifiReceiverMac: String? = null
+    @Volatile private var sessionWifiSsid: String? = null
+    private var wifiReconnectMonitor: ConnectivityManager.NetworkCallback? = null
+    private var wifiReconnectCheck: Job? = null
+    private var sessionNetworkMonitor: ConnectivityManager.NetworkCallback? = null
 
     // ---- 掉线自动重连（方案 A-3）----
     // 车机侧链路断开（ACL 掉、AirPlay 会话结束、车机重启）后自动重新建链，
@@ -281,6 +289,11 @@ object HyperCarRepo {
                     if (sessionLive.get() && RustCoreBridge.nativeCanKeepWifiSession()) {
                         iap2?.retireForWifi()
                         log("HANDOFF: 蓝牙 ACL 已退场，Wi-Fi iAP2 就绪且控制保活正常，继续 CarPlay")
+                        logAclEvent(device, connected)
+                        return@handler
+                    }
+                    if (hasCurrentSession && wifiReceiverMac != null && boundNetwork != null) {
+                        log("HANDOFF: 已知车机 Wi-Fi 恢复会话不依赖蓝牙 ACL，继续检查 AirPlay 链路")
                         logAclEvent(device, connected)
                         return@handler
                     }
@@ -382,6 +395,9 @@ object HyperCarRepo {
     /** 切换目标立即更新后续入站过滤；只取消尚未建立会话的出站拨号。 */
     fun updateTargetCar(mac: String?, name: String?) {
         val target = mac?.trim()?.takeIf { it.isNotEmpty() }?.uppercase(java.util.Locale.ROOT)
+        if (!target.orEmpty().equals(SettingsStore.targetCarMac.orEmpty(), ignoreCase = true)) {
+            SettingsStore.lastAirplayEndpoint = "" // Legacy endpoint had no receiver association.
+        }
         SettingsStore.setTargetCar(target, name?.takeIf { target != null && it.isNotBlank() })
         aclCarMac = null
         standbyEndpoint.set(null)
@@ -434,6 +450,7 @@ object HyperCarRepo {
 
     fun setAutoConnect(context: Context, enabled: Boolean) {
         SettingsStore.autoConnect = enabled
+        if (!enabled) stopWifiReconnectMonitor()
         io.github.hypercar.settings.SettingsRevision.bump()
         if (!enabled) { reconnectJob?.cancel(); reconnectJob = null }
         startAutomaticListening(context)
@@ -445,6 +462,8 @@ object HyperCarRepo {
         scope.launch {
             autoConnectChanges.lock()
             try {
+                if (SettingsStore.autoConnect) startWifiReconnectMonitor(context)
+                else stopWifiReconnectMonitor()
                 when (AutomaticConnectionPolicy.modeChanged(SettingsStore.autoConnect, hasCurrentSession)) {
                     AutomaticConnectionPolicy.IdleAction.KEEP_SESSION ->
                         log("AUTO: 自动模式=${SettingsStore.autoConnect}；保留当前会话")
@@ -481,6 +500,7 @@ object HyperCarRepo {
     private fun startStandbyListening() {
         if (!SettingsStore.autoConnect || hasCurrentSession) return
         val context = appContext() ?: return
+        startWifiReconnectMonitor(context)
         val coordinator = coordinatorFor(context)
         coordinator.start { endpoint ->
             standbyEndpoint.updateAndGet { mergeEndpoint(it, endpoint) }
@@ -494,6 +514,7 @@ object HyperCarRepo {
     }
 
     private fun stopStandbyListening() {
+        stopWifiReconnectMonitor()
         if (hasCurrentSession) return
         reconnectJob?.cancel()
         reconnectJob = null
@@ -502,6 +523,93 @@ object HyperCarRepo {
         standbyEndpoint.set(null)
         stopForegroundService()
         log("AUTO: 待机监听与自动重连已停止；手动连接仍可用")
+    }
+
+    private fun knownWifiReceiver(ssid: String?): String? {
+        val records = SettingsStore.knownCarNetworks.toMutableSet()
+        // Upgrade existing installs only when the selected car already has its own pairing credential.
+        val legacySsid = SettingsStore.lastAirplayEndpoint.substringAfter('|', "")
+        val target = SettingsStore.targetCarMac
+        if (legacySsid.isNotBlank() && target != null) records += "$legacySsid|$target"
+        val mac = KnownCarNetworkPolicy.receiver(ssid, records, target) ?: return null
+        val context = appContext() ?: return null
+        return mac.takeIf { SettingsStore.isCarPaired(mac) &&
+            PairingEvidence.read(context.filesDir, mac).mayDropProfiles }
+    }
+
+    private fun knownWifiNetwork(context: Context, ssid: String): Network? {
+        val networks = wifiNetworks(context)
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return null
+        val exact = networks.filter { network ->
+            val info = cm.getNetworkCapabilities(network)?.transportInfo as? android.net.wifi.WifiInfo
+            info?.ssid?.trim('"') == ssid
+        }
+        // Some ROMs redact WifiInfo; one Wi-Fi handle is unambiguous. Never choose an arbitrary
+        // network when concurrent station connections are present and SSID information is hidden.
+        return exact.singleOrNull() ?: networks.singleOrNull()
+    }
+
+    private fun watchSessionNetwork(context: Context, expected: Network) {
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return
+        sessionNetworkMonitor?.let { runCatching { cm.unregisterNetworkCallback(it) } }
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onLost(network: Network) {
+                if (network != expected || sessionNetworkMonitor !== this) return
+                val owner = this
+                scope.launch {
+                    autoConnectChanges.lock()
+                    try {
+                        if (sessionNetworkMonitor === owner && boundNetwork == network) {
+                            val pending = connectJob
+                            pending?.cancel()
+                            withTimeoutOrNull(JOIN_TIMEOUT_MILLIS) { pending?.join() }
+                            runDisconnect("已知车机 Wi-Fi 已断开")
+                        }
+                    } finally { autoConnectChanges.unlock() }
+                }
+            }
+        }
+        sessionNetworkMonitor = callback
+        runCatching { cm.registerNetworkCallback(NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(), callback) }
+            .onFailure { sessionNetworkMonitor = null; log("WIFI-RESUME: 会话网络监听失败：${it.message}") }
+    }
+
+    @Synchronized private fun startWifiReconnectMonitor(context: Context) {
+        if (wifiReconnectMonitor != null || !SettingsStore.autoConnect) return
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) = queueWifiReconnectCheck()
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) = queueWifiReconnectCheck()
+            override fun onLinkPropertiesChanged(network: Network, properties: android.net.LinkProperties) = queueWifiReconnectCheck()
+        }
+        runCatching {
+            cm.registerNetworkCallback(NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build(), callback)
+            wifiReconnectMonitor = callback
+            queueWifiReconnectCheck()
+        }.onFailure { log("WIFI-RESUME: 网络监听未启动：${it.message}") }
+    }
+
+    @Synchronized private fun queueWifiReconnectCheck() {
+        if (!SettingsStore.autoConnect || hasCurrentSession || wifiReconnectCheck?.isActive == true) return
+        wifiReconnectCheck = scope.launch {
+            delay(750) // Wi-Fi capabilities/SSID often arrive after onAvailable.
+            val context = appContext() ?: return@launch
+            if (!SettingsStore.autoConnect || hasCurrentSession || wifiNetworks(context).isEmpty()) return@launch
+            val ssid = currentWifiSsid(context)
+            if (knownWifiReceiver(ssid) == null || ssid == null || knownWifiNetwork(context, ssid) == null) return@launch
+            log("WIFI-RESUME: 已接入已配对车机网络，自动恢复 AirPlay，无需等待蓝牙 iAP2")
+            connectAutomatically(context)
+        }
+    }
+
+    @Synchronized private fun stopWifiReconnectMonitor() {
+        wifiReconnectCheck?.cancel()
+        wifiReconnectCheck = null
+        val cm = appContext()?.getSystemService(ConnectivityManager::class.java)
+        wifiReconnectMonitor?.let { runCatching { cm?.unregisterNetworkCallback(it) } }
+        wifiReconnectMonitor = null
     }
 
     fun clearLogs() {
@@ -761,9 +869,10 @@ object HyperCarRepo {
             push(link = LinkState.Negotiating("Rust 核心层协商 AirPlay 会话"))
             // 画面与音频由本机自绘界面自采自编，经 nativePushVideoFrame /
             // nativePushAudioPcm 投喂给引擎；这里只负责下发会话参数。
+            sessionWifiSsid = currentWifiSsid(context)
             val identityPath = context.filesDir.resolve("controller_identity.txt").absolutePath
             val json = SettingsStore.engineConfigJson(apHost, port, deviceMac, identityPath,
-                receiverBluetoothMac = io.github.hypercar.iap2.Iap2Peer.address)
+                receiverBluetoothMac = wifiReceiverMac ?: io.github.hypercar.iap2.Iap2Peer.address)
             // 下发配置原样打一行（不含密钥）：分辨率/帧率一目了然，
             // 免得再靠猜「这次到底请求了多大尺寸」
             log("CORE +${stageMs()}ms 引擎配置：$json")
@@ -906,11 +1015,17 @@ object HyperCarRepo {
         }
         runCatching { ctrlAdvertiser?.stop() }
         ctrlAdvertiser = null
+        val cm = appContext()?.getSystemService(ConnectivityManager::class.java)
+        sessionNetworkMonitor?.let { runCatching { cm?.unregisterNetworkCallback(it) } }
+        sessionNetworkMonitor = null
         runCatching { wifiJoiner?.release() }
+        runCatching { cm?.bindProcessToNetwork(null) }
         wifiJoiner = null
         joinedSsid = null
         joinedNetwork = null
         boundNetwork = null
+        wifiReceiverMac = null
+        sessionWifiSsid = null
     }
 
     // ---------------------------------------------------------------- WiFi
@@ -960,7 +1075,7 @@ object HyperCarRepo {
             log("WIFI: 端点无热点凭据（可能已在车机网络），直接绑定当前网络")
             null
         }
-        val effective = network ?: currentDefaultNetwork(context)
+        val effective = network ?: boundNetwork ?: wifiNetworks(context).firstOrNull() ?: currentDefaultNetwork(context)
         if (effective != null) {
             joiner.bindProcess(effective)
             boundNetwork = effective
@@ -976,6 +1091,9 @@ object HyperCarRepo {
             )
         } else {
             log("WIFI +${stageMs()}ms 没有可绑定的网络（Wi-Fi 未连接/未授权）")
+        }
+        if (effective != null && !ssid.isNullOrBlank()) {
+            ctrlAdvertiser?.ensureForNetwork(ssid, network = effective)
         }
         return effective
     }
@@ -1479,7 +1597,7 @@ object HyperCarRepo {
                         // 车机 MAC 三个来源（ACL 广播可能没收到，用户手点「连接」时尤其常见）：
                         //   ① ACL 回调记下的 aclCarMac；② 本轮 iAP2 socket 的对端；③ 设置里选定的目标
                         val peer = io.github.hypercar.iap2.Iap2Peer.address
-                        val mac = aclCarMac ?: peer ?: SettingsStore.targetCarMac
+                        val mac = wifiReceiverMac ?: aclCarMac ?: peer ?: SettingsStore.targetCarMac
                         if (mac.isNullOrBlank()) {
                             log(
                                 "PAIR: ⚠ 会话成功但拿不到车机 MAC（ACL / iAP2 对端 / 目标车机都为空）" +
@@ -1491,7 +1609,10 @@ object HyperCarRepo {
                                 ?: SettingsStore.targetCarName
                                 ?: "车机"
                             SettingsStore.markCarPaired(mac, carName)
+                            val rememberedSsid = sessionWifiSsid ?: joinedSsid
+                            if (!rememberedSsid.isNullOrBlank()) SettingsStore.rememberCarNetwork(rememberedSsid, mac)
                             val from = when {
+                                wifiReceiverMac != null -> "已知车机 Wi-Fi"
                                 aclCarMac != null -> "ACL 广播"
                                 peer != null -> "iAP2 对端"
                                 else -> "目标车机设置"
@@ -1608,6 +1729,22 @@ object HyperCarRepo {
         //    宝马盒子实测就是这样连上的（docs/NEGOTIATION-GAPS.md §14）：它不在连接时
         //    做发现，而是直连记住的 IP:端口。我们照抄这一条，能把"第二次起"的耗时
         //    从几十秒（等 0x4301/扫网段）压到一次 TCP 连接。
+        val resumeSsid = currentWifiSsid(context)
+        val resumeMac = knownWifiReceiver(resumeSsid)
+        if (resumeMac != null && !resumeSsid.isNullOrBlank()) {
+            val network = knownWifiNetwork(context, resumeSsid)
+            if (network != null) {
+                wifiReceiverMac = resumeMac
+                sessionWifiSsid = resumeSsid
+                context.getSystemService(ConnectivityManager::class.java)?.bindProcessToNetwork(network)
+                boundNetwork = network
+                watchSessionNetwork(context, network)
+                joinedNetwork = network
+                joinedSsid = resumeSsid
+                advertiser.ensureForNetwork(resumeSsid, force = true, network = network)
+                log("WIFI-RESUME: 绑定已知车机 Wi-Fi 并恢复 ctrl 广播，使用本车凭证")
+            }
+        }
         val remembered = SettingsStore.lastAirplayEndpoint
         if (remembered.contains('|')) {
             val (endpointPart, ssidPart) = remembered.split('|', limit = 2)
@@ -1627,16 +1764,15 @@ object HyperCarRepo {
             if (host.isNotEmpty() && port in 1..65535 && ssidMatches) {
                 val alive = withContext(Dispatchers.IO) {
                     runCatching {
-                        Socket().use { s -> s.connect(InetSocketAddress(host, port), REMEMBERED_PROBE_TIMEOUT_MILLIS.toInt()) }
+                        (boundNetwork?.socketFactory?.createSocket() ?: Socket()).use { socket ->
+                            socket.connect(InetSocketAddress(host, port), REMEMBERED_PROBE_TIMEOUT_MILLIS.toInt())
+                        }
                     }.isSuccess
                 }
                 if (alive) {
                     log("SESSION: ✓ 上次成功的端点 ${host}:${port} 仍然可连——直接用它（跳过发现）")
-                    // 注意：**端点省了，iAP2 不能省**。真 iPhone 在整个 AirPlay 会话期间
-                    // 都保持 iAP2 链路，车机也靠它维持 CarPlay 窗口；我们若跳过 iAP2，
-                    // ACL 空闲几十秒就被车机拆掉——CarWith 的「选择车机蓝牙」列表里就
-                    // 看不到这台车了，连下一步都点不下去（现场反馈 2026-10-25）。
-                    // 这里只把回调丢掉：端点已定，0x5703/0x4301 来了也不需要。
+                    // Bluetooth remains available for credentials/late endpoint updates, but is not
+                    // a prerequisite: Wi-Fi iAP2 runs independently after AirPlay event setup.
                     coordinator.start { ep ->
                         log("IAP2: 后台会话端点回调（端点已定，仅记录）ips=${ep.ipAddresses}")
                         val ip = ep.ipAddresses.firstOrNull { it.contains('.') && !it.contains(':') }
@@ -1717,7 +1853,7 @@ object HyperCarRepo {
                     val ssid = currentWifiSsid(context)
                     if (!ssid.isNullOrBlank() && ssid !in probedSsid) {
                         val changed = observedSsid != null && observedSsid != ssid
-                        val isCarHotspot = ssid == lastSeen.get()?.ssid
+                        val isCarHotspot = ssid == lastSeen.get()?.ssid || knownWifiReceiver(ssid) != null
                         if (changed || isCarHotspot) {
                             probedSsid.add(ssid)
                             log("WIFI: 检测到 Wi-Fi \"$ssid\"——静默试一次「把网关当车机热点」（:7000）")
@@ -1729,7 +1865,7 @@ object HyperCarRepo {
                             // 邀请可能在 cmd wifi / 网关探测期间到达，避免错过后再花十余秒扫 /20。
                             if (advertiser.lastInvitePeerIp != null) continue
                             // 网关拿不到（宝马 DIRECT 热点 gw=0.0.0.0）时，改在网段里主动找 —— 这是唯一出路
-                            if (ssid == lastSeen.get()?.ssid && localScanned.add(ssid)) {
+                            if (isCarHotspot && localScanned.add(ssid)) {
                                 // 先试 mDNS（车机若广播 _airplay._tcp，这一步就能定端点，比扫网段快）
                                 val mdnsHere = runCatching {
                                     AirplayServiceProbe(context, ::log).browse(boundNetwork)
@@ -1764,7 +1900,7 @@ object HyperCarRepo {
                         val waited = ticks * ENDPOINT_TICK_MILLIS / 1000
                         // 区分「车机根本没连进来」与「连进来了但没给凭据」——前者是车机
                         // 侧的问题（iDrive 里没把本机当 CarPlay 手机），后者才是协议问题。
-                        if (seen == null && coordinator.sessionStartCount == 0) {
+                        if (seen == null && coordinator.sessionStartCount == 0 && wifiReceiverMac == null) {
                             log(
                                 "SESSION: ${waited}s 内车机一次都没发起 iAP2（ACL 已连但收不到 …cafe 连入）——" +
                                     "这是车机侧状态：请在 iDrive「移动设备」里删除本机后重新配对，" +
