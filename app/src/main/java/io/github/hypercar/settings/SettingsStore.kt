@@ -27,6 +27,7 @@ object SettingsStore {
     private const val KEY_TARGET_MAC = "target_car_mac"
     private const val KEY_TARGET_NAME = "target_car_name"
     private const val KEY_AUTO_CONNECT = "auto_connect_on_bt"
+    private const val KEY_STANDBY_NOTIFICATION = "standby_notification"
     private const val KEY_MANUAL_BT_MAC = "manual_bt_mac"
     private const val KEY_HEAD_UNIT = "head_unit_profile"
     private const val KEY_REMOTE_PROFILES = "head_unit_remote_json"
@@ -83,6 +84,16 @@ object SettingsStore {
     var autoConnect: Boolean
         get() = p().getBoolean(KEY_AUTO_CONNECT, true)
         set(v) = p().edit().putBoolean(KEY_AUTO_CONNECT, v).apply()
+
+    /**
+     * 待机监听是否常驻前台通知（「正在监听车机，等待自动连接」）。默认开。
+     *
+     * 关闭后待机不再进前台服务：通知栏干净，但进程更容易被系统回收——
+     * 车机 ACL 广播（清单里的接收器）仍会尝试把 App 拉起来，只是不保证。
+     */
+    var standbyNotification: Boolean
+        get() = p().getBoolean(KEY_STANDBY_NOTIFICATION, true)
+        set(v) = p().edit().putBoolean(KEY_STANDBY_NOTIFICATION, v).apply()
 
     /** 选中的车机档案 id（见 `headunit/HeadUnitProfile.kt`）；默认宝马 iD8.5。 */
     var headUnitProfileId: String

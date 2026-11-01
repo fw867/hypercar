@@ -1145,6 +1145,9 @@ private fun FpsSegment(fps: Int, onFpsChanged: (Int) -> Unit) {
 private fun BehaviorSection() {
     val context = LocalContext.current
     var autoConnect by remember(io.github.hypercar.settings.SettingsRevision.value) { mutableStateOf(SettingsStore.autoConnect) }
+    var standbyNotification by remember(io.github.hypercar.settings.SettingsRevision.value) {
+        mutableStateOf(SettingsStore.standbyNotification)
+    }
     var enableAudio by rememberSaveable { mutableStateOf(SettingsStore.enableAudio) }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1159,6 +1162,21 @@ private fun BehaviorSection() {
                 onCheckedChange = {
                     autoConnect = it
                     HyperCarRepo.setAutoConnect(context, it)
+                },
+            )
+            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+            SwitchRow(
+                title = "待机通知",
+                subtitle = if (autoConnect) {
+                    "在通知栏显示「正在监听车机，等待自动连接」；关掉后不再常驻通知，但待机可能被系统回收"
+                } else {
+                    "需要先打开上面的「上车自动连接」——没有待机监听就没有这条通知"
+                },
+                checked = standbyNotification,
+                enabled = autoConnect,
+                onCheckedChange = {
+                    standbyNotification = it
+                    HyperCarRepo.setStandbyNotification(context, it)
                 },
             )
             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
@@ -1181,11 +1199,14 @@ private fun SwitchRow(
     subtitle: String,
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
+    enabled: Boolean = true,
 ) {
+    // 依赖项关闭时整行置灰、不可点（例如「待机通知」依赖「上车自动连接」）
+    val rowAlpha = if (enabled) 1f else 0.45f
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { onCheckedChange(!checked) }
+            .clickable(enabled = enabled) { onCheckedChange(!checked) }
             .heightIn(min = 56.dp)
             .padding(vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -1194,18 +1215,19 @@ private fun SwitchRow(
             Text(
                 text = title,
                 style = MaterialTheme.typography.titleSmall,
-                color = TextPrimary,
+                color = TextPrimary.copy(alpha = rowAlpha),
             )
             Text(
                 text = subtitle,
                 style = MaterialTheme.typography.bodySmall,
-                color = TextSecondary,
+                color = TextSecondary.copy(alpha = rowAlpha),
             )
         }
         Spacer(modifier = Modifier.width(12.dp))
         Switch(
             checked = checked,
-            onCheckedChange = onCheckedChange,
+            onCheckedChange = if (enabled) onCheckedChange else null,
+            enabled = enabled,
             colors = SwitchDefaults.colors(
                 checkedThumbColor = ElectricCyan,
                 checkedTrackColor = ElectricCyan.copy(alpha = 0.28f),

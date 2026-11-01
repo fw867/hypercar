@@ -42,7 +42,13 @@ class HyperCarService : Service() {
         }
         if (automatic && !autoEnabled) return START_NOT_STICKY
         listeningOnly = intent == null || intent.action == ACTION_LISTEN
-        startForegroundSafe()
+        // 「待机通知」关掉时：待机不占前台，只做进程内监听（由 repo 用 startService 拉起，
+        // 不会触发 startForegroundService 的 5s 超时）。会话仍然必须进前台保活。
+        if (listeningOnly && !io.github.hypercar.settings.SettingsStore.standbyNotification) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            startForegroundSafe()
+        }
         if (listeningOnly) releaseLocks() else acquireLocks()
         isRunning = true
         val device = deviceOf(intent)

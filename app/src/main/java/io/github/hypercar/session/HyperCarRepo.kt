@@ -471,6 +471,26 @@ object HyperCarRepo {
         startAutomaticListening(context)
     }
 
+    /**
+     * 待机通知开关：关掉后立刻撤掉「正在监听车机」的前台通知（会话占用前台时不动），
+     * 打开后若正在待机则补回前台保活。
+     */
+    fun setStandbyNotification(context: Context, enabled: Boolean) {
+        SettingsStore.standbyNotification = enabled
+        io.github.hypercar.settings.SettingsRevision.bump()
+        if (enabled) {
+            if (SettingsStore.autoConnect && !hasCurrentSession) {
+                runCatching { context.startForegroundService(HyperCarService.listenIntent(context)) }
+                    .onFailure { log("SERVICE: 待机通知恢复失败：${it.message}") }
+            }
+        } else if (!hasCurrentSession) {
+            // 没有会话要保活：直接停前台服务，监听本身仍在进程内跑
+            runCatching { context.stopService(android.content.Intent(context, HyperCarService::class.java)) }
+                .onFailure { log("SERVICE: 待机通知取消失败：${it.message}") }
+        }
+        log("AUTO: 待机通知${if (enabled) "已开启" else "已关闭"}")
+    }
+
     /** 只处理待机监听；当前手动/自动会话不随开关切换被拆除。 */
     fun startAutomaticListening(context: Context) {
         init(context)
@@ -522,8 +542,16 @@ object HyperCarRepo {
             if (SettingsStore.autoConnect) connectAutomatically(context)
         }
         if (coordinator.isRunning) {
-            runCatching { context.startForegroundService(HyperCarService.listenIntent(context)) }
-                .onFailure { log("SERVICE: 后台监听保活启动失败：${it.message}") }
+            // 「待机通知」关掉时不进前台服务：通知栏干净，代价是进程更容易被回收
+            // （车机 ACL 广播仍会尝试拉起 App，见清单里的 CarBluetoothReceiver）。
+            if (SettingsStore.standbyNotification) {
+                runCatching { context.startForegroundService(HyperCarService.listenIntent(context)) }
+                    .onFailure { log("SERVICE: 后台监听保活启动失败：${it.message}") }
+            } else {
+                runCatching { context.startService(HyperCarService.listenIntent(context)) }
+                    .onFailure { log("SERVICE: 后台监听启动失败：${it.message}") }
+                log("AUTO: 待机通知已关闭——只做进程内监听，不发前台通知")
+            }
             log("AUTO: 待机监听已启用，等待车机；尚未发起 AirPlay 会话")
             // 待机期间也盯着：别让安卓把 HFP/A2DP 回连到车机（见 CarProfileGuard）
             CarProfileGuard.enabled = true
