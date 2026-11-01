@@ -29,6 +29,19 @@ import java.lang.reflect.Method
 class SpikeShellService : ISpikeShell.Stub {
 
     private val playbackAudio = ShellPlaybackAudio()
+    private val bluetoothDiscovery = ShellBluetoothDiscovery()
+
+    override fun startBluetoothDiscoverable(owner: IBinder, token: String, seconds: Int): String {
+        val identity = android.os.Binder.clearCallingIdentity()
+        return try { bluetoothDiscovery.start(appContext, owner, token, seconds) }
+        finally { android.os.Binder.restoreCallingIdentity(identity) }
+    }
+
+    override fun stopBluetoothDiscoverable(token: String): String {
+        val identity = android.os.Binder.clearCallingIdentity()
+        return try { bluetoothDiscovery.stop(token) }
+        finally { android.os.Binder.restoreCallingIdentity(identity) }
+    }
 
     override fun startAudioCapture(owner: IBinder): android.os.ParcelFileDescriptor? {
         val identity = android.os.Binder.clearCallingIdentity()

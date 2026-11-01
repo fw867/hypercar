@@ -15,11 +15,12 @@ import androidx.core.content.ContextCompat
 import io.github.hypercar.settings.SettingsStore
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * **不让车机蓝牙挂上 HFP/A2DP**（无线 CarPlay 的"只配对、不连接"）。
  *
- * 为什么必须做（2026-11-01 现场，bugreport 内 `dumpsys bluetooth_manager`）：
+ * 档案策略的现场线索（2026-11-01，不能仅据此确定因果）：
  * ```
  * 11:05:10.840 HEADSET DISCONNECTED→CONNECTING   ← 手机自己回连 HFP
  * 11:05:10.959 A2DP    DISCONNECTED→CONNECTING   ← 手机自己回连 A2DP
@@ -43,13 +44,15 @@ object CarProfileGuard {
         Thread(r, "car-profile-guard").apply { isDaemon = true }
     }
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val generation = AtomicLong()
 
     @Volatile
     private var carAddress: String? = null
 
-    /** 只有待机监听/会话进行时才拦截；用户关掉自动连接后不再动他的车机音频。 */
+    /** 档案允许，且自动待机或手动/自动会话进行时才拦截。 */
     @Volatile
     var enabled: Boolean = false
+        private set
 
     private var receiver: BroadcastReceiver? = null
     private var appContext: Context? = null
@@ -57,27 +60,40 @@ object CarProfileGuard {
 
     /** 记住本轮车机地址（ACL 广播/目标设置里来）。 */
     fun noteCar(address: String?) {
-        if (!address.isNullOrBlank()) carAddress = address
+        val next = address?.trim()?.takeIf { it.isNotEmpty() }
+        if (!next.equals(carAddress, ignoreCase = true)) {
+            generation.incrementAndGet()
+            carAddress = next
+            lastEnforceAt.clear()
+        }
     }
 
-    fun knownCar(): String? = carAddress ?: SettingsStore.targetCarMac
+    fun knownCar(): String? = SettingsStore.targetCarMac ?: carAddress
 
     /** 开始监听车机的 HFP/A2DP 连接事件（幂等）。 */
-    fun start(context: Context, log: (String) -> Unit) {
+    @Synchronized fun start(context: Context, log: (String) -> Unit) {
+        logSink = log
         if (receiver != null) return
         val app = context.applicationContext
         appContext = app
-        logSink = log
         fun log(msg: String) = logSink?.invoke(msg)
         val r = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context?, intent: Intent?) {
                 val action = intent?.action ?: return
-                val state = intent.getIntExtra(BluetoothProfile.EXTRA_STATE, -1)
                 @Suppress("DEPRECATION")
                 val device: BluetoothDevice? =
                     intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
-                if (device == null || state != BluetoothProfile.STATE_CONNECTED) return
+                if (device == null) return
                 val address = runCatching { device.address }.getOrNull() ?: return
+                if (action == BluetoothDevice.ACTION_ACL_CONNECTED) {
+                    val transport = intent.getIntExtra(BluetoothDevice.EXTRA_TRANSPORT, BluetoothDevice.TRANSPORT_AUTO)
+                    val type = runCatching { device.type }.getOrDefault(BluetoothDevice.DEVICE_TYPE_UNKNOWN)
+                    if (CarAclPolicy.isClassicCarLink(transport, type)) onCarConnected(app, device, address)
+                    return
+                }
+                if (action != BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED &&
+                    action != BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED) return
+                if (intent.getIntExtra(BluetoothProfile.EXTRA_STATE, -1) != BluetoothProfile.STATE_CONNECTED) return
                 enforce(
                     context = app,
                     device = device,
@@ -89,24 +105,48 @@ object CarProfileGuard {
         val filter = IntentFilter().apply {
             addAction(BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED)
             addAction(BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED)
+            addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
         }
-        runCatching { ContextCompat.registerReceiver(app, r, filter, ContextCompat.RECEIVER_NOT_EXPORTED) }
-            .onFailure { log("BT-GUARD: 注册失败 ${it.message}") }
+        // Bluetooth 来自独立高权限 UID；NOT_EXPORTED 会漏收该进程的广播。
+        // 仅订阅系统保护的蓝牙 action，并继续校验经典传输和目标地址。
+        try {
+            ContextCompat.registerReceiver(app, r, filter, ContextCompat.RECEIVER_EXPORTED)
+        } catch (t: Exception) {
+            log("BT-GUARD: 注册失败 ${t.message}")
+            return
+        }
+        enabled = true
         receiver = r
         log("BT-GUARD: 已开始拦截车机的 HFP/A2DP（${knownCar() ?: "车机未知，等 ACL 锁定"}）")
     }
 
-    fun stop() {
+    @Synchronized fun stop() {
+        enabled = false
+        generation.incrementAndGet()
+        mainHandler.removeCallbacksAndMessages(null)
+        lastEnforceAt.clear()
         receiver?.let { r -> appContext?.let { ctx -> runCatching { ctx.unregisterReceiver(r) } } }
+        val wasRunning = receiver != null
         receiver = null
-        logSink?.invoke("BT-GUARD: 已停止")
+        if (wasRunning) logSink?.invoke("BT-GUARD: 已停止")
+        appContext = null
+    }
+
+    /** 独立于自动唤醒入口：手动连接关闭 autoConnect 时也接收 ACL。 */
+    fun onCarConnected(context: Context, device: BluetoothDevice, address: String) {
+        if (!enabled || !address.equals(knownCar(), ignoreCase = true)) return
+        val epoch = generation.get()
+        enforce(context, device, address, "ACL 连上（立即）")
+        mainHandler.postDelayed({
+            if (epoch == generation.get()) enforce(context, device, address, "ACL 连上 +4s 复查")
+        }, 4_000)
     }
 
     /**
-     * 立刻断一次该车机的 HFP/A2DP（后台线程；内部有 [MIN_INTERVAL_MILLIS] 节流）。
-     * @return true = 本次真的执行了断开
+     * 立刻断一次该车机的 HFP/A2DP（后台线程；内部有 [CarProfilePolicy.MIN_INTERVAL_MILLIS] 节流）。
+     * @return true = 本次已排队；停止/目标切换后排队任务会放弃
      */
-    fun enforce(
+    @Synchronized fun enforce(
         context: Context,
         device: BluetoothDevice,
         address: String,
@@ -120,11 +160,14 @@ object CarProfileGuard {
             return false
         }
         if (!enabled) return false
+        val epoch = generation.get()
         lastEnforceAt[address.uppercase()] = now
         worker.execute {
-            // 标记"自己断开"，免得 ACL 断开被接收器当成「下车」而拆会话
-            BtProfiles.markSelfDrop(address)
+            if (!enabled || epoch != generation.get() || !address.equals(knownCar(), ignoreCase = true)) return@execute
             val before = BtProfiles.connectedNames(context, address)
+            // 获取 profile 代理可能等待系统回调；期间停止/换车也要取消。
+            if (!enabled || epoch != generation.get() || !address.equals(knownCar(), ignoreCase = true)) return@execute
+            // disconnect 只在确有音频 profile 时标记 self-drop，空操作不吞掉真正的下车事件。
             val dropped = BtProfiles.disconnect(context, device)
             val left = BtProfiles.stillConnected(context, address)
             logSink?.invoke(
@@ -137,6 +180,9 @@ object CarProfileGuard {
 
     /** 主线程投递用（ACL 回调里已经不在主线程时也安全）。 */
     fun enforceAsync(context: Context, device: BluetoothDevice, address: String, reason: String) {
-        mainHandler.post { enforce(context, device, address, reason) }
+        val epoch = generation.get()
+        mainHandler.post {
+            if (epoch == generation.get()) enforce(context, device, address, reason)
+        }
     }
 }

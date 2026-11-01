@@ -85,6 +85,11 @@ object SettingsStore {
         get() = p().getBoolean(KEY_AUTO_CONNECT, true)
         set(v) = p().edit().putBoolean(KEY_AUTO_CONNECT, v).apply()
 
+    /** 已配对车机 Wi-Fi 上等待 iAP2 的一次短暂可发现兜底；需要 Shizuku。 */
+    var bluetoothDiscoverableFallback: Boolean
+        get() = p().getBoolean("bluetooth_discoverable_fallback", true)
+        set(v) = p().edit().putBoolean("bluetooth_discoverable_fallback", v).apply()
+
     /**
      * 待机监听是否常驻前台通知（「正在监听车机，等待自动连接」）。默认开。
      *

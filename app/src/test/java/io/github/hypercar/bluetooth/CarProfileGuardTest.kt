@@ -12,6 +12,18 @@ import org.junit.Test
  */
 class CarProfileGuardTest {
 
+    @Test fun manualSessionKeepsGuardWhenAutoConnectIsOff() {
+        assertTrue(CarProfilePolicy.shouldGuard(true, false, true))
+        assertFalse(CarProfilePolicy.shouldGuard(true, false, false))
+    }
+
+    @Test fun standbyRequiresAutoConnectAndReceiverProfileConsent() {
+        assertTrue(CarProfilePolicy.shouldGuard(true, true, false))
+        assertFalse(CarProfilePolicy.shouldGuard(false, true, false))
+        assertFalse(CarProfilePolicy.shouldGuard(false, true, true))
+        assertFalse(CarProfilePolicy.shouldGuard(false, false, true))
+    }
+
     @Test fun onlyTargetCarIsTouched() {
         assertTrue(
             CarProfilePolicy.shouldEnforce(

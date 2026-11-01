@@ -6,8 +6,8 @@
 # app/src/main/jniLibs/arm64-v8a/libhypercar_core.so），其余发布判定/签名闸门/
 # 版本累计机制同款。
 #
-# 版本号自动累计：`appVersionName` + 本次 run_number
-#   例：0.1.0 → APK 0.1.0.42（versionCode = 1_0042），每次推送 +1，可直接覆盖安装。
+# 版本号自动累计：`appVersionName` + (run_number + 400)。
+# 本地实测包已到 489；云端 run 89 后下一版为 490，保持可覆盖安装。
 #   基础版本仍只手改 app/build.gradle.kts 的 appVersionName。
 #
 # 发布规则（两种触发）：
@@ -43,6 +43,9 @@ on:
 # 发布 Release 需要写权限（创建 tag / Release）
 permissions:
   contents: write
+
+env:
+  HYPERCAR_BUILD_OFFSET: '400'
 
 concurrency:
   group: build-${{ github.ref }}
@@ -168,18 +171,20 @@ jobs:
           set -eu
           BASE=$(sed -n 's/^val appVersionName = "\(.*\)"/\1/p' app/build.gradle.kts)
           test -n "$BASE" || { echo "::error::无法从 app/build.gradle.kts 读取 appVersionName"; exit 1; }
-          VERSION="${BASE}.${GITHUB_RUN_NUMBER}"
+          BUILD_NUMBER=$((GITHUB_RUN_NUMBER + HYPERCAR_BUILD_OFFSET))
+          VERSION="${BASE}.${BUILD_NUMBER}"
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
           echo "name=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "本次版本：$VERSION（versionCode = base*10000 + ${GITHUB_RUN_NUMBER}）"
+          echo "本次版本：$VERSION（versionCode = base*10000 + ${BUILD_NUMBER}）"
 
-      # 版本号由 build.gradle.kts 按同一规则计算（见文件里的 hypercar.buildNumber），这里只传 run_number
+      # 版本号由 build.gradle.kts 计算，传入已包含本地测试版本偏移的构建号。
       # Windows 上生成的 gradlew 在 git 里可能没有执行位（core.fileMode=false），
       # checkout 到 Linux runner 后补一次 chmod
       - name: 构建 Release APK
         env:
-          BUILD_NUMBER: ${{ github.run_number }}
+          BUILD_NUMBER: ${{ steps.version.outputs.build_number }}
         run: |
           set -eu
           chmod +x gradlew
@@ -321,9 +326,11 @@ jobs:
 
           ### 本次修正
 
-          - Wi-Fi iAP2 逐帧发送，按接收端窗口等待真实 ACK；不重传不再误作已确认，交接 READY 等待本地发送完成。
-          - 新增握手排队／写出／等待日志；音乐封面异步回退，避免切歌后旧图覆盖。
-          - WinPlay／DiPlay 音频缓冲参数与宝马隔离；宝马 Wi-Fi iAP2 完整认证及持续连接仍待实车复测，不将模拟测试等同于实车验证。
+          - 已配对车机 Wi-Fi 后出现时及时恢复绑定与 ctrl 广播，修复提前手动连接后需等待整轮 5 分钟的问题。
+          - 新增蓝牙回连唤醒：网络、广播和监听就绪 5 秒仍无会话时，尝试一次最多 30 秒经典可发现窗口，独立守护进程负责到期及提前清理。
+          - 点击目标车机即可申请增强发现授权，批准后显示标签；统一授权结果出口，避免重复弹窗、提示及日志。
+          - 蓝牙监听失败/重启后自动重新注册；补齐手动会话的音频 profile 策略及旧任务清理。
+          - 本地 88 项单元测试通过，可发现窗口的到期与提前恢复已在 HyperOS 实机验证；车机二次上车效果仍待实车复测。
 
           ### 使用要求与适配状态
 

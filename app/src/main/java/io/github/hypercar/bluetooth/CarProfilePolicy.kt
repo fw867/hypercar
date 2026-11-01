@@ -12,6 +12,10 @@ package io.github.hypercar.bluetooth
  * 两次 iAP2 都没被打开；成功那次（11:07:16）没有 HFP 先行。
  */
 object CarProfilePolicy {
+    /** 手动会话也需要档案策略；关闭自动模式只结束空闲时的干预。 */
+    fun shouldGuard(dropProfilesBeforeIap2: Boolean, autoConnect: Boolean, hasCurrentSession: Boolean): Boolean =
+        dropProfilesBeforeIap2 && (autoConnect || hasCurrentSession)
+
     /** 同一地址两次强制断开的最小间隔：太密会和车机 ACL 重连互相打架。 */
     const val MIN_INTERVAL_MILLIS = 3_000L
 

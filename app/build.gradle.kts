@@ -10,7 +10,7 @@ plugins {
 // 基础版本：发布时只手改这一行。
 val appVersionName = "0.1.0"
 
-// CI 构建号：`-Phypercar.buildNumber=<github.run_number>`（CI 每次 push 传入）。
+// CI 构建号：`-Phypercar.buildNumber=<run_number + workflow offset>`（CI 每次 push 传入）。
 //   versionName = 0.1.0.<N>、versionCode = base*10000 + N —— 每次推送 +1，可覆盖安装。
 // 本地不传 -P 时就是纯 base 版本（0.1.0 / 1）。
 val buildNumber: Int? = providers.gradleProperty("hypercar.buildNumber").orNull?.toIntOrNull()

@@ -88,7 +88,7 @@ object CarUiCaster {
         }
         // Old APK services can retain displays whose encoder surface has died. Only clean
         // processes before binding; killing an already bound service leaves a stale Binder.
-        if (!SpikeShell.isConnected() && ShizukuTools.isReady) {
+        if (!SpikeShell.isConnected() && !SpikeShell.isBinding && ShizukuTools.isReady) {
             runCatching { ShizukuTools.exec("pkill -f 'io.github.hypercar:spike'", 2_000) }
             kotlinx.coroutines.delay(150)
         }

@@ -615,14 +615,18 @@ private fun PermissionSettingsSection() {
 
 @Composable
 private fun TargetCarSection() {
-    // 读一次变更计数器：切换车机型号会 bump，从而让本区块重新组合并显示"自动发现"
-    io.github.hypercar.settings.SettingsRevision.value
-    val targetName = SettingsStore.targetCarName ?: "自动发现"
+    val revision = io.github.hypercar.settings.SettingsRevision.value
+    val targetMac = SettingsStore.targetCarMac
+    val targetName = SettingsStore.targetCarName ?: targetMac ?: "未指定车机"
     var expanded by rememberSaveable { mutableStateOf(false) }
     var dialogVisible by remember { mutableStateOf(false) }
     val context = androidx.compose.ui.platform.LocalContext.current
+    val selectCar = rememberCarSelection()
+    val enhanced = remember(expanded, revision) {
+        io.github.hypercar.autowake.CarCompanionWake.associatedAddresses(context)
+    }
     // 已配对设备（下拉候选）。BLUETOOTH_CONNECT 未授予时给空表，
-    // 只保留「自动发现」与「手动输入 MAC…」两项，不至于让下拉空着。
+    // 未指定目标和手动输入仍可用，不将目标过滤描述成主动扫描。
     val bonded = remember(expanded) {
         runCatching {
             val granted = ContextCompat.checkSelfPermission(
@@ -659,12 +663,12 @@ private fun TargetCarSection() {
                         Text(
                             text = targetName,
                             style = MaterialTheme.typography.titleMedium,
-                            color = if (targetName == "自动发现") TextSecondary else TextPrimary,
+                            color = if (targetMac == null) TextSecondary else TextPrimary,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
                         Text(
-                            text = "仅列出已配对设备 · 未配置时来者不拒",
+                            text = "点击列表中的车机，选择并授权增强发现",
                             style = MaterialTheme.typography.bodySmall,
                             color = TextSecondary,
                         )
@@ -687,19 +691,19 @@ private fun TargetCarSection() {
                         text = {
                             Column {
                                 Text(
-                                    text = "自动发现",
+                                    text = "不指定车机",
                                     style = MaterialTheme.typography.bodyMedium,
-                                    color = if (targetName == "自动发现") ElectricCyan else TextPrimary,
+                                    color = if (targetMac == null) ElectricCyan else TextPrimary,
                                 )
                                 Text(
-                                    text = "不限制车机，谁来连都接受",
+                                    text = "不限定目标，由车机发起连接",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = TextSecondary,
                                 )
                             }
                         },
                         onClick = {
-                            HyperCarRepo.updateTargetCar(null, null)
+                            selectCar(null, null)
                             expanded = false
                         },
                     )
@@ -711,29 +715,20 @@ private fun TargetCarSection() {
                             DropdownMenuItem(
                                 text = {
                                     Column {
+                                        Text(
+                                            text = name,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = if (mac.equals(targetMac, ignoreCase = true)) ElectricCyan else TextPrimary,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
                                         Row(verticalAlignment = Alignment.CenterVertically) {
-                                            Text(
-                                                text = name,
-                                                style = MaterialTheme.typography.bodyMedium,
-                                                color = if (targetName == name) ElectricCyan else TextPrimary,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis,
-                                                modifier = Modifier.weight(1f, fill = false),
-                                            )
                                             if (paired) {
-                                                Spacer(modifier = Modifier.width(6.dp))
-                                                Text(
-                                                    text = "已配对 · " + agoText(pairedAt!!),
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    color = ElectricCyan,
-                                                    maxLines = 1,
-                                                    modifier = Modifier
-                                                        .background(
-                                                            ElectricCyan.copy(alpha = 0.14f),
-                                                            RoundedCornerShape(6.dp),
-                                                        )
-                                                        .padding(horizontal = 6.dp, vertical = 1.dp),
-                                                )
+                                                TargetCarBadge("已配对 · " + agoText(pairedAt!!))
+                                            }
+                                            if (enhanced.any { it.equals(mac, ignoreCase = true) }) {
+                                                if (paired) Spacer(modifier = Modifier.width(6.dp))
+                                                TargetCarBadge("增强发现")
                                             }
                                         }
                                         Text(
@@ -744,8 +739,8 @@ private fun TargetCarSection() {
                                     }
                                 },
                                 onClick = {
-                                    HyperCarRepo.updateTargetCar(mac, name)
                                     expanded = false
+                                    selectCar(mac, name)
                                 },
                             )
                         }
@@ -818,15 +813,24 @@ private fun TargetCarSection() {
             initialName = SettingsStore.targetCarName.orEmpty(),
             onDismiss = { dialogVisible = false },
             onCleared = {
-                HyperCarRepo.updateTargetCar(null, null)
+                selectCar(null, null)
                 dialogVisible = false
             },
             onSaved = { mac, name ->
-                HyperCarRepo.updateTargetCar(mac, name)
+                selectCar(mac, name)
                 dialogVisible = false
             },
         )
     }
+}
+
+@Composable
+private fun TargetCarBadge(text: String) {
+    Text(text = text, style = MaterialTheme.typography.labelSmall, color = ElectricCyan,
+        maxLines = 1,
+        modifier = Modifier.background(ElectricCyan.copy(alpha = 0.14f), RoundedCornerShape(6.dp))
+            .padding(horizontal = 6.dp, vertical = 1.dp),
+    )
 }
 
 /** 「重置配对身份」确认弹窗：写清会删什么、以及车机端也要删。 */
@@ -1149,6 +1153,7 @@ private fun BehaviorSection() {
         mutableStateOf(SettingsStore.standbyNotification)
     }
     var enableAudio by rememberSaveable { mutableStateOf(SettingsStore.enableAudio) }
+    var discoveryFallback by rememberSaveable { mutableStateOf(SettingsStore.bluetoothDiscoverableFallback) }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionLabel(text = "行为")
@@ -1187,6 +1192,16 @@ private fun BehaviorSection() {
                 onCheckedChange = {
                     enableAudio = it
                     SettingsStore.enableAudio = it
+                },
+            )
+            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+            SwitchRow(
+                title = "蓝牙回连唤醒",
+                subtitle = "已配对车机 Wi-Fi 就绪 5 秒仍未会话时，短暂可发现 30 秒；需要 Shizuku",
+                checked = discoveryFallback,
+                onCheckedChange = {
+                    discoveryFallback = it
+                    SettingsStore.bluetoothDiscoverableFallback = it
                 },
             )
         }
@@ -1277,7 +1292,7 @@ private fun HeadUnitSection(connected: Boolean = false) {
 
     fun applyProfile(profile: io.github.hypercar.headunit.HeadUnitProfile) {
         SettingsStore.headUnitProfileId = profile.id
-        // 换车机型号时把「目标车机」重置为自动发现：上一台的名字/MAC 留着，
+        // 换车机型号时清除「目标车机」：上一台的名字/MAC 留着，
         // 新车型会因「目标对不上」直接失败，而用户常常忘了改（现场反馈）。
         HyperCarRepo.updateTargetCar(null, null)
         io.github.hypercar.settings.SettingsRevision.bump()

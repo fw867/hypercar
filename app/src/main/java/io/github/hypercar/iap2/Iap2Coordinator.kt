@@ -72,6 +72,8 @@ class Iap2Coordinator(
     private var resolvedMac: String? = null
 
     val isRunning: Boolean get() = bluetooth?.isRunning == true
+    val isSessionActive: Boolean get() = bluetooth?.isSessionActive == true
+    val isListening: Boolean get() = bluetooth?.isListening == true
 
     /** 本次启动以来成功建过几轮 iAP2 会话（0 = 车机一次都没连进来）。 */
     val sessionStartCount: Int get() = bluetooth?.sessionStartCount ?: 0

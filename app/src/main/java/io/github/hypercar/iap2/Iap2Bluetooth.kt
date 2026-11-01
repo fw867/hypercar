@@ -106,7 +106,7 @@ class Iap2Bluetooth(
     /** 当前会话的链路通道（主动结束会话用）。 */
     private val activeChannel = AtomicReference<RfcommLinkChannel?>(null)
 
-    private val serverSocket = AtomicReference<BluetoothServerSocket?>(null)
+    @Volatile private var listener: RecoveringListener<BluetoothServerSocket, BluetoothSocket>? = null
 
     @Volatile
     private var serverThread: Thread? = null
@@ -157,6 +157,7 @@ class Iap2Bluetooth(
 
     /** 当前是否有会话在跑（上层诊断用）。 */
     val isSessionActive: Boolean get() = sessionActive.get()
+    val isListening: Boolean get() = running && listener?.isRegistered == true
 
     /** 本次 start() 以来成功建过几轮 iAP2 会话（0 = 车机从未连入/从未连上，诊断用）。 */
     val sessionStartCount: Int get() = sessionStarts.get()
@@ -169,15 +170,15 @@ class Iap2Bluetooth(
 
     /** 启动监听（入站）+ 出站循环。返回 false 表示蓝牙不可用/缺权限。 */
     @SuppressLint("MissingPermission")
-    fun start(): Boolean {
+    @Synchronized fun start(): Boolean {
         if (running) return true
         if (!hasPermission()) {
             log("BT: 缺少 BLUETOOTH_CONNECT 权限")
             return false
         }
         val adapter = adapterOrNull()
-        if (adapter == null || !adapter.isEnabled) {
-            log("BT: 蓝牙不可用或未开启")
+        if (adapter == null) {
+            log("BT: 蓝牙不可用")
             return false
         }
         // 每轮启动重置 SDP 结论与跳过日志（新配对/换固件后重新探测）
@@ -195,14 +196,36 @@ class Iap2Bluetooth(
                     if (allowOutboundIap2) "（自动：只尝试已配对且声明 iAP2 服务的设备）" else "（等车机发起，不操作其它已配对设备）"
                 },
         )
-        try {
-            serverSocket.set(adapter.listenUsingRfcommWithServiceRecord(SDP_NAME, IPHONE_IAP2_UUID))
-        } catch (error: IOException) {
-            log("BT: 监听失败 - ${error.message}")
-            running = false
-            return false
-        }
-        Thread({ acceptLoop(myGeneration) }, "iap2-bt-accept").apply {
+        var lastRegistrationErrorAt: Long? = null
+        var lastRegistrationAt: Long? = null
+        val newListener = RecoveringListener(
+            ownerAlive = { running && generation.get() == myGeneration },
+            open = {
+                try {
+                    if (!adapter.isEnabled) throw IOException("蓝牙未开启，等待系统恢复")
+                    adapter.listenUsingRfcommWithServiceRecord(SDP_NAME, IPHONE_IAP2_UUID).also {
+                        val now = SystemClock.elapsedRealtime()
+                        if (lastRegistrationAt == null || now - lastRegistrationAt!! >= 30_000) {
+                            log("BT: SDP 监听已注册 generation=$myGeneration uuid=$IPHONE_IAP2_UUID")
+                            lastRegistrationAt = now
+                        }
+                    }
+                } catch (error: SecurityException) {
+                    throw IOException("蓝牙权限不可用", error)
+                }
+            },
+            accept = { socket: BluetoothServerSocket -> socket.accept() },
+            onFailure = { error ->
+                val now = SystemClock.elapsedRealtime()
+                if (lastRegistrationErrorAt == null || now - lastRegistrationErrorAt!! >= 30_000) {
+                    log("BT: 监听失效/注册失败：${error.message}；保留会话任务，1s 后重新注册")
+                    lastRegistrationErrorAt = now
+                }
+            },
+            awaitRetry = { sleepQuietly(1_000) },
+        )
+        listener = newListener
+        Thread({ try { acceptLoop(myGeneration, newListener) } finally { newListener.close() } }, "iap2-bt-accept").apply {
             isDaemon = true
             serverThread = this
             start()
@@ -223,11 +246,12 @@ class Iap2Bluetooth(
      * 终态停止：关 RFCOMM、关监听、递增世代（过期线程自杀）。
      * 只在用户断开时调用；「ACL 断开但保留监听」用 [dropCurrentSession]。
      */
-    fun stop() {
+    @Synchronized fun stop() {
         if (!running) return
         running = false
         generation.incrementAndGet()
-        serverSocket.getAndSet(null)?.let { socket -> runCatching { socket.close() } }
+        listener?.close()
+        listener = null
         dropCurrentSession()
         serverThread?.interrupt()
         clientThread?.interrupt()
@@ -255,15 +279,9 @@ class Iap2Bluetooth(
     // ---- 入站：车机连入 ----
 
     @SuppressLint("MissingPermission")
-    private fun acceptLoop(myGeneration: Long) {
+    private fun acceptLoop(myGeneration: Long, listener: RecoveringListener<BluetoothServerSocket, BluetoothSocket>) {
         while (running && generation.get() == myGeneration) {
-            val socket: BluetoothSocket =
-                try {
-                    serverSocket.get()?.accept() ?: break
-                } catch (error: IOException) {
-                    if (running && generation.get() == myGeneration) log("BT: accept 失败 - ${error.message}")
-                    break
-                }
+            val socket = listener.acceptNext() ?: break
             if (!running || generation.get() != myGeneration) {
                 runCatching { socket.close() }
                 return

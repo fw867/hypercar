@@ -10,6 +10,8 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import rikka.shizuku.Shizuku
 
 /**
@@ -25,18 +27,33 @@ object SpikeShell {
 
     private var connection: ServiceConnection? = null
     private var args: Shizuku.UserServiceArgs? = null
+    private val bindMutex = Mutex()
+    @Volatile var isBinding: Boolean = false
+        private set
 
-    fun isConnected(): Boolean = service != null
+    fun isConnected(): Boolean = service?.asBinder()?.isBinderAlive == true
 
     fun startAudioCapture(owner: IBinder): android.os.ParcelFileDescriptor? = service?.startAudioCapture(owner)
     fun stopAudioCapture() { service?.stopAudioCapture() }
     fun audioCaptureStatus(): String = service?.audioCaptureStatus() ?: "shell disconnected"
+    fun startBluetoothDiscoverable(owner: IBinder, token: String, seconds: Int): String =
+        call("startBluetoothDiscoverable") { it.startBluetoothDiscoverable(owner, token, seconds) }
+    fun stopBluetoothDiscoverable(token: String): String =
+        call("stopBluetoothDiscoverable") { it.stopBluetoothDiscoverable(token) }
     fun updateDisplaySurface(id: Int, surface: Surface?, width: Int, height: Int, dpi: Int): String =
         service?.updateDisplaySurface(id, surface, width, height, dpi) ?: "ERR shell disconnected"
 
     /** 绑定（幂等）。返回人话结果，写进 spike 报告。 */
     suspend fun connect(context: Context): String {
-        service?.let { return "已连接" }
+        return bindMutex.withLock {
+            if (isConnected()) return@withLock "已连接"
+            service = null
+            isBinding = true
+            try { connectUnlocked(context) } finally { isBinding = false }
+        }
+    }
+
+    private suspend fun connectUnlocked(context: Context): String {
         if (!Shizuku.pingBinder()) return "Shizuku 未运行"
         val deferred = CompletableDeferred<String>()
         val conn = object : ServiceConnection {

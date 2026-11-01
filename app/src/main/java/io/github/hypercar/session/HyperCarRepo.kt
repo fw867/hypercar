@@ -272,20 +272,10 @@ object HyperCarRepo {
                             aclCarMac = address
                             log("AUTO: 本轮 iAP2 目标锁定为 ACL 车机 $address（${runCatching { device.name }.getOrNull() ?: "?"}）")
                         }
-                        // 关键：**不让安卓把 HFP/A2DP 回连到车机**——否则车机接下来 ~0.5s 就
-                        // Remote Terminated，iAP2 永远不会打开（2026-11-01 现场 dumpsys 证据）。
+                        // 音频 profile 干预受车机档案控制；是否为本次失败根因仍需实车验证。
                         CarProfileGuard.noteCar(address)
-                        if (headUnitProfile.dropProfilesBeforeIap2) {
-                            CarProfileGuard.enabled = true
-                            scope.launch {
-                                CarProfileGuard.enforce(app, device, address, "ACL 连上（立即）")
-                                // 安卓会连着重试几次，再补两轮（guard 内部有 3s 节流）
-                                kotlinx.coroutines.delay(1_500)
-                                CarProfileGuard.enforce(app, device, address, "ACL 连上 +1.5s 复查")
-                                kotlinx.coroutines.delay(2_500)
-                                CarProfileGuard.enforce(app, device, address, "ACL 连上 +4s 复查")
-                            }
-                        }
+                        updateCarProfileGuard(app)
+                        CarProfileGuard.onCarConnected(app, device, address)
                     }
                     if (!HyperCarService.isRunning) {
                         runCatching {
@@ -358,6 +348,14 @@ object HyperCarRepo {
 
     private fun connectAutomatically(context: Context) = requestConnect(context, manual = false)
 
+    fun connectFromCompanion(context: Context, address: String) {
+        if (!io.github.hypercar.autowake.CompanionWakePolicy.accepts(
+                SettingsStore.autoConnect, SettingsStore.targetCarMac, address,
+            ) || hasCurrentSession) return
+        log("COMPANION: 恢复监听并请求自动会话；仍等待本轮车机邀请")
+        connectAutomatically(context)
+    }
+
     private fun requestConnect(context: Context, manual: Boolean) {
         init(context)
         scope.launch {
@@ -381,6 +379,7 @@ object HyperCarRepo {
         sessionHadLink = false
         connecting = true
         sessionLive.set(true)
+        updateCarProfileGuard(context)
         runCatching { context.startForegroundService(HyperCarService.sessionIntent(context)) }
             .onFailure { log("SERVICE: 会话保活启动失败：${it.message}") }
         // 阶段计时基准：之后每条 CONNECT 日志都带 +Nms，一眼看出卡在哪一步
@@ -413,7 +412,9 @@ object HyperCarRepo {
         if (!target.orEmpty().equals(SettingsStore.targetCarMac.orEmpty(), ignoreCase = true)) {
             SettingsStore.lastAirplayEndpoint = "" // Legacy endpoint had no receiver association.
         }
+        CarProfileGuard.stop()
         SettingsStore.setTargetCar(target, name?.takeIf { target != null && it.isNotBlank() })
+        CarProfileGuard.noteCar(null)
         aclCarMac = null
         standbyEndpoint.set(null)
         iap2?.onTargetChanged()
@@ -499,9 +500,12 @@ object HyperCarRepo {
             try {
                 if (SettingsStore.autoConnect) startWifiReconnectMonitor(context)
                 else stopWifiReconnectMonitor()
+                io.github.hypercar.autowake.CarCompanionWake.sync(context)
                 when (AutomaticConnectionPolicy.modeChanged(SettingsStore.autoConnect, hasCurrentSession)) {
-                    AutomaticConnectionPolicy.IdleAction.KEEP_SESSION ->
+                    AutomaticConnectionPolicy.IdleAction.KEEP_SESSION -> {
+                        updateCarProfileGuard(context)
                         log("AUTO: 自动模式=${SettingsStore.autoConnect}；保留当前会话")
+                    }
                     AutomaticConnectionPolicy.IdleAction.START_LISTENING -> startStandbyListening()
                     AutomaticConnectionPolicy.IdleAction.STOP_LISTENING -> stopStandbyListening()
                 }
@@ -553,15 +557,19 @@ object HyperCarRepo {
                 log("AUTO: 待机通知已关闭——只做进程内监听，不发前台通知")
             }
             log("AUTO: 待机监听已启用，等待车机；尚未发起 AirPlay 会话")
-            // 待机期间也盯着：别让安卓把 HFP/A2DP 回连到车机（见 CarProfileGuard）
-            CarProfileGuard.enabled = true
-            CarProfileGuard.start(context, ::log)
+            updateCarProfileGuard(context)
         }
     }
 
+    private fun updateCarProfileGuard(context: Context) {
+        if (io.github.hypercar.bluetooth.CarProfilePolicy.shouldGuard(
+                headUnitProfile.dropProfilesBeforeIap2, SettingsStore.autoConnect, hasCurrentSession,
+            )) CarProfileGuard.start(context, ::log)
+        else CarProfileGuard.stop()
+    }
+
     private fun stopStandbyListening() {
-        // 用户关掉自动连接/手动停止：不再干预车机的音频配置文件
-        CarProfileGuard.enabled = false
+        appContext()?.let { updateCarProfileGuard(it) }
         stopWifiReconnectMonitor()
         if (hasCurrentSession) return
         reconnectJob?.cancel()
@@ -595,6 +603,30 @@ object HyperCarRepo {
         // Some ROMs redact WifiInfo; one Wi-Fi handle is unambiguous. Never choose an arbitrary
         // network when concurrent station connections are present and SSID information is hidden.
         return exact.singleOrNull() ?: networks.singleOrNull()
+    }
+
+    private suspend fun resumeKnownCarNetwork(context: Context, advertiser: CarPlayCtrlAdvertiser) {
+        val ssid = currentWifiSsid(context) ?: return
+        val mac = knownWifiReceiver(ssid) ?: return
+        val network = knownWifiNetwork(context, ssid) ?: return
+        val changed = boundNetwork != network || joinedSsid != ssid || wifiReceiverMac != mac
+        if (changed) {
+            val cm = context.getSystemService(ConnectivityManager::class.java) ?: return
+            if (!cm.bindProcessToNetwork(network)) {
+                log("WIFI-RESUME: 已知车机网络绑定失败，等待下次检查")
+                return
+            }
+            wifiReceiverMac = mac
+            CarProfileGuard.noteCar(mac)
+            sessionWifiSsid = ssid
+            boundNetwork = network
+            watchSessionNetwork(context, network)
+            joinedNetwork = network
+            joinedSsid = ssid
+            log("WIFI-RESUME: 绑定已知车机 Wi-Fi 并恢复 ctrl 广播，使用本车凭证")
+        }
+        // 同一网络不会反复重注册；上次注册失败则允许重试。
+        advertiser.ensureForNetwork(ssid, force = changed, network = network)
     }
 
     private fun watchSessionNetwork(context: Context, expected: Network) {
@@ -675,6 +707,7 @@ object HyperCarRepo {
     // ---------------------------------------------------------------- 连接主流程
 
     private suspend fun runConnect(context: Context) {
+        var discoveryJob: Job? = null
         try {
             // Shizuku 从「必须」降级为「可选增强」：没有它照样能连，只是两条路径降级——
             //  WiFi 走 WifiNetworkSpecifier（热点首连弹一次系统确认框）+ deviceID 用稳定伪 MAC。
@@ -732,6 +765,27 @@ object HyperCarRepo {
             val advertiser = CarPlayCtrlAdvertiser(context, { deviceMac }, ::log)
             ctrlAdvertiser = advertiser
             val lastSeen = AtomicReference<CarPlayEndpoint?>(null)
+            val baselineSessions = coordinator.sessionStartCount
+            discoveryJob = CoroutineScope(kotlinx.coroutines.currentCoroutineContext()).launch {
+                try { io.github.hypercar.bluetooth.ReconnectDiscoverability.watch(context,
+                    networkKey = {
+                        val mac = wifiReceiverMac
+                        val network = boundNetwork
+                        val ssid = sessionWifiSsid
+                        val target = SettingsStore.targetCarMac
+                        if (network != null && mac != null && ssid != null &&
+                            (target.isNullOrBlank() || target.equals(mac, ignoreCase = true))) "$network|$ssid|$mac" else null
+                    },
+                    servicesReady = { coordinator.isListening && advertiser.isAdvertising },
+                    sessionStarted = { coordinator.isSessionActive || coordinator.sessionStartCount > baselineSessions ||
+                        advertiser.lastInvitePeerIp != null || streaming },
+                    log = ::log,
+                ) } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (t: Exception) {
+                    log("BT-DISCOVERY: 可发现兜底失败：${t.message}，保留原连接流程")
+                }
+            }
             // **等端点超时也不拆 iAP2**（2026-10-24 iPhone HCI 对照 / 2026-10-25 现场）：
             // 真 iPhone 在拿到 0x5703 后 ≥34s 不发任何 iAP2 报文、也从不主动拆链；
             // 而「拆除会让车机收起 CarPlay 图标」——一旦车机把本机从 CarPlay 设备里摘掉，
@@ -948,6 +1002,7 @@ object HyperCarRepo {
         } catch (t: Throwable) {
             fail("会话异常: ${t.message}")
         } finally {
+            discoveryJob?.cancel()
             connecting = false
         }
     }
@@ -1046,6 +1101,7 @@ object HyperCarRepo {
 
     /** 释放保活服务、iAP2、Rust 和 WiFi 绑定；拆除与失败路径共用。 */
     private fun releaseSessionResources(keepListening: Boolean = false) {
+        CarProfileGuard.stop() // 清除旧会话的延迟检查；重新待机时再启动。
         if (!keepListening) stopForegroundService()
         MusicBridge.onCarDisconnected()
         streaming = false
@@ -1777,22 +1833,7 @@ object HyperCarRepo {
         // BMW's second-entry box trace still obtains Bluetooth credentials and a fresh ctrl invite.
         // Retain the network/identity shortcut, but never confuse a remembered/open port with activation.
         val requireActivation = headUnitProfile.requireAirplayActivation
-        val resumeSsid = currentWifiSsid(context)
-        val resumeMac = knownWifiReceiver(resumeSsid)
-        if (resumeMac != null && !resumeSsid.isNullOrBlank()) {
-            val network = knownWifiNetwork(context, resumeSsid)
-            if (network != null) {
-                wifiReceiverMac = resumeMac
-                sessionWifiSsid = resumeSsid
-                context.getSystemService(ConnectivityManager::class.java)?.bindProcessToNetwork(network)
-                boundNetwork = network
-                watchSessionNetwork(context, network)
-                joinedNetwork = network
-                joinedSsid = resumeSsid
-                advertiser.ensureForNetwork(resumeSsid, force = true, network = network)
-                log("WIFI-RESUME: 绑定已知车机 Wi-Fi 并恢复 ctrl 广播，使用本车凭证")
-            }
-        }
+        resumeKnownCarNetwork(context, advertiser)
         if (requireActivation) {
             log("SESSION: 等待本轮 ctrl 邀请或 iAP2 端点；保持蓝牙监听与 Wi-Fi 广播，不预连记忆/扫描端口")
             push(link = LinkState.Negotiating("等待车机开启 CarPlay"))
@@ -1880,6 +1921,9 @@ object HyperCarRepo {
                     ?: withTimeoutOrNull(ENDPOINT_TICK_MILLIS) { callbacks.receive() }
                 if (next == null) {
                     ticks++
+                    // 手动连接可以早于车机热点出现。等待期间也检查已配对网络，
+                    // 不等本轮 300s 超时；这里只恢复广播，仍需本轮邀请/端点才能连 AirPlay。
+                    resumeKnownCarNetwork(context, advertiser)
                     // ① 车机已经来邀请过（GET /ctrl-int/1/connect）→ 直接用邀请方 IP 当端点。
                     //    BMW MGU-55 实测：清单里声明「0x4301 不发」，等它是死等；而邀请一旦
                     //    到达，TCP 对端地址就是车机在热点网段上的地址，AirPlay 控制面在 7000。

@@ -43,4 +43,7 @@ interface ISpikeShell {
     String audioCaptureStatus();
     /** Keep the task/display alive while switching between the card texture and full-screen encoder. */
     String updateDisplaySurface(int displayId, in Surface surface, int width, int height, int dpi);
+    /** 有界经典可发现；owner 死亡、显式停止或独立计时到期后结束。 */
+    String startBluetoothDiscoverable(IBinder owner, String token, int seconds);
+    String stopBluetoothDiscoverable(String token);
 }

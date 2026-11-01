@@ -39,6 +39,10 @@
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.REQUEST_COMPANION_RUN_IN_BACKGROUND" />
+    <uses-permission android:name="android.permission.REQUEST_COMPANION_START_FOREGROUND_SERVICES_FROM_BACKGROUND" />
+    <uses-permission android:name="android.permission.REQUEST_OBSERVE_COMPANION_DEVICE_PRESENCE" />
+    <uses-feature android:name="android.software.companion_device_setup" android:required="false" />
     <!-- 语音助手/音频采集（预留）：本机自采音频供后续推流链路使用，
          当前仅声明权限，不采集任何音频。 -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
@@ -122,6 +126,14 @@
             android:foregroundServiceType="connectedDevice" />
 
         <!-- ACL 广播在隐式广播例外清单内，清单静态注册可拉起被杀进程 -->
+        <service
+            android:name=".autowake.CarCompanionService"
+            android:exported="true"
+            android:permission="android.permission.BIND_COMPANION_DEVICE_SERVICE">
+            <intent-filter>
+                <action android:name="android.companion.CompanionDeviceService" />
+            </intent-filter>
+        </service>
 
         <receiver
             android:name=".autowake.CarBluetoothReceiver"

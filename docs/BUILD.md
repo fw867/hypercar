@@ -51,6 +51,13 @@ BuildNumber；本地构建号高于 CI 时，较低版本的 CI APK 不能直接
 2. 授予通知、附近设备权限；音乐卡片还需要系统“通知使用权”。按 ROM 要求配置自启动、后台运行及悬浮窗权限。
 3. 安装高德地图，先在手机完成首次使用提示；安装所需音乐播放器。
 4. 车机开启无线 Apple CarPlay。首次在车机侧选择手机并确认配对，同一台车之后可自动回连。
+5. 增强发现（Android 13+）：在设置的“目标车机”列表直接点击车机，按 Android 系统弹窗授权。
+   授权后，“已配对 · 时间”旁显示“增强发现”标签；取消授权仍会保留所选车机。授权可先完成，
+   “上车自动连接”开启后才观察并唤醒应用。关闭自动连接会停止观察；切换目标会解除旧车关联。
+   此功能补充现有 ACL/Wi-Fi 唤醒，不替代车机的本轮 CarPlay 激活。
+6. “蓝牙回连唤醒”默认开启：已配对车机 Wi-Fi、广播与监听就绪 5 秒仍无会话时，通过 Shizuku
+   尝试一次最多 30 秒经典可发现窗口。连接开始、停止或到期后清理；无 Shizuku 时跳过。
+   详见 [可发现兜底与实机验证](BMW-DISCOVERABLE-RECONNECT-2026-11-01.md)。
 
 连接后 HyperCar 自动创建自绘首页；地图使用安装版高德，音乐从 MediaSession 获取元数据与控制能力。
 无需再进入 CarLife 的“无线连接”入口。首页／全屏地图切换保留导航；“返回车机”保持 CarPlay 连接。
@@ -69,7 +76,8 @@ H.264 level 由编码器按尺寸和帧率选择。详见 [推流检查记录](V
 - 提交标题末尾加 `[release]` 或 `[publish]`：测试通过后自动创建 GitHub Release，并附 APK。
 - 提交标题含 `[skip ci]`：跳过工作流任务；适合仅文档／截图的修改。
 - Actions 手动运行并勾选 `publish` 也必须通过测试。
-- 版本号：`appVersionName` + `github.run_number`；例如 `0.1.0.68`，versionCode 为 `10000 + run_number`。
+- 版本号：`appVersionName` + `github.run_number + 400`，versionCode 为 `10000 + 构建号`。
+  云端从 run 90 对应 0.1.0.490 开始，衔接手机已安装的本地测试版 489；后续每次构建继续递增。
 - 必需 Secrets：`KEYSTORE_BASE64`、`KEYSTORE_PASSWORD`、`KEY_ALIAS`、`KEY_PASSWORD`；可选
   `EXPECTED_CERT_SHA256`。缺失正式签名材料会失败，不会退回 debug 签名。
 - Release 说明记录当前功能、环境要求、适配限制，以及本次提交、APK 大小和 SHA-256。

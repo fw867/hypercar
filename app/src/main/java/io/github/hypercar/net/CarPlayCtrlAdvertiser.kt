@@ -58,6 +58,7 @@ class CarPlayCtrlAdvertiser(
 
     @Volatile
     private var registered = false
+    val isAdvertising: Boolean get() = registered
 
     private var registeredSsid: String? = null
     private var registeredNetwork: Network? = null

@@ -32,6 +32,12 @@ class HyperCarService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val automatic = intent?.action != ACTION_SESSION
         val autoEnabled = io.github.hypercar.settings.SettingsStore.autoConnect
+        if (intent?.action == ACTION_COMPANION && !CompanionWakePolicy.accepts(
+                autoEnabled, io.github.hypercar.settings.SettingsStore.targetCarMac, intent.getStringExtra(EXTRA_ADDRESS),
+            )) {
+            if (!io.github.hypercar.session.HyperCarRepo.hasCurrentSession) stopSelf()
+            return START_NOT_STICKY
+        }
         if (intent?.action == ACTION_STOP ||
             (automatic && !autoEnabled && !io.github.hypercar.session.HyperCarRepo.hasCurrentSession)) {
             isRunning = false
@@ -55,6 +61,10 @@ class HyperCarService : Service() {
         if (intent?.action == ACTION_START && device != null) {
             runCatching { AutoStart.handler?.invoke(applicationContext, device, true) }
                 .onFailure { Log.e(TAG, "触发会话失败", it) }
+        } else if (intent?.action == ACTION_COMPANION) {
+            intent.getStringExtra(EXTRA_ADDRESS)?.let {
+                io.github.hypercar.session.HyperCarRepo.connectFromCompanion(applicationContext, it)
+            }
         } else if (intent == null && autoEnabled) {
             // 系统回收后只恢复自动待机，不能凭空重建一轮手动会话。
             io.github.hypercar.session.HyperCarRepo.startAutomaticListening(applicationContext)
@@ -178,6 +188,8 @@ class HyperCarService : Service() {
         const val ACTION_START = "io.github.hypercar.action.AUTO_START"
         private const val ACTION_LISTEN = "io.github.hypercar.action.LISTEN"
         private const val ACTION_SESSION = "io.github.hypercar.action.SESSION"
+        private const val ACTION_COMPANION = "io.github.hypercar.action.COMPANION"
+        private const val EXTRA_ADDRESS = "io.github.hypercar.extra.COMPANION_ADDRESS"
 
         /** 下车：ACL 断开时（经 startService）收摊。 */
         const val ACTION_STOP = "io.github.hypercar.action.AUTO_STOP"
@@ -195,6 +207,9 @@ class HyperCarService : Service() {
 
         fun sessionIntent(context: Context): Intent =
             Intent(context, HyperCarService::class.java).setAction(ACTION_SESSION)
+
+        fun companionIntent(context: Context, address: String): Intent =
+            Intent(context, HyperCarService::class.java).setAction(ACTION_COMPANION).putExtra(EXTRA_ADDRESS, address)
 
         fun startIntent(context: Context, device: BluetoothDevice): Intent =
             Intent(context, HyperCarService::class.java)
