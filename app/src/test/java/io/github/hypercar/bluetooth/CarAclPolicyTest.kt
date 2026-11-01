@@ -1,4 +1,4 @@
-package io.github.hypercar.bluetooth
+﻿package io.github.hypercar.bluetooth
 
 import android.bluetooth.BluetoothDevice
 import io.github.hypercar.headunit.HeadUnitProfiles
@@ -20,9 +20,13 @@ class CarAclPolicyTest {
         assertTrue(CarAclPolicy.isClassicCarLink(BluetoothDevice.TRANSPORT_AUTO, BluetoothDevice.DEVICE_TYPE_UNKNOWN))
     }
 
-    @Test fun bmwOnlyListensAndKeepsSystemProfiles() {
+    @Test fun bmwOnlyListensAndDropsProfilesBeforeIap2() {
+        // 2026-11-01 按现场证据调整：上车时手机侧 HFP/A2DP 回连会抢占 ACL，车机随后
+        // Remote Terminated（dumpsys：11:05:10.840 HFP 回连 → 11:05:13.038 车机拆链），
+        // iAP2 从未打开。改成「只配对、不连接配置文件」，与 cardeck 一致。
+        // 出站仍然关闭：宝马车机是主动连入方，我们不去拨它。
         assertFalse(HeadUnitProfiles.BMW_ID85.allowOutboundIap2)
-        assertFalse(HeadUnitProfiles.BMW_ID85.dropProfilesBeforeIap2)
+        assertTrue(HeadUnitProfiles.BMW_ID85.dropProfilesBeforeIap2)
         assertTrue(HeadUnitProfiles.GENERIC.allowOutboundIap2)
         assertTrue(HeadUnitProfiles.WINPLAY.allowOutboundIap2)
     }

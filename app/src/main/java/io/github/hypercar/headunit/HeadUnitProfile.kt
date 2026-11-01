@@ -1,4 +1,4 @@
-package io.github.hypercar.headunit
+﻿package io.github.hypercar.headunit
 
 import io.github.hypercar.settings.SettingsStore
 
@@ -105,7 +105,11 @@ object HeadUnitProfiles {
         openEaSessions = true,
         sendTransportIdentifier = true,
         replyPowerUpdates = true,
-        dropProfilesBeforeIap2 = false,
+        // 2026-11-01 按用户要求打开（A/B 实验）：上车时手机侧 HFP/A2DP 回连会抢占 ACL，
+        // 车机随后 `Remote Terminated`（现场 dumpsys：11:05:10.840 HFP 回连 → 11:05:13.038 拆链），
+        // iAP2 从未打开。cardeck 的做法同样是「只配对、不连接配置文件」。
+        // ⚠ 2026-10-25 曾打开过又回退（当时观察到断开配置会连带把 ACL 拽掉）——本轮是对照实验。
+        dropProfilesBeforeIap2 = true,
         allowOutboundIap2 = false,
         abortWhenCarPlayWindowClosed = false,
         preferMdnsAirplay = true,

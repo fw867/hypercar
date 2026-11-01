@@ -1,4 +1,4 @@
-package io.github.hypercar.session
+﻿package io.github.hypercar.session
 
 import android.bluetooth.BluetoothDevice
 import android.content.Context
@@ -10,6 +10,7 @@ import android.net.NetworkCapabilities
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import io.github.hypercar.autowake.AutoStart
+import io.github.hypercar.bluetooth.CarProfileGuard
 import io.github.hypercar.autowake.HyperCarService
 import io.github.hypercar.carui.CarUiCaster
 import io.github.hypercar.carui.MusicBridge
@@ -271,6 +272,20 @@ object HyperCarRepo {
                             aclCarMac = address
                             log("AUTO: 本轮 iAP2 目标锁定为 ACL 车机 $address（${runCatching { device.name }.getOrNull() ?: "?"}）")
                         }
+                        // 关键：**不让安卓把 HFP/A2DP 回连到车机**——否则车机接下来 ~0.5s 就
+                        // Remote Terminated，iAP2 永远不会打开（2026-11-01 现场 dumpsys 证据）。
+                        CarProfileGuard.noteCar(address)
+                        if (headUnitProfile.dropProfilesBeforeIap2) {
+                            CarProfileGuard.enabled = true
+                            scope.launch {
+                                CarProfileGuard.enforce(app, device, address, "ACL 连上（立即）")
+                                // 安卓会连着重试几次，再补两轮（guard 内部有 3s 节流）
+                                kotlinx.coroutines.delay(1_500)
+                                CarProfileGuard.enforce(app, device, address, "ACL 连上 +1.5s 复查")
+                                kotlinx.coroutines.delay(2_500)
+                                CarProfileGuard.enforce(app, device, address, "ACL 连上 +4s 复查")
+                            }
+                        }
                     }
                     if (!HyperCarService.isRunning) {
                         runCatching {
@@ -510,10 +525,15 @@ object HyperCarRepo {
             runCatching { context.startForegroundService(HyperCarService.listenIntent(context)) }
                 .onFailure { log("SERVICE: 后台监听保活启动失败：${it.message}") }
             log("AUTO: 待机监听已启用，等待车机；尚未发起 AirPlay 会话")
+            // 待机期间也盯着：别让安卓把 HFP/A2DP 回连到车机（见 CarProfileGuard）
+            CarProfileGuard.enabled = true
+            CarProfileGuard.start(context, ::log)
         }
     }
 
     private fun stopStandbyListening() {
+        // 用户关掉自动连接/手动停止：不再干预车机的音频配置文件
+        CarProfileGuard.enabled = false
         stopWifiReconnectMonitor()
         if (hasCurrentSession) return
         reconnectJob?.cancel()

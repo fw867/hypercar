@@ -1,4 +1,4 @@
-package io.github.hypercar.perm
+﻿package io.github.hypercar.perm
 
 import android.Manifest
 import android.app.AppOpsManager
