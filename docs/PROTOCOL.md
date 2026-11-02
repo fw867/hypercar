@@ -22,7 +22,7 @@ CSM 格式为 `40 40 | total_len(u16BE) | message_id(u16BE) | parameters`，总�
 
 ## AirPlay 与 Wi-Fi iAP2
 
-已知宝马流程由本轮控制邀请（如 `/ctrl-int/1/connect`）或当前 iAP2 端点推进。内置档案显式要求激活；远程解析对该字段的影响见[车机档案](HEADUNIT-PROFILES.md)。发现 AirPlay 服务不等于已收到连接邀请。持久控制身份与接收端配对资料分开存储；本地存在凭据不等于车机仍认可。
+已知宝马流程由本轮控制邀请（如 `/ctrl-int/1/connect`）或当前 iAP2 端点推进。内置档案与当前下发配置均要求激活；远程字段已支持完整解析和导出，见[车机档案](HEADUNIT-PROFILES.md)。发现 AirPlay 服务不等于已收到连接邀请。持久控制身份与接收端配对资料分开存储；本地存在凭据不等于车机仍认可。
 
 Wi-Fi iAP2 的入站是事件通道 `POST /command`，plist 中 `type=iAPSendMessage`、`params.data` 承载链路包；出站经客户端控制通道。必须处理链路 ACK 和 CSM；RTSP 200 不能代替 iAP2 消息完成。盒子样本中视频可早于 Wi-Fi 认证完成，不把后者设为所有视频启动的硬门槛。
 

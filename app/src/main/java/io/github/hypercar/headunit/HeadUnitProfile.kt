@@ -11,7 +11,7 @@ import io.github.hypercar.settings.SettingsStore
  * 每加一个品牌都要动主流程。现在：**新增品牌 = 新增一个档案文件 + 注册表一行**，
  * 会话层与传输层只读档案，不再出现品牌名。
  *
- * 约定：字段一律带默认值（默认取「真 iPhone 实测行为」），
+ * 约定：字段一律带默认值（由当前兼容策略决定），
  * 这样新加档案时只需覆盖确实不同的那几项。
  */
 data class HeadUnitProfile(
@@ -35,41 +35,29 @@ data class HeadUnitProfile(
     /** 接收端会逐字符比对 AirPlay SETUP 的 deviceID 与本机蓝牙 MAC（WinPlay 会，BMW 不会）。 */
     val validatesDeviceId: Boolean = false,
 
-    /** 发 0x4300 CarPlayAvailability（真 iPhone 从不发；仅车机声明可收时才值得发）。 */
+    /** 是否发送 0x4300 CarPlayAvailability。 */
     val sendCarPlayAvailability: Boolean = false,
 
-    /** 开 0xEA00 EA 会话（真 iPhone 一个都不发，车机也从不回 0xEA03）。 */
+    /** 是否发起 0xEA00 EA 会话。 */
     val openEaSessions: Boolean = false,
 
-    /** 发 0x4E0E 设备传输标识（真 iPhone 不发）。 */
+    /** 是否发送 0x4E0E 设备传输标识。 */
     val sendTransportIdentifier: Boolean = false,
 
     /** 车机发 0xAE00 StartPowerUpdates 时回 0xAE01（真 iPhone 必回 3 条）。 */
     val replyPowerUpdates: Boolean = true,
 
     /**
-     * 发 iAP2 之前是否主动断开该车机的 HFP/A2DP（cardeck 的「只配对、不连接」）。
-     *
-     * - **奥迪 MIB3 需要**：手机与车机处于已连接状态时车机不开放 iAP2 服务窗口。
-     * - **宝马不需要，而且有害**（2026-10-25 现场）：车机在 HFP/A2DP 在线时照样会在
-     *   ACL 连上后 ~4s 主动连入手机 iAP2；我们主动断开会把整条 ACL 一起拽掉
-     *   （车机侧看到设备断开 → 重连 → 我们再断），形成 15~60s 一轮的「连上→断」循环，
-     *   车机始终等不到稳定的 iAP2 建链，表现就是「不把手机当 CarPlay 设备」。
+     * 是否启用目标车机音频配置保护。仅处理已连接的配置文件，
+     * 不调用设备级 disconnect；生效条件与节流由 CarProfileGuard/CarProfilePolicy 决定。
+     * 当前内置宝马启用，但其对二次上车的收益仍需实车验证。
      */
     val dropProfilesBeforeIap2: Boolean = true,
 
-    /** false = 只监听车机主动连入，不做 SDP 扫描、出站拨号或配置文件断开。 */
+    /** false = 不做主动 iAP2 出站拨号；音频配置保护由独立字段控制。 */
     val allowOutboundIap2: Boolean = true,
 
-    /**
-     * 0x1D01 判为「档案 A」（车机没开无线 CarPlay 窗口）时是否**主动结束会话**。
-     *
-     * **必须 false**（2026-10-25 现场 A/B 定谳）：0.27（保持链路）时车机显示 CarPlay
-     * 图标；0.28 起加了「档案 A 立即结束会话」后，车机把本机降级成普通蓝牙设备、
-     * 图标消失，之后连 iAP2 都不再发起——与 docs/NEGOTIATION-GAPS.md §10.5 的结论
-     * 「拆除会让车机收起 CarPlay 图标」一致。档案 A/B 的切换由车机决定，靠拆链去
-     * 「换一轮」代价是把 CarPlay 设备身份丢掉，不划算。
-     */
+    /** 能力识别为 CarPlay 窗口未开放时是否主动结束；当前内置档案均为 false。 */
     val abortWhenCarPlayWindowClosed: Boolean = false,
 
     /** 端点端口策略：true = 先查 mDNS `_airplay._tcp`，false = 直接用 [fallbackAirplayPorts]。 */
@@ -98,7 +86,7 @@ object HeadUnitProfiles {
         id = "bmw_id85",
         label = "BMW iD8.5",
         model = "MGU-86 / MGU-55",
-        notes = "兼容 MGU-86 / MGU-55；保持系统蓝牙连接，由车机发起 CarPlay。首次连接请在 iDrive 确认授权。",
+        notes = "兼容 MGU-86 / MGU-55；由车机发起 CarPlay，启用目标音频配置保护。首次连接请在 iDrive 确认授权。",
         validatesDeviceId = false,
         // ↓ 这三项 2026-10-25 现场 A/B 恢复为 0.27 值：0.27 有 CarPlay 图标，停发后图标消失
         sendCarPlayAvailability = true,

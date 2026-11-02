@@ -134,5 +134,7 @@ dependencies {
     implementation("dev.rikka.shizuku:provider:13.1.5")
 
     testImplementation("junit:junit:4.13.2")
+    // Exercise remote profile parsing with real JSON semantics in local JVM tests.
+    testImplementation("org.json:json:20240303")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
 }

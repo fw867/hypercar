@@ -24,7 +24,7 @@ import java.net.URL
  *  - **无依赖**：用 `HttpURLConnection` + `org.json`（都是系统自带），不引 OkHttp。
  *
  * 文件格式见仓库 `profiles/headunits.json`，字段与 [HeadUnitProfile] 一一对应，
- * 除 `id/label` 外都可省略（省略即取默认值 = 真 iPhone 实测行为）。
+ * 除 `id` 外都可省略；省略字段继承同 id 内置档案，新 id 使用 BMW 默认模板。
  */
 object RemoteProfiles {
 
@@ -37,7 +37,7 @@ object RemoteProfiles {
      * 规则：**`_schema` 低于本常量的远程条目，只能新增车型，不能覆盖内置档案**
      * ——这样"修内置档案"必须显式升 schema 才会生效，旧缓存不会把修复顶回去。
      */
-    const val SCHEMA = 3
+    const val SCHEMA = 4
 
     /** 档案列表地址（raw.githubusercontent.com，改 `main` 为其它分支即可灰度）。 */
     const val DEFAULT_URL =
@@ -82,8 +82,9 @@ object RemoteProfiles {
         memoSchema = parsed.schema
     }
 
-    /** 远程档案里是否有这个 id（用于 UI 打「远程」角标）。 */
-    fun isRemote(id: String): Boolean = cached().any { it.id == id }
+    /** 只有实际参与合并的远程档案才显示「远程」角标。 */
+    fun isRemote(id: String): Boolean = cached().any { it.id == id } &&
+        (cachedSchema() >= SCHEMA || HeadUnitProfiles.builtin.none { it.id == id })
 
     /**
      * 把内置表与远程表合并：内置保持原顺序（远程可覆盖同 id），远程独有项追加。
@@ -191,9 +192,15 @@ object RemoteProfiles {
             abortWhenCarPlayWindowClosed =
                 o.optBoolean("abortWhenCarPlayWindowClosed", defaults.abortWhenCarPlayWindowClosed),
             preferMdnsAirplay = o.optBoolean("preferMdnsAirplay", defaults.preferMdnsAirplay),
+            requireAirplayActivation =
+                o.optBoolean("requireAirplayActivation", defaults.requireAirplayActivation),
             fallbackAirplayPorts = readPorts(o, defaults.fallbackAirplayPorts),
-            touchDisplay = o.optString("touchDisplay", "").ifBlank { defaults.touchDisplay },
-            pairingHint = o.optString("pairingHint", "").ifBlank { null },
+            touchDisplay = if (o.has("touchDisplay")) {
+                o.optString("touchDisplay", "").ifBlank { null }
+            } else defaults.touchDisplay,
+            pairingHint = if (o.has("pairingHint")) {
+                o.optString("pairingHint", "").ifBlank { null }
+            } else defaults.pairingHint,
         )
     }
 
@@ -223,12 +230,13 @@ object RemoteProfiles {
                     put("allowOutboundIap2", p.allowOutboundIap2)
                     put("abortWhenCarPlayWindowClosed", p.abortWhenCarPlayWindowClosed)
                     put("preferMdnsAirplay", p.preferMdnsAirplay)
+                    put("requireAirplayActivation", p.requireAirplayActivation)
                     put("fallbackAirplayPorts", JSONArray(p.fallbackAirplayPorts))
-                    p.touchDisplay?.let { put("touchDisplay", it) }
-                    p.pairingHint?.let { put("pairingHint", it) }
+                    put("touchDisplay", p.touchDisplay ?: "")
+                    put("pairingHint", p.pairingHint ?: "")
                 },
             )
         }
-        return JSONObject().put("profiles", arr).toString(2)
+        return JSONObject().put("_schema", SCHEMA).put("profiles", arr).toString(2)
     }
 }

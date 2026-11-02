@@ -21,12 +21,12 @@ BMW MGU-55 是当前实车基准。Audi 尚未完成本项目实车验证；gene
 
 配置源为 [headunits.json](../profiles/headunits.json)，解析与合并见 [RemoteProfiles](../app/src/main/java/io/github/hypercar/headunit/RemoteProfiles.kt)。
 
-当前 schema 为 3。达到当前 schema 的同 ID 远程档案覆盖内置档案；旧 schema 仅追加新的 ID。解析器支持的字段未明确提供时，从对应内置档案继承；新 ID 的缺省模板为 BMW。未实现解析的字段另见下文。刷新失败保留已有缓存，因此不能假定失败后一定恢复纯内置值。
+当前 schema 为 4。达到当前 schema 的同 ID 远程档案覆盖内置档案；旧 schema 仅追加新的 ID，不覆盖内置值，也不为内置条目显示“远程”角标。省略字段继承对应内置档案；新 ID 使用 BMW 模板。刷新失败保留缓存，但旧缓存仍受 schema 隔离。
 
-目前 JSON 中 BMW 明确设置 dropProfilesBeforeIap2=false，与内置 true 不同，实际值取决于已加载的配置。诊断必须记录有效档案与配置来源，不能只看源码内置表。
+仓库下发配置已与内置连接策略对齐：BMW 的 dropProfilesBeforeIap2=true、requireAirplayActivation=true，端口兜底包含 17000。诊断仍应记录有效档案及来源，因为自定义配置可以显式覆盖这些值。
 
-当前支持的策略字段包括：validatesDeviceId、sendCarPlayAvailability、openEaSessions、sendTransportIdentifier、replyPowerUpdates、dropProfilesBeforeIap2、allowOutboundIap2、abortWhenCarPlayWindowClosed、preferMdnsAirplay、fallbackAirplayPorts、touchDisplay，以及显示信息与 pairingHint。
+当前支持的策略字段包括：validatesDeviceId、sendCarPlayAvailability、openEaSessions、sendTransportIdentifier、replyPowerUpdates、dropProfilesBeforeIap2、allowOutboundIap2、abortWhenCarPlayWindowClosed、preferMdnsAirplay、requireAirplayActivation、fallbackAirplayPorts、touchDisplay，以及显示信息与 pairingHint。
 
-requireAirplayActivation 当前没有在远程解析器中读取；远程构造对象使用该字段的默认 false，而不是继承内置 BMW 的 true。因此表中激活门槛是内置值，加载同 ID 远程档案后可能不同；不能把它作为可远程调整的字段。keepIap2AliveOnly 不属于当前解析字段。不得凭 JSON 出现某字段就认定已生效。
+requireAirplayActivation 已补齐解析与导出：省略时继承，显式 false 可关闭门槛。pairingHint 与 touchDisplay 省略时也继承；显式空字符串可清除。导出携带当前 _schema，保留策略及可选字段的清除状态。已废弃的 keepIap2AliveOnly 从下发配置移除，不恢复其旧行为。
 
 新增车型先记录接收端角色、邀请、服务、触摸和日志证据，再修改对应字段；不要因另一车型文档中的固定端口、Session ID 或时间阈值就宣称已适配。
