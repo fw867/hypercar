@@ -37,7 +37,9 @@ class CarPlayCtrlAdvertiser(
     /** 本机真实蓝牙 MAC（TXT id；解析失败时返回占位值，车机不会邀请）。 */
     private val bluetoothMacProvider: () -> String,
     private val log: (String) -> Unit,
+    private val onDiagnostic: (Event) -> Unit = {},
 ) {
+    enum class Event { REGISTERED, INVITED }
     companion object {
         const val SERVICE_TYPE = "_carplay-ctrl._tcp"
         private const val SERVICE_NAME = "sender"
@@ -181,6 +183,7 @@ class CarPlayCtrlAdvertiser(
                                 return
                             }
                             registeredAtMillis = SystemClock.uptimeMillis()
+                            runCatching { onDiagnostic(Event.REGISTERED) }
                             log("$TAG: mDNS 注册成功 ${serviceInfo.serviceName} network=$registeredNetwork port=$port")
                         }
                     }
@@ -280,6 +283,7 @@ class CarPlayCtrlAdvertiser(
                         }?.substringAfter(':')
                         ?.trim()
                 inviteCount++
+                runCatching { onDiagnostic(Event.INVITED) }
                 if (peer != "?" && peer.contains('.')) {
                     lastInvitePeerIp = peer
                 }

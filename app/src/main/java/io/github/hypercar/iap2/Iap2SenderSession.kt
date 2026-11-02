@@ -79,6 +79,8 @@ class Iap2SenderSession(
     /** 单调时钟，可在时序回归测试中控制超时。 */
     private val nanoTime: () -> Long = System::nanoTime,
     private val onIdentification: (String) -> Unit = {},
+    /** Actual RFCOMM peer, rather than a mutable UI selection or phone MAC. */
+    private val receiverAddress: String? = null,
 ) {
     private val parser = Iap2Csm.Parser()
     private var phaseName = "IDLE"
@@ -241,7 +243,7 @@ class Iap2SenderSession(
         send(Iap2MessageIds.MFI_REQUEST_CERTIFICATE)
         val certificate = expect(Iap2MessageIds.MFI_CERTIFICATE, deadline)
         log("iap2 rx=0xaa01 certificate bytes=${certificate.body.size}（跳过校验）")
-        val mfiResult = runMfiChallenge(deadline, receiverKey = MfiLengthMemory.receiverKey(identityText))
+        val mfiResult = runMfiChallenge(deadline, receiverKey = MfiLengthMemory.receiverKey(identityText, receiverAddress))
         ensureActive("MFi 结果发送前")
         send(Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED)
         log("iap2 tx=0xaa05 compatibility-result=$mfiResult（未做证书/签名验证，不代表标准认证通过）")

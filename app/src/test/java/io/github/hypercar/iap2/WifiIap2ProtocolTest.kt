@@ -32,7 +32,7 @@ class WifiIap2ProtocolTest {
     }
     private fun messages(frames: List<Wire>) = frames.filter { it.session != 0 }.flatMap { Iap2Csm.Parser().offer(it.body) }
 
-    private inner class Car(val window: Int = 32) {
+    private inner class Car(val window: Int = 32, val controlSession: Int = 1) {
         val logs = mutableListOf<String>()
         val protocol = WifiIap2Protocol("test-device", { logs += it }, { ByteArray(32) { 7 } })
         var sequence = 86
@@ -47,7 +47,7 @@ class WifiIap2ProtocolTest {
         fun start(): List<Iap2Csm.Frame> {
             assertArrayEquals(Iap2LinkEngine.MARKER, protocol.feed(Iap2LinkEngine.MARKER, time++))
             val sync = Iap2LinkEngine.SynchronizationPayload(window, 65535, 0, 0, 0, 0,
-                listOf(Iap2LinkEngine.SessionDescriptor(1, 0, 2), Iap2LinkEngine.SessionDescriptor(2, 1, 2))).encode()
+                listOf(Iap2LinkEngine.SessionDescriptor(controlSession, 0, 2), Iap2LinkEngine.SessionDescriptor(2, 1, 2))).encode()
             val syn = packet(0x80, sequence, 0, body = sync)
             assertTrue(feed(syn.copyOfRange(0, 6)).isEmpty())
             val answer = feed(syn.copyOfRange(6, syn.size)).single()
@@ -56,7 +56,7 @@ class WifiIap2ProtocolTest {
             return messages(feed(packet(0x40, sequence, ack)))
         }
         fun message(id: Int, body: ByteArray = byteArrayOf()): List<Iap2Csm.Frame> =
-            messages(feed(packet(0x40, ++sequence, ack, 1, Iap2Csm.encode(id, body))))
+            messages(feed(packet(0x40, ++sequence, ack, controlSession, Iap2Csm.encode(id, body))))
         fun ready() {
             assertEquals(listOf(0x1d00), start().map { it.messageId })
             val identification = message(0x1d01)
@@ -234,6 +234,39 @@ class WifiIap2ProtocolTest {
         assertTrue(car.message(0xaa06).isEmpty()) // Late serial must not restart challenge.
         car.message(0xaa03, Iap2Csm.param(0, ByteArray(64) { 1 }))
         assertTrue(car.protocol.ready)
+    }
+
+    @Test fun newGenerationNegotiatesItsOwnSessionAndCannotReuseOldAuthentication() {
+        val old = Car(controlSession = 1)
+        old.ready()
+        assertTrue(old.protocol.ready)
+        val fresh = Car(controlSession = 7)
+        assertEquals(listOf(0x1d00), fresh.start().map { it.messageId })
+        // A late signature alone cannot authenticate a fresh Wi-Fi link.
+        assertTrue(fresh.message(0xaa03, Iap2Csm.param(0, ByteArray(64))).isEmpty())
+        assertFalse(fresh.protocol.ready)
+        assertEquals(listOf(0x1d02, 0xaa00), fresh.message(0x1d01).map { it.messageId })
+        assertEquals(0xaa02, fresh.message(0xaa01, Iap2Csm.param(0, byteArrayOf(1))).single().messageId)
+        assertTrue(fresh.message(0xaa03, Iap2Csm.param(0, ByteArray(64))).any { it.messageId == 0xaa05 })
+        val replies = fresh.feed(packet(0x40, ++fresh.sequence, fresh.ack, 7, Iap2Csm.encode(0x4157)))
+        assertTrue(replies.filter { it.body.isNotEmpty() }.all { it.session == 7 })
+        assertEquals(listOf(0x4158), messages(replies).map { it.messageId })
+    }
+
+    @Test fun malformedAuthenticationPayloadCannotReachReadyOrBeReused() {
+        val emptyCertificate = Car()
+        emptyCertificate.start(); emptyCertificate.message(0x1d01)
+        assertTrue(emptyCertificate.message(0xaa01, Iap2Csm.param(0, byteArrayOf())).isEmpty())
+        assertTrue(emptyCertificate.protocol.failed)
+        assertFalse(emptyCertificate.protocol.ready)
+        assertTrue(emptyCertificate.message(0xaa03, Iap2Csm.param(0, ByteArray(64))).isEmpty())
+
+        val emptySignature = Car()
+        emptySignature.start(); emptySignature.message(0x1d01)
+        emptySignature.message(0xaa01, Iap2Csm.param(0, byteArrayOf(1)))
+        assertTrue(emptySignature.message(0xaa03, Iap2Csm.param(0, byteArrayOf())).isEmpty())
+        assertTrue(emptySignature.protocol.failed)
+        assertFalse(emptySignature.protocol.ready)
     }
 
     @Test fun splitAndRepeatedDetectionMarkersAreAnsweredWithoutCompetingSyn() {

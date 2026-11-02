@@ -63,6 +63,13 @@ import kotlinx.coroutines.withTimeoutOrNull
  *    → 本机自绘界面自采自编，经 nativePushVideoFrame / nativePushAudioPcm 投喂 Rust
  */
 object HyperCarRepo {
+    private val connectionDiagnostics = ConnectionDiagnostics(SystemClock::elapsedRealtime)
+    @Volatile private var connectionAttemptId = 0L
+
+    private fun finishDiagnostic(outcome: String, reason: String) {
+        connectionDiagnostics.finish(connectionAttemptId, outcome, reason)
+        connectionDiagnostics.report().lastOrNull()?.let { log(it) }
+    }
 
     private val _snapshots = MutableStateFlow(SessionSnapshot())
     val snapshots: StateFlow<SessionSnapshot> = _snapshots.asStateFlow()
@@ -347,29 +354,30 @@ object HyperCarRepo {
 
     val hasCurrentSession: Boolean get() = sessionLive.get() || connecting || streaming
 
-    fun connect(context: Context) = requestConnect(context, manual = true)
+    fun connect(context: Context) = requestConnect(context, manual = true, source = "manual")
 
-    private fun connectAutomatically(context: Context) = requestConnect(context, manual = false)
+    private fun connectAutomatically(context: Context, source: String = "acl") =
+        requestConnect(context, manual = false, source = source)
 
     fun connectFromCompanion(context: Context, address: String) {
         if (!io.github.hypercar.autowake.CompanionWakePolicy.accepts(
                 SettingsStore.autoConnect, SettingsStore.targetCarMac, address,
             ) || hasCurrentSession) return
         log("COMPANION: 恢复监听并请求自动会话；仍等待本轮车机邀请")
-        connectAutomatically(context)
+        connectAutomatically(context, "companion")
     }
 
-    private fun requestConnect(context: Context, manual: Boolean) {
+    private fun requestConnect(context: Context, manual: Boolean, source: String) {
         init(context)
         scope.launch {
             autoConnectChanges.lock()
             try {
-                if (AutomaticConnectionPolicy.mayStart(manual, SettingsStore.autoConnect)) beginConnect(context)
+                if (AutomaticConnectionPolicy.mayStart(manual, SettingsStore.autoConnect)) beginConnect(context, source)
             } finally { autoConnectChanges.unlock() }
         }
     }
 
-    private fun beginConnect(context: Context) {
+    private fun beginConnect(context: Context, source: String) {
         init(context)
         if (connecting || streaming) {
             log("CONNECT: 已在连接/已连接，忽略重复触发")
@@ -382,6 +390,12 @@ object HyperCarRepo {
         sessionHadLink = false
         connecting = true
         sessionLive.set(true)
+        val profile = headUnitProfile
+        connectionAttemptId = connectionDiagnostics.begin(source,
+            "${profile.id} remote=${io.github.hypercar.headunit.RemoteProfiles.isRemote(profile.id)} " +
+                "activation=${profile.requireAirplayActivation} outbound=${profile.allowOutboundIap2} " +
+                "profileGuard=${profile.dropProfilesBeforeIap2}")
+        log(connectionDiagnostics.report().last())
         updateCarProfileGuard(context)
         runCatching { context.startForegroundService(HyperCarService.sessionIntent(context)) }
             .onFailure { log("SERVICE: 会话保活启动失败：${it.message}") }
@@ -547,7 +561,7 @@ object HyperCarRepo {
         val coordinator = coordinatorFor(context)
         coordinator.start { endpoint ->
             standbyEndpoint.updateAndGet { mergeEndpoint(it, endpoint) }
-            if (SettingsStore.autoConnect) connectAutomatically(context)
+            if (SettingsStore.autoConnect) connectAutomatically(context, "standby-iap2")
         }
         if (coordinator.isRunning) {
             // 「待机通知」关掉时不进前台服务：通知栏干净，代价是进程更容易被回收
@@ -704,7 +718,7 @@ object HyperCarRepo {
             val ssid = currentWifiSsid(context)
             if (knownWifiReceiver(ssid) == null || ssid == null || knownWifiNetwork(context, ssid) == null) return@launch
             log("WIFI-RESUME: 已接入已配对车机网络，恢复 ctrl 广播与监听，按车机激活状态建立 AirPlay")
-            connectAutomatically(context)
+            connectAutomatically(context, "known-wifi")
         }
     }
 
@@ -731,6 +745,20 @@ object HyperCarRepo {
     // ---------------------------------------------------------------- 连接主流程
 
     private suspend fun runConnect(context: Context) {
+        val diagnosticId = connectionAttemptId
+        val bluetoothPermission = context.checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        val dependencies = ConnectionPreflight.State(
+            bluetoothEnabled = runCatching { context.getSystemService(android.bluetooth.BluetoothManager::class.java)?.adapter?.isEnabled }.getOrNull(),
+            bluetoothPermission = bluetoothPermission,
+            wifiEnabled = runCatching { context.getSystemService(android.net.wifi.WifiManager::class.java)?.isWifiEnabled }.getOrNull(),
+            shizukuReady = ShizukuTools.isReady,
+        )
+        val findings = ConnectionPreflight.findings(dependencies)
+        val preflight = "bluetooth=${dependencies.bluetoothEnabled} permission=$bluetoothPermission " +
+            "wifi=${dependencies.wifiEnabled} shizuku=${dependencies.shizukuReady}"
+        connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.DEPENDENCIES_CHECKED, preflight)
+        log("PREFLIGHT: $preflight；${findings.joinToString("；").ifBlank { "依赖检查通过" }}")
         var discoveryJob: Job? = null
         try {
             // Shizuku 从「必须」降级为「可选增强」：没有它照样能连，只是两条路径降级——
@@ -786,7 +814,12 @@ object HyperCarRepo {
             // 绑 WiFi + 广播 `_carplay-ctrl._tcp`——车机是在 WiFi 上发现该服务后
             // `GET /ctrl-int/1/connect` 邀请手机，**邀请成功才下发 0x4301**。
             // 若等 0x4301 才去入网，双方互等（旧实现就是这样，真车上永远拿不到端点）。
-            val advertiser = CarPlayCtrlAdvertiser(context, { deviceMac }, ::log)
+            val advertiser = CarPlayCtrlAdvertiser(context, { deviceMac }, ::log, onDiagnostic = { event ->
+                connectionDiagnostics.mark(diagnosticId, when (event) {
+                    CarPlayCtrlAdvertiser.Event.REGISTERED -> ConnectionDiagnostics.Stage.CTRL_REGISTERED
+                    CarPlayCtrlAdvertiser.Event.INVITED -> ConnectionDiagnostics.Stage.CTRL_INVITED
+                })
+            })
             ctrlAdvertiser = advertiser
             val lastSeen = AtomicReference<CarPlayEndpoint?>(null)
             val baselineSessions = coordinator.sessionStartCount
@@ -862,6 +895,7 @@ object HyperCarRepo {
                     " srcvers=${endpoint.sourceVersion ?: "-"}",
             )
             val network = joinAndBind(context, endpoint)
+            if (network != null) connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.WIFI_BOUND)
             if (network == null) {
                 fail("没有可用的车机网络，停止本轮连接")
                 return
@@ -1014,6 +1048,7 @@ object HyperCarRepo {
             // 前后各记一行：原生崩溃（Rust panic 越过 JNI → SIGABRT）会直接把进程带走，
             // 这两行能区分「崩在 nativeStart 里」还是「崩在引擎跑起来之后」。
             log("CORE: 调用 nativeStart（$apHost:$port fd=$controlFd）")
+            connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.AIRPLAY_START)
             val started = RustCoreBridge.nativeStart(json, controlFd, socketProvider(sockets))
             log("CORE: nativeStart 返回 $started")
             if (!started) {
@@ -1065,6 +1100,7 @@ object HyperCarRepo {
             return
         }
         push(link = LinkState.Stopping)
+        finishDiagnostic("STOPPED", reason)
         val hadLink = sessionHadLink
         releaseSessionResources(keepListening, graceful)
         log("SESSION: 已断开（$reason）")
@@ -1125,7 +1161,7 @@ object HyperCarRepo {
                 return@launch
             }
             reconnectAttempts = attempt
-            connectAutomatically(ctx)
+            connectAutomatically(ctx, "retry")
         }
     }
 
@@ -1636,16 +1672,11 @@ object HyperCarRepo {
      */
     private fun resolveEndpoint(host: String, port: Int, network: Network? = null): java.net.InetSocketAddress {
         val raw = host.trim()
-        val linkLocal = raw.contains(':') && raw.substringBefore('%').lowercase().let {
-            it.startsWith("fe80") || it.startsWith("fe90") || it.startsWith("fea0") || it.startsWith("feb0")
-        }
+        val linkLocal = io.github.hypercar.net.EndpointScope.isLinkLocal(raw)
         if (network != null) {
-            val scoped = if (linkLocal && !raw.contains('%')) {
-                val cm = appContext()?.getSystemService(ConnectivityManager::class.java)
-                val iface = cm?.getLinkProperties(network)?.interfaceName
-                    ?: throw java.io.IOException("车机网络 #$network 没有 IPv6 scope 接口")
-                "$raw%$iface"
-            } else raw
+            val cm = appContext()?.getSystemService(ConnectivityManager::class.java)
+            val scoped = io.github.hypercar.net.EndpointScope.onNetwork(raw,
+                if (linkLocal && !raw.contains('%')) cm?.getLinkProperties(network)?.interfaceName else null)
             return java.net.InetSocketAddress(network.getAllByName(scoped).first(), port)
         }
         if (!linkLocal || raw.contains('%')) {
@@ -1724,6 +1755,9 @@ object HyperCarRepo {
                     push(link = LinkState.Negotiating(detail))
                 }
                 "connected" -> {
+                    val diagnosticId = connectionAttemptId
+                    connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.RECORD)
+                    connectionDiagnostics.report().lastOrNull()?.let { log(it) }
                     MusicBridge.onCarConnected()
                     streaming = true
                     sessionHadLink = true
@@ -1773,6 +1807,7 @@ object HyperCarRepo {
                             val result = runCatching { CarUiCaster.start(ctx) }
                                 .getOrElse { "启动失败: ${it.javaClass.simpleName}: ${it.message}" }
                             log("CARUI: $result")
+                            if (CarUiCaster.running) connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.UI_STARTED)
                         }
                     }
                 }
@@ -1862,6 +1897,7 @@ object HyperCarRepo {
         lastSeen: AtomicReference<CarPlayEndpoint?>,
         advertiser: CarPlayCtrlAdvertiser,
     ): CarPlayEndpoint? = withTimeoutOrNull(ENDPOINT_TIMEOUT_MILLIS) {
+        val diagnosticId = connectionAttemptId
         // BMW's second-entry box trace still obtains Bluetooth credentials and a fresh ctrl invite.
         // Retain the network/identity shortcut, but never confuse a remembered/open port with activation.
         val requireActivation = headUnitProfile.requireAirplayActivation
@@ -1924,6 +1960,8 @@ object HyperCarRepo {
 
         val callbacks = Channel<CarPlayEndpoint>(Channel.UNLIMITED)
         coordinator.start { endpoint ->
+            connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.IAP2_PARAMETERS,
+                "wifiCredentials=${!endpoint.ssid.isNullOrBlank()} endpoint=${endpoint.ipAddresses.isNotEmpty()}")
             callbacks.trySend(endpoint)
             // 端口阶段（awaitUsableEndpoint 已返回）再来的 0x4301：记下来供端口循环热切换
             if (sessionLive.get() && airplayHost != null && endpoint.airPlayPort > 0) {
@@ -1949,8 +1987,13 @@ object HyperCarRepo {
             // 网段主动扫描也只在「当前 SSID 就是车机热点」且还没扫过时做一次
             val localScanned = HashSet<String>()
             while (usable == null) {
+                if (coordinator.isListening) connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.BLUETOOTH_LISTENING)
+                if (coordinator.isSessionActive) connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.IAP2_STARTED)
+                if (boundNetwork != null) connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.WIFI_BOUND)
                 val next = standbyEndpoint.getAndSet(null)
                     ?: withTimeoutOrNull(ENDPOINT_TICK_MILLIS) { callbacks.receive() }
+                if (next != null) connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.IAP2_PARAMETERS,
+                    "wifiCredentials=${!next.ssid.isNullOrBlank()} endpoint=${next.ipAddresses.isNotEmpty()}")
                 if (next == null) {
                     ticks++
                     // 手动连接可以早于车机热点出现。等待期间也检查已配对网络，
@@ -2024,6 +2067,7 @@ object HyperCarRepo {
                     if (ssid != null) observedSsid = ssid
                     // ② 每 15s 报一次进度（tick 是 5s，探测要跟得上换网速度）
                     if (ticks % TICKS_PER_PROGRESS == 0) {
+                        connectionDiagnostics.report().lastOrNull()?.let { log(it) }
                         val seen = lastSeen.get()
                         val waited = ticks * ENDPOINT_TICK_MILLIS / 1000
                         // 区分「车机根本没连进来」与「连进来了但没给凭据」——前者是车机
@@ -2099,6 +2143,7 @@ object HyperCarRepo {
 
     private fun fail(reason: String) {
         if (!sessionLive.compareAndSet(true, false)) return
+        finishDiagnostic("FAILED", reason)
         log("SESSION 失败: $reason")
         val hadLink = sessionHadLink
         // 媒体失败与 SDP 生命周期分开：自动模式结束旧会话，但保留可用监听和 channel。
@@ -2389,7 +2434,7 @@ object HyperCarRepo {
     fun exportLogs() {
         scope.launch {
             val logs = _snapshots.value.recentLogs
-            if (logs.isEmpty()) {
+            if (logs.isEmpty() && connectionDiagnostics.report().isEmpty()) {
                 log("LOG: 无日志可导出")
                 return@launch
             }
@@ -2414,6 +2459,8 @@ object HyperCarRepo {
             appendLine("# 应用 ${DeviceInfo.appVersion(ctx)}")
             appendLine("# 设备 ${DeviceInfo.systemSummary()}")
             appendLine("# 说明：以下时间戳为本机时间；日志共 ${logs.size} 行")
+            appendLine("# 连接摘要：WAITING=尚未完成 RECORD；STREAMING=已完成 RECORD；不代表实际画面/声音验证")
+            connectionDiagnostics.report().forEach { appendLine("# $it") }
             appendLine()
             logs.forEach { appendLine(it) }
         }

@@ -12,7 +12,9 @@ import android.content.Context
  *  - Audi MMI 6318：20B 秒答，32B 曾 0.4 秒拆链；
  *  - Audi MMI 3315：20B 静默，**32B** 才应答。
  * 所以既不能全局写死某一档，也不能只靠进程内记忆（App 重启即丢，每次重连都重付 6 秒）。
- * 这里按「车机身份（name+model+manufacturer）」持久化三件事：
+ * 已知对端按「实际 RFCOMM 地址 + 身份文本 + 传输类型」哈希后持久化；
+ * 不把旧的同型号共享历史迁入具体车机。未提供地址的旧调用保留原身份键。
+ * 记录以下观察：
  *
  *  - [Entry.succeeded]：最近一次**成功拿到签名**的长度 → 下次直接首选，省掉试探；
  *  - [Entry.silent]：窗口内无应答的长度 → 排到后面（但仍保留为兜底，车机固件可能变）；
@@ -40,14 +42,24 @@ object MfiLengthMemory {
     private const val KEY_REJECTED = "rejected_"
     private const val KEY_DISCONNECTED = "disconnected_"
 
-    /** 车机身份 → 存储键。只用稳定字段，避免蓝牙名里的可变后缀影响命中。 */
-    fun receiverKey(identityText: String): String =
-        identityText
-            .lowercase()
+    /** Known peers get isolated, non-identifying keys. Never seed them from shared model-only history. */
+    fun receiverKey(identityText: String, peerAddress: String? = null, transport: String = "bt"): String {
+        val peer = peerAddress?.trim()?.replace(":", "")?.replace("-", "")
+            ?.lowercase(java.util.Locale.ROOT)?.takeIf { it.matches(Regex("[0-9a-f]{12}")) }
+        if (peer != null) {
+            val material = listOf(transport.trim().lowercase(java.util.Locale.ROOT), peer,
+                identityText.trim().lowercase(java.util.Locale.ROOT)).joinToString("|")
+            val hash = java.security.MessageDigest.getInstance("SHA-256").digest(material.toByteArray(Charsets.UTF_8))
+                .joinToString("") { "%02x".format(it.toInt() and 0xff) }.take(48)
+            return "v2_$hash"
+        }
+        return identityText
+            .lowercase(java.util.Locale.ROOT)
             .replace(Regex("[^a-z0-9]+"), "_")
             .trim('_')
             .take(64)
             .ifBlank { "unknown" }
+    }
 
     /** 读取某车机的记忆（无 context 时退化为进程内内存表，便于单测）。 */
     fun load(

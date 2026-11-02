@@ -16,6 +16,7 @@
 | [日志采集](CAPTURE.md) | Android 蓝牙日志、导出与数据解释 |
 | [盒子流程](BMW-BOX-CARPLAY-FLOW.md) | 已采集的宝马盒子连接证据 |
 | [参考项目](REFERENCE-REVIEW.md) | 可复核的参考内容与角色区别 |
+| [LIVI 与 Android 主机源码对照](RECEIVER-SOURCE-REVIEW.md) | 重连、邀请、退出、多屏与厂商栈依赖 |
 | [验证记录](VALIDATION.md) | 实车、手机及测试各自证明了什么 |
 
 当前已确认首次连接稳定；二次上车的最新发现与退出改动尚未完成实车闭环验证。已实现某项机制不等于已证明它能修复二次上车。

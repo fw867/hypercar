@@ -4,6 +4,8 @@
 
 | 来源 | 已确认可参考内容 | 本项目适用边界 |
 |---|---|---|
+| [LIVI](https://github.com/f-io/LIVI) | 原生接收栈、主动回连、控制邀请、IPv6、多屏与车辆协议 | 接收端角色；其主动拨号和拆 ACL 策略不能直接搬到手机，详见[源码对照](RECEIVER-SOURCE-REVIEW.md) |
+| [headunit-carplay](https://github.com/riazosama/headunit-carplay) | Android 车机 iAP2 桥、依赖就绪与链路清理 | 依赖 Autochips 预装接收栈、真实 MFi 与 root，无线音频仍绕行；与 hatak30/cp-bridge 是不同项目 |
 | [CatPlay](https://github.com/catplay-labs/catplay) | 手机内容源实现、附加蓝牙 UUID、媒体与 TEARDOWN 的关闭顺序 | 已加入 Android 标记服务；Linux HCI、固定通道及 USB 包装器公告不能直接照搬 |
 | [Cardeck 协议笔记](https://github.com/shaonialife/cardeck/blob/main/docs/PROTOCOL-NOTES.md) | iAP2 问候、EA 字段、Wi-Fi iAP2 与激活的排查记录 | 文档随实验修订，早期心跳解释不能与后续修正同时作为定论；奥迪、VW 现象不是宝马规范 |
 | [Cardeck 自动连接](https://github.com/shaonialife/cardeck/blob/main/docs/AUTO-CONNECT.md) | 目标车机 ACL 唤醒、前台服务及后台启动条件 | ACL 接收器只能在链路已经发生后工作，不能主动使车机发起连接 |
