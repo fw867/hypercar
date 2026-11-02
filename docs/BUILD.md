@@ -1,6 +1,6 @@
 # 编译、安装与发布
 
-更新：2026-10-31。当前默认分支为 `main`（原 `feat/carplay-only-ui` 已改名），使用 Android 自绘车机 UI 与 CarPlay / AirPlay。
+更新：2026-11-02。当前默认分支为 `main`，使用 Android 自绘车机 UI 与 CarPlay / AirPlay。
 当前版本不需要安装 CarLife、CarWith，也不需要 PC hub。
 
 ## 构建环境
@@ -34,6 +34,8 @@ cd ..
 ./gradlew :app:testReleaseUnitTest
 ```
 
+以上手动命令用于已配置好环境的终端。Windows 中文路径优先使用 build-local.ps1；手动运行 Gradle 时使用脚本建立的 ASCII 路径，并将 PowerShell 中的属性参数整体加引号，例如 `'-Phypercar.buildNumber=493'`。
+
 本项目 JNI 层依赖 Unix FD，完整 Rust crate 不能直接当作通用 Windows 程序测试。需要在 Android
 执行 Rust 测试时，使用 `cargo ndk -t arm64-v8a test --release --lib --no-run`，将生成的测试可执行文件
 推到 `/data/local/tmp/`、赋予执行权限后在手机运行。具体可执行文件路径以 cargo 输出为准。
@@ -50,16 +52,16 @@ BuildNumber；本地构建号高于 CI 时，较低版本的 CI APK 不能直接
 1. 启动 Shizuku，并授权 HyperCar：用于创建车机虚拟屏、注入地图触摸、拉起应用和静默入网。
 2. 授予通知、附近设备权限；音乐卡片还需要系统“通知使用权”。按 ROM 要求配置自启动、后台运行及悬浮窗权限。
 3. 安装高德地图，先在手机完成首次使用提示；安装所需音乐播放器。
-4. 车机开启无线 Apple CarPlay。首次在车机侧选择手机并确认配对，同一台车之后可自动回连。
+4. 车机开启无线 Apple CarPlay。首次在车机侧选择手机并确认配对。自动回连机制已实现，二次上车可靠性仍在实车验证。
 5. 增强发现（Android 13+）：在设置的“目标车机”列表直接点击车机，按 Android 系统弹窗授权。
    授权后，“已配对 · 时间”旁显示“增强发现”标签；取消授权仍会保留所选车机。授权可先完成，
    “上车自动连接”开启后才观察并唤醒应用。关闭自动连接会停止观察；切换目标会解除旧车关联。
    此功能补充现有 ACL/Wi-Fi 唤醒，不替代车机的本轮 CarPlay 激活。
 6. “蓝牙回连唤醒”默认开启：已配对车机 Wi-Fi、广播与监听就绪 5 秒仍无会话时，通过 Shizuku
    尝试一次最多 30 秒经典可发现窗口。连接开始、停止或到期后清理；无 Shizuku 时跳过。
-   详见 [可发现兜底与实机验证](BMW-DISCOVERABLE-RECONNECT-2026-11-01.md)。
+   详见 [会话控制](SESSION-CONTROL.md)与[验证记录](VALIDATION.md)。
 
-连接后 HyperCar 自动创建自绘首页；地图使用安装版高德，音乐从 MediaSession 获取元数据与控制能力。
+连接后 HyperCar 自动创建自绘首页；地图使用安装版高德或百度，音乐从 MediaSession 获取元数据与控制能力。
 无需再进入 CarLife 的“无线连接”入口。首页／全屏地图切换保留导航；“返回车机”保持 CarPlay 连接。
 
 ## 分辨率与帧率
@@ -77,7 +79,6 @@ H.264 level 由编码器按尺寸和帧率选择。详见 [推流检查记录](V
 - 提交标题含 `[skip ci]`：跳过工作流任务；适合仅文档／截图的修改。
 - Actions 手动运行并勾选 `publish` 也必须通过测试。
 - 版本号：`appVersionName` + `github.run_number + 400`，versionCode 为 `10000 + 构建号`。
-  云端从 run 90 对应 0.1.0.490 开始，衔接手机已安装的本地测试版 489；后续每次构建继续递增。
 - 必需 Secrets：`KEYSTORE_BASE64`、`KEYSTORE_PASSWORD`、`KEY_ALIAS`、`KEY_PASSWORD`；可选
   `EXPECTED_CERT_SHA256`。缺失正式签名材料会失败，不会退回 debug 签名。
 - Release 说明记录当前功能、环境要求、适配限制，以及本次提交、APK 大小和 SHA-256。
