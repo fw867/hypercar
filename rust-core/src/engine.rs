@@ -25,6 +25,7 @@ use crate::{emit_log, emit_stats, emit_state};
 
 /// 外部（Kotlin 侧）投喂给引擎的数据事件。
 pub enum SourceEvent {
+    CarWithTouch(TouchInput),
     RequestHostUi,
     /// 视频编码器产出一帧（H.264 Annex B，可能含 SPS/PPS/IDR）。
     VideoFrame { pts_us: u64, data: Vec<u8> },
@@ -55,6 +56,10 @@ pub struct EngineConfig {
     pub keep_alive_stats: bool,
     #[serde(default)]
     pub bmw_box_bootstrap: bool,
+    /// CarWith 模式（2026-11-03）：视频/音频改由本机 CarLife（CarWith）的 H.264/PCM 提供，
+    /// 不再使用自绘 UI 的编码器帧。
+    #[serde(default)]
+    pub carlife_source: bool,
     #[serde(default)]
     pub desktop_receiver: bool,
     pub identity_path: String,
@@ -113,6 +118,62 @@ pub async fn run_engine(
     let (host_ui_tx, mut host_ui_rx) = mpsc::channel::<()>(1);
     let (video_tx, video_rx) = mpsc::unbounded_channel::<SourceEvent>();
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<SourceEvent>();
+
+    // ---- CarWith 模式：把本机 CarLife（CarWith）的 H.264 / PCM 灌进同一条事件流 ----
+    // 与自绘 UI 的区别只在"源"：视频帧来源换成 CarLife 的 8240 通道，音频换成 9240/9241/9242。
+    // 引擎下游（screen/audio pump、触摸反向）完全复用，不需要第二套实现。
+    // EngineTasks owns the hub. Restarting creates a fresh source immediately;
+    // a time-based global guard also suppressed valid reconnects and mode switches.
+    let carwith_display = cfg.carlife_source.then(|| Arc::new(Mutex::new((cfg.width, cfg.height))));
+    let mut carwith_hub = None;
+    if cfg.carlife_source {
+        let life_cfg = crate::carlife::CarLifeConfig {
+            width: cfg.width,
+            height: cfg.height,
+            fps: cfg.fps,
+            voice: 1,
+            bt_address: cfg.device_id.clone(),
+            bt_name: "BMW".to_string(),
+        };
+        match crate::carlife::CarLifeHub::connect(life_cfg, "127.0.0.1".to_string(), stop.clone(), carwith_display.clone()) {
+            Ok((hub, mut life_events)) => {
+                let hub = Arc::new(hub);
+                carwith_hub = Some(hub.clone());
+                let carwith_touch_size = touch_size.clone();
+                let vtx = video_tx.clone();
+                let atx = audio_tx.clone();
+                tasks.spawn(async move {
+                    // Keep channel senders and the hub alive for the entire source task.
+                    let _hub = hub;
+                    while let Some(ev) = life_events.recv().await {
+                        match ev {
+                            CarLifeEvent::VideoFrame { pts_us, data } => {
+                                let _ = vtx.send(SourceEvent::VideoFrame { pts_us, data });
+                            }
+                            CarLifeEvent::EncoderResolution { width, height } => {
+                                *carwith_touch_size.lock() = (width, height);
+                                let _ = vtx.send(SourceEvent::EncoderResolution { width, height });
+                            }
+                            CarLifeEvent::AudioInit { tts, rate, channels } => {
+                                let _ = atx.send(SourceEvent::AudioInit { tts, rate, channels });
+                            }
+                            CarLifeEvent::AudioStop { tts } => {
+                                let _ = atx.send(SourceEvent::AudioStop { tts });
+                            }
+                            CarLifeEvent::AudioData { tts, rate, channels, data } => {
+                                let _ = atx.send(SourceEvent::AudioData { tts, rate, channels, data });
+                            }
+                            CarLifeEvent::Handshake => emit_log("CARLIFE: 握手完成（CarWith）"),
+                            CarLifeEvent::ClientLeft { video } => {
+                                emit_log(&format!("CARLIFE: 源端断开 video={video}"));
+                            }
+                        }
+                    }
+                });
+            }
+            Err(error) => emit_log(&format!("CARLIFE: CarWith 模式连接失败：{error}")),
+        }
+    }
     {
         let stop_d = stop.clone();
         tasks.spawn(async move {
@@ -120,6 +181,9 @@ pub async fn run_engine(
                 tokio::select! {
                     _ = stop_d.notified() => return,
                     ev = source_rx.recv() => match ev {
+                        Some(SourceEvent::CarWithTouch(t)) => {
+                            if let Some(hub) = &carwith_hub { hub.inject_touch(t.action, t.x, t.y); }
+                        }
                         Some(SourceEvent::RequestHostUi) => { let _ = host_ui_tx.try_send(()); }
                         Some(ev) => {
                             let to_audio = matches!(
@@ -407,6 +471,7 @@ pub async fn run_engine(
         // 与编码侧共用：/info 报到车机真实尺寸后写入，编码器回报后再覆盖
         encoder_size: encoder_size.clone(),
         touch_size: touch_size.clone(),
+        carwith_display,
     };
     let outcome = tokio::select! {
         biased;
@@ -604,3 +669,16 @@ struct AudioPumpStat {
 
 
 
+
+/// CarLife（HU 侧）向引擎上报的事件（2026-11-03 从 archive 分支取回，供 CarWith 模式使用）。
+#[derive(Debug, Clone)]
+pub enum CarLifeEvent {
+    Handshake,
+    VideoFrame { pts_us: u64, data: Vec<u8> },
+    AudioInit { tts: bool, rate: u32, channels: u8 },
+    AudioStop { tts: bool },
+    AudioData { tts: bool, rate: u32, channels: u8, data: Vec<u8> },
+    /// 手机在 VIDEO_ENCODER_INIT_DONE 里回报的实际编码分辨率。
+    EncoderResolution { width: u32, height: u32 },
+    ClientLeft { video: bool },
+}

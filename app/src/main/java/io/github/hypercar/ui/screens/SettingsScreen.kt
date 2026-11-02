@@ -114,6 +114,7 @@ fun SettingsScreen(modifier: Modifier = Modifier, linkConnected: Boolean = false
     ) {
         // ---- 常用 ----
         BehaviorSection()
+            CarSourceSection()
         // ---- 一次性配置 ----
         HeadUnitSection(connected = linkConnected)
         TargetCarSection()
@@ -1474,3 +1475,73 @@ private fun HeadUnitSection(connected: Boolean = false) {
 
 
 
+
+/** 车机画面来源（2026-11-03）：自绘 UI（需 Shizuku）或 CarWith 模式（需小米手机）。 */
+@Composable
+private fun CarSourceSection() {
+    val ctx = LocalContext.current
+    var current by rememberSaveable { mutableStateOf(SettingsStore.carSource) }
+    var guide by remember { mutableStateOf<String?>(null) }
+    val shizukuReady = remember { io.github.hypercar.shizuku.ShizukuTools.isReady }
+
+    val carWithOk = remember {
+        runCatching {
+            ctx.packageManager.getApplicationInfo(
+                "com.miui.carlink", android.content.pm.PackageManager.MATCH_DISABLED_COMPONENTS)
+        }.isSuccess
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SectionLabel(text = "车机画面来源")
+        GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                listOf(
+                    "car_ui" to ("自绘车机 UI" to "本 App 自己渲染（地图卡 + 音乐卡 + Dock），需要 Shizuku"),
+                    "carwith" to ("CarWith 模式" to "由 CarWith 渲染/编码，本 App 只做转发；需要小米手机"),
+                ).forEach { (key, pair) ->
+                    val (title, desc) = pair
+                    Row(
+                        modifier = Modifier.fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .clickable {
+                                when {
+                                    key == "car_ui" && !shizukuReady ->
+                                        guide = "自绘车机 UI 需要 Shizuku：请安装并启动 Shizuku 后再选。"
+                                    key == "carwith" && !carWithOk ->
+                                        guide = "CarWith 模式需要系统自带的 CarWith（com.miui.carlink），当前未检测到。"
+                                    else -> {
+                                        current = key
+                                        SettingsStore.carSource = key
+                                        io.github.hypercar.settings.SettingsRevision.bump()
+                                    }
+                                }
+                            }
+                            .padding(vertical = 6.dp),
+                        verticalAlignment = Alignment.Top,
+                    ) {
+                        RadioButton(selected = current == key, onClick = null)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column {
+                            Text(title, style = MaterialTheme.typography.bodyMedium,
+                                color = if (current == key) MintGreen else TextPrimary)
+                            Text(desc, style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                            if (key == "carwith" && !carWithOk) {
+                                Text("⚠ 当前设备不满足条件", style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFFF59E0B))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    guide?.let { text ->
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { guide = null },
+            confirmButton = {
+                androidx.compose.material3.TextButton(onClick = { guide = null }) { Text("知道了") }
+            },
+            title = { Text("无法切换画面来源") },
+            text = { Text(text) },
+        )
+    }
+}

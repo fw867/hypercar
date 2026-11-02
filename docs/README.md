@@ -5,6 +5,7 @@
 | 文档 | 内容 |
 |---|---|
 | [架构](ARCHITECTURE.md) | Android、虚拟屏与 Rust 的分工 |
+| [可选 CarWith 画面源](CARWITH-SOURCE.md) | 本机七通道、认证/加密门控与验证范围 |
 | [构建](BUILD.md) | 编译、签名、安装与发布 |
 | [会话控制](SESSION-CONTROL.md) | 首次连接、自动唤醒、增强发现与退出 |
 | [协议](PROTOCOL.md) | 当前 iAP2、AirPlay、网络与关闭行为 |

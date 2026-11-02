@@ -226,6 +226,17 @@ object SettingsStore {
         get() = p().getInt(KEY_FPS, 60)
         set(v) = p().edit().putInt(KEY_FPS, v.coerceIn(20, 60)).apply()
 
+    /** 车机画面来源（2026-11-03）：
+     *  · "car_ui"   —— 本 App 自绘车机首页（当前默认，地图卡 + 音乐卡 + Dock）
+     *  · "carwith"  —— 走小米 CarWith：拉起它的 CarLife 入口，由 CarWith 自己建显示/编码，
+     *                 我们只做 CarLife 通道 → AirPlay 的转发（需装 CarWith + 小米版 CarLife）
+     */
+    var carSource: String
+        get() = p().getString("car_source", "car_ui") ?: "car_ui"
+        set(v) = p().edit().putString("car_source", v).apply()
+
+    /** 是否 CarWith 模式。 */
+    val carWithMode: Boolean get() = carSource == "carwith"
     var enableAudio: Boolean
         get() = p().getBoolean(KEY_ENABLE_AUDIO, true)
         set(v) = p().edit().putBoolean(KEY_ENABLE_AUDIO, v).apply()
@@ -317,6 +328,8 @@ object SettingsStore {
             append("\"device_id\":\"").append(esc(deviceBluetoothMac)).append("\",")
             append("\"car_ip\":\"").append(esc(carIp)).append("\",")
             append("\"airplay_port\":").append(airplayPort).append(",")
+            // CarWith 模式：视频/音频源改由本机 CarLife（CarWith）提供（2026-11-03）
+            append("\"carlife_source\":").append(if (carWithMode) "true" else "false").append(",")
             append("\"width\":").append(plan.width).append(",")
             append("\"height\":").append(plan.height).append(",")
             append("\"touch_display_w\":").append(tdW).append(",")

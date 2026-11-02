@@ -1,8 +1,10 @@
 # HyperCar
 
 让 Android 手机通过经典蓝牙 iAP2 与 Wi-Fi AirPlay，向无线 CarPlay 车机传送自绘界面和系统音频。当前主线不依赖 CarLife、CarWith 或 PC hub，不需要 root。
-
-目前以 BMW MGU-55 / iD8.5 为实车开发基准。首次连接已获用户反馈稳定推流；二次上车的自动唤醒、发现及退出机制仍在实车验证，尚未确认可靠恢复。WinPlay 用于桌面联调，Audi MIB3 档案尚未完成本项目实车验证。
+ 
+ 小米手机可以直接设置CarWith，可不用安装Shizuku。
+ 
+目前以 BMW MGU-55 / iD8.5 为实车开发基准。首次连接已获用户反馈稳定推流；二次上车的自动唤醒。WinPlay 用于桌面联调，Audi MIB3 档案尚未完成本项目实车验证。
 
 ## 界面
 
@@ -31,6 +33,25 @@ Android / Kotlin 管理蓝牙、网络、会话和 Compose 首页；Shizuku 创�
 - 接收端支持无线 CarPlay；首次在车机侧选中手机并确认配对。
 
 自动连接通过目标车机经典 ACL、已知 Wi-Fi 和可选增强发现恢复待机。手机加入车机 Wi-Fi 不等于车机已激活 CarPlay；成功样本仍经过本轮邀请。详细设置见[会话控制](docs/SESSION-CONTROL.md)。
+
+## 画面来源：自绘 UI 与 CarWith 模式
+
+设置里可切换两种来源：
+
+- **自绘车机 UI（默认）**：本 App 自己渲染地图卡 / 音乐卡 / Dock，经 Shizuku 建虚显并编码推送；需要 Shizuku。
+- **CarWith 模式**：拉起小米 CarWith 的 `CarlifeAdbActivity`，由 CarWith 渲染与编码，本 App 只做 CarLife → AirPlay 转发；需要系统自带 `com.miui.carlink`。
+
+
+| 项 | 取值 / 说明 |
+| --- | --- |
+| CarLife 协议版本 | **4.1**（`pbInt(1,4)+pbInt(2,1)`；沿用公版的 3.2 会被 CarWith 直接断开连接） |
+| 通道 | CMD 7240 / VIDEO 8240 / MEDIA 9240 / TTS 9241 / VR 9242 / CTRL 9340 / **DATA 9440** |
+| 认证 | 收 `MD_AUTH_RESULT` 回 `HU_MD_AUTH_RESULT_ACK (0x1804C)` |
+| 内容加密 | 特征声明 `CONTENT_ENCRYPTION=1` → 发 `HU_RSA_PUBLIC_KEY (0x1806B)`（RSA-2048，base64 DER）→ 解 `MD_AES_SEED` 回 `HU_AES_ACK (0x1806D)` → 收到 `MD_ENCRYPT_READY` 之后才发 `VIDEO_ENCODER_INIT` |
+| 启动浮层 | `LAUNCH_MODE_NORMAL` 之后补发 `HU_GO_TO_FOREGROUND (0x18025)`，并在收到 `FOREGROUND` 时再次回应，CarWith 才会收起「启动中」浮层 |
+
+入口拉起后需轮询 7240 是否监听（CarWith 的端口通常只开约 1~2 秒），失败会重试两轮，并提示检查 MIUI「后台弹出界面」权限。
+
 
 ## 构建
 

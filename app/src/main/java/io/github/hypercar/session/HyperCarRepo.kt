@@ -1800,10 +1800,19 @@ object HyperCarRepo {
                             sinceMillis = System.currentTimeMillis(),
                         ),
                     )
-                    // P1：AirPlay RECORD 完成 → 自绘车机首页接管屏幕流
+                    // P1：AirPlay RECORD 完成 → 接管屏幕流。
+                    // 两种来源（2026-11-03 设置里可切）：
+                    //  · car_ui  —— 我们自绘车机首页（默认）
+                    //  · carwith —— 拉起小米 CarWith 的 CarLife 入口，由它建显示/编码，
+                    //               我们只做 CarLife 通道 → AirPlay 的转发（Rust 引擎会主动拨 7240）
                     val ctx = appContext()
                     if (ctx != null) {
                         scope.launch {
+                            if (SettingsStore.carWithMode) {
+                                val r = launchCarWith(ctx)
+                                log("CARWITH: $r")
+                                return@launch
+                            }
                             val result = runCatching { CarUiCaster.start(ctx) }
                                 .getOrElse { "启动失败: ${it.javaClass.simpleName}: ${it.message}" }
                             log("CARUI: $result")
@@ -2597,3 +2606,29 @@ object HyperCarRepo {
 
 
 
+
+    /**
+     * CarWith 模式入口（2026-11-03）。
+     *
+     * 用**普通 intent** 打开 CarWith 已导出的 `CarlifeAdbActivity`（名字里有 Adb，但普通应用
+     * 就能启动，不需要 adb 客户端，也不需要系统签名/root）。CarWith 会自己建显示与编码器，
+     * 并在本机开 CarLife 端口（7240/8240/9240/9340）；Rust 引擎随即主动拨号接管。
+     *
+     * 前提：装了 CarWith（com.miui.carlink）；MIUI「后台弹出界面」需允许，
+     * 否则入口会被静默丢弃（7240 一直 ECONNREFUSED）。不再检查/冻结任何包。
+     */
+
+    private suspend fun launchCarWith(ctx: android.content.Context): String {
+        // Do not probe 7240 with a disposable client: it consumes a real CarLife connection.
+        val comp = "com.miui.carlink/com.miui.carlink.castfwk.usb.CarlifeAdbActivity"
+        if (ShizukuTools.isReady) {
+            val result = runCatching { ShizukuTools.exec("am start -n $comp", 8_000) }.getOrNull()
+            if (result?.ok == true) return "入口启动请求已发送；等待七路通道、挑战认证与加密就绪"
+        }
+        return runCatching {
+            ctx.startActivity(android.content.Intent().setComponent(
+                android.content.ComponentName("com.miui.carlink", "com.miui.carlink.castfwk.usb.CarlifeAdbActivity"))
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+            "入口启动请求已发送；等待 CarWith 协议握手"
+        }.getOrElse { "启动 CarWith 失败: ${it.javaClass.simpleName}" }
+    }

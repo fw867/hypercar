@@ -21,6 +21,7 @@ mod airplay;
 mod audio_out;
 mod bplist;
 mod crypto;
+mod carlife;
 mod engine;
 mod iap2_nav;
 mod modes;
@@ -486,6 +487,8 @@ fn native_start_impl(
         obj: factory_obj,
     });
 
+    let (source_tx, source_rx) = mpsc::unbounded_channel::<engine::SourceEvent>();
+    let carwith_touch_source = cfg.carlife_source.then(|| source_tx.clone());
     let (touch_tx, mut touch_rx) = mpsc::unbounded_channel::<TouchInput>();
     let (key_tx, _key_rx) = mpsc::unbounded_channel::<u32>();
     // 车机 HID 触摸 → Kotlin：airplay::handle_hid_report 只负责换算坐标与边沿，
@@ -493,11 +496,14 @@ fn native_start_impl(
     // 通道随引擎重建；监听器是独立 GlobalRef，不随引擎重启丢失。
     TOKIO_RT.spawn(async move {
         while let Some(t) = touch_rx.recv().await {
-            emit_touch(t.action, t.x, t.y);
+            if let Some(source) = &carwith_touch_source {
+                let _ = source.send(engine::SourceEvent::CarWithTouch(t));
+            } else {
+                emit_touch(t.action, t.x, t.y);
+            }
         }
     });
-    // 自绘界面 → 引擎：视频帧 / 音频 PCM 都走这条通道
-    let (source_tx, source_rx) = mpsc::unbounded_channel::<engine::SourceEvent>();
+    // Self-rendered media still uses source_tx/source_rx; CarWith routes only its own input above.
     // 触摸坐标目标：手机实际编码尺寸（nativeSetVideoSize 直接更新）；
     // 与 /info 的 encoder_size 分开，避免车机显示参数覆盖后 HID 坐标被缩放错。
     let touch_size = Arc::new(parking_lot::Mutex::new((

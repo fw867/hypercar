@@ -61,6 +61,8 @@ pub struct AirplayParams {
     /// 手机实际编码尺寸（`nativeSetVideoSize` 由 JNI 直接写入）。触摸坐标换算用它，
     /// 避免被 `/info` 的车机显示尺寸覆盖后把 HID 坐标缩放到画布外。
     pub touch_size: Arc<Mutex<(u32, u32)>>,
+    /// CarWith-only requested canvas. None leaves the self-rendered display path unchanged.
+    pub carwith_display: Option<Arc<Mutex<(u32, u32)>>>,
 }
 
 /// 车机触摸（已是编码画布坐标）。
@@ -272,6 +274,9 @@ pub async fn negotiate(
         .and_then(|a| a.first());
     let display_uuid = display.and_then(|d| uuid_text(d.get("uuid")));
     let (disp_w, disp_h) = display.map(read_display_size).unwrap_or((0, 0));
+    if let Some(requested) = &p.carwith_display {
+        if disp_w >= 2 && disp_h >= 2 { *requested.lock() = (disp_w, disp_h); }
+    }
     // 车机能力位图：判断是否支持 HEVC 等能力，只能靠它（codec 由本机编码器决定）
     let car_features = info.get("features").and_then(Value::as_int).unwrap_or(0);
     emit_log(&format!(
@@ -562,6 +567,21 @@ fn read_display_size(display: &Value) -> (u32, u32) {
 #[cfg(test)]
 mod display_size_tests {
     use super::*;
+    #[test]
+    fn hid_mapping_tracks_actual_carwith_source_without_changing_receiver_coordinates() {
+        let (tx,mut rx)=mpsc::unbounded_channel();let (key,_)=mpsc::unbounded_channel();
+        let source=Arc::new(Mutex::new((1280,372)));
+        let mut down=false;let mut logged=0;
+        let report=[0,1,0x56,0x05,0x8d,0x01]; // receiver (1366,397), half of 2732x794.
+        handle_hid_report(&report,&tx,&key,(2732,794),None,&source,&mut down,&mut logged);
+        let touch=rx.try_recv().unwrap();assert_eq!((touch.action,touch.x,touch.y),(0,640,186));
+        *source.lock()=(1920,720); // A negotiated source change is applied once, at the HID mapper.
+        handle_hid_report(&report,&tx,&key,(2732,794),None,&source,&mut down,&mut logged);
+        let touch=rx.try_recv().unwrap();assert_eq!((touch.action,touch.x,touch.y),(2,960,360));
+        let release=[0,0,0x56,0x05,0x8d,0x01];
+        handle_hid_report(&release,&tx,&key,(2732,794),None,&source,&mut down,&mut logged);
+        assert_eq!(rx.try_recv().unwrap().action,1);
+    }
     #[test]
     fn desktop_pcm_setup_uses_positive_latency_and_keeps_car_parameters() {
         for desktop in [false,true] {
