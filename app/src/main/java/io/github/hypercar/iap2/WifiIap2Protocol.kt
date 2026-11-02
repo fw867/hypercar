@@ -133,9 +133,11 @@ internal class WifiIap2Protocol(
             }
             0x4154 -> if (phase == "READY") send(0x4155, Iap2Csm.u8(2, 0))
             0x4157 -> if (phase == "READY") {
-                // Valid empty communications state: no SIM information is exposed.
-                send(0x4158, Iap2Csm.u8(0, 1), Iap2Csm.u8(1, 6), Iap2Csm.u8(2, 0),
-                    Iap2Csm.string(4, ""), *Array(14) { Iap2Csm.u8(it + 5, if (it == 0 || it == 1 || it == 7) 1 else 0) })
+                // CatPlay CommunicationsUpdate: 5..8 are bridge capabilities, 12..17 call controls.
+                // No telephony bridge is wired. Do not invent SIM/signal/registration state,
+                // advertise working call controls, or emit undefined parameter 18.
+                send(0x4158, *intArrayOf(5, 6, 7, 8, 12, 13, 14, 15, 16, 17)
+                    .map { Iap2Csm.u8(it, 0) }.toTypedArray())
             }
             0x4170 -> if (phase == "READY") send(0x4171, Iap2Csm.u8(0, 0), Iap2Csm.u16(2, 0), Iap2Csm.u8(5, 0), Iap2Csm.u16(7, 0))
             // Firmware 0x63cb4..0x63cc8: AD00 -> AD01, parameter 0 (u8) = 1.

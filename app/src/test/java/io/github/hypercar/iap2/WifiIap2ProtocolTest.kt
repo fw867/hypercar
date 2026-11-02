@@ -72,6 +72,18 @@ class WifiIap2ProtocolTest {
         }
     }
 
+    @Test fun communicationsReplyDoesNotClaimUnimplementedPhoneControlsOrInventSimState() {
+        val car = Car()
+        car.ready()
+        val reply = car.message(0x4157).single()
+        assertEquals(0x4158, reply.messageId)
+        val params = Iap2Csm.parseParams(reply.body)
+        // CatPlay iap2.rs CommunicationsUpdate: carrier requires cellular support;
+        // 0/1/2 are optional live modem state, 18 is not a defined parameter.
+        assertEquals(setOf(5, 6, 7, 8, 12, 13, 14, 15, 16, 17), params.map { it.id }.toSet())
+        params.forEach { assertArrayEquals(byteArrayOf(0), it.value) }
+    }
+
     @Test fun readyWaitsForPostAuthenticationGreetingsToLeaveTheLinkBacklog() {
         val car=Car(window=1);car.start();car.message(0x1d01)
         assertEquals(listOf(0xaa00),messages(car.feed(packet(0x40,car.sequence,car.ack))).map { it.messageId })

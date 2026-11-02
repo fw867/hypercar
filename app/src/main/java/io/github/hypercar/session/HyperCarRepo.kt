@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
+import io.github.hypercar.net.SessionSocketLease
 import android.net.NetworkRequest
 import android.net.NetworkCapabilities
 import android.os.ParcelFileDescriptor
@@ -131,12 +132,14 @@ object HyperCarRepo {
                 "第 $attempt/$AIRPLAY_MAX_ATTEMPTS 次原地重试",
         )
         push(link = LinkState.Negotiating("AirPlay 重试 $attempt/$AIRPLAY_MAX_ATTEMPTS"))
+        val sockets = sessionSockets ?: return
         scope.launch {
+            if (sessionSockets !== sockets || !sessionLive.get()) return@launch
             runCatching { RustCoreBridge.nativeStop() }
             delay(AIRPLAY_RETRY_DELAY_MILLIS)
-            if (!sessionLive.get()) return@launch
+            if (sessionSockets !== sockets || !sessionLive.get()) return@launch
             val context = appContext() ?: return@launch
-            val fd = openControlFd(context, host!!, port)
+            val fd = openControlFd(context, sockets, host!!, port)
             if (fd == null || fd < 0) {
                 retryAirplayOrFail("控制端口重连失败 $host:$port")
                 return@launch
@@ -147,7 +150,7 @@ object HyperCarRepo {
             val json = SettingsStore.engineConfigJson(host, port, sessionDeviceMac, identityPath,
                 receiverBluetoothMac = wifiReceiverMac ?: io.github.hypercar.iap2.Iap2Peer.address)
             log("CORE: 重试 nativeStart（$host:$port fd=$fd，第 $attempt 次）")
-            val started = RustCoreBridge.nativeStart(json, fd, socketProvider)
+            val started = RustCoreBridge.nativeStart(json, fd, socketProvider(sockets))
             log("CORE: 重试 nativeStart 返回 $started")
             if (!started) retryAirplayOrFail("核心层重启失败")
         }
@@ -633,13 +636,27 @@ object HyperCarRepo {
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return
         sessionNetworkMonitor?.let { runCatching { cm.unregisterNetworkCallback(it) } }
         val callback = object : ConnectivityManager.NetworkCallback() {
+            private var lastCapabilities: String? = null
+            private var lastLink: String? = null
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                if (network != expected || sessionNetworkMonitor !== this) return
+                val state = "wifi=${caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)} validated=${caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)} internet=${caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)}"
+                if (state != lastCapabilities) { lastCapabilities = state; log("NET-WATCH: network=#$network $state") }
+            }
+            override fun onLinkPropertiesChanged(network: Network, properties: android.net.LinkProperties) {
+                if (network != expected || sessionNetworkMonitor !== this) return
+                val state = "if=${properties.interfaceName} addresses=${properties.linkAddresses} routes=${properties.routes}"
+                if (state != lastLink) { lastLink = state; log("NET-WATCH: network=#$network $state") }
+            }
             override fun onLost(network: Network) {
                 if (network != expected || sessionNetworkMonitor !== this) return
+                log("NET-WATCH: network=#$network lost；终止本轮网络，不切到其他网络")
                 val owner = this
                 scope.launch {
                     autoConnectChanges.lock()
                     try {
                         if (sessionNetworkMonitor === owner && boundNetwork == network) {
+                            sessionSockets?.takeIf { it.network == expected }?.invalidate()
                             val pending = connectJob
                             pending?.cancel()
                             withTimeoutOrNull(JOIN_TIMEOUT_MILLIS) { pending?.join() }
@@ -838,6 +855,15 @@ object HyperCarRepo {
                     " srcvers=${endpoint.sourceVersion ?: "-"}",
             )
             val network = joinAndBind(context, endpoint)
+            if (network == null) {
+                fail("没有可用的车机网络，停止本轮连接")
+                return
+            }
+            val sockets = SessionSocketLease(network)
+            sessionSockets?.invalidate()
+            sessionSockets = sockets
+            watchSessionNetwork(context, network)
+            log("NET: 本轮 socket 固定使用网络 #$network；${describeNetwork(context, network)}")
             // **不再预探测端口**：老代码在这里对 7000/7001/7100/5000/62078 各 connect 一次再 close
             // （只为打日志），但很多接收端（DiPlay/xcertplay 这类单控制器实现、以及部分车机）
             // 会把「连上又立刻断开」当成控制器掉线，随即关掉 AirPlay 服务——于是我们真正去连时
@@ -910,7 +936,7 @@ object HyperCarRepo {
                     AIRPLAY_CONNECT_RETRY_TIMEOUT_MILLIS.toInt()
                 }
                 for (candidate in portsNow) {
-                    val fd = openControlFd(context, hostNow, candidate, perTry)
+                    val fd = openControlFd(context, sockets, hostNow, candidate, perTry)
                     if (fd != null && fd >= 0) {
                         port = candidate
                         controlFd = fd
@@ -981,7 +1007,7 @@ object HyperCarRepo {
             // 前后各记一行：原生崩溃（Rust panic 越过 JNI → SIGABRT）会直接把进程带走，
             // 这两行能区分「崩在 nativeStart 里」还是「崩在引擎跑起来之后」。
             log("CORE: 调用 nativeStart（$apHost:$port fd=$controlFd）")
-            val started = RustCoreBridge.nativeStart(json, controlFd, socketProvider)
+            val started = RustCoreBridge.nativeStart(json, controlFd, socketProvider(sockets))
             log("CORE: nativeStart 返回 $started")
             if (!started) {
                 fail("核心层启动失败（查看日志）")
@@ -1101,6 +1127,8 @@ object HyperCarRepo {
 
     /** 释放保活服务、iAP2、Rust 和 WiFi 绑定；拆除与失败路径共用。 */
     private fun releaseSessionResources(keepListening: Boolean = false) {
+        sessionSockets?.invalidate() // 阻止旧引擎继续创建/移交 socket，先于 nativeStop。
+        sessionSockets = null
         CarProfileGuard.stop() // 清除旧会话的延迟检查；重新待机时再启动。
         if (!keepListening) stopForegroundService()
         MusicBridge.onCarDisconnected()
@@ -1203,7 +1231,7 @@ object HyperCarRepo {
     }
 
     /** 把某个 [Network] 的链路属性压成一行（IP/前缀/网关/DNS/接口），供日志排查。 */
-    private suspend fun describeNetwork(context: Context, network: Network): String = runCatching {
+    private fun describeNetwork(context: Context, network: Network): String = runCatching {
         val cm = context.getSystemService(ConnectivityManager::class.java)
         val lp = cm?.getLinkProperties(network)
         val caps = cm?.getNetworkCapabilities(network)
@@ -1213,7 +1241,7 @@ object HyperCarRepo {
         val gw = lp?.routes?.firstOrNull { it.isDefaultRoute }?.gateway?.hostAddress
         val dns = lp?.dnsServers?.mapNotNull { it.hostAddress }?.joinToString(",")
         "if=${lp?.interfaceName ?: "?"} ipv4=[${v4 ?: "-"}] ipv6=${v6} gw=${gw ?: "-"} dns=[${dns ?: "-"}]" +
-            " ssid=${currentWifiSsid(context) ?: "-"}" +
+            " ssid=${(caps?.transportInfo as? android.net.wifi.WifiInfo)?.ssid ?: "?"}" +
             " validated=${caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) ?: false}" +
             " internet=${caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ?: false}"
     }.getOrElse { "网络属性读取失败（${it.message}）" }
@@ -1513,54 +1541,22 @@ object HyperCarRepo {
         return null
     }
 
-    /**
-     * 连车机 AirPlay 控制端口（TCP），按候选网络逐个试，成功返回已 detach 的 FD。
-     *
-     * 为什么不能「绑定默认网络后连一次」：手机手动连上热点后，系统默认网络仍可能是
-     * 移动数据（热点无外网，HyperOS 会主动切走），这时连 192.168.137.1 必然超时
-     * （2026-10-23 20:06、20:08 两次现场都是 5s 超时）。这里把
-     * 「已绑定的网络 → 手机上所有 Wi-Fi 网络 → 进程默认网络」都试一遍，哪条通走哪条。
-     */
+    /** 本轮控制连接与后续媒体连接共用固定 Network，不轮询其他 Wi-Fi/默认网络。 */
     private suspend fun openControlFd(
         context: Context,
+        sockets: SessionSocketLease<Network>,
         host: String,
         port: Int,
         timeoutMillis: Int = CONTROL_CONNECT_TIMEOUT_MILLIS.toInt(),
     ): Int? = withContext(Dispatchers.IO) {
-        val cm = context.getSystemService(ConnectivityManager::class.java)
-        val candidates = buildList<Network?> {
-            boundNetwork?.let { add(it) }
-            addAll(wifiNetworks(context))
-            add(null)
-        }.distinct()
-        for (network in candidates) {
-            val label = if (network == null) "进程默认网络" else "Wi-Fi 网络 #$network"
-            if (network != null) runCatching { cm?.bindProcessToNetwork(network) }
-            val startedAt = System.currentTimeMillis()
-            var lastError: String? = null
-            val fd = runCatching {
-                val socket = Socket()
-                socket.tcpNoDelay = true
-                socket.connect(resolveEndpoint(host, port), timeoutMillis)
-                keepAliveForRust(socket)
-                ParcelFileDescriptor.fromSocket(socket).detachFd()
-            }.onFailure { lastError = it.javaClass.simpleName + ": " + it.message }.getOrNull()
-            val cost = System.currentTimeMillis() - startedAt
-            if (fd != null && fd >= 0) {
-                if (network != null) {
-                    boundNetwork = network
-                    // 同步给 joiner：它的 onLost 只认自己记录的网络，不同步就解不掉绑定
-                    wifiJoiner?.bindProcess(network)
-                }
-                log("NET +${stageMs()}ms ✓ $host:$port 已连通（$label，耗时 ${cost}ms，fd=$fd）")
-                return@withContext fd
-            }
-            log("NET +${stageMs()}ms ✗ 经 $label 连 $host:$port 失败（${cost}ms，${lastError ?: "未知原因"}）")
-        }
-        // 全败：恢复默认绑定，别让进程一直卡在一块无外网的网络上
-        runCatching { cm?.bindProcessToNetwork(null) }
-        boundNetwork = null
-        null
+        val startedAt = SystemClock.elapsedRealtime()
+        runCatching {
+            openTcpFd(sockets, host, port, timeoutMillis)
+        }.onSuccess { fd ->
+            log("NET +${stageMs()}ms ✓ $host:$port 已连通（固定网络 #${sockets.network}，耗时 ${SystemClock.elapsedRealtime()-startedAt}ms，fd=$fd）")
+        }.onFailure { error ->
+            log("NET: 控制 socket 失败 network=#${sockets.network} $host:$port ${error.javaClass.simpleName}: ${error.message}；${describeNetwork(context, sockets.network)}")
+        }.getOrNull()
     }
 
     /** 手机当前挂着的 Wi-Fi 网络（很可能就是用户手动连上的车机热点）。 */
@@ -1638,10 +1634,19 @@ object HyperCarRepo {
      * 补 `%wlan0` 后控制通道能通，但**事件通道/数据通道**同样走这里，所以必须集中在一处。
      * 依次尝试 %wlan0 / %wlan1 / %ap0 / %wlan2，再枚举本机所有非回环网卡名。
      */
-    private fun resolveEndpoint(host: String, port: Int): java.net.InetSocketAddress {
+    private fun resolveEndpoint(host: String, port: Int, network: Network? = null): java.net.InetSocketAddress {
         val raw = host.trim()
         val linkLocal = raw.contains(':') && raw.substringBefore('%').lowercase().let {
             it.startsWith("fe80") || it.startsWith("fe90") || it.startsWith("fea0") || it.startsWith("feb0")
+        }
+        if (network != null) {
+            val scoped = if (linkLocal && !raw.contains('%')) {
+                val cm = appContext()?.getSystemService(ConnectivityManager::class.java)
+                val iface = cm?.getLinkProperties(network)?.interfaceName
+                    ?: throw java.io.IOException("车机网络 #$network 没有 IPv6 scope 接口")
+                "$raw%$iface"
+            } else raw
+            return java.net.InetSocketAddress(network.getAllByName(scoped).first(), port)
         }
         if (!linkLocal || raw.contains('%')) {
             return java.net.InetSocketAddress(raw, port)
@@ -1661,21 +1666,44 @@ object HyperCarRepo {
         return java.net.InetSocketAddress(raw, port)
     }
 
-    private val socketProvider = object : RustCoreBridge.SocketProvider {
+    @Volatile private var sessionSockets: SessionSocketLease<Network>? = null
+
+    private fun openTcpFd(sockets: SessionSocketLease<Network>, host: String, port: Int, timeout: Int): Int =
+        sockets.open(
+            create = { Socket() },
+            bind = { network, socket -> network.bindSocket(socket) },
+            connect = {
+                it.tcpNoDelay = true
+                it.connect(resolveEndpoint(host, port, sockets.network), timeout.coerceAtLeast(1_000))
+            },
+            handoff = { socket ->
+                val fd = ParcelFileDescriptor.fromSocket(socket).detachFd()
+                keepAliveForRust(socket)
+                fd
+            },
+        )
+
+    private fun socketProvider(sockets: SessionSocketLease<Network>) = object : RustCoreBridge.SocketProvider {
         override fun openTcpFd(host: String, port: Int, timeoutMs: Int): Int = runCatching {
-            val socket = Socket()
-            socket.tcpNoDelay = true
-            socket.connect(resolveEndpoint(host, port), timeoutMs.coerceAtLeast(1_000))
-            keepAliveForRust(socket)
-            ParcelFileDescriptor.fromSocket(socket).detachFd()
-        }.getOrElse { -1 }
+            openTcpFd(sockets, host, port, timeoutMs)
+        }.onFailure { socketFailure(sockets, "TCP", host, port, it) }.getOrElse { -1 }
 
         override fun openUdpFd(host: String, port: Int): Int = runCatching {
-            val udp = DatagramSocket()
-            udp.connect(resolveEndpoint(host, port))
-            keepAliveForRust(udp)
-            ParcelFileDescriptor.fromDatagramSocket(udp).detachFd()
-        }.getOrElse { -1 }
+            sockets.open(
+                create = { DatagramSocket(null as java.net.SocketAddress?) },
+                bind = { network, socket -> network.bindSocket(socket) },
+                connect = { it.connect(resolveEndpoint(host, port, sockets.network)) },
+                handoff = { udp ->
+                    val fd = ParcelFileDescriptor.fromDatagramSocket(udp).detachFd()
+                    keepAliveForRust(udp)
+                    fd
+                },
+            )
+        }.onFailure { socketFailure(sockets, "UDP", host, port, it) }.getOrElse { -1 }
+    }
+
+    private fun socketFailure(sockets: SessionSocketLease<Network>, type: String, host: String, port: Int, error: Throwable) {
+        log("NET: $type socket 失败 network=#${sockets.network} $host:$port ${error.javaClass.simpleName}: ${error.message}")
     }
 
     // ---------------------------------------------------------------- Rust 回调
@@ -1685,6 +1713,12 @@ object HyperCarRepo {
     private val rustListener = object : RustCoreBridge.EventListener {
         override fun onState(state: String, detail: String) {
             log("CORE: [$state] $detail")
+            if (state == "ended" || state == "error") {
+                val network = sessionSockets?.network
+                appContext()?.let { context ->
+                    if (network != null) log("NET-END: network=#$network reason=$detail；${describeNetwork(context, network)}")
+                }
+            }
             when (state) {
                 "negotiating" -> {
                     SettingsStore.receiverViewport = null
