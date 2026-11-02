@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
 
 use crate::airplay::{self, AirplayParams, SocketProvider, TouchInput};
 use crate::audio_out::AudioOut;
@@ -100,9 +100,11 @@ pub async fn run_engine(
     touch_tx: mpsc::UnboundedSender<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
     mut source_rx: mpsc::UnboundedReceiver<SourceEvent>,
-    stop: Arc<Notify>,
+    shutdown: Arc<crate::shutdown::EngineShutdown>,
     touch_size: Arc<Mutex<(u32, u32)>>,
 ) -> Result<(), String> {
+    let stop = shutdown.signal.clone();
+    let mut tasks = EngineTasks::default();
     emit_state("negotiating", "AirPlay 会话启动");
     // 触摸/按键通道：CarPlay 事件通道把车机操作送到这里，P1 起交给自绘 UI 处理。
     let _ = (&touch_tx, &key_tx);
@@ -113,7 +115,7 @@ pub async fn run_engine(
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<SourceEvent>();
     {
         let stop_d = stop.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             loop {
                 tokio::select! {
                     _ = stop_d.notified() => return,
@@ -145,7 +147,7 @@ pub async fn run_engine(
     {
         let stop_v = stop.clone();
         let stats = video_stats.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let mut sender: Option<ScreenSender> = None;
             // 屏幕流就绪前收到的编码尺寸先存着，就绪时补上
             let mut pending_size: Option<(u32, u32)> = None;
@@ -238,7 +240,7 @@ pub async fn run_engine(
     {
         let stop_a = stop.clone();
         let stats = audio_stats.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let mut out: Option<AudioOut> = None;
             let mut ready = Some(audio_out_rx);
             let mut audio_rx = audio_rx;
@@ -406,7 +408,10 @@ pub async fn run_engine(
         encoder_size: encoder_size.clone(),
         touch_size: touch_size.clone(),
     };
-    let outcome = airplay::negotiate(
+    let outcome = tokio::select! {
+        biased;
+        _ = shutdown.wait() => return Ok(()),
+        result = airplay::negotiate(
         ctrl_r,
         ctrl_w,
         &params,
@@ -415,14 +420,16 @@ pub async fn run_engine(
         key_tx,
         stop.clone(),
         screen_ready_tx,
-    )
-    .await?;
+        ) => result?,
+    };
 
     // Requests share the encrypted control channel, with their own CSeq; feedback continues independently.
-    let _keepalive = outcome.keepalive;
+    let keepalive = outcome.keepalive;
+    let teardown = outcome.teardown;
     let control = outcome.control;
+    let close_control = control.clone();
     let stop_ui = stop.clone();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         loop {
             tokio::select! {
                 _ = stop_ui.notified() => return,
@@ -451,7 +458,7 @@ pub async fn run_engine(
         let stop_s = stop.clone();
         let vstats = video_stats.clone();
         let astats = audio_stats.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             let mut last_frames = 0u64;
             let mut last_bytes = 0u64;
             let mut last_tick = tokio::time::Instant::now();
@@ -474,9 +481,31 @@ pub async fn run_engine(
     }
 
     // 等待停止信号
-    stop.notified().await;
+    shutdown.wait().await;
     emit_state("stopping", "引擎停止");
+    // 停媒体泵后才发业务 TEARDOWN，控制通道保留到应答/超时，最后再解绑网络。
+    tasks.shutdown().await;
+    drop(keepalive);
+    airplay::finish_session(&close_control, &teardown, shutdown.graceful()).await;
     Ok(())
+}
+
+#[derive(Default)]
+struct EngineTasks(Vec<tokio::task::JoinHandle<()>>);
+impl EngineTasks {
+    fn spawn(&mut self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        self.0.push(tokio::spawn(future));
+    }
+    async fn shutdown(&mut self) {
+        for task in &self.0 { task.abort(); }
+        let tasks = std::mem::take(&mut self.0);
+        let _ = tokio::time::timeout(Duration::from_millis(250), async {
+            for task in tasks { let _ = task.await; }
+        }).await;
+    }
+}
+impl Drop for EngineTasks {
+    fn drop(&mut self) { for task in &self.0 { task.abort(); } }
 }
 
 // ---------------------------------------------------------------- 音频重采样

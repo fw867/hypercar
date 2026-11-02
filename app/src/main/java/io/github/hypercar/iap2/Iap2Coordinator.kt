@@ -78,6 +78,10 @@ class Iap2Coordinator(
     /** 本次启动以来成功建过几轮 iAP2 会话（0 = 车机一次都没连进来）。 */
     val sessionStartCount: Int get() = bluetooth?.sessionStartCount ?: 0
 
+    fun refreshCarPlayMarker() = bluetooth?.setCarPlayMarkerEnabled(
+        io.github.hypercar.settings.SettingsStore.bluetoothCarPlayMarker,
+    )
+
     fun onTargetChanged() = bluetooth?.onTargetChanged()
 
     /**
@@ -92,6 +96,7 @@ class Iap2Coordinator(
         synchronized(this) {
             bluetooth?.let { existing ->
                 if (existing.isRunning) {
+                    refreshCarPlayMarker()
                     log("IAP2: 已在运行，仅更新端点回调")
                     return
                 }
@@ -115,6 +120,7 @@ class Iap2Coordinator(
                     onSessionEnded = { reason -> log("IAP2: 会话结束（$reason），继续监听/出站等待重连") },
                 )
             bluetooth = bt
+            bt.setCarPlayMarkerEnabled(io.github.hypercar.settings.SettingsStore.bluetoothCarPlayMarker)
             if (!bt.start()) {
                 log("IAP2: 蓝牙启动失败（权限/开关），请检查后重试")
                 bluetooth = null

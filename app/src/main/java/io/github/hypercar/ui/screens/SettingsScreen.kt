@@ -1154,6 +1154,7 @@ private fun BehaviorSection() {
     }
     var enableAudio by rememberSaveable { mutableStateOf(SettingsStore.enableAudio) }
     var discoveryFallback by rememberSaveable { mutableStateOf(SettingsStore.bluetoothDiscoverableFallback) }
+    var carPlayMarker by rememberSaveable { mutableStateOf(SettingsStore.bluetoothCarPlayMarker) }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionLabel(text = "行为")
@@ -1202,6 +1203,16 @@ private fun BehaviorSection() {
                 onCheckedChange = {
                     discoveryFallback = it
                     SettingsStore.bluetoothDiscoverableFallback = it
+                },
+            )
+            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+            SwitchRow(
+                title = "CarPlay 蓝牙身份广播",
+                subtitle = "额外广播 CarPlay 手机身份，增强车机识别；可单独关闭验证连接效果",
+                checked = carPlayMarker,
+                onCheckedChange = {
+                    carPlayMarker = it
+                    HyperCarRepo.setBluetoothCarPlayMarker(it)
                 },
             )
         }

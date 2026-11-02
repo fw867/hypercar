@@ -92,4 +92,26 @@ class RecoveringListenerTest {
         assertEquals(1, attempts)
         fresh.close()
     }
+
+    @Test fun optionalMarkerFailureAndStopLeavePrimaryListenerAvailable() {
+        val primaryServer = Resource()
+        val primary = RecoveringListener(
+            ownerAlive = { true }, open = { primaryServer }, accept = { _: Resource -> Resource() },
+            onFailure = {}, awaitRetry = {},
+        )
+        primary.acceptNext()
+        var markerAlive = true
+        val marker = RecoveringListener<Resource, Resource>(
+            ownerAlive = { markerAlive }, open = { throw IOException("marker unavailable") },
+            accept = { fail("failed marker must not deliver a connection"); Resource() },
+            onFailure = {}, awaitRetry = { markerAlive = false },
+        )
+        assertNull(marker.acceptNext())
+        marker.close()
+        assertTrue(primary.isRegistered)
+        assertFalse(primaryServer.closed)
+        assertNotNull(primary.acceptNext())
+        primary.close()
+        assertTrue(primaryServer.closed)
+    }
 }

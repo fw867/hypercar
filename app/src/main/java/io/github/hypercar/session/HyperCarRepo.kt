@@ -460,7 +460,8 @@ object HyperCarRepo {
                 pending?.cancel()
                 withTimeoutOrNull(JOIN_TIMEOUT_MILLIS) { pending?.join() }
                 val keepListening = AutomaticConnectionPolicy.keepListeningAfterStop(SettingsStore.autoConnect)
-                runDisconnect(if (userInitiated) "用户断开当前会话" else "车机 ACL 断开", keepListening)
+                runDisconnect(if (userInitiated) "用户断开当前会话" else "车机 ACL 断开", keepListening,
+                    graceful = userInitiated)
                 if (keepListening) startStandbyListening()
                 else stopStandbyListening()
             } finally { autoConnectChanges.unlock() }
@@ -569,6 +570,12 @@ object HyperCarRepo {
                 headUnitProfile.dropProfilesBeforeIap2, SettingsStore.autoConnect, hasCurrentSession,
             )) CarProfileGuard.start(context, ::log)
         else CarProfileGuard.stop()
+    }
+
+    fun setBluetoothCarPlayMarker(enabled: Boolean) {
+        SettingsStore.bluetoothCarPlayMarker = enabled
+        iap2?.refreshCarPlayMarker()
+        log("BT-MARKER: 额外 CarPlay 身份广播=${if (enabled) "开" else "关"}，保留主 iAP2 服务")
     }
 
     private fun stopStandbyListening() {
@@ -1040,7 +1047,11 @@ object HyperCarRepo {
      * 每调一次都 nativeStop + 重建快照 + 记一行日志，历史版本正是在这里配合
      * ACTION_STOP 回灌，把「断开」刷成了每秒几百条。
      */
-    private suspend fun runDisconnect(reason: String, keepListening: Boolean = false) {
+    private suspend fun runDisconnect(
+        reason: String,
+        keepListening: Boolean = AutomaticConnectionPolicy.keepListeningAfterStop(SettingsStore.autoConnect),
+        graceful: Boolean = false,
+    ) {
         // 幂等：重复的断开事件（ACL 断开广播 + 引擎 ended + service 转交）只真正拆一次。
         // 但**状态必须回 Idle**——曾经这里直接 return，导致链路已断、界面还显示"已连接"。
         if (!sessionLive.compareAndSet(true, false)) {
@@ -1055,7 +1066,7 @@ object HyperCarRepo {
         }
         push(link = LinkState.Stopping)
         val hadLink = sessionHadLink
-        releaseSessionResources(keepListening)
+        releaseSessionResources(keepListening, graceful)
         log("SESSION: 已断开（$reason）")
         _snapshots.update { s ->
             s.copy(
@@ -1067,7 +1078,7 @@ object HyperCarRepo {
             )
         }
         scheduleAutoReconnect(reason, hadLink)
-        if (!keepListening && SettingsStore.autoConnect) scheduleStandbyAfterCleanup()
+        if (SettingsStore.autoConnect) scheduleStandbyAfterCleanup()
     }
 
     /**
@@ -1126,7 +1137,7 @@ object HyperCarRepo {
     }
 
     /** 释放保活服务、iAP2、Rust 和 WiFi 绑定；拆除与失败路径共用。 */
-    private fun releaseSessionResources(keepListening: Boolean = false) {
+    private fun releaseSessionResources(keepListening: Boolean = false, graceful: Boolean = false) {
         sessionSockets?.invalidate() // 阻止旧引擎继续创建/移交 socket，先于 nativeStop。
         sessionSockets = null
         CarProfileGuard.stop() // 清除旧会话的延迟检查；重新待机时再启动。
@@ -1136,7 +1147,11 @@ object HyperCarRepo {
         // P1：先停自绘界面（释放 D1 显示/编码器），再停引擎。
         // 清理涉及 shell binder/编码器释放，可能卡住；异步执行，断开流程不等它。
         CarUiCaster.stopAsync()
-        runCatching { RustCoreBridge.nativeStop() }
+        // 在解绑网络、结束蓝牙旧会话之前完成有界业务退出；断网/EOF 路径只强制清理。
+        runCatching {
+            if (graceful) log("SESSION-CLOSE: graceful completed=${RustCoreBridge.nativeStopGracefully()}")
+            else RustCoreBridge.nativeStop()
+        }
         if (keepListening) {
             standbyEndpoint.set(null)
             runCatching { iap2?.endCurrentSession() }
@@ -1571,19 +1586,6 @@ object HyperCarRepo {
 
     // ---------------------------------------------------------------- socket 供给（移交 Rust）
 
-    /**
-     * 交给 Rust 的 socket 宿主（Socket / DatagramSocket）**必须保持可达**。
-     *
-     * `detachFd()` 只是把 fd 从 PFD 里摘出来交给 Rust；Java 的 Socket 对象仍然持有同一个
-     * fd，是它背后的 `FileDescriptor` 负责在 GC 时 close。若此时 Socket 已不可达，GC 会在
-     * Rust 还在用的时候把 fd 关掉（推流中途断流、引擎 EBADF）。这里把宿主对象留一份强引用：
-     * 实际 fd 由 Rust 持有并在 nativeStop 时关闭，Java 这边只是不再去 close 它。
-     * 每个会话只留几个小对象，只增不减（不 close、不回收，避免重复 close 到被复用的 fd 号）。
-     *
-     * 注：不能用 `android.system.Os.dup(int)` 做副本——该重载不是公开 API（只有
-     * `dup(FileDescriptor)`），编译期就过不了。
-     */
-    private val socketKeepAlive = java.util.Collections.synchronizedList(mutableListOf<Any>())
 
     /**
      * 配对身份自愈：**文件是主、SharedPreferences 是备份**。
@@ -1622,9 +1624,7 @@ object HyperCarRepo {
             }
         }.onFailure { log("PAIR: 身份自愈失败 - ${it.message}") }
     }
-    private fun keepAliveForRust(owner: Any) {
-        socketKeepAlive.add(owner)
-    }
+
 
     /**
      * 解析 AirPlay 端点地址：**链路本地 IPv6（fe80::）必须带 scope** 才能连。
@@ -1678,7 +1678,6 @@ object HyperCarRepo {
             },
             handoff = { socket ->
                 val fd = ParcelFileDescriptor.fromSocket(socket).detachFd()
-                keepAliveForRust(socket)
                 fd
             },
         )
@@ -1695,7 +1694,6 @@ object HyperCarRepo {
                 connect = { it.connect(resolveEndpoint(host, port, sockets.network)) },
                 handoff = { udp ->
                     val fd = ParcelFileDescriptor.fromDatagramSocket(udp).detachFd()
-                    keepAliveForRust(udp)
                     fd
                 },
             )
@@ -2103,9 +2101,9 @@ object HyperCarRepo {
         if (!sessionLive.compareAndSet(true, false)) return
         log("SESSION 失败: $reason")
         val hadLink = sessionHadLink
-        // 失败即停蓝牙/WiFi 侧（保留 Failed 状态给 UI）：否则 iAP2 出站循环会继续每 3s
-        // 断一次车机音频配置文件，还占着 RFCOMM 监听，下一次上车也会被旧会话拖住。
-        releaseSessionResources()
+        // 媒体失败与 SDP 生命周期分开：自动模式结束旧会话，但保留可用监听和 channel。
+        // 非自动模式仍完全释放，用户关闭自动连接后不会留下后台服务。
+        releaseSessionResources(AutomaticConnectionPolicy.keepListeningAfterStop(SettingsStore.autoConnect))
         _snapshots.value = _snapshots.value.copy(
             link = LinkState.Failed(reason),
         )

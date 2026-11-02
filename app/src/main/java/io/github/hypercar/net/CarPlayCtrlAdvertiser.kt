@@ -5,6 +5,7 @@ import android.net.Network
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.os.SystemClock
+import android.os.Build
 import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
@@ -27,9 +28,7 @@ import java.net.Socket
  *     都不再发、0x4301 永不到达（奥迪 MMI 3315 对照：950.7.1 时 0.65s 就下发）。
  *  2. **TXT `id` 必须是本机真实蓝牙 MAC**：车机按它匹配「待邀请的手机」，占位值
  *     （02:00:…）会导致永不邀请。
- *  3. **注册必须发生在 `bindProcessToNetwork` 之后**：`NsdManager.registerService` 没有
- *     Network 参数（API 36 的 `AdvertisingRequest` 才有），组播跟随进程默认网络；
- *     不绑就从蜂窝发出去，车机看不到。
+ *  3. Android 13+ 通过 NsdServiceInfo.network 限定本轮车机网络；较旧系统保留进程绑定。
  *
  * 服务名沿用 cardeck 验证过的 `sender`（改 `iPhone` 与 srcvers 同时变更时无法单次归因）。
  */
@@ -47,6 +46,9 @@ class CarPlayCtrlAdvertiser(
         private const val MAX_HEAD_BYTES = 16 * 1024
         private const val FORCE_COOLDOWN_MILLIS = 2_000L
         private const val PLACEHOLDER_MAC = "02:00:00:00:00:00"
+        private const val REGISTRATION_TIMEOUT_MILLIS = 10_000L
+        private const val REFRESH_INTERVAL_MILLIS = 30_000L
+        private const val MAX_WAITING_REFRESHES = 2
     }
 
     private val appContext = context.applicationContext
@@ -56,14 +58,14 @@ class CarPlayCtrlAdvertiser(
     private var acceptThread: Thread? = null
     private var registrationListener: NsdManager.RegistrationListener? = null
 
-    @Volatile
-    private var registered = false
-    val isAdvertising: Boolean get() = registered
+    private val registration = ServiceRegistrationState()
+    val isAdvertising: Boolean get() = registration.ready
 
     private var registeredSsid: String? = null
     private var registeredNetwork: Network? = null
     private var registeredAtMillis = 0L
     private var registeredMac: String? = null
+    private var waitingRefreshes = 0
 
     /** 车机 ctrl 邀请计数（每收到一次 `GET /ctrl-int/1/connect` 加一）。 */
     @Volatile
@@ -98,17 +100,20 @@ class CarPlayCtrlAdvertiser(
     ): Boolean {
         val macPlaceholder = (registeredMac ?: PLACEHOLDER_MAC) == PLACEHOLDER_MAC
         val effectiveNetwork = network ?: registeredNetwork
-        if (registered && registeredSsid == ssid && registeredNetwork == effectiveNetwork && !macPlaceholder && !force) {
-            return true
+        val same = registeredSsid == ssid && registeredNetwork == effectiveNetwork && !macPlaceholder
+        val age = SystemClock.uptimeMillis() - registeredAtMillis
+        if (same && registration.pending && age < REGISTRATION_TIMEOUT_MILLIS) return true
+        if (same && registration.ready) {
+            if (force && age < FORCE_COOLDOWN_MILLIS) return true
+            if (!force) {
+                // NSD 自身会维护公告；仅在无邀请的等待期有限刷新，保留 TCP 端口。
+                if (lastInvitePeerIp != null || age < REFRESH_INTERVAL_MILLIS || waitingRefreshes >= MAX_WAITING_REFRESHES) return true
+                waitingRefreshes++
+                log("$TAG: 等待邀请，刷新广播 $waitingRefreshes/$MAX_WAITING_REFRESHES network=$effectiveNetwork port=$port")
+            }
         }
-        if (force && registered && registeredSsid == ssid && registeredNetwork == effectiveNetwork &&
-            !macPlaceholder && SystemClock.uptimeMillis() - registeredAtMillis < FORCE_COOLDOWN_MILLIS
-        ) {
-            // 绑定后的一串「确保」调用常在同一秒内发生，逐次 unregister+register 会撞
-            // NsadManager 的 listener-already-in-use 并吃 1.2s 重试
-            return true
-        }
-        if (registered) {
+        if (!same) waitingRefreshes = 0
+        if (registrationListener != null) {
             log("$TAG: 重新注册 mDNS 广播（${registeredSsid ?: "?"} → $ssid，端口 ${port} 不变）")
             // **只换 mDNS 注册，不换 socket/端口**（cardeck 2026-10-22 实测）：
             // 旧实现每次重注册都新建 ServerSocket（端口 43857→33383→…），中间还有最长
@@ -131,7 +136,7 @@ class CarPlayCtrlAdvertiser(
 
     @Synchronized
     fun start(): Boolean {
-        if (registered) return true
+        if (registration.ready || registration.pending) return true
         // socket 与 accept 线程**只在第一次创建**，之后重注册一直复用（端口稳定）
         val socket =
             serverSocket
@@ -151,6 +156,7 @@ class CarPlayCtrlAdvertiser(
                     start()
                 }
         }
+        val token = registration.begin()
         return try {
             val mac = bluetoothMacProvider()
             val info =
@@ -161,24 +167,39 @@ class CarPlayCtrlAdvertiser(
                     // 车机在 WiFi 上唯一能看到的手机身份就是这两个 TXT 字段
                     setAttribute("id", mac)
                     setAttribute("srcvers", SRCVERS)
+                    if (Build.VERSION.SDK_INT >= 33) setNetwork(registeredNetwork)
                 }
             // 每次注册用全新 listener：unregisterService 是异步的，复用同一实例会
             // 撞 "listener already in use"
             val listener =
                 object : NsdManager.RegistrationListener {
                     override fun onServiceRegistered(serviceInfo: NsdServiceInfo) {
-                        log("$TAG: mDNS 注册成功 ${serviceInfo.serviceName}")
+                        synchronized(this@CarPlayCtrlAdvertiser) {
+                            if (!registration.registered(token)) {
+                                // 注销可能与系统注册完成交错；只清理过期 listener，不能撤销当前注册。
+                                if (registrationListener !== this) runCatching { nsdManager.unregisterService(this) }
+                                return
+                            }
+                            registeredAtMillis = SystemClock.uptimeMillis()
+                            log("$TAG: mDNS 注册成功 ${serviceInfo.serviceName} network=$registeredNetwork port=$port")
+                        }
                     }
 
                     override fun onRegistrationFailed(
                         serviceInfo: NsdServiceInfo,
                         errorCode: Int,
                     ) {
-                        registered = false
-                        log("$TAG: mDNS 注册失败 code=$errorCode（下次拿到 0x5703 会重试）")
+                        synchronized(this@CarPlayCtrlAdvertiser) {
+                            if (!registration.failed(token)) return
+                            log("$TAG: mDNS 注册失败 code=$errorCode network=$registeredNetwork（等待期间重试）")
+                        }
                     }
 
-                    override fun onServiceUnregistered(serviceInfo: NsdServiceInfo) = Unit
+                    override fun onServiceUnregistered(serviceInfo: NsdServiceInfo) {
+                        synchronized(this@CarPlayCtrlAdvertiser) {
+                            if (registration.failed(token)) log("$TAG: 当前广播已注销，等待期间重试")
+                        }
+                    }
 
                     override fun onUnregistrationFailed(
                         serviceInfo: NsdServiceInfo,
@@ -187,16 +208,16 @@ class CarPlayCtrlAdvertiser(
                 }
             registrationListener = listener
             nsdManager.registerService(info, NsdManager.PROTOCOL_DNS_SD, listener)
-            registered = true
             registeredAtMillis = SystemClock.uptimeMillis()
             registeredMac = mac
             log(
-                "$TAG: 已监听 :${socket.localPort}，广播 $SERVICE_TYPE " +
+                "$TAG: 已监听 :${socket.localPort}，提交广播 $SERVICE_TYPE network=$registeredNetwork " +
                     "name=$SERVICE_NAME id=$mac srcvers=$SRCVERS" +
                     if (mac == PLACEHOLDER_MAC) "（⚠ 占位 MAC：车机不会邀请）" else "",
             )
             true
         } catch (error: Exception) {
+            registration.failed(token)
             log("$TAG: 启动失败 - ${error.message}")
             false
         }
@@ -205,10 +226,11 @@ class CarPlayCtrlAdvertiser(
     /** 只注销 mDNS 注册（保留 socket 与 accept 线程，端口不变）。 */
     @Synchronized
     private fun unregisterMdns() {
-        registered = false
-        registrationListener?.let { runCatching { nsdManager.unregisterService(it) } }
+        registration.invalidate()
+        val previous = registrationListener
         registrationListener = null
         registeredMac = null
+        previous?.let { runCatching { nsdManager.unregisterService(it) } }
     }
 
     private fun acceptLoop(socket: ServerSocket) {

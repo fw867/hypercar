@@ -22,7 +22,7 @@ class SessionSocketLeaseTest {
         assertEquals("cellular", selected)
         assertEquals(listOf("bind:car", "connect", "handoff"), steps)
         assertEquals(42, fd)
-        assertFalse(socket.closed)
+        assertTrue(socket.closed)
     }
 
     @Test fun bindingFailureClosesSocketWithoutConnectingOrFallingBack() {

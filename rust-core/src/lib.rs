@@ -33,6 +33,7 @@ mod timing;
 mod wifi_iap2;
 mod auth_setup;
 mod display_layout;
+mod shutdown;
 
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;
@@ -44,7 +45,7 @@ use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::runtime::{Builder, Runtime};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::mpsc;
 
 use crate::airplay::{SocketProvider, TouchInput};
 
@@ -67,7 +68,8 @@ static LISTENER: RwLock<Option<GlobalRef>> = RwLock::new(None);
 static TOUCH_LISTENER: RwLock<Option<GlobalRef>> = RwLock::new(None);
 
 struct EngineHandle {
-    stop: Arc<Notify>,
+    shutdown: Arc<shutdown::EngineShutdown>,
+    abort: tokio::task::AbortHandle,
     touch_tx: mpsc::UnboundedSender<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
     /// 自绘界面投喂给引擎的视频帧 / 音频 PCM（nativePushVideoFrame / nativePushAudioPcm）
@@ -427,7 +429,7 @@ fn native_start_impl(
     socket_provider: JObject,
 ) -> jboolean {
     // 停旧引擎
-    stop_engine();
+    stop_engine(false);
 
     let config_str: String = match env.get_string(&config_json) {
         Ok(s) => s.into(),
@@ -503,12 +505,15 @@ fn native_start_impl(
         cfg.height.max(2),
     )));
     let touch_size_engine = touch_size.clone();
-    let stop = Arc::new(Notify::new());
+    let shutdown = Arc::new(shutdown::EngineShutdown::new());
 
-    let stop_run = stop.clone();
+    let stop_run = shutdown.clone();
+    let completion = shutdown::CompletionGuard(shutdown.clone());
+    let stop_result = shutdown.clone();
     let touch_tx_engine = touch_tx.clone();
     let key_tx_engine = key_tx.clone();
     let engine_task = TOKIO_RT.spawn(async move {
+        let _completion = completion;
         let result = engine::run_engine(
             cfg,
             control_stream,
@@ -522,13 +527,15 @@ fn native_start_impl(
         .await;
         if let Err(e) = &result {
             emit_log(&format!("引擎退出: {e}"));
-            emit_state("failed", e);
+            if !stop_result.requested() { emit_state("failed", e); }
         }
     });
+    let abort = engine_task.abort_handle();
     // panic 隔离看门狗：Cargo 已去掉 panic = "abort"，任务内 panic 由 tokio 捕获在
     // JoinHandle 里。这里把它报成「会话失败」并留日志，而不是让进程无声消失。
     TOKIO_RT.spawn(async move {
         if let Err(join_error) = engine_task.await {
+            if join_error.is_cancelled() { return; }
             emit_log(&format!("引擎任务异常退出: {join_error}"));
             emit_state("failed", "核心层内部异常（panic），请导出日志");
         }
@@ -537,7 +544,8 @@ fn native_start_impl(
     // 发送端留在句柄里（触摸/按键通道 P1 起接给自绘 UI）
     // 发送端留在句柄里，供 nativePushVideoFrame / nativePushAudioPcm 投喂数据
     *ENGINE.lock() = Some(EngineHandle {
-        stop,
+        shutdown,
+        abort,
         touch_tx,
         key_tx,
         source_tx,
@@ -554,17 +562,26 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStop(
     _env: JNIEnv,
     _class: JClass,
 ) {
-    stop_engine();
+    stop_engine(false);
 }
 
-fn stop_engine() {
-    if let Some(handle) = ENGINE.lock().take() {
-        // notify_waiters 唤醒当前所有等待者；notify_one 存一个 permit，
-        // 防止「停止信号早于最终 await 注册」时引擎挂死（Notify 不记忆 waiters）。
-        handle.stop.notify_waiters();
-        handle.stop.notify_one();
-        emit_log("引擎已停止");
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStopGracefully(
+    _env: JNIEnv, _class: JClass,
+) -> jboolean { if stop_engine(true) { JNI_TRUE } else { JNI_FALSE } }
+
+fn stop_engine(graceful: bool) -> bool {
+    let previous = ENGINE.lock().take(); // 等待时不能持有全局引擎锁。
+    let Some(handle) = previous else { return true };
+    handle.shutdown.request(graceful);
+    let done = handle.shutdown.wait_done(std::time::Duration::from_millis(2_000));
+    if !done {
+        emit_log("SESSION-CLOSE: 旧引擎停止超时，强制取消");
+        handle.abort.abort();
     }
+    let done = done || handle.shutdown.wait_done(std::time::Duration::from_millis(300));
+    emit_log(&format!("SESSION-CLOSE: 引擎清理 completed={done} graceful={graceful}"));
+    done
 }
 
 /// 投喂一帧 H.264（Annex B，来自本机 MediaCodec 的编码输出）。

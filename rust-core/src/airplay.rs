@@ -76,6 +76,7 @@ pub struct AirplayOutcome {
     pub audio: Option<AudioOut>,
     pub keep_alive_stats: bool,
     pub keepalive: KeepaliveTasks,
+    pub teardown: Vec<u8>,
 }
 
 /// 跑完整个 AirPlay 协商，返回屏幕/音频发送器（交给 pump 任务）。
@@ -469,12 +470,84 @@ pub async fn negotiate(
 
     if let Some(audio) = audio.as_mut() { audio.set_ownership(audio_owned); }
 
+    let mut streams = vec![Value::dict(vec![("type", Value::int(110)), ("uuid", Value::str(&stream_uuid))])];
+    if audio.is_some() { streams.push(Value::dict(vec![("type", Value::int(100))])); }
+    let teardown = bplist::encode(&Value::dict(vec![("streams", Value::array(streams))]));
     Ok(AirplayOutcome {
         control: channel,
         audio,
         keep_alive_stats,
         keepalive,
+        teardown,
     })
+}
+
+/// 主动停止才发 TEARDOWN；EOF/断网只清理。外层超时也覆盖等待 write 锁和写 socket。
+pub(crate) async fn finish_session(control: &RtspChannel, teardown: &[u8], graceful: bool) {
+    if graceful && !control.is_closed() {
+        emit_log("SESSION-CLOSE: TEARDOWN begin（媒体泵已停止）");
+        match tokio::time::timeout(Duration::from_millis(900), control.request(
+            "TEARDOWN", "/", teardown, "application/x-apple-binary-plist", &[], Duration::from_millis(800),
+        )).await {
+            Ok(Ok(reply)) => emit_log(&format!("SESSION-CLOSE: TEARDOWN status={}", reply.status())),
+            Ok(Err(error)) => emit_log(&format!("SESSION-CLOSE: TEARDOWN failed: {error}；继续释放")),
+            Err(_) => emit_log("SESSION-CLOSE: TEARDOWN timeout；继续释放"),
+        }
+    } else { emit_log("SESSION-CLOSE: 跳过 TEARDOWN（强制停止/控制通道已关闭）"); }
+    let _ = tokio::time::timeout(Duration::from_millis(200), control.shutdown()).await;
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn pair() -> (Arc<RtspChannel>, tokio::net::TcpStream) {
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(server.local_addr().unwrap()).await.unwrap();
+        let (peer, _) = server.accept().await.unwrap();
+        let (r, w) = client.into_split();
+        (RtspChannel::spawn(r, w, None).0, peer)
+    }
+    #[tokio::test]
+    async fn active_session_sends_teardown_then_closes_control_after_ack() {
+        let (control, mut peer) = pair().await;
+        let server = tokio::spawn(async move {
+            let mut data = Vec::new();
+            let request = loop {
+                let mut buf = [0; 4096];
+                let n = peer.read(&mut buf).await.unwrap();
+                assert!(n > 0, "must not close control before TEARDOWN");
+                data.extend_from_slice(&buf[..n]);
+                if let Some(msg) = crate::rtsp::parse_rtsp_messages(&mut data).into_iter().next() { break msg }
+            };
+            assert_eq!(request.method(), Some("TEARDOWN"));
+            assert!(request.first_line.starts_with("TEARDOWN / RTSP/1.0"));
+            let plist = bplist::parse(&request.body).unwrap();
+            assert_eq!(plist.get("streams").unwrap().as_array().unwrap().len(), 1);
+            let cseq = request.headers.get("cseq").unwrap();
+            peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Length: 0\r\n\r\n").as_bytes()).await.unwrap();
+            let mut end = [0];
+            assert_eq!(peer.read(&mut end).await.unwrap(), 0);
+        });
+        let body = bplist::encode(&Value::dict(vec![("streams", Value::array(vec![Value::dict(vec![("type", Value::int(110))])]))]));
+        finish_session(&control, &body, true).await;
+        tokio::time::timeout(Duration::from_secs(2), server).await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn silent_receiver_cannot_block_stop() {
+        let (control, mut peer) = pair().await;
+        tokio::time::timeout(Duration::from_millis(1_500), finish_session(&control, &[], true)).await.unwrap();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_millis(500), peer.read_to_end(&mut bytes)).await.unwrap().unwrap();
+        assert!(bytes.starts_with(b"TEARDOWN"));
+    }
+    #[tokio::test]
+    async fn forced_stop_closes_without_sending_protocol_messages() {
+        let (control, mut peer) = pair().await;
+        finish_session(&control, &[], false).await;
+        let mut buf = [0; 1];
+        assert_eq!(tokio::time::timeout(Duration::from_millis(500), peer.read(&mut buf)).await.unwrap().unwrap(), 0);
+    }
 }
 
 /// CarPlay uses widthPixels/heightPixels; older receivers may use width/height.

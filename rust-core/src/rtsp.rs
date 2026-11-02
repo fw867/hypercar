@@ -362,6 +362,13 @@ impl RtspChannel {
         self.reader.abort();
         self.pending.lock().clear();
     }
+
+    pub fn is_closed(&self) -> bool { self.reader.is_finished() }
+
+    pub async fn shutdown(&self) {
+        self.close();
+        let _ = self.write.lock().await.shutdown().await;
+    }
 }
 
 impl Drop for RtspChannel {

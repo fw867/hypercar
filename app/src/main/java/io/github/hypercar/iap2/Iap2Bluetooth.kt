@@ -107,6 +107,8 @@ class Iap2Bluetooth(
     private val activeChannel = AtomicReference<RfcommLinkChannel?>(null)
 
     @Volatile private var listener: RecoveringListener<BluetoothServerSocket, BluetoothSocket>? = null
+    private var carPlayMarker: CarPlayBluetoothMarker? = null
+    @Volatile private var markerEnabled = false
 
     @Volatile
     private var serverThread: Thread? = null
@@ -158,6 +160,26 @@ class Iap2Bluetooth(
     /** 当前是否有会话在跑（上层诊断用）。 */
     val isSessionActive: Boolean get() = sessionActive.get()
     val isListening: Boolean get() = running && listener?.isRegistered == true
+
+    /** 只变更额外标记，不重建主服务、不打断当前会话。 */
+    @Synchronized fun setCarPlayMarkerEnabled(enabled: Boolean) {
+        markerEnabled = enabled
+        if (!enabled || !running) {
+            carPlayMarker?.close()
+            carPlayMarker = null
+            return
+        }
+        if (carPlayMarker != null) return
+        val adapter = adapterOrNull() ?: return
+        val epoch = generation.get()
+        carPlayMarker = CarPlayBluetoothMarker(
+            adapter = adapter,
+            ownerAlive = { running && markerEnabled && generation.get() == epoch },
+            primaryReady = { isListening },
+            onConnection = { socket -> handleIncomingSocket(socket, epoch, "BT-MARKER") },
+            log = log,
+        ).also { it.start() }
+    }
 
     /** 本次 start() 以来成功建过几轮 iAP2 会话（0 = 车机从未连入/从未连上，诊断用）。 */
     val sessionStartCount: Int get() = sessionStarts.get()
@@ -230,6 +252,7 @@ class Iap2Bluetooth(
             serverThread = this
             start()
         }
+        setCarPlayMarkerEnabled(markerEnabled)
         if (allowOutboundIap2) {
             Thread({ connectLoop(myGeneration) }, "iap2-bt-client").apply {
                 isDaemon = true
@@ -250,6 +273,8 @@ class Iap2Bluetooth(
         if (!running) return
         running = false
         generation.incrementAndGet()
+        carPlayMarker?.close()
+        carPlayMarker = null
         listener?.close()
         listener = null
         dropCurrentSession()
@@ -282,45 +307,59 @@ class Iap2Bluetooth(
     private fun acceptLoop(myGeneration: Long, listener: RecoveringListener<BluetoothServerSocket, BluetoothSocket>) {
         while (running && generation.get() == myGeneration) {
             val socket = listener.acceptNext() ?: break
-            if (!running || generation.get() != myGeneration) {
+            handleIncomingSocket(socket, myGeneration, "BT-S")
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    @Synchronized private fun handleIncomingSocket(socket: BluetoothSocket, myGeneration: Long, tag: String) {
+        if (!running || generation.get() != myGeneration) {
+            runCatching { socket.close() }
+            return
+        }
+        if (wifiHandoff) { runCatching { socket.close() }; return }
+        val peerAddress = safeAddress(socket.remoteDevice)
+        // 指定了目标车机时拒绝其它设备的连入（多台车机场景：非目标的控制器
+        // 也会周期回连，放行会抢占/误建会话）。地址比对，大小写不敏感。
+        val target = targetProvider()
+        if (!io.github.hypercar.bluetooth.CarTargetPolicy.acceptsIncoming(target, peerAddress)) {
+            log("$tag: 忽略非目标设备连入 addr=${peerAddress ?: "?"}（当前目标：$target）")
+            runCatching { socket.close() }
+            return
+        }
+        if (sessionActive.get()) {
+            // 额外身份入口只补充发现，不能用它的探测替换正在建立的主 iAP2 会话。
+            if (tag == "BT-MARKER") {
+                log("$tag: 已有 iAP2 会话，关闭额外入口连接并保留原会话")
                 runCatching { socket.close() }
                 return
             }
-            if (wifiHandoff) { runCatching { socket.close() }; continue }
-            val peerAddress = safeAddress(socket.remoteDevice)
-            // 指定了目标车机时拒绝其它设备的连入（多台车机场景：非目标的控制器
-            // 也会周期回连，放行会抢占/误建会话）。地址比对，大小写不敏感。
-            val target = targetProvider()
-            if (!io.github.hypercar.bluetooth.CarTargetPolicy.acceptsIncoming(target, peerAddress)) {
-                log("BT-S: 忽略非目标设备连入 addr=${peerAddress ?: "?"}（当前目标：$target）")
+            // **本轮已拿到凭据（端点）**才拒绝新连入；还在等凭据的「空转轮次」必须让位：
+            // 车机只有在**新一轮** iAP2 里才会给档案 B 的能力清单，而我们又不肯为了
+            // 换轮去主动拆链（拆链会让车机收起 CarPlay 图标，2026-10-25 现场定谳）。
+            // 所以由车机发起的新连接来顶替旧会话——既不拆链，也不挡路。
+            if (sessionProductive) {
+                log("$tag: 已有 iAP2 会话在跑且已拿到凭据，忽略新的连入 addr=${peerAddress ?: "?"}")
                 runCatching { socket.close() }
-                continue
+                return
             }
+            log("$tag: 车机重新连入（上一轮仍在等凭据）——结束旧会话让位给新一轮 addr=${peerAddress ?: "?"}")
+            dropCurrentSession()
+            sleepQuietly(500)
             if (sessionActive.get()) {
-                // **本轮已拿到凭据（端点）**才拒绝新连入；还在等凭据的「空转轮次」必须让位：
-                // 车机只有在**新一轮** iAP2 里才会给档案 B 的能力清单，而我们又不肯为了
-                // 换轮去主动拆链（拆链会让车机收起 CarPlay 图标，2026-10-25 现场定谳）。
-                // 所以由车机发起的新连接来顶替旧会话——既不拆链，也不挡路。
-                if (sessionProductive) {
-                    log("BT-S: 已有 iAP2 会话在跑且已拿到凭据，忽略新的连入 addr=${peerAddress ?: "?"}")
-                    runCatching { socket.close() }
-                    continue
-                }
-                log("BT-S: 车机重新连入（上一轮仍在等凭据）——结束旧会话让位给新一轮 addr=${peerAddress ?: "?"}")
-                dropCurrentSession()
-                sleepQuietly(500)
-                if (sessionActive.get()) {
-                    log("BT-S: 旧会话未在 500ms 内退出，忽略本次连入 addr=${peerAddress ?: "?"}")
-                    runCatching { socket.close() }
-                    continue
-                }
+                log("$tag: 旧会话未在 500ms 内退出，忽略本次连入 addr=${peerAddress ?: "?"}")
+                runCatching { socket.close() }
+                return
             }
-            val peerName = safeName(socket.remoteDevice) ?: peerAddress ?: "unknown"
-            log("BT-S: 车机已连入 name=$peerName，开始 iAP2 发送端会话")
-            Thread({ runSession(socket, "BT-S") }, "iap2-bt-session").apply {
-                isDaemon = true
-                start()
-            }
+        }
+        val peerName = safeName(socket.remoteDevice) ?: peerAddress ?: "unknown"
+        log("$tag: 车机已连入 name=$peerName，开始 iAP2 发送端会话")
+        Thread({
+            if (!running || generation.get() != myGeneration) runCatching { socket.close() }
+            else runSession(socket, tag)
+        }, "iap2-bt-session").apply {
+            isDaemon = true
+            start()
         }
     }
 

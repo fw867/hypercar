@@ -90,6 +90,11 @@ object SettingsStore {
         get() = p().getBoolean("bluetooth_discoverable_fallback", true)
         set(v) = p().edit().putBoolean("bluetooth_discoverable_fallback", v).apply()
 
+    /** 可独立回退的经典蓝牙 CarPlay 手机身份标记。 */
+    var bluetoothCarPlayMarker: Boolean
+        get() = p().getBoolean("bluetooth_carplay_marker", true)
+        set(v) = p().edit().putBoolean("bluetooth_carplay_marker", v).apply()
+
     /**
      * 待机监听是否常驻前台通知（「正在监听车机，等待自动连接」）。默认开。
      *

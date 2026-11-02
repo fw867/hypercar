@@ -14,7 +14,7 @@ internal class SessionSocketLease<N>(val network: N) {
         if (!active) throw IOException("session socket lease closed")
     }
 
-    /** Bind before connect, and close every socket that is not handed to the native owner. */
+    /** handoff 必须导出独立 FD；原 Java socket 成功失败都关闭（本项目 minSdk=31）。 */
     fun <S : Closeable, R> open(
         create: () -> S,
         bind: (N, S) -> Unit,
@@ -32,9 +32,8 @@ internal class SessionSocketLease<N>(val network: N) {
                 checkActive()
                 handoff(socket)
             }
-        } catch (error: Throwable) {
+        } finally {
             runCatching { socket.close() }
-            throw error
         }
     }
 }
