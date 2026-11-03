@@ -63,6 +63,8 @@ pub struct EngineConfig {
     #[serde(default)]
     pub carlife_source: bool,
     #[serde(default)]
+    pub carwith_stretch: bool,
+    #[serde(default)]
     pub desktop_receiver: bool,
     pub identity_path: String,
     #[serde(default)]
@@ -483,6 +485,7 @@ pub async fn run_engine(
         encoder_size: encoder_size.clone(),
         touch_size: touch_size.clone(),
         carwith_display,
+        carwith_stretch: cfg.carlife_source && cfg.carwith_stretch,
     };
     let outcome = tokio::select! {
         biased;

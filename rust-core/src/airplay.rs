@@ -63,6 +63,7 @@ pub struct AirplayParams {
     pub touch_size: Arc<Mutex<(u32, u32)>>,
     /// CarWith-only requested canvas. None leaves the self-rendered display path unchanged.
     pub carwith_display: Option<Arc<Mutex<(u32, u32)>>>,
+    pub carwith_stretch: bool,
 }
 
 /// 车机触摸（已是编码画布坐标）。
@@ -427,6 +428,9 @@ pub async fn negotiate(
         "AIRPLAY: ✓ 主屏流就绪 dataPort={data_port} connId={conn_id_screen} {enc_w}x{enc_h}"
     ));
     let mut screen = screen;
+    if p.carwith_stretch {
+        screen.set_display_target(disp_w, disp_h);
+    }
     screen.set_ownership(screen_owned);
 
     // ---- 7. （音频挪到 RECORD 之后，见第 8 步）----
@@ -581,6 +585,12 @@ mod display_size_tests {
         let release=[0,0,0x56,0x05,0x8d,0x01];
         handle_hid_report(&release,&tx,&key,(2732,794),None,&source,&mut down,&mut logged);
         assert_eq!(rx.try_recv().unwrap().action,1);
+        // A stretched 16:9 source on a wide receiver still maps both axes independently.
+        for ((x,y), expected) in [((0u16,0u16),(0,0)), ((2049,198),(1440,179))] {
+            let [xl,xh]=x.to_le_bytes(); let [yl,yh]=y.to_le_bytes();
+            handle_hid_report(&[0,1,xl,xh,yl,yh],&tx,&key,(2732,794),None,&source,&mut down,&mut logged);
+            let touch=rx.try_recv().unwrap();assert_eq!((touch.x,touch.y),expected);
+        }
     }
     #[test]
     fn desktop_pcm_setup_uses_positive_latency_and_keeps_car_parameters() {

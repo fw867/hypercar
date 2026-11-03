@@ -255,6 +255,9 @@ object SettingsStore {
 
     /** 是否 CarWith 模式。 */
     val carWithMode: Boolean get() = carSource == "carwith"
+    var carWithStretch: Boolean
+        get() = p().getBoolean("carwith_stretch", false)
+        set(v) = p().edit().putBoolean("carwith_stretch", v).apply()
     var enableAudio: Boolean
         get() = p().getBoolean(KEY_ENABLE_AUDIO, true)
         set(v) = p().edit().putBoolean(KEY_ENABLE_AUDIO, v).apply()
@@ -348,6 +351,7 @@ object SettingsStore {
             append("\"airplay_port\":").append(airplayPort).append(",")
             // CarWith 模式：视频/音频源改由本机 CarLife（CarWith）提供（2026-11-03）
             append("\"carlife_source\":").append(if (carWithMode) "true" else "false").append(",")
+            append("\"carwith_stretch\":").append(if (carWithStretch) "true" else "false").append(",")
             append("\"width\":").append(plan.width).append(",")
             append("\"height\":").append(plan.height).append(",")
             append("\"touch_display_w\":").append(tdW).append(",")

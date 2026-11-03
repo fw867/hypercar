@@ -1583,6 +1583,10 @@ fun CarSourceSection(
                     !startup.shizukuReady -> "自绘 UI 需先在「权限与后台」完成 Shizuku 授权。"
                     else -> "自绘 UI 使用下方显示设置。"
                 }, color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+                if (current == "carwith" && startup.carWithInstalled) {
+                    CarWithSettingsShortcut()
+                    CarWithStretchSetting()
+                }
                 if (!startup.carWithInstalled) {
                     Text("未安装系统 CarWith，此选项不可用。", color = AmberWarning,
                         style = MaterialTheme.typography.bodySmall)
@@ -1644,6 +1648,9 @@ fun CarSourceSection(
             CapsuleButton(if (current == "carwith") "已选择 CarWith" else "选择 CarWith",
                 onClick = { selectSource("carwith") }, enabled = !connected && startup.carWithInstalled,
                 modifier = Modifier.fillMaxWidth(), filled = current == "carwith")
+            if (startup.carWithInstalled) {
+                CarWithSettingsShortcut()
+            }
             if (!compact) {
                 Spacer(Modifier.height(8.dp))
                 Text("从安装或授权页面返回后会自动重新检查。", color = TextSecondary,
@@ -1651,4 +1658,37 @@ fun CarSourceSection(
             }
         }
     }
+}
+
+@Composable
+private fun CarWithSettingsShortcut() {
+    val ctx = LocalContext.current
+    TextButton(onClick = {
+        val intent = android.content.Intent().setClassName(
+            io.github.hypercar.session.StartupRequirements.CARWITH_PACKAGE,
+            "com.carwith.launcher.settings.phone.UCarScreenSettingsActivity",
+        )
+        try {
+            ctx.startActivity(intent)
+        } catch (_: android.content.ActivityNotFoundException) {
+            android.widget.Toast.makeText(ctx, "无法打开 CarWith 设置，请从系统设置中进入。",
+                android.widget.Toast.LENGTH_LONG).show()
+        } catch (_: SecurityException) {
+            android.widget.Toast.makeText(ctx, "系统限制打开 CarWith 设置，请从系统设置中进入。",
+                android.widget.Toast.LENGTH_LONG).show()
+        }
+    }) {
+        Text("打开 CarWith 设置", color = ElectricCyan)
+    }
+}
+
+@Composable
+private fun CarWithStretchSetting() {
+    var stretch by rememberSaveable { mutableStateOf(SettingsStore.carWithStretch) }
+    SwitchRow(
+        title = "拉伸铺满车机屏幕",
+        subtitle = "按车机上报尺寸铺满，比例不同时会变形；下次连接生效。",
+        checked = stretch,
+        onCheckedChange = { stretch = it; SettingsStore.carWithStretch = it },
+    )
 }

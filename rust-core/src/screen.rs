@@ -74,9 +74,11 @@ pub struct ScreenSender {
     cipher: ScreenCipher,
     /** ChaCha 帧计数（每帧自增；AES-CTR 形态不使用但照常计数，对齐参考实现）。 */
     frame_counter: u64,
-    /** 解码器画布宽/高（VideoConfig 头部 params[1..3]，f32 LE）。 */
+    /** Actual encoded source size; display_target may override the presentation header. */
     width: f32,
     height: f32,
+    /// Optional receiver presentation size; encoded size/SPS and touch source remain independent.
+    display_target: Option<(u32, u32)>,
     /** 车机 /info 声明 keepAliveSendStatsAsBody 时为 true → opcode=5 + 统计体。 */
     keep_alive_with_stats: bool,
     /** 上一次屏幕流 keepAlive 的时刻（1s 节流）。 */
@@ -122,6 +124,7 @@ impl ScreenSender {
             frame_counter: 0,
             width: even_width as f32,
             height: even_height as f32,
+            display_target: None,
             keep_alive_with_stats,
             last_keep_alive: tokio::time::Instant::now(),
             frames: 0,
@@ -140,13 +143,22 @@ impl ScreenSender {
         }
     }
 
-    /// 更新画布尺寸（编码侧回报其**实际**编码分辨率时调用）。
-    ///
-    /// 车机按 VideoConfig 里的宽高建立解码画布；若与真实码流不一致，画面会被
-    /// 拉伸/裁切，触摸坐标也会整体偏移。故以手机实际尺寸为准，而非设置里的值。
-    /// 当前画布尺寸（engine 用它判断是否需要重发 VideoConfig）。
+    /// Actual source size (also used by engine to detect encoder changes).
+    /// The opt-in display target changes only VideoConfig presentation dimensions.
     pub fn size(&self) -> (u32, u32) {
         (self.width as u32, self.height as u32)
+    }
+
+    /// Ask the receiver to present the unchanged bitstream across its reported display.
+    /// Unknown receiver dimensions preserve the original source-sized presentation.
+    pub fn set_display_target(&mut self, width: u32, height: u32) {
+        self.display_target = if width >= 2 && height >= 2 {
+            Some((width, height))
+        } else {
+            None
+        };
+        self.reset_source();
+        crate::emit_log(&format!("VIDEO: stretch target={:?}; encoded size remains source-sized", self.display_target));
     }
 
     pub fn reset_source(&mut self) {
@@ -166,8 +178,8 @@ impl ScreenSender {
         }
         if w as f32 != self.width || h as f32 != self.height {
             crate::emit_log(&format!(
-                "VIDEO: 画布 {}x{} → {w}x{h}（跟随手机实际编码分辨率）",
-                self.width as u32, self.height as u32
+                "VIDEO: 编码源 {}x{} → {w}x{h} display_target={:?}",
+                self.width as u32, self.height as u32, self.display_target
             ));
             self.config_sent = false;
             self.waiting_idr = true;
@@ -187,15 +199,16 @@ impl ScreenSender {
         header[6] = SCREEN_FLAG_ENCRYPTED;
         // params[1]（偏移 16）里是**两个** f32：width 在 16..20、height 在 20..24。
         // 曾把 height 写到 24..28（误当 params[2]），车机读到的画布高度成 0 → 黑屏/错缩放。
-        header[16..20].copy_from_slice(&self.width.to_le_bytes());
-        header[20..24].copy_from_slice(&self.height.to_le_bytes());
+        let (display_w, display_h) = self.display_target.unwrap_or_else(|| self.size());
+        header[16..20].copy_from_slice(&(display_w as f32).to_le_bytes());
+        header[20..24].copy_from_slice(&(display_h as f32).to_le_bytes());
         let mut wire = Vec::with_capacity(HEADER_LEN + avcc.len());
         wire.extend_from_slice(&header);
         wire.extend_from_slice(avcc);
         self.w.write_all(&wire).await?;
         self.config_sent = true;
         self.waiting_idr = true;
-        crate::emit_log(&format!("VIDEO: config written {}B {}x{} flags=0x04", avcc.len(), self.width, self.height));
+        crate::emit_log(&format!("VIDEO: config written {}B {}x{} flags=0x04 source={}x{} stretch={}", avcc.len(), display_w, display_h, self.width, self.height, self.display_target.is_some()));
         Ok(())
     }
 
@@ -479,6 +492,34 @@ pub fn build_avcc(sps: &[u8], pps: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn stretch_changes_only_presentation_and_survives_source_reset() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let (_, write) = client.into_split();
+        let mut sender = ScreenSender::new(write, ScreenCipher::ChaCha([7;32]), 2560, 744, true);
+        let avcc = build_avcc(&[0x67,0x42,0,0x1f], &[0x68,1]);
+        // Default, enabled, changed source/new round, and missing receiver report.
+        for (step, expected) in [(0,(2560,744)), (1,(2736,800)), (2,(2736,800)), (3,(1920,720))] {
+            match step {
+                1 => sender.set_display_target(2736,800),
+                2 => { sender.set_size(1920,720); sender.reset_source(); },
+                3 => sender.set_display_target(0,800),
+                _ => {},
+            }
+            assert_eq!(sender.size(), if step < 2 {(2560,744)} else {(1920,720)});
+            sender.send_config(&avcc).await.unwrap();
+            let mut header = [0u8;HEADER_LEN];
+            peer.read_exact(&mut header).await.unwrap();
+            assert_eq!(f32::from_le_bytes(header[16..20].try_into().unwrap()), expected.0 as f32);
+            assert_eq!(f32::from_le_bytes(header[20..24].try_into().unwrap()), expected.1 as f32);
+            let mut body = vec![0;u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize];
+            peer.read_exact(&mut body).await.unwrap();
+            assert_eq!(body,avcc); // SPS/PPS and encoded resolution are untouched.
+        }
+    }
 
     #[tokio::test]
     async fn fresh_stream_waits_for_config_and_idr_then_encrypts_with_actual_header() {
