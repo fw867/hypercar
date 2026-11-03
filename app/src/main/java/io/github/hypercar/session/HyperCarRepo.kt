@@ -1575,7 +1575,7 @@ object HyperCarRepo {
     ): CarPlayEndpoint? {
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return null
         val previous = boundNetwork
-        for (network in wifiNetworks(context)) {
+        for (network in boundNetwork?.let { listOf(it) } ?: wifiNetworks(context)) {
             val gateway =
                 cm.getLinkProperties(network)
                     ?.routes
@@ -1583,7 +1583,7 @@ object HyperCarRepo {
                     ?.gateway
                     ?.hostAddress
                     ?: continue
-            if (!gateway.contains('.') || gateway.contains(':')) continue
+            if (!gateway.contains('.') || gateway.contains(':') || gateway == "0.0.0.0") continue
             val reachable =
                 runCatching {
                     cm.bindProcessToNetwork(network)
@@ -1907,39 +1907,23 @@ object HyperCarRepo {
             ?: endpoint.gateway?.takeIf { it.isNotBlank() }
     }
 
-    /**
-     * 等一个真正可用的端点（有 IP），期间把 0x5703（热点凭据）与 0x4301（AirPlay 端口/地址）
-     * 两次回调合并成一份，并每 [ENDPOINT_PROGRESS_MILLIS] 报一次进度。
-     *
-     * 为什么不能取第一个回调：两条消息分工不同，0x5703 只有 ssid/psk（没有 IP/端口），
-     * 0x4301 才带端口与车机地址，先后顺序由车机决定。WinPlay 实测 0x5703 先到、
-     * 0x4301 晚 143ms（真车同理）。取首个回调 = 拿凭据那一份去要 IP，必然立刻失败。
-     *
-     * **拿到 0x5703 就立刻入网 + 广播 `_carplay-ctrl._tcp`**（不等 0x4301）：
-     * 真车（Audi MIB3 / BMW）是「在 WiFi 上发现手机 ctrl 服务 → `GET /ctrl-int/1/connect`
-     * 邀请 → 邀请成功才下发 0x4301」。若等 0x4301 才入网，两边互等，永远拿不到端点
-     * （cardeck 在奥迪上实测的死锁；hypercar 旧流程同样只有 0x4301 一条来源）。
-     *
-     * 用无界 Channel 收集回调而不是首个回调 resume：0x5703/0x4301 可能连续到达，一条都不能丢；
-     * 等待结束（或超时）后 close，晚到的回调 trySend 失败即静默丢弃。
-     */
-    private suspend fun awaitUsableEndpoint(
+    private suspend fun proactiveWifiSessionAllowed(context: Context, enabled: Boolean): Boolean {
+        if (!enabled) return false
+        val ssid = currentWifiSsid(context)
+        val receiver = knownWifiReceiver(ssid)
+        val network = ssid?.let { knownWifiNetwork(context, it) }
+        return ProactiveWifiSessionPolicy.allows(enabled, receiver, iap2?.activePeerAddress,
+            network != null && network == boundNetwork && receiver == wifiReceiverMac)
+    }
+
+    private suspend fun probeRememberedEndpoint(
         context: Context,
         coordinator: Iap2Coordinator,
-        lastSeen: AtomicReference<CarPlayEndpoint?>,
-        advertiser: CarPlayCtrlAdvertiser,
-    ): CarPlayEndpoint? = withTimeoutOrNull(ENDPOINT_TIMEOUT_MILLIS) {
-        val diagnosticId = connectionAttemptId
-        // BMW's second-entry box trace still obtains Bluetooth credentials and a fresh ctrl invite.
-        // Retain the network/identity shortcut, but never confuse a remembered/open port with activation.
-        val requireActivation = headUnitProfile.requireAirplayActivation
-        resumeKnownCarNetwork(context, advertiser)
-        if (requireActivation) {
-            log("SESSION: 等待本轮 ctrl 邀请或 iAP2 端点；保持蓝牙监听与 Wi-Fi 广播，不预连记忆/扫描端口")
-            push(link = LinkState.Negotiating("等待车机开启 CarPlay"))
-        }
+        strictNetwork: Boolean,
+    ): CarPlayEndpoint? {
         val remembered = SettingsStore.lastAirplayEndpoint
-        if (!requireActivation && remembered.contains('|')) {
+        if (remembered.contains('|') && (!strictNetwork ||
+                ProactiveWifiSessionPolicy.rememberedEndpoint(remembered, currentWifiSsid(context)) != null)) {
             val (endpointPart, ssidPart) = remembered.split('|', limit = 2)
             // 只认 IPv4 的端点：老版本可能把 fe80:: 写进来（那种地址不带 scope 必然 EINVAL），
             // 读到就丢弃，走正常发现流程。
@@ -1974,7 +1958,7 @@ object HyperCarRepo {
                             lateAirplayHost = ip; lateAirplayPort = ep.airPlayPort
                         }
                     }
-                    return@withTimeoutOrNull CarPlayEndpoint(
+                    return CarPlayEndpoint(
                         ssid = currentSsid,
                         passphrase = null,
                         airPlayPort = port,
@@ -1987,6 +1971,54 @@ object HyperCarRepo {
                 } else {
                     log("SESSION: 上次的端点 ${host}:${port} 连不上（换了网段/车机换了地址）——回退到发现流程")
                 }
+            }
+        }
+
+        return null
+    }
+
+    /**
+     * 等一个真正可用的端点（有 IP），期间把 0x5703（热点凭据）与 0x4301（AirPlay 端口/地址）
+     * 两次回调合并成一份，并每 [ENDPOINT_PROGRESS_MILLIS] 报一次进度。
+     *
+     * 为什么不能取第一个回调：两条消息分工不同，0x5703 只有 ssid/psk（没有 IP/端口），
+     * 0x4301 才带端口与车机地址，先后顺序由车机决定。WinPlay 实测 0x5703 先到、
+     * 0x4301 晚 143ms（真车同理）。取首个回调 = 拿凭据那一份去要 IP，必然立刻失败。
+     *
+     * **拿到 0x5703 就立刻入网 + 广播 `_carplay-ctrl._tcp`**（不等 0x4301）：
+     * 真车（Audi MIB3 / BMW）是「在 WiFi 上发现手机 ctrl 服务 → `GET /ctrl-int/1/connect`
+     * 邀请 → 邀请成功才下发 0x4301」。若等 0x4301 才入网，两边互等，永远拿不到端点
+     * （cardeck 在奥迪上实测的死锁；hypercar 旧流程同样只有 0x4301 一条来源）。
+     *
+     * 用无界 Channel 收集回调而不是首个回调 resume：0x5703/0x4301 可能连续到达，一条都不能丢；
+     * 等待结束（或超时）后 close，晚到的回调 trySend 失败即静默丢弃。
+     */
+    private suspend fun awaitUsableEndpoint(
+        context: Context,
+        coordinator: Iap2Coordinator,
+        lastSeen: AtomicReference<CarPlayEndpoint?>,
+        advertiser: CarPlayCtrlAdvertiser,
+    ): CarPlayEndpoint? = withTimeoutOrNull(ENDPOINT_TIMEOUT_MILLIS) {
+        val diagnosticId = connectionAttemptId
+        // BMW's second-entry box trace still obtains Bluetooth credentials and a fresh ctrl invite.
+        // Retain the network/identity shortcut, but never confuse a remembered/open port with activation.
+        val profileRequiresActivation = headUnitProfile.requireAirplayActivation
+        val proactiveEnabled = SettingsStore.proactiveWifiSession
+        val proactiveDelay = ProactiveWifiSessionDelay()
+        suspend fun proactiveReady(): Boolean = proactiveDelay.ready(
+            proactiveWifiSessionAllowed(context, proactiveEnabled), boundNetwork?.toString(),
+            SystemClock.elapsedRealtime(),
+        )
+        resumeKnownCarNetwork(context, advertiser)
+        var requireActivation = profileRequiresActivation && !proactiveReady()
+        log("WIFI-ACTIVE: 本轮开关=$proactiveEnabled 延时=${ProactiveWifiSessionPolicy.DELAY_MILLIS}ms（已配对车机 Wi-Fi 绑定后计时）；正常邀请优先，端口可连不代表车机已授权")
+        if (requireActivation) {
+            log("SESSION: 等待本轮 ctrl 邀请或 iAP2 端点；保持蓝牙监听与 Wi-Fi 广播，不预连记忆/扫描端口")
+            push(link = LinkState.Negotiating("等待车机开启 CarPlay"))
+        }
+        if (!requireActivation) {
+            probeRememberedEndpoint(context, coordinator, profileRequiresActivation)?.let {
+                return@withTimeoutOrNull it
             }
         }
 
@@ -2029,7 +2061,7 @@ object HyperCarRepo {
                 if (next == null) {
                     ticks++
                     // 手动连接可以早于车机热点出现。等待期间也检查已配对网络，
-                    // 不等本轮 300s 超时；这里只恢复广播，仍需本轮邀请/端点才能连 AirPlay。
+                    // 不等本轮 300s 超时；实验模式仅允许已配对且已绑定的车机网络主动尝试。
                     resumeKnownCarNetwork(context, advertiser)
                     // ① 车机已经来邀请过（GET /ctrl-int/1/connect）→ 直接用邀请方 IP 当端点。
                     //    BMW MGU-55 实测：清单里声明「0x4301 不发」，等它是死等；而邀请一旦
@@ -2050,6 +2082,15 @@ object HyperCarRepo {
                             fromInvite = true,
                         )
                         continue
+                    }
+                    val waitBefore = requireActivation
+                    requireActivation = profileRequiresActivation && !proactiveReady()
+                    if (waitBefore && !requireActivation) {
+                        log("WIFI-ACTIVE: 已配对车机 Wi-Fi 稳定满 10s，主动尝试 AirPlay / Wi-Fi iAP2；尚未收到车机邀请")
+                        probeRememberedEndpoint(context, coordinator, true)?.let {
+                            usable = it
+                        }
+                        if (usable != null) continue
                     }
                     // ① 静默网关试探：手机刚连上（或本来就该连）车机热点时，不用等 0x4301——
                     //    车机的 AirPlay 控制面通常就在热点网关的 7000 端口。

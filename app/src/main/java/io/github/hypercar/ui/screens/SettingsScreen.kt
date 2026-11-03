@@ -1156,6 +1156,7 @@ private fun BehaviorSection() {
     var enableAudio by rememberSaveable { mutableStateOf(SettingsStore.enableAudio) }
     var discoveryFallback by rememberSaveable { mutableStateOf(SettingsStore.bluetoothDiscoverableFallback) }
     var carPlayMarker by rememberSaveable { mutableStateOf(SettingsStore.bluetoothCarPlayMarker) }
+    var proactiveWifi by rememberSaveable { mutableStateOf(SettingsStore.proactiveWifiSession) }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionLabel(text = "行为")
@@ -1214,6 +1215,17 @@ private fun BehaviorSection() {
                 onCheckedChange = {
                     carPlayMarker = it
                     HyperCarRepo.setBluetoothCarPlayMarker(it)
+                },
+            )
+            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+            SwitchRow(
+                title = "车机 Wi-Fi 主动连接（实验）",
+                subtitle = "接入已配对车机 Wi-Fi 后等待 10 秒再主动尝试；车机先邀请则立即连接。下次连接生效，自动上车需开启上车自动连接",
+                checked = proactiveWifi,
+                onCheckedChange = {
+                    proactiveWifi = it
+                    SettingsStore.proactiveWifiSession = it
+                    HyperCarRepo.log("WIFI-ACTIVE: 实验开关=${if (it) "开" else "关"}，下次连接生效")
                 },
             )
         }

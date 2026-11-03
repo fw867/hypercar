@@ -95,6 +95,11 @@ object SettingsStore {
         get() = p().getBoolean("bluetooth_carplay_marker", true)
         set(v) = p().edit().putBoolean("bluetooth_carplay_marker", v).apply()
 
+    /** 实验：已配对车机 Wi-Fi 上不等邀请，主动建立 AirPlay / Wi-Fi iAP2。 */
+    var proactiveWifiSession: Boolean
+        get() = p().getBoolean("proactive_wifi_session", false)
+        set(v) = p().edit().putBoolean("proactive_wifi_session", v).apply()
+
     /**
      * 待机监听是否常驻前台通知（「正在监听车机，等待自动连接」）。默认开。
      *
