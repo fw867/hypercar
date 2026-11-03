@@ -289,6 +289,8 @@ private fun HeroGlyph(link: LinkState) {
 
 @Composable
 private fun IdleGlyph() {
+    val accent = ElectricCyan
+
     val transition = rememberInfiniteTransition(label = "idle-pulse")
     val pulse by transition.animateFloat(
         initialValue = 0.72f,
@@ -304,13 +306,13 @@ private fun IdleGlyph() {
     )
     Canvas(modifier = Modifier.size(88.dp)) {
         drawCircle(
-            color = ElectricCyan.copy(alpha = pulseAlpha),
+            color = accent.copy(alpha = pulseAlpha),
             radius = size.minDimension / 2f * pulse,
         )
     }
     Canvas(modifier = Modifier.size(88.dp)) {
         drawCircle(
-            color = ElectricCyan.copy(alpha = 0.22f),
+            color = accent.copy(alpha = 0.22f),
             radius = size.minDimension / 2f - 1.dp.toPx(),
             style = Stroke(width = 1.5.dp.toPx()),
         )
@@ -318,7 +320,7 @@ private fun IdleGlyph() {
     Icon(
         imageVector = Icons.Rounded.DirectionsCar,
         contentDescription = "待机",
-        tint = ElectricCyan.copy(alpha = 0.9f),
+        tint = accent.copy(alpha = 0.9f),
         modifier = Modifier.size(38.dp),
     )
 }
@@ -370,16 +372,19 @@ private fun ArcGlyph(
 
 @Composable
 private fun ConnectedGlyph() {
+    val success = MintGreen
+    val accent = ElectricCyan
+
     Canvas(modifier = Modifier.size(88.dp)) {
         drawCircle(
             brush = Brush.linearGradient(
-                listOf(MintGreen.copy(alpha = 0.24f), ElectricCyan.copy(alpha = 0.10f)),
+                listOf(success.copy(alpha = 0.24f), accent.copy(alpha = 0.10f)),
             ),
         )
     }
     Canvas(modifier = Modifier.size(88.dp)) {
         drawCircle(
-            color = MintGreen.copy(alpha = 0.55f),
+            color = success.copy(alpha = 0.55f),
             radius = size.minDimension / 2f - 1.dp.toPx(),
             style = Stroke(width = 1.5.dp.toPx()),
         )
@@ -387,23 +392,26 @@ private fun ConnectedGlyph() {
     Icon(
         imageVector = Icons.Rounded.Check,
         contentDescription = "已连接",
-        tint = MintGreen,
+        tint = success,
         modifier = Modifier.size(44.dp),
     )
 }
 
 @Composable
 private fun FailedGlyph() {
+    val error = CoralError
+    val warning = AmberWarning
+
     Canvas(modifier = Modifier.size(88.dp)) {
         drawCircle(
             brush = Brush.linearGradient(
-                listOf(CoralError.copy(alpha = 0.22f), AmberWarning.copy(alpha = 0.10f)),
+                listOf(error.copy(alpha = 0.22f), warning.copy(alpha = 0.10f)),
             ),
         )
     }
     Canvas(modifier = Modifier.size(88.dp)) {
         drawCircle(
-            color = CoralError.copy(alpha = 0.55f),
+            color = error.copy(alpha = 0.55f),
             radius = size.minDimension / 2f - 1.dp.toPx(),
             style = Stroke(width = 1.5.dp.toPx()),
         )
@@ -411,7 +419,7 @@ private fun FailedGlyph() {
     Icon(
         imageVector = Icons.Rounded.Warning,
         contentDescription = "失败",
-        tint = CoralError,
+        tint = error,
         modifier = Modifier.size(40.dp),
     )
 }
@@ -419,6 +427,8 @@ private fun FailedGlyph() {
 /** 协商步骤尾部的三点呼吸（300ms 周期）。 */
 @Composable
 private fun BreathingDots(modifier: Modifier = Modifier) {
+    val accent = ElectricCyan
+
     val transition = rememberInfiniteTransition(label = "step-dots")
     val alpha by transition.animateFloat(
         initialValue = 0.2f,
@@ -432,7 +442,7 @@ private fun BreathingDots(modifier: Modifier = Modifier) {
     ) {
         repeat(3) {
             Canvas(modifier = Modifier.size(4.dp)) {
-                drawCircle(color = ElectricCyan.copy(alpha = alpha))
+                drawCircle(color = accent.copy(alpha = alpha))
             }
         }
     }

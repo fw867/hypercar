@@ -26,6 +26,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.graphics.Brush
@@ -52,13 +53,15 @@ fun Modifier.glassPanel(
     glowColor: Color = LocalGlass.current.glowColor,
 ): Modifier {
     val glass = LocalGlass.current
+    val dark = io.github.hypercar.ui.theme.LocalAppPalette.current.dark
+    val accent = ElectricCyan
     val shape = RoundedCornerShape(cornerRadius)
-    val strokeBrush = remember(glass, cornerRadius) {
+    val strokeBrush = remember(glass, cornerRadius, accent, dark) {
         Brush.verticalGradient(
             listOf(
-                ElectricCyan.copy(alpha = 0.28f),
+                if (dark) accent.copy(alpha = 0.28f) else glass.strokeColor,
                 glass.strokeColor,
-                NebulaVioletStroke,
+                if (dark) NebulaVioletStroke else glass.strokeColor,
             ),
         )
     }
@@ -69,7 +72,7 @@ fun Modifier.glassPanel(
             strokeCap = Paint.Cap.ROUND
         }
     }
-    val glowModifier = if (glow) {
+    val glowModifier = if (glow && dark) {
         Modifier.drawWithCache {
             val strokeWidthPx = 2.dp.toPx()
             val radiusPx = cornerRadius.toPx()
@@ -96,6 +99,7 @@ fun Modifier.glassPanel(
     }
     return this
         .then(glowModifier)
+        .shadow(if (dark) 0.dp else 1.dp, shape, clip = false)
         .clip(shape)
         .background(glass.panelBrush)
         .border(glass.strokeWidth, strokeBrush, shape)

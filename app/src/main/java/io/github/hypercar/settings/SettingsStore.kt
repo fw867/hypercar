@@ -83,6 +83,13 @@ object SettingsStore {
         p().edit().remove("listening_disabled").apply()
     }
 
+    var appThemeMode: AppThemeMode
+        get() = AppThemeMode.fromValue(p().getString("app_theme_mode", "dark"))
+        set(value) {
+            p().edit().putString("app_theme_mode", value.value).apply()
+            SettingsRevision.bump()
+        }
+
     /** 上车自动连接（ACL 广播唤醒），新安装默认关，完成启动条件后由用户开启。 */
     var autoConnect: Boolean
         get() = p().getBoolean(KEY_AUTO_CONNECT, false)

@@ -103,7 +103,8 @@ private enum class SettingsPage(val title: String) {
     Connection("连接与唤醒"),
     Display("画面与声音"),
     Permissions("权限与后台"),
-    Advanced("高级设置");
+    Advanced("高级设置"),
+    Appearance("主题与外观");
 
     val parent: SettingsPage get() = Main
 }
@@ -146,6 +147,8 @@ fun SettingsScreen(
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
                             SettingsMenuItem("画面与声音", "画面来源、音频转发与显示参数") { open(SettingsPage.Display) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+                            SettingsMenuItem("主题与外观", "跟随系统、HyperOS 风格浅色与深色") { open(SettingsPage.Appearance) }
+                            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
                             SettingsMenuItem("权限与后台", "系统权限、后台运行与 Shizuku 授权") { open(SettingsPage.Permissions) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
                             SettingsMenuItem("高级设置", "手动蓝牙地址与重置配对身份") { open(SettingsPage.Advanced) }
@@ -166,6 +169,7 @@ fun SettingsScreen(
                         PermissionSettingsSection()
                         ShizukuSection(startup)
                     }
+                    SettingsPage.Appearance -> AppearanceSection()
                     SettingsPage.Advanced -> {
                         IdentitySection()
                         ResetPairingSection()
@@ -174,6 +178,36 @@ fun SettingsScreen(
                 Spacer(Modifier.height(8.dp))
             }
         }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AppearanceSection() {
+    val mode = remember(io.github.hypercar.settings.SettingsRevision.value) { SettingsStore.appThemeMode }
+    SectionLabel("主题模式")
+    GlassPanel(modifier = Modifier.fillMaxWidth(), contentPadding = PaddingValues(16.dp)) {
+        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+            io.github.hypercar.settings.AppThemeMode.entries.forEachIndexed { index, option ->
+                SegmentedButton(selected = mode == option, onClick = { SettingsStore.appThemeMode = option },
+                    shape = SegmentedButtonDefaults.itemShape(index, count = 3),
+                    label = { Text(option.label, style = MaterialTheme.typography.labelMedium) })
+            }
+        }
+        Spacer(Modifier.height(12.dp))
+        Text("跟随手机系统自动切换；手动选择即时生效。", color = TextSecondary,
+            style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.height(6.dp))
+        Text("仅改变 App 的主题风格，车机主题请在车机中设置。", color = TextSecondary,
+            style = MaterialTheme.typography.bodySmall)
+    }
+    GlassPanel(modifier = Modifier.fillMaxWidth(), contentPadding = PaddingValues(16.dp)) {
+        Text(if (io.github.hypercar.ui.theme.LocalAppPalette.current.dark) "当前：深色主题" else "当前：HyperOS 风格浅色主题",
+            color = TextPrimary, style = MaterialTheme.typography.titleSmall)
+        Spacer(Modifier.height(6.dp))
+        Text(if (io.github.hypercar.ui.theme.LocalAppPalette.current.dark) "深空背景 · 青色强调 · 玻璃卡片"
+            else "浅灰背景 · 蓝色强调 · 白色圆角卡片", color = TextSecondary,
+            style = MaterialTheme.typography.bodySmall)
     }
 }
 
@@ -437,7 +471,7 @@ private fun ManualBtMacDialog(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color(0xB302040A))
+                .background(io.github.hypercar.ui.theme.ScrimDeepSpace)
                 .pointerInput(Unit) { detectTapGestures { onDismiss() } }
                 .padding(20.dp)
                 .navigationBarsPadding(),
@@ -886,7 +920,7 @@ private fun ResetPairingDialog(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color(0xB302040A))
+                .background(io.github.hypercar.ui.theme.ScrimDeepSpace)
                 .pointerInput(Unit) { detectTapGestures { onDismiss() } }
                 .padding(20.dp)
                 .navigationBarsPadding(),
@@ -935,7 +969,7 @@ private fun ResetPairingDialog(
                         onClick = onConfirm,
                         modifier = Modifier.height(44.dp),
                         filled = true,
-                        contentColor = Color(0xFF12060A),
+                        contentColor = io.github.hypercar.ui.theme.InkBlack,
                         borderColor = AmberWarning,
                     )
                 }
@@ -966,7 +1000,7 @@ private fun TargetCarDialog(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .background(Color(0xB302040A))
+                .background(io.github.hypercar.ui.theme.ScrimDeepSpace)
                 .pointerInput(Unit) { detectTapGestures { onDismiss() } }
                 .padding(20.dp)
                 .navigationBarsPadding(),

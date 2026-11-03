@@ -36,6 +36,7 @@ import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -105,7 +106,17 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
-            HyperCarTheme {
+            val themeMode = remember(SettingsRevision.value) { SettingsStore.appThemeMode }
+            HyperCarTheme(mode = themeMode) {
+                val dark = io.github.hypercar.ui.theme.LocalAppPalette.current.dark
+                SideEffect {
+                    window.statusBarColor = android.graphics.Color.TRANSPARENT
+                    window.navigationBarColor = android.graphics.Color.TRANSPARENT
+                    WindowInsetsControllerCompat(window, window.decorView).apply {
+                        isAppearanceLightStatusBars = !dark
+                        isAppearanceLightNavigationBars = !dark
+                    }
+                }
                 MainContent()
             }
         }

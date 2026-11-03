@@ -31,8 +31,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import io.github.hypercar.core.AudioStats
 import io.github.hypercar.core.SessionSnapshot
 import io.github.hypercar.core.VideoStats
@@ -93,6 +96,7 @@ private fun StatChip(
     modifier: Modifier = Modifier,
     leadingIcon: ImageVector? = null,
     onClick: (() -> Unit)? = null,
+    valueStyle: TextStyle = MonoMetric,
 ) {
     Row(
         modifier = modifier
@@ -125,7 +129,7 @@ private fun StatChip(
             )
             Text(
                 text = value,
-                style = MonoMetric,
+                style = valueStyle,
                 color = accent,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
@@ -159,6 +163,7 @@ private fun VideoChip(video: VideoStats, modifier: Modifier = Modifier) {
         accent = accent,
         leadingIcon = Icons.Rounded.Videocam,
         modifier = modifier,
+        valueStyle = MonoMetric.copy(fontFamily = FontFamily.Default, fontSize = 11.sp, letterSpacing = 0.sp),
     )
 }
 

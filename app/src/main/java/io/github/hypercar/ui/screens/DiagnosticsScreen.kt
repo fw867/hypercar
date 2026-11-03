@@ -453,11 +453,12 @@ private fun stripMarker(text: String): String {
 }
 
 /** 级别 → 颜色：E 红 / W 琥珀 / I 青 / D 与未知用次级灰。 */
+@Composable
 internal fun logLevelColor(level: Char?): Color = when (level) {
     'E' -> CoralError
     'W' -> AmberWarning
-    'I' -> ElectricCyan.copy(alpha = 0.8f)
-    'D' -> MintGreen.copy(alpha = 0.55f)
+    'I' -> ElectricCyan.copy(alpha = if (io.github.hypercar.ui.theme.LocalAppPalette.current.dark) 0.8f else 1f)
+    'D' -> MintGreen.copy(alpha = if (io.github.hypercar.ui.theme.LocalAppPalette.current.dark) 0.55f else 1f)
     else -> TextSecondary
 }
 

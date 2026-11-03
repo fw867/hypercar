@@ -117,7 +117,7 @@ private enum class GuidanceState {
         }
 
     val tint
-        get() = when (this) {
+        @Composable get() = when (this) {
             NeedPermission -> AmberWarning
             NeedLocation -> AmberWarning
             NeedFirstConnect -> ElectricCyan

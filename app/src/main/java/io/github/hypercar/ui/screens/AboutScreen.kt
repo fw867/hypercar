@@ -3,6 +3,7 @@ package io.github.hypercar.ui.screens
 import android.content.Intent
 import android.net.Uri
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -27,6 +28,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.colorResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -68,10 +70,11 @@ fun AboutScreen(modifier: Modifier = Modifier) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Image(
                 painter = painterResource(R.drawable.ic_launcher_glyph),
-                contentDescription = null,
+                contentDescription = "HyperCar 标志",
                 modifier = Modifier
                     .size(64.dp)
-                    .clip(RoundedCornerShape(18.dp)),
+                    .clip(RoundedCornerShape(18.dp))
+                    .background(colorResource(R.color.ic_launcher_background)),
             )
             Spacer(modifier = Modifier.width(14.dp))
             Column {
@@ -83,7 +86,7 @@ fun AboutScreen(modifier: Modifier = Modifier) {
                     color = TextPrimary,
                 )
                 Text(
-                    text = "自绘车机 UI · 高德导航 · CarPlay / AirPlay",
+                    text = "Android 无线 CarPlay 互联\n支持自绘界面与 CarWith",
                     style = MaterialTheme.typography.bodySmall,
                     color = TextSecondary,
                 )
