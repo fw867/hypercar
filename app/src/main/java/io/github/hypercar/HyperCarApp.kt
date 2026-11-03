@@ -21,6 +21,7 @@ class HyperCarApp : Application() {
         // 会话总管：注入 ACL 唤醒 handler + Rust 回调监听（秒连链路的第一环）
         HyperCarRepo.init(this)
         if (SettingsStore.autoConnect) HyperCarRepo.startAutomaticListening(this)
+        io.github.hypercar.carui.MusicNotificationListener.sync(this)
         // 触发 RustCoreBridge 类加载（loadLibrary + nativeInitLogger）。
         // 注意：这里绝不能再 setListener(null)——Repo 刚注册的监听会被清掉。
         RustCoreBridge.nativeIsRunning()

@@ -72,6 +72,7 @@ class Iap2Coordinator(
     private var resolvedMac: String? = null
 
     val isRunning: Boolean get() = bluetooth?.isRunning == true
+    val activePeerAddress: String? get() = bluetooth?.activePeerAddress
     val isSessionActive: Boolean get() = bluetooth?.isSessionActive == true
     val isListening: Boolean get() = bluetooth?.isListening == true
 

@@ -114,6 +114,10 @@
             android:name=".carui.MusicNotificationListener"
             android:exported="true"
             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <!-- Bind explicitly for automatic listening or a manual session; unlock must not auto-bind. -->
+            <meta-data
+                android:name="android.service.notification.default_autobind_listenerservice"
+                android:value="false" />
             <intent-filter>
                 <action android:name="android.service.notification.NotificationListenerService" />
             </intent-filter>

@@ -26,6 +26,8 @@ use crate::{emit_log, emit_stats, emit_state};
 /// 外部（Kotlin 侧）投喂给引擎的数据事件。
 pub enum SourceEvent {
     CarWithTouch(TouchInput),
+    RequestCarWithKeyFrame,
+    ResetVideoSource,
     RequestHostUi,
     /// 视频编码器产出一帧（H.264 Annex B，可能含 SPS/PPS/IDR）。
     VideoFrame { pts_us: u64, data: Vec<u8> },
@@ -147,6 +149,7 @@ pub async fn run_engine(
                     let _hub = hub;
                     while let Some(ev) = life_events.recv().await {
                         match ev {
+                            CarLifeEvent::SourceReset => { let _ = vtx.send(SourceEvent::ResetVideoSource); }
                             CarLifeEvent::VideoFrame { pts_us, data } => {
                                 let _ = vtx.send(SourceEvent::VideoFrame { pts_us, data });
                             }
@@ -181,6 +184,9 @@ pub async fn run_engine(
                 tokio::select! {
                     _ = stop_d.notified() => return,
                     ev = source_rx.recv() => match ev {
+                        Some(SourceEvent::RequestCarWithKeyFrame) => {
+                            if let Some(hub) = &carwith_hub { hub.request_keyframe(); }
+                        }
                         Some(SourceEvent::CarWithTouch(t)) => {
                             if let Some(hub) = &carwith_hub { hub.inject_touch(t.action, t.x, t.y); }
                         }
@@ -242,6 +248,11 @@ pub async fn run_engine(
                         ready = None;
                     }
                     ev = video_rx.recv() => match ev {
+                        Some(SourceEvent::ResetVideoSource) => {
+                            encoder_size = None; pending_size = None;
+                            if let Some(s) = sender.as_mut() { s.reset_source(); }
+                            emit_log("CARWITH-VIDEO: fresh source round; waiting for current configuration and IDR");
+                        }
                         Some(SourceEvent::EncoderResolution { width, height }) => {
                             // 手机回报实际编码尺寸 → 同步 AirPlay 画布（VideoConfig 宽高）。
                             // 必须在首帧引出 VideoConfig 之前生效，否则车机按旧画布解码。
@@ -673,6 +684,7 @@ struct AudioPumpStat {
 /// CarLife（HU 侧）向引擎上报的事件（2026-11-03 从 archive 分支取回，供 CarWith 模式使用）。
 #[derive(Debug, Clone)]
 pub enum CarLifeEvent {
+    SourceReset,
     Handshake,
     VideoFrame { pts_us: u64, data: Vec<u8> },
     AudioInit { tts: bool, rate: u32, channels: u8 },

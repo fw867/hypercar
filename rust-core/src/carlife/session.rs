@@ -192,14 +192,28 @@ fn crypt(bytes: &[u8], key: Option<&[u8]>, encrypt: bool) -> Result<Vec<u8>,Stri
 }
 
 pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLifeEvent>,
-    size: Arc<Mutex<(u32,u32)>>, requested: Arc<Mutex<(u32,u32)>>, mut cfg: CarLifeConfig, state: Shared) -> Result<(),String> {
+    size: Arc<Mutex<(u32,u32)>>, requested: Arc<Mutex<(u32,u32)>>, mut cfg: CarLifeConfig, state: Shared, reset_request: Arc<Notify>) -> Result<(),String> {
     let (mut rd, mut wr) = stream.into_split();
     if !send_cmd(&mut wr, CMD_HU_PROTOCOL_VERSION, &proto_version_payload()).await { return Err("version write failed".into()); }
     let mut buf=Vec::new(); let mut chunk=[0;4096];
+    let mut last_reset: Option<tokio::time::Instant> = None;
     loop {
         let started=state.lock().started;
-        let read=if started { rd.read(&mut chunk).await }
-            else { tokio::time::timeout(Duration::from_secs(20),rd.read(&mut chunk)).await.map_err(|_| "CarWith command timeout")? };
+        let read = tokio::select! {
+            _ = reset_request.notified(), if started => {
+                // mcarplay CarLifeSession.requestKeyFrame: CMD 0x1800B, not CTRL or START.
+                if last_reset.map(|t| t.elapsed() >= Duration::from_secs(1)).unwrap_or(true) {
+                    if !send_cmd(&mut wr, 0x1800b, &[]).await { return Err("CarWith RESET write failed".into()); }
+                    last_reset = Some(tokio::time::Instant::now());
+                    emit_log("CARWITH-HS: TX 0x1800b VIDEO_ENCODER_RESET (keyframe request)");
+                }
+                continue;
+            }
+            result = async {
+                if started { Ok(rd.read(&mut chunk).await) }
+                else { tokio::time::timeout(Duration::from_secs(20),rd.read(&mut chunk)).await }
+            } => result.map_err(|_| "CarWith command timeout")?,
+        };
         let n=read.map_err(|e|e.to_string())?;
         if n==0 { return Err("CarWith command EOF".into()); }
         buf.extend_from_slice(&chunk[..n]);
@@ -332,6 +346,35 @@ mod tests {
         assert_eq!(s.decrypt(&wire).unwrap(),actions[0].1);
         assert_eq!(first_int(&actions[0].1,3),Some(30));
         assert!(s.receive(CMD_MD_AES_SEED,&body,&cfg()).is_err());
+    }
+
+    #[tokio::test]
+    async fn reset_waits_for_video_start_and_uses_command_channel_with_throttling() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn next(stream: &mut TcpStream) -> u32 {
+            let mut header = [0; 8]; stream.read_exact(&mut header).await.unwrap();
+            let mut body = vec![0; u16::from_be_bytes([header[0], header[1]]) as usize];
+            stream.read_exact(&mut body).await.unwrap();
+            u32::from_be_bytes(header[4..8].try_into().unwrap())
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut phone, _) = listener.accept().await.unwrap();
+        let state = Shared::new(Mutex::new(Session::default()));
+        let reset = Arc::new(Notify::new());
+        let (events, _rx) = mpsc::unbounded_channel();
+        let size = Arc::new(Mutex::new((1280, 720)));
+        let task = tokio::spawn(run(stream, events, size.clone(), size, cfg(), state.clone(), reset.clone()));
+        assert_eq!(next(&mut phone).await, CMD_HU_PROTOCOL_VERSION);
+        reset.notify_one();
+        assert!(tokio::time::timeout(Duration::from_millis(30), next(&mut phone)).await.is_err());
+        state.lock().started = true;
+        phone.write_all(&build_cmd_frame(0x10022, &[])).await.unwrap();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1), next(&mut phone)).await.unwrap(), 0x1800b);
+        reset.notify_one();
+        assert!(tokio::time::timeout(Duration::from_millis(30), next(&mut phone)).await.is_err());
+        drop(phone);
+        assert!(tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap().is_err());
     }
 
     #[test] fn aes_ecb_matches_known_block_and_rejects_bad_padding() {

@@ -19,8 +19,8 @@ import io.github.hypercar.settings.SettingsStore
  * 隐式广播豁免清单里（Android 8+ 对清单隐式广播限制的例外），车机蓝牙一连上系统就把本进程
  * 拉起来，不需要任何前台 Activity。
  *
- * 目标过滤：优先用户选定的目标车机（SettingsStore.targetCarMac），否则按蓝牙名关键词
- * （BMW/MINI/宝马）兜底——耳机/手表不会误触发。拿不到 address/name（缺 BLUETOOTH_CONNECT）
+ * 目标过滤：优先用户选定的目标车机（SettingsStore.targetCarMac），否则识别已成功连接的车机、声明 iAP2 的已配对设备及
+ * 常见车机名称——耳机/手表不会误触发。拿不到 address/name（缺 BLUETOOTH_CONNECT）
  * 无法判断是否目标车机，直接放弃并记日志。
  *
  * 「上车自动连接」开关（SettingsStore.autoConnect）每次广播都读（进程可能刚冷启动，无内存缓存）。
@@ -59,7 +59,7 @@ class CarBluetoothReceiver : BroadcastReceiver() {
             Log.i(TAG, "拿不到蓝牙 name/address（缺 BLUETOOTH_CONNECT？）——放弃")
             return
         }
-        if (!isTargetCar(app, address, name)) {
+        if (!isTargetCar(device, address, name)) {
             Log.i(TAG, "忽略非车机蓝牙 $name（$address）")
             return
         }
@@ -92,12 +92,16 @@ class CarBluetoothReceiver : BroadcastReceiver() {
             }
     }
 
-    /** 目标车机判定：选定 MAC 优先，否则按蓝牙名关键词兜底。 */
-    private fun isTargetCar(context: Context, address: String, name: String): Boolean {
-        val targetMac = SettingsStore.targetCarMac
-        if (!targetMac.isNullOrBlank()) return address.equals(targetMac, ignoreCase = true)
-        return CAR_KEYWORDS.any { name.contains(it, ignoreCase = true) }
-    }
+    /** Read the current selection; automatic mode recognises known/advertised receivers too. */
+    @SuppressLint("MissingPermission")
+    private fun isTargetCar(device: BluetoothDevice, address: String, name: String): Boolean =
+        io.github.hypercar.bluetooth.CarTargetPolicy.acceptsAcl(
+            SettingsStore.targetCarMac, address, name,
+            knownCar = SettingsStore.isCarPaired(address),
+            hasIap2 = device.bondState == BluetoothDevice.BOND_BONDED && runCatching {
+                device.uuids?.any { it.uuid == io.github.hypercar.iap2.Iap2Bluetooth.ACCESSORY_IAP2_UUID } == true
+            }.getOrDefault(false),
+        )
 
     @Suppress("DEPRECATION")
     private fun deviceOf(intent: Intent): BluetoothDevice? =
@@ -113,9 +117,6 @@ class CarBluetoothReceiver : BroadcastReceiver() {
 
         /** 「自己断开导致的 ACL 断开」日志节流（出站循环每 3s 一轮，别一行一行刷）。 */
         const val SELF_DROP_LOG_THROTTLE_MILLIS = 30_000L
-
-        /** 未选目标车机时的兜底：常见车机蓝牙名关键词（真车 BMW/MINI/宝马）。 */
-        val CAR_KEYWORDS = listOf("BMW", "MINI", "宝马")
 
         /** 日志节流时间戳。放 companion：清单接收器每次广播都是新实例，实例字段记不住。 */
         @Volatile

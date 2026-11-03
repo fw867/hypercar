@@ -5,6 +5,7 @@
 //! CarWith DATA is port 9440. Do not mix generic CarLife assumptions with this path.
 
 mod session;
+mod video;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -218,6 +219,7 @@ pub struct CarLifeHub {
     mic_tx: mpsc::UnboundedSender<Vec<u8>>,
     /// 麦克风帧时间戳基准
     mic_start: std::time::Instant,
+    keyframe_request: Option<Arc<Notify>>,
 }
 
 impl CarLifeHub {
@@ -289,6 +291,7 @@ impl CarLifeHub {
                 encoder_size,
                 mic_tx,
                 mic_start: std::time::Instant::now(),
+                keyframe_request: None,
             },
             event_rx,
         ))
@@ -306,10 +309,12 @@ impl CarLifeHub {
     /// 现场 2026-10-23 22:56 实测，点「开始连接」后手机 `com.baidu.carlife.xiaomi`
     /// （uid 10345）开始 **LISTEN** `7240/8240/9240/9241/9242/9340`，等车机连入；
     /// 这与参考实现 `CarLifeWirelessBox` 的 `HuRole.connect(phoneIp, port)` 一致。
-    /// Android 上（HU 与 MD 同机）仍然用 [`Self::start`] 的监听模式。
+    /// Android CarWith 同机也使用本方法主动连接 127.0.0.1；Self::start 仅保留旧监听模式。
     pub fn connect(
         cfg: CarLifeConfig, md_host: String, stop: Arc<Notify>, requested: Option<Arc<Mutex<(u32,u32)>>>,
     ) -> Result<(Self, mpsc::UnboundedReceiver<CarLifeEvent>), String> {
+        let keyframe_request = Arc::new(Notify::new());
+        let reset_request = keyframe_request.clone();
         let (events, event_rx) = mpsc::unbounded_channel();
         let (touch_tx, mut touch_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (mic_tx, mic_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -351,6 +356,7 @@ impl CarLifeHub {
                 emit_log("CARWITH-HS: all seven channels connected; start fresh 4.1 handshake");
                 queue.lock().clear();
                 *round_touch.lock()=session::TouchGesture::default();
+                let _ = events_task.send(CarLifeEvent::SourceReset);
                 let state=session::Shared::new(Mutex::new(session::Session::default()));
                 let mut sockets=sockets.into_iter();
                 let cmd=sockets.next().unwrap();
@@ -370,7 +376,7 @@ impl CarLifeHub {
                 let outcome=tokio::select! {
                     _=stop.notified()=>{children.abort_all(); return;},
                     _=children.join_next()=>Err("CarWith media/control channel closed".into()),
-                    result=session::run(cmd,events_task.clone(),size.clone(),requested.clone(),config.clone(),state.clone())=>result,
+                    result=session::run(cmd,events_task.clone(),size.clone(),requested.clone(),config.clone(),state.clone(),reset_request.clone())=>result,
                 };
                 children.abort_all(); while children.join_next().await.is_some() {}
                 queue.lock().clear();
@@ -378,7 +384,11 @@ impl CarLifeHub {
                 tokio::select! { _=stop.notified()=>return, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
             }
         });
-        Ok((Self {owned_tasks:vec![fill_task,connection_task],touch_state,events,touch_tx,cfg,encoder_size,mic_tx,mic_start:std::time::Instant::now()},event_rx))
+        Ok((Self {owned_tasks:vec![fill_task,connection_task],touch_state,events,touch_tx,cfg,encoder_size,mic_tx,mic_start:std::time::Instant::now(),keyframe_request:Some(keyframe_request)},event_rx))
+    }
+
+    pub fn request_keyframe(&self) {
+        if let Some(request) = &self.keyframe_request { request.notify_one(); }
     }
 
     /// 外部（AirPlay 事件通道）注入触摸 → CarLife CTRL 通道 TOUCH_ACTION。
@@ -477,7 +487,7 @@ fn now_ms() -> u32 {
         .unwrap_or(0)
 }
 
-/// 媒体帧（12 字节头）：`[u32 BE len][u32 BE ts_ms][u32 BE type][payload]`。
+/// 媒体帧（12 字节头）：`[u32 BE len][u32 BE timestamp][u32 BE type][payload]`。CarWith VIDEO 时间为 Unix 秒。
 fn build_media_frame(service_type: u32, timestamp_ms: u32, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(12 + payload.len());
     out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -512,7 +522,7 @@ fn read_cmd_frame(buf: &[u8]) -> Option<(u32, Vec<u8>, usize)> {
     Some((service_type, buf[8..total].to_vec(), total))
 }
 
-/// 媒体帧（12 字节头）：`[u32 BE len][u32 BE ts_ms][u32 BE type][payload]`。
+/// 媒体帧（12 字节头）：`[u32 BE len][u32 BE timestamp][u32 BE type][payload]`。CarWith VIDEO 时间为 Unix 秒。
 fn read_media_frame(buf: &[u8]) -> Option<(u32, u32, Vec<u8>, usize)> {
     if buf.len() < 12 {
         return None;
@@ -1321,6 +1331,8 @@ async fn handle_media_client(
     // （2026-10-26 00:24 现场：没有任何 VideoFrame 产出）。这里把前几次读到的东西打出来，
     // 一眼就能分清「8240 上一个字节都没有」还是「有数据但帧头解析不出来」。
     let mut diag_reads: u32 = 0;
+    let mut parser = video::VideoParser::default();
+    let mut access_units = 0u64;
     // **VIDEO 心跳**：官方 HU 实现（apollo-DuerOS `ConnectionEstablishHandler` 的
     // heartBeatTask）每秒往 VIDEO 通道发一条 `MSG_VIDEO_HEARTBEAT (0x20002)`；
     // 我们之前只读不发，CarLife 可能因此认为视频通道"没人要"，编码器空转不给帧。
@@ -1332,7 +1344,10 @@ async fn handle_media_client(
     loop {
         let read = tokio::select! {
             _ = hb.tick(), if is_video => {
-                let frame = build_media_frame(VIDEO_HEARTBEAT, now_ms(), &[]);
+                let timestamp = if encryption.is_some() {
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as u32
+                } else { now_ms() };
+                let frame = build_media_frame(VIDEO_HEARTBEAT, timestamp, &[]);
                 if wr.write_all(&frame).await.is_err() {
                     return;
                 }
@@ -1388,10 +1403,26 @@ async fn handle_media_client(
                             // 首帧到达：CMD 侧的 START 补发逻辑据此停止
                             VIDEO_FIRST_FRAME_RECEIVED
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
-                            let _ = events.send(CarLifeEvent::VideoFrame {
-                                pts_us: ts_ms as u64 * 1000,
-                                data: payload,
-                            });
+                            if encryption.is_some() {
+                                let units = match parser.push(&payload) {
+                                    Ok(units) => units,
+                                    Err(error) => { emit_log(&format!("CARWITH-VIDEO: {error}")); return; }
+                                };
+                                for data in units {
+                                    access_units += 1;
+                                    let types: Vec<_> = crate::screen::annexb_nals(&data).iter().map(|n| n[0] & 31).collect();
+                                    if access_units == 1 || types.contains(&5) {
+                                        emit_log(&format!("CARWITH-VIDEO: AU#{access_units} bytes={} nals={types:?} sourceUnixSeconds={ts_ms}; AirPlay PTS=monotonic",data.len()));
+                                    }
+                                    let _ = events.send(CarLifeEvent::VideoFrame {
+                                        pts_us: crate::timing::monotonic_nanos() / 1000, data,
+                                    });
+                                }
+                            } else {
+                                let _ = events.send(CarLifeEvent::VideoFrame {
+                                    pts_us: ts_ms as u64 * 1000, data: payload,
+                                });
+                            }
                         }
                     }
                     VIDEO_HEARTBEAT => { /* 流级心跳，忽略 */ }

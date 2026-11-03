@@ -72,4 +72,13 @@ class RemoteProfilesTest {
             ), actual)
         }
     }
+    @Test fun cachedSchemaFourCannotReenableBmwAudioProfileDrops() {
+        val stale = RemoteProfiles.parse("""{"_schema":4,"profiles":[
+            {"id":"bmw_id85","dropProfilesBeforeIap2":true}]}""")
+        val effective = RemoteProfiles.merge(HeadUnitProfiles.builtin, stale, 4)
+            .single { it.id == "bmw_id85" }
+        assertFalse(effective.dropProfilesBeforeIap2)
+        assertFalse(effective.allowOutboundIap2)
+        assertTrue(effective.requireAirplayActivation)
+    }
 }

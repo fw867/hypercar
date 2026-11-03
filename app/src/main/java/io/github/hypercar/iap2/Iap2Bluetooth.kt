@@ -101,6 +101,8 @@ class Iap2Bluetooth(
 
     /** 当前会话占用的 socket（stop/notifyBluetoothLost 关它来打断阻塞读写）。 */
     private val currentSocket = AtomicReference<BluetoothSocket?>(null)
+    // Unlike currentSocket, this never points at a still-pending outbound dial.
+    private val sessionSocket = AtomicReference<BluetoothSocket?>(null)
     private val pendingDial = AtomicReference<BluetoothSocket?>(null)
 
     /** 当前会话的链路通道（主动结束会话用）。 */
@@ -144,7 +146,9 @@ class Iap2Bluetooth(
     private var sessionProductive = false
 
     /** 「是否提供 iAP2 服务」结论缓存（地址→结论）：SDP 查询不便宜，勿每 3s 重查。 */
-    private val iap2ServiceCache = ConcurrentHashMap<String, Boolean>()
+    private data class ServiceResult(val revision: Long, val available: Boolean)
+    private val iap2ServiceCache = ConcurrentHashMap<String, ServiceResult>()
+    private val targetRevision = java.util.concurrent.atomic.AtomicLong()
 
     /** 「无 iAP2 服务→跳过」日志去重（每地址一次即可，重复轮询不刷屏）。 */
     private val skippedNoService: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet())
@@ -158,6 +162,9 @@ class Iap2Bluetooth(
     val isRunning: Boolean get() = running
 
     /** 当前是否有会话在跑（上层诊断用）。 */
+    val activePeerAddress: String?
+        get() = sessionSocket.get()?.let { runCatching { safeAddress(it.remoteDevice) }.getOrNull() }
+
     val isSessionActive: Boolean get() = sessionActive.get()
     val isListening: Boolean get() = running && listener?.isRegistered == true
 
@@ -204,6 +211,7 @@ class Iap2Bluetooth(
             return false
         }
         // 每轮启动重置 SDP 结论与跳过日志（新配对/换固件后重新探测）
+        targetRevision.incrementAndGet()
         iap2ServiceCache.clear()
         skippedNoService.clear()
         running = true
@@ -290,13 +298,17 @@ class Iap2Bluetooth(
      * 车机蓝牙断开后，旧 RFCOMM socket 的读会卡在半开连接上不返回——必须主动关。
      */
     fun dropCurrentSession() {
+        sessionSocket.getAndSet(null)?.let { runCatching { it.close() } }
         pendingDial.getAndSet(null)?.let { socket -> runCatching { socket.close() } }
         activeChannel.getAndSet(null)?.let { channel -> runCatching { channel.close() } }
         currentSocket.getAndSet(null)?.let { socket -> runCatching { socket.close() } }
     }
 
     fun onTargetChanged() {
-        // 不碰 currentSocket：入站会话可能恰好在此时建立，只取消尚在 connect() 的拨号。
+        targetRevision.incrementAndGet()
+        iap2ServiceCache.clear()
+        skippedNoService.clear()
+        // Preserve an existing connection; only cancel an unfinished outbound dial.
         pendingDial.getAndSet(null)?.let { runCatching { it.close() } }
         log("BT: 目标已更新 explicit=${targetProvider() ?: "自动"} hint=${preferredProvider() ?: "无"} active=${sessionActive.get()}")
     }
@@ -391,11 +403,10 @@ class Iap2Bluetooth(
             }
             val explicitTarget = targetProvider()
             val preferred = preferredProvider()
-            val target = io.github.hypercar.bluetooth.CarTargetPolicy.outgoingTarget(explicitTarget, preferred)
-            val candidates = candidateDevices(adapter, target)
+            val candidates = candidateDevices(adapter, explicitTarget, preferred)
             if (candidates.isEmpty()) {
-                if (target != null) {
-                    log("BT-C: 目标 $target 不在已配对列表（或未声明 iAP2 服务）——请先在系统设置里与车机完成配对")
+                if (explicitTarget != null) {
+                    log("BT-C: 目标 $explicitTarget 不在已配对列表（或未声明 iAP2 服务）——请先在系统设置里与车机完成配对")
                     sleepQuietly(RETRY_DELAY_MILLIS * 4)
                 } else {
                     log("BT-C: 没有「已配对且声明 iAP2 服务」的设备——请先与车机完成系统蓝牙配对")
@@ -477,6 +488,7 @@ class Iap2Bluetooth(
     private fun candidateDevices(
         adapter: android.bluetooth.BluetoothAdapter,
         target: String?,
+        preferred: String?,
     ): List<BluetoothDevice> {
         val bonded =
             try {
@@ -484,31 +496,30 @@ class Iap2Bluetooth(
             } catch (_: SecurityException) {
                 emptyList()
             }
-        if (target != null) {
-            // 目标策略：地址命中即唯一候选——用户显式指定就该尝试（SDP 缓存可能缺失）
-            return bonded.filter { it.address.equals(target, ignoreCase = true) }
-        }
-        return bonded.filter { device ->
-            if (awaitIap2Service(device)) {
-                true
-            } else {
-                if (skippedNoService.add(device.address)) {
-                    log("BT-C: 跳过「${safeName(device) ?: device.address}」（未发现 iAP2 服务——非 CarPlay 设备，保持其音频连接）")
-                }
-                false
+        val byAddress = bonded.associateBy { it.address }
+        val addresses = io.github.hypercar.bluetooth.CarTargetPolicy.outgoingCandidates(
+            target, preferred, byAddress.keys.toList(),
+        ) { address ->
+            val device = byAddress.getValue(address)
+            val found = awaitIap2Service(device)
+            if (!found && skippedNoService.add(address)) {
+                log("BT-C: 跳过「${safeName(device) ?: address}」（未发现 iAP2 服务——非 CarPlay 设备，保持其音频连接）")
             }
+            found
         }
+        return addresses.map(byAddress::getValue)
     }
 
     /**
      * 设备是否提供配件端 iAP2 服务（…caff）：先读系统 uuids 缓存，缺失再
      * `fetchUuidsWithSdp` 触发一次 SDP 查询并等 `ACTION_UUID` 广播（超时按无服务）。
-     * 结论缓存到下一次 start()——车机固件升级换 UUID 的场景由重启覆盖。
+     * 结论缓存到下一次 start()/目标切换；旧目标下的在途 SDP 结果不能污染新轮缓存。
      * 权限：调用方已校验 BLUETOOTH_CONNECT；SecurityException 由 runCatching 吸收。
      */
     @SuppressLint("MissingPermission")
     private fun awaitIap2Service(device: BluetoothDevice): Boolean {
-        iap2ServiceCache[device.address]?.let { return it }
+        val revision = targetRevision.get()
+        iap2ServiceCache[device.address]?.takeIf { it.revision == revision }?.let { return it.available }
 
         fun cachedHas(): Boolean =
             runCatching {
@@ -516,7 +527,7 @@ class Iap2Bluetooth(
             }.getOrDefault(false)
 
         if (cachedHas()) {
-            iap2ServiceCache[device.address] = true
+            iap2ServiceCache[device.address] = ServiceResult(revision, true)
             return true
         }
         val latch = CountDownLatch(1)
@@ -551,7 +562,7 @@ class Iap2Bluetooth(
         }
         runCatching { appContext.unregisterReceiver(receiver) }
         val has = cachedHas()
-        iap2ServiceCache[device.address] = has
+        iap2ServiceCache[device.address] = ServiceResult(revision, has)
         return has
     }
 
@@ -591,6 +602,7 @@ class Iap2Bluetooth(
             runCatching { socket.close() }
             return
         }
+        sessionSocket.set(socket)
         sessionStarts.incrementAndGet()
         sessionProductive = false
         currentSocket.set(socket)
@@ -651,6 +663,7 @@ class Iap2Bluetooth(
         } finally {
             sessionLog("END alive=${channel.isAlive} cancelled=${channel.isCancelled} reason=${channel.closeReason ?: "会话层退出"}")
             activeChannel.compareAndSet(channel, null)
+            sessionSocket.compareAndSet(socket, null)
             currentSocket.compareAndSet(socket, null)
             runCatching { channel.close() }
             runCatching { socket.close() }

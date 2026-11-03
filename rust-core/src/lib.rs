@@ -75,6 +75,7 @@ struct EngineHandle {
     key_tx: mpsc::UnboundedSender<u32>,
     /// 自绘界面投喂给引擎的视频帧 / 音频 PCM（nativePushVideoFrame / nativePushAudioPcm）
     source_tx: mpsc::UnboundedSender<engine::SourceEvent>,
+    carwith_source: bool,
     /// 手机实际编码尺寸（触摸坐标目标）。与 /info 的 encoder_size 分开。
     touch_size: Arc<parking_lot::Mutex<(u32, u32)>>,
 }
@@ -151,8 +152,11 @@ pub(crate) fn emit_night_mode(night: bool) {
     });
 }
 
-/// 车机 forceKeyFrame → Kotlin，让 MediaCodec 立刻产出一个 IDR。
+/// Route forceKeyFrame to the active producer: CarWith CMD RESET or Kotlin MediaCodec.
 pub(crate) fn emit_force_keyframe() {
+    let routed = ENGINE.lock().as_ref().map(|h| h.carwith_source &&
+        h.source_tx.send(engine::SourceEvent::RequestCarWithKeyFrame).is_ok()).unwrap_or(false);
+    if routed { return; }
     call_listener("onForceKeyFrame", |env, obj| {
         env.call_method(obj, "onForceKeyFrame", "()V", &[])
             .map(|_| ())
@@ -488,6 +492,7 @@ fn native_start_impl(
     });
 
     let (source_tx, source_rx) = mpsc::unbounded_channel::<engine::SourceEvent>();
+    let carwith_source = cfg.carlife_source;
     let carwith_touch_source = cfg.carlife_source.then(|| source_tx.clone());
     let (touch_tx, mut touch_rx) = mpsc::unbounded_channel::<TouchInput>();
     let (key_tx, _key_rx) = mpsc::unbounded_channel::<u32>();
@@ -555,6 +560,7 @@ fn native_start_impl(
         touch_tx,
         key_tx,
         source_tx,
+        carwith_source,
         touch_size,
     });
 

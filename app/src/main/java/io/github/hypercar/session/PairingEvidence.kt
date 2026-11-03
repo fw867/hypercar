@@ -8,6 +8,13 @@ data class PairingEvidence(val identityPresent: Boolean, val receiverCredentialP
     val mayDropProfiles: Boolean get() = identityPresent && receiverCredentialPresent
 
     companion object {
+        /** A shared/home SSID is a discovery hint, never a desktop receiver's credential identity. */
+        fun receiverMac(activePeer: String?, sessionPeer: String?, wifiHint: String?, desktop: Boolean): String? =
+            activePeer?.takeIf { receiverKey(it) != null }
+                ?: sessionPeer?.takeIf { receiverKey(it) != null }
+                ?: wifiHint?.takeIf { !desktop && receiverKey(it) != null }
+
+
         fun receiverKey(mac: String?): String? {
             val normalized = mac?.trim()?.lowercase(Locale.ROOT) ?: return null
             if (!Regex("(?:[0-9a-f]{2}:){5}[0-9a-f]{2}").matches(normalized)) return null

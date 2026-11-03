@@ -50,7 +50,7 @@ data class HeadUnitProfile(
     /**
      * 是否启用目标车机音频配置保护。仅处理已连接的配置文件，
      * 不调用设备级 disconnect；生效条件与节流由 CarProfileGuard/CarProfilePolicy 决定。
-     * 当前内置宝马启用，但其对二次上车的收益仍需实车验证。
+     * 宝马经用户实测未改善二次上车，当前关闭；其它档案按各自配置。
      */
     val dropProfilesBeforeIap2: Boolean = true,
 
@@ -86,18 +86,15 @@ object HeadUnitProfiles {
         id = "bmw_id85",
         label = "BMW iD8.5",
         model = "MGU-86 / MGU-55",
-        notes = "兼容 MGU-86 / MGU-55；由车机发起 CarPlay，启用目标音频配置保护。首次连接请在 iDrive 确认授权。",
+        notes = "兼容 MGU-86 / MGU-55；由车机发起 CarPlay，保留系统蓝牙音频连接。首次连接请在 iDrive 确认授权。",
         validatesDeviceId = false,
         // ↓ 这三项 2026-10-25 现场 A/B 恢复为 0.27 值：0.27 有 CarPlay 图标，停发后图标消失
         sendCarPlayAvailability = true,
         openEaSessions = true,
         sendTransportIdentifier = true,
         replyPowerUpdates = true,
-        // 2026-11-01 按用户要求打开（A/B 实验）：上车时手机侧 HFP/A2DP 回连会抢占 ACL，
-        // 车机随后 `Remote Terminated`（现场 dumpsys：11:05:10.840 HFP 回连 → 11:05:13.038 拆链），
-        // iAP2 从未打开。cardeck 的做法同样是「只配对、不连接配置文件」。
-        // ⚠ 2026-10-25 曾打开过又回退（当时观察到断开配置会连带把 ACL 拽掉）——本轮是对照实验。
-        dropProfilesBeforeIap2 = true,
+        // 2026-11-03 用户实测二次上车无改善，关闭 HFP/A2DP 主动断开以继续对照。
+        dropProfilesBeforeIap2 = false,
         allowOutboundIap2 = false,
         abortWhenCarPlayWindowClosed = false,
         preferMdnsAirplay = true,

@@ -149,6 +149,13 @@ impl ScreenSender {
         (self.width as u32, self.height as u32)
     }
 
+    pub fn reset_source(&mut self) {
+        self.config_sent = false;
+        self.last_sps = None; self.last_pps = None;
+        self.waiting_idr = true; self.last_sync_request = None;
+        self.logged_first_frame = false;
+    }
+
     pub fn set_ownership(&mut self, owner: std::sync::Arc<std::sync::atomic::AtomicBool>) { self.ownership = Some(owner); }
 
     pub fn set_size(&mut self, width: u32, height: u32) {

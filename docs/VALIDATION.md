@@ -40,3 +40,112 @@
 - UWB / 蓝牙数字钥匙失效与 HyperCar 调试之间的因果关系。
 
 以上不作为已知修复或确定故障原因。继续测试时保留版本、有效档案、完整时间范围和车机操作，按[诊断](HANDSHAKE-DIAGNOSTICS.md)定位实际到达的阶段。
+
+
+## 11 月 3 日 CarWith 实车复核
+
+517 的两份上午导出均为 CarWith 画面源。首段约 0.9 秒即由车机先拆 RFCOMM，随后 RTSP EOF；重连后本机源完成认证/加密并产出 H.264，但约 34 秒 AirPlay 会话期间未写出 VideoConfig、发送视频 frames=0。屏幕权限前丢初始化参数及关键帧回调未路由 CarWith 的代码缺口已定位，尚未实施修复或验证修复效果。用户后续自绘 UI 正常的现场反馈未包含在这两份导出中。
+
+通过 ADB 获取的完整蓝牙 HCI 覆盖 10:35:19～11:48:06，确认首段 DISC 来自车机、第二段手机拆蓝牙发生在 RTSP EOF 之后。此结果区分断开顺序，不证明车机内部终止理由，也不证明先前通信状态校正已修复认证后断连。详见 [CarWith 实车排查](CARWITH-SOURCE.md)。
+
+
+## mCarPlay 对照后的 CarWith 转发补齐（本地 518）
+
+参考固定版本 `a3a4117ed60b864324d681e45086be594ed7233a`，独立实现 CarWith Annex B access-unit 重组、每源 SPS/PPS 缓存/IDR 补参数、活动源关键帧请求路由到 CMD RESET、新源轮次清理旧 avcC，以及 CarWith 秒时间戳与 AirPlay 单调钟分离。本轮不更改自绘视频编码参数、蓝牙初配和认证门槛；详细分阶段差异见 [CarWith 对照与边界](CARWITH-SOURCE.md)。
+
+手机执行最终 Rust 测试：47 通过、0 失败、1 个真实 CarWith 接入场景 ignored。新增 8 项覆盖实际 TCP 的 RESET 时机/节流、屏幕所有权恢复后的配置先于 IDR、跨包/多 slice/多帧、参数缓存、格式缓存隔离和超限处理。120 项 Release JVM 通过；Rust release、APK/R8/vital lint 与正式签名验证通过。产物为 0.1.0.518 / 10518，尚未安装。宝马实车黑屏是否改善、第一次认证后车机结束的原因仍未验证，不把独立 loopback 成功当实车修复结论。
+
+
+## 11 月 3 日手机界面不响应：音乐桥主线程 Binder 阻塞
+
+用户保留卡死现场后，通过 USB ADB 只读采集 input/window、全缓冲 logcat、data_app_anr。手机仍为 0.1.0.517 / 10517，当前应用 PID=15364；本地 518 尚未安装。资料位于开发机 `D:/devtools/hypercar-diagnostics/20261103-freeze/`，不提交原始系统记录。
+
+当前进程的 MIUIScout 记录提供了直接栈证据：12:46:29、12:47:03 同一主线程 Handler message（seq=1876，`MusicBridge$ticker$1`）持续未返回，耗时分别 2,363,584 ms、2,397,054 ms，约 39～40 分钟。调用链为 `MusicBridge$ticker.run → publish → android.support.v4.media.session.IMediaSession$Stub$Proxy.getShuffleMode → BinderProxy.transactNative`。当时 Activity 的实际窗口没有 surface，系统只显示启动快照，InputDispatcher 没有 focused window；不能把画面静止直接解释为 Compose 渲染器问题。
+
+DropBox 另有五次 HyperCar ANR：11 月 2 日 21:38（493），11 月 3 日 01:00（503）、01:11（507）、01:56（514）、12:01（517）。均为触控分发等待超过 5 秒，主线程落在 MusicBridge.publish 的 support MediaSession Binder 调用。各次阻塞目标记录为 `com.luna.music`（汽水音乐），约 6.7～17.9 秒；反混淆中 g=getRepeatMode、h=getShuffleMode。当前堆栈证明本进程仍堵在 getShuffleMode，但没有取得对端播放器的内部线程栈，不能断言汽水音乐内部具体死锁原因。
+
+直接代码问题：MusicBridge 的 ticker 在主线程每秒执行 publish；后者读取 `compatController.repeatMode/shuffleMode`（以及其他状态），回调收到模式值后也只调用 publish 再次查询。同步 Binder 等不到对端时，主线程不能处理触控、绘制或 Activity 消息。它早于今天 CarWith 518 的视频修复，不应归因于尚未安装的本地新库。
+
+修复方向：UI 发布仅使用内存快照，模式回调直接更新缓存；初始及必要的播放器状态/队列查询移至隔离的后台执行器，不在主线程等待。后台调用需要有界提交、合并刷新及会话代际检查，阻塞时显示未知/旧值，不能靠不断创建新线程绕过不可取消的 Binder。进度刷新可从已缓存 PlaybackState 外推，不应每秒同步访问第三方播放器。已有 onMusicThread 的 1500 ms latch 只约束等待者，并不能取消主线程内部的 Binder 调用。
+
+本轮完成原因定位，没有修改 MusicBridge 运行代码、安装、重启应用或停止播放器。底层直接取栈与 SIGQUIT 被设备权限拒绝后，使用现成的系统 MIUIScout 主线程栈确认现场，未要求 root。
+
+
+## 11 月 3 日音乐桥卡死修复与 519 安装
+
+0.1.0.519 / 10519 在本次音乐修复中保留本地 518 的 CarWith 原生库。MusicBridge 的 publish/ticker 改为读取缓存的 metadata、PlaybackState、queue、ratingType 与播放模式；平台媒体回调直接更新缓存，进度按缓存状态的单调钟及 playbackSpeed 外推并限制到歌曲时长。首次会话发现及快照获取在后台执行，同一 session token 不反复替换回调或用迟到快照覆盖最新回调。
+
+support MediaController 的创建、模式回调注册/注销、初始 repeat/shuffle 查询移到独立后台执行器，模式回调直接采用参数。onSessionReady 后补查初始模式；初始结果不能覆盖较新的模式回调。模式设置另用后台执行器，避免某次查询阻塞同时阻塞设置。每个执行器最多一个运行任务、一个最新待办；切换播放器、销毁会话、断开通知监听会使旧结果失效，并清空缓存。通知监听 detach 同时注销 active-sessions listener，避免旧监听跨接入轮次残留。
+
+这不试图取消不可中断的 Binder，也不为超时不断新建线程。如果旧播放器长期不回应，其模式查询线程可能仍在等待；UI、歌曲状态回调与其他播放器会话发现保持可用，模式信息可能暂时未知。普通 framework 播放控制及断连暂停顺序保持既有逻辑，本次不以重启/强停汽水音乐规避问题。
+
+新增 4 项 JVM 测试，以真实阻塞线程验证：查询不阻塞提交者、100 次刷新只保留最后一个待办、detach 后已投递结果失效、切换后旧结果不能覆盖新结果，以及查询抛异常后可继续工作（其中刷新与阻塞合为一项）。总计 124 项 Release JVM 测试全部通过，Release APK、R8、vital lint 与正式签名验证通过。既有 47 项 Android Rust 测试结果沿用 518 记录，本次未改动原生库。
+
+2026-11-03 13:00:46，USB ADB 对手机 31a37894 覆盖安装成功，保留应用数据；读取包信息确认 versionName=0.1.0.519、versionCode=10519。启动后通知监听接入、权限仍有效；实际点击设置、诊断、关于、主页，逐页读取 UI 层级，页面内容均正常变化，最后回到主页。自动监听仍保持关闭，没有启动连接或改动配对。新进程 PID=32757 的检查日志中未见新的 FATAL/ANR。该结果是安装后手机交互冒烟验证，不代表长期不复发或完成宝马/CarWith 实车验证。
+
+519 APK SHA-256：`55ce6168777188fc73ec1d63ff786fd2838640c60255cc0d817f904c15ad4ab3`。
+
+
+## 11 月 3 日音乐监听随连接状态启停（520）
+
+按用户确认，音乐通知监听不再独立常驻：只有开启上车自动连接或存在当前手动/自动会话时才接入。待机关闭自动连接、手动停止且自动连接关闭、连接失败清理后，均停止音乐刷新/查询、清理回调缓存，并通过 NotificationListenerService.requestUnbind 解除系统绑定；开启自动连接或手动启动时 requestRebind 恢复。已有会话中关闭开关保留音乐监听，等会话结束再停。同步在主线程执行时重新判断最新状态，避免快速开关/停止后启动的过期动作。进程启动时也应用同一门槛。通知使用权与组件启用状态不更改，不退出整个进程。
+
+124 项 Release JVM 测试通过，Release/R8/vital lint、正式签名验证通过。2026-11-03 13:18:45 已覆盖安装 0.1.0.520 / 10520，保留应用数据。当前自动连接关闭且无会话，ADB 服务列表为 (nothing)，日志确认“自动连接关闭且无会话，已暂停音乐监听”，通知使用权仍保留。此时手机锁屏，UI 点击验证等待解锁，尚不能据此宣称手动启动/停止及开关联动均已完成手机验证。
+
+520 APK SHA-256：`ec541a41ee3c61e7435ff47dcafaf9daf65fbb41498a3e88331440f01def83a6`。
+
+
+## 11 月 3 日解锁后联动复测与最终 522
+
+手机解锁后发现 520 的 requestUnbind 单独使用不能稳定维持停用状态：音乐服务被系统重新绑定，且恢复音乐接入的回调不稳定。补测曾尝试动态禁用组件（本地 521），但通知管理器会移除对应允许记录，恢复不可靠，因此撤回组件开关方案，已恢复该手机原有通知授权。
+
+最终 0.1.0.522 / 10522 在 manifest 为音乐服务声明 `android.service.notification.default_autobind_listenerservice=false`，由自动监听或当前会话显式 requestRebind，需要停用时 requestUnbind。此机制在 [AOSP NotificationListenerService](https://raw.githubusercontent.com/aosp-mirror/platform_frameworks_base/master/core/java/android/service/notification/NotificationListenerService.java) 与 [ManagedServices](https://raw.githubusercontent.com/aosp-mirror/platform_frameworks_base/master/services/core/java/com/android/server/notification/ManagedServices.java) 中有对应按需绑定定义与实现。运行中不再切换组件启用状态；只兼容恢复本地组件门控试验遗留的 disabled 状态。
+
+522 已正式签名覆盖安装，124 项 Release JVM 测试、Release/R8/vital lint 通过。手机实际点击配合服务列表与音乐 attach/detach 日志完成以下检查：
+
+- 自动连接关闭且待机：无音乐监听服务、无连接保活服务。
+- 自动连接关闭时手动启动：两项服务恢复，音乐 attach 且通知权限有效。
+- 手动停止且自动连接关闭：两项服务均移除；重复手动启动/停止结果相同。
+- 开启自动连接：音乐监听恢复；本机环境同时自动发起了连接尝试。
+- 手动/自动连接尝试期间关闭自动连接：保留当前会话与音乐监听，手动停止后两项服务均移除。
+- 自动连接开启时手动停止：音乐监听及自动待机仍保留。
+- 最后关闭自动连接并停止会话，再强停/重新打开 HyperCar：两项服务均未恢复。
+
+最后恢复为自动连接关闭、无会话、主页。该结果验证启停与系统绑定生命周期；测试期间没有完成接收器握手或实车影音测试，不作为 CarWith 实车成功证据。最终包 SHA-256：`5f1e5b25168b2aebe24923baf60c914616fd7050f60ce724d265dbc32119d0ad`。
+
+
+## 11 月 3 日宝马切 DiPlay：共享 Wi-Fi 凭证身份串用（525）
+
+手机原导出只包含重启后恢复的 400 行，缺少切换现场。524 补足导出私有落盘日志与上一份轮转，实际读取 22,222 行，约 2.69 MB，保存在开发机诊断目录 `D:/devtools/hypercar-diagnostics/20261103-freeze/hypercar-history-134446.txt`。原始记录不提交仓库。保留历史从 11 月 3 日 01:06 开始，不包含用户所述昨晚重置动作；不能用缺失的重置日志认定重置失败。
+
+现场事实：
+
+| 时间 | 证据 |
+|---|---|
+| 01:07～02:09 | 多次记录 YX-PC 成功连接，MAC 尾号 B5:F1，凭证键 `bt_c0…b5f1` |
+| 11:53:09.627 | 用户目标=自动，旧 ACL 候选清除，旧监听停止后重建 |
+| 11:53:13.375 | 已使用 WinPlay 档案，主动拨号=true；不是 BMW 档案未切换 |
+| 11:53:17.159 | 出站把 Redmi Note 11 5G 判为未发现 iAP2 服务并跳过 |
+| 11:53:18.424～18.575 | 接受该手机的蓝牙入站；识别 name/model/manufacturer 均为 DiPlay，target=自动 |
+| 11:53:18.449 | 引擎却使用 YX-PC 凭证键 `bt_c0…b5f1`，此前已连接=true |
+| 11:53～11:55 | /info 与 pair-verify 返回成功；加密 SETUP /setup 超时或 EOF，未完成 RECORD |
+| 11:57:35～36 | 指定 Redmi 为目标，并完成增强发现授权 |
+| 11:57:55.131～55.648 | 凭证键变为 DiPlay 的 `bt_8c…e55c`，此前已连接=false；完整 pair-setup、verify、SETUP、RECORD 成功 |
+
+因此不能归因于“不指定时仍按旧 MAC 拒绝 DiPlay”：入站已实际接纳；也不是该轮仍使用 BMW 协商档案。明确的代码错误是 `wifiReceiverMac ?: Iap2Peer.address` 把同一家庭 Wi-Fi 的 YX-PC 历史候选置于当前 DiPlay 蓝牙对端之前，从而错误套用另一台接收端的“已配对”状态。增强发现操作同时指定了新目标，改变了身份取值路径；现有记录不能证明增强发现授权本身是完成 AirPlay 的必要条件。凭证串用与 SETUP 失败时间吻合，但“修复后现场不再超时”仍待接收器复测。
+
+525 修复：凭证优先采用真正运行的 iAP2 会话 Socket 对端，不使用尚在拨号的 Socket 或全局历史 peer；将该身份保存在本轮会话供蓝牙退场后的 Wi-Fi 重试继续使用。WinPlay/DiPlay 无当前蓝牙对端时，不用共享 SSID 历史 MAC 判定配对，交由已有 /info 公钥索引机制处理；BMW 独立热点仅 Wi-Fi 回连保留原有本车身份提示。首次启动、原地重试、成功配对记录使用同一身份，并记录 Wi-Fi 候选冲突。
+
+另补齐自动模式的候选范围和唤醒识别：ACL 地址只排序，不作为唯一出站候选；切换目标清除 SDP 探测缓存并隔离旧轮结果；未指定目标时，已成功连接车机及声明 iAP2 的已配对接收器可触发经典蓝牙唤醒，仍排除 LE 数字钥匙事件。早先试作的“切换配置就重建待协商会话”已撤回，保留日志确认正常的型号更新与入站流程。重置逻辑目前会删除身份、所有 per-receiver 标记、身份备份、端点、Wi-Fi 关联、MFi 记忆与成功车机标记；没有证据说明本次 DiPlay 的正确记录在重置后仍被沿用。
+
+新增文件系统回归用 YX-PC 标记存在、DiPlay 无标记的现场组合验证身份选择，覆盖共享网络无蓝牙、BMW 仅 Wi-Fi 和重试身份优先级；与候选/唤醒测试合计 132 项 Release JVM 全通过。Release/R8/vital lint 与正式签名验证通过。525 APK SHA-256：`9e70eb39221ff13843565239398fe64444ee0398039acd8b0ffcf6425ffafcdb`。本轮未改 Rust 或运行新的实车接收器握手。
+
+
+525 于 2026-11-03 13:50:17 通过 USB ADB 覆盖安装，确认 versionName=0.1.0.525 / versionCode=10525。手机验证自动模式关闭待机无服务、手动启动恢复音乐与连接服务、手动停止两项均移除，页面正常响应；最后保持 WinPlay 档案、不指定车机、自动连接关闭、无会话。没有重置配对身份或新增增强发现授权。DiPlay 的实际首次配对/SETUP 效果待接收器复测。
+
+
+## 11 月 3 日关闭宝马音频配置主动断开（526）
+
+用户实测主动断开 A2DP 未改善二次上车，要求先关闭作对照。内置 BMW iD8.5 与仓库 profiles/headunits.json 同步设置 `dropProfilesBeforeIap2=false`，从而关闭该档案的 HFP/A2DP 配置保护监听和拨号前主动断开；宝马仍仅被动接收 iAP2，并等待本轮 AirPlay 激活。其它内置车型策略不变。schema 由 4 升至 5，阻止旧远程 BMW=true 缓存覆盖本次关闭；新增缓存回归测试验证 schema 4 不能重新启用该策略。
+
+133 项 Release JVM 测试通过，Release/R8/vital lint 与正式签名验证通过；已 USB ADB 覆盖安装 0.1.0.526 / 10526 并启动，保留数据与当前车机型号设置。没有通过手机执行真实车机 A2DP 断开/重连，不作为二次上车问题已改善的证据。526 APK SHA-256：`008de64b35701e0407a0571bbdf650e5ffb70e74ea5f62f0d3ddb2a21563082b`。

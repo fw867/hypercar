@@ -155,7 +155,7 @@ object HyperCarRepo {
             ensurePairingIdentity(context, identityFile)
             val identityPath = identityFile.absolutePath
             val json = SettingsStore.engineConfigJson(host, port, sessionDeviceMac, identityPath,
-                receiverBluetoothMac = wifiReceiverMac ?: io.github.hypercar.iap2.Iap2Peer.address)
+                receiverBluetoothMac = receiverForEngine())
             log("CORE: 重试 nativeStart（$host:$port fd=$fd，第 $attempt 次）")
             val started = RustCoreBridge.nativeStart(json, fd, socketProvider(sockets))
             log("CORE: 重试 nativeStart 返回 $started")
@@ -217,6 +217,7 @@ object HyperCarRepo {
 
     /** Identity pinned to a known Wi-Fi resume; never reuse another receiver's Bluetooth identity. */
     @Volatile private var wifiReceiverMac: String? = null
+    @Volatile private var sessionReceiverMac: String? = null
     @Volatile private var sessionWifiSsid: String? = null
     private var wifiReconnectMonitor: ConnectivityManager.NetworkCallback? = null
     private var wifiReconnectCheck: Job? = null
@@ -388,8 +389,10 @@ object HyperCarRepo {
         reconnectJob?.cancel()
         reconnectJob = null
         sessionHadLink = false
+        sessionReceiverMac = null
         connecting = true
         sessionLive.set(true)
+        io.github.hypercar.carui.MusicNotificationListener.sync(context)
         val profile = headUnitProfile
         connectionAttemptId = connectionDiagnostics.begin(source,
             "${profile.id} remote=${io.github.hypercar.headunit.RemoteProfiles.isRemote(profile.id)} " +
@@ -519,6 +522,7 @@ object HyperCarRepo {
                 if (SettingsStore.autoConnect) startWifiReconnectMonitor(context)
                 else stopWifiReconnectMonitor()
                 io.github.hypercar.autowake.CarCompanionWake.sync(context)
+                io.github.hypercar.carui.MusicNotificationListener.sync(context)
                 when (AutomaticConnectionPolicy.modeChanged(SettingsStore.autoConnect, hasCurrentSession)) {
                     AutomaticConnectionPolicy.IdleAction.KEEP_SESSION -> {
                         updateCarProfileGuard(context)
@@ -556,6 +560,7 @@ object HyperCarRepo {
 
     private fun startStandbyListening() {
         if (!SettingsStore.autoConnect || hasCurrentSession) return
+        appContext()?.let { io.github.hypercar.carui.MusicNotificationListener.sync(it) }
         val context = appContext() ?: return
         startWifiReconnectMonitor(context)
         val coordinator = coordinatorFor(context)
@@ -602,7 +607,22 @@ object HyperCarRepo {
         iap2 = null
         standbyEndpoint.set(null)
         stopForegroundService()
+        appContext()?.let { io.github.hypercar.carui.MusicNotificationListener.sync(it) }
         log("AUTO: 待机监听与自动重连已停止；手动连接仍可用")
+    }
+
+    private fun receiverForEngine(): String? {
+        val active = iap2?.activePeerAddress
+        val desktop = io.github.hypercar.headunit.ReceiverCompatibility.isDesktopReceiver(
+            SettingsStore.headUnitProfileId,
+            io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(active),
+        )
+        val selected = PairingEvidence.receiverMac(active, sessionReceiverMac, wifiReceiverMac, desktop)
+        if (wifiReceiverMac != null && !wifiReceiverMac.equals(selected, true)) {
+            log("RECEIVER: Wi-Fi 历史候选=$wifiReceiverMac；当前蓝牙对端=${active ?: "无"}，凭证身份=${selected ?: "由接收端 /info 判定"}；不以共享网络历史覆盖实际接收端")
+        }
+        sessionReceiverMac = selected
+        return selected
     }
 
     private fun knownWifiReceiver(ssid: String?): String? {
@@ -1041,7 +1061,7 @@ object HyperCarRepo {
             sessionWifiSsid = currentWifiSsid(context)
             val identityPath = context.filesDir.resolve("controller_identity.txt").absolutePath
             val json = SettingsStore.engineConfigJson(apHost, port, deviceMac, identityPath,
-                receiverBluetoothMac = wifiReceiverMac ?: io.github.hypercar.iap2.Iap2Peer.address)
+                receiverBluetoothMac = receiverForEngine())
             // 下发配置原样打一行（不含密钥）：分辨率/帧率一目了然，
             // 免得再靠猜「这次到底请求了多大尺寸」
             log("CORE +${stageMs()}ms 引擎配置：$json")
@@ -1072,6 +1092,7 @@ object HyperCarRepo {
         } finally {
             discoveryJob?.cancel()
             connecting = false
+            appContext()?.let { io.github.hypercar.carui.MusicNotificationListener.sync(it) }
         }
     }
 
@@ -1208,7 +1229,9 @@ object HyperCarRepo {
         joinedNetwork = null
         boundNetwork = null
         wifiReceiverMac = null
+        sessionReceiverMac = null
         sessionWifiSsid = null
+        appContext()?.let { io.github.hypercar.carui.MusicNotificationListener.sync(it) }
     }
 
     // ---------------------------------------------------------------- WiFi
@@ -1765,10 +1788,8 @@ object HyperCarRepo {
                     // 配对成功过 → 记一笔（设置页「目标车机」列表给它打「已配对」标记）。
                     // 蓝牙已配对 ≠ CarPlay 配对过：只有会话真正激活（RECORD 完成）才算。
                     runCatching {
-                        // 车机 MAC 三个来源（ACL 广播可能没收到，用户手点「连接」时尤其常见）：
-                        //   ① ACL 回调记下的 aclCarMac；② 本轮 iAP2 socket 的对端；③ 设置里选定的目标
-                        val peer = io.github.hypercar.iap2.Iap2Peer.address
-                        val mac = wifiReceiverMac ?: aclCarMac ?: peer ?: SettingsStore.targetCarMac
+                        // Prefer the identity used by this engine; SSID history can refer to another receiver.
+                        val mac = sessionReceiverMac ?: iap2?.activePeerAddress ?: aclCarMac ?: SettingsStore.targetCarMac
                         if (mac.isNullOrBlank()) {
                             log(
                                 "PAIR: ⚠ 会话成功但拿不到车机 MAC（ACL / iAP2 对端 / 目标车机都为空）" +
@@ -1776,16 +1797,18 @@ object HyperCarRepo {
                             )
                         } else {
                             val carName = bondedNameOf(mac)
-                                ?: io.github.hypercar.iap2.Iap2Peer.name
+                                ?: io.github.hypercar.iap2.Iap2Peer.name.takeIf {
+                                    mac.equals(io.github.hypercar.iap2.Iap2Peer.address, true)
+                                }
                                 ?: SettingsStore.targetCarName
                                 ?: "车机"
                             SettingsStore.markCarPaired(mac, carName)
                             val rememberedSsid = sessionWifiSsid ?: joinedSsid
                             if (!rememberedSsid.isNullOrBlank()) SettingsStore.rememberCarNetwork(rememberedSsid, mac)
                             val from = when {
-                                wifiReceiverMac != null -> "已知车机 Wi-Fi"
-                                aclCarMac != null -> "ACL 广播"
-                                peer != null -> "iAP2 对端"
+                                mac.equals(iap2?.activePeerAddress, true) -> "当前 iAP2 对端"
+                                mac.equals(sessionReceiverMac, true) -> "本轮凭证身份"
+                                mac.equals(aclCarMac, true) -> "ACL 广播"
                                 else -> "目标车机设置"
                             }
                             log(
@@ -2442,7 +2465,22 @@ object HyperCarRepo {
      */
     fun exportLogs() {
         scope.launch {
-            val logs = _snapshots.value.recentLogs
+            val logs = withContext(Dispatchers.IO) {
+                synchronized(diskLogLock) {
+                    val history = runCatching {
+                        diskLogWriter?.flush()
+                        val dir = appCtx?.filesDir ?: return@runCatching emptyList<String>()
+                        listOf("$DISK_LOG_NAME.1", DISK_LOG_NAME).flatMap { name ->
+                            val file = java.io.File(dir, name)
+                            if (file.exists()) file.readLines() else emptyList()
+                        }
+                    }.getOrElse {
+                        log("LOG: 读取保留历史失败 ${it.message}，回退当前环形日志")
+                        emptyList()
+                    }
+                    history.ifEmpty { _snapshots.value.recentLogs }
+                }
+            }
             if (logs.isEmpty() && connectionDiagnostics.report().isEmpty()) {
                 log("LOG: 无日志可导出")
                 return@launch
@@ -2467,7 +2505,7 @@ object HyperCarRepo {
             appendLine("# HyperCar 调试日志  导出于 $stamp")
             appendLine("# 应用 ${DeviceInfo.appVersion(ctx)}")
             appendLine("# 设备 ${DeviceInfo.systemSummary()}")
-            appendLine("# 说明：以下时间戳为本机时间；日志共 ${logs.size} 行")
+            appendLine("# 说明：以下时间戳为本机时间；保留的落盘日志（含上一份轮转，读取失败时回退当前日志）共 ${logs.size} 行")
             appendLine("# 连接摘要：WAITING=尚未完成 RECORD；STREAMING=已完成 RECORD；不代表实际画面/声音验证")
             connectionDiagnostics.report().forEach { appendLine("# $it") }
             appendLine()

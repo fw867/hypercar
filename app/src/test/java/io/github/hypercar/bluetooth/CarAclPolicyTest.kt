@@ -20,13 +20,10 @@ class CarAclPolicyTest {
         assertTrue(CarAclPolicy.isClassicCarLink(BluetoothDevice.TRANSPORT_AUTO, BluetoothDevice.DEVICE_TYPE_UNKNOWN))
     }
 
-    @Test fun bmwOnlyListensAndDropsProfilesBeforeIap2() {
-        // 2026-11-01 按现场证据调整：上车时手机侧 HFP/A2DP 回连会抢占 ACL，车机随后
-        // Remote Terminated（dumpsys：11:05:10.840 HFP 回连 → 11:05:13.038 车机拆链），
-        // iAP2 从未打开。改成「只配对、不连接配置文件」，与 cardeck 一致。
-        // 出站仍然关闭：宝马车机是主动连入方，我们不去拨它。
+    @Test fun bmwOnlyListensAndPreservesAudioProfiles() {
+        // 用户实测断音频配置未改善二次上车，恢复保留；仍由宝马主动发起 iAP2。
         assertFalse(HeadUnitProfiles.BMW_ID85.allowOutboundIap2)
-        assertTrue(HeadUnitProfiles.BMW_ID85.dropProfilesBeforeIap2)
+        assertFalse(HeadUnitProfiles.BMW_ID85.dropProfilesBeforeIap2)
         assertTrue(HeadUnitProfiles.GENERIC.allowOutboundIap2)
         assertTrue(HeadUnitProfiles.WINPLAY.allowOutboundIap2)
     }
