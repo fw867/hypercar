@@ -48,6 +48,8 @@ import io.github.hypercar.ui.theme.TextSecondary
  */
 @Composable
 fun HomeScreen(
+    startup: io.github.hypercar.session.StartupReadiness,
+    onRefreshSetup: () -> Unit,
     snapshot: SessionSnapshot,
     onStart: () -> Unit,
     onStop: () -> Unit,
@@ -83,6 +85,23 @@ fun HomeScreen(
             },
         )
     }
+    @Composable
+    fun Setup() {
+        if (!startup.manualReady) {
+            Text("首次使用 · 完成以下设置后才能连接", color = TextPrimary,
+                style = MaterialTheme.typography.titleMedium)
+            Checklist()
+            CarSourceSection(startup = startup, onRefreshSetup = onRefreshSetup,
+                connected = snapshot.link is io.github.hypercar.core.LinkState.Connected ||
+                    snapshot.link is io.github.hypercar.core.LinkState.Negotiating)
+            val ctx = androidx.compose.ui.platform.LocalContext.current
+            if (!startup.bluetoothEnabled || !startup.wifiEnabled) {
+                io.github.hypercar.ui.components.CapsuleButton("开启蓝牙 / Wi-Fi", onClick = {
+                    ctx.startActivity(android.content.Intent(android.provider.Settings.ACTION_WIRELESS_SETTINGS))
+                }, modifier = Modifier.fillMaxWidth(), filled = false)
+            }
+        }
+    }
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
         val landscape = maxWidth > maxHeight
         if (landscape) {
@@ -99,7 +118,10 @@ fun HomeScreen(
                         .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
+                    Setup()
                     StatusHeroCard(
+                        startEnabled = startup.manualReady,
+                        startBlockReason = startup.manualIssues.joinToString("；"),
                         link = snapshot.link,
                         autoConnectEnabled = autoConnect,
                         onStartClick = onStart,
@@ -120,7 +142,7 @@ fun HomeScreen(
                         .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
-                    Checklist()
+                    if (startup.manualReady) Checklist()
                     FirstConnectGuideCard()
 
                 }
@@ -133,8 +155,11 @@ fun HomeScreen(
                     .padding(horizontal = 16.dp, vertical = 16.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
+                Setup()
                 // 第一张卡：实时步骤（Negotiating 时显示 link.step）
                 StatusHeroCard(
+                    startEnabled = startup.manualReady,
+                    startBlockReason = startup.manualIssues.joinToString("；"),
                     link = snapshot.link,
                     autoConnectEnabled = autoConnect,
                     onStartClick = onStart,
@@ -148,7 +173,7 @@ fun HomeScreen(
                     onOpenShizuku = onOpenShizukuSettings,
                     degradedHint = degradedChipHint(snapshot),
                 )
-                Checklist()
+                if (startup.manualReady) Checklist()
                 FirstConnectGuideCard()
 
                 Spacer(modifier = Modifier.height(8.dp))
@@ -168,10 +193,8 @@ fun HomeScreen(
  */
 private fun degradedChipHint(snapshot: SessionSnapshot): String? = when {
     snapshot.shizukuReady -> null
-    !snapshot.degradedPermissionGranted -> "降级模式 · 点此授权"
-    !snapshot.degradedLocationOn -> "降级模式 · 点此开定位"
-    !snapshot.degradedFirstConnectDone -> "降级模式 · 点此首连"
-    else -> "降级模式 · 点此设置"
+    io.github.hypercar.settings.SettingsStore.carWithMode -> "CarWith 无需 Shizuku"
+    else -> "自绘 UI 必须安装、启动并授权"
 }
 
 
@@ -304,7 +327,7 @@ internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
         val headUnit = io.github.hypercar.headunit.HeadUnitProfiles.current()
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
-                text = "首次连接（只需做一次）",
+                text = "3. 首次车机配对",
                 style = MaterialTheme.typography.titleSmall,
                 color = TextPrimary,
             )
@@ -317,9 +340,9 @@ internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
         }
         Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = "① 车机侧打开 Apple CarPlay（首次需在车机屏幕点确认）\n" +
-                "② 手机点「启动连接」，等状态变为「已连接」\n" +
-                "③ 在车机列表选择本机蓝牙名称，完成一次配对",
+            text = "① 完成必需权限和画面来源设置，让「启动连接」可用\n" +
+                "② 手机启动连接，在车机 Apple CarPlay 列表选择本机并确认配对\n" +
+                "③ 等待显示已连接，再确认车机画面、触摸和声音正常",
             style = MaterialTheme.typography.bodySmall,
             color = TextSecondary,
         )
@@ -333,7 +356,7 @@ internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
         }
         Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = "首次手动确认后，同一台车会自动回连。",
+            text = "需要自动回连时，完成悬浮窗授权，再到设置开启「上车自动连接」。",
             style = MaterialTheme.typography.labelSmall,
             color = TextSecondary,
         )

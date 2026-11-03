@@ -47,6 +47,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -65,6 +66,11 @@ import io.github.hypercar.core.SessionSnapshot
 import io.github.hypercar.perm.AppPermissions
 import io.github.hypercar.perm.PermGroup
 import io.github.hypercar.session.HyperCarRepo
+import io.github.hypercar.session.StartupRequirements
+import io.github.hypercar.settings.SettingsRevision
+import io.github.hypercar.settings.SettingsStore
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import io.github.hypercar.ui.screens.AboutScreen
 import io.github.hypercar.ui.screens.DiagnosticsScreen
 import io.github.hypercar.ui.screens.HomeScreen
@@ -129,6 +135,21 @@ private fun MainContent() {
 
     // 从系统设置页返回（用户手动开权限/自启动/电池）后刷新清单
     val lifecycleOwner = LocalLifecycleOwner.current
+    var startup by remember { mutableStateOf(StartupRequirements.read(context)) }
+    LaunchedEffect(lifecycleOwner, permVersion, SettingsRevision.value) {
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            while (true) {
+                startup = withContext(Dispatchers.IO) { StartupRequirements.read(context) }
+                delay(1_000)
+            }
+        }
+    }
+    LaunchedEffect(startup) {
+        HyperCarRepo.refreshSystemState()
+        if (SettingsStore.autoConnect && !startup.automaticReady) {
+            HyperCarRepo.startAutomaticListening(context)
+        }
+    }
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
@@ -271,6 +292,8 @@ private fun MainContent() {
             ) { tab ->
                 when (tab) {
                     AppTab.Home -> HomeScreen(
+                        startup = startup,
+                        onRefreshSetup = { permVersion++ },
                         snapshot = snapshot,
                         onStart = { HyperCarRepo.connect(context) },
                         onStop = { HyperCarRepo.disconnect() },
@@ -300,6 +323,8 @@ private fun MainContent() {
                     )
 
                     AppTab.Settings -> SettingsScreen(
+                            startup = startup,
+                            onRefreshSetup = { permVersion++ },
                             linkConnected = snapshot.link is io.github.hypercar.core.LinkState.Connected ||
                                 snapshot.link is io.github.hypercar.core.LinkState.Negotiating,)
 

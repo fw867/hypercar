@@ -68,16 +68,14 @@ fun PermissionChecklistCard(
 ) {
     val requiredMissing = listOf(
         !summary.nearby,
-        summary.locationRequired && !summary.location,
+        summary.locationRequired && (!summary.location || !locationServiceOn),
         summary.notificationRequired && !summary.notification,
-        // 通知使用权：音乐卡片的数据源，属于"必须"
-        !summary.notificationAccess,
     ).count { it }
 
     // 卡片是否显示：必需项缺失，或还有可优化的项
     val overlayMissing = !summary.overlay
     val batteryMissing = !summary.batteryWhitelisted
-    if (requiredMissing == 0 && !overlayMissing && !batteryMissing) return
+    if (requiredMissing == 0 && !overlayMissing && !batteryMissing && summary.notificationAccess) return
 
     // 可选项（自启动/电池）在 HyperOS 上无法回读，用户可主动收起，避免首页常年挂卡
     val context = LocalContext.current
@@ -99,7 +97,7 @@ fun PermissionChecklistCard(
             )
             Spacer(modifier = Modifier.size(10.dp))
             Text(
-                text = "权限检查",
+                text = "1. 设置权限",
                 style = MaterialTheme.typography.titleSmall,
                 color = TextPrimary,
                 modifier = Modifier.weight(1f),
@@ -138,7 +136,10 @@ fun PermissionChecklistCard(
                 },
                 granted = summary.location && locationServiceOn,
                 required = true,
-                onClick = { onRequest(PermGroup.Location) },
+                onClick = {
+                    if (summary.location && !locationServiceOn) AppPermissions.openLocationSettings(context)
+                    else onRequest(PermGroup.Location)
+                },
             )
         }
         if (summary.notificationRequired) {
@@ -150,12 +151,12 @@ fun PermissionChecklistCard(
                 onClick = { onRequest(PermGroup.Notification) },
             )
         }
-        // 通知使用权（必做）：音乐卡片靠它读系统播放信息。只能深链系统页，无法弹窗申请。
+        // Music metadata is optional and must not block CarWith or video connection.
         StatusRow(
             title = "通知使用权（音乐卡片）",
-            detail = "车机音乐卡片读取系统播放信息必需；只读媒体会话，不读取通知内容",
+            detail = "自绘音乐卡片读取播放信息需要；不影响建立连接，CarWith 无需此项",
             granted = summary.notificationAccess,
-            required = true,
+            required = false,
             onClick = onNotificationAccess,
         )
 
@@ -166,8 +167,8 @@ fun PermissionChecklistCard(
 
         // 悬浮窗可用 Settings.canDrawOverlays 验证 → 状态行
         StatusRow(
-            title = "后台启动（显示在其他应用上层）",
-            detail = "Android 12+ 后台拉起前台服务的一条豁免，上车唤醒依赖它",
+            title = "悬浮窗（自动上车连接需要）",
+            detail = "允许后台唤醒连接服务；未授权仍可前台手动连接",
             granted = summary.overlay,
             required = false,
             onClick = onOpenOverlay,
@@ -236,6 +237,9 @@ fun PermissionChecklistCard(
                 modifier = Modifier.fillMaxWidth(),
                 filled = true,
             )
+            Text("权限被拒绝？前往应用设置", color = ElectricCyan,
+                style = MaterialTheme.typography.labelMedium,
+                modifier = Modifier.clickable { AppPermissions.openAppDetails(context) }.padding(vertical = 8.dp))
         }
     }
 }

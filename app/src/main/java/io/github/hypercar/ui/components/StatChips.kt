@@ -185,8 +185,7 @@ private fun ShizukuChip(
     degradedHint: String? = null,
     modifier: Modifier = Modifier,
 ) {
-    // Shizuku 已降级为「可选增强」：没有它也能连车（热点首连弹一次框 + 稳定伪 MAC），
-    // 有则体验最优（0 弹窗 + 真实蓝牙 MAC）。故未就绪时用中性灰、文案标「可选」，不报警色。
+    // Source-specific setup: self UI requires Shizuku; CarWith may use system Wi-Fi authorization.
     // 未就绪时可点进设置页授权（此前只有只读文案，用户找不到入口）。
     StatChip(
         label = "Shizuku",

@@ -1,5 +1,6 @@
 package io.github.hypercar.ui.screens
 
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -41,6 +42,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextFieldDefaults
+import androidx.compose.runtime.key
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
@@ -95,62 +97,100 @@ import io.github.hypercar.ui.theme.TextSecondary
  */
 private val FpsOptions = listOf(30, 60)
 
-/**
- * 设置页：全部直读直写 [SettingsStore]，改动即时生效（apply() 异步落盘，读路径内存可见）。
- *
- * 排布原则（按"改动频率 × 影响面"自上而下）：
- *   1. **常用**：行为（自动连接/音频）——装好就要调的；
- *   2. **一次性配置**：目标车机、权限与系统设置；
- *   3. **高级**（分隔线以下）：屏幕推送分辨率/帧率（兜底值）、设备身份（蓝牙 MAC）、Shizuku。
- */
+private enum class SettingsPage(val title: String) {
+    Main("设置"),
+    Car("我的车机"),
+    Connection("连接与唤醒"),
+    Display("画面与声音"),
+    Permissions("权限与后台"),
+    Advanced("高级设置");
+
+    val parent: SettingsPage get() = Main
+}
+
+/** Settings navigation changes presentation only; all writes keep their existing handlers. */
 @Composable
-fun SettingsScreen(modifier: Modifier = Modifier, linkConnected: Boolean = false) {
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 16.dp, vertical = 16.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-    ) {
-        // ---- 常用 ----
-        BehaviorSection()
-            CarSourceSection()
-        // ---- 一次性配置 ----
-        HeadUnitSection(connected = linkConnected)
-        TargetCarSection()
-        PermissionSettingsSection()
-        // ---- 高级 ----
-        AdvancedMarker()
-        ResolutionSection()
-        IdentitySection()
-        ShizukuSection()
-        Spacer(modifier = Modifier.height(8.dp))
+fun SettingsScreen(
+    startup: io.github.hypercar.session.StartupReadiness,
+    onRefreshSetup: () -> Unit,
+    modifier: Modifier = Modifier,
+    linkConnected: Boolean = false,
+) {
+    var pageName by rememberSaveable { mutableStateOf(SettingsPage.Main.name) }
+    val page = SettingsPage.entries.firstOrNull { it.name == pageName } ?: SettingsPage.Main
+    fun open(destination: SettingsPage) { pageName = destination.name }
+    BackHandler(enabled = page != SettingsPage.Main) { open(page.parent) }
+
+    Column(modifier = modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 8.dp)) {
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            if (page != SettingsPage.Main) {
+                TextButton(onClick = { open(page.parent) }) { Text("‹ 返回", color = ElectricCyan) }
+                Spacer(Modifier.width(8.dp))
+            }
+            Text(page.title, color = TextPrimary, style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.padding(vertical = 12.dp))
+        }
+        key(page) {
+            Column(
+                modifier = Modifier.weight(1f).verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+            ) {
+                when (page) {
+                    SettingsPage.Main -> {
+                        Text("选择要调整的功能", color = TextSecondary,
+                            style = MaterialTheme.typography.bodySmall)
+                        GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)) {
+                            SettingsMenuItem("我的车机", "车机型号、目标设备与增强发现") { open(SettingsPage.Car) }
+                            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+                            SettingsMenuItem("连接与唤醒", "自动上车、待机通知与连接恢复") { open(SettingsPage.Connection) }
+                            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+                            SettingsMenuItem("画面与声音", "画面来源、音频转发与显示参数") { open(SettingsPage.Display) }
+                            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+                            SettingsMenuItem("权限与后台", "系统权限、后台运行与 Shizuku 授权") { open(SettingsPage.Permissions) }
+                            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+                            SettingsMenuItem("高级设置", "手动蓝牙地址与重置配对身份") { open(SettingsPage.Advanced) }
+                        }
+                    }
+                    SettingsPage.Car -> {
+                        HeadUnitSection(connected = linkConnected)
+                        TargetCarSection()
+                    }
+                    SettingsPage.Connection -> BehaviorSection(startup)
+                    SettingsPage.Display -> {
+                        CarSourceSection(startup, onRefreshSetup, connected = linkConnected,
+                            title = "画面来源", compact = true)
+                        AudioSection()
+                        ResolutionSection()
+                    }
+                    SettingsPage.Permissions -> {
+                        PermissionSettingsSection()
+                        ShizukuSection(startup)
+                    }
+                    SettingsPage.Advanced -> {
+                        IdentitySection()
+                        ResetPairingSection()
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+            }
+        }
     }
 }
 
-/** 分隔线 + "高级"：把低频/兜底设置与常用设置分开，避免首屏被淹没。 */
 @Composable
-private fun AdvancedMarker() {
+private fun SettingsMenuItem(title: String, description: String, onClick: () -> Unit) {
     Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(top = 4.dp),
+        modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick).padding(vertical = 16.dp, horizontal = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        HorizontalDivider(
-            modifier = Modifier.weight(1f),
-            color = StrokeGlass.copy(alpha = 0.5f),
-        )
-        Text(
-            text = "高级",
-            style = MaterialTheme.typography.labelSmall,
-            color = TextSecondary.copy(alpha = 0.8f),
-            modifier = Modifier.padding(horizontal = 12.dp),
-        )
-        HorizontalDivider(
-            modifier = Modifier.weight(1f),
-            color = StrokeGlass.copy(alpha = 0.5f),
-        )
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+            Text(title, color = TextPrimary, style = MaterialTheme.typography.titleSmall)
+            Text(description, color = TextSecondary, style = MaterialTheme.typography.bodySmall,
+                maxLines = 2, overflow = TextOverflow.Ellipsis)
+        }
+        Spacer(Modifier.width(12.dp))
+        Text("›", color = ElectricCyan, style = MaterialTheme.typography.titleLarge)
     }
 }
 
@@ -164,10 +204,10 @@ private fun AdvancedMarker() {
  * 对应的下一步动作：安装 → 打开 → 授权 → 已就绪。
  */
 @Composable
-private fun ShizukuSection() {
+private fun ShizukuSection(startup: io.github.hypercar.session.StartupReadiness) {
     val context = LocalContext.current
     var version by remember { mutableIntStateOf(0) }
-    val state = remember(version) { ShizukuTools.state(context) }
+    val state = remember(version, startup.shizukuReady) { ShizukuTools.state(context) }
 
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -186,7 +226,7 @@ private fun ShizukuSection() {
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        SectionLabel(text = "Shizuku（可选增强）")
+        SectionLabel(text = "Shizuku 授权")
         GlassPanel(
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
         ) {
@@ -263,15 +303,7 @@ private fun ShizukuSection() {
                 )
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = "不启用也能用：降级模式用系统 WiFi 授权框连热点（每个热点首次弹一次），" +
-                    "且拿不到真实蓝牙 MAC。启用后连热点零弹窗、可读真实 MAC。",
-                style = MaterialTheme.typography.labelSmall,
-                color = TextSecondary.copy(alpha = 0.75f),
-                maxLines = 3,
-                overflow = TextOverflow.Ellipsis,
-            )
+
         }
     }
 }
@@ -284,14 +316,13 @@ private fun ShizukuState.label(): String = when (this) {
 }
 
 private fun ShizukuState.hint(): String = when (this) {
-    ShizukuState.Ready -> "可以静默加入车机热点（不弹系统确认框），也能用 shell 执行调试命令。"
+    ShizukuState.Ready -> "自绘 UI 所需授权已完成；CarWith 无需此项。"
     ShizukuState.NotGranted ->
         "点下方按钮会弹出 Shizuku 的授权框；若没弹，请先在 Shizuku 里确认服务已启动。"
     ShizukuState.NotRunning ->
         "需要先打开 Shizuku 并启动服务（无线调试配对，或 root 启动）。"
     ShizukuState.NotInstalled ->
-        "Shizuku 是可选的：装上后能免除每个热点首次的系统确认框。" +
-            "不装也能用；真实蓝牙 MAC 可手动填写，不依赖 Shizuku。"
+        "自绘车机 UI 必须先安装 Shizuku，再启动服务并授权 HyperCar。点击安装可前往 GitHub 最新发布页。"
 }
 
 /* ---------- 设备身份（蓝牙 MAC） ---------- */
@@ -765,6 +796,26 @@ private fun TargetCarSection() {
         }
     }
 
+    if (dialogVisible) {
+        TargetCarDialog(
+            initialMac = SettingsStore.targetCarMac.orEmpty(),
+            initialName = SettingsStore.targetCarName.orEmpty(),
+            onDismiss = { dialogVisible = false },
+            onCleared = {
+                selectCar(null, null)
+                dialogVisible = false
+            },
+            onSaved = { mac, name ->
+                selectCar(mac, name)
+                dialogVisible = false
+            },
+        )
+    }
+}
+
+@Composable
+private fun ResetPairingSection() {
+    val context = LocalContext.current
     // ---- 重置配对身份（车机端/手机端删过连接、两边状态对不上时用） ----
     var resetConfirm by remember { mutableStateOf(false) }
     GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp)) {
@@ -808,21 +859,6 @@ private fun TargetCarSection() {
         )
     }
 
-    if (dialogVisible) {
-        TargetCarDialog(
-            initialMac = SettingsStore.targetCarMac.orEmpty(),
-            initialName = SettingsStore.targetCarName.orEmpty(),
-            onDismiss = { dialogVisible = false },
-            onCleared = {
-                selectCar(null, null)
-                dialogVisible = false
-            },
-            onSaved = { mac, name ->
-                selectCar(mac, name)
-                dialogVisible = false
-            },
-        )
-    }
 }
 
 @Composable
@@ -1037,38 +1073,20 @@ private fun DialogTextField(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ResolutionSection() {
-    // Presets describe receiver viewports; the encoder plan scales them proportionally on the next session.
     var widthText by rememberSaveable { mutableStateOf(SettingsStore.videoWidth.toString()) }
     var heightText by rememberSaveable { mutableStateOf(SettingsStore.videoHeight.toString()) }
     var fps by rememberSaveable { mutableStateOf(SettingsStore.videoFps) }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        SectionLabel(text = "车机显示区域（兜底值）")
+        SectionLabel(text = "分辨率与帧率")
         GlassPanel(
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 16.dp),
         ) {
             Text(
-                text = "优先采用车机 /info 上报的像素尺寸；无法读取时才使用这里填写的显示区域尺寸。" +
-                    "使用车机上报的原生尺寸，仅做偶数对齐，默认 60 fps，也可手动降低帧率。" +
-                    "不拉伸画面；修改后下次连接生效。",
+                text = "优先使用车机上报的分辨率，无上报时使用以下兜底值。默认 1920×1080，下次连接生效。",
                 style = MaterialTheme.typography.bodySmall,
                 color = TextSecondary,
             )
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                listOf("宽屏 3.44:1" to (2560 to 744), "16:9" to (1920 to 1080), "8:3" to (1920 to 720)).forEach { (label, size) ->
-                    TextButton(onClick = {
-                        SettingsStore.videoWidth = size.first
-                        SettingsStore.videoHeight = size.second
-                        widthText = size.first.toString()
-                        heightText = size.second.toString()
-                    }) { Text(label) }
-                }
-            }
-            val preview = io.github.hypercar.settings.VideoEncodingPlan.fit(
-                widthText.toIntOrNull() ?: 2560, heightText.toIntOrNull() ?: 744, fps,
-            )
-            Text("预计推流 ${preview.width}×${preview.height} · 最高 ${preview.fps} fps",
-                style = MaterialTheme.typography.bodySmall, color = TextSecondary)
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(10.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -1098,18 +1116,17 @@ private fun ResolutionSection() {
                 )
                 TextButton(
                     onClick = {
-                        SettingsStore.videoWidth = 2560
-                        SettingsStore.videoHeight = 744
-                        widthText = "2560"
-                        heightText = "744"
+                        SettingsStore.videoWidth = SettingsStore.DEFAULT_VIDEO_WIDTH
+                        SettingsStore.videoHeight = SettingsStore.DEFAULT_VIDEO_HEIGHT
+                        widthText = SettingsStore.DEFAULT_VIDEO_WIDTH.toString()
+                        heightText = SettingsStore.DEFAULT_VIDEO_HEIGHT.toString()
                     },
                     contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
                 ) {
                     Text("恢复默认", style = MaterialTheme.typography.labelMedium)
                 }
             }
-            Spacer(modifier = Modifier.height(8.dp))
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(12.dp))
             FpsSegment(fps) { selected ->
                 fps = selected
                 SettingsStore.videoFps = selected
@@ -1147,54 +1164,45 @@ private fun FpsSegment(fps: Int, onFpsChanged: (Int) -> Unit) {
 /* ---------- 开关组 ---------- */
 
 @Composable
-private fun BehaviorSection() {
+private fun BehaviorSection(startup: io.github.hypercar.session.StartupReadiness) {
     val context = LocalContext.current
     var autoConnect by remember(io.github.hypercar.settings.SettingsRevision.value) { mutableStateOf(SettingsStore.autoConnect) }
     var standbyNotification by remember(io.github.hypercar.settings.SettingsRevision.value) {
         mutableStateOf(SettingsStore.standbyNotification)
     }
-    var enableAudio by rememberSaveable { mutableStateOf(SettingsStore.enableAudio) }
     var discoveryFallback by rememberSaveable { mutableStateOf(SettingsStore.bluetoothDiscoverableFallback) }
     var carPlayMarker by rememberSaveable { mutableStateOf(SettingsStore.bluetoothCarPlayMarker) }
     var proactiveWifi by rememberSaveable { mutableStateOf(SettingsStore.proactiveWifiSession) }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        SectionLabel(text = "行为")
+        SectionLabel(text = "自动连接与恢复")
         GlassPanel(
             contentPadding = PaddingValues(horizontal = 20.dp, vertical = 6.dp),
         ) {
             SwitchRow(
                 title = "上车自动连接",
-                subtitle = "控制待机监听与自动重连，不影响手动连接或当前会话",
+                subtitle = if (startup.automaticReady) "启动条件已满足，可开启待机监听与自动重连"
+                    else "请先完成：" + startup.automaticIssues.joinToString("；"),
                 checked = autoConnect,
+                enabled = startup.automaticReady || autoConnect,
                 onCheckedChange = {
-                    autoConnect = it
                     HyperCarRepo.setAutoConnect(context, it)
+                    autoConnect = SettingsStore.autoConnect
                 },
             )
             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
             SwitchRow(
                 title = "待机通知",
                 subtitle = if (autoConnect) {
-                    "在通知栏显示「正在监听车机，等待自动连接」；关掉后不再常驻通知，但待机可能被系统回收"
+                    "显示待机监听通知，降低后台被系统回收的概率"
                 } else {
-                    "需要先打开上面的「上车自动连接」——没有待机监听就没有这条通知"
+                    "开启上车自动连接后可设置"
                 },
                 checked = standbyNotification,
                 enabled = autoConnect,
                 onCheckedChange = {
                     standbyNotification = it
                     HyperCarRepo.setStandbyNotification(context, it)
-                },
-            )
-            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-            SwitchRow(
-                title = "音频转发",
-                subtitle = "本机音轨直通 AirPlay 通道",
-                checked = enableAudio,
-                onCheckedChange = {
-                    enableAudio = it
-                    SettingsStore.enableAudio = it
                 },
             )
             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
@@ -1210,7 +1218,7 @@ private fun BehaviorSection() {
             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
             SwitchRow(
                 title = "CarPlay 蓝牙身份广播",
-                subtitle = "额外广播 CarPlay 手机身份，增强车机识别；可单独关闭验证连接效果",
+                subtitle = "帮助车机识别本机，可单独开关对照连接效果",
                 checked = carPlayMarker,
                 onCheckedChange = {
                     carPlayMarker = it
@@ -1220,7 +1228,7 @@ private fun BehaviorSection() {
             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
             SwitchRow(
                 title = "车机 Wi-Fi 主动连接（实验）",
-                subtitle = "接入已配对车机 Wi-Fi 后等待 10 秒再主动尝试；车机先邀请则立即连接。下次连接生效，自动上车需开启上车自动连接",
+                subtitle = "接入已配对车机 Wi-Fi 后等待 10 秒主动尝试；车机先邀请则立即连接。下次连接生效",
                 checked = proactiveWifi,
                 onCheckedChange = {
                     proactiveWifi = it
@@ -1229,6 +1237,15 @@ private fun BehaviorSection() {
                 },
             )
         }
+    }
+}
+
+@Composable
+private fun AudioSection() {
+    var enabled by rememberSaveable { mutableStateOf(SettingsStore.enableAudio) }
+    GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 2.dp)) {
+        SwitchRow(title = "音频转发", subtitle = "将声音传到车机，下次连接生效", checked = enabled,
+            onCheckedChange = { enabled = it; SettingsStore.enableAudio = it })
     }
 }
 
@@ -1488,72 +1505,116 @@ private fun HeadUnitSection(connected: Boolean = false) {
 
 
 
-/** 车机画面来源（2026-11-03）：自绘 UI（需 Shizuku）或 CarWith 模式（需小米手机）。 */
+/** Shared by first-use onboarding and settings, refreshed after grants/installations. */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun CarSourceSection() {
+fun CarSourceSection(
+    startup: io.github.hypercar.session.StartupReadiness,
+    onRefreshSetup: () -> Unit,
+    connected: Boolean = false,
+    title: String = "2. 选择车机画面来源",
+    compact: Boolean = false,
+) {
     val ctx = LocalContext.current
-    var current by rememberSaveable { mutableStateOf(SettingsStore.carSource) }
-    var guide by remember { mutableStateOf<String?>(null) }
-    val shizukuReady = remember { io.github.hypercar.shizuku.ShizukuTools.isReady }
-
-    val carWithOk = remember {
-        runCatching {
-            ctx.packageManager.getApplicationInfo(
-                "com.miui.carlink", android.content.pm.PackageManager.MATCH_DISABLED_COMPONENTS)
-        }.isSuccess
+    val current = startup.source
+    val shizukuState = ShizukuTools.state(ctx)
+    fun selectSource(source: String) {
+        if (connected) return
+        if (source == "car_ui" && !ShizukuTools.isReady) return
+        if (source == "carwith" && !io.github.hypercar.session.StartupRequirements.carWithInstalled(ctx)) return
+        SettingsStore.carSource = source
+        io.github.hypercar.settings.SettingsRevision.bump()
+        HyperCarRepo.log("STARTUP: 画面来源=$source，重新检查启动条件")
+        onRefreshSetup()
     }
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        SectionLabel(text = "车机画面来源")
-        GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp)) {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                listOf(
-                    "car_ui" to ("自绘车机 UI" to "本 App 自己渲染（地图卡 + 音乐卡 + Dock），需要 Shizuku"),
-                    "carwith" to ("CarWith 模式" to "由 CarWith 渲染/编码，本 App 只做转发；需要小米手机"),
-                ).forEach { (key, pair) ->
-                    val (title, desc) = pair
-                    Row(
-                        modifier = Modifier.fillMaxWidth()
-                            .clip(RoundedCornerShape(12.dp))
-                            .clickable {
-                                when {
-                                    key == "car_ui" && !shizukuReady ->
-                                        guide = "自绘车机 UI 需要 Shizuku：请安装并启动 Shizuku 后再选。"
-                                    key == "carwith" && !carWithOk ->
-                                        guide = "CarWith 模式需要系统自带的 CarWith（com.miui.carlink），当前未检测到。"
-                                    else -> {
-                                        current = key
-                                        SettingsStore.carSource = key
-                                        io.github.hypercar.settings.SettingsRevision.bump()
-                                    }
-                                }
-                            }
-                            .padding(vertical = 6.dp),
-                        verticalAlignment = Alignment.Top,
-                    ) {
-                        RadioButton(selected = current == key, onClick = null)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Column {
-                            Text(title, style = MaterialTheme.typography.bodyMedium,
-                                color = if (current == key) MintGreen else TextPrimary)
-                            Text(desc, style = MaterialTheme.typography.bodySmall, color = TextSecondary)
-                            if (key == "carwith" && !carWithOk) {
-                                Text("⚠ 当前设备不满足条件", style = MaterialTheme.typography.bodySmall,
-                                    color = Color(0xFFF59E0B))
-                            }
-                        }
+    if (compact) {
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            SectionLabel(text = title)
+            GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
+                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                    listOf("car_ui" to "自绘车机 UI", "carwith" to "CarWith").forEachIndexed { index, (source, label) ->
+                        SegmentedButton(
+                            selected = current == source,
+                            enabled = !connected && if (source == "car_ui") startup.shizukuReady else startup.carWithInstalled,
+                            onClick = { selectSource(source) },
+                            shape = SegmentedButtonDefaults.itemShape(index = index, count = 2),
+                            label = { Text(label, style = MaterialTheme.typography.labelMedium) },
+                        )
                     }
+                }
+                Spacer(Modifier.height(8.dp))
+                Text(when {
+                    connected -> "断开连接后可切换画面来源。"
+                    current == "carwith" -> "CarWith 的画面尺寸请在系统 CarWith 页面设置。"
+                    !startup.shizukuReady -> "自绘 UI 需先在「权限与后台」完成 Shizuku 授权。"
+                    else -> "自绘 UI 使用下方显示设置。"
+                }, color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+                if (!startup.carWithInstalled) {
+                    Text("未安装系统 CarWith，此选项不可用。", color = AmberWarning,
+                        style = MaterialTheme.typography.bodySmall)
                 }
             }
         }
+        return
     }
-    guide?.let { text ->
-        androidx.compose.material3.AlertDialog(
-            onDismissRequest = { guide = null },
-            confirmButton = {
-                androidx.compose.material3.TextButton(onClick = { guide = null }) { Text("知道了") }
-            },
-            title = { Text("无法切换画面来源") },
-            text = { Text(text) },
-        )
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SectionLabel(text = title)
+        GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp)) {
+            if (connected) {
+                Text("请先断开当前会话，再切换画面来源", color = AmberWarning,
+                    style = MaterialTheme.typography.bodySmall)
+            }
+            Text("自绘车机 UI", color = TextPrimary, style = MaterialTheme.typography.titleSmall)
+            Text(if (compact) "地图与音乐界面，需要 Shizuku 已启动并授权。"
+                else "地图、音乐卡片与 Dock。必须先完成 Shizuku 安装、启动和授权。",
+                color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.height(8.dp))
+            if (startup.shizukuReady) {
+                CapsuleButton(if (current == "car_ui") "已选择自绘车机 UI" else "选择自绘车机 UI",
+                    onClick = { selectSource("car_ui") }, enabled = !connected,
+                    modifier = Modifier.fillMaxWidth(), filled = current == "car_ui")
+            } else {
+                Text(when (shizukuState) {
+                    ShizukuState.NotInstalled -> "第 1 步：下载并安装 Shizuku；第 2 步：启动服务；第 3 步：授权 HyperCar。"
+                    ShizukuState.NotRunning -> "已安装：请在 Shizuku 内通过无线调试或 root 启动服务，再返回申请授权。"
+                    ShizukuState.NotGranted -> "服务已启动：请申请授权，在 Shizuku 弹窗中允许 HyperCar。"
+                    ShizukuState.Ready -> "授权已完成，正在更新状态。"
+                }, color = AmberWarning, style = MaterialTheme.typography.bodySmall)
+                Spacer(Modifier.height(8.dp))
+                CapsuleButton(when (shizukuState) {
+                    ShizukuState.NotInstalled -> "前往 GitHub 下载 Shizuku 最新版"
+                    ShizukuState.NotRunning -> "打开 Shizuku，启动服务"
+                    ShizukuState.NotGranted -> "申请 Shizuku 授权"
+                    ShizukuState.Ready -> "重新检查授权"
+                }, onClick = {
+                    when (ShizukuTools.state(ctx)) {
+                        ShizukuState.NotInstalled -> ShizukuTools.openShizukuSite(ctx)
+                        ShizukuState.NotRunning -> ShizukuTools.openShizukuApp(ctx)
+                        ShizukuState.NotGranted -> ShizukuTools.requestPermissionIfNeeded {
+                            HyperCarRepo.refreshSystemState()
+                            onRefreshSetup()
+                        }
+                        ShizukuState.Ready -> onRefreshSetup()
+                    }
+                }, modifier = Modifier.fillMaxWidth(), enabled = !connected)
+            }
+            Spacer(Modifier.height(16.dp))
+            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+            Spacer(Modifier.height(16.dp))
+            Text("CarWith 模式", color = TextPrimary, style = MaterialTheme.typography.titleSmall)
+            Text(if (startup.carWithInstalled) "已检测到系统 CarWith，无需 Shizuku。画面尺寸请在 CarWith 中设置。"
+                else "未检测到可用的系统 CarWith（com.miui.carlink），当前设备无法选择此模式。",
+                color = if (startup.carWithInstalled) TextSecondary else AmberWarning,
+                style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.height(8.dp))
+            CapsuleButton(if (current == "carwith") "已选择 CarWith" else "选择 CarWith",
+                onClick = { selectSource("carwith") }, enabled = !connected && startup.carWithInstalled,
+                modifier = Modifier.fillMaxWidth(), filled = current == "carwith")
+            if (!compact) {
+                Spacer(Modifier.height(8.dp))
+                Text("从安装或授权页面返回后会自动重新检查。", color = TextSecondary,
+                    style = MaterialTheme.typography.labelSmall)
+            }
+        }
     }
 }

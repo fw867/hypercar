@@ -275,6 +275,10 @@ object HyperCarRepo {
                 val app = ctx.applicationContext
                 if (!SettingsStore.autoConnect) return@handler
                 if (connected) {
+                    if (!StartupRequirements.read(app).automaticReady) {
+                        startAutomaticListening(app)
+                        return@handler
+                    }
                     // 记住刚连上 ACL 的车机：本轮 iAP2 只拨/只收这台，别再去碰
                     // HI-BOX 之类已配对的旧 dongle（每次 RFCOMM 失败都白占栈、添噪音，
                     // 2026-10-25 现场日志里 10 分钟里一半是它们的连接失败）
@@ -373,6 +377,15 @@ object HyperCarRepo {
         scope.launch {
             autoConnectChanges.lock()
             try {
+                if (!hasCurrentSession) {
+                    val readiness = StartupRequirements.read(context)
+                    val issues = if (manual) readiness.manualIssues else readiness.automaticIssues
+                    if (issues.isNotEmpty()) {
+                        log("STARTUP: 阻止连接：${issues.joinToString("；")}")
+                        push(link = LinkState.Failed("请先完成使用引导：${issues.joinToString("；")}"))
+                        return@launch
+                    }
+                }
                 if (AutomaticConnectionPolicy.mayStart(manual, SettingsStore.autoConnect)) beginConnect(context, source)
             } finally { autoConnectChanges.unlock() }
         }
@@ -486,6 +499,13 @@ object HyperCarRepo {
     }
 
     fun setAutoConnect(context: Context, enabled: Boolean) {
+        if (enabled) {
+            val issues = StartupRequirements.read(context).automaticIssues
+            if (issues.isNotEmpty()) {
+                log("STARTUP: 无法开启自动上车连接：${issues.joinToString("；")}")
+                return
+            }
+        }
         SettingsStore.autoConnect = enabled
         if (!enabled) stopWifiReconnectMonitor()
         io.github.hypercar.settings.SettingsRevision.bump()
@@ -519,6 +539,14 @@ object HyperCarRepo {
         scope.launch {
             autoConnectChanges.lock()
             try {
+                if (SettingsStore.autoConnect) {
+                    val issues = StartupRequirements.read(context).automaticIssues
+                    if (issues.isNotEmpty()) {
+                        SettingsStore.autoConnect = false
+                        io.github.hypercar.settings.SettingsRevision.bump()
+                        log("STARTUP: 启动条件未满足，已关闭自动上车连接：${issues.joinToString("；")}")
+                    }
+                }
                 if (SettingsStore.autoConnect) startWifiReconnectMonitor(context)
                 else stopWifiReconnectMonitor()
                 io.github.hypercar.autowake.CarCompanionWake.sync(context)
@@ -562,6 +590,10 @@ object HyperCarRepo {
         if (!SettingsStore.autoConnect || hasCurrentSession) return
         appContext()?.let { io.github.hypercar.carui.MusicNotificationListener.sync(it) }
         val context = appContext() ?: return
+        if (!StartupRequirements.read(context).automaticReady) {
+            startAutomaticListening(context)
+            return
+        }
         startWifiReconnectMonitor(context)
         val coordinator = coordinatorFor(context)
         coordinator.start { endpoint ->
@@ -765,6 +797,11 @@ object HyperCarRepo {
     // ---------------------------------------------------------------- 连接主流程
 
     private suspend fun runConnect(context: Context) {
+        val startupIssues = StartupRequirements.read(context).manualIssues
+        if (startupIssues.isNotEmpty()) {
+            fail("启动条件已变化：${startupIssues.joinToString("；")}")
+            return
+        }
         val diagnosticId = connectionAttemptId
         val bluetoothPermission = context.checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) ==
             android.content.pm.PackageManager.PERMISSION_GRANTED

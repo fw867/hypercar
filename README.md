@@ -38,8 +38,10 @@ Android / Kotlin 管理蓝牙、网络、会话和 Compose 首页；Shizuku 创�
 
 设置里可切换两种来源：
 
-- **自绘车机 UI（默认）**：本 App 自己渲染地图卡 / 音乐卡 / Dock，经 Shizuku 建虚显并编码推送；需要 Shizuku。
+- **自绘车机 UI**：本 App 自己渲染地图卡 / 音乐卡 / Dock，经 Shizuku 建虚显并编码推送；必须安装、启动并授权 Shizuku。
 - **CarWith 模式**：拉起小米 CarWith 的 `CarlifeAdbActivity`，由 CarWith 渲染与编码，本 App 只做 CarLife → AirPlay 转发；需要系统自带 `com.miui.carlink`。
+
+新安装需按首页引导完成必需权限、显式选择画面来源，条件满足后才能连接。自动上车另需悬浮窗权限，默认关闭；音乐通知使用权、电池与厂商自启动按功能需要配置。详见[首次配置](docs/BUILD.md)。
 
 
 | 项 | 取值 / 说明 |

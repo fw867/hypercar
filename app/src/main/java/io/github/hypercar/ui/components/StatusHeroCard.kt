@@ -74,6 +74,8 @@ import kotlinx.coroutines.delay
 fun StatusHeroCard(
     link: LinkState,
     autoConnectEnabled: Boolean = true,
+    startEnabled: Boolean = true,
+    startBlockReason: String? = null,
     onStartClick: () -> Unit,
     onStopClick: () -> Unit,
     /** 右上角日志图标（原来首页底部那行「查看全部日志」文字链接）。 */
@@ -114,7 +116,11 @@ fun StatusHeroCard(
                 ) { state ->
                     HeroHeadline(link = state, nowMillis = nowMillis, profileLabel = profileLabel, autoConnectEnabled = autoConnectEnabled)
                 }
-                HeroAction(link = link, onStartClick = onStartClick, onStopClick = onStopClick)
+                HeroAction(link = link, onStartClick = onStartClick, onStopClick = onStopClick, startEnabled = startEnabled)
+                if (!startEnabled && link !is LinkState.Connected && link !is LinkState.Negotiating) {
+                    Text(startBlockReason ?: "请先完成使用引导", color = AmberWarning,
+                        style = MaterialTheme.typography.bodySmall)
+                }
             }
             if (onOpenLogs != null) {
                 Text(
@@ -439,6 +445,7 @@ private fun HeroAction(
     link: LinkState,
     onStartClick: () -> Unit,
     onStopClick: () -> Unit,
+    startEnabled: Boolean,
 ) {
     val buttonModifier = Modifier
         .fillMaxWidth()
@@ -477,6 +484,7 @@ private fun HeroAction(
         is LinkState.Failed -> CapsuleButton(
             text = "重试连接",
             onClick = onStartClick,
+            enabled = startEnabled,
             modifier = buttonModifier,
             filled = true,
             leadingIcon = Icons.Rounded.Refresh,
@@ -485,6 +493,7 @@ private fun HeroAction(
         is LinkState.Idle -> CapsuleButton(
             text = "启动连接",
             onClick = onStartClick,
+            enabled = startEnabled,
             modifier = buttonModifier,
             filled = true,
             leadingIcon = Icons.Rounded.PowerSettingsNew,

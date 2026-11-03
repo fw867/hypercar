@@ -110,11 +110,11 @@ object ShizukuTools {
         true
     }.getOrDefault(false)
 
-    /** Shizuku 官方站点（未安装时的安装入口）——用浏览器打开，避免依赖应用商店。 */
+    /** GitHub 最新正式发布页，随上游更新而变化，不固定 APK 版本。 */
     fun openShizukuSite(context: Context) {
         runCatching {
             context.startActivity(
-                Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://shizuku.rikka.app/"))
+                Intent(Intent.ACTION_VIEW, android.net.Uri.parse("https://github.com/RikkaApps/Shizuku/releases/latest"))
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             )
         }

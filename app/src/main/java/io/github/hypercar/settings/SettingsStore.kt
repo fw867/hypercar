@@ -8,6 +8,9 @@ import android.content.SharedPreferences
  * 与 UI 的契约：全部属性为 suspend-free 同步读，写入立即生效并广播 Flow。
  */
 object SettingsStore {
+    const val DEFAULT_VIDEO_WIDTH = 1920
+    const val DEFAULT_VIDEO_HEIGHT = 1080
+
 
     @Volatile
     private var prefs: SharedPreferences? = null
@@ -80,9 +83,9 @@ object SettingsStore {
         p().edit().remove("listening_disabled").apply()
     }
 
-    /** 上车自动连接（ACL 广播唤醒），默认开。 */
+    /** 上车自动连接（ACL 广播唤醒），新安装默认关，完成启动条件后由用户开启。 */
     var autoConnect: Boolean
-        get() = p().getBoolean(KEY_AUTO_CONNECT, true)
+        get() = p().getBoolean(KEY_AUTO_CONNECT, false)
         set(v) = p().edit().putBoolean(KEY_AUTO_CONNECT, v).apply()
 
     /** 已配对车机 Wi-Fi 上等待 iAP2 的一次短暂可发现兜底；需要 Shizuku。 */
@@ -210,11 +213,11 @@ object SettingsStore {
     fun clearPairedCars() = p().edit().remove(KEY_PAIRED_CARS).apply()
     /** 屏幕推送分辨率**兜底值**（车机 `/info` 没回报尺寸时才用）。 */
     var videoWidth: Int
-        get() = p().getInt(KEY_WIDTH, 2560)
+        get() = p().getInt(KEY_WIDTH, DEFAULT_VIDEO_WIDTH)
         set(v) = p().edit().putInt(KEY_WIDTH, v.coerceAtLeast(2)).apply()
 
     var videoHeight: Int
-        get() = p().getInt(KEY_HEIGHT, 744)
+        get() = p().getInt(KEY_HEIGHT, DEFAULT_VIDEO_HEIGHT)
         set(v) = p().edit().putInt(KEY_HEIGHT, v.coerceAtLeast(2)).apply()
 
     @Volatile var receiverViewport: Pair<Int, Int>? = null
@@ -239,6 +242,9 @@ object SettingsStore {
     var carSource: String
         get() = p().getString("car_source", "car_ui") ?: "car_ui"
         set(v) = p().edit().putString("car_source", v).apply()
+
+    /** Existing explicit choices survive upgrades; fresh installs must choose a source. */
+    val carSourceSelected: Boolean get() = p().contains("car_source")
 
     /** 是否 CarWith 模式。 */
     val carWithMode: Boolean get() = carSource == "carwith"
