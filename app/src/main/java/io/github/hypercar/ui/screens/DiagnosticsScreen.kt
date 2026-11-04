@@ -54,7 +54,7 @@ import io.github.hypercar.ui.theme.TextPrimary
 import io.github.hypercar.ui.theme.TextSecondary
 
 /**
- * 诊断页：全量日志（反转显示：最新在上）+ 记录开关 + 复制 + 导出 + 清空 + 会话摘要。
+ * 诊断页：全量日志（反转显示：最新在上）+ 记录开关 + 复制 + 导出 + 清空。
  * 无需 adb，链路日志由 Rust 核心层环形缓冲直推 UI；上车调试时可一键导出到 下载/HyperCar/。
  */
 @Composable
@@ -66,7 +66,6 @@ fun DiagnosticsScreen(
     onClearLogs: () -> Unit,
     onExport: () -> Unit,
     modifier: Modifier = Modifier,
-    pipeline: io.github.hypercar.core.PipelineDiagnostics = io.github.hypercar.core.PipelineDiagnostics(),
 ) {
     // 轻提示（复制/导出反馈）：2s 自动消失
     var toast by remember { mutableStateOf<String?>(null) }
@@ -93,7 +92,6 @@ fun DiagnosticsScreen(
             onFeedback = { toast = it },
             logs = logs,
         )
-        if (pipeline.generation > 0) SessionCard(pipeline)
         AnimatedVisibility(
             visible = toast != null,
             enter = fadeIn(),
@@ -112,32 +110,6 @@ fun DiagnosticsScreen(
                 .fillMaxWidth()
                 .weight(1f),
         )
-    }
-}
-
-/** Full-width compact summary; leave the remaining height to the log viewer. */
-@Composable
-private fun SessionCard(p: io.github.hypercar.core.PipelineDiagnostics) {
-    fun age(ms: Long?) = ms?.let { "${it / 1000}s前" } ?: "无"
-    val owner = when (p.screenOwned) { true -> "手机"; false -> "车机"; null -> "未知" }
-    val lines = listOf(
-        "控制 ${if (p.controlReady) "就绪" else "协商中"} · iAP2 ${p.wifiLabel} · 归属 $owner · 视频 ${p.videoLabel}",
-        "视频 来源/写出 ${p.sourceUnits}/${p.writtenFrames}帧 · 进入/重建 ${p.uiRequests}/${p.rebuilds}",
-        "音频 ${if (p.audioReady) "就绪" else "未就绪"} · 写出/非零PCM ${p.audioPackets}/${p.signalPackets}包",
-        "计时 请求/回包 ${p.timingRequests}/${p.timingReplies} · 最近 ${age(p.timingReplyAgeMs)}",
-        "TCP 确认 ${p.tcpAckedBytes?.let { "${it / 1024}KB" } ?: "未知"} · 队列 ${p.tcpQueuedBytes?.let { "${it}B" } ?: "未知"} · 重传 ${p.tcpRetransmissions ?: "未知"} · 采样 ${age(p.tcpSampleAgeMs)}",
-    )
-    GlassPanel(modifier = Modifier.fillMaxWidth(),
-        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)) {
-        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text("连接阶段" + if (p.active) "" else " · 上次会话", color = TextPrimary,
-                style = MaterialTheme.typography.titleSmall, fontSize = 12.sp, lineHeight = 15.sp)
-            lines.forEach { line ->
-                Text(line, color = TextSecondary, fontSize = 11.sp, lineHeight = 14.sp)
-            }
-            Text("写出/TCP确认不代表车机已显示或出声", color = TextSecondary,
-                fontSize = 10.sp, lineHeight = 12.sp)
-        }
     }
 }
 

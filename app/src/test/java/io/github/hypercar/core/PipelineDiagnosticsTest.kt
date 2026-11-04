@@ -4,6 +4,39 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PipelineDiagnosticsTest {
+    @Test fun queueAndCumulativeRetransmitsDoNotTurnHealthyTransportRed() {
+        val p=PipelineDiagnostics.parse("""{"generation":11,"control_ready":true,"wifi_iap2":"READY_TRANSPORT","video_stream":"READY","audio_ready":true,"timing":{"requests":20,"replies":20},"video_tcp":{"state":1,"acked_bytes":8192,"outq_bytes":1024,"total_retrans":9}}""")!!
+        assertEquals(PipelineStatus.SUCCESS,p.controlStatus)
+        assertEquals(PipelineStatus.SUCCESS,p.wifiStatus)
+        assertEquals(PipelineStatus.SUCCESS,p.videoStatus)
+        assertEquals(PipelineStatus.SUCCESS,p.audioStatus)
+        assertEquals(PipelineStatus.SUCCESS,p.timingStatus)
+        assertEquals(PipelineStatus.SUCCESS,p.tcpStatus)
+    }
+    @Test fun waitingBorrowedScreenAndSynOnlyCounterAreNotFailures() {
+        val p=PipelineDiagnostics(generation=12,active=true,wifiIap2="WAIT_PEER_LONG",
+            screenOwned=false,videoStream="PAUSED",tcpState=1,tcpAckedBytes=1)
+        assertEquals(PipelineStatus.NEUTRAL,p.controlStatus)
+        assertEquals(PipelineStatus.NEUTRAL,p.wifiStatus)
+        assertEquals(PipelineStatus.NEUTRAL,p.videoStatus)
+        assertEquals(PipelineStatus.NEUTRAL,p.audioStatus)
+        assertEquals(PipelineStatus.NEUTRAL,p.timingStatus)
+        assertEquals(PipelineStatus.NEUTRAL,p.tcpStatus)
+    }
+    @Test fun explicitFailuresAreRedButEndedSnapshotsAreNeutral() {
+        val p=PipelineDiagnostics.parse("""{"generation":13,"wifi_iap2":"FAILED","video_stream":"FAILED","timing":{"requests":20,"replies":19,"send_errors":1,"receive_errors":2},"video_tcp":{"state":8,"acked_bytes":8192,"info_errno":null}}""")!!
+        assertEquals(1L,p.timingSendErrors);assertEquals(2L,p.timingReceiveErrors)
+        assertEquals(PipelineStatus.ERROR,p.wifiStatus)
+        assertEquals(PipelineStatus.ERROR,p.videoStatus)
+        assertEquals(PipelineStatus.ERROR,p.timingStatus)
+        assertEquals(PipelineStatus.ERROR,p.tcpStatus)
+        assertEquals(PipelineStatus.ERROR,p.copy(tcpState=1,tcpInfoError=9).tcpStatus)
+        val old=p.copy(active=false)
+        assertEquals(PipelineStatus.NEUTRAL,old.wifiStatus)
+        assertEquals(PipelineStatus.NEUTRAL,old.videoStatus)
+        assertEquals(PipelineStatus.NEUTRAL,old.timingStatus)
+        assertEquals(PipelineStatus.NEUTRAL,old.tcpStatus)
+    }
     @Test fun preservesUnknownOwnershipAndDoesNotInferSignalFromRtp() {
         val p = PipelineDiagnostics.parse("""{"generation":7,"control_ready":true,"screen_owned":null,"wifi_iap2":"WAIT_PEER_LONG","audio_packets_written":1000,"audio_signal_packets":0,"video_frames_written":200} """)!!
         assertNull(p.screenOwned)

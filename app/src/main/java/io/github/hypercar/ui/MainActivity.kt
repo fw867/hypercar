@@ -340,7 +340,6 @@ private fun MainContent() {
                                 snapshot.link is io.github.hypercar.core.LinkState.Negotiating,)
 
                     AppTab.Diagnostics -> DiagnosticsScreen(
-                        pipeline = snapshot.pipeline,
                         logs = snapshot.recentLogs,
                         recording = snapshot.logRecording,
                         lastExportPath = snapshot.lastExportPath,

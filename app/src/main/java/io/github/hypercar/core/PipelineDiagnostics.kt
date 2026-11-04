@@ -2,6 +2,8 @@ package io.github.hypercar.core
 
 import org.json.JSONObject
 
+enum class PipelineStatus { NEUTRAL, SUCCESS, ERROR }
+
 /** Observed sender facts; receiver display and speaker output have no acknowledgement here. */
 data class PipelineDiagnostics(
     val generation: Long = 0,
@@ -24,7 +26,26 @@ data class PipelineDiagnostics(
     val tcpQueuedBytes: Long? = null,
     val tcpRetransmissions: Long? = null,
     val tcpSampleAgeMs: Long? = null,
+    val timingSendErrors: Long = 0,
+    val timingReceiveErrors: Long = 0,
+    val tcpState: Int? = null,
+    val tcpInfoError: Long? = null,
 ) {
+    private fun status(success: Boolean, error: Boolean = false) = when {
+        !active || generation <= 0 -> PipelineStatus.NEUTRAL
+        error -> PipelineStatus.ERROR
+        success -> PipelineStatus.SUCCESS
+        else -> PipelineStatus.NEUTRAL
+    }
+    val controlStatus get() = status(controlReady)
+    val wifiStatus get() = status(wifiIap2 == "READY_TRANSPORT", wifiIap2 in setOf("FAILED", "STOPPED"))
+    val videoStatus get() = status(videoStream == "READY", videoStream == "FAILED")
+    val audioStatus get() = status(audioReady)
+    val timingStatus get() = status(timingRequests > 0 && timingReplies == timingRequests,
+        timingSendErrors > 0 || timingReceiveErrors > 0)
+    // Queue depth and cumulative retransmits are ordinary TCP observations, not proof of failure.
+    val tcpStatus get() = status((tcpAckedBytes ?: 0) > 1,
+        tcpInfoError != null || tcpState in setOf(7, 8, 9, 11))
     val timingLabel: String get() = "计时：请求 $timingRequests / 回包 $timingReplies　最近 ${timingReplyAgeMs?.let { "${it / 1000}s前" } ?: "无"}"
     val tcpLabel: String get() = "TCP：确认 ${tcpAckedBytes?.let { "${it / 1024}KB" } ?: "未知"}　队列 ${tcpQueuedBytes?.let { "${it}B" } ?: "未知"}　重传 ${tcpRetransmissions ?: "未知"}"
     val tcpAgeLabel: String get() = "TCP采样：${tcpSampleAgeMs?.let { "${it / 1000}s前" } ?: "暂无"}；确认仅表示对端网络接收"
@@ -71,6 +92,10 @@ data class PipelineDiagnostics(
                 timingReplyAgeMs = timing.number("reply_age_ms"),
                 tcpAckedBytes = tcp.number("acked_bytes"), tcpQueuedBytes = tcp.number("outq_bytes"),
                 tcpRetransmissions = tcp.number("total_retrans"), tcpSampleAgeMs = tcp.number("age_ms"),
+                timingSendErrors = timing.number("send_errors") ?: 0,
+                timingReceiveErrors = timing.number("receive_errors") ?: 0,
+                tcpState = tcp.number("state")?.takeIf { it <= 255 }?.toInt(),
+                tcpInfoError = tcp.number("info_errno"),
             )
         }.getOrNull()
     }

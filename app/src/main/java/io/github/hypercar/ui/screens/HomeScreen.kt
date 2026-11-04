@@ -37,6 +37,7 @@ import io.github.hypercar.ui.components.GlassPanel
 import io.github.hypercar.ui.components.PermissionChecklistCard
 import io.github.hypercar.ui.components.StatGrid
 import io.github.hypercar.ui.components.StatusHeroCard
+import io.github.hypercar.ui.components.ConnectionStageCard
 import io.github.hypercar.ui.theme.MintGreen
 import io.github.hypercar.ui.theme.MonoLogLine
 import io.github.hypercar.ui.theme.TextPrimary
@@ -144,7 +145,10 @@ fun HomeScreen(
                     verticalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
                     if (startup.manualReady) Checklist()
-                    FirstConnectGuideCard()
+                    if (snapshot.link is io.github.hypercar.core.LinkState.Connected) {
+                        ConnectionStageCard(snapshot.pipeline.takeIf { it.active }
+                            ?: io.github.hypercar.core.PipelineDiagnostics())
+                    } else FirstConnectGuideCard()
 
                 }
             }
@@ -176,7 +180,10 @@ fun HomeScreen(
                     degradedHint = degradedChipHint(snapshot),
                 )
                 if (startup.manualReady) Checklist()
-                FirstConnectGuideCard()
+                if (snapshot.link is io.github.hypercar.core.LinkState.Connected) {
+                    ConnectionStageCard(snapshot.pipeline.takeIf { it.active }
+                        ?: io.github.hypercar.core.PipelineDiagnostics())
+                } else FirstConnectGuideCard()
 
                 Spacer(modifier = Modifier.height(8.dp))
             }
