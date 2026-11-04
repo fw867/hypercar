@@ -1,6 +1,5 @@
 package io.github.hypercar.ui.screens
 
-import android.os.Build
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -19,12 +18,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.ContentCopy
-import androidx.compose.material.icons.rounded.DeleteOutline
-import androidx.compose.material.icons.rounded.FileDownload
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
@@ -44,7 +39,6 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import io.github.hypercar.BuildConfig
 import io.github.hypercar.session.GitHubFeedback
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.ui.components.CapsuleButton
@@ -60,7 +54,7 @@ import io.github.hypercar.ui.theme.TextPrimary
 import io.github.hypercar.ui.theme.TextSecondary
 
 /**
- * 诊断页：全量日志（反转显示：最新在上）+ 记录开关 + 复制 + 导出 + 清空 + 版本信息。
+ * 诊断页：全量日志（反转显示：最新在上）+ 记录开关 + 复制 + 导出 + 清空 + 会话摘要。
  * 无需 adb，链路日志由 Rust 核心层环形缓冲直推 UI；上车调试时可一键导出到 下载/HyperCar/。
  */
 @Composable
@@ -86,8 +80,8 @@ fun DiagnosticsScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .padding(horizontal = 16.dp, vertical = 16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Header(
             count = logs.size,
@@ -99,26 +93,7 @@ fun DiagnosticsScreen(
             onFeedback = { toast = it },
             logs = logs,
         )
-        if (pipeline.generation > 0) {
-            GlassPanel(contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)) {
-                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                    Text("连接阶段" + if (pipeline.active) "" else " · 上次会话", color = TextPrimary,
-                        style = MaterialTheme.typography.titleSmall)
-                    Text("控制：${if (pipeline.controlReady) "会话就绪" else "协商中"}　iAP2：${pipeline.wifiLabel}",
-                        color = TextSecondary, fontSize = 11.sp)
-                    Text("画面归属：${when (pipeline.screenOwned) { true -> "手机"; false -> "车机"; null -> "未知" }}　视频：${pipeline.videoLabel}",
-                        color = TextSecondary, fontSize = 11.sp)
-                    Text("来源 ${pipeline.sourceUnits} / 写出 ${pipeline.writtenFrames} 帧　进入请求 ${pipeline.uiRequests} / 重建 ${pipeline.rebuilds}",
-                        color = TextSecondary, fontSize = 11.sp)
-                    Text("音频：${if (pipeline.audioReady) "通道就绪" else "未就绪"}　写出 ${pipeline.audioPackets} 包 / 非零PCM ${pipeline.signalPackets} 包",
-                        color = TextSecondary, fontSize = 11.sp)
-                    Text(pipeline.timingLabel, color = TextSecondary, fontSize = 11.sp)
-                    Text(pipeline.tcpLabel, color = TextSecondary, fontSize = 11.sp)
-                    Text(pipeline.tcpAgeLabel, color = TextSecondary, fontSize = 10.sp)
-                    Text("写出或TCP确认不能确认车机已显示或出声", color = TextSecondary, fontSize = 10.sp)
-                }
-            }
-        }
+        if (pipeline.generation > 0) SessionCard(pipeline)
         AnimatedVisibility(
             visible = toast != null,
             enter = fadeIn(),
@@ -137,7 +112,32 @@ fun DiagnosticsScreen(
                 .fillMaxWidth()
                 .weight(1f),
         )
-        VersionCard()
+    }
+}
+
+/** Full-width compact summary; leave the remaining height to the log viewer. */
+@Composable
+private fun SessionCard(p: io.github.hypercar.core.PipelineDiagnostics) {
+    fun age(ms: Long?) = ms?.let { "${it / 1000}s前" } ?: "无"
+    val owner = when (p.screenOwned) { true -> "手机"; false -> "车机"; null -> "未知" }
+    val lines = listOf(
+        "控制 ${if (p.controlReady) "就绪" else "协商中"} · iAP2 ${p.wifiLabel} · 归属 $owner · 视频 ${p.videoLabel}",
+        "视频 来源/写出 ${p.sourceUnits}/${p.writtenFrames}帧 · 进入/重建 ${p.uiRequests}/${p.rebuilds}",
+        "音频 ${if (p.audioReady) "就绪" else "未就绪"} · 写出/非零PCM ${p.audioPackets}/${p.signalPackets}包",
+        "计时 请求/回包 ${p.timingRequests}/${p.timingReplies} · 最近 ${age(p.timingReplyAgeMs)}",
+        "TCP 确认 ${p.tcpAckedBytes?.let { "${it / 1024}KB" } ?: "未知"} · 队列 ${p.tcpQueuedBytes?.let { "${it}B" } ?: "未知"} · 重传 ${p.tcpRetransmissions ?: "未知"} · 采样 ${age(p.tcpSampleAgeMs)}",
+    )
+    GlassPanel(modifier = Modifier.fillMaxWidth(),
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)) {
+        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text("连接阶段" + if (p.active) "" else " · 上次会话", color = TextPrimary,
+                style = MaterialTheme.typography.titleSmall, fontSize = 12.sp, lineHeight = 15.sp)
+            lines.forEach { line ->
+                Text(line, color = TextSecondary, fontSize = 11.sp, lineHeight = 14.sp)
+            }
+            Text("写出/TCP确认不代表车机已显示或出声", color = TextSecondary,
+                fontSize = 10.sp, lineHeight = 12.sp)
+        }
     }
 }
 
@@ -313,7 +313,7 @@ private fun LogList(logs: List<String>, modifier: Modifier = Modifier) {
     }
     GlassPanel(
         modifier = modifier,
-        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
     ) {
         if (logs.isEmpty()) {
             Column(
@@ -387,54 +387,6 @@ private fun DiagnosticsLogRow(line: String) {
 
 /** `12:34:56.789  ` 行前缀。 */
 private val TimestampPrefixRegex = Regex("""^(\d{2}:\d{2}:\d{2}\.\d{3})\s+""")
-
-/* ---------- 版本信息 ---------- */
-
-@Composable
-private fun VersionCard() {
-    GlassPanel(
-        contentPadding = PaddingValues(horizontal = 20.dp, vertical = 14.dp),
-    ) {
-        SectionLabel(text = "版本信息")
-        Spacer(modifier = Modifier.height(6.dp))
-        InfoRow(label = "版本", value = BuildConfig.VERSION_NAME)
-        HorizontalDivider(
-            modifier = Modifier.padding(vertical = 4.dp),
-            color = StrokeGlass.copy(alpha = 0.5f),
-        )
-        InfoRow(label = "包名", value = BuildConfig.APPLICATION_ID)
-        HorizontalDivider(
-            modifier = Modifier.padding(vertical = 4.dp),
-            color = StrokeGlass.copy(alpha = 0.5f),
-        )
-        InfoRow(
-            label = "系统",
-            value = "Android ${Build.VERSION.RELEASE} · SDK ${Build.VERSION.SDK_INT}",
-        )
-        HorizontalDivider(
-            modifier = Modifier.padding(vertical = 4.dp),
-            color = StrokeGlass.copy(alpha = 0.5f),
-        )
-        InfoRow(label = "设备", value = "${Build.MANUFACTURER} ${Build.MODEL}")
-    }
-}
-
-@Composable
-private fun InfoRow(label: String, value: String) {
-    Row(modifier = Modifier.fillMaxWidth()) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.bodySmall,
-            color = TextSecondary,
-            modifier = Modifier.width(64.dp),
-        )
-        Text(
-            text = value,
-            style = MonoLogLine,
-            color = TextPrimary,
-        )
-    }
-}
 
 /* ---------- 日志解析（供首页预览与诊断页共用） ---------- */
 

@@ -308,7 +308,7 @@ private fun MainContent() {
                         snapshot = snapshot,
                         onStart = { HyperCarRepo.connect(context) },
                         onStop = { HyperCarRepo.disconnect() },
-                        onOpenDiagnostics = { tabIndex = AppTab.Diagnostics.ordinal },
+                        onToggleAutoConnect = { HyperCarRepo.setAutoConnect(context, it) },
                         onRequestDegradedPermission = {
                             permissionLauncher.launch(HyperCarRepo.degradedPermissionsToRequest())
                         },

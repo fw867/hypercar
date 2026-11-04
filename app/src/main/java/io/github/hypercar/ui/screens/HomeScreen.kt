@@ -53,7 +53,7 @@ fun HomeScreen(
     snapshot: SessionSnapshot,
     onStart: () -> Unit,
     onStop: () -> Unit,
-    onOpenDiagnostics: () -> Unit,
+    onToggleAutoConnect: (Boolean) -> Unit,
     onRequestDegradedPermission: () -> Unit,
     permissions: PermissionSummary,
     locationServiceOn: Boolean,
@@ -126,7 +126,8 @@ fun HomeScreen(
                         autoConnectEnabled = autoConnect,
                         onStartClick = onStart,
                         onStopClick = onStop,
-                        onOpenLogs = onOpenDiagnostics,
+                        onToggleAutoConnect = onToggleAutoConnect,
+                        autoConnectToggleEnabled = startup.automaticReady || autoConnect,
                         profileLabel = io.github.hypercar.headunit.HeadUnitProfiles.current().label,
                     )
                     StatGrid(
@@ -164,7 +165,8 @@ fun HomeScreen(
                     autoConnectEnabled = autoConnect,
                     onStartClick = onStart,
                     onStopClick = onStop,
-                    onOpenLogs = onOpenDiagnostics,
+                    onToggleAutoConnect = onToggleAutoConnect,
+                    autoConnectToggleEnabled = startup.automaticReady || autoConnect,
                         profileLabel = io.github.hypercar.headunit.HeadUnitProfiles.current().label,
                 )
                 // 四枚状态芯片改成 2×2：原来单行横滑，Shizuku 在窄屏上被挤出屏幕

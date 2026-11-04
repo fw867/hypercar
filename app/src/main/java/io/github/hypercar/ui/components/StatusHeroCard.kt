@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Bluetooth
+import androidx.compose.material.icons.rounded.Autorenew
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.DirectionsCar
@@ -28,6 +29,8 @@ import androidx.compose.material.icons.rounded.PowerSettingsNew
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconToggleButton
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -46,6 +49,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.github.hypercar.core.LinkState
@@ -78,8 +83,9 @@ fun StatusHeroCard(
     startBlockReason: String? = null,
     onStartClick: () -> Unit,
     onStopClick: () -> Unit,
-    /** 右上角日志图标（原来首页底部那行「查看全部日志」文字链接）。 */
-    onOpenLogs: (() -> Unit)? = null,
+    /** Same automatic-connection preference and prerequisites as the settings page. */
+    onToggleAutoConnect: ((Boolean) -> Unit)? = null,
+    autoConnectToggleEnabled: Boolean = true,
     /** 当前车机档案名（显示在标题上方，小字）。 */
     profileLabel: String? = null,
     modifier: Modifier = Modifier,
@@ -105,14 +111,14 @@ fun StatusHeroCard(
         glow = link !is LinkState.Idle,
         glowColor = accent,
     ) {
-        // 右上角日志图标：原来是首页底部一行「查看全部日志」文字链接，
-        // 挪到首卡右上角后不占版面，也符合"第一张卡就是入口"的直觉。
+        // The top-right shortcut changes automatic mode without replacing the session action.
         Box(modifier = Modifier.fillMaxWidth()) {
             Column(verticalArrangement = Arrangement.spacedBy(20.dp)) {
                 Crossfade(
                     targetState = link,
                     animationSpec = tween(300),
                     label = "hero-state",
+                    modifier = Modifier.padding(end = if (onToggleAutoConnect != null) 48.dp else 0.dp),
                 ) { state ->
                     HeroHeadline(link = state, nowMillis = nowMillis, profileLabel = profileLabel, autoConnectEnabled = autoConnectEnabled)
                 }
@@ -122,17 +128,26 @@ fun StatusHeroCard(
                         style = MaterialTheme.typography.bodySmall)
                 }
             }
-            if (onOpenLogs != null) {
-                Text(
-                    text = "☰",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = TextSecondary,
+            if (onToggleAutoConnect != null) {
+                IconToggleButton(
+                    checked = autoConnectEnabled,
+                    onCheckedChange = onToggleAutoConnect,
+                    enabled = autoConnectToggleEnabled,
+                    colors = IconButtonDefaults.iconToggleButtonColors(
+                        containerColor = StrokeGlass.copy(alpha = 0.35f),
+                        contentColor = TextSecondary,
+                        checkedContainerColor = ElectricCyan.copy(alpha = 0.16f),
+                        checkedContentColor = ElectricCyan,
+                    ),
                     modifier = Modifier
                         .align(Alignment.TopEnd)
-                        .clip(RoundedCornerShape(8.dp))
-                        .clickable(onClick = onOpenLogs)
-                        .padding(horizontal = 8.dp, vertical = 4.dp),
-                )
+                        .size(48.dp)
+                        .semantics { stateDescription = if (autoConnectEnabled) "已开启" else "已关闭" },
+                ) {
+                    Icon(Icons.Rounded.Autorenew,
+                        contentDescription = "自动连接：${if (autoConnectEnabled) "已开启，点击关闭" else "已关闭，点击开启"}",
+                        modifier = Modifier.size(24.dp))
+                }
             }
         }
     }
