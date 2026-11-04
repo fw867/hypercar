@@ -77,6 +77,8 @@ class ShellPlaybackAudio {
     }
 
     @Synchronized
+    // REMOTE_SUBMIX (8) is hidden from the SDK; this service records as shell UID.
+    @android.annotation.SuppressLint("MissingPermission", "WrongConstant")
     fun start(context: Context, owner: IBinder): ParcelFileDescriptor? {
         stop()
         var recorder: AudioRecord? = null

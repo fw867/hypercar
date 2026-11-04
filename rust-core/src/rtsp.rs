@@ -1,4 +1,4 @@
-//! AirPlay RTSP 控制通道（加密帧 + CSeq 异步派发）。
+﻿//! AirPlay RTSP 控制通道（加密帧 + CSeq 异步派发）。
 //!
 //! 协议依据（docs/PROTOCOL-NOTES.md §9c/§9f 与 cardeck 实测）：
 //!  - 控制通道密文帧 = [2B LE 长度][密文][16B Poly1305 tag]，AAD = 前 2 字节，
@@ -118,14 +118,6 @@ impl RtspMessage {
         self.headers.get("cseq").and_then(|s| s.parse().ok())
     }
 
-    /// 请求的方法（POST/SETUP…）；应答返回 None。
-    pub fn method(&self) -> Option<&str> {
-        if self.is_response() {
-            None
-        } else {
-            self.first_line.split_whitespace().next()
-        }
-    }
 }
 
 /// 增量重组：从裸字节流切出完整 RTSP 消息，残余留在 buf。
@@ -240,9 +232,6 @@ impl RtspChannel {
 
     pub fn trace_id(&self) -> u64 { self.trace_id }
 
-    pub fn is_encrypted(&self) -> bool {
-        self.cipher.lock().is_some()
-    }
 
     pub fn next_cseq(&self) -> i32 {
         let mut c = self.cseq.lock();

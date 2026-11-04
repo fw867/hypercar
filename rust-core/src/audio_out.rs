@@ -35,8 +35,6 @@ pub const CHANNELS: usize = 2;
 
 /** RTP 头定长（无 CSRC/扩展）。 */
 const RTP_HEADER_LEN: usize = 12;
-/** ChaCha20-Poly1305 tag 长度。 */
-const TAG_SIZE: usize = 16;
 /** 包尾小端 nonce 计数长度。 */
 const NONCE_TAIL_LEN: usize = 8;
 /** 同步包定长（8B 头 + 8B NTP + 4B 下一包时间戳）。 */

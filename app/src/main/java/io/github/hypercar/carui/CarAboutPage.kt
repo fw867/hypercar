@@ -1,3 +1,4 @@
+﻿@file:Suppress("DEPRECATION")   // Icons.Rounded.ArrowBack 建议换 AutoMirrored 版，本文件暂保留
 package io.github.hypercar.carui
 
 import android.graphics.Bitmap

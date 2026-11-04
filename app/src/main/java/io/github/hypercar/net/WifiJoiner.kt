@@ -107,9 +107,9 @@ class WifiJoiner(
      */
     suspend fun joinCarHotspotSilently(ssid: String, psk: String): JoinResult {
         lastFailureReason = null
-        // WEP 无法用 wpa2/开放表达——两条路径都不支持，交调用方兜底
-        if (isWepKey(psk)) {
-            lastFailureReason = "热点是 WEP 加密，公开 API 无法静默入网"
+        // Password length alone cannot distinguish WEP from valid 10/13/26-character WPA2.
+        if (isUnsupportedPassphrase(psk)) {
+            lastFailureReason = "热点密码不足 8 位，无法按 WPA2 入网"
             return JoinResult.Unsupported
         }
         // 清掉旧回调/旧绑定，干净起步
@@ -195,21 +195,18 @@ class WifiJoiner(
         val unavailable = java.util.concurrent.atomic.AtomicBoolean(false)
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                if (callback.get() !== this) return
                 result.set(network)
                 latch.countDown()
             }
 
             override fun onUnavailable() {
+                if (callback.get() !== this) return
                 unavailable.set(true)
                 latch.countDown()
             }
 
-            override fun onLost(network: Network) {
-                if (boundNetwork.compareAndSet(network, null)) {
-                    connectivityManager.bindProcessToNetwork(null)
-                }
-                lostCallback()
-            }
+            override fun onLost(network: Network) = handleNetworkLost(this, network)
         }
         callback.set(cb)
         try {
@@ -223,9 +220,16 @@ class WifiJoiner(
             return null
         }
         val deadline = SystemClock.uptimeMillis() + timeoutMs
-        while (SystemClock.uptimeMillis() < deadline) {
-            currentCoroutineContext().ensureActive()
-            if (latch.await(200, TimeUnit.MILLISECONDS)) break
+        try {
+            while (SystemClock.uptimeMillis() < deadline) {
+                currentCoroutineContext().ensureActive()
+                if (latch.await(200, TimeUnit.MILLISECONDS)) break
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            if (callback.compareAndSet(cb, null)) {
+                runCatching { connectivityManager.unregisterNetworkCallback(cb) }
+            }
+            throw cancelled
         }
         val network = result.get()
         if (network == null) {
@@ -252,26 +256,36 @@ class WifiJoiner(
      * 同一热点重复绑定走快路径：句柄未变时直接返回 true，不再重复 bind（避免无谓解绑/重绑抖动）。
      */
     fun bindProcess(network: Network): Boolean = synchronized(bindLock) {
-        if (boundNetwork.get() == network) return true // 快路径：已绑同一网络
+        if (boundNetwork.get() == network && connectivityManager.boundNetworkForProcess == network) return true // 快路径：已绑同一网络
         val ok = connectivityManager.bindProcessToNetwork(network)
         if (ok) boundNetwork.set(network)
         ok
     }
 
-    /** 解绑进程网络并注销回调。幂等，可重复调用。 */
-    fun release() {
+    private fun handleNetworkLost(owner: ConnectivityManager.NetworkCallback, network: Network) {
+        val notify = synchronized(bindLock) {
+            if (callback.get() !== owner || boundNetwork.get() != network) false
+            else {
+                boundNetwork.set(null)
+                if (connectivityManager.boundNetworkForProcess == network) {
+                    connectivityManager.bindProcessToNetwork(null)
+                }
+                true
+            }
+        }
+        if (notify) lostCallback()
+    }
+
+    /** Release only this instance's process binding and callback. */
+    fun release() = synchronized(bindLock) {
         callback.getAndSet(null)?.let {
             runCatching { connectivityManager.unregisterNetworkCallback(it) }
         }
-        synchronized(bindLock) {
-            if (boundNetwork.getAndSet(null) != null) {
-                connectivityManager.bindProcessToNetwork(null)
-            }
+        val previous = boundNetwork.getAndSet(null)
+        if (previous != null && connectivityManager.boundNetworkForProcess == previous) {
+            connectivityManager.bindProcessToNetwork(null)
         }
     }
-
-    /** WEP 密钥形态（5/10/13/26 位）——静默路径无法表达，返回 true 让调用方走兜底。 */
-    private fun isWepKey(psk: String): Boolean = psk.length in setOf(5, 10, 13, 26)
 
     /** 轮询 `cmd wifi status` 直到出现目标 SSID；[timeoutMs] 内未匹配返回 false。可取消。 */
     private suspend fun awaitSsid(ssid: String, timeoutMs: Long): Boolean {
@@ -303,21 +317,17 @@ class WifiJoiner(
         val result = AtomicReference<Network?>(null)
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                if (callback.get() !== this) return
                 result.set(network)
                 latch.countDown()
             }
 
             override fun onUnavailable() {
+                if (callback.get() !== this) return
                 latch.countDown()
             }
 
-            override fun onLost(network: Network) {
-                // 车机熄火/离开范围：热点消失 → 解绑并通知会话层
-                if (boundNetwork.compareAndSet(network, null)) {
-                    connectivityManager.bindProcessToNetwork(null)
-                }
-                lostCallback()
-            }
+            override fun onLost(network: Network) = handleNetworkLost(this, network)
         }
         callback.set(cb)
         try {
@@ -328,9 +338,16 @@ class WifiJoiner(
             return null
         }
         val deadline = SystemClock.uptimeMillis() + timeoutMs
-        while (SystemClock.uptimeMillis() < deadline) {
-            currentCoroutineContext().ensureActive()
-            if (latch.await(200, TimeUnit.MILLISECONDS)) break
+        try {
+            while (SystemClock.uptimeMillis() < deadline) {
+                currentCoroutineContext().ensureActive()
+                if (latch.await(200, TimeUnit.MILLISECONDS)) break
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            if (callback.compareAndSet(cb, null)) {
+                runCatching { connectivityManager.unregisterNetworkCallback(cb) }
+            }
+            throw cancelled
         }
         val network = result.get()
         if (network == null) {
@@ -340,7 +357,8 @@ class WifiJoiner(
         return network
     }
 
-    private companion object {
+    internal companion object {
+        internal fun isUnsupportedPassphrase(psk: String): Boolean = psk.isNotEmpty() && psk.length < 8
         const val TAG = "WifiJoiner"
         const val JOIN_WAIT_MS = 15_000L
         const val HANDLE_WAIT_MS = 15_000L

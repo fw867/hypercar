@@ -79,7 +79,6 @@ pub struct TouchInput {
 pub struct AirplayOutcome {
     pub control: Arc<RtspChannel>,
     pub audio: Option<AudioOut>,
-    pub keep_alive_stats: bool,
     pub keepalive: KeepaliveTasks,
     pub teardown: Vec<u8>,
 }
@@ -446,7 +445,6 @@ pub async fn negotiate(
     Ok(AirplayOutcome {
         control: channel,
         audio,
-        keep_alive_stats,
         keepalive,
         teardown,
     })
@@ -1026,29 +1024,6 @@ async fn activate_session(channel: &Arc<RtspChannel>, declaration: &[u8]) -> Res
     Ok(())
 }
 
-async fn send_modes_changed(channel: &Arc<RtspChannel>) -> Option<u16> {
-    match channel.request(
-        "POST", "/command", &build_modes_changed(),
-        "application/x-apple-binary-plist", &[], Duration::from_secs(5),
-    ).await {
-        Ok(resp) => {
-            emit_log(&format!("AIRPLAY: modesChanged [{}]", resp.first_line));
-            Some(resp.status())
-        }
-        Err(e) => {
-            emit_log(&format!("AIRPLAY: modesChanged 失败 - {e}"));
-            None
-        }
-    }
-}
-
-async fn require_modes_changed(channel: &Arc<RtspChannel>) -> Result<(), String> {
-    match send_modes_changed(channel).await {
-        Some(200) => Ok(()),
-        status => Err(format!("会话 SETUP 后 modesChanged 未获确认（status={status:?}），停止流激活")),
-    }
-}
-
 pub(crate) async fn record_session(channel: &Arc<RtspChannel>) -> Result<(), String> {
     // CatPlay AirPlayRtspClient::record 使用无请求体的 RECORD /。
     let reply = channel.request(
@@ -1088,37 +1063,6 @@ async fn setup_and_read_info(
         }
     };
     Ok((setup, info))
-}
-
-fn build_modes_changed() -> Vec<u8> {
-    let app_states = Value::array(vec![
-        Value::dict(vec![("appStateID", Value::int(2)), ("entity", Value::int(0))]),
-        Value::dict(vec![("appStateID", Value::int(3)), ("entity", Value::int(0))]),
-        Value::dict(vec![
-            ("appStateID", Value::int(1)),
-            ("entity", Value::int(0)),
-            ("speechMode", Value::int(-1)),
-        ]),
-    ]);
-    let resources = Value::array(vec![
-        Value::dict(vec![
-            ("resourceID", Value::int(1)),
-            ("entity", Value::int(1)),
-            ("permanentEntity", Value::int(1)),
-        ]),
-        Value::dict(vec![
-            ("resourceID", Value::int(2)),
-            ("entity", Value::int(1)),
-            ("permanentEntity", Value::int(1)),
-        ]),
-    ]);
-    bplist::encode(&Value::dict(vec![
-        ("type", Value::str("modesChanged")),
-        (
-            "params",
-            Value::dict(vec![("appStates", app_states), ("resources", resources)]),
-        ),
-    ]))
 }
 
 pub(crate) fn build_screen_setup(conn_id: i64, uuid: &str) -> Vec<u8> {

@@ -1,8 +1,7 @@
 package io.github.hypercar.ui.screens
 
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.ui.draw.clip
+
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -16,30 +15,21 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.github.hypercar.core.SessionSnapshot
 import io.github.hypercar.perm.PermGroup
 import io.github.hypercar.perm.PermissionSummary
-import io.github.hypercar.ui.components.DegradedGuidanceCard
 import io.github.hypercar.ui.components.GlassPanel
 import io.github.hypercar.ui.components.PermissionChecklistCard
 import io.github.hypercar.ui.components.StatGrid
 import io.github.hypercar.ui.components.StatusHeroCard
 import io.github.hypercar.ui.components.ConnectionStageCard
-import io.github.hypercar.ui.theme.MintGreen
-import io.github.hypercar.ui.theme.MonoLogLine
 import io.github.hypercar.ui.theme.TextPrimary
 import io.github.hypercar.ui.theme.TextSecondary
 
@@ -192,10 +182,6 @@ fun HomeScreen(
 }
 
 /**
- * 「查看全部日志」入口：首页原来的小日志卡占满底部且无法上滑（现场反馈），
- * 改成一行可点文字，日志本身去「诊断」页看。
- */
-/**
  * Shizuku 芯片上的降级模式提示（原首页下方那张大卡的内容）。
  *
  * 只留一句最要紧的：还差什么动作。null = 不需要提示（Shizuku 已启用）。
@@ -204,119 +190,6 @@ private fun degradedChipHint(snapshot: SessionSnapshot): String? = when {
     snapshot.shizukuReady -> null
     io.github.hypercar.settings.SettingsStore.carWithMode -> "CarWith 无需 Shizuku"
     else -> "自绘 UI 必须安装、启动并授权"
-}
-
-
-@Composable
-private fun DiagnosticsLink(onOpenDiagnostics: () -> Unit) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .clickable(onClick = onOpenDiagnostics)
-            .padding(horizontal = 4.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(
-            text = "查看全部日志 / 诊断",
-            style = MaterialTheme.typography.labelMedium,
-            color = TextSecondary,
-        )
-        Spacer(modifier = Modifier.weight(1f))
-        Text(
-            text = "→",
-            style = MaterialTheme.typography.labelMedium,
-            color = TextSecondary,
-        )
-    }
-}
-
-/**
- * 最近日志预览：最近 5 行等宽小字，reverseLayout 让最新行贴底并自动跟随。
- */
-@Composable
-private fun LogPreviewCard(
-    logs: List<String>,
-    onOpenDiagnostics: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val recent = remember(logs) { logs.takeLast(5) }
-    val listState = rememberLazyListState()
-    LaunchedEffect(recent.size) {
-        if (recent.isNotEmpty()) listState.scrollToItem(0)
-    }
-    GlassPanel(
-        modifier = modifier.clickable(onClick = onOpenDiagnostics),
-        contentPadding = PaddingValues(
-            start = 16.dp,
-            end = 16.dp,
-            top = 12.dp,
-            bottom = 12.dp,
-        ),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                text = "最近日志",
-                style = MaterialTheme.typography.titleSmall,
-                color = TextPrimary,
-            )
-            Spacer(modifier = Modifier.weight(1f))
-            Text(
-                text = "全部 →",
-                style = MaterialTheme.typography.labelSmall,
-                color = TextSecondary,
-                fontFamily = FontFamily.Monospace,
-            )
-        }
-        Spacer(modifier = Modifier.height(8.dp))
-        if (recent.isEmpty()) {
-            Text(
-                text = "暂无日志，连接一次车机后这里会显示链路轨迹",
-                style = MonoLogLine,
-                color = TextSecondary,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-            )
-        } else {
-            LazyColumn(
-                state = listState,
-                reverseLayout = true,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f),
-                verticalArrangement = Arrangement.spacedBy(3.dp),
-            ) {
-                items(recent.reversed()) { line ->
-                    LogLineRow(line = line)
-                }
-            }
-        }
-    }
-}
-
-/** 单行日志：等宽 11sp，按级别（E/W/I/D）着色。解析逻辑见 [parseLogLine]。 */
-@Composable
-internal fun LogLineRow(line: String, modifier: Modifier = Modifier) {
-    val parsed = remember(line) { parseLogLine(line) }
-    val color = logLevelColor(parsed.level)
-    Row(modifier = modifier.fillMaxWidth()) {
-        Text(
-            text = levelTag(parsed.level),
-            style = MonoLogLine,
-            color = color,
-            modifier = Modifier.padding(end = 6.dp),
-        )
-        Text(
-            text = parsed.text,
-            style = MonoLogLine,
-            color = if (parsed.level == 'E') color else TextSecondary,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-    }
 }
 
 

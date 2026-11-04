@@ -118,52 +118,6 @@ class CarHomeActivity : ComponentActivity() {
         if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) downTime = 0L
     }
 
-    /**
-     * 把当前 D1 界面离屏画到 Bitmap 并存 PNG（调试/验收用）。
-     *
-     * 为什么不用 `screencap -d`：D1 的输出面是编码器 InputSurface，shell 的 screencap
-     * 抓不了；而且设备锁屏时虚拟屏暂停合成。把 View 直接 draw 到 Bitmap 不依赖屏幕状态。
-     * 必须在主线程调用（内部会切）。
-     */
-    fun captureToFile(): String? {
-        val view = window.decorView
-        if (view.width <= 0 || view.height <= 0) return null
-        return runCatching {
-            val bmp = android.graphics.Bitmap.createBitmap(
-                view.width,
-                view.height,
-                android.graphics.Bitmap.Config.ARGB_8888,
-            )
-            view.draw(android.graphics.Canvas(bmp))
-            val path = io.github.hypercar.spike.SpikeReport.writePng(this, "carui-home", bmp)
-            bmp.recycle()
-            path
-        }.getOrNull()
-    }
-
-    /** PixelCopy includes the TextureView map; software View.draw cannot capture its GPU texture. */
-    fun captureWindow(onResult: (String?) -> Unit) {
-        val view = window.decorView
-        if (view.width <= 0 || view.height <= 0) {
-            onResult(null)
-            return
-        }
-        val bitmap = android.graphics.Bitmap.createBitmap(view.width, view.height,
-            android.graphics.Bitmap.Config.ARGB_8888)
-        runCatching {
-            android.view.PixelCopy.request(window, bitmap, { result ->
-                val path = if (result == android.view.PixelCopy.SUCCESS) {
-                    io.github.hypercar.spike.SpikeReport.writePng(this, "carui-home", bitmap)
-                } else null
-                bitmap.recycle()
-                onResult(path)
-            }, android.os.Handler(mainLooper))
-        }.onFailure {
-            bitmap.recycle()
-            onResult(null)
-        }
-    }
-
     companion object {
         @Volatile
         var instance: CarHomeActivity? = null

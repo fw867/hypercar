@@ -39,8 +39,6 @@ pub enum SourceEvent {
     AudioStop { tts: bool },
     /// 一包 PCM（16-bit 小端，交错）。
     AudioData { tts: bool, rate: u32, channels: u8, data: Vec<u8> },
-    /// 视频源断开（自绘界面停止推流）。
-    ClientLeft { video: bool },
 }
 
 /// 引擎配置（SettingsStore.engineConfigJson 的反序列化目标）。
@@ -140,7 +138,6 @@ pub async fn run_engine(
             width: cfg.width,
             height: cfg.height,
             fps: cfg.fps,
-            voice: 1,
             bt_address: cfg.device_id.clone(),
             bt_name: "BMW".to_string(),
         };

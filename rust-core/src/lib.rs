@@ -7,15 +7,6 @@
 //!
 //! JNI 命名对应 io.github.hypercar.core.RustCoreBridge（下划线式导出名）。
 //!
-//! # dead-code lint 说明
-//!
-//! 本 crate 是 `crate-type = ["cdylib"]`，dead-code lint 只把「从 8 个 JNI 导出
-//! 可达」的代码算作活跃。但协议实现刻意保留了完整覆盖面（如 pair-setup M1..M6
-//! 完整链路，主路径只走 pair-verify）与一批诊断/统计访问器（`frames_sent`、
-//! `packets_sent`、`resolution` 等，供后续 UI 或日志接线）。这些不是遗留垃圾，
-//! 而是库的 API 面——故 crate 级 allow，避免用 `#[allow(dead_code)]` 逐个标注
-//! 淹没真正的意图注释。新增代码若确属误删引用，仍应靠 code review 拦截。
-#![allow(dead_code)]
 
 mod airplay;
 mod audio_out;
@@ -78,7 +69,6 @@ struct EngineHandle {
     shutdown: Arc<shutdown::EngineShutdown>,
     abort: tokio::task::AbortHandle,
     touch_tx: mpsc::UnboundedSender<TouchInput>,
-    key_tx: mpsc::UnboundedSender<u32>,
     /// 自绘界面投喂给引擎的视频帧 / 音频 PCM（nativePushVideoFrame / nativePushAudioPcm）
     source_tx: mpsc::UnboundedSender<engine::SourceEvent>,
     carwith_source: bool,
@@ -578,7 +568,6 @@ fn native_start_impl(
         shutdown,
         abort,
         touch_tx,
-        key_tx,
         source_tx,
         carwith_source,
         touch_size,
@@ -619,7 +608,7 @@ fn stop_engine(graceful: bool) -> bool {
 /// 投喂一帧 H.264（Annex B，来自本机 MediaCodec 的编码输出）。
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePushVideoFrame(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     data: JByteArray,
     pts_us: jlong,
@@ -663,7 +652,7 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSetVide
 /// 投喂一包 PCM（16-bit 小端交错；用于把手机音频送进 AirPlay 音频流）。
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePushAudioPcm(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     pcm: JShortArray,
     rate: jint,

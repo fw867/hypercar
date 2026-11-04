@@ -87,7 +87,7 @@ object CarProfileGuard {
                 val address = runCatching { device.address }.getOrNull() ?: return
                 if (action == BluetoothDevice.ACTION_ACL_CONNECTED) {
                     val transport = intent.getIntExtra(BluetoothDevice.EXTRA_TRANSPORT, BluetoothDevice.TRANSPORT_AUTO)
-                    val type = runCatching { device.type }.getOrDefault(BluetoothDevice.DEVICE_TYPE_UNKNOWN)
+                    val type = try { device.type } catch (_: SecurityException) { BluetoothDevice.DEVICE_TYPE_UNKNOWN }
                     if (CarAclPolicy.isClassicCarLink(transport, type)) onCarConnected(app, device, address)
                     return
                 }

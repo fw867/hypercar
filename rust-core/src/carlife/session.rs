@@ -1,5 +1,6 @@
 //! Xiaomi CarWith 4.1: channel admission, challenge proof and content encryption are separate gates.
 use super::*;
+use crate::emit_state;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use rsa::pkcs8::EncodePublicKey;
 use sha2::Digest;
@@ -268,7 +269,7 @@ pub(super) async fn control(mut stream: TcpStream, queue: Arc<Mutex<Vec<Vec<u8>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn cfg()->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:60,voice:0,bt_address:"00:11:22:33:44:55".into(),bt_name:"HyperCar".into()}}
+    fn cfg()->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:60,bt_address:"00:11:22:33:44:55".into(),bt_name:"HyperCar".into()}}
     fn info()->Vec<u8> {let mut out=Vec::new(); for (field,text) in [(4,"Xiaomi"),(14,"test"),(20,"37")] {proto::string(&mut out,field,text);} out}
     fn prepared()->Session {
         let mut s=Session::default();

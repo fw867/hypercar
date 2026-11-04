@@ -62,26 +62,9 @@ object RustCoreBridge {
         fun onTouch(action: Int, x: Int, y: Int)
     }
 
-    @Volatile
-    private var listener: EventListener? = null
-
-    fun setListener(l: EventListener?) {
-        listener = l
-        nativeSetListener(l)
-    }
-
-    fun currentListener(): EventListener? = listener
-
-    @Volatile
-    private var touchListener: TouchListener? = null
-
-    /** 装/卸车机触摸监听器（null = 卸载）。会话开始前装一次即可。 */
-    fun setTouchListener(l: TouchListener?) {
-        touchListener = l
-        nativeSetTouchListener(l)
-    }
-
-    fun currentTouchListener(): TouchListener? = touchListener
+    // Native GlobalRefs own callback lifetimes; do not keep an unused second Kotlin cache.
+    fun setListener(listener: EventListener?) = nativeSetListener(listener)
+    fun setTouchListener(listener: TouchListener?) = nativeSetTouchListener(listener)
 
     external fun nativeInitLogger()
 

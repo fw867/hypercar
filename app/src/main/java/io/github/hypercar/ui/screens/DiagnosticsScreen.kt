@@ -337,9 +337,11 @@ private fun DiagnosticsLogRow(line: String) {
         if (timestamp != null) {
             Text(
                 text = timestamp,
-                style = MonoLogLine.copy(fontSize = 9.sp),
+                style = MonoLogLine.copy(fontSize = 9.sp, lineHeight = 12.sp),
                 color = TextSecondary.copy(alpha = 0.55f),
-                modifier = Modifier.width(58.dp),
+                maxLines = 1,
+                softWrap = false,
+                modifier = Modifier.width(70.dp),
             )
         }
         Text(
@@ -386,7 +388,8 @@ internal fun parseLogLine(line: String): ParsedLogLine {
     return ParsedLogLine(null, trimmed)
 }
 
-private val LogLevelRegex = Regex("""\[?([EWID])[/:]\s?""")
+// Require a token boundary: SPIKE:, CORE: and URLs must not be mistaken for E:/D:.
+private val LogLevelRegex = Regex("""(?:^|\s|\[)([EWID])(?:[/:]|\])\s?""")
 
 private fun stripMarker(text: String): String {
     val rest = text.drop(1)

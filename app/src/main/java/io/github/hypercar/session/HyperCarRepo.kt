@@ -1,4 +1,5 @@
-﻿package io.github.hypercar.session
+﻿@file:Suppress("DEPRECATION")   // allNetworks/WifiInfo/getDefaultAdapter 等平台 API 已废弃但无替代
+package io.github.hypercar.session
 
 import android.bluetooth.BluetoothDevice
 import android.content.Context
@@ -288,7 +289,7 @@ object HyperCarRepo {
                     runCatching { device.address }.getOrNull()?.let { address ->
                         if (address != aclCarMac) {
                             aclCarMac = address
-                            log("AUTO: 本轮 iAP2 目标锁定为 ACL 车机 $address（${runCatching { device.name }.getOrNull() ?: "?"}）")
+                            log("AUTO: 本轮 iAP2 目标锁定为 ACL 车机 $address（${bluetoothName(device) ?: "?"}）")
                         }
                         // 音频 profile 干预受车机档案控制；是否为本次失败根因仍需实车验证。
                         CarProfileGuard.noteCar(address)
@@ -341,7 +342,7 @@ object HyperCarRepo {
      * 车机若在极短时间内反复重建 ACL，也不会把日志刷满（见 [log] 的限流兜底）。
      */
     private fun logAclEvent(device: BluetoothDevice, connected: Boolean) {
-        val name = runCatching { device.name }.getOrNull() ?: "未知设备"
+        val name = bluetoothName(device) ?: "未知设备"
         val address = runCatching { device.address }.getOrNull() ?: "?"
         val key = "$address/$connected"
         val now = SystemClock.elapsedRealtime()
@@ -794,7 +795,7 @@ object HyperCarRepo {
         // 设备/系统/SDK/App 版本了（反馈出去的日志无法定位版本，2026-10-25 实测踩到）。
         // 不走 log()：它在「记录已暂停」时会直接丢弃，而这一行恰恰是最该保留的。
         val ctx = appCtx ?: return
-        val stamp = logTimeFormat.get().format(java.util.Date())
+        val stamp = logTimeFormat.get()?.format(java.util.Date()) ?: ""
         val env = "$stamp  ENV: ${DeviceInfo.fullSummary(ctx)}"
         appendDiskLog(env)
         _snapshots.update { it.copy(recentLogs = it.recentLogs + env) }
@@ -1231,10 +1232,16 @@ object HyperCarRepo {
             joinedNetwork = boundNetwork
             return boundNetwork
         }
-        val joiner = WifiJoiner(context) {
-            // 车机熄火热点消失：结束会话，回到待机
-            log("WIFI: 车机热点消失（熄火/离开）");
-            scope.launch { runDisconnect("热点消失") }
+        wifiJoiner?.release()
+        val attempt = connectionAttemptId
+        lateinit var joiner: WifiJoiner
+        joiner = WifiJoiner(context) {
+            scope.launch {
+                if (connectionAttemptId == attempt && wifiJoiner === joiner && sessionLive.get()) {
+                    log("WIFI: 当前车机热点消失（熄火/离开）")
+                    runDisconnect("热点消失")
+                }
+            }
         }
         wifiJoiner = joiner
 
@@ -1260,9 +1267,14 @@ object HyperCarRepo {
             log("WIFI: 端点无热点凭据（可能已在车机网络），直接绑定当前网络")
             null
         }
-        val effective = network ?: boundNetwork ?: wifiNetworks(context).firstOrNull() ?: currentDefaultNetwork(context)
+        val wifi = wifiNetworks(context)
+        val effective = network ?: boundNetwork?.takeIf { it in wifi } ?: wifi.firstOrNull()
         if (effective != null) {
-            joiner.bindProcess(effective)
+            if (!joiner.bindProcess(effective)) {
+                log("WIFI: 绑定车机网络失败 #$effective")
+                joiner.release()
+                return null
+            }
             boundNetwork = effective
             if (!ssid.isNullOrBlank() && network != null) {
                 joinedSsid = ssid
@@ -1300,9 +1312,6 @@ object HyperCarRepo {
     }.getOrElse { "网络属性读取失败（${it.message}）" }
 
     /** 兜底：拿当前默认网络（连上车机热点但静默路径失败时，Android 可能仍选蜂窝）。 */
-    private fun currentDefaultNetwork(context: Context): Network? = runCatching {
-        context.getSystemService(ConnectivityManager::class.java)?.activeNetwork
-    }.getOrNull()
 
     /**
      * 「网关兜底」：iAP2 没给出可连的 AirPlay 地址时，拿当前 Wi-Fi 的默认网关 + 7000 端口当端点。
@@ -1448,7 +1457,7 @@ object HyperCarRepo {
                 i++
             }
         }
-        candidates.remove(self.hostAddress)
+        candidates.remove(self.hostAddress ?: return null)
         if (candidates.isEmpty()) return null
 
         val ports = headUnitProfile.fallbackAirplayPorts.distinct().ifEmpty { listOf(7000) }
@@ -1977,6 +1986,9 @@ object HyperCarRepo {
 
     private fun appContext(): android.content.Context? = appCtx
 
+    private fun bluetoothName(device: BluetoothDevice): String? =
+        try { device.name } catch (_: SecurityException) { null }
+
     private fun pickHost(endpoint: CarPlayEndpoint): String? {
         // IPv4 优先 → 其余地址；全空再试网关（cardeck EndpointHosts 同序）
         val ips = endpoint.ipAddresses.filter { it.isNotBlank() }
@@ -2207,9 +2219,8 @@ object HyperCarRepo {
                     log("SESSION: 先拿到热点凭据（0x5703）——立即入网 + 广播 _carplay-ctrl，再等 0x4301")
                     joinAndBind(context, merged)
                     val ssid = merged.ssid
-                    if (ssid != null) {
-                        advertiser.ensureForNetwork(ssid, force = true, network = boundNetwork)
-                    }
+                    // merged.ssid 为非空类型，原 if (ssid != null) 恒真
+                    advertiser.ensureForNetwork(merged.ssid, force = true, network = boundNetwork)
                 }
                 if (pickHost(merged) != null) {
                     usable = merged
@@ -2376,7 +2387,7 @@ object HyperCarRepo {
         if (overBudget) return
         android.util.Log.i("HyperCar", line)
         if (!logRecording) return // 记录开关关闭：丢弃（logcat 仍写，adb 可查）
-        val stamp = logTimeFormat.get().format(java.util.Date())
+        val stamp = logTimeFormat.get()?.format(java.util.Date()) ?: ""
         appendDiskLog("$stamp  $line")
         _snapshots.update { s ->
             val extra =

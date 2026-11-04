@@ -1,15 +1,12 @@
 package io.github.hypercar.update
 
 import android.content.Context
-import android.os.Build
 import io.github.hypercar.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
 
 /**
  * 自动更新：读 GitHub Releases API 比较版本。
@@ -90,6 +87,8 @@ object UpdateCenter {
                 isNewer(latest.version, currentVersion) -> UpdateUiState.Available(latest)
                 else -> UpdateUiState.UpToDate(latest.version)
             }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
         } catch (e: Exception) {
             UpdateUiState.Failed(e.message ?: "检查失败")
         }
@@ -153,6 +152,4 @@ object UpdateCenter {
         return false
     }
 
-    /** 手机型号，便于 Release 反馈里带上环境（未使用时可删）。 */
-    fun deviceSummary(): String = "${Build.MANUFACTURER} ${Build.MODEL} / Android ${Build.VERSION.RELEASE}"
 }

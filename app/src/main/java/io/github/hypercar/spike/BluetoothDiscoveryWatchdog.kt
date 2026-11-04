@@ -1,3 +1,4 @@
+﻿@file:Suppress("DEPRECATION")   // 平台 API / 旧图标名已废弃但当前无替代，统一在此抑制
 package io.github.hypercar.spike
 
 import android.content.Context

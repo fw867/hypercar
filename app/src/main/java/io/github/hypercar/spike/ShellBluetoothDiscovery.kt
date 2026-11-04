@@ -105,6 +105,8 @@ internal class ShellBluetoothDiscovery {
             check(adapter.isEnabled) { "蓝牙未开启" }
         }
 
+        // Executed in the Shizuku UserService with shell UID, not the application process.
+        @android.annotation.SuppressLint("MissingPermission")
         override fun mode() = adapter.scanMode
         override fun timeoutSeconds(): Long {
             val result = BluetoothAdapter::class.java.getMethod("getDiscoverableTimeout").invoke(adapter)

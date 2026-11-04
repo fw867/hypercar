@@ -189,6 +189,7 @@ object MusicBridge {
     private var manualPauseRequested = false
     /** 用户在音乐卡片里选定的 App；有它的会话时优先显示它，而不是按“正在播放”抢焦点。 */
     private var preferredPackage: String? = null
+    private val packageSwitchRevision = java.util.concurrent.atomic.AtomicLong()
     private var autoPlayPending = false
     private var autoPlayDeadline = 0L
 
@@ -291,10 +292,13 @@ object MusicBridge {
                         "am start -n ${comp.flattenToShortString()}", 8_000)
                 }.getOrNull()
                 HyperCarRepo.log("MUSIC: 拉到手机屏幕 $pkg（${if (r?.ok == true) "ok" else r?.err?.take(60)}）")
-            } else if (intent != null && ctx != null) {
-                runCatching {
-                    ctx.startActivity(intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
-                    HyperCarRepo.log("MUSIC: 拉到手机屏幕 $pkg（startActivity）")
+            } else {
+                val i = intent
+                if (i != null) {
+                    runCatching {
+                        checkNotNull(ctx).startActivity(i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+                        HyperCarRepo.log("MUSIC: 拉到手机屏幕 $pkg（startActivity）")
+                    }
                 }
             }
         }
@@ -345,7 +349,6 @@ object MusicBridge {
     val MUSIC_DISPLAY_H = 1920
 
     /** 音乐 App 的虚显 id（未创建时为 -1）。 */
-    fun musicDisplayId(): Int = idleDisplayId
 
     /** 把音乐虚显的输出面换成卡片里的 TextureView，画面就"搬进"音乐卡。 */
     /**
@@ -438,6 +441,7 @@ object MusicBridge {
     }
 
     fun onCarDisconnected() = onMusicThread {
+        packageSwitchRevision.incrementAndGet()
         if (!carConnected) return@onMusicThread
         carConnected = false
         carAudioReady = false
@@ -633,6 +637,7 @@ object MusicBridge {
     /** 音乐卡片左上角切换 App：记住选择并把目标 App 拉到手机前台（车机只显示媒体卡片）。 */
     fun selectPackage(context: Context, packageName: String) {
         if (packageName.isBlank()) return
+        val switchRevision = packageSwitchRevision.incrementAndGet()
         // 切换前先停掉/关掉上一个 App（即使它已暂停，也一并清掉，避免后台残留）。
         val previous = controller?.packageName
         val previousPlaying = playback?.state == PlaybackState.STATE_PLAYING
@@ -641,7 +646,7 @@ object MusicBridge {
                 runCatching { controller?.transportControls?.pause() }
                 HyperCarRepo.log("MUSIC: 停止上一个播放器 $previous")
             }
-            closePackage(context, previous)
+            closePackage(previous, switchRevision)
         }
         preferredPackage = packageName
         val prefs = playbackPrefs
@@ -653,9 +658,11 @@ object MusicBridge {
             // 走 shell 拉起：MIUI 对后台 startActivity 会弹「是否允许启动」确认页，
             // 车机上点一下切歌不该把手机前台让给系统确认框。
             val cmd = "am start -n ${component.flattenToShortString()} --display 0"
-            Thread({
-                runBlocking { runCatching { ShizukuTools.exec(cmd, 4_000) } }
-            }, "music-launch").apply { isDaemon = true }.start()
+            launchScope.launch {
+                if (packageSwitchRevision.get() == switchRevision) {
+                    runCatching { ShizukuTools.exec(cmd, 4_000) }
+                }
+            }
         } else if (intent != null) {
             runCatching {
                 val options = android.app.ActivityOptions.makeBasic().setLaunchDisplayId(0)
@@ -670,25 +677,19 @@ object MusicBridge {
 
     /** 设置里改默认音乐 App：只改偏好，不立即播放。 */
     fun setDefaultPackage(packageName: String) {
+        packageSwitchRevision.incrementAndGet()
         preferredPackage = packageName.takeIf { it.isNotBlank() }
         playbackPrefs?.edit()?.putString("preferred_package", packageName)?.apply()
         main.post { choose() }
     }
 
-    /** 关闭上一个音乐 App：优先 shell force-stop（与 MIUI 后台限制无关）。 */
-    private fun closePackage(context: Context, packageName: String) {
-        if (packageName.isBlank()) return
-        if (ShizukuTools.isReady) {
-            Thread({
-                // 给 pause 一点时间落到 MediaSession，再杀进程，避免它又被通知栏拉起来。
-                Thread.sleep(250)
-                runBlocking { runCatching { ShizukuTools.exec("am force-stop $packageName", 4_000) } }
-            }, "music-close").apply { isDaemon = true }.start()
-        } else {
-            runCatching {
-                (context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager)
-                    .killBackgroundProcesses(packageName)
-            }
+    /** Delayed cleanup belongs to one switch; A→B→A must not force-stop the new A. */
+    private fun closePackage(packageName: String, revision: Long) {
+        if (packageName.isBlank() || !ShizukuTools.isReady) return
+        launchScope.launch {
+            kotlinx.coroutines.delay(250)
+            if (packageSwitchRevision.get() != revision) return@launch
+            runCatching { ShizukuTools.exec("am force-stop $packageName", 4_000) }
         }
     }
 
@@ -720,6 +721,7 @@ object MusicBridge {
     }
 
     fun detach(reason: String = "通知使用权已断开") {
+        packageSwitchRevision.incrementAndGet()
         QqMusicAdapter.close()
         MusicArtwork.clear()
         main.removeCallbacks(ticker)

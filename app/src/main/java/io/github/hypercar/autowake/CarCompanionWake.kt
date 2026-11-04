@@ -40,6 +40,7 @@ object CarCompanionWake {
     }
 
     private fun completeAssociation(request: PendingAssociation, info: AssociationInfo) {
+        if (!supported(request.context)) return
         val address = info.deviceMacAddress?.toString()
         if (!associationGate.isActive(request.ticket)) {
             // 重复 created 回调不重复观察/提示；晚到的新授权仍按系统记录更新标签。
@@ -67,6 +68,7 @@ object CarCompanionWake {
     /** ActivityResult 与 onAssociationCreated 汇入同一完成出口，返回是否还需等待。 */
     fun onAssociationResult(associationId: Long, approved: Boolean): Boolean {
         val request = pendingAssociation ?: return false
+        if (!supported(request.context)) return false
         if (request.ticket.id != associationId) return false
         if (!approved) {
             finishAssociation(request, "未授权增强发现，所选目标车机仍已保存")

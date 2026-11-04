@@ -126,6 +126,7 @@ pub struct TimingServer {
     pub port: u16,
     /** 应答循环任务句柄（`stop()` 时 abort）。 */
     task: tokio::task::JoinHandle<()>,
+    #[cfg(test)]
     diagnostics: Arc<Mutex<TimingDiagnostics>>,
 }
 
@@ -135,9 +136,6 @@ impl TimingServer {
     /// 非 async 签名下无法直接 await 绑定，故走「std 绑定 → 非阻塞 →
     /// `UdpSocket::from_std`」路径；`from_std` 需要注册到 reactor，因此**必须在
     /// tokio runtime 上下文中调用**（会话流程本就跑在 async 里，天然满足）。
-    pub fn start() -> std::io::Result<Self> {
-        Self::start_impl(None)
-    }
     pub fn start_with_pipeline(pipeline:Arc<Mutex<crate::pipeline::Pipeline>>)->std::io::Result<Self> {
         Self::start_impl(Some(pipeline))
     }
@@ -189,13 +187,10 @@ impl TimingServer {
             }
         });
 
-        Ok(Self { port, task, diagnostics })
+        Ok(Self { port, task, #[cfg(test)] diagnostics })
     }
 
-    /// 停止应答循环（abort 后台任务；socket 随任务一起丢弃）。
-    pub fn stop(&mut self) {
-        self.task.abort();
-    }
+
 }
 
 impl Drop for TimingServer {
@@ -208,7 +203,7 @@ mod diagnostics_tests {
     #[tokio::test]
     async fn live_udp_counts_replies_and_invalid_datagrams() {
         let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
-        let mut server=TimingServer::start_with_pipeline(pipeline.clone()).unwrap();
+        let server=TimingServer::start_with_pipeline(pipeline.clone()).unwrap();
         let peer=UdpSocket::bind("127.0.0.1:0").await.unwrap();
         peer.connect((std::net::Ipv4Addr::LOCALHOST,server.port)).await.unwrap();
         peer.send(&[1,2,3]).await.unwrap();
@@ -223,6 +218,6 @@ mod diagnostics_tests {
         assert_eq!(s.send_errors,0);assert!(s.last_local_reply_us.is_some());
         let mut p=pipeline.lock().timing.clone();
         p.refresh_age(p.last_reply_ms.unwrap()+5000);assert_eq!(p.reply_age_ms,Some(5000));
-        server.stop();
+        drop(server);
     }
 }
