@@ -28,6 +28,10 @@ mod modes;
 mod pairing;
 mod rtsp;
 mod screen;
+mod h264;
+mod pipeline;
+mod tcp_diagnostics;
+mod screen_session;
 mod srp6a;
 mod tlv8;
 mod timing;
@@ -35,6 +39,8 @@ mod wifi_iap2;
 mod auth_setup;
 mod display_layout;
 mod shutdown;
+#[cfg(test)]
+mod showcase_wire;
 
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;
@@ -92,6 +98,13 @@ pub(crate) fn emit_log(line: &str) {
         let jline = env.new_string(line)?;
         env.call_method(obj, "onLog", "(Ljava/lang/String;)V", &[(&jline).into()])
             .map(|_| ())
+    });
+}
+
+pub(crate) fn emit_pipeline(json: &str) {
+    call_listener("onPipeline", |env,obj| {
+        let data=env.new_string(json)?;
+        env.call_method(obj,"onPipeline","(Ljava/lang/String;)V",&[(&data).into()]).map(|_| ())
     });
 }
 
@@ -202,6 +215,13 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeMarkWif
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeCanKeepWifiSession(
     _env: JNIEnv, _class: JClass,
 ) -> jboolean { if wifi_iap2::can_keep_session() { JNI_TRUE } else { JNI_FALSE } }
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSetWifiIap2Phase(
+    mut env: JNIEnv, _class: JClass, id: jlong, phase: JString,
+) {
+    if let Ok(phase)=env.get_string(&phase) { wifi_iap2::set_phase(id as u64,&phase.to_string_lossy()); }
+}
 
 pub(crate) fn emit_display_size(width: u32, height: u32) {
     call_listener("onDisplaySize", |env, obj| {

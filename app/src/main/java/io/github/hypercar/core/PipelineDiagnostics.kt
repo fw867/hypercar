@@ -1,0 +1,77 @@
+package io.github.hypercar.core
+
+import org.json.JSONObject
+
+/** Observed sender facts; receiver display and speaker output have no acknowledgement here. */
+data class PipelineDiagnostics(
+    val generation: Long = 0,
+    val active: Boolean = false,
+    val controlReady: Boolean = false,
+    val wifiIap2: String = "WAIT_SESSION",
+    val screenOwned: Boolean? = null,
+    val videoStream: String = "WAIT_SETUP",
+    val sourceUnits: Long = 0,
+    val writtenFrames: Long = 0,
+    val audioReady: Boolean = false,
+    val audioPackets: Long = 0,
+    val signalPackets: Long = 0,
+    val uiRequests: Long = 0,
+    val rebuilds: Long = 0,
+    val timingRequests: Long = 0,
+    val timingReplies: Long = 0,
+    val timingReplyAgeMs: Long? = null,
+    val tcpAckedBytes: Long? = null,
+    val tcpQueuedBytes: Long? = null,
+    val tcpRetransmissions: Long? = null,
+    val tcpSampleAgeMs: Long? = null,
+) {
+    val timingLabel: String get() = "计时：请求 $timingRequests / 回包 $timingReplies　最近 ${timingReplyAgeMs?.let { "${it / 1000}s前" } ?: "无"}"
+    val tcpLabel: String get() = "TCP：确认 ${tcpAckedBytes?.let { "${it / 1024}KB" } ?: "未知"}　队列 ${tcpQueuedBytes?.let { "${it}B" } ?: "未知"}　重传 ${tcpRetransmissions ?: "未知"}"
+    val tcpAgeLabel: String get() = "TCP采样：${tcpSampleAgeMs?.let { "${it / 1000}s前" } ?: "暂无"}；确认仅表示对端网络接收"
+    val wifiLabel: String get() = when (wifiIap2) {
+        "WAIT_SESSION" -> "等待会话"
+        "WAIT_PEER" -> "等待车机首包"
+        "WAIT_PEER_LONG" -> "尚无车机首包"
+        "LINK" -> "链路协商"
+        "IDENTIFICATION" -> "设备识别"
+        "CERTIFICATE", "CHALLENGE" -> "认证交互"
+        "READY_PENDING" -> "等待发送完成"
+        "READY_TRANSPORT" -> "传输就绪"
+        "FAILED" -> "握手失败"
+        "STOPPED" -> "已停止"
+        else -> "未知"
+    }
+    val videoLabel: String get() = when (videoStream) {
+        "READY" -> "通道就绪"
+        "REBUILDING" -> "重建中"
+        "FAILED" -> "通道失败"
+        "PAUSED" -> "等待画面归还"
+        else -> "等待通道"
+    }
+    companion object {
+        fun parse(json: String): PipelineDiagnostics? = runCatching {
+            val j = JSONObject(json)
+            val generation = j.getLong("generation")
+            require(generation > 0)
+            val timing = j.optJSONObject("timing")
+            val tcp = j.optJSONObject("video_tcp")
+            fun JSONObject?.number(key: String): Long? =
+                if (this == null || isNull(key)) null else optLong(key).takeIf { it >= 0 }
+            PipelineDiagnostics(
+                generation = generation, active = true,
+                controlReady = j.optBoolean("control_ready"), wifiIap2 = j.optString("wifi_iap2", "WAIT_SESSION"),
+                screenOwned = if (j.isNull("screen_owned")) null else j.getBoolean("screen_owned"),
+                videoStream = j.optString("video_stream", "WAIT_SETUP"),
+                sourceUnits = j.optLong("video_source_units").coerceAtLeast(0),
+                writtenFrames = j.optLong("video_frames_written").coerceAtLeast(0),
+                audioReady = j.optBoolean("audio_ready"), audioPackets = j.optLong("audio_packets_written").coerceAtLeast(0),
+                signalPackets = j.optLong("audio_signal_packets").coerceAtLeast(0),
+                uiRequests = j.optLong("ui_requests").coerceAtLeast(0), rebuilds = j.optLong("screen_rebuilds").coerceAtLeast(0),
+                timingRequests = timing.number("requests") ?: 0, timingReplies = timing.number("replies") ?: 0,
+                timingReplyAgeMs = timing.number("reply_age_ms"),
+                tcpAckedBytes = tcp.number("acked_bytes"), tcpQueuedBytes = tcp.number("outq_bytes"),
+                tcpRetransmissions = tcp.number("total_retrans"), tcpSampleAgeMs = tcp.number("age_ms"),
+            )
+        }.getOrNull()
+    }
+}

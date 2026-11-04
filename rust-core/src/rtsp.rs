@@ -452,7 +452,24 @@ async fn reader_loop(
             } else {
                 let cseq = msg.cseq();
                 let body = reply.as_ref().and_then(|f| f(&msg)).unwrap_or_default();
-                if body.is_empty() {
+                let ui_type = if msg.first_line.contains("/command") {
+                    crate::bplist::parse(&msg.body).ok().and_then(|v| match v.get("type").and_then(crate::bplist::Value::as_str) {
+                        Some("requestUI") => Some("requestUI"),
+                        Some("changeUIContext") => Some("changeUIContext"),
+                        _ => None,
+                    })
+                } else { None };
+                if let Some(ui_type) = ui_type {
+                    // Finish the UI command's acknowledgement before feedback can be scheduled.
+                    // iAP and touch keep their existing immediate dispatch path below.
+                    match respond_ok(&write, &cipher, cseq, &body).await {
+                        Ok(()) => {
+                            crate::emit_log(&format!("RTSP#{trace_id}: UI response TCP written type={ui_type} CSeq={cseq:?} status=200 body={}B",body.len()));
+                            let _ = inbound_tx.send(msg);
+                        }
+                        Err(error) => crate::emit_log(&format!("RTSP#{trace_id}: UI response failed type={ui_type} CSeq={cseq:?}: {error}")),
+                    }
+                } else if body.is_empty() {
                     // Touch/iAP delivery remains immediate; it must not wait for a socket write.
                     let _ = inbound_tx.send(msg);
                     if let Err(error)=respond_ok(&write, &cipher, cseq, &body).await {
@@ -496,6 +513,33 @@ async fn respond_ok(write: &SharedWrite, cipher: &SharedCipher, cseq: Option<i32
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ui_commands_receive_empty_200_with_optional_cseq_before_dispatch() {
+        for (kind,cseq) in [("requestUI",Some(19)),("changeUIContext",None)] {
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut car=tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (phone,_)=listener.accept().await.unwrap(); let (r,w)=phone.into_split();
+            let (_channel,mut inbound)=RtspChannel::spawn(r,w,None);
+            let body=crate::bplist::encode(&crate::bplist::Value::dict(vec![
+                ("type",crate::bplist::Value::str(kind)),
+                ("params",crate::bplist::Value::dict(vec![("url",crate::bplist::Value::str("maps:private?test=1"))])),
+            ]));
+            let sequence=cseq.map(|c| format!("CSeq: {c}\r\n")).unwrap_or_default();
+            car.write_all(format!("POST /command RTSP/1.0\r\n{sequence}Content-Length: {}\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+            car.write_all(&body).await.unwrap();
+            let dispatched=tokio::time::timeout(Duration::from_secs(1),inbound.recv()).await.unwrap().unwrap();
+            assert_eq!(dispatched.body,body);
+            // At dispatch the complete reply is already writable/readable on the peer socket.
+            let mut buffer=Vec::new(); let mut chunk=[0;1024];
+            let response=loop {
+                let n=tokio::time::timeout(Duration::from_secs(1),car.read(&mut chunk)).await.unwrap().unwrap();
+                assert!(n>0); buffer.extend_from_slice(&chunk[..n]);
+                if let Some(response)=parse_rtsp_messages(&mut buffer).pop() { break response; }
+            };
+            assert_eq!(response.status(),200); assert_eq!(response.cseq(),cseq); assert!(response.body.is_empty());
+        }
+    }
 
     #[tokio::test]
     async fn command_response_contains_business_status_and_matching_cseq() {

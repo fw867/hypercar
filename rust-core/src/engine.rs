@@ -65,6 +65,10 @@ pub struct EngineConfig {
     #[serde(default)]
     pub carwith_stretch: bool,
     #[serde(default)]
+    pub ui_retake_recovery: bool,
+    #[serde(default)]
+    pub screen_stream_recovery: bool,
+    #[serde(default)]
     pub desktop_receiver: bool,
     pub identity_path: String,
     #[serde(default)]
@@ -114,6 +118,7 @@ pub async fn run_engine(
 ) -> Result<(), String> {
     let stop = shutdown.signal.clone();
     let mut tasks = EngineTasks::default();
+    let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
     emit_state("negotiating", "AirPlay 会话启动");
     // 触摸/按键通道：CarPlay 事件通道把车机操作送到这里，P1 起交给自绘 UI 处理。
     let _ = (&touch_tx, &key_tx);
@@ -214,11 +219,13 @@ pub async fn run_engine(
     }
 
     // ---- 视频泵 ----
-    let (screen_ready_tx, screen_ready_rx) = tokio::sync::oneshot::channel::<ScreenSender>();
+    let (screen_ready_tx, mut screen_ready_rx) = mpsc::channel::<crate::screen_session::ScreenCommand>(2);
     let video_stats = Arc::new(Mutex::new(PumpStat::default()));
     {
         let stop_v = stop.clone();
         let stats = video_stats.clone();
+        let screen_recoverable=cfg.screen_stream_recovery;
+        let video_pipeline=pipeline.clone();
         tasks.spawn(async move {
             let mut sender: Option<ScreenSender> = None;
             // 屏幕流就绪前收到的编码尺寸先存着，就绪时补上
@@ -226,29 +233,29 @@ pub async fn run_engine(
             // 编码器真实尺寸（最后一次 EncoderResolution）。VideoConfig/画布都以它为准；
             // /info 可能先写入车机尺寸，编码器回报后覆盖。
             let mut encoder_size: Option<(u32, u32)> = None;
-            let mut ready = Some(screen_ready_rx);
+            let mut before_ready_units = 0u64;
             let mut video_rx = video_rx;
             // 16ms tick：仅用于 keepAlive 节拍（真帧由视频泵推送）
             let mut tick = tokio::time::interval(Duration::from_millis(16));
             loop {
                 tokio::select! {
                     _ = stop_v.notified() => return,
-                    r = async {
-                        match ready.as_mut() {
-                            Some(rx) => Some(rx.await.ok()),
-                            None => std::future::pending().await,
-                        }
-                    } => {
-                        if let Some(mut s) = r.flatten() {
+                    command = screen_ready_rx.recv() => match command {
+                        Some(crate::screen_session::ScreenCommand::Install(mut s)) => {
                             if let Some((w, h)) = pending_size.take() {
                                 s.set_size(w, h);
                             }
                             sender = Some(s);
                             crate::emit_force_keyframe();
-                            emit_log("VIDEO: sender ready; request fresh SPS/PPS/IDR");
+                            emit_log(&format!("VIDEO: sender ready; discarded_before_ready_units={before_ready_units}; request fresh SPS/PPS/IDR"));
                         }
-                        ready = None;
-                    }
+                        Some(crate::screen_session::ScreenCommand::Pause(reply)) => {
+                            drop(sender.take());
+                            let _=reply.send(());
+                            emit_log("VIDEO: old sender released; screen recovery pause acknowledged");
+                        }
+                        None => return,
+                    },
                     ev = video_rx.recv() => match ev {
                         Some(SourceEvent::ResetVideoSource) => {
                             encoder_size = None; pending_size = None;
@@ -266,6 +273,7 @@ pub async fn run_engine(
                             }
                         }
                         Some(SourceEvent::VideoFrame { pts_us, data }) => {
+                            stats.lock().source_units += 1;
                             if let Some(s) = sender.as_mut() {
                                 let before_frames = s.frames_sent();
                                 let before_bytes = s.bytes_per_second();
@@ -282,16 +290,30 @@ pub async fn run_engine(
                                 } else {
                                     pts_us
                                 };
-                                if let Err(error) = s.send_video_annexb(&data, pts).await {
-                                    emit_log(&format!("VIDEO: write failed: {error}"));
-                                    emit_state("ended", "屏幕流写失败（车机侧断开）");
+                                let written=if screen_recoverable {
+                                    tokio::time::timeout(Duration::from_secs(2),s.send_video_annexb(&data,pts)).await
+                                        .unwrap_or_else(|_|Err(std::io::Error::new(std::io::ErrorKind::TimedOut,"video TCP write timeout")))
+                                } else { s.send_video_annexb(&data,pts).await };
+                                if let Err(error) = written {
+                                    emit_log(&format!("VIDEO: write failed: {error}; {}", s.diagnostics()));
+                                    video_pipeline.lock().video_stream="FAILED".into();
+                                    if screen_recoverable {
+                                        drop(sender.take());
+                                        emit_log("SCREEN-RECOVERY: video write failed; keep audio/control, await next allowed requestUI");
+                                        continue;
+                                    }
+                                    emit_state("ended", "屏幕流写失败（请检查网络及车机会话）");
                                     return;
                                 }
                                 let mut st = stats.lock();
                                 st.frames += s.frames_sent() - before_frames;
                                 st.bytes += s.bytes_per_second() - before_bytes;
+                            } else {
+                                before_ready_units += 1;
+                                if before_ready_units == 1 {
+                                    emit_log("VIDEO: source arrived before screen TCP sender ready; discarding until ready");
+                                }
                             }
-                            // 屏幕流未就绪：丢帧（AirPlay 会话可能晚于画面就绪）
                         }
                         Some(_) => {}
                         None => return,
@@ -299,8 +321,18 @@ pub async fn run_engine(
                     _ = tick.tick() => {
                         // 屏幕流 keepAlive 帧（明文、1s 节流；缺它 Audi MMI 3315 10.2s 拆轮）
                         if let Some(s) = sender.as_mut() {
-                            if let Err(error) = s.maybe_send_keep_alive().await {
-                                emit_log(&format!("VIDEO: keepAlive failed: {error}"));
+                            let written=if screen_recoverable {
+                                tokio::time::timeout(Duration::from_secs(2),s.maybe_send_keep_alive()).await
+                                    .unwrap_or_else(|_|Err(std::io::Error::new(std::io::ErrorKind::TimedOut,"video keepAlive write timeout")))
+                            } else { s.maybe_send_keep_alive().await };
+                            if let Err(error) = written {
+                                emit_log(&format!("VIDEO: keepAlive failed: {error}; {}", s.diagnostics()));
+                                video_pipeline.lock().video_stream="FAILED".into();
+                                if screen_recoverable {
+                                    drop(sender.take());
+                                    emit_log("SCREEN-RECOVERY: video keepAlive failed; preserve other channels");
+                                    continue;
+                                }
                                 emit_state("ended", "屏幕保活写失败");
                                 return;
                             }
@@ -349,6 +381,7 @@ pub async fn run_engine(
             sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // 发包速率自测：每秒记一行，联调时能直接看出节拍对不对。
             let mut sent_packets: u64 = 0;
+            let mut audio_errors: u64 = 0;
             let mut rate_mark = std::time::Instant::now();
             let mut mixed = vec![0i16; SPF * 2];
             loop {
@@ -429,8 +462,15 @@ pub async fn run_engine(
                         if let Some(a) = out.as_mut() {
                             // 静音时也发包：保持 RTP 时钟连续（车机按包排播）
                             let before = a.packets_sent();
-                            let _ = a.send_pcm(&mixed).await;
-                            sent_packets += a.packets_sent().saturating_sub(before);
+                            if let Err(error)=a.send_pcm(&mixed).await {
+                                audio_errors+=1;
+                                if audio_errors==1 || audio_errors%100==0 { emit_log(&format!("AUDIO: RTP write failed count={audio_errors}: {error}")); }
+                            }
+                            let written=a.packets_sent().saturating_sub(before);
+                            sent_packets += written;
+                            let mut counters=stats.lock();
+                            counters.packets += written;
+                            if mixed.iter().any(|s| *s != 0) { counters.signal_packets += written; }
                         }
                         // 每秒报一次实际发包速率：48000/352 ≈ 136/s。低于它就是漏拍，
                         // 接收端会表现为 late/discontinuity 增长、听感断续。
@@ -453,6 +493,28 @@ pub async fn run_engine(
     }
 
     // ---- AirPlay 协商（控制 FD 已连接车机端口）----
+    {
+        let health=pipeline.clone(); let vs=video_stats.clone(); let aus=audio_stats.clone(); let signal=stop.clone();
+        tasks.spawn(async move {
+            let mut last_key=String::new();
+            let mut last_log=tokio::time::Instant::now()-Duration::from_secs(10);
+            loop {
+                let mut snapshot=health.lock().clone();
+                { let v=vs.lock(); snapshot.video_source_units=v.source_units; snapshot.video_frames_written=v.frames; }
+                { let a=aus.lock(); snapshot.audio_packets_written=a.packets; snapshot.audio_signal_packets=a.signal_packets; }
+                snapshot.wifi_iap2=crate::wifi_iap2::phase(snapshot.wifi_id);
+                let now_ms=crate::timing::monotonic_nanos()/1_000_000;
+                snapshot.timing.refresh_age(now_ms);
+                if let Some(tcp)=snapshot.video_tcp.as_mut() {tcp.age_ms=now_ms.saturating_sub(tcp.sampled_ms);}
+                if let Ok(json)=serde_json::to_string(&snapshot) { crate::emit_pipeline(&json); }
+                let key=snapshot.stage_key();
+                if key!=last_key || last_log.elapsed()>=Duration::from_secs(10) {
+                    emit_log(&snapshot.summary()); last_key=key; last_log=tokio::time::Instant::now();
+                }
+                tokio::select! { _=signal.notified()=>return, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
+            }
+        });
+    }
     emit_state("negotiating", "AirPlay 协商开始");
     let (ctrl_r, ctrl_w) = control_stream.into_split();
     // 编码画布尺寸：/info 报到车机真实尺寸后写入，编码器回报后覆盖
@@ -486,6 +548,9 @@ pub async fn run_engine(
         touch_size: touch_size.clone(),
         carwith_display,
         carwith_stretch: cfg.carlife_source && cfg.carwith_stretch,
+        ui_retake_recovery: cfg.ui_retake_recovery,
+        screen_stream_recovery: cfg.screen_stream_recovery,
+        pipeline: pipeline.clone(),
     };
     let outcome = tokio::select! {
         biased;
@@ -669,12 +734,15 @@ fn take_or_zero(q: &mut VecDeque<i16>) -> i16 {
 
 #[derive(Default)]
 struct PumpStat {
+    source_units: u64,
     frames: u64,
     bytes: u64,
 }
 
 #[derive(Default)]
 struct AudioPumpStat {
+    packets: u64,
+    signal_packets: u64,
     playing: bool,
     ducking: bool,
 }

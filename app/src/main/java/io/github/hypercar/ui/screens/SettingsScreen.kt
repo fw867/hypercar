@@ -1207,6 +1207,8 @@ private fun BehaviorSection(startup: io.github.hypercar.session.StartupReadiness
     var discoveryFallback by rememberSaveable { mutableStateOf(SettingsStore.bluetoothDiscoverableFallback) }
     var carPlayMarker by rememberSaveable { mutableStateOf(SettingsStore.bluetoothCarPlayMarker) }
     var proactiveWifi by rememberSaveable { mutableStateOf(SettingsStore.proactiveWifiSession) }
+    var uiRetake by rememberSaveable { mutableStateOf(SettingsStore.uiRetakeRecovery) }
+    var screenRecovery by rememberSaveable { mutableStateOf(SettingsStore.screenStreamRecovery) }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionLabel(text = "自动连接与恢复")
@@ -1268,6 +1270,28 @@ private fun BehaviorSection(startup: io.github.hypercar.session.StartupReadiness
                     proactiveWifi = it
                     SettingsStore.proactiveWifiSession = it
                     HyperCarRepo.log("WIFI-ACTIVE: 实验开关=${if (it) "开" else "关"}，下次连接生效")
+                },
+            )
+            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+            SwitchRow(
+                title = "CarPlay 界面恢复（实验）",
+                subtitle = "已连接却点不开时，再次点击车机 CarPlay 图标尝试恢复画面；下次连接生效",
+                checked = uiRetake,
+                onCheckedChange = {
+                    uiRetake = it
+                    SettingsStore.uiRetakeRecovery = it
+                    HyperCarRepo.log("UI-RECOVERY: 实验开关=${if (it) "开" else "关"}，下次连接生效")
+                },
+            )
+            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+            SwitchRow(
+                title = "视频通道重建（实验）",
+                subtitle = "再次点击 CarPlay 图标时仅重建视频通道，保留音频；可单独测试，下次连接生效",
+                checked = screenRecovery,
+                onCheckedChange = {
+                    screenRecovery = it
+                    SettingsStore.screenStreamRecovery = it
+                    HyperCarRepo.log("SCREEN-RECOVERY: 实验开关=${if (it) "开" else "关"}，下次连接生效")
                 },
             )
         }
@@ -1684,11 +1708,11 @@ private fun CarWithSettingsShortcut() {
 
 @Composable
 private fun CarWithStretchSetting() {
-    var stretch by rememberSaveable { mutableStateOf(SettingsStore.carWithStretch) }
     SwitchRow(
         title = "拉伸铺满车机屏幕",
-        subtitle = "按车机上报尺寸铺满，比例不同时会变形；下次连接生效。",
-        checked = stretch,
-        onCheckedChange = { stretch = it; SettingsStore.carWithStretch = it },
+        subtitle = "暂时停用，视频按实际编码尺寸发送。",
+        checked = false,
+        onCheckedChange = {},
+        enabled = false,
     )
 }

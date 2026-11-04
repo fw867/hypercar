@@ -8,9 +8,18 @@ use tokio::sync::{mpsc, Notify};
 use crate::{bplist::{self, Value}, rtsp::RtspChannel};
 
 #[derive(Default)]
-struct Handoff { id: u64, ready: bool, health: Option<std::time::Instant>, ready_token: u64 }
+struct Handoff { id: u64, ready: bool, health: Option<std::time::Instant>, ready_token: u64, phase: String }
 static HANDOFF: Lazy<Mutex<Handoff>> = Lazy::new(|| Mutex::new(Handoff::default()));
 pub fn is_active(id: u64) -> bool { HANDOFF.lock().id == id }
+pub fn set_phase(id: u64, phase: &str) {
+    if !matches!(phase,"WAIT_PEER"|"WAIT_PEER_LONG"|"LINK"|"IDENTIFICATION"|"CERTIFICATE"|"CHALLENGE"|"READY_PENDING"|"FAILED"|"STOPPED") { return; }
+    let mut s=HANDOFF.lock(); if s.id==id { s.phase=phase.into(); }
+}
+pub fn phase(id: u64) -> String {
+    let s=HANDOFF.lock();
+    if id==0 { "WAIT_SESSION".into() } else if s.id!=id { "STOPPED".into() }
+    else if s.ready { "READY_TRANSPORT".into() } else if s.phase.is_empty() { "WAIT_PEER".into() } else { s.phase.clone() }
+}
 pub fn mark_ready(id: u64, ready: bool) {
     let token = {
         let mut state = HANDOFF.lock();

@@ -26,9 +26,30 @@ class ShellPlaybackAudio {
         private val devices = AudioManager::class.java.getMethod("getDevicesForStream", Int::class.javaPrimitiveType)
         private var original = -1
         private var maximum = -1
+        private var routeLease: PlaybackRouteLease? = null
+        private var routeAttempted = false
+        private var released = false
         private fun isCaptureRoute() = (devices.invoke(audio, AudioManager.STREAM_MUSIC) as Int) == 0x8000
 
-        fun acquire(): String {
+        @Synchronized fun inspect(silent: Boolean): String {
+            if (released) return "capture released"
+            val mask = devices.invoke(audio, AudioManager.STREAM_MUSIC) as Int
+            val active = audio.isMusicActive
+            val recovery = if (silent && active && mask != 0x8000 && !routeAttempted) {
+                routeAttempted = true
+                runCatching {
+                    val lease = PlaybackRouteLease(audio)
+                    routeLease = lease
+                    lease.acquire()
+                }.getOrElse { "media route recovery failed: ${it.cause?.message ?: it.message}" }
+            } else ""
+            // Playback can change the route after the one-second startup check has finished.
+            if (silent && active && original < 0 && isCaptureRoute()) acquire()
+            return "route=0x${mask.toString(16)} active=$active muted=${audio.isStreamMute(AudioManager.STREAM_MUSIC)} volume=${audio.getStreamVolume(AudioManager.STREAM_MUSIC)}/${audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)} silent=$silent $recovery"
+        }
+
+        @Synchronized fun acquire(): String {
+            if (released) return "capture released"
             repeat(50) {
                 if (isCaptureRoute()) {
                     original = audio.getStreamVolume(AudioManager.STREAM_MUSIC)
@@ -41,10 +62,16 @@ class ShellPlaybackAudio {
             return "remote_submix route not exclusive; phone volume unchanged"
         }
 
-        fun release() {
-            if (original >= 0 && isCaptureRoute() &&
-                audio.getStreamVolume(AudioManager.STREAM_MUSIC) == maximum) {
-                audio.setStreamVolume(AudioManager.STREAM_MUSIC, original, 0)
+        @Synchronized fun release() {
+            if (released) return
+            released = true
+            try {
+                if (original >= 0 && isCaptureRoute() &&
+                    audio.getStreamVolume(AudioManager.STREAM_MUSIC) == maximum) {
+                    audio.setStreamVolume(AudioManager.STREAM_MUSIC, original, 0)
+                }
+            } finally {
+                routeLease?.let { android.util.Log.i("HyperCar", "CARUI-AUDIO: ${it.release()}") }
             }
         }
     }
@@ -83,9 +110,21 @@ class ShellPlaybackAudio {
                 try {
                     ParcelFileDescriptor.AutoCloseOutputStream(current.output).use { out ->
                         val bytes = ByteArray(3840) // 20ms, bounded pipe provides backpressure.
+                        var lastInspect = android.os.SystemClock.elapsedRealtime()
+                        var nonzero = false
                         while (current.live.get()) {
                             val count = record.read(bytes, 0, bytes.size, AudioRecord.READ_BLOCKING)
                             check(count > 0) { "AudioRecord.read=$count" }
+                            if (!nonzero) nonzero = (0 until count).any { bytes[it].toInt() != 0 }
+                            val now = android.os.SystemClock.elapsedRealtime()
+                            if (now - lastInspect >= 5_000) {
+                                val detail = runCatching { current.volume.inspect(!nonzero) }
+                                    .getOrElse { "route inspection failed: ${it.cause?.message ?: it.message}" }
+                                status = "capturing 48000Hz stereo PCM16; $detail"
+                                android.util.Log.i("HyperCar", "CARUI-AUDIO: $detail")
+                                lastInspect = now
+                                nonzero = false
+                            }
                             out.write(bytes, 0, count)
                         }
                     }

@@ -33,6 +33,7 @@ object RustCoreBridge {
         fun onState(state: String, detail: String)
 
         fun onLog(line: String)
+        fun onPipeline(json: String) {}
 
         /** 统计心跳（约 1s 一次）：fps/frames/kbps/音频闪避。 */
         fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean)
@@ -103,6 +104,7 @@ object RustCoreBridge {
     /** 主动退出：有界等待 TEARDOWN 和旧引擎资源释放，不用于网络丢失或蓝牙交接。 */
     external fun nativeStopGracefully(): Boolean
     external fun nativeMarkWifiIap2Ready(id: Long, ready: Boolean)
+    external fun nativeSetWifiIap2Phase(id: Long, phase: String)
     external fun nativeCanKeepWifiSession(): Boolean
     external fun nativeSendIap2(id: Long, bytes: ByteArray): Boolean
 

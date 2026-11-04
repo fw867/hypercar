@@ -42,7 +42,7 @@ class AirplayServiceProbe(
      *
      * 返回第一个「SRV 端口 + A 地址」都齐的实例；拿不到返回 null（调用方退回端口列表）。
      */
-    suspend fun browse(network: Network?, timeoutMillis: Long = 3_000): Endpoint? =
+    suspend fun browse(network: Network?, timeoutMillis: Long = 3_000, strictNetwork: Boolean = false): Endpoint? =
         withContext(Dispatchers.IO) {
             var socket: MulticastSocket? = null
             try {
@@ -54,6 +54,7 @@ class AirplayServiceProbe(
                 // 顺序反了的话 socket 已 bound，bindSocket 会失败，包就会走默认网络发出去。
                 val boundToCarNetwork = network != null &&
                     runCatching { network.bindSocket(socket) }.isSuccess
+                if (strictNetwork && !boundToCarNetwork) error("car network binding failed; skip rediscovery")
                 if (!boundToCarNetwork) socket.bind(InetSocketAddress(0))
                 if (nif != null) runCatching { socket.networkInterface = nif }
                 runCatching { socket.joinGroup(InetSocketAddress(InetAddress.getByName(GROUP), PORT), nif) }
@@ -62,30 +63,24 @@ class AirplayServiceProbe(
                 socket.send(DatagramPacket(query, query.size, InetAddress.getByName(GROUP), PORT))
                 log("$TAG: 已查询 $SERVICE（if=${interfaceName ?: "-"}），等应答 ${timeoutMillis}ms")
 
-                val deadline = System.currentTimeMillis() + timeoutMillis
-                val srv = HashMap<String, Pair<Int, String>>()
-                val addr = HashMap<String, String>()
-                val models = HashMap<String, String>()
-                val ptrs = HashSet<String>()
+                val deadline = android.os.SystemClock.elapsedRealtime() + timeoutMillis
+                val records = AirplayDnsRecords()
                 val buf = ByteArray(4096)
-                while (System.currentTimeMillis() < deadline) {
-                    socket.soTimeout = (deadline - System.currentTimeMillis()).toInt().coerceAtLeast(1)
+                while (android.os.SystemClock.elapsedRealtime() < deadline) {
+                    socket.soTimeout = (deadline - android.os.SystemClock.elapsedRealtime()).toInt().coerceAtLeast(1)
                     val packet = DatagramPacket(buf, buf.size)
                     val received = runCatching { socket.receive(packet); true }.getOrDefault(false)
                     if (!received) break
-                    parse(packet.data, packet.length, srv, addr, models, ptrs)
-                    for (instance in srv.keys) {
-                        val pair = srv[instance] ?: continue
-                        val ip = addr[pair.second] ?: addr[pair.second.trimEnd('.')] ?: continue
-                        log("$TAG: ✓ $instance → $ip:${pair.first}" + (models[instance]?.let { "（model=$it）" } ?: ""))
-                        return@withContext Endpoint(ip, pair.first, instance, models[instance])
+                    records.accept(packet.data, packet.length)
+                    records.first()?.let { endpoint ->
+                        log("$TAG: ✓ ${endpoint.instance} → ${endpoint.host}:${endpoint.port}")
+                        return@withContext Endpoint(endpoint.host, endpoint.port, endpoint.instance, endpoint.model)
                     }
                 }
-                log(
-                    "$TAG: 未拿到可用应答（PTR=${ptrs.size} SRV=${srv.size} A=${addr.size}）" +
-                        if (ptrs.isEmpty()) "——车机可能不广播该服务，退回端口探测" else "",
-                )
+                log("$TAG: 未拿到可用应答——继续等待车机邀请或本轮端口重试")
                 null
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
             } catch (t: Throwable) {
                 log("$TAG: 探测异常 ${t.javaClass.simpleName}: ${t.message}")
                 null
@@ -122,93 +117,4 @@ class AirplayServiceProbe(
         return out.toByteArray()
     }
 
-    /** 解析一条应答，累积 PTR / SRV / TXT / A。 */
-    private fun parse(
-        data: ByteArray,
-        length: Int,
-        srv: HashMap<String, Pair<Int, String>>,
-        addr: HashMap<String, String>,
-        models: HashMap<String, String>,
-        ptrs: MutableSet<String>,
-    ) {
-        runCatching {
-            val pos = intArrayOf(12)
-            val qd = u16(data, 4)
-            val an = u16(data, 6)
-            repeat(qd) {
-                readName(data, length, pos)
-                pos[0] += 4
-            }
-            repeat(an) {
-                val name = readName(data, length, pos)
-                if (pos[0] + 10 > length) return
-                val type = u16(data, pos[0])
-                pos[0] += 8
-                val rdlen = u16(data, pos[0])
-                pos[0] += 2
-                val rdStart = pos[0]
-                when (type) {
-                    12 -> ptrs += readName(data, length, pos)
-                    33 -> {
-                        val port = u16(data, rdStart + 4)
-                        val target = readName(data, length, pos)
-                        srv[name] = port to target
-                    }
-                    16 -> {
-                        var i = rdStart
-                        while (i < rdStart + rdlen && i < length) {
-                            val len = data[i].toInt() and 0xFF
-                            if (len == 0 || i + 1 + len > length) break
-                            val kv = String(data, i + 1, len, Charsets.UTF_8)
-                            if (kv.startsWith("model=")) models[name] = kv.removePrefix("model=")
-                            i += 1 + len
-                        }
-                    }
-                    1 -> {
-                        if (rdlen == 4) {
-                            addr[name] = "${data[rdStart].toInt() and 0xFF}.${data[rdStart + 1].toInt() and 0xFF}." +
-                                "${data[rdStart + 2].toInt() and 0xFF}.${data[rdStart + 3].toInt() and 0xFF}"
-                        }
-                    }
-                }
-                pos[0] = rdStart + rdlen
-            }
-        }
-    }
-
-    private fun u16(data: ByteArray, at: Int): Int =
-        ((data[at].toInt() and 0xFF) shl 8) or (data[at + 1].toInt() and 0xFF)
-
-    /** 读 DNS 名字（支持 0xC0 压缩指针）。 */
-    private fun readName(data: ByteArray, length: Int, pos: IntArray): String {
-        val sb = StringBuilder()
-        var jumps = 0
-        var cursor = pos[0]
-        var advanced = 0
-        while (cursor < length && jumps < 8) {
-            val len = data[cursor].toInt() and 0xFF
-            if (len == 0) {
-                cursor += 1
-                if (advanced == 0) advanced = 1
-                break
-            }
-            if (len and 0xC0 == 0xC0) {
-                if (cursor + 1 >= length) break
-                val ptr = ((len and 0x3F) shl 8) or (data[cursor + 1].toInt() and 0xFF)
-                if (advanced == 0) advanced = 2
-                cursor = ptr
-                jumps++
-                continue
-            }
-            if (cursor + 1 + len > length) break
-            if (sb.isNotEmpty()) sb.append('.')
-            sb.append(String(data, cursor + 1, len, Charsets.US_ASCII))
-            cursor += 1 + len
-            if (advanced == 0) advanced = cursor - pos[0]
-        }
-        pos[0] += maxOf(advanced, 1)
-        return sb.toString()
-    }
 }
-
-

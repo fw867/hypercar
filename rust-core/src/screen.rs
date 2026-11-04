@@ -31,6 +31,7 @@
 use crate::crypto::{chacha_seal, nonce64, Aes128CtrStream};
 use crate::timing::ntp_be;
 use std::time::Duration;
+use std::os::fd::AsRawFd;
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::OwnedWriteHalf;
 
@@ -74,10 +75,10 @@ pub struct ScreenSender {
     cipher: ScreenCipher,
     /** ChaCha 帧计数（每帧自增；AES-CTR 形态不使用但照常计数，对齐参考实现）。 */
     frame_counter: u64,
-    /** Actual encoded source size; display_target may override the presentation header. */
+    /** Source-reported encoded size; SPS dimensions take precedence in VideoConfig. */
     width: f32,
     height: f32,
-    /// Optional receiver presentation size; encoded size/SPS and touch source remain independent.
+    /// Diagnostic only: the old header-only stretch request is never applied to the wire.
     display_target: Option<(u32, u32)>,
     /** 车机 /info 声明 keepAliveSendStatsAsBody 时为 true → opcode=5 + 统计体。 */
     keep_alive_with_stats: bool,
@@ -105,6 +106,16 @@ pub struct ScreenSender {
     waiting_idr: bool,
     last_sync_request: Option<tokio::time::Instant>,
     ownership: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    source_frames: u64,
+    ownership_skips: u64,
+    sync_skips: u64,
+    written_idrs: u64,
+    wire_bytes: u64,
+    last_source: Option<tokio::time::Instant>,
+    last_write: Option<tokio::time::Instant>,
+    last_owner: Option<bool>,
+    tcp_diagnostics: Option<(std::sync::Arc<parking_lot::Mutex<crate::pipeline::Pipeline>>,u64)>,
+    tcp_monitor: Option<crate::tcp_diagnostics::TcpMonitor>,
 }
 
 impl ScreenSender {
@@ -140,35 +151,78 @@ impl ScreenSender {
             waiting_idr: true,
             last_sync_request: None,
             ownership: None,
+            source_frames: 0,
+            ownership_skips: 0,
+            sync_skips: 0,
+            written_idrs: 0,
+            wire_bytes: 0,
+            last_source: None,
+            last_write: None,
+            last_owner: None,
+            tcp_diagnostics: None,
+            tcp_monitor: None,
+        }
+    }
+
+    pub fn attach_diagnostics(&mut self,pipeline:std::sync::Arc<parking_lot::Mutex<crate::pipeline::Pipeline>>,connection_id:u64) {
+        self.tcp_monitor.take();
+        pipeline.lock().video_tcp=Some(crate::tcp_diagnostics::TcpSnapshot::capture(self.w.as_ref().as_raw_fd(),connection_id));
+        self.tcp_monitor=Some(crate::tcp_diagnostics::TcpMonitor::start(self.w.as_ref().as_raw_fd(),connection_id,pipeline.clone()));
+        self.tcp_diagnostics=Some((pipeline,connection_id));
+    }
+    fn sample_tcp(&self) {
+        if let Some((pipeline,id))=&self.tcp_diagnostics {
+            let snapshot=crate::tcp_diagnostics::TcpSnapshot::capture(self.w.as_ref().as_raw_fd(),*id);
+            let mut p=pipeline.lock();
+            if p.video_tcp.as_ref().map(|s|s.connection_id)==Some(*id) {p.video_tcp=Some(snapshot);}
         }
     }
 
     /// Actual source size (also used by engine to detect encoder changes).
-    /// The opt-in display target changes only VideoConfig presentation dimensions.
     pub fn size(&self) -> (u32, u32) {
         (self.width as u32, self.height as u32)
     }
 
-    /// Ask the receiver to present the unchanged bitstream across its reported display.
-    /// Unknown receiver dimensions preserve the original source-sized presentation.
+    /// Preserve old configuration for diagnostics, but never falsify encoded dimensions.
     pub fn set_display_target(&mut self, width: u32, height: u32) {
         self.display_target = if width >= 2 && height >= 2 {
             Some((width, height))
         } else {
             None
         };
-        self.reset_source();
-        crate::emit_log(&format!("VIDEO: stretch target={:?}; encoded size remains source-sized", self.display_target));
+        crate::emit_log(&format!("VIDEO: header-only stretch suspended requested={:?}; config follows encoded SPS/source", self.display_target));
     }
 
     pub fn reset_source(&mut self) {
+        crate::emit_log(&format!("VIDEO: reset source {}", self.diagnostics()));
         self.config_sent = false;
         self.last_sps = None; self.last_pps = None;
         self.waiting_idr = true; self.last_sync_request = None;
         self.logged_first_frame = false;
     }
 
-    pub fn set_ownership(&mut self, owner: std::sync::Arc<std::sync::atomic::AtomicBool>) { self.ownership = Some(owner); }
+    pub fn set_ownership(&mut self, owner: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.ownership = Some(owner);
+        self.observe_owner();
+    }
+
+    fn observe_owner(&mut self) -> bool {
+        let owned = self.ownership.as_ref().map(|v| v.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(true);
+        if self.last_owner != Some(owned) {
+            crate::emit_log(&format!("VIDEO: screen gate phone_owned={owned} written_frames={} source_units={} (local arbitration; not receiver display confirmation)", self.frames, self.source_frames));
+            self.last_owner = Some(owned);
+        }
+        owned
+    }
+
+    pub fn diagnostics(&self) -> String {
+        self.sample_tcp();
+        let age = |t: Option<tokio::time::Instant>| t.map(|v| v.elapsed().as_millis() as i64).unwrap_or(-1);
+        format!("source_units={} skipped_owner={} skipped_sync={} tcp_written_frames={} tcp_written_bytes={} payload_bytes={} written_idrs={} config={} waiting_idr={} phone_owned={:?} source_age_ms={} write_age_ms={} receiver_display=unknown",
+            self.source_frames, self.ownership_skips, self.sync_skips, self.frames, self.wire_bytes,
+            self.bytes, self.written_idrs, self.config_sent, self.waiting_idr, self.last_owner,
+            age(self.last_source), age(self.last_write))
+    }
 
     pub fn set_size(&mut self, width: u32, height: u32) {
         let w = (width / 2) * 2;
@@ -199,7 +253,8 @@ impl ScreenSender {
         header[6] = SCREEN_FLAG_ENCRYPTED;
         // params[1]（偏移 16）里是**两个** f32：width 在 16..20、height 在 20..24。
         // 曾把 height 写到 24..28（误当 params[2]），车机读到的画布高度成 0 → 黑屏/错缩放。
-        let (display_w, display_h) = self.display_target.unwrap_or_else(|| self.size());
+        let sps_size = crate::h264::avcc_dimensions(avcc);
+        let (display_w, display_h) = sps_size.unwrap_or_else(|| self.size());
         header[16..20].copy_from_slice(&(display_w as f32).to_le_bytes());
         header[20..24].copy_from_slice(&(display_h as f32).to_le_bytes());
         let mut wire = Vec::with_capacity(HEADER_LEN + avcc.len());
@@ -208,7 +263,8 @@ impl ScreenSender {
         self.w.write_all(&wire).await?;
         self.config_sent = true;
         self.waiting_idr = true;
-        crate::emit_log(&format!("VIDEO: config written {}B {}x{} flags=0x04 source={}x{} stretch={}", avcc.len(), display_w, display_h, self.width, self.height, self.display_target.is_some()));
+        crate::emit_log(&format!("VIDEO: config TCP written {}B header={}x{} encoder_report={}x{} sps={sps_size:?} report_matches_sps={:?} flags=0x04 header_stretch=false requested_target={:?}; receiver decode/display unconfirmed",
+            avcc.len(), display_w, display_h, self.width, self.height, sps_size.map(|s| s == self.size()), self.display_target));
         Ok(())
     }
 
@@ -219,7 +275,10 @@ impl ScreenSender {
     ///
     /// config 尚未发出时丢帧（对齐参考实现：车机没有 avcC 就无从解码）。
     pub async fn send_video_annexb(&mut self, annexb: &[u8], pts_us: u64) -> std::io::Result<()> {
-        if self.ownership.as_ref().map(|v| !v.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(false) {
+        self.source_frames += 1;
+        self.last_source = Some(tokio::time::Instant::now());
+        if !self.observe_owner() {
+            self.ownership_skips += 1;
             self.waiting_idr = true;
             self.last_sync_request = None;
             return Ok(());
@@ -277,6 +336,7 @@ impl ScreenSender {
         }
         let is_idr = nals.iter().any(|nal| nal_type(nal) == 5);
         if !self.config_sent || (self.waiting_idr && !is_idr) {
+            self.sync_skips += 1;
             if self.last_sync_request.map(|t| t.elapsed() >= Duration::from_secs(1)).unwrap_or(true) {
                 self.last_sync_request = Some(tokio::time::Instant::now());
                 crate::emit_force_keyframe();
@@ -284,6 +344,7 @@ impl ScreenSender {
             }
             return Ok(());
         }
+        let resuming = self.waiting_idr;
         if self.waiting_idr {
             crate::emit_log(&format!("VIDEO: first IDR ready pts={pts_us}us clock={}us", crate::timing::monotonic_nanos() / 1000));
             self.waiting_idr = false;
@@ -327,6 +388,14 @@ impl ScreenSender {
         self.w.write_all(&wire).await?;
 
         self.frames = self.frames.wrapping_add(1);
+        self.wire_bytes = self.wire_bytes.wrapping_add(wire.len() as u64);
+        self.last_write = Some(tokio::time::Instant::now());
+        if is_idr {
+            self.written_idrs += 1;
+            if self.written_idrs == 1 || resuming {
+                crate::emit_log(&format!("VIDEO: IDR TCP written pts={pts_us}us frame={} wire={}B; receiver decode/display unconfirmed", self.frames, wire.len()));
+            }
+        }
         self.bytes = self.bytes.wrapping_add(plain.len() as u64);
         self.frames_since_keep_alive = self.frames_since_keep_alive.wrapping_add(1);
         self.bytes_since_keep_alive = self.bytes_since_keep_alive.wrapping_add(plain.len() as u64);
@@ -340,6 +409,7 @@ impl ScreenSender {
     /// keepAliveSendStatsAsBody）发 opcode=5，body 长度同时写进头部 params[14] 的后 4 字节
     /// （偏移 124，f32 LE），与 catplay 逐字节一致。
     pub async fn maybe_send_keep_alive(&mut self) -> std::io::Result<()> {
+        self.observe_owner();
         if self.last_keep_alive.elapsed() < Duration::from_millis(KEEPALIVE_INTERVAL_MS) {
             return Ok(());
         }
@@ -380,7 +450,8 @@ impl ScreenSender {
         wire.extend_from_slice(&body);
         self.w.write_all(&wire).await?;
         if self.keep_alive_count == 1 || self.keep_alive_count % 10 == 0 {
-            crate::emit_log(&format!("VIDEO: keepAlive written opcode={opcode} body={}B count={} frames={}", body.len(), self.keep_alive_count, self.frames));
+            crate::emit_log(&format!("VIDEO: keepAlive written opcode={opcode} body={}B count={} window_fps={:.1} window_payload_Bps={:.0} {}", body.len(), self.keep_alive_count,
+                frames_in_window as f64 / window, bytes_in_window as f64 / window, self.diagnostics()));
         }
         Ok(())
     }
@@ -393,6 +464,14 @@ impl ScreenSender {
     /// 累计发送字节数（契约约定的简化口径；真实速率统计后续再按 keepAlive 窗口换算）。
     pub fn bytes_per_second(&self) -> u64 {
         self.bytes
+    }
+}
+
+impl Drop for ScreenSender {
+    fn drop(&mut self) {
+        crate::emit_log(&format!("VIDEO: sender released {}", self.diagnostics()));
+        // Must stop descriptor sampling BEFORE Rust drops the write half and closes its fd.
+        self.tcp_monitor.take();
     }
 }
 
@@ -494,15 +573,15 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     #[tokio::test]
-    async fn stretch_changes_only_presentation_and_survives_source_reset() {
+    async fn old_stretch_preference_never_overrides_encoded_size_even_after_source_reset() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (mut peer, _) = listener.accept().await.unwrap();
         let (_, write) = client.into_split();
         let mut sender = ScreenSender::new(write, ScreenCipher::ChaCha([7;32]), 2560, 744, true);
         let avcc = build_avcc(&[0x67,0x42,0,0x1f], &[0x68,1]);
-        // Default, enabled, changed source/new round, and missing receiver report.
-        for (step, expected) in [(0,(2560,744)), (1,(2736,800)), (2,(2736,800)), (3,(1920,720))] {
+        // Stale enabled preferences must remain safe across source size changes/new rounds.
+        for (step, expected) in [(0,(2560,744)), (1,(2560,744)), (2,(1920,720)), (3,(1920,720))] {
             match step {
                 1 => sender.set_display_target(2736,800),
                 2 => { sender.set_size(1920,720); sender.reset_source(); },
@@ -519,6 +598,18 @@ mod tests {
             peer.read_exact(&mut body).await.unwrap();
             assert_eq!(body,avcc); // SPS/PPS and encoded resolution are untouched.
         }
+        // Even stale source metadata cannot override a parseable cropped SPS.
+        let sps = [0x67,0x42,0xc0,0x28,0xda,0x01,0xe0,0x08,0x9f,0x97,0x01,0x01,0x01,0x02];
+        let avcc = build_avcc(&sps, &[0x68,1]);
+        sender.set_display_target(2736,800);
+        sender.send_config(&avcc).await.unwrap();
+        let mut header = [0u8;HEADER_LEN];
+        peer.read_exact(&mut header).await.unwrap();
+        assert_eq!(f32::from_le_bytes(header[16..20].try_into().unwrap()), 1920.0);
+        assert_eq!(f32::from_le_bytes(header[20..24].try_into().unwrap()), 1080.0);
+        let mut body = vec![0;avcc.len()];
+        peer.read_exact(&mut body).await.unwrap();
+        assert_eq!(body, avcc);
     }
 
     #[tokio::test]
@@ -556,6 +647,11 @@ mod tests {
         assert_eq!(sender.frames_sent(), 1);
         sender.send_video_annexb(&access_unit, 5000).await.unwrap();
         assert_eq!(sender.frames_sent(), 2);
+        assert_eq!(sender.source_frames, 5);
+        assert_eq!(sender.ownership_skips, 1);
+        assert_eq!(sender.sync_skips, 2);
+        assert_eq!(sender.written_idrs, 2);
+        assert_eq!(sender.wire_bytes, 2 * (128 + 6 + 16));
     }
 
     #[tokio::test]

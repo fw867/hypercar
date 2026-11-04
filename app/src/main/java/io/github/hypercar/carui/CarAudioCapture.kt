@@ -63,6 +63,7 @@ object CarAudioCapture {
                         if (now - lastLog >= 5000) {
                             val rms = kotlin.math.sqrt(squareSum / windowSamples.coerceAtLeast(1)).toInt()
                             HyperCarRepo.log("CARUI-AUDIO: samples=$samples peak=$peak rms=$rms → AirPlay PCM48k stereo")
+                            HyperCarRepo.log("CARUI-AUDIO: ${runCatching { SpikeShell.audioCaptureStatus() }.getOrDefault("shell status unavailable")}")
                             peak = 0
                             squareSum = 0.0
                             windowSamples = 0

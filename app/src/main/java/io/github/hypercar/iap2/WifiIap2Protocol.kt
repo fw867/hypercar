@@ -19,6 +19,15 @@ internal class WifiIap2Protocol(
     private var retriedCertificate = false
     private var tracedFrames = 0
     private var now = 0L
+    private var peerWaitSince: Long? = null
+    private var nextPeerWaitLog = 0L
+    val diagnosticPhase: String get() = when {
+        failed -> "FAILED"
+        !started && peerWaitSince?.let { now - it >= 15_000 } == true -> "WAIT_PEER_LONG"
+        !started -> "WAIT_PEER"
+        phase == "READY" -> "READY_PENDING"
+        else -> phase
+    }
     private val seen = mutableSetOf<Int>()
     private val unknown = mutableSetOf<Int>()
     private val deferred = linkedMapOf<Int, Iap2Csm.Frame>()
@@ -37,6 +46,7 @@ internal class WifiIap2Protocol(
 
     fun feed(bytes: ByteArray, nowMillis: Long): ByteArray {
         if (failed) return ByteArray(0)
+        if (bytes.isEmpty()) return advance(nowMillis)
         now = nowMillis
         if (!started) {
             started = true
@@ -51,6 +61,14 @@ internal class WifiIap2Protocol(
     fun advance(nowMillis: Long): ByteArray {
         if (failed) return ByteArray(0)
         now = nowMillis
+        if (!started) {
+            if (peerWaitSince == null) peerWaitSince = now
+            if (now >= nextPeerWaitLog) {
+                log("WAIT_PEER elapsed=${now - peerWaitSince!!}ms; no Wi-Fi iAP2 peer bytes; media session remains independent")
+                nextPeerWaitLog = now + 10_000
+            }
+            return ByteArray(0)
+        }
         engine.advanceTime(now)
         if (phase == "LINK" && engine.state == Iap2LinkEngine.State.NORMAL) {
             phase = "IDENTIFICATION"

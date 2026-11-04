@@ -33,11 +33,17 @@ object WifiIap2Bridge {
         private val protocol = WifiIap2Protocol(deviceId, { HyperCarRepo.log("WIFI-IAP#$id: $it") })
         val thread = Thread({
             var readyReported = false
+            var lastPhase = ""
             try {
                 while (!closed && !protocol.failed) {
                     val bytes = input.poll(20, TimeUnit.MILLISECONDS)
                     val now = System.nanoTime() / 1_000_000
                     val output = if (bytes == null) protocol.advance(now) else protocol.feed(bytes, now)
+                    if (protocol.diagnosticPhase != lastPhase) {
+                        lastPhase = protocol.diagnosticPhase
+                        RustCoreBridge.nativeSetWifiIap2Phase(id, lastPhase)
+                        HyperCarRepo.log("WIFI-IAP#$id: phase=$lastPhase")
+                    }
                     // takeOutput batches several complete packets (ACK + identification + certificate).
                     // The box sends each separately; don't rely on BMW consuming concatenated frames.
                     val frames = WifiIap2Framing.split(output)
@@ -55,7 +61,12 @@ object WifiIap2Bridge {
                 // Normal generation teardown.
             } catch (error: Exception) {
                 HyperCarRepo.log("WIFI-IAP#$id: ${error.javaClass.simpleName}: ${error.message}")
-            } finally { closed = true; RustCoreBridge.nativeMarkWifiIap2Ready(id, false); input.clear() }
+            } finally {
+                closed = true
+                RustCoreBridge.nativeMarkWifiIap2Ready(id, false)
+                RustCoreBridge.nativeSetWifiIap2Phase(id, if (protocol.failed) "FAILED" else "STOPPED")
+                input.clear()
+            }
         }, "wifi-iap2-$id").apply { isDaemon = true }
 
         fun close() { closed = true; thread.interrupt(); input.clear() }

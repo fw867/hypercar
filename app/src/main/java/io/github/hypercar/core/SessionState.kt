@@ -13,7 +13,7 @@ sealed interface LinkState {
     /** 协商进行中，[step] 为当前步骤的人话描述（秒连链路的可视化）。 */
     data class Negotiating(val step: String) : LinkState
 
-    /** 全链路已建立：[carName] 车机名，[sinceMillis] 建立时刻。 */
+    /** 控制会话与视频通道已建立；不表示车机已显示或喇叭已出声。 */
     data class Connected(val carName: String, val sinceMillis: Long) : LinkState
 
     /** 失败：[reason] 人话原因，[recoverable] 是否可自动重试。 */
@@ -38,6 +38,7 @@ data class AudioStats(
 
 /** UI 快照：Repo 每次变更推送给 Compose。 */
 data class SessionSnapshot(
+    val pipeline: PipelineDiagnostics = PipelineDiagnostics(),
     val link: LinkState = LinkState.Idle,
     val video: VideoStats = VideoStats(),
     val audio: AudioStats = AudioStats(),

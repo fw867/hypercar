@@ -146,17 +146,23 @@ object HyperCarRepo {
             delay(AIRPLAY_RETRY_DELAY_MILLIS)
             if (sessionSockets !== sockets || !sessionLive.get()) return@launch
             val context = appContext() ?: return@launch
-            val fd = openControlFd(context, sockets, host!!, port)
-            if (fd == null || fd < 0) {
-                retryAirplayOrFail("控制端口重连失败 $host:$port")
+            val carNetworkSsid = currentWifiSsid(context)
+            val connected = connectAirplayEndpoint(context, sockets, listOf(AirplayTarget(host!!, port)))
+            if (connected == null) {
+                retryAirplayOrFail("控制端口重连失败 $host:$port（已重新发现）")
                 return@launch
             }
+            val target = connected.target
+            val fd = connected.socket
+            airplayHost = target.host
+            airplayPort = target.port
+            rememberAirplayEndpoint(carNetworkSsid, target)
             val identityFile = context.filesDir.resolve("controller_identity.txt")
             ensurePairingIdentity(context, identityFile)
             val identityPath = identityFile.absolutePath
-            val json = SettingsStore.engineConfigJson(host, port, sessionDeviceMac, identityPath,
+            val json = SettingsStore.engineConfigJson(target.host, target.port, sessionDeviceMac, identityPath,
                 receiverBluetoothMac = receiverForEngine())
-            log("CORE: 重试 nativeStart（$host:$port fd=$fd，第 $attempt 次）")
+            log("CORE: 重试 nativeStart（$target fd=$fd，第 $attempt 次）")
             val started = RustCoreBridge.nativeStart(json, fd, socketProvider(sockets))
             log("CORE: 重试 nativeStart 返回 $started")
             if (!started) retryAirplayOrFail("核心层重启失败")
@@ -177,11 +183,8 @@ object HyperCarRepo {
      */
     @Volatile
     private var airplayHost: String? = null
-    /** 晚到 0x4301 给出的地址/端口（端口循环里会立刻改用，不再陪跑候选端口）。 */
-    @Volatile
-    private var lateAirplayHost: String? = null
-    @Volatile
-    private var lateAirplayPort: Int = 0
+    /** Atomic host+port, scoped to the connection attempt by recordLateAirplayEndpoint. */
+    private val lateAirplayEndpoint = AtomicReference<AirplayTarget?>(null)
 
     @Volatile
     private var airplayPort: Int = 0
@@ -403,6 +406,9 @@ object HyperCarRepo {
         reconnectJob = null
         sessionHadLink = false
         sessionReceiverMac = null
+        lateAirplayEndpoint.set(null)
+        airplayHost = null
+        airplayPort = 0
         connecting = true
         sessionLive.set(true)
         io.github.hypercar.carui.MusicNotificationListener.sync(context)
@@ -994,6 +1000,8 @@ object HyperCarRepo {
             val apHost = mdnsEndpoint?.host ?: host
             val candidatePorts = if (mdnsEndpoint != null) {
                 listOf(mdnsEndpoint.port)
+            } else if (haveEndpoint) {
+                listOf(endpoint.airPlayPort)
             } else {
                 headUnit.fallbackAirplayPorts.distinct().ifEmpty { listOf(7000) }
             }
@@ -1011,100 +1019,32 @@ object HyperCarRepo {
 
             // ---- 连 AirPlay 控制端口并移交 FD ----
             push(link = LinkState.Negotiating("连接车机 AirPlay 端口"))
-            var port = 0
-            var controlFd: Int? = null
-            // 晚到的 0x4301 会给出**真实端口与地址**（WinPlay：17000 + IPv6 link-local）。
-            // 以前它只更新一行日志，我们还在用猜的 [7000,7001,7100] 死连到超时
-            // （2026-10-25 21:48 现场：0x4301 早给了 airPlayPort=17000，我们 14s 后还在试 7100）。
-            // 现在每轮先看它一眼：给了就**立刻改用**，不再陪跑候选端口。
-            var hostNow = apHost
-            var portsNow: List<Int> = candidatePorts
-            // 一个**短重试窗口**：接收端/车机常常在 ctrl 邀请之后才把 7000 打开，
-            // 或者中途重启一次 AirPlay 服务；单轮「全 refused 就 fail」会误判成连不上
-            // （2026-10-26 12:47 桌面联调现场：探测时 7000 开着，1.5s 后真连全 refused）。
-            // 窗口内每 400ms 重试一轮，单次连接超时缩短到 1.2s，避免最坏情况拖太久。
-            val connectDeadline = SystemClock.uptimeMillis() + AIRPLAY_CONNECT_WINDOW_MILLIS
-            var pass = 0
-            var lateSwitched = false
-            while (true) {
-                pass++
-                val perTry = if (pass == 1) {
-                    CONTROL_CONNECT_TIMEOUT_MILLIS.toInt()
-                } else {
-                    AIRPLAY_CONNECT_RETRY_TIMEOUT_MILLIS.toInt()
-                }
-                for (candidate in portsNow) {
-                    val fd = openControlFd(context, sockets, hostNow, candidate, perTry)
-                    if (fd != null && fd >= 0) {
-                        port = candidate
-                        controlFd = fd
-                        break
-                    }
-                }
-                if (controlFd != null) break
-                // 晚到的 0x4301：给了真实端口/地址就立刻改用它（只切一次，避免来回跳）
-                val latePort = lateAirplayPort
-                val lateHostRaw = lateAirplayHost
-                if (!lateSwitched && latePort > 0) {
-                    lateSwitched = true
-                    // 只在晚到地址是 **IPv4** 时改 host：fe80:: link-local 不带 scope 连不上
-                    // （EINVAL，2026-10-25 两轮现场如此）。这种情况只借它的端口，host 保持原样。
-                    val lateHost = lateHostRaw?.takeIf { it.contains('.') && !it.contains(':') }
-                    if (lateHost != null) {
-                        log("SESSION: ✓ 晚到的 0x4301 给出端点 ${lateHost}:${latePort}——改用它重连")
-                        hostNow = lateHost
-                        airplayHost = lateHost
-                    } else {
-                        log("SESSION: 晚到的 0x4301 端口=${latePort}（地址 ${lateHostRaw ?: "-"} 不是 IPv4）——沿用 $hostNow，只换端口")
-                    }
-                    portsNow = listOf(latePort)
-                }
-                if (SystemClock.uptimeMillis() >= connectDeadline) break
-                if (pass == 1) {
-                    log(
-                        "SESSION: 候选端口全部连不上——${AIRPLAY_CONNECT_WINDOW_MILLIS / 1000}s 内重试" +
-                            "（接收端可能还没把 AirPlay 端口打开）",
-                    )
-                }
-                kotlinx.coroutines.delay(400)
-            }
-            val apHostFinal = hostNow
-            if (controlFd == null || controlFd < 0 || port == 0) {
-                fail(
-                    "AirPlay 控制端口连接失败 $apHostFinal（试过 ${portsNow};" +
-                        " 端口探测时可能还开着，连接被拒说明接收端已把 AirPlay 服务关掉）",
-                )
+            val carNetworkSsid = currentWifiSsid(context)
+            val connected = connectAirplayEndpoint(context, sockets, candidatePorts.map { AirplayTarget(apHost, it) })
+            if (connected == null) {
+                fail("AirPlay 端点暂不可用；已失效旧缓存并重新发现，等待车机下一轮邀请")
                 return
             }
+            val apHostFinal = connected.target.host
+            val port = connected.target.port
+            val controlFd = connected.socket
+            airplayHost = apHostFinal
             airplayPort = port
-            // 记住这次成功的端点：下次同一热点直接试它（盒子就是这么稳的）。
-            //
-            // **只记 IPv4**：fe80:: 链路本地地址不带 scope 连不上（EINVAL），一旦被记下来，
-            // 之后每次都会先试它、每次都秒失败——2026-10-25 23:53 现场就是这样
-            // 「成功过一次以后再也连不上」，记忆里存的是 fe80::db93:…。
-            val savedHost = apHostFinal.takeIf { it.contains('.') && !it.contains(':') }
-            if (savedHost != null) {
-                runCatching {
-                    SettingsStore.lastAirplayEndpoint = "$savedHost:$port|${currentWifiSsid(context).orEmpty()}"
-                }
-            } else {
-                log("SESSION: 端点 $apHostFinal 不是 IPv4——不写入记忆（避免下次先试死地址）")
-            }
-
+            rememberAirplayEndpoint(carNetworkSsid, connected.target)
             // ---- 启动 Rust 引擎（协商在 Rust 内继续）----
             push(link = LinkState.Negotiating("Rust 核心层协商 AirPlay 会话"))
             // 画面与音频由本机自绘界面自采自编，经 nativePushVideoFrame /
             // nativePushAudioPcm 投喂给引擎；这里只负责下发会话参数。
-            sessionWifiSsid = currentWifiSsid(context)
+            sessionWifiSsid = carNetworkSsid
             val identityPath = context.filesDir.resolve("controller_identity.txt").absolutePath
-            val json = SettingsStore.engineConfigJson(apHost, port, deviceMac, identityPath,
+            val json = SettingsStore.engineConfigJson(apHostFinal, port, deviceMac, identityPath,
                 receiverBluetoothMac = receiverForEngine())
             // 下发配置原样打一行（不含密钥）：分辨率/帧率一目了然，
             // 免得再靠猜「这次到底请求了多大尺寸」
             log("CORE +${stageMs()}ms 引擎配置：$json")
             // 前后各记一行：原生崩溃（Rust panic 越过 JNI → SIGABRT）会直接把进程带走，
             // 这两行能区分「崩在 nativeStart 里」还是「崩在引擎跑起来之后」。
-            log("CORE: 调用 nativeStart（$apHost:$port fd=$controlFd）")
+            log("CORE: 调用 nativeStart（$apHostFinal:$port fd=$controlFd）")
             connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.AIRPLAY_START)
             val started = RustCoreBridge.nativeStart(json, controlFd, socketProvider(sockets))
             log("CORE: nativeStart 返回 $started")
@@ -1150,7 +1090,7 @@ object HyperCarRepo {
         if (!sessionLive.compareAndSet(true, false)) {
             _snapshots.update { s ->
                 if (s.link is LinkState.Connected) {
-                    s.copy(link = LinkState.Idle)
+                    s.copy(link = LinkState.Idle, pipeline = s.pipeline.copy(active = false))
                 } else {
                     s
                 }
@@ -1158,6 +1098,7 @@ object HyperCarRepo {
             return
         }
         push(link = LinkState.Stopping)
+        closedPipelineGeneration.accumulateAndGet(_snapshots.value.pipeline.generation, ::maxOf)
         finishDiagnostic("STOPPED", reason)
         val hadLink = sessionHadLink
         releaseSessionResources(keepListening, graceful)
@@ -1165,6 +1106,7 @@ object HyperCarRepo {
         _snapshots.update { s ->
             s.copy(
                 link = LinkState.Idle,
+                pipeline = s.pipeline.copy(active = false),
                 video = VideoStats(),
                 audio = AudioStats(),
                 shizukuReady = ShizukuTools.isReady,
@@ -1652,6 +1594,82 @@ object HyperCarRepo {
         return null
     }
 
+    private fun recordLateAirplayEndpoint(coordinator: Iap2Coordinator, attempt: Long, endpoint: CarPlayEndpoint) {
+        if (attempt != connectionAttemptId || !sessionLive.get() || iap2 !== coordinator) return
+        val host = pickHost(endpoint) ?: return
+        if (endpoint.airPlayPort in 1..65535) {
+            lateAirplayEndpoint.set(AirplayTarget(host, endpoint.airPlayPort))
+        }
+    }
+
+    private fun invalidateRememberedEndpoint(ssid: String?, target: AirplayTarget) {
+        val saved = SettingsStore.lastAirplayEndpoint
+        val remembered = ProactiveWifiSessionPolicy.rememberedEndpoint(saved, ssid)
+        if (remembered == (target.host to target.port) && SettingsStore.lastAirplayEndpoint == saved) {
+            SettingsStore.lastAirplayEndpoint = ""
+            log("ENDPOINT: 连接失败，失效当前车机缓存 $target；配对身份保留")
+        }
+    }
+
+    private fun rememberAirplayEndpoint(ssid: String?, target: AirplayTarget) {
+        if (target.host.contains('.') && !target.host.contains(':')) {
+            SettingsStore.lastAirplayEndpoint = "$target|${ssid.orEmpty()}"
+        }
+    }
+
+    /** Fresh discovery is bound to this exact session's Network; never falls back to cellular. */
+    private suspend fun connectAirplayEndpoint(
+        context: Context,
+        sockets: SessionSocketLease<Network>,
+        initial: List<AirplayTarget>,
+    ): AirplayEndpointConnector.Connected<Int>? {
+        val attempt = connectionAttemptId
+        val ssid = currentWifiSsid(context)
+        val advertiser = ctrlAdvertiser
+        var invitation = advertiser?.lastInvitation
+        val hints = AirplayEndpointHints()
+        var tries = 0
+        return AirplayEndpointConnector(
+            current = { connectionAttemptId == attempt && sessionLive.get() &&
+                sessionSockets === sockets && boundNetwork == sockets.network },
+            now = { SystemClock.elapsedRealtime() },
+            open = { target: AirplayTarget ->
+                tries++
+                openControlFd(context, sockets, target.host, target.port,
+                    if (tries == 1) CONTROL_CONNECT_TIMEOUT_MILLIS.toInt() else AIRPLAY_CONNECT_RETRY_TIMEOUT_MILLIS.toInt())
+            },
+            close = { fd: Int -> runCatching { ParcelFileDescriptor.adoptFd(fd).close() }; Unit },
+            invalidate = { target -> invalidateRememberedEndpoint(ssid, target) },
+            updates = {
+                val late = lateAirplayEndpoint.getAndSet(null)
+                val next = advertiser?.lastInvitation
+                val newInvite = next?.takeIf { it !== invitation }
+                invitation = next
+                when {
+                    late != null -> { log("ENDPOINT: 本轮 iAP2 更新 → $late"); listOf(hints.advertised(late)) }
+                    newInvite != null -> {
+                        val target = hints.invited(newInvite.host)
+                        log("ENDPOINT: 新 ctrl 邀请 → $target（同地址保留明确端口）")
+                        listOf(target)
+                    }
+                    else -> emptyList()
+                }
+            },
+            discover = {
+                log("ENDPOINT: 旧目标暂不可用，在网络 #${sockets.network} 重新查询 _airplay._tcp（最多 1500ms）")
+                val fresh = AirplayServiceProbe(context, ::log).browse(sockets.network, 1500, strictNetwork = true)
+                if (fresh != null) {
+                    log("ENDPOINT: 重新发现 → ${fresh.host}:${fresh.port}（${fresh.instance}）")
+                    listOf(hints.advertised(AirplayTarget(fresh.host, fresh.port)))
+                } else {
+                    log("ENDPOINT: 无新服务，保留 ctrl 广播与 iAP2，限时等待新端点/服务启动")
+                    emptyList()
+                }
+            },
+            pause = { delay(400) },
+        ).connect(initial, AIRPLAY_CONNECT_WINDOW_MILLIS)
+    }
+
     /** 本轮控制连接与后续媒体连接共用固定 Network，不轮询其他 Wi-Fi/默认网络。 */
     private suspend fun openControlFd(
         context: Context,
@@ -1659,15 +1677,24 @@ object HyperCarRepo {
         host: String,
         port: Int,
         timeoutMillis: Int = CONTROL_CONNECT_TIMEOUT_MILLIS.toInt(),
-    ): Int? = withContext(Dispatchers.IO) {
-        val startedAt = SystemClock.elapsedRealtime()
-        runCatching {
-            openTcpFd(sockets, host, port, timeoutMillis)
-        }.onSuccess { fd ->
-            log("NET +${stageMs()}ms ✓ $host:$port 已连通（固定网络 #${sockets.network}，耗时 ${SystemClock.elapsedRealtime()-startedAt}ms，fd=$fd）")
-        }.onFailure { error ->
-            log("NET: 控制 socket 失败 network=#${sockets.network} $host:$port ${error.javaClass.simpleName}: ${error.message}；${describeNetwork(context, sockets.network)}")
-        }.getOrNull()
+    ): Int? {
+        var acquiredFd: Int? = null
+        try {
+            return withContext(Dispatchers.IO) {
+                val startedAt = SystemClock.elapsedRealtime()
+                runCatching {
+                    openTcpFd(sockets, host, port, timeoutMillis).also { acquiredFd = it }
+                }.onSuccess { fd ->
+                    log("NET +${stageMs()}ms ✓ $host:$port 已连通（固定网络 #${sockets.network}，耗时 ${SystemClock.elapsedRealtime()-startedAt}ms，fd=$fd）")
+                }.onFailure { error ->
+                    log("NET: 控制 socket 失败 network=#${sockets.network} $host:$port ${error.javaClass.simpleName}: ${error.message}；${describeNetwork(context, sockets.network)}")
+                }.getOrNull()
+            }
+        } catch (cancelled: CancellationException) {
+            // withContext may discard a detached fd when cancellation races its return.
+            acquiredFd?.let { runCatching { ParcelFileDescriptor.adoptFd(it).close() } }
+            throw cancelled
+        }
     }
 
     /** 手机当前挂着的 Wi-Fi 网络（很可能就是用户手动连上的车机热点）。 */
@@ -1798,10 +1825,24 @@ object HyperCarRepo {
     // ---------------------------------------------------------------- Rust 回调
 
     private var lastAudioPlaying = false
+    private val closedPipelineGeneration = java.util.concurrent.atomic.AtomicLong(0)
 
     private val rustListener = object : RustCoreBridge.EventListener {
+        override fun onPipeline(json: String) {
+            val next = io.github.hypercar.core.PipelineDiagnostics.parse(json) ?: return
+            if (!sessionLive.get()) return
+            _snapshots.update { s ->
+                if ((s.link !is LinkState.Negotiating && s.link !is LinkState.Connected) ||
+                    next.generation <= closedPipelineGeneration.get() || next.generation < s.pipeline.generation) s
+                else s.copy(pipeline = next)
+            }
+        }
         override fun onState(state: String, detail: String) {
             log("CORE: [$state] $detail")
+            if (state in setOf("ended", "failed", "error", "stopping")) {
+                closedPipelineGeneration.accumulateAndGet(_snapshots.value.pipeline.generation, ::maxOf)
+                _snapshots.update { s -> s.copy(pipeline = s.pipeline.copy(active = false)) }
+            }
             if (state == "ended" || state == "error") {
                 val network = sessionSockets?.network
                 appContext()?.let { context ->
@@ -1958,60 +1999,23 @@ object HyperCarRepo {
         coordinator: Iap2Coordinator,
         strictNetwork: Boolean,
     ): CarPlayEndpoint? {
-        val remembered = SettingsStore.lastAirplayEndpoint
-        if (remembered.contains('|') && (!strictNetwork ||
-                ProactiveWifiSessionPolicy.rememberedEndpoint(remembered, currentWifiSsid(context)) != null)) {
-            val (endpointPart, ssidPart) = remembered.split('|', limit = 2)
-            // 只认 IPv4 的端点：老版本可能把 fe80:: 写进来（那种地址不带 scope 必然 EINVAL），
-            // 读到就丢弃，走正常发现流程。
-            val hostCandidate = endpointPart.substringBefore(':').trim()
-            val hostUsable = hostCandidate.contains('.') && !hostCandidate.contains(':')
-            if (!hostUsable && hostCandidate.isNotEmpty()) {
-                log("SESSION: 记忆里的端点 $hostCandidate 不是 IPv4——忽略它，走正常发现")
-                runCatching { SettingsStore.lastAirplayEndpoint = "" }
-            }
-            val parts = endpointPart.split(':')
-            val host = if (hostUsable) hostCandidate else ""
-            val port = parts.getOrNull(1)?.trim()?.toIntOrNull() ?: 0
-            val currentSsid = currentWifiSsid(context)
-            val ssidMatches = ssidPart.isBlank() || (currentSsid != null && currentSsid == ssidPart)
-            if (host.isNotEmpty() && port in 1..65535 && ssidMatches) {
-                val alive = withContext(Dispatchers.IO) {
-                    runCatching {
-                        (boundNetwork?.socketFactory?.createSocket() ?: Socket()).use { socket ->
-                            socket.connect(InetSocketAddress(host, port), REMEMBERED_PROBE_TIMEOUT_MILLIS.toInt())
-                        }
-                    }.isSuccess
-                }
-                if (alive) {
-                    log("SESSION: ✓ 上次成功的端点 ${host}:${port} 仍然可连——直接用它（跳过发现）")
-                    // Bluetooth remains available for credentials/late endpoint updates, but is not
-                    // a prerequisite: Wi-Fi iAP2 runs independently after AirPlay event setup.
-                    coordinator.start { ep ->
-                        log("IAP2: 后台会话端点回调（端点已定，仅记录）ips=${ep.ipAddresses}")
-                        val ip = ep.ipAddresses.firstOrNull { it.contains('.') && !it.contains(':') }
-                            ?: ep.ipAddresses.firstOrNull()
-                        if (ip != null && ep.airPlayPort > 0) {
-                            lateAirplayHost = ip; lateAirplayPort = ep.airPlayPort
-                        }
-                    }
-                    return CarPlayEndpoint(
-                        ssid = currentSsid,
-                        passphrase = null,
-                        airPlayPort = port,
-                        deviceIdentifier = null,
-                        publicKeyHex = null,
-                        sourceVersion = null,
-                        ipAddresses = listOf(host),
-                        gateway = host,
-                    )
-                } else {
-                    log("SESSION: 上次的端点 ${host}:${port} 连不上（换了网段/车机换了地址）——回退到发现流程")
-                }
-            }
+        val diagnosticId = connectionAttemptId
+        val currentSsid = currentWifiSsid(context)
+        val saved = SettingsStore.lastAirplayEndpoint
+        val remembered = ProactiveWifiSessionPolicy.rememberedEndpoint(saved, currentSsid) ?: return null
+        if (strictNetwork && knownWifiReceiver(currentSsid) == null) return null
+        val (host, port) = remembered
+        // Use the real control connection once, without a connect/disconnect preflight which
+        // can make a single-controller receiver close its service before nativeStart.
+        log("SESSION: 使用本车网络缓存 $host:$port 作为候选；实际连接失败后失效并重新发现")
+        coordinator.start { endpoint ->
+            recordLateAirplayEndpoint(coordinator, diagnosticId, endpoint)
         }
-
-        return null
+        return CarPlayEndpoint(
+            ssid = currentSsid, passphrase = null, airPlayPort = port,
+            deviceIdentifier = null, publicKeyHex = null, sourceVersion = null,
+            ipAddresses = listOf(host), gateway = host,
+        )
     }
 
     /**
@@ -2065,16 +2069,7 @@ object HyperCarRepo {
                 "wifiCredentials=${!endpoint.ssid.isNullOrBlank()} endpoint=${endpoint.ipAddresses.isNotEmpty()}")
             callbacks.trySend(endpoint)
             // 端口阶段（awaitUsableEndpoint 已返回）再来的 0x4301：记下来供端口循环热切换
-            if (sessionLive.get() && airplayHost != null && endpoint.airPlayPort > 0) {
-                // 优先 IPv4：0x4301 往往同时给 IPv4 和 fe80:: link-local，
-                // 后者不带 scope 直接 connect 会 EINVAL（2026-10-25 21:55 现场）。
-                val ip = endpoint.ipAddresses.firstOrNull { it.contains('.') && !it.contains(':') }
-                    ?: endpoint.ipAddresses.firstOrNull()
-                if (ip != null) {
-                    lateAirplayHost = ip
-                    lateAirplayPort = endpoint.airPlayPort
-                }
-            }
+            recordLateAirplayEndpoint(coordinator, diagnosticId, endpoint)
         }
         try {
             var usable: CarPlayEndpoint? = null
@@ -2253,6 +2248,8 @@ object HyperCarRepo {
 
     private fun fail(reason: String) {
         if (!sessionLive.compareAndSet(true, false)) return
+        closedPipelineGeneration.accumulateAndGet(_snapshots.value.pipeline.generation, ::maxOf)
+        _snapshots.update { it.copy(pipeline = it.pipeline.copy(active = false)) }
         finishDiagnostic("FAILED", reason)
         log("SESSION 失败: $reason")
         val hadLink = sessionHadLink

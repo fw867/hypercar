@@ -110,6 +110,14 @@ object SettingsStore {
         get() = p().getBoolean("proactive_wifi_session", false)
         set(v) = p().edit().putBoolean("proactive_wifi_session", v).apply()
 
+    var uiRetakeRecovery: Boolean
+        get() = p().getBoolean("ui_retake_recovery", false)
+        set(v) = p().edit().putBoolean("ui_retake_recovery", v).apply()
+
+    var screenStreamRecovery: Boolean
+        get() = p().getBoolean("screen_stream_recovery", false)
+        set(v) = p().edit().putBoolean("screen_stream_recovery", v).apply()
+
     /**
      * 待机监听是否常驻前台通知（「正在监听车机，等待自动连接」）。默认开。
      *
@@ -352,6 +360,8 @@ object SettingsStore {
             // CarWith 模式：视频/音频源改由本机 CarLife（CarWith）提供（2026-11-03）
             append("\"carlife_source\":").append(if (carWithMode) "true" else "false").append(",")
             append("\"carwith_stretch\":").append(if (carWithStretch) "true" else "false").append(",")
+            append("\"ui_retake_recovery\":").append(if (uiRetakeRecovery) "true" else "false").append(",")
+            append("\"screen_stream_recovery\":").append(if (screenStreamRecovery) "true" else "false").append(",")
             append("\"width\":").append(plan.width).append(",")
             append("\"height\":").append(plan.height).append(",")
             append("\"touch_display_w\":").append(tdW).append(",")

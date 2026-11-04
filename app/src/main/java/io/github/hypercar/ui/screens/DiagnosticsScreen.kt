@@ -72,6 +72,7 @@ fun DiagnosticsScreen(
     onClearLogs: () -> Unit,
     onExport: () -> Unit,
     modifier: Modifier = Modifier,
+    pipeline: io.github.hypercar.core.PipelineDiagnostics = io.github.hypercar.core.PipelineDiagnostics(),
 ) {
     // 轻提示（复制/导出反馈）：2s 自动消失
     var toast by remember { mutableStateOf<String?>(null) }
@@ -98,6 +99,26 @@ fun DiagnosticsScreen(
             onFeedback = { toast = it },
             logs = logs,
         )
+        if (pipeline.generation > 0) {
+            GlassPanel(contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Text("连接阶段" + if (pipeline.active) "" else " · 上次会话", color = TextPrimary,
+                        style = MaterialTheme.typography.titleSmall)
+                    Text("控制：${if (pipeline.controlReady) "会话就绪" else "协商中"}　iAP2：${pipeline.wifiLabel}",
+                        color = TextSecondary, fontSize = 11.sp)
+                    Text("画面归属：${when (pipeline.screenOwned) { true -> "手机"; false -> "车机"; null -> "未知" }}　视频：${pipeline.videoLabel}",
+                        color = TextSecondary, fontSize = 11.sp)
+                    Text("来源 ${pipeline.sourceUnits} / 写出 ${pipeline.writtenFrames} 帧　进入请求 ${pipeline.uiRequests} / 重建 ${pipeline.rebuilds}",
+                        color = TextSecondary, fontSize = 11.sp)
+                    Text("音频：${if (pipeline.audioReady) "通道就绪" else "未就绪"}　写出 ${pipeline.audioPackets} 包 / 非零PCM ${pipeline.signalPackets} 包",
+                        color = TextSecondary, fontSize = 11.sp)
+                    Text(pipeline.timingLabel, color = TextSecondary, fontSize = 11.sp)
+                    Text(pipeline.tcpLabel, color = TextSecondary, fontSize = 11.sp)
+                    Text(pipeline.tcpAgeLabel, color = TextSecondary, fontSize = 10.sp)
+                    Text("写出或TCP确认不能确认车机已显示或出声", color = TextSecondary, fontSize = 10.sp)
+                }
+            }
+        }
         AnimatedVisibility(
             visible = toast != null,
             enter = fadeIn(),

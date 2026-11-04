@@ -85,6 +85,9 @@ class CarPlayCtrlAdvertiser(
     @Volatile
     var lastInvitePeerIp: String? = null
         private set
+    internal class Invitation(val host: String)
+    @Volatile internal var lastInvitation: Invitation? = null
+        private set
 
     /** 已注册的端口（-1 = 未启动）。 */
     val port: Int get() = serverSocket?.localPort ?: -1
@@ -286,6 +289,7 @@ class CarPlayCtrlAdvertiser(
                 runCatching { onDiagnostic(Event.INVITED) }
                 if (peer != "?" && peer.contains('.')) {
                     lastInvitePeerIp = peer
+                    lastInvitation = Invitation(peer)
                 }
                 log("$TAG: ✓ 车机 ctrl 邀请（第 $inviteCount 次，receiver=${receiverId ?: "?"}）——AirPlay 窗口已开启")
             }

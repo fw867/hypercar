@@ -4,6 +4,19 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class WifiIap2ProtocolTest {
+    @Test fun noPeerBytesStayPassiveAndDoNotFailMediaSession() {
+        val logs = mutableListOf<String>()
+        val p = WifiIap2Protocol("test-device", { logs += it })
+        assertTrue(p.advance(1).isEmpty())
+        assertEquals("WAIT_PEER", p.diagnosticPhase)
+        assertTrue(p.advance(15_001).isEmpty())
+        assertEquals("WAIT_PEER_LONG", p.diagnosticPhase)
+        assertTrue(p.advance(60_001).isEmpty())
+        assertFalse(p.failed)
+        assertArrayEquals(Iap2LinkEngine.MARKER, p.feed(Iap2LinkEngine.MARKER,60_002))
+        assertEquals("LINK", p.diagnosticPhase)
+        assertTrue(logs.any { it.startsWith("WAIT_PEER") })
+    }
     @Test fun existingBluetoothStartStillInitiatesSyn() {
         val engine = Iap2LinkEngine()
         engine.start(1)

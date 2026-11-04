@@ -205,7 +205,7 @@ private fun HeroHeadline(link: LinkState, nowMillis: Long, profileLabel: String?
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         Text(
-                            text = "已连接",
+                            text = "会话已连接",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MintGreen.copy(alpha = 0.9f),
                         )
