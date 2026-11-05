@@ -126,9 +126,38 @@ class Iap2Bluetooth(
      */
     private val sessionActive = java.util.concurrent.atomic.AtomicBoolean(false)
     private val sessions = Iap2SessionGate()
+    private val acceptedSockets = AtomicLong()
+    private val rejectedSockets = AtomicLong()
+    @Volatile private var lastAcceptAt = 0L
+    @Volatile private var lastWorkerAt = 0L
 
-    @Synchronized fun setSessionEnabled(enabled: Boolean) {
+    fun diagnosticSummary(): String {
+        val now = SystemClock.elapsedRealtime()
+        fun age(at: Long) = if (at == 0L) "none" else "${now - at}ms"
+        return "generation=${generation.get()} running=$running registered=$isListening " +
+            "acceptThread=${serverThread?.state} alive=${serverThread?.isAlive == true} ${sessions.diagnostics()} " +
+            "handoff=$wifiHandoff active=${sessionActive.get()} accepted=${acceptedSockets.get()} " +
+            "rejected=${rejectedSockets.get()} acceptAge=${age(lastAcceptAt)} workerAge=${age(lastWorkerAt)}"
+    }
+
+    private fun rejectSocket(socket: BluetoothSocket, tag: String, reason: String) {
+        rejectedSockets.incrementAndGet()
+        log("BT-REJECT: entry=$tag reason=$reason peer=${safeAddress(socket.remoteDevice)} ${diagnosticSummary()}")
+        runCatching { socket.close() }
+    }
+
+    /** This runs before the admission monitor, so a blocked handler is observable too. */
+    private fun acceptSocket(socket: BluetoothSocket, epoch: Long, tag: String) {
+        acceptedSockets.incrementAndGet()
+        lastAcceptAt = SystemClock.elapsedRealtime()
+        log("BT-ACCEPT: entry=$tag listenerGeneration=$epoch peer=${safeAddress(socket.remoteDevice)} ${diagnosticSummary()}")
+        handleIncomingSocket(socket, epoch, tag)
+    }
+
+    @Synchronized fun setSessionEnabled(enabled: Boolean, reason: String = "caller") {
+        val previous = sessions.diagnostics()
         sessions.setEnabled(enabled)
+        if (previous != sessions.diagnostics()) log("BT-GATE: reason=$reason before=[$previous] after=[${sessions.diagnostics()}] generation=${generation.get()}")
         if (!enabled) dropCurrentSession()
     }
 
@@ -160,8 +189,11 @@ class Iap2Bluetooth(
     private val skippedNoService: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet())
 
     @Volatile private var wifiHandoff = false
-    fun setWifiHandoff(active: Boolean) {
+    @Synchronized fun setWifiHandoff(active: Boolean, reason: String = "caller") {
+        val previous = wifiHandoff
         wifiHandoff = active
+        if (active && !previous) sessions.retireTickets()
+        if (previous != active) log("BT-HANDOFF: reason=$reason from=$previous to=$active generation=${generation.get()}")
         if (active) dropCurrentSession()
     }
 
@@ -189,7 +221,7 @@ class Iap2Bluetooth(
             adapter = adapter,
             ownerAlive = { running && markerEnabled && generation.get() == epoch },
             primaryReady = { isListening },
-            onConnection = { socket -> handleIncomingSocket(socket, epoch, "BT-MARKER") },
+            onConnection = { socket -> acceptSocket(socket, epoch, "BT-MARKER") },
             log = log,
         ).also { it.start() }
     }
@@ -340,32 +372,35 @@ class Iap2Bluetooth(
     private fun acceptLoop(myGeneration: Long, listener: RecoveringListener<BluetoothServerSocket, BluetoothSocket>) {
         while (running && generation.get() == myGeneration) {
             val socket = listener.acceptNext() ?: break
-            handleIncomingSocket(socket, myGeneration, "BT-S")
+            acceptSocket(socket, myGeneration, "BT-S")
         }
     }
 
     @SuppressLint("MissingPermission")
     @Synchronized private fun handleIncomingSocket(socket: BluetoothSocket, myGeneration: Long, tag: String) {
         if (!running || generation.get() != myGeneration) {
-            runCatching { socket.close() }
+            rejectSocket(socket, tag, "stale-listener-generation")
             return
         }
         val ticket = sessions.ticket()
-        if (wifiHandoff || ticket == null) { runCatching { socket.close() }; return }
+        if (wifiHandoff || ticket == null) {
+            rejectSocket(socket, tag, if (wifiHandoff) "wifi-handoff" else "sessions-disabled")
+            return
+        }
         val peerAddress = safeAddress(socket.remoteDevice)
         // 指定了目标车机时拒绝其它设备的连入（多台车机场景：非目标的控制器
         // 也会周期回连，放行会抢占/误建会话）。地址比对，大小写不敏感。
         val target = targetProvider()
         if (!io.github.hypercar.bluetooth.CarTargetPolicy.acceptsIncoming(target, peerAddress)) {
             log("$tag: 忽略非目标设备连入 addr=${peerAddress ?: "?"}（当前目标：$target）")
-            runCatching { socket.close() }
+            rejectSocket(socket, tag, "non-target")
             return
         }
         if (sessionActive.get()) {
             // 额外身份入口只补充发现，不能用它的探测替换正在建立的主 iAP2 会话。
             if (tag == "BT-MARKER") {
                 log("$tag: 已有 iAP2 会话，关闭额外入口连接并保留原会话")
-                runCatching { socket.close() }
+                rejectSocket(socket, tag, "duplicate-marker")
                 return
             }
             // **本轮已拿到凭据（端点）**才拒绝新连入；还在等凭据的「空转轮次」必须让位：
@@ -374,7 +409,7 @@ class Iap2Bluetooth(
             // 所以由车机发起的新连接来顶替旧会话——既不拆链，也不挡路。
             if (sessionProductive) {
                 log("$tag: 已有 iAP2 会话在跑且已拿到凭据，忽略新的连入 addr=${peerAddress ?: "?"}")
-                runCatching { socket.close() }
+                rejectSocket(socket, tag, "productive-session")
                 return
             }
             log("$tag: 车机重新连入（上一轮仍在等凭据）——结束旧会话让位给新一轮 addr=${peerAddress ?: "?"}")
@@ -382,14 +417,14 @@ class Iap2Bluetooth(
             sleepQuietly(500)
             if (sessionActive.get()) {
                 log("$tag: 旧会话未在 500ms 内退出，忽略本次连入 addr=${peerAddress ?: "?"}")
-                runCatching { socket.close() }
+                rejectSocket(socket, tag, "previous-session-still-closing")
                 return
             }
         }
         val peerName = safeName(socket.remoteDevice) ?: peerAddress ?: "unknown"
         log("$tag: 车机已连入 name=$peerName，开始 iAP2 发送端会话")
         Thread({
-            if (!running || generation.get() != myGeneration) runCatching { socket.close() }
+            if (!running || generation.get() != myGeneration) rejectSocket(socket, tag, "stale-worker-generation")
             else runSession(socket, tag, ticket)
         }, "iap2-bt-session").apply {
             isDaemon = true
@@ -636,10 +671,19 @@ class Iap2Bluetooth(
     ) {
         // Publish the socket atomically with the pause check, so pausing can always close it.
         synchronized(this) {
-            if (!running || !sessions.allows(ticket) || !sessionActive.compareAndSet(false, true)) {
-                runCatching { socket.close() }
+            val rejected = when {
+                !running -> "not-running"
+                !sessions.allows(ticket) -> "stale-session-ticket"
+                wifiHandoff -> "wifi-handoff-before-worker"
+                !sessionActive.compareAndSet(false, true) -> "session-already-active"
+                else -> null
+            }
+            if (rejected != null) {
+                rejectSocket(socket, tag, rejected)
                 return
             }
+            lastWorkerAt = SystemClock.elapsedRealtime()
+            log("BT-WORKER: entry=$tag ticket=$ticket peer=${safeAddress(socket.remoteDevice)} ${diagnosticSummary()}")
             sessionSocket.set(socket)
             sessionStarts.incrementAndGet()
             sessionProductive = false
@@ -759,6 +803,9 @@ private class RfcommLinkChannel(
 ) : Iap2LinkChannel, Closeable {
     private val engine = Iap2LinkEngine()
     private val lock = Any()
+    private val openedAt = SystemClock.elapsedRealtime()
+    private var socketReadBytes = 0L
+    private var socketWriteBytes = 0L
     private val controls = LinkedBlockingQueue<ByteArray?>()
     private val readyLatch = CountDownLatch(1)
 
@@ -885,6 +932,8 @@ private class RfcommLinkChannel(
                 if (count == 0) continue
                 synchronized(lock) {
                     if (terminated) return
+                    if (socketReadBytes == 0L) log("RFCOMM-IO: first-read bytes=$count elapsed=${SystemClock.elapsedRealtime() - openedAt}ms")
+                    socketReadBytes += count
                     engine.feed(buffer.copyOf(count), nowMillis())
                     processEventsLocked()
                     drainOutputLocked()
@@ -947,6 +996,8 @@ private class RfcommLinkChannel(
         if (bytes.isEmpty()) return
         try {
             socket.outputStream.write(bytes)
+            if (socketWriteBytes == 0L) log("RFCOMM-IO: first-write-returned bytes=${bytes.size} elapsed=${SystemClock.elapsedRealtime() - openedAt}ms; peer reception unconfirmed")
+            socketWriteBytes += bytes.size
         } catch (error: IOException) {
             finishLocked(error)
         }
@@ -969,6 +1020,7 @@ private class RfcommLinkChannel(
             controls.offer(POISON) // 哨兵：唤醒阻塞的接收方（LBQ 不接受 null）
             readyLatch.countDown()
             runCatching { socket.close() }
+            log("RFCOMM-IO: end read_bytes=$socketReadBytes socket_write_bytes=$socketWriteBytes elapsed=${SystemClock.elapsedRealtime() - openedAt}ms local_cancel=$locallyCancelled")
             log(if (reason == null) "LINK closed" else "LINK closed: ${reason.message}")
         }
     }

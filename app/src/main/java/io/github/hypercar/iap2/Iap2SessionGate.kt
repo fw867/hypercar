@@ -8,6 +8,8 @@ internal class Iap2SessionGate {
     @Synchronized fun setEnabled(value: Boolean) {
         if (enabled != value) { enabled = value; revision++ }
     }
+    @Synchronized fun diagnostics(): String = "enabled=$enabled revision=$revision"
+    @Synchronized fun retireTickets() { revision++ }
     @Synchronized fun ticket(): Long? = revision.takeIf { enabled }
     @Synchronized fun allows(ticket: Long): Boolean = enabled && revision == ticket
 }

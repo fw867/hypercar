@@ -36,8 +36,6 @@ import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -1561,93 +1559,42 @@ object HyperCarRepo {
      *
      * @return 试探成功时的合成端点（`airPlayPort=7000`、ip=网关）；失败返回 null
      */
-    /**
-     * 在**车机热点网段里主动找 AirPlay 端点**（网关为空时的唯一出路）。
-     *
-     * 为什么要这么干：宝马 DIRECT-BMW 热点不回默认网关（现场日志 `gw=0.0.0.0`，
-     * 172.16.222.105/20 只有 IPv4、没有 DNS/网关），于是
-     *
-     *  - 「把网关当车机」这条路直接不可用（拿不到 gateway 就 continue 了）；
-     *  - 车机又明说 `0x4301` 不发（清单里 `CarPlayStartSession(0x4301)=不发`），
-     *  - mDNS 只在**端点确定之后**才查——死锁在「等车机地址」直到车机 30s 后拆 iAP2。
-     *
-     * 这里改成：入网后立刻在**本网段**扫 7000 端口。候选来自三处，覆盖面从窄到宽：
-     *
-     *  1. ARP/邻居表：车机若给过我们任何一帧，它就一定在表里；
-     *  2. 自己所在 /24 的 `.1`/`.2`/`.254`（车机做 AP 时通常是其中之一）；
-     *  3. 掩码小于 /24 时（宝马 /20），每个 /24 的 `.1`/`.254`（最多 48 个）。
-     *
-     * 只做 TCP 连接探测（250ms），确认能连就把 IP 当端点交给后续 pair-verify。/@return 命中的端点；全都不通返回 null
-     */
-    private suspend fun discoverAirplayOnLocalSubnet(
-        context: Context,
-        ssid: String,
-    ): CarPlayEndpoint? {
-        val network = boundNetwork ?: wifiNetworks(context).firstOrNull() ?: return null
+    /** Bounded discovery on the bound receiver network; invitations always take priority. */
+    private suspend fun discoverAirplayOnLocalSubnet(context: Context, ssid: String): CarPlayEndpoint? {
+        val network = boundNetwork ?: return null
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return null
         val lp = cm.getLinkProperties(network) ?: return null
-        val self = lp.linkAddresses
-            .mapNotNull { it.address }
-            .filterIsInstance<java.net.Inet4Address>()
-            .firstOrNull { !it.isLoopbackAddress && !it.isLinkLocalAddress }
-            ?: return null
-        val prefix = lp.linkAddresses
-            .firstOrNull { it.address == self }
-            ?.prefixLength
-            ?: 24
-        val octets = self.address.map { it.toInt() and 0xFF }
-        val base = "${octets[0]}.${octets[1]}.${octets[2]}"
-
-        val candidates = LinkedHashSet<String>()
-        // ① ARP 里已经出现过的邻居（车机只要回过包就在里面）
-        runCatching {
-            java.io.File("/proc/net/arp").readLines().drop(1).forEach { line ->
-                val parts = line.split(Regex("\\\\s+"))
-                val ip = parts.firstOrNull()?.trim().orEmpty()
-                val device = parts.lastOrNull()?.trim().orEmpty()
-                val flags = parts.getOrNull(2)?.trim().orEmpty()
-                if (ip.count { it == '.' } == 3 && device.startsWith("wlan") && flags != "0x0") {
-                    candidates.add(ip)
-                }
-            }
+        val local = lp.linkAddresses.firstOrNull { it.address is java.net.Inet4Address &&
+            !it.address.isLoopbackAddress && !it.address.isLinkLocalAddress } ?: return null
+        val address = local.address.hostAddress ?: return null
+        if (local.prefixLength !in 16..30) {
+            log("DISCOVERY: prefix=/${local.prefixLength} 不在有界 IPv4 扫描范围内，继续等邀请")
+            return null
         }
-        // ②/③ 网关候选：自己 /24 的三个常见地址 + 每个 /24 的 .1/.254
-        listOf(".1", ".2", ".254").forEach { candidates.add("$base$it") }
-        if (prefix in 16..23) {
-            val step = 1 shl (24 - prefix)
-            val thirdStart = octets[2] - (octets[2] % step)
-            var i = 0
-            while (i < step && candidates.size < 48) {
-                val third = thirdStart + i
-                candidates.add("${octets[0]}.${octets[1]}.$third.1")
-                candidates.add("${octets[0]}.${octets[1]}.$third.254")
-                i++
-            }
+        val plan = AirplaySubnetPlan(address, local.prefixLength)
+        val neighbors = runCatching {
+            plan.arpPeers(java.io.File("/proc/net/arp").readLines(), lp.interfaceName)
+        }.getOrElse { error ->
+            log("DISCOVERY: ARP 邻居表不可用 ${error.javaClass.simpleName}，继续使用有界地址枚举")
+            emptyList()
         }
-        candidates.remove(self.hostAddress ?: return null)
-        if (candidates.isEmpty()) return null
-
-        val ports = headUnitProfile.fallbackAirplayPorts.distinct().ifEmpty { listOf(7000) }
-        val started = System.currentTimeMillis()
-        log("WIFI: 网关为空——在 $base/${prefix} 扫 AirPlay（先试 ${candidates.size} 个常见地址 × 端口 ${ports}）")
-
-        // 阶段 1：常见地址（ARP 邻居 + .1/.2/.254），多端口都试
-        probeHostsForAirplay(candidates.toList(), ports)?.let { hit ->
-            log("WIFI: ✓ 网段扫描命中车机 AirPlay 端点 ${hit.first}:${hit.second}（${System.currentTimeMillis() - started}ms）")
+        val common = plan.commonHosts(neighbors)
+        val ports = headUnitProfile.fallbackAirplayPorts.filter { it in 1..65535 }.distinct().ifEmpty { listOf(7000) }
+        val started = SystemClock.elapsedRealtime()
+        log("DISCOVERY: network=#$network interface=${lp.interfaceName} self=$address/${local.prefixLength} " +
+            "neighbors=${neighbors.size} common=${common.size} ports=$ports limit=$TOTAL_SWEEP_MAX")
+        probeHostsForAirplay(network, common, ports)?.let { hit ->
+            log("DISCOVERY: source=common target=${hit.first}:${hit.second} elapsed=${SystemClock.elapsedRealtime() - started}ms；仅端口可达，尚未授权")
             return endpointFor(ssid, hit.first, hit.second)
         }
-
-        // 阶段 2：整个前缀全扫（宝马是 /20 → 4094 个地址）。只探主端口，
-        // 分块并发、命中即刻返回；未命中的地址大多是 EHOSTUNREACH，会远快于超时。
-        val full = fullPrefixHosts(self, prefix, alreadyTried = candidates)
-        if (full.isNotEmpty()) {
-            log("WIFI: 常见地址无一响应——扩到整个 /$prefix 全扫（${full.size} 个地址，单端口 ${ports.first()}）")
-            probeHostsForAirplay(full, listOf(ports.first()))?.let { hit ->
-                log("WIFI: ✓ 全段扫描命中车机 AirPlay 端点 ${hit.first}:${hit.second}（${System.currentTimeMillis() - started}ms）")
-                return endpointFor(ssid, hit.first, hit.second)
-            }
+        if (!sessionLive.get() || boundNetwork != network || ctrlAdvertiser?.lastInvitePeerIp != null || lateAirplayEndpoint.get() != null) return null
+        val full = plan.remainingHosts(common.toSet(), TOTAL_SWEEP_MAX)
+        log("DISCOVERY: source=prefix remaining=${full.size} ports=$ports；逐地址保留全部候选端口，正常邀请优先")
+        probeHostsForAirplay(network, full, ports)?.let { hit ->
+            log("DISCOVERY: source=prefix target=${hit.first}:${hit.second} elapsed=${SystemClock.elapsedRealtime() - started}ms；仅端口可达，尚未授权")
+            return endpointFor(ssid, hit.first, hit.second)
         }
-        log("WIFI: 全段扫描未找到车机 AirPlay（${System.currentTimeMillis() - started}ms）——继续等车机邀请/0x4301")
+        log("DISCOVERY: 未得到可用候选或已被邀请/换网中止，elapsed=${SystemClock.elapsedRealtime() - started}ms")
         return null
     }
 
@@ -1663,65 +1610,30 @@ object HyperCarRepo {
         gateway = host,
     )
 
-    /**
-     * 并行探测一组地址（分块 128 并发，命中即返回）。
-     *
-     * 为什么分块而不是一次全发：/20 有 4094 个地址，一次性建 4094 个 socket 会被
-     * 系统 fd 上限和 AP 的客户端表打回来；分块还能在命中后立刻停止、不浪费后面的探测。
-     */
-    private suspend fun probeHostsForAirplay(
-        hosts: List<String>,
-        ports: List<Int>,
-    ): Pair<String, Int>? = coroutineScope {
-        val hit = java.util.concurrent.atomic.AtomicReference<Pair<String, Int>?>(null)
-        for (chunk in hosts.chunked(PROBE_CHUNK_SIZE)) {
-            if (hit.get() != null) break
-            chunk.map { ip ->
-                async(Dispatchers.IO) {
-                    if (hit.get() != null) return@async
-                    for (port in ports) {
-                        val ok = runCatching {
-                            Socket().use { s ->
-                                s.connect(InetSocketAddress(ip, port), FULL_SWEEP_TIMEOUT_MILLIS.toInt())
-                            }
-                        }.isSuccess
-                        if (ok) {
-                            hit.compareAndSet(null, ip to port)
-                            return@async
-                        }
-                    }
-                }
-            }.forEach { it.await() }
+    /** Every socket is pinned to this network; stop between probes on invite, cancellation or network change. */
+    private suspend fun probeHostsForAirplay(network: Network, hosts: List<String>, ports: List<Int>): Pair<String, Int>? {
+        val attempt = connectionAttemptId
+        val tried = java.util.concurrent.atomic.AtomicLong()
+        val bindFailures = java.util.concurrent.atomic.AtomicLong()
+        fun stop() = !sessionLive.get() || connectionAttemptId != attempt || boundNetwork != network ||
+            ctrlAdvertiser?.lastInvitePeerIp != null || lateAirplayEndpoint.get() != null
+        try {
+            return AirplaySubnetProbe.find(hosts, ports, PROBE_CHUNK_SIZE,
+                shouldStop = ::stop,
+                probe = { host, port ->
+                    tried.incrementAndGet()
+                    var bound = false
+                    runCatching { Socket().use { socket ->
+                        network.bindSocket(socket)
+                        bound = true
+                        socket.connect(InetSocketAddress(host, port), FULL_SWEEP_TIMEOUT_MILLIS.toInt())
+                    } }.onFailure { if (!bound) bindFailures.incrementAndGet() }.isSuccess
+                },
+            )
+        } finally {
+            log("DISCOVERY-PROBE: attempt=$attempt network=#$network hosts=${hosts.size} ports=$ports " +
+                "socket_attempts=${tried.get()} bind_failures=${bindFailures.get()} interrupted=${stop()}")
         }
-        hit.get()
-    }
-
-    /**
-     * 列出整个前缀内的全部主机地址（排除自己、网络地址、广播地址与已试过的）。
-     *
-     * 只对 /16../23 生效：/24 及更小的前缀本身就是"全部"，已在阶段 1 覆盖；
-     * 再往上（/8 之类）不可能出现在热点场景，直接跳过避免扫爆。
-     */
-    private fun fullPrefixHosts(
-        self: java.net.Inet4Address,
-        prefix: Int,
-        alreadyTried: Set<String>,
-    ): List<String> {
-        if (prefix !in 16..23) return emptyList()
-        val o = self.address.map { it.toInt() and 0xFF }
-        val hostBits = 32 - prefix
-        val mask = if (hostBits >= 32) 0 else (1 shl hostBits) - 1
-        val network = ((o[0] shl 24) or (o[1] shl 16) or (o[2] shl 8) or o[3]) and mask.inv()
-        val limit = TOTAL_SWEEP_MAX
-        val out = ArrayList<String>(minOf(1 shl hostBits, limit))
-        var addr = network + 1
-        val last = network + mask - 1
-        while (addr <= last && out.size < limit) {
-            val ip = "${(addr ushr 24) and 0xFF}.${(addr ushr 16) and 0xFF}.${(addr ushr 8) and 0xFF}.${addr and 0xFF}"
-            if (ip != self.hostAddress && ip !in alreadyTried) out.add(ip)
-            addr++
-        }
-        return out
     }
 
     private fun probeGatewayAsCarHotspot(
@@ -2367,6 +2279,7 @@ object HyperCarRepo {
                                     continue
                                 }
                                 val found = discoverAirplayOnLocalSubnet(context, ssid)
+                                if (advertiser.lastInvitePeerIp != null) continue
                                 if (found != null) {
                                     usable = found.copy(proactive = profileRequiresActivation)
                                     continue
@@ -2377,6 +2290,7 @@ object HyperCarRepo {
                     if (ssid != null) observedSsid = ssid
                     // ② 每 15s 报一次进度（tick 是 5s，探测要跟得上换网速度）
                     if (ticks % TICKS_PER_PROGRESS == 0) {
+                        log("BT-HEALTH: attempt=$diagnosticId ${coordinator.diagnosticSummary()}")
                         connectionDiagnostics.report().lastOrNull()?.let { log(it) }
                         val seen = lastSeen.get()
                         val waited = ticks * ENDPOINT_TICK_MILLIS / 1000

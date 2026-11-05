@@ -6,7 +6,6 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.media.MediaMetadata
 import android.media.Rating
-import android.media.session.MediaSession
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
@@ -17,9 +16,6 @@ import kotlinx.coroutines.launch
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import androidx.core.app.NotificationManagerCompat
-import android.support.v4.media.session.MediaControllerCompat
-import android.support.v4.media.session.MediaSessionCompat
-import android.support.v4.media.session.PlaybackStateCompat
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.shizuku.ShizukuTools
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -49,21 +45,7 @@ data class NowPlaying(
     val reason: String = "",
     val liked: Boolean = false,
     val canLike: Boolean = false,
-    val repeatMode: Int = PlaybackStateCompat.REPEAT_MODE_INVALID,
-    val shuffleMode: Int = PlaybackStateCompat.SHUFFLE_MODE_INVALID,
-    val canRepeat: Boolean = false,
-    val canShuffle: Boolean = false,
-    val queue: List<MusicQueueEntry> = emptyList(),
-    val activeQueueId: Long = -1L,
-    val canSelectQueue: Boolean = false,
-    val dedicatedMode: MusicPlaybackMode? = null,
-    val queueLoading: Boolean = false,
-    val queueError: String = "",
-    val modeError: String = "",
-    val queueHasMore: Boolean = false,
 )
-
-data class MusicQueueEntry(val id: Long, val title: String, val artist: String, val sourceId: String? = null)
 
 class MusicNotificationListener : NotificationListenerService() {
     override fun onListenerConnected() {
@@ -137,40 +119,25 @@ object MusicBridge {
     private val main = Handler(Looper.getMainLooper())
 
     private val _state = MutableStateFlow(NowPlaying())
-    /** 歌词缓存（2026-10-31）：只有 QQ 音乐通过第三方 API 能拿到 LRC。 */
     val state: StateFlow<NowPlaying> = _state
 
     private var service: NotificationListenerService? = null
     private var controller: MediaController? = null
-    private var compatController: MediaControllerCompat? = null
     // Main-thread snapshots. Rendering and the ticker never query a remote player.
     private data class SessionSnapshot(
         val controller: MediaController?,
         val metadata: MediaMetadata?,
         val playback: PlaybackState?,
-        val queue: List<MediaSession.QueueItem>,
         val ratingType: Int,
         val count: Int,
         val denied: Boolean = false,
     )
     private var metadata: MediaMetadata? = null
     private var playback: PlaybackState? = null
-    private var queue: List<MediaSession.QueueItem> = emptyList()
     private var ratingType = Rating.RATING_NONE
-    private var repeatMode = PlaybackStateCompat.REPEAT_MODE_INVALID
-    private var shuffleMode = PlaybackStateCompat.SHUFFLE_MODE_INVALID
-    private var repeatRevision = 0L
-    private var shuffleRevision = 0L
     private var sessionGeneration = 0L
     private var callback: MediaController.Callback? = null
     private val sessionQueries = musicQuery<SessionSnapshot>("music-session-query")
-    // Compat mode getters call the PLAYER synchronously, unlike framework session controls.
-    // Keep them separate so a hung player cannot block discovery of another player's session.
-    private val modeQueries = musicQuery<Unit>("music-mode-query")
-    private val modeCommands = musicQuery<Unit>("music-mode-command")
-    // Only touched by modeQueries' single worker, including unregister/register.
-    private var modeRegistration: Pair<MediaControllerCompat, MediaControllerCompat.Callback>? = null
-
     private fun <T> musicQuery(name: String) = LatestMusicQuery<T>(
         name, { action -> main.post { action() }; Unit },
         { HyperCarRepo.log("MUSIC: $name 失败 ${it.javaClass.simpleName}: ${it.message}") },
@@ -272,7 +239,7 @@ object MusicBridge {
     /**
      * **把音乐 App 拉到手机屏幕**（2026-10-31）。
      *
-     * 自动播放时我们把它放在不可见虚显上（不抢前台），但用户想改播放列表/音效时必须能在手机上操作。
+     * 自动播放时我们把它放在不可见虚显上（不抢前台），但用户想调整播放器/音效时必须能在手机上操作。
      * 由于 App 的 task 已经在虚拟屏上，单纯 `am start --display 0` 不一定能把 task 迁过去，
      * 所以这里做"强制重启到默认屏"：force-stop（清掉虚显上的实例）→ 普通 am start（落主屏）。
      * 下一次连接/自动播放会重新把它放回虚显。
@@ -507,11 +474,6 @@ object MusicBridge {
     }
 
     private fun sessionCallback(generation: Long) = object : MediaController.Callback() {
-        override fun onQueueChanged(value: MutableList<MediaSession.QueueItem>?) {
-            if (generation != sessionGeneration) return
-            queue = value.orEmpty().toList()
-            publish()
-        }
         override fun onMetadataChanged(value: MediaMetadata?) {
             if (generation != sessionGeneration) return
             metadata = value
@@ -535,80 +497,12 @@ object MusicBridge {
 
     private fun clearController() {
         sessionGeneration++
-        modeQueries.invalidate()
-        modeCommands.invalidate()
         callback?.let { old -> runCatching { controller?.unregisterCallback(old) } }
         callback = null
         controller = null
-        compatController = null
         metadata = null
         playback = null
-        queue = emptyList()
         ratingType = Rating.RATING_NONE
-        repeatMode = PlaybackStateCompat.REPEAT_MODE_INVALID
-        shuffleMode = PlaybackStateCompat.SHUFFLE_MODE_INVALID
-        // A blocked Binder cannot be cancelled. There is at most one running query and
-        // one replacement, so detach/switch never allocates more blocked threads.
-        modeQueries.submit({ clearModeRegistration() }, {})
-    }
-
-    private fun clearModeRegistration() {
-        modeRegistration?.let { (remote, listener) -> runCatching { remote.unregisterCallback(listener) } }
-        modeRegistration = null
-    }
-
-    private fun bindModes(s: NotificationListenerService, target: MediaController, generation: Long) {
-        modeQueries.submit({
-            clearModeRegistration()
-            val remote = MediaControllerCompat(s, MediaSessionCompat.Token.fromToken(target.sessionToken)!!)
-            val listener = object : MediaControllerCompat.Callback() {
-                override fun onSessionReady() {
-                    if (generation == sessionGeneration) refreshModes(remote, generation)
-                }
-                override fun onRepeatModeChanged(value: Int) {
-                    if (generation != sessionGeneration) return
-                    repeatRevision++
-                    repeatMode = value
-                    publish()
-                }
-                override fun onShuffleModeChanged(value: Int) {
-                    if (generation != sessionGeneration) return
-                    shuffleRevision++
-                    shuffleMode = value
-                    publish()
-                }
-            }
-            modeRegistration = remote to listener
-            remote.registerCallback(listener, main)
-            main.post {
-                if (generation == sessionGeneration) {
-                    compatController = remote
-                    refreshModes(remote, generation)
-                }
-            }
-        }, {})
-    }
-
-    private fun refreshModes(remote: MediaControllerCompat, generation: Long) {
-        val rr = repeatRevision
-        val sr = shuffleRevision
-        modeQueries.submit({
-            // Deliver independently: a blocked shuffle query must not hide repeat's result.
-            val repeat = remote.repeatMode
-            main.post {
-                if (generation == sessionGeneration && repeatRevision == rr) {
-                    repeatMode = repeat
-                    publish()
-                }
-            }
-            val shuffle = remote.shuffleMode
-            main.post {
-                if (generation == sessionGeneration && shuffleRevision == sr) {
-                    shuffleMode = shuffle
-                    publish()
-                }
-            }
-        }, {})
     }
 
     private val ticker = object : Runnable {
@@ -722,7 +616,6 @@ object MusicBridge {
 
     fun detach(reason: String = "通知使用权已断开") {
         packageSwitchRevision.incrementAndGet()
-        QqMusicAdapter.close()
         MusicArtwork.clear()
         main.removeCallbacks(ticker)
         sessionQueries.invalidate()
@@ -756,7 +649,7 @@ object MusicBridge {
                 ?: sessions.firstOrNull { !it.metadata?.getString(MediaMetadata.METADATA_KEY_TITLE).isNullOrBlank() }
                 ?: sessions.firstOrNull()
             SessionSnapshot(target, target?.metadata, target?.playbackState,
-                target?.queue.orEmpty().toList(), target?.ratingType ?: Rating.RATING_NONE, sessions.size, denied)
+                target?.ratingType ?: Rating.RATING_NONE, sessions.size, denied)
         }, { snapshot ->
             if (service !== s) return@submit
             permissionDenied = snapshot.denied
@@ -768,14 +661,12 @@ object MusicBridge {
                 controller = target
                 metadata = snapshot.metadata
                 playback = snapshot.playback
-                queue = snapshot.queue
                 ratingType = snapshot.ratingType
                 if (target != null) {
                     val generation = sessionGeneration
                     callback = sessionCallback(generation).also {
                         runCatching { target.registerCallback(it, main) }
                     }
-                    bindModes(s, target, generation)
                 }
                 val key = "${target?.packageName ?: "-"}|${snapshot.count}"
                 if (CarUiCaster.running && key != lastChoiceKey) {
@@ -796,7 +687,6 @@ object MusicBridge {
     private fun publish() {
         val c = controller
         if (c == null) {
-            QqMusicAdapter.close()
             MusicArtwork.clear()
             _state.value = NowPlaying(
                 reason = when {
@@ -810,8 +700,6 @@ object MusicBridge {
         val ps = playback
         val pkg = c.packageName
         val ctx = service
-        QqMusicAdapter.select(ctx, pkg == QqMusicAdapter.PACKAGE) { publish() }
-        val qq = QqMusicAdapter.state.takeIf { pkg == QqMusicAdapter.PACKAGE }
         val label = runCatching {
             val ai = ctx!!.packageManager.getApplicationInfo(pkg, 0)
             ctx.packageManager.getApplicationLabel(ai).toString()
@@ -841,21 +729,6 @@ object MusicBridge {
             },
             canLike = likeAction != null || (actions and PlaybackState.ACTION_SET_RATING != 0L &&
                 ratingType in listOf(Rating.RATING_HEART, Rating.RATING_THUMB_UP_DOWN)),
-            repeatMode = repeatMode,
-            shuffleMode = shuffleMode,
-            canRepeat = actions and PlaybackStateCompat.ACTION_SET_REPEAT_MODE != 0L,
-            canShuffle = actions and PlaybackStateCompat.ACTION_SET_SHUFFLE_MODE != 0L,
-            queue = if (qq != null && qq.songs.isNotEmpty()) qq.songs.mapIndexed { index, song ->
-                MusicQueueEntry(index.toLong(), song.title, song.artist, song.id)
-            } else queue.map { MusicQueueEntry(it.queueId,
-                it.description.title?.toString().orEmpty(), it.description.subtitle?.toString().orEmpty()) },
-            activeQueueId = ps?.activeQueueItemId ?: -1L,
-            canSelectQueue = qq?.songs?.isNotEmpty() == true || actions and PlaybackState.ACTION_SKIP_TO_QUEUE_ITEM != 0L,
-            dedicatedMode = qq?.mode,
-            queueLoading = qq?.loading ?: false,
-            queueError = qq?.queueError.orEmpty(),
-            modeError = qq?.modeError.orEmpty(),
-            queueHasMore = qq?.hasMore ?: false,
         )
     }
 
@@ -914,43 +787,6 @@ object MusicBridge {
                 Rating.RATING_THUMB_UP_DOWN -> c.transportControls.setRating(Rating.newThumbRating(!_state.value.liked))
             }
         }.onFailure { HyperCarRepo.log("MUSIC: 喜欢操作失败 ${it.message}") }
-    }
-
-    fun setPlaybackMode(mode: MusicPlaybackMode) = onMusicThread {
-        if (controller?.packageName == QqMusicAdapter.PACKAGE && QqMusicAdapter.state.mode != null) {
-            QqMusicAdapter.setMode(mode); return@onMusicThread
-        }
-        val c = compatController ?: return@onMusicThread
-        val state = _state.value
-        if (!MusicPlaybackModes.available(state.canRepeat, state.canShuffle, state.repeatMode, state.shuffleMode).contains(mode)) return@onMusicThread
-        modeCommands.submit({
-            if (state.canShuffle) c.transportControls.setShuffleMode(
-                if (mode == MusicPlaybackMode.SHUFFLE) PlaybackStateCompat.SHUFFLE_MODE_ALL else PlaybackStateCompat.SHUFFLE_MODE_NONE)
-            if (state.canRepeat) c.transportControls.setRepeatMode(when (mode) {
-                MusicPlaybackMode.ONE -> PlaybackStateCompat.REPEAT_MODE_ONE
-                MusicPlaybackMode.ALL -> PlaybackStateCompat.REPEAT_MODE_ALL
-                else -> PlaybackStateCompat.REPEAT_MODE_NONE
-            })
-        }, {})
-    }
-
-    fun playQueueItem(packageName: String, id: Long, sourceId: String? = null) = onMusicThread {
-        val c = controller ?: return@onMusicThread
-        if (c.packageName == packageName && packageName == QqMusicAdapter.PACKAGE && sourceId != null) {
-            QqMusicAdapter.playSong(sourceId); return@onMusicThread
-        }
-        if (c.packageName != packageName || (playback?.actions ?: 0L) and PlaybackState.ACTION_SKIP_TO_QUEUE_ITEM == 0L) return@onMusicThread
-        if (queue.none { it.queueId == id }) return@onMusicThread
-        runCatching { c.transportControls.skipToQueueItem(id) }
-            .onFailure { HyperCarRepo.log("MUSIC: 切换列表歌曲失败 ${it.message}") }
-    }
-
-    fun loadMusicQueue(more: Boolean = false) = onMusicThread {
-        if (controller?.packageName == QqMusicAdapter.PACKAGE) QqMusicAdapter.loadQueue(more)
-    }
-
-    fun refreshPlaybackMode() = onMusicThread {
-        if (controller?.packageName == QqMusicAdapter.PACKAGE) QqMusicAdapter.refreshMode()
     }
 
     fun refresh() = choose()

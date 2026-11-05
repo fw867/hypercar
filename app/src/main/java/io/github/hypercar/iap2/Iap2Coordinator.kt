@@ -97,15 +97,17 @@ class Iap2Coordinator(
 
     fun keepIdentityOnly() = startTransport(false, null)
 
-    fun pauseSessions() { bluetooth?.setSessionEnabled(false); endpointCallback = null }
+    fun diagnosticSummary(): String = bluetooth?.diagnosticSummary() ?: "transport=not-created"
+
+    fun pauseSessions() { bluetooth?.setSessionEnabled(false, "pauseSessions"); endpointCallback = null }
 
     private fun startTransport(allowSessions: Boolean, onEndpoint: ((CarPlayEndpoint) -> Unit)?) {
         synchronized(this) {
             endpointCallback = onEndpoint
             bluetooth?.let { existing ->
                 if (existing.isRunning) {
-                    existing.setSessionEnabled(allowSessions)
-                    if (allowSessions) existing.setWifiHandoff(false)
+                    existing.setSessionEnabled(allowSessions, "startTransport-existing")
+                    if (allowSessions) existing.setWifiHandoff(false, "startTransport-resume")
                     refreshCarPlayMarker()
                     log(if (allowSessions) "IAP2: 已在运行，允许会话且保留 SDP 注册" else "IAP2: 仅保留 iPhone 身份声明，暂停会话与出站；SDP 已注册=${existing.isListening}")
                     return
@@ -130,7 +132,7 @@ class Iap2Coordinator(
                     onSessionEnded = { reason -> log("IAP2: 会话结束（$reason），继续监听/出站等待重连") },
                 )
             bluetooth = bt
-            bt.setSessionEnabled(allowSessions)
+            bt.setSessionEnabled(allowSessions, "startTransport-new")
             bt.setCarPlayMarkerEnabled(io.github.hypercar.settings.SettingsStore.bluetoothCarPlayMarker)
             if (!bt.start()) {
                 log("IAP2: 蓝牙启动失败（权限/开关），请检查后重试")
@@ -153,7 +155,7 @@ class Iap2Coordinator(
      * 车机蓝牙断开后旧 RFCOMM socket 的读会卡在半开连接上不返回——必须主动关，
      * 否则会话线程滞留、下一轮「秒连」被旧会话占位。
      */
-    fun retireForWifi() { bluetooth?.setWifiHandoff(true) }
+    fun retireForWifi() { bluetooth?.setWifiHandoff(true, "wifi-ready-retirement") }
 
     fun endCurrentSession() { bluetooth?.dropCurrentSession() }
 

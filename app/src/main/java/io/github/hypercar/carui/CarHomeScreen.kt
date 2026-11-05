@@ -8,8 +8,6 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -379,13 +377,6 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
     val context = LocalContext.current
     val installed = remember(context) { MusicApps.installed(context) }
     var picker by remember { mutableStateOf(false) }
-    var queueOpen by remember(music.packageName) { mutableStateOf(false) }
-    var modesOpen by remember(music.packageName) { mutableStateOf(false) }
-    // 是否把音乐 App 的界面直接显示在这张卡片里（2026-11-01）
-    // 共享状态：Dock 的音乐按钮 / 卡片右上角 ⤢ 都通过它切换
-    val mode = music.dedicatedMode ?: MusicPlaybackModes.current(music.repeatMode, music.shuffleMode)
-    val modes = if (music.dedicatedMode != null) listOf(MusicPlaybackMode.ALL, MusicPlaybackMode.ONE, MusicPlaybackMode.SHUFFLE)
-        else MusicPlaybackModes.available(music.canRepeat, music.canShuffle, music.repeatMode, music.shuffleMode)
     val currentIcon = remember(music.packageName) { MusicApps.iconFor(context, music.packageName) }
     val dark = CarThemeState.dark
     val ink = if (dark) White else Color(0xFF1B1730)
@@ -395,7 +386,7 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
         if (dark) listOf(Color(0xFF484265), Color(0xFF25203A), Color(0xFF171623))
         else listOf(Color(0xFFD6E5F5), Color(0xFFF1F7FE), Color(0xFFE4EFFA))))) {
         // **音乐 App 直接显示在这张卡片里**（2026-11-01）：打开后可直接在车机上操作它的
-        // 播放列表/设置；右上角关闭按钮收起、回到常规音乐卡。画面来自音乐虚显，触摸经 shell 注入。
+        // 音乐应用界面/设置；右上角关闭按钮收起、回到常规音乐卡。画面来自音乐虚显，触摸经 shell 注入。
         if (MusicUiState.appView) {
             MusicAppPanel(Modifier.fillMaxSize()) { MusicUiState.appView = false }
             return@Box
@@ -480,19 +471,12 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
                     Text(formatTime(music.durationMs), color = sub.copy(alpha = .7f), fontSize = 10.sp)
                 }
                 Spacer(Modifier.height(10.dp))
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly,
                     verticalAlignment = Alignment.CenterVertically) {
-                    PlayerButton(Icons.Rounded.QueueMusic, "播放列表", 25, ink, touchSize = 44) {
-                        queueOpen = true; MusicBridge.loadMusicQueue()
-                    }
                     PlayerButton(Icons.Rounded.SkipPrevious, "上一首", 31, ink, touchSize = 44) { MusicBridge.previous() }
                     PlayerButton(if (music.playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
                         if (music.playing) "暂停" else "播放", 40, ink, touchSize = 52) { MusicBridge.playPause() }
                     PlayerButton(Icons.Rounded.SkipNext, "下一首", 31, ink, touchSize = 44) { MusicBridge.next() }
-                    PlayerButton(mode?.icon() ?: Icons.Rounded.Repeat,
-                        mode?.label ?: "播放模式", 25, ink, touchSize = 44) {
-                        modesOpen = true; MusicBridge.refreshPlaybackMode()
-                    }
                 }
             } else {
                 Text("在手机上播放音乐，即可在这里控制", color = sub, fontSize = 12.sp)
@@ -548,83 +532,7 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
                 }
             }
         }
-        if (queueOpen || modesOpen) {
-            Column(Modifier.fillMaxSize().background(pickerBg).padding(14.dp)) {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Text(if (queueOpen) "播放列表" else "播放模式", color = ink, fontSize = 19.sp,
-                        fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                    IconButton(onClick = { queueOpen = false; modesOpen = false }) {
-                        Icon(Icons.Rounded.Close, "关闭", tint = ink)
-                    }
-                }
-                if (queueOpen) {
-                    if (music.queue.isEmpty()) {
-                        Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                            Text(if (music.queueLoading) "正在获取播放列表…" else music.queueError.ifBlank { "当前播放器暂未提供播放列表" }, color = sub, fontSize = 14.sp)
-                        }
-                        if (music.packageName == QqMusicAdapter.PACKAGE) TextButton(onClick = { MusicBridge.loadMusicQueue() }) { Text("重试", color = ink) }
-                        TextButton(onClick = { launchMusic(context, music) }) { Text("在手机播放器中查看", color = ink) }
-                    } else LazyColumn(Modifier.weight(1f)) {
-                        items(music.queue) { song ->
-                            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
-                                .background(if (song.id == music.activeQueueId) ink.copy(alpha = .08f) else Color.Transparent)
-                                .clickable(enabled = music.canSelectQueue) {
-                                    MusicBridge.playQueueItem(music.packageName, song.id, song.sourceId); queueOpen = false
-                                }.padding(horizontal = 12.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically) {
-                                Column(Modifier.weight(1f)) {
-                                    Text(song.title.ifBlank { "未知歌曲" }, color = ink, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                    if (song.artist.isNotBlank()) Text(song.artist, color = sub, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                }
-                                if (song.id == music.activeQueueId) Icon(Icons.Rounded.GraphicEq, "当前歌曲", tint = ink, modifier = Modifier.size(20.dp))
-                            }
-                        }
-                        if (music.queueError.isNotBlank()) item { Text(music.queueError, color = sub, modifier = Modifier.padding(12.dp)) }
-                        if (music.queueHasMore) item {
-                            TextButton(onClick = { MusicBridge.loadMusicQueue(more = true) }, enabled = !music.queueLoading) {
-                                Text(if (music.queueLoading) "正在加载…" else "加载更多", color = ink)
-                            }
-                        }
-                    }
-                } else if (modes.isEmpty()) {
-                    Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
-                        Text(music.modeError.ifBlank { "当前播放器暂不支持切换播放模式" }, color = sub, fontSize = 14.sp)
-                    }
-                    if (music.packageName == QqMusicAdapter.PACKAGE) TextButton(onClick = { MusicBridge.refreshPlaybackMode() }) { Text("重试", color = ink) }
-                    TextButton(onClick = { launchMusic(context, music) }) { Text("在手机播放器中切换", color = ink) }
-                } else modes.forEach { option ->
-                    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
-                        .clickable { MusicBridge.setPlaybackMode(option); modesOpen = false }
-                        .padding(horizontal = 12.dp, vertical = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-                        // **每种模式都有独立图标**（2026-10-31）：之前这一列只有文字，
-                        // 四种模式看起来一模一样，用户以为图标画错了。
-                        Icon(option.icon(), option.label, tint = ink, modifier = Modifier.size(22.dp))
-                        Spacer(Modifier.width(12.dp))
-                        Text(option.label, color = ink, fontSize = 17.sp, modifier = Modifier.weight(1f))
-                        if (option == mode) Icon(Icons.Rounded.Check, "当前模式", tint = ink)
-                    }
-                }
-            }
-        }
     }
-}
-
-/**
- * 播放模式 → 图标（2026-10-31 修正）。
- *
- * 四种模式各用不同图标，彼此一眼可区分：
- *  · 顺序播放 → PlaylistPlay（列表播完即停）
- *  · 列表循环 → Repeat（首尾相接的循环箭头）
- *  · 单曲循环 → RepeatOne（循环箭头 + 数字 1）
- *  · 随机播放 → Shuffle（交叉箭头）
- *
- * 之前模式面板里只有文字、没有任何图标，按钮上「顺序/列表循环」的图标又都很像，
- * 于是看起来像"列表播放模式的图标做错了"。
- */
-private fun MusicPlaybackMode.icon() = when (this) {
-    MusicPlaybackMode.SEQUENTIAL -> Icons.Rounded.PlaylistPlay
-    MusicPlaybackMode.ALL -> Icons.Rounded.Repeat
-    MusicPlaybackMode.ONE -> Icons.Rounded.RepeatOne
-    MusicPlaybackMode.SHUFFLE -> Icons.Rounded.Shuffle
 }
 
 @Composable
@@ -644,7 +552,7 @@ private fun PlayerButton(
 
 private fun launchMusic(context: android.content.Context, music: NowPlaying) {
     // **在手机屏幕上打开当前音乐 App**（2026-10-31）：自动播放把它放在不可见虚显上，
-    // 用户要改播放列表/音效时必须能把它调回手机；走 MusicBridge.openOnPhone()，
+    // 用户要调整播放器/音效时必须能把它调回手机；走 MusicBridge.openOnPhone()，
     // 它会 force-stop 虚显上的实例再在默认屏启动（单纯 am start --display 0 不一定能迁 task）。
     if (music.packageName.isNotBlank() &&
         context.packageManager.getLaunchIntentForPackage(music.packageName) != null
@@ -795,7 +703,7 @@ private fun AppTile(
 /**
  * 音乐 App 面板（2026-11-01）：把音乐虚显的画面直接铺在这张卡片里，
  * 触摸按比例换算成虚显像素后经 SpikeShell 注入，于是可以在车机上操作它的
- * 播放列表/设置；右上角「关闭」收起回到常规音乐卡。
+ * 音乐应用界面/设置；右上角「关闭」收起回到常规音乐卡。
  */
 @Composable
 private fun MusicAppPanel(modifier: Modifier, onClose: () -> Unit) {
