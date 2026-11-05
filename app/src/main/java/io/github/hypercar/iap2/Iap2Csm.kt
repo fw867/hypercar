@@ -134,18 +134,6 @@ object Iap2Csm {
         return param(id, value.encodeToByteArray() + byteArrayOf(0))
     }
 
-    fun u16List(
-        id: Int,
-        values: IntArray,
-    ): ByteArray {
-        val out = ByteArray(values.size * 2)
-        values.forEachIndexed { index, value ->
-            out[index * 2] = (value ushr 8).toByte()
-            out[index * 2 + 1] = value.toByte()
-        }
-        return param(id, out)
-    }
-
     /** 嵌套参数组：参数值为子参数序列（如 0x4300 的无线组件、0x4301 的无线组）。 */
     fun group(
         id: Int,

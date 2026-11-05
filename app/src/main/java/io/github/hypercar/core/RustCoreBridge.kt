@@ -103,14 +103,6 @@ object RustCoreBridge {
     /** 投喂一包 PCM（16-bit 小端交错；本机采集的音频）。 */
     external fun nativePushAudioPcm(pcm: ShortArray, rate: Int, channels: Int)
 
-    /**
-     * **SPIKE-P0 调试专用**：直接向引擎触摸通道注入一条事件。
-     *
-     * 没有车机/接收端发 HID 时，用它验证「Rust 触摸通道 → JNI → Kotlin onTouch」。
-     * 生产路径不调用；P0 结束后可删。
-     */
-    external fun nativeDebugTouch(action: Int, x: Int, y: Int)
-
     /** Rust 侧是否在运行（诊断）。 */
     external fun nativeIsRunning(): Boolean
 

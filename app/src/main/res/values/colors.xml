@@ -1,8 +1,7 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 深空黑基底 + 电光青主色（UI 由 Compose 绘制，这里只留启动窗口底色） -->
+    <!-- UI 由 Compose 绘制，这里只留启动窗口底色 -->
     <color name="deep_space">#FF05070C</color>
-    <color name="electric_cyan">#FF00E5FF</color>
     <!-- 自适应图标底色：与图标画布边缘同色（深海军蓝），遮罩动画期间不露白边 -->
     <color name="ic_launcher_background">#FF05080D</color>
 </resources>

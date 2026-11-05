@@ -4,14 +4,6 @@ import io.github.hypercar.shizuku.ShizukuTools
 
 /** Shell launch helpers used by the production car UI. */
 object SpikeDisplay {
-    suspend fun shizukuExec(command: String, timeoutMs: Long = 8_000): String {
-        if (!ShizukuTools.isReady) return "Shizuku 未就绪"
-        val r = runCatching { ShizukuTools.exec(command, timeoutMs) }.getOrElse {
-            return "exec 异常: ${it.message}"
-        }
-        return "exit=${r.code} out=${r.out.take(1500)} err=${r.err.take(300)}"
-    }
-
     suspend fun amStartComponentOnDisplay(
         displayId: Int,
         component: String,

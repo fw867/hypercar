@@ -186,14 +186,6 @@ class Iap2SenderSession(
         /** 0xEA00 没被 0xEA03 确认时最多补开几轮（再多会变成骚扰车机）。 */
         const val EA_REOPEN_ATTEMPTS = 6
         /**
-         * 是否开 iAP2 EA 会话（0xEA00）。
-         *
-         * 2026-10-24 用真 iPhone 的 HCI 日志对照：iPhone 一个都不发，车机也从不回 0xEA03；
-         * CarPlay 的媒体面走 AirPlay（Wi-Fi），不依赖 EA 隧道。默认关闭以减少与车机状态机的分歧；
-         * 若某车型确实需要 EA 隧道，改 true 即恢复（EA_REOPEN_ATTEMPTS 的重发逻辑一并生效）。
-         */
-        const val ENABLE_EA_SESSIONS = false
-        /**
      * 是否发 0x4E0E（设备传输标识）。
      *
      * 真 iPhone 不发它（HCI 实测），MGU-55 也只是 ACK，故默认关闭。

@@ -1,31 +1,18 @@
 package io.github.hypercar.spike
 
-import android.app.Presentation
-import android.content.Context
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
-import android.hardware.display.DisplayManager
-import android.hardware.display.VirtualDisplay
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Bundle
-import android.os.SystemClock
 import android.view.Surface
-import android.view.View
 import io.github.hypercar.core.RustCoreBridge
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /**
- * S3：自绘画面 → MediaCodec(avc) → `nativePushVideoFrame`（SPIKE-P0）。
+ * Production D1/D2 encoder: Surface → MediaCodec AVC → nativePushVideoFrame.
  *
- * 结构就是 P1 `CarUiCaster` 的雏形：一块 1920x720 的 VirtualDisplay 输出到编码器
- * InputSurface，`Presentation` 往这块屏上装我们的 View，编码器输出 Annex B 直接喂引擎。
+ * Virtual displays are owned by the shell service; this class owns only encoding resources.
  *
  * 关键细节（踩了会表现为「编码器在跑、车机还是待机卡片」）：
  *  - 首帧必须带 SPS/PPS——`screen.rs` 只有看到 SPS/PPS 才发 VideoConfig，否则丢帧；
@@ -33,7 +20,6 @@ import java.util.Locale
  *  - `nativeSetVideoSize` 只改画布宽高，不触发 VideoConfig；先调它，帧里再带 SPS。
  */
 class SpikeCaster(
-    private val context: Context,
     private val width: Int = 1920,
     private val height: Int = 720,
     private val fps: Int = 60,
@@ -44,8 +30,6 @@ class SpikeCaster(
     private val lock = Any()
     private var codec: MediaCodec? = null
     private var inputSurface: Surface? = null
-    private var virtualDisplay: VirtualDisplay? = null
-    private var presentation: Presentation? = null
     private var thread: HandlerThread? = null
 
     @Volatile
@@ -136,89 +120,66 @@ class SpikeCaster(
             }
         }
         val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        try {
-            enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        } catch (t: Throwable) {
-            SpikeReport.add(tag, "configure 带 profile/level/bitrateMode 失败（${t.message}），去掉后重试")
-            format.removeKey(MediaFormat.KEY_PROFILE)
-            format.removeKey(MediaFormat.KEY_LEVEL)
-            format.removeKey(MediaFormat.KEY_BITRATE_MODE)
-            enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        }
-        val surface = enc.createInputSurface()
-        // 把编码器输入面的帧率钉到配置值：设备/虚拟屏是 90Hz 时 Compose 会按 90 出帧，
-        // 不钉要么被发送端丢帧成 45fps 抖动，要么 90~110fps 压垮 AirPlay 接收端。
-        runCatching {
-            surface.setFrameRate(
-                fps.toFloat(),
-                Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
-                Surface.CHANGE_FRAME_RATE_ALWAYS,
-            )
-        }
-        val ht = HandlerThread("hypercar-spike-enc")
-        ht.start()
-        val handler = Handler(ht.looper)
-        enc.setCallback(callback, handler)
-        enc.start()
-
         codec = enc
-        inputSurface = surface
-        thread = ht
-        startedAtNs = System.nanoTime()
-        statsAtNs = startedAtNs
-        running = true
+        try {
+            try {
+                enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            } catch (t: Throwable) {
+                SpikeReport.add(tag, "configure 带 profile/level/bitrateMode 失败（${t.message}），去掉后重试")
+                format.removeKey(MediaFormat.KEY_PROFILE)
+                format.removeKey(MediaFormat.KEY_LEVEL)
+                format.removeKey(MediaFormat.KEY_BITRATE_MODE)
+                enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            }
+            val surface = enc.createInputSurface()
+            inputSurface = surface
+            // 把编码器输入面的帧率钉到配置值：设备/虚拟屏是 90Hz 时 Compose 会按 90 出帧，
+            // 不钉要么被发送端丢帧成 45fps 抖动，要么 90~110fps 压垮 AirPlay 接收端。
+            runCatching {
+                surface.setFrameRate(
+                    fps.toFloat(),
+                    Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
+                    Surface.CHANGE_FRAME_RATE_ALWAYS,
+                )
+            }
+            val ht = HandlerThread("hypercar-spike-enc")
+            thread = ht
+            ht.start()
+            val handler = Handler(ht.looper)
+            enc.setCallback(callback, handler)
+            enc.start()
 
-        // 先对齐画布，再出帧（send_config 由帧里的 SPS/PPS 触发）
-        RustCoreBridge.nativeSetVideoSize(width, height)
-        val msg = "编码器启动：${width}x${height}@${fps} ${bitrate / 1000}kbps " +
-            "surface=${surface.isValid} encoder=${enc.name}"
-        SpikeReport.add(tag, msg)
-        return msg
-    }
+            codec = enc
+            inputSurface = surface
+            thread = ht
+            startedAtNs = System.nanoTime()
+            statsAtNs = startedAtNs
+            running = true
 
-    /** 用 App 自己的 VD + Presentation 出画面（无 Shizuku 时的兜底；锁屏时不合成）。 */
-    fun attachOwnDisplay(): String {
-        val surface = inputSurface ?: return "ERR 编码器未启动"
-        val dm = context.getSystemService(DisplayManager::class.java)
-            ?: return "ERR DisplayManager 不可用"
-        val vd = dm.createVirtualDisplay(
-            "hypercar-cast",
-            width,
-            height,
-            240,
-            surface,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY,
-        )
-        val displayId = vd.display.displayId
-        val stage = Presentation(context, vd.display).apply {
-            setContentView(SpikeStageView(context, width, height, displayId, fps))
-            show()
+            // 先对齐画布，再出帧（send_config 由帧里的 SPS/PPS 触发）
+            RustCoreBridge.nativeSetVideoSize(width, height)
+            val msg = "编码器启动：${width}x${height}@${fps} ${bitrate / 1000}kbps " +
+                "surface=${surface.isValid} encoder=${enc.name}"
+            SpikeReport.add(tag, msg)
+            return msg
+        } catch (error: Throwable) {
+            stop()
+            throw error
         }
-        virtualDisplay = vd
-        presentation = stage
-        val msg = "app 建屏 displayId=$displayId（Presentation）"
-        SpikeReport.add(tag, msg)
-        return msg
     }
-
-    fun start(): String = startEncoder() + " / " + attachOwnDisplay()
 
     fun stop() {
-        if (!running) return
+        val wasRunning = running
         running = false
-        runCatching { presentation?.dismiss() }
-        runCatching { virtualDisplay?.release() }
         runCatching { codec?.stop() }
         runCatching { codec?.release() }
         runCatching { inputSurface?.release() }
         runCatching { thread?.quitSafely() }
-        presentation = null
-        virtualDisplay = null
         codec = null
         inputSurface = null
         thread = null
 
+        if (!wasRunning) return
         val secs = (System.nanoTime() - startedAtNs) / 1e9
         val avgFps = if (secs > 0) frames / secs else 0.0
         SpikeReport.add(
@@ -337,63 +298,5 @@ class SpikeCaster(
             }
         }
         statsLine?.let { SpikeReport.add(tag, it) }
-    }
-}
-
-/** 编码用的测试画面：大时钟 + 帧号 + 移动色块（持续 invalidate 保证 60fps 有内容变化）。 */
-private class SpikeStageView(
-    context: Context,
-    private val targetW: Int,
-    private val targetH: Int,
-    private val displayId: Int,
-    private val targetFps: Int,
-) : View(context) {
-
-    private val clock = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
-    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE
-        textSize = 96f
-        isFakeBoldText = true
-    }
-    private val accent = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(64, 220, 255) }
-    private val green = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.rgb(80, 230, 140) }
-    private val grid = Paint().apply { color = Color.rgb(28, 40, 60); strokeWidth = 2f }
-
-    private var frame = 0L
-    private val startNs = System.nanoTime()
-
-    override fun onDraw(canvas: Canvas) {
-        frame++
-        val tMs = (System.nanoTime() - startNs) / 1_000_000
-        canvas.drawColor(Color.rgb(6, 10, 18))
-        var x = 0f
-        while (x < targetW) {
-            canvas.drawLine(x, 0f, x, targetH.toFloat(), grid)
-            x += 120f
-        }
-        var y = 0f
-        while (y < targetH) {
-            canvas.drawLine(0f, y, targetW.toFloat(), y, grid)
-            y += 120f
-        }
-
-        textPaint.textSize = 150f
-        canvas.drawText(clock.format(Date()), 80f, 200f, textPaint)
-        textPaint.textSize = 64f
-        canvas.drawText(
-            "SPIKE CAST  display=$displayId  ${targetW}x${targetH}@${targetFps}",
-            80f,
-            320f,
-            accent,
-        )
-        canvas.drawText("frame=$frame   uptime=${tMs}ms", 80f, 410f, textPaint)
-
-        val speed = 0.6f
-        val barX = (tMs * speed) % targetW.toFloat()
-        canvas.drawRect(barX, 500f, barX + 220f, 700f, green)
-        val bar2X = (targetW - ((tMs * 0.35f) % targetW.toFloat()))
-        canvas.drawRect(bar2X - 160f, 500f, bar2X, 700f, accent)
-
-        postInvalidateOnAnimation()
     }
 }

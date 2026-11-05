@@ -4,7 +4,6 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
-import android.provider.Settings
 import io.github.hypercar.core.RustCoreBridge
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.settings.SettingsStore
@@ -42,8 +41,6 @@ object CarUiCaster {
     private var caster: SpikeCaster? = null
     private var displayId = -1
     private var cpuLock: PowerManager.WakeLock? = null
-    private var appContext: Context? = null
-    @Volatile private var starting = false
 
     @Volatile
     var running: Boolean = false
@@ -51,31 +48,37 @@ object CarUiCaster {
 
     val currentDisplayId: Int get() = displayId
 
-    suspend fun start(context: Context): String {
-        if (running || starting) {
-            // stop 可能清掉监听器后卡住；重连分支必须补装，否则触摸静默丢失
+    private val lifecycle = SessionResourceLifecycle()
+
+    suspend fun start(context: Context, current: () -> Boolean = { true }): String {
+        val ticket = lifecycle.ticket()
+        return lifecycle.start(ticket, current, ::stopLocked) {
+            startLocked(context.applicationContext) { lifecycle.isCurrent(ticket) && current() }
+        } ?: "会话已停止，取消界面启动"
+    }
+
+    private suspend fun startLocked(context: Context, current: () -> Boolean): String {
+        if (running) {
+            // A new native engine needs the touch callback and source dimensions again.
             installTouchListener()
-            scope.launch {
-                if (SettingsStore.enableAudio) CarAudioCapture.start() else CarAudioCapture.stop()
-            }
+            if (SettingsStore.enableAudio) CarAudioCapture.start() else CarAudioCapture.stop()
             // 引擎重连会新建一个 encoder_size（初始值来自设置，可能是 2560x744）；
             // 画面尺寸必须重新上报，否则 Rust 触摸坐标按 2560x744 缩放，D1/D2 上点不动。
             runCatching { RustCoreBridge.nativeSetVideoSize(width, height) }
             if (MapController.mapActive) MapController.refreshVideoSize()
             scope.launch {
                 kotlinx.coroutines.delay(900)
+                if (!current()) return@launch
                 runCatching { RustCoreBridge.nativeSetVideoSize(width, height) }
                 if (MapController.mapActive) MapController.refreshVideoSize()
             }
             return "已经在跑（display=$displayId，已重新上报 ${width}x$height）"
         }
-        starting = true
         plan = SettingsStore.encodingPlan
         width = plan.width
         height = plan.height
         HyperCarRepo.log("CARUI: viewport=${SettingsStore.receiverViewport ?: (SettingsStore.videoWidth to SettingsStore.videoHeight)} stream=${width}x${height}@${plan.fps} dpi=$DPI")
-        try {
-        val c = SpikeCaster(context, width = width, height = height, fps = plan.fps, bitrate = plan.bitrate, tag = TAG)
+        val c = SpikeCaster(width = width, height = height, fps = plan.fps, bitrate = plan.bitrate, tag = TAG)
         caster = c
         val encoder = runCatching { c.startEncoder() }.getOrElse { t ->
             caster = null
@@ -107,7 +110,6 @@ object CarUiCaster {
         val launch = SpikeDisplay.amStartComponentOnDisplay(id, component, clearTask = false)
         installTouchListener()
         MapController.init(context, c)
-        appContext = context.applicationContext
 
         // 会话期 CPU 常醒 + 虚拟屏独立显示组：锁屏/息屏后车机 UI 仍保持 60fps，
         // 这是防冻结的关键，不能再删。
@@ -125,15 +127,13 @@ object CarUiCaster {
         // 引擎刚起时 nativeSetVideoSize 可能落在 ENGINE 句柄安装之前；延迟补报一次
         scope.launch {
             kotlinx.coroutines.delay(900)
+            if (!current()) return@launch
             runCatching { RustCoreBridge.nativeSetVideoSize(width, height) }
             if (MapController.mapActive) MapController.refreshVideoSize()
         }
         val msg = "启动 ok display=$id | ${width}x${height} | $encoder | bind=$bind | create=$created | launch=$launch"
         HyperCarRepo.log("CARUI: $msg")
         return msg
-        } finally {
-            starting = false
-        }
     }
 
     fun requestKeyFrame() {
@@ -144,9 +144,8 @@ object CarUiCaster {
     }
 
     /**
-     * 安装 Rust 触摸监听。stop() 会先 setTouchListener(null)；若上一次 stop 卡在
-     * shell binder/编码器释放里，running 仍是 true，重连走「已经在跑」分支时必须重装，
-     * 否则画面继续但所有触摸被静默丢弃（2026-10-27 现场定位）。
+     * Install the input callback for the currently owned display. Lifecycle changes
+     * serialize listener installation with old-display teardown.
      */
     private fun installTouchListener() {
         RustCoreBridge.setTouchListener(object : RustCoreBridge.TouchListener {
@@ -164,29 +163,30 @@ object CarUiCaster {
         })
     }
 
-    private val cleanupExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-        Thread(r, "carui-cleanup").apply { isDaemon = true }
-    }
-
-    /** 会话拆除路径调用：清理可能卡在 binder/编码器释放上，不能阻塞断开流程。 */
+    /** Retire synchronously; all cleanup stays off the UI thread. */
     fun stopAsync() {
-        runCatching { cleanupExecutor.execute { runCatching { stop() } } }
+        val retired = lifecycle.retire()
+        scope.launch { lifecycle.stop(retired, ::stopLocked) }
     }
 
-    fun stop() {
-        CarAudioCapture.stop()
-        if (!running && displayId < 0) return
+    private inline fun release(resource: String, block: () -> Unit) {
+        runCatching(block).onFailure { HyperCarRepo.log("CARUI: 释放 $resource 失败 ${it.message}") }
+    }
+
+    private fun stopLocked() {
+        release("audio") { CarAudioCapture.stop() }
+        if (!running && displayId < 0 && caster == null) return
         // 先收地图（释放 D2/复原横屏覆盖），再收 D1
-        MapController.stop()
-        MapController.reset()
-        RustCoreBridge.setTouchListener(null)
-        if (displayId > 0) SpikeShell.releaseDisplay()
+        release("map") { MapController.stop() }
+        release("map state") { MapController.reset() }
+        release("touch") { RustCoreBridge.setTouchListener(null) }
+        if (displayId > 0) release("display") { SpikeShell.releaseDisplay() }
         displayId = -1
-        runCatching { caster?.stop() }
+        release("encoder") { caster?.stop() }
         caster = null
         running = false
 
-        runCatching { cpuLock?.takeIf { it.isHeld }?.release() }
+        release("wake lock") { cpuLock?.takeIf { it.isHeld }?.release() }
         cpuLock = null
         HyperCarRepo.log("CARUI: 已停止（显示/编码器已释放）")
     }

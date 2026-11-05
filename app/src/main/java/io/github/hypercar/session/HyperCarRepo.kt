@@ -35,6 +35,7 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.CancellationException
@@ -162,7 +163,7 @@ object HyperCarRepo {
             ensurePairingIdentity(context, identityFile)
             val identityPath = identityFile.absolutePath
             val json = SettingsStore.engineConfigJson(target.host, target.port, sessionDeviceMac, identityPath,
-                receiverBluetoothMac = receiverForEngine())
+                receiverBluetoothMac = receiverForEngine(), carWithSource = sessionCarWithMode)
             log("CORE: 重试 nativeStart（$target fd=$fd，第 $attempt 次）")
             val started = RustCoreBridge.nativeStart(json, fd, socketProvider(sockets))
             log("CORE: 重试 nativeStart 返回 $started")
@@ -231,6 +232,8 @@ object HyperCarRepo {
     // 车机侧链路断开（ACL 掉、AirPlay 会话结束、车机重启）后自动重新建链，
     // 不需要用户去点「连接」。用户主动断开时置 userDisconnectRequested，不再重连。
     private var reconnectJob: Job? = null
+    private var sessionUiJob: Job? = null
+    @Volatile private var sessionCarWithMode = false
     private var automaticResumeJob: Job? = null
 
     val automaticPauseRemaining: Long get() = appContext()?.let {
@@ -439,6 +442,7 @@ object HyperCarRepo {
         reconnectJob?.cancel()
         reconnectJob = null
         sessionHadLink = false
+        sessionCarWithMode = SettingsStore.carWithMode
         sessionReceiverMac = null
         lateAirplayEndpoint.set(null)
         airplayHost = null
@@ -496,29 +500,14 @@ object HyperCarRepo {
         log("TARGET: 用户目标=${target ?: "自动"}，已清除旧 ACL 候选；入站过滤立即生效，已建立会话保持")
     }
 
-    /** 诊断：把「已配对车机」记录打进日志（调试广播 `PROBE_PAIRED` 用）。 */
-    fun debugDumpPairedCars() {
-        val list = SettingsStore.pairedCars
-        if (list.isEmpty()) {
-            log("PAIRED-DUMP: 记录为空（还没有一次成功配对被记下来）")
-            return
-        }
-        log("PAIRED-DUMP: 共 ${list.size} 条")
-        val fmt = java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.US)
-        list
-            .sortedByDescending { it.substringAfterLast('|').toLongOrNull() ?: 0L }
-            .forEach { row ->
-                val mac = row.substringBefore('|')
-                val name = row.substringBeforeLast('|').substringAfter('|')
-                val at = row.substringAfterLast('|').toLongOrNull() ?: 0L
-                val bonded = bondedNameOf(mac) != null
-                log("PAIRED-DUMP: $mac | $name | ${fmt.format(java.util.Date(at))} | 蓝牙列表可见=$bonded")
-            }
-    }
     fun disconnect() = disconnect(userInitiated = true)
 
-    private fun disconnect(userInitiated: Boolean) {
-        val attempt = connectionAttemptId
+    private fun disconnect(
+        userInitiated: Boolean,
+        expectedAttempt: Long = connectionAttemptId,
+        reason: String = if (userInitiated) "用户断开当前会话" else "车机 ACL 断开",
+    ) {
+        val attempt = expectedAttempt
         scope.launch {
             autoConnectChanges.lock()
             try {
@@ -536,7 +525,7 @@ object HyperCarRepo {
                 pending?.cancel()
                 withTimeoutOrNull(JOIN_TIMEOUT_MILLIS) { pending?.join() }
                 val keepListening = AutomaticConnectionPolicy.keepListeningAfterStop(SettingsStore.autoConnect, automaticPauseRemaining > 0)
-                runDisconnect(if (userInitiated) "用户断开当前会话" else "车机 ACL 断开", keepListening,
+                runDisconnect(reason, keepListening,
                     graceful = userInitiated)
                 if (keepListening) startStandbyListening()
                 else stopStandbyListening()
@@ -1084,7 +1073,7 @@ object HyperCarRepo {
             sessionWifiSsid = carNetworkSsid
             val identityPath = context.filesDir.resolve("controller_identity.txt").absolutePath
             val json = SettingsStore.engineConfigJson(apHostFinal, port, deviceMac, identityPath,
-                receiverBluetoothMac = receiverForEngine())
+                receiverBluetoothMac = receiverForEngine(), carWithSource = sessionCarWithMode)
             // 下发配置原样打一行（不含密钥）：分辨率/帧率一目了然，
             // 免得再靠猜「这次到底请求了多大尺寸」
             log("SESSION-ORIGIN: ctrlInvite=${advertiser.lastInvitation != null} endpointFromInvite=${endpoint.fromInvite} " +
@@ -1231,6 +1220,8 @@ object HyperCarRepo {
         streaming = false
         // P1：先停自绘界面（释放 D1 显示/编码器），再停引擎。
         // 清理涉及 shell binder/编码器释放，可能卡住；异步执行，断开流程不等它。
+        sessionUiJob?.cancel()
+        sessionUiJob = null
         CarUiCaster.stopAsync()
         // 在解绑网络、结束蓝牙旧会话之前完成有界业务退出；断网/EOF 路径只强制清理。
         runCatching {
@@ -1287,7 +1278,7 @@ object HyperCarRepo {
             scope.launch {
                 if (connectionAttemptId == attempt && wifiJoiner === joiner && sessionLive.get()) {
                     log("WIFI: 当前车机热点消失（熄火/离开）")
-                    runDisconnect("热点消失")
+                    disconnect(userInitiated = false, expectedAttempt = attempt, reason = "热点消失")
                 }
             }
         }
@@ -1896,6 +1887,7 @@ object HyperCarRepo {
         }
         override fun onState(state: String, detail: String) {
             log("CORE: [$state] $detail")
+            if (!sessionLive.get() && state in setOf("negotiating", "connected", "failed", "ended")) return
             if (state in setOf("ended", "failed", "error", "stopping")) {
                 closedPipelineGeneration.accumulateAndGet(_snapshots.value.pipeline.generation, ::maxOf)
                 _snapshots.update { s -> s.copy(pipeline = s.pipeline.copy(active = false)) }
@@ -1965,13 +1957,16 @@ object HyperCarRepo {
                     //               我们只做 CarLife 通道 → AirPlay 的转发（Rust 引擎会主动拨 7240）
                     val ctx = appContext()
                     if (ctx != null) {
-                        scope.launch {
-                            if (SettingsStore.carWithMode) {
+                        sessionUiJob?.cancel()
+                        sessionUiJob = scope.launch {
+                            fun current() = sessionLive.get() && streaming && connectionAttemptId == diagnosticId
+                            if (!current()) return@launch
+                            if (sessionCarWithMode) {
                                 val r = launchCarWith(ctx)
                                 log("CARWITH: $r")
                                 return@launch
                             }
-                            val result = runCatching { CarUiCaster.start(ctx) }
+                            val result = runCatching { CarUiCaster.start(ctx, ::current) }
                                 .getOrElse { "启动失败: ${it.javaClass.simpleName}: ${it.message}" }
                             log("CARUI: $result")
                             if (CarUiCaster.running) connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.UI_STARTED)
@@ -1984,7 +1979,7 @@ object HyperCarRepo {
                 }
                 "ended" -> {
                     MusicBridge.onCarDisconnected()
-                    scope.launch { runDisconnect(detail) }
+                    disconnect(userInitiated = false, reason = detail)
                 }
                 "stopping" -> { /* runDisconnect 内处理 */ }
             }
@@ -2266,8 +2261,6 @@ object HyperCarRepo {
                     wifiJoined = true
                     log("SESSION: 先拿到热点凭据（0x5703）——立即入网 + 广播 _carplay-ctrl，再等 0x4301")
                     joinAndBind(context, merged)
-                    val ssid = merged.ssid
-                    // merged.ssid 为非空类型，原 if (ssid != null) 恒真
                     advertiser.ensureForNetwork(merged.ssid, force = true, network = boundNetwork)
                 }
                 if (pickHost(merged) != null) {
@@ -2718,10 +2711,6 @@ object HyperCarRepo {
     /** 网关兜底端口（AirPlay 控制面惯例值）与静默试探的单次连接超时。 */
     private const val GATEWAY_FALLBACK_PORT = 7000
     private const val GATEWAY_PROBE_TIMEOUT_MILLIS = 1_200L
-    /** 网段扫描时单个 TCP 探测的超时（毫秒）：要快，宁可漏也不能拖住握手。 */
-    private const val LOCAL_PROBE_TIMEOUT_MILLIS = 250L
-    /** 复用「上次成功的端点」时的探测超时：连通就用，不通再走完整发现。 */
-    private const val REMEMBERED_PROBE_TIMEOUT_MILLIS = 600L
     /** 全段扫描的并发块大小：一次最多同时建这么多 socket（太多会被 fd 上限/AP 客户端表打回）。 */
     private const val PROBE_CHUNK_SIZE = 128
     /** 全段扫描单个地址的超时：没人应答的地址多数会立刻 EHOSTUNREACH，超时只是兜底。 */
@@ -2795,6 +2784,7 @@ object HyperCarRepo {
         val comp = "com.miui.carlink/com.miui.carlink.castfwk.usb.CarlifeAdbActivity"
         if (ShizukuTools.isReady) {
             val result = runCatching { ShizukuTools.exec("am start -n $comp", 8_000) }.getOrNull()
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
             if (result?.ok == true) return "入口启动请求已发送；等待七路通道、挑战认证与加密就绪"
         }
         return runCatching {

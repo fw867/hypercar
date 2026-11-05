@@ -142,3 +142,28 @@ CarWith 入口在 08.302 发出启动请求，此时本地 7240 尚在等待连�
 
 
 最终构建验证：120 项 Release JVM 测试全部通过；Rust release 库及签名 APK、R8、Release vital lint 构建成功。版本 `0.1.0.518 / 10518`，包内 arm64 核心库与本轮 release 产物逐字节一致，签名证书 CN=HyperCar。APK SHA-256：`5afeef998e3a90668d87380870f93553bbc3fc94a2db8eef77f64f07cbdc7e23`。未安装、提交或推送；本轮只通过 ADB 执行独立回归测试，没有启动真实 CarWith 源测试，也没有变更手机正在使用的画面源。
+
+
+## 2026-11-05：CarWith 手机设备列表名称核查
+
+从当前手机提取 `com.miui.carlink` 安装 APK 并检查 DEX 与资源，确认：
+
+- HyperCar 的主动源通过 `CarlifeAdbActivity` → `CarlinkService` 的 `CARLINK_STATUS_CASTING_CARLIFE_USB_ADB` 分支启动。
+- `CarlinkService.onStartCommand` 在该分支直接调用 `e2.g.A("百度carlife+")` 设置名称；USB AOA CarLife 分支也设置相同字面值。该分支没有从入口 Intent 读取自定义名称。
+- 手机连接信息页 `UCarConnectInfoActivity$UCarConnectInfoFragment.j2/Y1` 将该字面值本地化成 `R.string.baidu_carlife_text`（中文“百度CarLife+”）。因此列表里的名称不能靠修改 HU_INFO 的 btname/model 直接替换。
+- `CarlifeAdbActivity.c` 创建一个新 Intent，只传 `startType=3` 给服务；向 Activity 添加 `device_name` 并不会转交给该服务路径。连接信息页读取 `device_name` 仅用于页面展示，不等于支持重命名连接。
+
+结论：当前有线/ADB 条目的名称不是蓝牙名，也不是 HU_INFO 的 manufacturer/model/btname。仅修改 HU_INFO 无法解决列表显示，因此已撤回本轮两处名称修改，没有构建或安装名称修复版。不修改 CarWith APK 或私有数据库。
+
+### mcarplay 的其它命名通道
+
+核查远端固定提交 `9dd589413bf1806d6a20f6e1a6b96f848a86e477`：
+
+- [`CarLifeLauncher.kt#L201-L204`](https://github.com/wangxso/mcarplay/blob/9dd589413bf1806d6a20f6e1a6b96f848a86e477/app/src/main/java/com/mcarplay/app/carlife/CarLifeLauncher.kt#L201-L204) 的旧版内部服务启动命令传入 `startType=4`、`carlife_wireless_type=Baidu_ap`、`carlife_wireless_type_name=mcarplay`。这里的名称来自服务启动 Intent，是一条区别于 HU_INFO/蓝牙名的通道。
+- 同文件 `requestLegacyCarWithService/runLegacyServiceCommand` 检查 root UID；普通应用和 UID 2000 的 Shizuku shell 不直接启动该受保护服务。
+- [`CARWITH-4.0.4-ANALYSIS.md`](https://github.com/wangxso/mcarplay/blob/9dd589413bf1806d6a20f6e1a6b96f848a86e477/docs/CARWITH-4.0.4-ANALYSIS.md) 也说明公开入口转入 `startType=3` 的 USB/ADB 兼容路径。
+- 当前手机 APK 的 `CarlinkService.onStartCommand` 在无线服务分支确实读取 `carlife_wireless_type_name`，而 `startType=3` 分支直接写固定名称。公开 Activity 会新建 Intent，只附带 `startType=3`，不会转发额外名称。
+
+这证明有内部命名参数，但不证明向当前公开有线入口加同名 extra 就能改名；它会被丢弃。若需尝试，应单独评估具备真实 root 身份时的内部入口兼容性，而非将普通有线连接伪报为蓝牙连接。本轮没有切换入口或操作该服务。
+
+本机诊断产物：`/mnt/d/devtools/hypercar-diagnostics/carwith-name/carlink.apk`；方法摘录 `/tmp/hypercar-carlink-name-code3.txt`，资源摘录 `/tmp/hypercar-carlink-resources.txt`。第三方 APK 不提交仓库。

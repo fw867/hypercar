@@ -178,11 +178,4 @@ object CarProfileGuard {
         return true
     }
 
-    /** 主线程投递用（ACL 回调里已经不在主线程时也安全）。 */
-    fun enforceAsync(context: Context, device: BluetoothDevice, address: String, reason: String) {
-        val epoch = generation.get()
-        mainHandler.post {
-            if (epoch == generation.get()) enforce(context, device, address, reason)
-        }
-    }
 }

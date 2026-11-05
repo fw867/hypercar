@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -178,6 +178,17 @@ pub struct RtspChannel {
     cseq: Arc<Mutex<i32>>,
     pending: Arc<Mutex<HashMap<i32, oneshot::Sender<RtspMessage>>>>,
     reader: tokio::task::JoinHandle<()>,
+    closed: AtomicBool,
+}
+
+// Removal is also required when a request future is cancelled by its caller. A partially
+// written encrypted transaction cannot be resumed: its cipher counter has already advanced.
+struct TransactionGuard<'a> { channel: &'a RtspChannel, cseq: i32, writing: bool }
+impl Drop for TransactionGuard<'_> {
+    fn drop(&mut self) {
+        self.channel.pending.lock().remove(&self.cseq);
+        if self.writing { self.channel.close(); }
+    }
 }
 
 impl RtspChannel {
@@ -220,6 +231,7 @@ impl RtspChannel {
             cseq,
             pending,
             reader,
+            closed: AtomicBool::new(false),
         });
         (this, inbound)
     }
@@ -249,6 +261,8 @@ impl RtspChannel {
         extra_headers: &[(&str, String)],
         timeout: Duration,
     ) -> Result<RtspMessage, String> {
+        if self.is_closed() { return Err("控制通道已关闭".into()); }
+        let deadline = tokio::time::Instant::now() + timeout;
         let cseq = self.next_cseq();
         let started = std::time::Instant::now();
         let trace = path != "/feedback";
@@ -258,6 +272,7 @@ impl RtspChannel {
         }
         let (tx, rx) = oneshot::channel();
         self.pending.lock().insert(cseq, tx);
+        let mut transaction = TransactionGuard { channel: self, cseq, writing: false };
 
         let head = format!(
             "{method} {path} RTSP/1.0\r\n\
@@ -277,7 +292,10 @@ impl RtspChannel {
         plaintext.extend_from_slice(body);
 
         {
-            let mut w = self.write.lock().await;
+            let mut w = tokio::time::timeout_at(deadline, self.write.lock()).await
+                .map_err(|_| format!("RTSP 等待写锁超时 CSeq={cseq} {method} {path}"))?;
+            if self.is_closed() { return Err("控制通道已关闭".into()); }
+            transaction.writing = true;
             // 心跳与 RECORD 可并发等待应答；加密 nonce 的分配顺序必须等于上线路序。
             let wire = {
                 let mut guard = self.cipher.lock();
@@ -286,23 +304,24 @@ impl RtspChannel {
                     None => plaintext,
                 }
             };
-            if let Err(error) = w.write_all(&wire).await {
-                self.pending.lock().remove(&cseq);
+            let written = tokio::time::timeout_at(deadline, async {
+                w.write_all(&wire).await?;
+                w.flush().await
+            }).await.map_err(|_| format!("RTSP 发送超时 CSeq={cseq} {method} {path}"))?;
+            if let Err(error) = written {
                 let detail = format!("RTSP#{} CSeq={cseq} {method} {path} 写失败: {error}", self.trace_id);
                 crate::emit_log(&detail);
                 return Err(detail);
             }
-            w.flush().await.ok();
+            transaction.writing = false;
         }
 
-        let result = match tokio::time::timeout(timeout, rx).await {
+        let result = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(msg)) => Ok(msg),
             Ok(Err(_)) => {
-                self.pending.lock().remove(&cseq);
                 Err(format!("控制通道已关闭（等待 CSeq={cseq} {method} {path}）"))
             }
             Err(_) => {
-                self.pending.lock().remove(&cseq);
                 Err(format!("RTSP 超时（{timeout:?}，CSeq={cseq} {method} {path}）"))
             }
         };
@@ -321,7 +340,10 @@ impl RtspChannel {
         body: &[u8],
         content_type: &str,
     ) -> Result<i32, String> {
+        if self.is_closed() { return Err("控制通道已关闭".into()); }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         let cseq = self.next_cseq();
+        let mut transaction = TransactionGuard { channel: self, cseq, writing: false };
         let head = format!(
             "POST {path} RTSP/1.0\r\n\
              Content-Type: {content_type}\r\n\
@@ -332,7 +354,10 @@ impl RtspChannel {
         let mut plaintext = Vec::with_capacity(head.len() + body.len());
         plaintext.extend_from_slice(head.as_bytes());
         plaintext.extend_from_slice(body);
-        let mut w = self.write.lock().await;
+        let mut w = tokio::time::timeout_at(deadline, self.write.lock()).await
+            .map_err(|_| "事件通道等待写锁超时".to_string())?;
+        if self.is_closed() { return Err("控制通道已关闭".into()); }
+        transaction.writing = true;
         let wire = {
             let mut guard = self.cipher.lock();
             match guard.as_mut() {
@@ -340,19 +365,22 @@ impl RtspChannel {
                 None => plaintext,
             }
         };
-        w.write_all(&wire)
-            .await
+        tokio::time::timeout_at(deadline, async {
+            w.write_all(&wire).await?;
+            w.flush().await
+        }).await.map_err(|_| "事件通道发送超时".to_string())?
             .map_err(|e| format!("事件通道写失败: {e}"))?;
-        w.flush().await.ok();
+        transaction.writing = false;
         Ok(cseq)
     }
 
     pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
         self.reader.abort();
         self.pending.lock().clear();
     }
 
-    pub fn is_closed(&self) -> bool { self.reader.is_finished() }
+    pub fn is_closed(&self) -> bool { self.closed.load(Ordering::Acquire) || self.reader.is_finished() }
 
     pub async fn shutdown(&self) {
         self.close();
@@ -586,9 +614,84 @@ mod tests {
             "POST", "/feedback", &[], "application/octet-stream", &[], Duration::from_secs(2),
         )).await;
         assert!(cancelled.is_err());
+        assert!(channel.pending.lock().is_empty());
+        assert!(!channel.is_closed());
         assert_eq!(channel.cipher.lock().as_ref().unwrap().write_counter, 0);
         drop(busy_writer);
         assert_eq!(channel.request("RECORD", "/", &[], "application/octet-stream", &[], Duration::from_secs(2)).await.unwrap().status(), 200);
         peer.await.unwrap();
+    }
+}
+
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn pair() -> (Arc<RtspChannel>, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        let (r,w) = socket.into_split();
+        let (channel,_) = RtspChannel::spawn(r,w,None);
+        (channel,peer)
+    }
+
+    async fn read_request(peer: &mut TcpStream) -> RtspMessage {
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 2048];
+        loop {
+            let n = peer.read(&mut chunk).await.unwrap();
+            assert!(n > 0);
+            bytes.extend_from_slice(&chunk[..n]);
+            if let Some(message) = parse_rtsp_messages(&mut bytes).pop() { return message; }
+        }
+    }
+
+    #[tokio::test]
+    async fn request_budget_includes_waiting_for_writer() {
+        let (channel,_peer) = pair().await;
+        let held = channel.write.lock().await;
+        let result = tokio::time::timeout(Duration::from_secs(1), channel.request(
+            "RECORD", "/", &[], "application/octet-stream", &[], Duration::from_millis(20),
+        )).await.unwrap();
+        assert!(result.unwrap_err().contains("写锁超时"));
+        assert!(channel.pending.lock().is_empty());
+        assert!(!channel.is_closed());
+        drop(held); channel.close();
+    }
+
+    #[tokio::test]
+    async fn cancelled_response_waiter_is_removed_without_closing_healthy_channel() {
+        let (channel,mut peer) = pair().await;
+        let requester = channel.clone();
+        let task = tokio::spawn(async move { requester.request(
+            "POST", "/command", &[], "application/octet-stream", &[], Duration::from_secs(3),
+        ).await });
+        let _ = read_request(&mut peer).await;
+        task.abort(); assert!(task.await.unwrap_err().is_cancelled());
+        assert!(channel.pending.lock().is_empty());
+        assert!(!channel.is_closed());
+        let car = tokio::spawn(async move {
+            let request = read_request(&mut peer).await;
+            peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",request.cseq().unwrap()).as_bytes()).await.unwrap();
+        });
+        assert_eq!(channel.request("RECORD", "/", &[], "application/octet-stream", &[], Duration::from_secs(1)).await.unwrap().status(), 200);
+        car.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timed_out_partial_write_invalidates_transport_and_all_pending_requests() {
+        let (channel,_peer) = pair().await;
+        // A peer that never reads cannot accept this body into its TCP receive window.
+        let payload = vec![7; 16 * 1024 * 1024];
+        let result = tokio::time::timeout(Duration::from_secs(2), channel.request(
+            "POST", "/command", &payload, "application/octet-stream", &[], Duration::from_millis(30),
+        )).await.unwrap();
+        assert!(result.unwrap_err().contains("发送超时"));
+        assert!(channel.is_closed());
+        assert!(channel.pending.lock().is_empty());
+        assert!(channel.request("RECORD", "/", &[], "application/octet-stream", &[], Duration::from_secs(1)).await.is_err());
     }
 }

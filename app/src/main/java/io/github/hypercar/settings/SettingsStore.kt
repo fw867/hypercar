@@ -336,6 +336,7 @@ object SettingsStore {
         width: Int = videoWidth,
         height: Int = videoHeight,
         receiverBluetoothMac: String? = null,
+        carWithSource: Boolean = carWithMode,
     ): String {
         fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
         // 触摸兜底空间：车机档案若给了 touchDisplay 就用它；否则用设置里的
@@ -360,7 +361,7 @@ object SettingsStore {
             append("\"car_ip\":\"").append(esc(carIp)).append("\",")
             append("\"airplay_port\":").append(airplayPort).append(",")
             // CarWith 模式：视频/音频源改由本机 CarLife（CarWith）提供（2026-11-03）
-            append("\"carlife_source\":").append(if (carWithMode) "true" else "false").append(",")
+            append("\"carlife_source\":").append(if (carWithSource) "true" else "false").append(",")
             append("\"carwith_stretch\":").append(if (carWithStretch) "true" else "false").append(",")
             append("\"screen_resource_lifecycle\":").append(if (screenResourceLifecycle) "true" else "false").append(",")
             append("\"width\":").append(plan.width).append(",")

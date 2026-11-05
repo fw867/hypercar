@@ -62,14 +62,12 @@ static LISTENER: RwLock<Option<GlobalRef>> = RwLock::new(None);
 /// 车机 HID 触摸回调（Rust → Kotlin）。
 ///
 /// 与 [LISTENER] 分开持有 GlobalRef：触摸是高频事件（车机滑一下就是几十条），
-/// 不能因为 UI 层临时把 EventListener 置空而丢触摸；EngineHandle 里另有一条
-/// 触摸通道（`touch_tx`），引擎重启不需要重装监听器。
+/// 不能因为 UI 层临时把 EventListener 置空而丢触摸；引擎重启不需要重装监听器。
 static TOUCH_LISTENER: RwLock<Option<GlobalRef>> = RwLock::new(None);
 
 struct EngineHandle {
     shutdown: Arc<shutdown::EngineShutdown>,
     abort: tokio::task::AbortHandle,
-    touch_tx: mpsc::UnboundedSender<TouchInput>,
     /// 自绘界面投喂给引擎的视频帧 / 音频 PCM（nativePushVideoFrame / nativePushAudioPcm）
     source_tx: mpsc::UnboundedSender<engine::SourceEvent>,
     carwith_source: bool,
@@ -444,8 +442,16 @@ fn native_start_impl(
     control_fd: jint,
     socket_provider: JObject,
 ) -> jboolean {
-    // 停旧引擎
-    stop_engine(false);
+    if control_fd < 0 {
+        emit_log("controlFd 非法");
+        return JNI_FALSE;
+    }
+    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(control_fd as RawFd) };
+    // Own the descriptor before any fallible operation; failure closes it through RAII.
+    if !stop_engine(false) {
+        emit_log("nativeStart: 旧引擎尚未退出，拒绝重叠启动");
+        return JNI_FALSE;
+    }
 
     let config_str: String = match env.get_string(&config_json) {
         Ok(s) => s.into(),
@@ -458,10 +464,6 @@ fn native_start_impl(
             return JNI_FALSE;
         }
     };
-    if control_fd < 0 {
-        emit_log("controlFd 非法");
-        return JNI_FALSE;
-    }
     emit_log("nativeStart: 配置已解析，开始接管控制 FD");
 
     // 控制 FD → 非阻塞 tokio TcpStream（所有权移交 Rust）
@@ -472,12 +474,11 @@ fn native_start_impl(
     // 2026-10-23 20:44 的秒崩就死在这一行：日志停在「CORE: 调用 nativeStart」，之后
     // 一条 CORE 都没有（'there is no reactor running' panic → abort）。这里显式 enter()。
     let control_stream = {
-        let std_stream = unsafe {
-            let std_stream = std::net::TcpStream::from_raw_fd(control_fd as RawFd);
-            let _ = std_stream.set_nonblocking(true);
-            let _ = std_stream.set_nodelay(true);
-            std_stream
-        };
+        if let Err(error) = std_stream.set_nonblocking(true) {
+            emit_log(&format!("控制 FD 设置非阻塞失败: {error}"));
+            return JNI_FALSE;
+        }
+        let _ = std_stream.set_nodelay(true);
         let _enter = TOKIO_RT.enter();
         match TcpStream::from_std(std_stream) {
             Ok(s) => s,
@@ -568,7 +569,6 @@ fn native_start_impl(
     *ENGINE.lock() = Some(EngineHandle {
         shutdown,
         abort,
-        touch_tx,
         source_tx,
         carwith_source,
         touch_size,
@@ -676,28 +676,6 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePushAud
             rate: rate.max(8000) as u32,
             channels: channels.clamp(1, 2) as u8,
             data: bytes,
-        });
-    }
-}
-
-/// **SPIKE-P0 调试专用**：把一条触摸直接塞进引擎的触摸通道。
-///
-/// 没有车机/接收端发 HID 时，用它验证「Rust 触摸通道 → JNI → Kotlin onTouch」这条
-/// 回调链是否通（HID 报告解析本身由 `airplay::handle_hid_report` 负责，车上已定谳）。
-/// 生产路径不调用它；P0 结束后可删。
-#[no_mangle]
-pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeDebugTouch(
-    _env: JNIEnv,
-    _class: JClass,
-    action: jint,
-    x: jint,
-    y: jint,
-) {
-    if let Some(handle) = ENGINE.lock().as_ref() {
-        let _ = handle.touch_tx.send(TouchInput {
-            action: action.clamp(0, 2) as u32,
-            x: x.max(0) as u32,
-            y: y.max(0) as u32,
         });
     }
 }
