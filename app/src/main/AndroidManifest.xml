@@ -140,6 +140,8 @@
             </intent-filter>
         </service>
 
+        <receiver android:name=".autowake.AutomaticConnectionResume" android:exported="false" />
+
         <receiver
             android:name=".autowake.CarBluetoothReceiver"
             android:exported="true">

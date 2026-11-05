@@ -39,7 +39,7 @@ class CarBluetoothReceiver : BroadcastReceiver() {
         }
         val app = context.applicationContext
         // 每次都读开关：进程可能刚被广播冷启动，无内存缓存可依赖
-        if (!SettingsStore.autoConnect) return
+        if (!SettingsStore.autoConnect && (connected || !io.github.hypercar.session.HyperCarRepo.hasCurrentSession)) return
 
         val device = deviceOf(intent)
         if (device == null) {

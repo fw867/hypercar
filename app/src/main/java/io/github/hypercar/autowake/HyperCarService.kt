@@ -32,6 +32,16 @@ class HyperCarService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val automatic = intent?.action != ACTION_SESSION
         val autoEnabled = io.github.hypercar.settings.SettingsStore.autoConnect
+        if (automatic && autoEnabled && io.github.hypercar.session.HyperCarRepo.automaticPauseRemaining > 0) {
+            io.github.hypercar.session.HyperCarRepo.startAutomaticListening(this)
+            if (!io.github.hypercar.session.HyperCarRepo.hasCurrentSession) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                releaseLocks()
+                isRunning = false
+                stopSelf()
+            }
+            return START_NOT_STICKY
+        }
         if (automatic && autoEnabled && !io.github.hypercar.session.HyperCarRepo.hasCurrentSession &&
             !io.github.hypercar.session.StartupRequirements.read(this).automaticReady) {
             io.github.hypercar.session.HyperCarRepo.setAutoConnect(this, false)

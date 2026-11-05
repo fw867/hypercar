@@ -63,9 +63,7 @@ pub struct EngineConfig {
     #[serde(default)]
     pub carwith_stretch: bool,
     #[serde(default)]
-    pub ui_retake_recovery: bool,
-    #[serde(default)]
-    pub screen_stream_recovery: bool,
+    pub screen_resource_lifecycle: bool,
     #[serde(default)]
     pub desktop_receiver: bool,
     pub identity_path: String,
@@ -218,7 +216,7 @@ pub async fn run_engine(
     // ---- 视频泵 ----
     let (screen_ready_tx, screen_ready_rx) = mpsc::channel::<crate::screen_session::ScreenCommand>(2);
     let video_stats = Arc::new(Mutex::new(PumpStat::default()));
-    tasks.spawn(video_pump(stop.clone(), video_stats.clone(), cfg.screen_stream_recovery,
+    tasks.spawn(video_pump(stop.clone(), video_stats.clone(), cfg.screen_resource_lifecycle,
         pipeline.clone(), screen_ready_rx, video_rx));
 
     // ---- 音频泵：重采样 + 闪避混音 + RTP ----
@@ -426,8 +424,7 @@ pub async fn run_engine(
         touch_size: touch_size.clone(),
         carwith_display,
         carwith_stretch: cfg.carlife_source && cfg.carwith_stretch,
-        ui_retake_recovery: cfg.ui_retake_recovery,
-        screen_stream_recovery: cfg.screen_stream_recovery,
+        screen_resource_lifecycle: cfg.screen_resource_lifecycle,
         pipeline: pipeline.clone(),
     };
     let outcome = tokio::select! {
@@ -447,7 +444,9 @@ pub async fn run_engine(
 
     // Requests share the encrypted control channel, with their own CSeq; feedback continues independently.
     let keepalive = outcome.keepalive;
-    let teardown = outcome.teardown;
+    let mut teardown = outcome.teardown;
+    let resource_session = outcome.resource_session;
+    let had_audio = outcome.audio.is_some();
     let control = outcome.control;
     let close_control = control.clone();
     let stop_ui = stop.clone();
@@ -508,16 +507,21 @@ pub async fn run_engine(
     // 停媒体泵后才发业务 TEARDOWN，控制通道保留到应答/超时，最后再解绑网络。
     tasks.shutdown().await;
     drop(keepalive);
+    if let Some(session) = resource_session {
+        if let Ok(current) = tokio::time::timeout(Duration::from_millis(250), session.resource_teardown(had_audio)).await {
+            teardown = current;
+        }
+    }
     airplay::finish_session(&close_control, &teardown, shutdown.graceful()).await;
     Ok(())
 }
 
-/// Optional recovery commands are a separate control plane. Its producer may finish after
-/// negotiation with recovery disabled; that does not end the active media source/stream.
-async fn video_pump(
+/// Optional screen lifecycle commands are a separate control plane. Its producer may finish after
+/// negotiation with resource lifecycle disabled; that does not end the active media source/stream.
+pub(crate) async fn video_pump(
     stop_v: Arc<Notify>,
     stats: Arc<Mutex<PumpStat>>,
-    screen_recoverable: bool,
+    resource_lifecycle: bool,
     video_pipeline: Arc<Mutex<crate::pipeline::Pipeline>>,
     mut screen_ready_rx: mpsc::Receiver<crate::screen_session::ScreenCommand>,
     video_rx: mpsc::UnboundedReceiver<SourceEvent>,
@@ -545,14 +549,29 @@ async fn video_pump(
                     crate::emit_force_keyframe();
                     emit_log(&format!("VIDEO: sender ready; discarded_before_ready_units={before_ready_units}; request fresh SPS/PPS/IDR"));
                 }
+                Some(crate::screen_session::ScreenCommand::InstallIfOwned { sender: mut next, modes, revision, reply }) => {
+                    let accepted = {
+                        let state = modes.lock();
+                        if state.can_restore_screen(revision) {
+                            next.set_resource_grant(modes.clone(),revision);
+                            if let Some((w,h)) = pending_size.take() { next.set_size(w,h); }
+                            video_pipeline.lock().video_stream="READY".into();
+                            sender = Some(next);
+                            true
+                        } else { false }
+                    };
+                    let _ = reply.send(accepted);
+                    emit_log(&format!("SCREEN-LIFECYCLE: video pump install revision={revision} accepted={accepted}"));
+                    if accepted { crate::emit_force_keyframe(); }
+                }
                 Some(crate::screen_session::ScreenCommand::Pause(reply)) => {
                     drop(sender.take());
                     let _=reply.send(());
-                    emit_log("VIDEO: old sender released; screen recovery pause acknowledged");
+                    emit_log("VIDEO: old sender released; screen lifecycle pause acknowledged");
                 }
                 None => {
                     commands_open = false;
-                    emit_log("VIDEO: recovery command channel closed; keep current stream/source and keepAlive active");
+                    emit_log("VIDEO: screen command channel closed; keep current stream/source and keepAlive active");
                 },
             },
             ev = video_rx.recv() => match ev {
@@ -589,16 +608,16 @@ async fn video_pump(
                         } else {
                             pts_us
                         };
-                        let written=if screen_recoverable {
+                        let written=if resource_lifecycle {
                             tokio::time::timeout(Duration::from_secs(2),s.send_video_annexb(&data,pts)).await
                                 .unwrap_or_else(|_|Err(std::io::Error::new(std::io::ErrorKind::TimedOut,"video TCP write timeout")))
                         } else { s.send_video_annexb(&data,pts).await };
                         if let Err(error) = written {
                             emit_log(&format!("VIDEO: write failed: {error}; {}", s.diagnostics()));
                             video_pipeline.lock().video_stream="FAILED".into();
-                            if screen_recoverable {
+                            if resource_lifecycle {
                                 drop(sender.take());
-                                emit_log("SCREEN-RECOVERY: video write failed; keep audio/control, await next allowed requestUI");
+                                emit_log("SCREEN-LIFECYCLE: video write failed; keep audio/control, await next allowed requestUI");
                                 continue;
                             }
                             emit_state("ended", "屏幕流写失败（请检查网络及车机会话）");
@@ -620,16 +639,16 @@ async fn video_pump(
             _ = tick.tick() => {
                 // 屏幕流 keepAlive 帧（明文、1s 节流；缺它 Audi MMI 3315 10.2s 拆轮）
                 if let Some(s) = sender.as_mut() {
-                    let written=if screen_recoverable {
+                    let written=if resource_lifecycle {
                         tokio::time::timeout(Duration::from_secs(2),s.maybe_send_keep_alive()).await
                             .unwrap_or_else(|_|Err(std::io::Error::new(std::io::ErrorKind::TimedOut,"video keepAlive write timeout")))
                     } else { s.maybe_send_keep_alive().await };
                     if let Err(error) = written {
                         emit_log(&format!("VIDEO: keepAlive failed: {error}; {}", s.diagnostics()));
                         video_pipeline.lock().video_stream="FAILED".into();
-                        if screen_recoverable {
+                        if resource_lifecycle {
                             drop(sender.take());
-                            emit_log("SCREEN-RECOVERY: video keepAlive failed; preserve other channels");
+                            emit_log("SCREEN-LIFECYCLE: video keepAlive failed; preserve other channels");
                             continue;
                         }
                         emit_state("ended", "屏幕保活写失败");
@@ -644,6 +663,19 @@ async fn video_pump(
 #[cfg(test)]
 mod video_pump_tests {
     use super::*;
+    #[test]
+    fn obsolete_recovery_flags_do_not_enable_the_new_experiment() {
+        let mut json=serde_json::json!({
+            "device_id":"test","car_ip":"127.0.0.1","airplay_port":7000,
+            "width":1920,"height":720,"fps":60,"identity_path":"unused",
+            "ui_retake_recovery":true,"screen_stream_recovery":true,
+        });
+        let config:EngineConfig=serde_json::from_value(json.clone()).unwrap();
+        assert!(!config.screen_resource_lifecycle);assert!(config.enable_audio);
+        json["screen_resource_lifecycle"]=serde_json::json!(true);
+        let config:EngineConfig=serde_json::from_value(json).unwrap();
+        assert!(config.screen_resource_lifecycle);assert!(config.enable_audio);
+    }
     use tokio::io::AsyncReadExt;
     #[tokio::test]
     async fn negotiation_command_sender_drop_does_not_stop_video_or_keepalive() {
@@ -791,7 +823,7 @@ fn take_or_zero(q: &mut VecDeque<i16>) -> i16 {
 // ---------------------------------------------------------------- 统计
 
 #[derive(Default)]
-struct PumpStat {
+pub(crate) struct PumpStat {
     source_units: u64,
     frames: u64,
     bytes: u64,

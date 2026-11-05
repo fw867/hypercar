@@ -1208,8 +1208,7 @@ private fun BehaviorSection(startup: io.github.hypercar.session.StartupReadiness
     var discoveryFallback by rememberSaveable { mutableStateOf(SettingsStore.bluetoothDiscoverableFallback) }
     var carPlayMarker by rememberSaveable { mutableStateOf(SettingsStore.bluetoothCarPlayMarker) }
     var proactiveWifi by rememberSaveable { mutableStateOf(SettingsStore.proactiveWifiSession) }
-    var uiRetake by rememberSaveable { mutableStateOf(SettingsStore.uiRetakeRecovery) }
-    var screenRecovery by rememberSaveable { mutableStateOf(SettingsStore.screenStreamRecovery) }
+    var resourceLifecycle by rememberSaveable { mutableStateOf(SettingsStore.screenResourceLifecycle) }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionLabel(text = "自动连接与恢复")
@@ -1275,24 +1274,13 @@ private fun BehaviorSection(startup: io.github.hypercar.session.StartupReadiness
             )
             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
             SwitchRow(
-                title = "CarPlay 界面恢复（实验）",
-                subtitle = "已连接却点不开时，再次点击车机 CarPlay 图标尝试恢复画面；下次连接生效",
-                checked = uiRetake,
+                title = "画面资源联动（实验）",
+                subtitle = "取得主屏后建立视频通道，车机收回主屏时释放视频并保留音频，下次连接生效",
+                checked = resourceLifecycle,
                 onCheckedChange = {
-                    uiRetake = it
-                    SettingsStore.uiRetakeRecovery = it
-                    HyperCarRepo.log("UI-RECOVERY: 实验开关=${if (it) "开" else "关"}，下次连接生效")
-                },
-            )
-            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-            SwitchRow(
-                title = "视频通道重建（实验）",
-                subtitle = "再次点击 CarPlay 图标时仅重建视频通道，保留音频；可单独测试，下次连接生效",
-                checked = screenRecovery,
-                onCheckedChange = {
-                    screenRecovery = it
-                    SettingsStore.screenStreamRecovery = it
-                    HyperCarRepo.log("SCREEN-RECOVERY: 实验开关=${if (it) "开" else "关"}，下次连接生效")
+                    SettingsStore.screenResourceLifecycle = it
+                    resourceLifecycle = SettingsStore.screenResourceLifecycle
+                    HyperCarRepo.log("SCREEN-LIFECYCLE: 实验开关=${if (it) "开" else "关"}，下次连接生效")
                 },
             )
         }

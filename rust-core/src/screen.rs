@@ -106,6 +106,7 @@ pub struct ScreenSender {
     waiting_idr: bool,
     last_sync_request: Option<tokio::time::Instant>,
     ownership: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    resource_grant: Option<(std::sync::Arc<parking_lot::Mutex<crate::modes::Modes>>,u64)>,
     source_frames: u64,
     ownership_skips: u64,
     sync_skips: u64,
@@ -151,6 +152,7 @@ impl ScreenSender {
             waiting_idr: true,
             last_sync_request: None,
             ownership: None,
+            resource_grant: None,
             source_frames: 0,
             ownership_skips: 0,
             sync_skips: 0,
@@ -206,8 +208,14 @@ impl ScreenSender {
         self.observe_owner();
     }
 
+    pub fn set_resource_grant(&mut self, modes:std::sync::Arc<parking_lot::Mutex<crate::modes::Modes>>, revision:u64) {
+        // Do not observe here: installation validates while holding the same arbitration lock.
+        self.resource_grant=Some((modes,revision));
+    }
+
     fn observe_owner(&mut self) -> bool {
-        let owned = self.ownership.as_ref().map(|v| v.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(true);
+        let owned = self.ownership.as_ref().map(|v| v.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(true)
+            && self.resource_grant.as_ref().map(|(modes,revision)|modes.lock().can_restore_screen(*revision)).unwrap_or(true);
         if self.last_owner != Some(owned) {
             crate::emit_log(&format!("VIDEO: screen gate phone_owned={owned} written_frames={} source_units={} (local arbitration; not receiver display confirmation)", self.frames, self.source_frames));
             self.last_owner = Some(owned);

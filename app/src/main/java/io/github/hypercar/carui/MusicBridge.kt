@@ -94,7 +94,7 @@ class MusicNotificationListener : NotificationListenerService() {
         // Owned by the main thread; requestUnbind releases the SYSTEM binding, not permission.
         private var connected: MusicNotificationListener? = null
 
-        private fun shouldListen() = io.github.hypercar.settings.SettingsStore.autoConnect ||
+        private fun shouldListen() = HyperCarRepo.automaticConnectionAllowed ||
             HyperCarRepo.hasCurrentSession
 
         private fun pauseListening() {
@@ -103,7 +103,7 @@ class MusicNotificationListener : NotificationListenerService() {
             MusicBridge.detach("连接监听已暂停")
             runCatching { listener.requestUnbind() }
                 .onFailure { HyperCarRepo.log("MUSIC: 暂停系统绑定失败 ${it.message}") }
-            HyperCarRepo.log("MUSIC: 自动连接关闭且无会话，已暂停音乐监听")
+            HyperCarRepo.log("MUSIC: 自动监听关闭或休眠且无会话，已暂停音乐监听")
         }
 
         /** Re-evaluate on delivery so rapid stop/start or switch changes cannot apply stale state. */

@@ -90,10 +90,8 @@ fun StatusHeroCard(
     profileLabel: String? = null,
     modifier: Modifier = Modifier,
 ) {
-    val isConnected = link is LinkState.Connected
     var nowMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(isConnected) {
-        if (!isConnected) return@LaunchedEffect
+    LaunchedEffect(Unit) {
         while (true) {
             nowMillis = System.currentTimeMillis()
             delay(1000L)
@@ -157,6 +155,8 @@ fun StatusHeroCard(
 
 @Composable
 private fun HeroHeadline(link: LinkState, nowMillis: Long, profileLabel: String? = null, autoConnectEnabled: Boolean = true) {
+    val pauseRemaining = io.github.hypercar.session.HyperCarRepo.automaticPauseRemaining
+    val paused = autoConnectEnabled && pauseRemaining > 0
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
@@ -170,12 +170,13 @@ private fun HeroHeadline(link: LinkState, nowMillis: Long, profileLabel: String?
             when (link) {
                 is LinkState.Idle -> {
                     Text(
-                        text = if (autoConnectEnabled) "等待上车" else "手动连接",
+                        text = if (paused) "自动连接已暂停" else if (autoConnectEnabled) "等待上车" else "手动连接",
                         style = MaterialTheme.typography.titleLarge,
                         color = TextPrimary,
                     )
                     Text(
-                        text = if (autoConnectEnabled) "正在监听车机，也可手动启动连接" else "自动监听已关闭，仍可手动启动连接",
+                        text = if (paused) "约 ${(pauseRemaining + 59_999) / 60_000} 分钟后恢复，仍可手动启动连接"
+                            else if (autoConnectEnabled) "正在监听车机，也可手动启动连接" else "自动监听已关闭，仍可手动启动连接",
                         style = MaterialTheme.typography.bodyMedium,
                         color = TextSecondary,
                     )

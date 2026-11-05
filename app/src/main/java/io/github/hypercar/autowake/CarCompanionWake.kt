@@ -197,7 +197,7 @@ object CarCompanionWake {
     }
 
     @Synchronized fun appeared(context: Context, info: AssociationInfo) {
-        if (!supported(context)) return
+        if (!supported(context) || !HyperCarRepo.automaticConnectionAllowed) return
         val address = info.deviceMacAddress?.toString() ?: return
         val now = SystemClock.elapsedRealtime()
         val last = lastTrigger.takeIf { address.equals(lastAddress, ignoreCase = true) }

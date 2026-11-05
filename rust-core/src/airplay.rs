@@ -63,8 +63,7 @@ pub struct AirplayParams {
     /// CarWith-only requested canvas. None leaves the self-rendered display path unchanged.
     pub carwith_display: Option<Arc<Mutex<(u32, u32)>>>,
     pub carwith_stretch: bool,
-    pub ui_retake_recovery: bool,
-    pub screen_stream_recovery: bool,
+    pub screen_resource_lifecycle: bool,
     pub pipeline: Arc<Mutex<crate::pipeline::Pipeline>>,
 }
 
@@ -81,6 +80,7 @@ pub struct AirplayOutcome {
     pub audio: Option<AudioOut>,
     pub keepalive: KeepaliveTasks,
     pub teardown: Vec<u8>,
+    pub resource_session: Option<Arc<crate::screen_session::ScreenSession>>,
 }
 
 /// 跑完整个 AirPlay 协商，返回屏幕/音频发送器（交给 pump 任务）。
@@ -320,6 +320,11 @@ pub async fn negotiate(
         let mut health=reply_pipeline.lock();
         health.screen_owned=Some(modes.screen_owned());
         if command.get("type").and_then(Value::as_str)==Some("requestUI") { health.ui_requests+=1; }
+        drop(health);
+        if matches!(command.get("type").and_then(Value::as_str), Some("changeModes") | Some("requestUI")) {
+            emit_log(&format!("MODES: event applied type={} {}; reply_bytes={}",
+                command.get("type").and_then(Value::as_str).unwrap_or("?"),modes.diagnostics(),response.as_ref().map(Vec::len).unwrap_or(0)));
+        }
         response
     })));
 
@@ -349,15 +354,15 @@ pub async fn negotiate(
         control:channel.clone(), factory:factory.clone(), params:p.clone(), shared:shared_secret,
         uuid:display_uuid.clone().unwrap_or_else(|| "6E4E3B31-0E5B-4A8F-9F1B-2C5D7E9A0C11".into()),
         keep_stats:keep_alive_stats, display:(disp_w,disp_h), owned:screen_owned.clone(),
-        commands:screen_ready, initialized:std::sync::atomic::AtomicBool::new(false),
+        commands:screen_ready,
+        activated:std::sync::atomic::AtomicBool::new(false), resource_state:tokio::sync::Mutex::new(Default::default()),
     });
     keepalive.0.push(spawn_event_dispatcher(
         event_rx,
         channel.clone(),
         wifi_iap_id,
         modes.clone(),
-        p.ui_retake_recovery,
-        p.screen_stream_recovery.then(|| screen_session.clone()),
+        p.screen_resource_lifecycle.then(|| screen_session.clone()),
         touch_tx,
         key_tx,
         // 触摸的「显示空间」分母，优先级：
@@ -397,9 +402,19 @@ pub async fn negotiate(
     p.pipeline.lock().control_ready=true;
 
     // ---- 6. 屏幕流 SETUP ----
-    let screen = screen_session.open().await?;
-    screen_session.install(screen).await?;
-    emit_state("connected", "控制会话与视频通道就绪；车机显示尚未确认");
+    screen_session.activated.store(true, std::sync::atomic::Ordering::Release);
+    emit_log(&format!("SCREEN-LIFECYCLE: session enabled={} initial={}", p.screen_resource_lifecycle,modes.lock().diagnostics()));
+    if p.screen_resource_lifecycle {
+        if let Err(error) = screen_session.reconcile_resource(&modes).await {
+            p.pipeline.lock().video_stream="FAILED".into();
+            emit_log(&format!("SCREEN-LIFECYCLE: initial video failed: {error}; preserve audio/control"));
+        }
+        emit_state("connected", "控制会话就绪；视频通道随主屏使用权建立");
+    } else {
+        let screen = screen_session.open().await?;
+        screen_session.install(screen).await?;
+        emit_state("connected", "控制会话与视频通道就绪；车机显示尚未确认");
+    }
     if box_bootstrap {
         let control = channel.clone(); let stop_h = stop.clone(); let device = p.device_id.clone();
         keepalive.0.push(tokio::spawn(async move {
@@ -447,6 +462,7 @@ pub async fn negotiate(
         audio,
         keepalive,
         teardown,
+        resource_session: p.screen_resource_lifecycle.then(|| screen_session.clone()),
     })
 }
 
@@ -488,7 +504,7 @@ mod shutdown_tests {
                 data.extend_from_slice(&buf[..n]);
                 if let Some(msg) = crate::rtsp::parse_rtsp_messages(&mut data).into_iter().next() { break msg }
             };
-            assert_eq!(request.method(), Some("TEARDOWN"));
+            assert!(request.first_line.starts_with("TEARDOWN "));
             assert!(request.first_line.starts_with("TEARDOWN / RTSP/1.0"));
             let plist = bplist::parse(&request.body).unwrap();
             assert_eq!(plist.get("streams").unwrap().as_array().unwrap().len(), 1);
@@ -530,22 +546,6 @@ fn read_display_size(display: &Value) -> (u32, u32) {
 #[cfg(test)]
 mod display_size_tests {
     use super::*;
-    #[tokio::test]
-    async fn first_ui_return_recovers_missing_stream_without_waiting_for_second_click() {
-        let mut modes=crate::modes::Modes::initial();
-        modes.request_ui();let previous=modes.take_ui_retake().unwrap();
-        assert!(modes.change(&Value::dict(vec![("resources",Value::array(vec![Value::dict(vec![
-            ("resourceID",Value::int(1)),("transferType",Value::int(3)),
-            ("transferPriority",Value::int(500)),("unborrowConstraint",Value::int(100)),
-        ])]))])));
-        assert!(!modes.screen_owned());modes.request_ui();
-        let action=ui_feedback(&mut modes,true,true,true);
-        let ModeFeedback::Recover {revision,retake,rebuild}=action else {panic!("missing sender must recover on first return");};
-        assert!(!retake);assert!(rebuild);assert!(modes.can_restore_screen(revision));
-        assert!(rebuild_due(Some((tokio::time::Instant::now(),previous)),revision,true));
-        assert!(!rebuild_due(Some((tokio::time::Instant::now(),revision)),revision,true));
-    }
-
     #[tokio::test]
     async fn dropping_worker_while_feedback_pending_releases_control_without_stop_notification() {
         use tokio::io::AsyncReadExt;
@@ -674,73 +674,6 @@ mod display_size_tests {
     }
 
     #[tokio::test]
-    async fn ui_retake_reports_release_then_fresh_ownership_and_preserves_audio() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        async fn read(car: &mut TcpStream) -> crate::rtsp::RtspMessage {
-            let mut buffer=Vec::new(); let mut chunk=[0;4096];
-            loop {
-                let n=tokio::time::timeout(Duration::from_secs(2),car.read(&mut chunk)).await.unwrap().unwrap();
-                assert!(n>0); buffer.extend_from_slice(&chunk[..n]);
-                let mut messages=crate::rtsp::parse_rtsp_messages(&mut buffer);
-                if !messages.is_empty() { return messages.remove(0); }
-            }
-        }
-        async fn reply(car: &mut TcpStream, message: &crate::rtsp::RtspMessage, status: u16) {
-            car.write_all(format!("RTSP/1.0 {status} Reply\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",message.cseq().unwrap()).as_bytes()).await.unwrap();
-        }
-        fn entities(message: &crate::rtsp::RtspMessage) -> (i64,i64) {
-            let command=bplist::parse(&message.body).unwrap();
-            let r=command.get("params").unwrap().get("resources").unwrap().as_array().unwrap();
-            (r[0].get("entity").unwrap().as_int().unwrap(),r[1].get("entity").unwrap().as_int().unwrap())
-        }
-        for scenario in 0..4 {
-            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let socket=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
-            let (mut car,_)=listener.accept().await.unwrap();
-            let (r,w)=socket.into_split(); let (control,_)=RtspChannel::spawn(r,w,None);
-            let stop=Arc::new(Notify::new());
-            let modes=Arc::new(Mutex::new(crate::modes::Modes::initial()));
-            modes.lock().request_ui();
-            let revision=modes.lock().take_ui_retake().unwrap();
-            let feedback=spawn_mode_feedback(control,stop.clone(),modes.clone(),None);
-            feedback.send(Some(ModeFeedback::Recover { revision,retake:true,rebuild:false })).unwrap();
-            let release=read(&mut car).await;
-            assert_eq!(entities(&release),(2,1));
-            assert!(modes.lock().screen_owned()); // Only declaration changes during recovery.
-            if scenario == 1 {
-                assert!(modes.lock().change(&Value::dict(vec![("resources",Value::array(vec![Value::dict(vec![
-                    ("resourceID",Value::int(1)),("transferType",Value::int(3)),
-                    ("transferPriority",Value::int(500)),("unborrowConstraint",Value::int(1000)),
-                ])]))])));
-            }
-            let start=tokio::time::Instant::now();
-            reply(&mut car,&release,if scenario == 2 {422} else {200}).await;
-            if scenario == 3 {
-                tokio::time::sleep(Duration::from_millis(30)).await;
-                stop.notify_waiters();
-                let mut probe=[0;1];
-                // Stopping during the 200ms gap must not send a late screen claim.
-                match tokio::time::timeout(Duration::from_millis(250),car.read(&mut probe)).await {
-                    Err(_) | Ok(Ok(0)) => {}, other => panic!("late recovery write: {other:?}"),
-                }
-                continue;
-            }
-            let restored=read(&mut car).await;
-            assert_eq!(entities(&restored),(if scenario == 1 {2} else {1},1));
-            if scenario != 2 { assert!(start.elapsed() >= Duration::from_millis(180)); }
-            reply(&mut car,&restored,200).await;
-            // Rapid repeated clicks send the current declaration, not another release cycle.
-            if scenario == 0 {
-                modes.lock().request_ui();
-                let revision=modes.lock().take_ui_retake().unwrap();
-                feedback.send(Some(ModeFeedback::Recover { revision,retake:true,rebuild:false })).unwrap();
-                assert_eq!(entities(&read(&mut car).await),(1,1));
-            }
-            stop.notify_waiters();
-        }
-    }
-
-    #[tokio::test]
     async fn session_setup_and_info_precede_record_then_resource_declaration() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -801,7 +734,7 @@ mod display_size_tests {
         let display = &info.get("displays").unwrap().as_array().unwrap()[0];
         assert_eq!(uuid_text(display.get("uuid")).as_deref(), Some("actual-bmw-display"));
         assert_eq!(read_display_size(display), (2560, 744));
-        activate_session(&channel, &build_modes_changed()).await.unwrap();
+        activate_session(&channel, &crate::modes::Modes::initial().declaration()).await.unwrap();
         drop(channel);
         assert_eq!(peer.await.unwrap().len(), 5);
     }
@@ -1235,8 +1168,7 @@ fn spawn_event_dispatcher(
     control: Arc<RtspChannel>,
     wifi_iap_id: u64,
     modes: Arc<Mutex<crate::modes::Modes>>,
-    ui_retake_recovery: bool,
-    screen_recovery: Option<Arc<crate::screen_session::ScreenSession>>,
+    screen_lifecycle: Option<Arc<crate::screen_session::ScreenSession>>,
     touch_tx: mpsc::UnboundedSender<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
     display_size: (u32, u32),
@@ -1244,8 +1176,7 @@ fn spawn_event_dispatcher(
     target_size: Arc<Mutex<(u32, u32)>>,
     stop: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
-    let mode_feedback = spawn_mode_feedback(control.clone(), stop.clone(), modes.clone(), screen_recovery.clone());
-    emit_log(&format!("UI-RECOVERY: session enabled={ui_retake_recovery} gap=200ms cooldown=3000ms"));
+    let mode_feedback = spawn_mode_feedback(control.clone(), stop.clone(), modes.clone(), screen_lifecycle.clone());
     tokio::spawn(async move {
         let mut bad_commands = 0usize;
         let mut tip_down = false; // 上一次报告的按下状态（down/move/up 边沿检测）
@@ -1314,9 +1245,7 @@ fn spawn_event_dispatcher(
                 }
                 "requestUI" => {
                     log_ui_command(&command);
-                    let missing=screen_recovery.as_ref().map(|s|s.needs_rebuild()).unwrap_or(false);
-                    let action=ui_feedback(&mut modes.lock(),ui_retake_recovery,screen_recovery.is_some(),missing);
-                    let _ = mode_feedback.send(Some(action));
+                    let _ = mode_feedback.send(Some(ModeFeedback::Snapshot));
                     crate::emit_force_keyframe();
                 }
                 "changeUIContext" => {
@@ -1399,19 +1328,7 @@ fn spawn_event_dispatcher(
 /// stop event dispatch (Wi-Fi iAP2 certificate exchange, touch and forceKeyFrame).
 /// A watch channel keeps only the latest snapshot while a previous response is pending.
 #[derive(Clone, Copy)]
-enum ModeFeedback { Snapshot, Recover { revision:u64, retake:bool, rebuild:bool } }
-
-fn ui_feedback(modes:&mut crate::modes::Modes,retake:bool,rebuild:bool,missing:bool)->ModeFeedback {
-    let repeated=modes.take_ui_retake();
-    let revision=repeated.or_else(||if rebuild && missing {modes.screen_revision()} else {None});
-    match revision.filter(|_|retake || rebuild) {
-        Some(revision)=>ModeFeedback::Recover {revision,retake:retake && repeated.is_some(),rebuild},
-        None=>ModeFeedback::Snapshot,
-    }
-}
-fn rebuild_due(last:Option<(tokio::time::Instant,u64)>,revision:u64,missing:bool)->bool {
-    last.map(|(at,previous)|at.elapsed()>=Duration::from_secs(10) || (missing && previous!=revision)).unwrap_or(true)
-}
+enum ModeFeedback { Snapshot }
 
 struct ModeFeedbackWorker {
     tx:tokio::sync::watch::Sender<Option<ModeFeedback>>,
@@ -1425,48 +1342,27 @@ impl Drop for ModeFeedbackWorker {fn drop(&mut self) {self.task.abort();}}
 
 fn spawn_mode_feedback(
     control: Arc<RtspChannel>, stop: Arc<Notify>, modes: Arc<Mutex<crate::modes::Modes>>,
-    screen_recovery: Option<Arc<crate::screen_session::ScreenSession>>,
+    screen_lifecycle: Option<Arc<crate::screen_session::ScreenSession>>,
 ) -> ModeFeedbackWorker {
     let (tx, mut rx) = tokio::sync::watch::channel::<Option<ModeFeedback>>(None);
     let task=tokio::spawn(async move {
-        let mut last_retake: Option<tokio::time::Instant> = None;
-        let mut last_rebuild: Option<(tokio::time::Instant,u64)> = None;
         loop {
             tokio::select! {
                 _ = stop.notified() => return,
                 changed = rx.changed() => if changed.is_err() { return; },
             }
-            let Some(action) = *rx.borrow_and_update() else { continue; };
-            if let ModeFeedback::Recover { revision, retake:true, .. } = action {
-                let release = modes.lock().retake_declaration(revision);
-                let cooled_down = last_retake.map(|t| t.elapsed() >= Duration::from_secs(3)).unwrap_or(true);
-                if let Some(release) = release.filter(|_| cooled_down) {
-                    last_retake = Some(tokio::time::Instant::now());
-                    emit_log("UI-RECOVERY: repeated requestUI while phone owns screen; declare screen=2, preserve audio");
-                    let reply = tokio::select! {
-                        _ = stop.notified() => return,
-                        reply = control.request("POST", "/command", &release, "application/x-apple-binary-plist", &[], Duration::from_secs(3)) => reply,
-                    };
-                    let accepted = match reply {
-                        Ok(reply) => {
-                            let business = bplist::parse(&reply.body).ok().and_then(|v| v.get("status").and_then(Value::as_int));
-                            emit_log(&format!("UI-RECOVERY: release RTSP_status={} business_status={business:?}", reply.status()));
-                            reply.status() == 200 && business.map(|s| s == 0).unwrap_or(true)
-                        }
-                        Err(error) => { emit_log(&format!("UI-RECOVERY: release failed: {error}")); false }
-                    };
-                    if accepted {
-                        tokio::select! {
-                            _ = stop.notified() => return,
-                            _ = tokio::time::sleep(Duration::from_millis(200)) => {},
-                        }
-                    }
-                    emit_log(&format!("UI-RECOVERY: publish latest ownership phone_owned={} (receiver changes take precedence)", modes.lock().screen_owned()));
-                } else {
-                    emit_log("UI-RECOVERY: retake skipped (new resource state or cooldown); publish latest ownership");
+            if rx.borrow_and_update().is_none() { continue; }
+            if let Some(session) = screen_lifecycle.as_ref() {
+                let result = tokio::select! {
+                    _ = stop.notified() => return,
+                    result = session.reconcile_resource(&modes) => result,
+                };
+                if let Err(error) = result {
+                    session.params.pipeline.lock().video_stream="FAILED".into();
+                    emit_log(&format!("SCREEN-LIFECYCLE: failed: {error}; preserve audio/control; retry on next resource/UI event"));
                 }
+                continue;
             }
-            // Read fresh after every await: never replay an old phone claim over a car borrow.
             let body = modes.lock().declaration();
             let response = tokio::select! {
                 _ = stop.notified() => return,
@@ -1476,26 +1372,6 @@ fn spawn_mode_feedback(
                 Ok(reply) => {
                     let business_status = bplist::parse(&reply.body).ok().and_then(|v| v.get("status").and_then(Value::as_int));
                     emit_log(&format!("MODES: modesChanged feedback RTSP_status={} business_status={business_status:?} body={}B; receiver display unconfirmed", reply.status(), reply.body.len()));
-                    if matches!(action, ModeFeedback::Recover { .. }) && reply.status() == 200 && business_status.map(|s| s == 0).unwrap_or(true) && modes.lock().screen_owned() {
-                        crate::emit_force_keyframe();
-                        if let (ModeFeedback::Recover { revision,rebuild:true,.. },Some(recovery))=(action,screen_recovery.as_ref()) {
-                            if rebuild_due(last_rebuild,revision,recovery.needs_rebuild()) && modes.lock().can_restore_screen(revision) {
-                                last_rebuild=Some((tokio::time::Instant::now(),revision));
-                                let result=tokio::select! {
-                                    _=stop.notified()=>return,
-                                    result=recovery.rebuild(&modes,revision)=>result,
-                                };
-                                match result {
-                                    Ok(true)=>{},
-                                    Ok(false)=>emit_log("SCREEN-RECOVERY: deferred after resource state changed"),
-                                    Err(error)=>{
-                                        recovery.params.pipeline.lock().video_stream="FAILED".into();
-                                        emit_log(&format!("SCREEN-RECOVERY: failed: {error}; retain audio/control for diagnosis"));
-                                    }
-                                }
-                            } else { emit_log("SCREEN-RECOVERY: skipped (new resource state or 10s cooldown)"); }
-                        }
-                    }
                 }
                 Err(error) => emit_log(&format!("MODES: modesChanged feedback failed {error}")),
             }

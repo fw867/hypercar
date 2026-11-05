@@ -147,10 +147,7 @@ class Iap2Coordinator(
 
     fun endCurrentSession() { bluetooth?.dropCurrentSession() }
 
-    fun notifyBluetoothLost() {
-        log("IAP2: 蓝牙 ACL 断开——结束当前 iAP2 会话（监听保留）")
-        bluetooth?.dropCurrentSession()
-    }
+    fun captureBluetoothLost(address: String): (() -> Unit)? = bluetooth?.captureBluetoothLost(address)
 
     // ---- 内部 ----
 

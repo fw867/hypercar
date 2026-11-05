@@ -82,7 +82,6 @@ pub struct Modes {
     speech: i64,
     playback_enabled: bool,
     revision: u64,
-    pending_ui_retake: Option<u64>,
 }
 
 impl Modes {
@@ -94,6 +93,13 @@ impl Modes {
     }
     pub fn audio_owned(&self) -> bool { self.resources[1].current == 1 }
     pub fn screen_owned(&self) -> bool { self.resources[0].current == 1 }
+    pub fn screen_generation(&self) -> u64 { self.revision }
+    pub fn diagnostics(&self) -> String {
+        let r = self.resources[0];
+        format!("screen={}/{} revision={} take={} borrow={} unborrow={} borrows={} audio={}/{}",
+            r.current,r.permanent,self.revision,r.take,r.borrow,r.unborrow,r.borrows,
+            self.resources[1].current,self.resources[1].permanent)
+    }
 
     /// /info.modes is a ChangeModes declaration, not an incoming modesChanged snapshot.
     /// Initial Take/Borrow have CatPlay's bootstrap semantics; do not replay them as live requests.
@@ -107,6 +113,7 @@ impl Modes {
             None => fallback,
         };
         value.playback_enabled = enable_audio;
+        crate::emit_log(&format!("MODES: initial receiver constraints {}", value.diagnostics()));
         // Like CatPlay's overlay: obtain screen when its declared constraints permit it.
         value.resources[0].take_by(1, ANYTIME, ANYTIME, ANYTIME);
         // The user enabled application playback. Never override a receiver's Never constraint or
@@ -179,11 +186,10 @@ impl Modes {
             }
         }
         if !next.apply_apps(params) { return false; }
-        // Only screen changes invalidate an in-flight screen recovery. Audio/app updates
-        // must not cancel a screen request which the event dispatcher has not consumed yet.
+        // Only screen changes invalidate a pending video stream grant; audio/app changes
+        // must not cancel screen setup.
         if next.resources[0] != self.resources[0] {
             next.revision = self.revision.wrapping_add(1);
-            next.pending_ui_retake = None;
         }
         *self = next;
         true
@@ -236,24 +242,15 @@ impl Modes {
         Some(body)
     }
     pub fn request_ui(&mut self) {
-        let was_owned = self.screen_owned();
         let before=self.resources[0];
+        crate::emit_log(&format!("MODES: requestUI before {}", self.diagnostics()));
         let accepted = self.resources[0].take_by(1, USER_INITIATED, ANYTIME, ANYTIME);
         if self.resources[0]!=before { self.revision = self.revision.wrapping_add(1); }
-        self.pending_ui_retake = if accepted && was_owned { Some(self.revision) } else { None };
         crate::emit_log(&format!("MODES: requestUI local screen claim accepted={accepted} screen={}/{} audio={}/{}; receiver display unconfirmed",
             self.resources[0].current, self.resources[0].permanent, self.resources[1].current, self.resources[1].permanent));
     }
 
-    pub fn take_ui_retake(&mut self) -> Option<u64> { self.pending_ui_retake.take() }
-    pub fn screen_revision(&self) -> Option<u64> { self.screen_owned().then_some(self.revision) }
 
-    pub fn retake_declaration(&self, revision: u64) -> Option<Vec<u8>> {
-        if !self.can_restore_screen(revision) { return None; }
-        let mut released = self.clone();
-        released.resources[0] = Resource::owned(2, ANYTIME, ANYTIME);
-        Some(released.declaration())
-    }
     pub fn can_restore_screen(&self,revision:u64) -> bool { self.revision==revision && self.screen_owned() }
 }
 
@@ -267,44 +264,6 @@ fn release_fields_empty(v: &Value) -> bool { ["transferPriority", "takeConstrain
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn unrelated_audio_change_preserves_screen_recovery_revision_and_intent() {
-        let mut modes=Modes::initial();modes.request_ui();let revision=modes.screen_revision().unwrap();
-        assert!(modes.change(&Value::dict(vec![("resources",Value::array(vec![Value::dict(vec![
-            ("resourceID",Value::int(2)),("transferType",Value::int(3)),
-            ("transferPriority",Value::int(500)),("unborrowConstraint",Value::int(100)),
-        ])]))])));
-        assert!(!modes.audio_owned());assert!(modes.can_restore_screen(revision));
-        assert_eq!(modes.take_ui_retake(),Some(revision));
-    }
-    #[test]
-    fn ui_retake_is_screen_only_and_invalidated_by_live_resource_change() {
-        let mut m = Modes::initial();
-        assert!(m.change(&change(1,1)));
-        m.request_ui();
-        assert!(m.take_ui_retake().is_none()); // First 2 -> 1 already changes ownership.
-        m.request_ui();
-        let revision = m.take_ui_retake().unwrap();
-        m.request_ui();
-        assert_eq!(m.take_ui_retake(),Some(revision)); // Same-owner clicks do not cancel recovery.
-        let before = m.declaration();
-        let release = bplist::parse(&m.retake_declaration(revision).unwrap()).unwrap();
-        let resources = release.get("params").unwrap().get("resources").unwrap().as_array().unwrap();
-        assert_eq!(integer(&resources[0],"entity"), Some(2));
-        assert_eq!(integer(&resources[0],"permanentEntity"), Some(2));
-        assert_eq!(integer(&resources[1],"entity"), Some(1));
-        assert_eq!(m.declaration(),before); // Actual ownership / audio are untouched.
-        assert!(m.change(&change(1,3)));
-        assert!(m.retake_declaration(revision).is_none());
-        let mut blocked = resource(1,3);
-        if let Value::Dict(ref mut fields) = blocked {
-            fields.retain(|(k,_)| k.as_str() != Some("unborrowConstraint"));
-            fields.push((Value::str("unborrowConstraint"),Value::int(1000)));
-        }
-        let mut m = Modes::initial();
-        assert!(m.change(&Value::dict(vec![("resources",Value::array(vec![blocked]))])));
-        m.request_ui(); assert!(!m.screen_owned()); assert!(m.take_ui_retake().is_none());
-    }
     fn resource(id: i64, transfer: i64) -> Value {
         let mut fields = vec![("resourceID", Value::int(id)), ("transferType", Value::int(transfer))];
         if transfer == 1 { fields.extend([("transferPriority", Value::int(500)), ("takeConstraint", Value::int(100)), ("borrowConstraint", Value::int(100))]); }
@@ -323,6 +282,25 @@ mod tests {
             ])] } else { vec![] })),
         ]))])
     }
+    #[test] fn screen_grant_revision_survives_audio_updates_and_repeated_ui() {
+        let mut modes=Modes::initial();modes.request_ui();let revision=modes.screen_generation();
+        assert!(modes.change(&change(2,3)));assert!(!modes.audio_owned());
+        assert!(modes.can_restore_screen(revision));
+        modes.request_ui();assert_eq!(modes.screen_generation(),revision);
+        assert!(modes.change(&change(1,3)));assert!(!modes.can_restore_screen(revision));
+        modes.request_ui();assert!(modes.screen_owned());
+        assert!(!modes.can_restore_screen(revision));
+    }
+    #[test] fn ui_never_overrides_uninterruptible_screen_borrow() {
+        let mut modes=Modes::initial();
+        assert!(modes.change(&Value::dict(vec![("resources",Value::array(vec![Value::dict(vec![
+            ("resourceID",Value::int(1)),("transferType",Value::int(3)),
+            ("transferPriority",Value::int(500)),("unborrowConstraint",Value::int(1000)),
+        ])]))])));
+        let revision=modes.screen_generation();modes.request_ui();
+        assert!(!modes.screen_owned());assert_eq!(modes.screen_generation(),revision);
+    }
+
     #[test] fn info_initial_release_preserves_owner_and_constraints() {
         let mut info = info_audio(1000, false);
         if let Value::Dict(ref mut dict) = info { if let Value::Dict(ref mut modes) = dict[0].1 {

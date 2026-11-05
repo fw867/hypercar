@@ -91,6 +91,11 @@ object SettingsStore {
         }
 
     /** 上车自动连接（ACL 广播唤醒），新安装默认关，完成启动条件后由用户开启。 */
+    /** Manual-stop cooldown; one atomic preference retains the deadline across process restarts. */
+    var automaticPause: String
+        get() = p().getString("automatic_connection_pause", "").orEmpty()
+        set(value) = p().edit().putString("automatic_connection_pause", value).apply()
+
     var autoConnect: Boolean
         get() = p().getBoolean(KEY_AUTO_CONNECT, false)
         set(v) = p().edit().putBoolean(KEY_AUTO_CONNECT, v).apply()
@@ -110,13 +115,10 @@ object SettingsStore {
         get() = p().getBoolean("proactive_wifi_session", false)
         set(v) = p().edit().putBoolean("proactive_wifi_session", v).apply()
 
-    var uiRetakeRecovery: Boolean
-        get() = p().getBoolean("ui_retake_recovery", false)
-        set(v) = p().edit().putBoolean("ui_retake_recovery", v).apply()
-
-    var screenStreamRecovery: Boolean
-        get() = p().getBoolean("screen_stream_recovery", false)
-        set(v) = p().edit().putBoolean("screen_stream_recovery", v).apply()
+    /** 实验：根据主屏使用权建立或释放视频通道。 */
+    var screenResourceLifecycle: Boolean
+        get() = p().getBoolean("screen_resource_lifecycle", false)
+        set(v) = p().edit().putBoolean("screen_resource_lifecycle", v).apply()
 
     /**
      * 待机监听是否常驻前台通知（「正在监听车机，等待自动连接」）。默认开。
@@ -360,8 +362,7 @@ object SettingsStore {
             // CarWith 模式：视频/音频源改由本机 CarLife（CarWith）提供（2026-11-03）
             append("\"carlife_source\":").append(if (carWithMode) "true" else "false").append(",")
             append("\"carwith_stretch\":").append(if (carWithStretch) "true" else "false").append(",")
-            append("\"ui_retake_recovery\":").append(if (uiRetakeRecovery) "true" else "false").append(",")
-            append("\"screen_stream_recovery\":").append(if (screenStreamRecovery) "true" else "false").append(",")
+            append("\"screen_resource_lifecycle\":").append(if (screenResourceLifecycle) "true" else "false").append(",")
             append("\"width\":").append(plan.width).append(",")
             append("\"height\":").append(plan.height).append(",")
             append("\"touch_display_w\":").append(tdW).append(",")

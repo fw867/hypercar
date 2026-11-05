@@ -269,6 +269,7 @@ pub(super) async fn control(mut stream: TcpStream, queue: Arc<Mutex<Vec<Vec<u8>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
     fn cfg()->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:60,bt_address:"00:11:22:33:44:55".into(),bt_name:"HyperCar".into()}}
     fn info()->Vec<u8> {let mut out=Vec::new(); for (field,text) in [(4,"Xiaomi"),(14,"test"),(20,"37")] {proto::string(&mut out,field,text);} out}
     fn prepared()->Session {
@@ -313,7 +314,7 @@ mod tests {
         assert!(!s.init_sent);
         let actions=s.receive(CMD_MD_AUTHEN_RESPONSE,&proof(&s),&cfg()).unwrap();
         assert_eq!(actions.iter().map(|a|a.0).collect::<Vec<_>>(),vec![CMD_HU_AUTHEN_RESULT,CMD_HU_FEATURE_CONFIG_RESPONSE]);
-        assert_eq!(parse_feature_config(&actions[1].1),vec![("CONTENT_ENCRYPTION".into(),1)]);
+        assert_eq!(actions[1].1, b"\x08\x01\x12\x16\x0a\x12CONTENT_ENCRYPTION\x10\x01");
         assert!(!s.init_sent);
         assert!(s.receive(CMD_MD_ENCRYPT_READY,&[],&cfg()).is_err());
     }
@@ -405,7 +406,7 @@ mod tests {
                     assert!(authenticated);assert!(data.starts_with(&[0,0,0,1])||data.starts_with(&[0,0,1]));
                     capture.write_all(&data).unwrap();frames+=1;
                     if !touched && began.elapsed()>=Duration::from_secs(4) {
-                        let actual=*_hub.encoder_size_handle().lock();
+                        let actual=*_hub.encoder_size.lock();
                         println!("CarWith touch test: actual={}x{}",actual.0,actual.1);
                         let (x,y)=(actual.0*45/1280,actual.1*665/720);
                         _hub.inject_touch(TOUCH_DOWN,x,y);tokio::time::sleep(Duration::from_millis(100)).await;

@@ -23,6 +23,7 @@ mod h264;
 mod pipeline;
 mod tcp_diagnostics;
 mod screen_session;
+mod screen_resource;
 mod srp6a;
 mod tlv8;
 mod timing;

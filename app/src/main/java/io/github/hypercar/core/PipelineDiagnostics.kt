@@ -67,6 +67,7 @@ data class PipelineDiagnostics(
         "REBUILDING" -> "重建中"
         "FAILED" -> "通道失败"
         "PAUSED" -> "等待画面归还"
+        "WAIT_OWNERSHIP" -> "等待主屏使用权"
         else -> "等待通道"
     }
     companion object {

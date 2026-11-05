@@ -5,6 +5,18 @@ import org.junit.Test
 import io.github.hypercar.session.AutomaticConnectionPolicy.IdleAction.*
 
 class AutomaticConnectionPolicyTest {
+    @Test fun pauseBlocksAllAutomaticStartsButNeverManualStarts() {
+        for (enabled in listOf(false, true)) {
+            assertTrue(AutomaticConnectionPolicy.mayStart(true, enabled, paused = true))
+            assertFalse(AutomaticConnectionPolicy.mayStart(false, enabled, paused = true))
+            assertFalse(AutomaticConnectionPolicy.keepListeningAfterStop(enabled, paused = true))
+            assertEquals(STOP_LISTENING, AutomaticConnectionPolicy.modeChanged(enabled, false, paused = true))
+            assertEquals(KEEP_SESSION, AutomaticConnectionPolicy.modeChanged(enabled, true, paused = true))
+        }
+        assertTrue(AutomaticConnectionPolicy.mayStart(false, true, paused = false))
+        assertEquals(START_LISTENING, AutomaticConnectionPolicy.modeChanged(true, false, paused = false))
+    }
+
     @Test fun manualStartWorksWithBothAutomaticModes() {
         for (enabled in listOf(false, true)) {
             assertTrue(AutomaticConnectionPolicy.mayStart(manual = true, autoConnect = enabled))

@@ -117,11 +117,21 @@ mod tests {
         sender.send_config(&crate::screen::build_avcc(&[0x67,0x42,0,0x1f],&[0x68,1])).await.unwrap();
         let initial=p.lock().video_tcp.as_ref().unwrap().sampled_ms;
         let mut nal=vec![2u8;8*1024*1024];nal[..5].copy_from_slice(&[0,0,0,1,0x65]);
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(1250),sender.send_video_annexb(&nal,2000)).await.is_err());
-        let sample=p.lock().video_tcp.clone().unwrap();
+        // Debug encryption of 8 MiB can itself take longer than one timer period on a host.
+        // Wait for observed independent sampling/backlog, rather than timing only write_all.
+        let writer=tokio::spawn(async move {sender.send_video_annexb(&nal,2000).await});
+        let sample=tokio::time::timeout(std::time::Duration::from_secs(6),async {
+            loop {
+                let sample=p.lock().video_tcp.clone().unwrap();
+                if sample.sampled_ms>=initial+900 && sample.outq_bytes.unwrap_or(0)>0 {break sample;}
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }).await.unwrap();
+        assert!(!writer.is_finished(),"non-reading peer must still block the video write");
         assert!(sample.sampled_ms>=initial+900,"periodic telemetry must run during a pending write");
         assert!(sample.outq_bytes.unwrap()>0,"car is not reading; kernel queue must show backlog");
-        drop(sender);let stopped=p.lock().video_tcp.as_ref().unwrap().sampled_ms;
+        writer.abort();assert!(writer.await.unwrap_err().is_cancelled());
+        let stopped=p.lock().video_tcp.as_ref().unwrap().sampled_ms;
         tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         assert_eq!(p.lock().video_tcp.as_ref().unwrap().sampled_ms,stopped);
         drop(car);

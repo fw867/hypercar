@@ -297,6 +297,21 @@ class Iap2Bluetooth(
      * 只结束当前会话、保留监听/出站循环（ACL 断开时调用）。
      * 车机蓝牙断开后，旧 RFCOMM socket 的读会卡在半开连接上不返回——必须主动关。
      */
+    /** Capture before dispatching cleanup: a queued old ACL event cannot close a replacement socket. */
+    fun captureBluetoothLost(address: String): (() -> Unit)? {
+        fun matches(socket: BluetoothSocket) = runCatching {
+            socket.remoteDevice.address.equals(address, ignoreCase = true)
+        }.getOrDefault(false)
+        val cleanups = listOf(sessionSocket, pendingDial, currentSocket).mapNotNull { ref ->
+            PeerDisconnectCleanup.capture(ref, ::matches) { socket -> runCatching { socket.close() }; Unit }
+        }
+        if (cleanups.isEmpty()) return null
+        return {
+            cleanups.forEach { it() }
+            log("BT: ACL 断开，仅清理 $address 捕获的旧 RFCOMM；保留 SDP 与 Wi-Fi 会话")
+        }
+    }
+
     fun dropCurrentSession() {
         sessionSocket.getAndSet(null)?.let { runCatching { it.close() } }
         pendingDial.getAndSet(null)?.let { socket -> runCatching { socket.close() } }
