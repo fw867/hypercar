@@ -22,10 +22,10 @@ data class PairingEvidence(val identityPresent: Boolean, val receiverCredentialP
         }
 
         fun read(filesDir: File, mac: String?): PairingEvidence {
-            val identity = File(filesDir, "controller_identity.txt")
+            val identity = PairingIdentityFiles.location(filesDir, mac).file
             val key = receiverKey(mac)
             return PairingEvidence(identity.isFile && identity.length() > 0,
-                key != null && File(filesDir, "controller_identity.txt.paired-$key").isFile)
+                key != null && File(identity.parentFile, "${identity.name}.paired-$key").isFile)
         }
     }
 }

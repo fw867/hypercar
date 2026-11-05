@@ -10,7 +10,8 @@ class AutomaticConnectionPolicyTest {
             assertTrue(AutomaticConnectionPolicy.mayStart(true, enabled, paused = true))
             assertFalse(AutomaticConnectionPolicy.mayStart(false, enabled, paused = true))
             assertFalse(AutomaticConnectionPolicy.keepListeningAfterStop(enabled, paused = true))
-            assertEquals(STOP_LISTENING, AutomaticConnectionPolicy.modeChanged(enabled, false, paused = true))
+            assertEquals(enabled, AutomaticConnectionPolicy.keepIdentityAfterStop(enabled, paused = true))
+            assertEquals(if (enabled) KEEP_IDENTITY else STOP_LISTENING, AutomaticConnectionPolicy.modeChanged(enabled, false, paused = true))
             assertEquals(KEEP_SESSION, AutomaticConnectionPolicy.modeChanged(enabled, true, paused = true))
         }
         assertTrue(AutomaticConnectionPolicy.mayStart(false, true, paused = false))

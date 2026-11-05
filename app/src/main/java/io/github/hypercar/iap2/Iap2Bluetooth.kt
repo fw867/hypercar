@@ -125,6 +125,12 @@ class Iap2Bluetooth(
      * 任一 RFCOMM 会话运行期间，出站循环暂停连接尝试。
      */
     private val sessionActive = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val sessions = Iap2SessionGate()
+
+    @Synchronized fun setSessionEnabled(enabled: Boolean) {
+        sessions.setEnabled(enabled)
+        if (!enabled) dropCurrentSession()
+    }
 
     /** 「蓝牙已连接→已断开」日志节流（车机可能反复自动重连，避免刷屏）。 */
     @Volatile
@@ -280,6 +286,7 @@ class Iap2Bluetooth(
     @Synchronized fun stop() {
         if (!running) return
         running = false
+        sessions.setEnabled(false)
         generation.incrementAndGet()
         carPlayMarker?.close()
         carPlayMarker = null
@@ -343,7 +350,8 @@ class Iap2Bluetooth(
             runCatching { socket.close() }
             return
         }
-        if (wifiHandoff) { runCatching { socket.close() }; return }
+        val ticket = sessions.ticket()
+        if (wifiHandoff || ticket == null) { runCatching { socket.close() }; return }
         val peerAddress = safeAddress(socket.remoteDevice)
         // 指定了目标车机时拒绝其它设备的连入（多台车机场景：非目标的控制器
         // 也会周期回连，放行会抢占/误建会话）。地址比对，大小写不敏感。
@@ -382,7 +390,7 @@ class Iap2Bluetooth(
         log("$tag: 车机已连入 name=$peerName，开始 iAP2 发送端会话")
         Thread({
             if (!running || generation.get() != myGeneration) runCatching { socket.close() }
-            else runSession(socket, tag)
+            else runSession(socket, tag, ticket)
         }, "iap2-bt-session").apply {
             isDaemon = true
             start()
@@ -397,7 +405,8 @@ class Iap2Bluetooth(
         var inboundGraceDone = false
         while (running && generation.get() == myGeneration) {
             // 会话期间静默：两条 RFCOMM 会互相踩（见 sessionActive 注释）
-            if (wifiHandoff || sessionActive.get()) {
+            val ticket = sessions.ticket()
+            if (ticket == null || wifiHandoff || sessionActive.get()) {
                 sleepQuietly(2_000)
                 continue
             }
@@ -408,11 +417,11 @@ class Iap2Bluetooth(
                 inboundGraceDone = true
                 val deadline = SystemClock.uptimeMillis() + INBOUND_GRACE_MILLIS
                 while (running && generation.get() == myGeneration &&
-                    !sessionActive.get() && SystemClock.uptimeMillis() < deadline
+                    sessions.allows(ticket) && !sessionActive.get() && SystemClock.uptimeMillis() < deadline
                 ) {
                     sleepQuietly(250)
                 }
-                if (sessionActive.get() || !running || generation.get() != myGeneration) continue
+                if (!sessions.allows(ticket) || sessionActive.get() || !running || generation.get() != myGeneration) continue
                 log("BT-C: ${INBOUND_GRACE_MILLIS / 1000}s 内车机未主动连入——改走出站（会先断开该车机的 HFP/A2DP）")
             }
             val explicitTarget = targetProvider()
@@ -431,7 +440,7 @@ class Iap2Bluetooth(
             var connected: BluetoothSocket? = null
             for (device in candidates) {
                 if (!running || generation.get() != myGeneration) return
-                if (sessionActive.get()) break
+                if (!sessions.allows(ticket) || sessionActive.get()) break
                 // SDP 等待期间目标可能由 ACL 广播锁定；旧候选不能继续拨号。
                 if (targetProvider() != explicitTarget || preferredProvider() != preferred) break
                 if (device.bondState != BluetoothDevice.BOND_BONDED) continue
@@ -445,6 +454,7 @@ class Iap2Bluetooth(
                 // 文件在线时不开放 iAP2 服务窗口（奥迪 MIB3 实测每 3s 连接失败）。
                 // **宝马档案不做这一步**：它的 HFP/A2DP 在线时照样主动连入 iAP2，而断开
                 // 会连带把 ACL 拽掉（车机反复重连），反而再也不发起 CarPlay。
+                if (!sessions.allows(ticket)) break
                 val evidence = io.github.hypercar.session.PairingEvidence.read(appContext.filesDir, device.address)
                 if (dropProfilesBeforeIap2 && evidence.mayDropProfiles) {
                     // 注意：BtProfiles.disconnect 内部会打「自己断开」归因标记——断开
@@ -466,7 +476,7 @@ class Iap2Bluetooth(
                     profileDropSkippedLogged = true
                     log("BT-C: 保留 HFP/A2DP：档案允许断开=$dropProfilesBeforeIap2 身份=${evidence.identityPresent} 本车凭证=${evidence.receiverCredentialPresent}；首配/未知状态不主动断配置文件")
                 }
-                val socket = tryConnect(device)
+                val socket = tryConnect(device, ticket)
                 if (socket != null) {
                     log("BT-C: ✓ 已连入 $name 的 iAP2 服务（RFCOMM 建立）")
                     connected = socket
@@ -488,7 +498,7 @@ class Iap2Bluetooth(
                 runCatching { connected.close() }
                 return
             }
-            runSession(connected, "BT-C")
+            runSession(connected, "BT-C", ticket)
             sleepQuietly(RETRY_DELAY_MILLIS)
         }
     }
@@ -532,6 +542,7 @@ class Iap2Bluetooth(
      */
     @SuppressLint("MissingPermission")
     private fun awaitIap2Service(device: BluetoothDevice): Boolean {
+        val ticket = sessions.ticket() ?: return false
         val revision = targetRevision.get()
         iap2ServiceCache[device.address]?.takeIf { it.revision == revision }?.let { return it.available }
 
@@ -556,6 +567,7 @@ class Iap2Bluetooth(
                     if (hit?.address == device.address) latch.countDown()
                 }
             }
+        if (!sessions.allows(ticket)) return false
         val started =
             runCatching {
                 val filter = IntentFilter(BluetoothDevice.ACTION_UUID)
@@ -565,7 +577,7 @@ class Iap2Bluetooth(
                     @Suppress("DEPRECATION")
                     appContext.registerReceiver(receiver, filter)
                 }
-                device.fetchUuidsWithSdp()
+                if (sessions.allows(ticket)) device.fetchUuidsWithSdp() else false
             }.getOrDefault(false)
         if (started) {
             try {
@@ -581,7 +593,8 @@ class Iap2Bluetooth(
     }
 
     @SuppressLint("MissingPermission")
-    private fun tryConnect(device: BluetoothDevice): BluetoothSocket? {
+    private fun tryConnect(device: BluetoothDevice, ticket: Long): BluetoothSocket? {
+        if (!sessions.allows(ticket)) return null
         val socket =
             try {
                 device.createRfcommSocketToServiceRecord(ACCESSORY_IAP2_UUID)
@@ -590,11 +603,21 @@ class Iap2Bluetooth(
             }
         // 连接前就登记：connect() 是阻塞调用（SDP 查询 + 建链最长可达数十秒），
         // stop()/dropCurrentSession() 只有拿到 socket 引用才能 close() 打断它。
-        currentSocket.set(socket)
-        pendingDial.set(socket)
+        synchronized(this) {
+            if (!running || !sessions.allows(ticket)) {
+                runCatching { socket.close() }
+                return null
+            }
+            currentSocket.set(socket)
+            pendingDial.set(socket)
+        }
         return try {
             socket.connect()
-            socket
+            if (!sessions.allows(ticket)) {
+                currentSocket.compareAndSet(socket, null)
+                runCatching { socket.close() }
+                null
+            } else socket
         } catch (_: IOException) {
             currentSocket.compareAndSet(socket, null)
             runCatching { socket.close() }
@@ -609,17 +632,19 @@ class Iap2Bluetooth(
     private fun runSession(
         socket: BluetoothSocket,
         tag: String,
+        ticket: Long,
     ) {
-        if (!sessionActive.compareAndSet(false, true)) {
-            // 竞争兜底（accept 与 connect 两侧可能同时启动会话）：后来者直接让位
-            log("$tag 已有 iAP2 会话在跑，本连接不建会话")
-            runCatching { socket.close() }
-            return
+        // Publish the socket atomically with the pause check, so pausing can always close it.
+        synchronized(this) {
+            if (!running || !sessions.allows(ticket) || !sessionActive.compareAndSet(false, true)) {
+                runCatching { socket.close() }
+                return
+            }
+            sessionSocket.set(socket)
+            sessionStarts.incrementAndGet()
+            sessionProductive = false
+            currentSocket.set(socket)
         }
-        sessionSocket.set(socket)
-        sessionStarts.incrementAndGet()
-        sessionProductive = false
-        currentSocket.set(socket)
         // 记住本轮对端车机（ACL 广播可能没收到，记录「已配对车机」要靠它拿 MAC）
         runCatching { Iap2Peer.remember(safeAddress(socket.remoteDevice), safeName(socket.remoteDevice)) }
         val handshakeId = HANDSHAKE_IDS.incrementAndGet()
@@ -636,14 +661,16 @@ class Iap2Bluetooth(
                 log = sessionLog,
                 bluetoothMac = bluetoothMacProvider(),
                 deviceName = "iPhone",
-                onIdentification = { Iap2Peer.rememberIdentification(safeAddress(socket.remoteDevice), it) },
+                onIdentification = { if (sessions.allows(ticket)) Iap2Peer.rememberIdentification(safeAddress(socket.remoteDevice), it) },
                 // 端点回调顺手标记「本轮已拿到凭据」：acceptLoop 用它决定是否允许
                 // 车机的新连入顶替本轮（空转轮次可顶替，有凭据的不许抢）
                 onEndpoint = { endpoint ->
-                    if (!endpoint.ssid.isNullOrBlank() || endpoint.ipAddresses.isNotEmpty()) {
-                        sessionProductive = true
+                    if (sessions.allows(ticket)) {
+                        if (!endpoint.ssid.isNullOrBlank() || endpoint.ipAddresses.isNotEmpty()) {
+                            sessionProductive = true
+                        }
+                        onEndpoint(endpoint)
                     }
-                    onEndpoint(endpoint)
                 },
                 context = appContext,
                 receiverAddress = safeAddress(socket.remoteDevice),

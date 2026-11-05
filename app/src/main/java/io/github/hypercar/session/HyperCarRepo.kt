@@ -159,11 +159,13 @@ object HyperCarRepo {
             airplayHost = target.host
             airplayPort = target.port
             rememberAirplayEndpoint(carNetworkSsid, target)
-            val identityFile = context.filesDir.resolve("controller_identity.txt")
-            ensurePairingIdentity(context, identityFile)
-            val identityPath = identityFile.absolutePath
+            val receiver = receiverForEngine()
+            val identity = PairingIdentityFiles.location(context.filesDir, receiver)
+            ensurePairingIdentity(identity)
+            sessionIdentity = identity
+            val identityPath = identity.file.absolutePath
             val json = SettingsStore.engineConfigJson(target.host, target.port, sessionDeviceMac, identityPath,
-                receiverBluetoothMac = receiverForEngine(), carWithSource = sessionCarWithMode)
+                receiverBluetoothMac = receiver, carWithSource = sessionCarWithMode)
             log("CORE: 重试 nativeStart（$target fd=$fd，第 $attempt 次）")
             val started = RustCoreBridge.nativeStart(json, fd, socketProvider(sockets))
             log("CORE: 重试 nativeStart 返回 $started")
@@ -234,6 +236,7 @@ object HyperCarRepo {
     private var reconnectJob: Job? = null
     private var sessionUiJob: Job? = null
     @Volatile private var sessionCarWithMode = false
+    @Volatile private var sessionIdentity: PairingIdentityFiles.Location? = null
     private var automaticResumeJob: Job? = null
 
     val automaticPauseRemaining: Long get() = appContext()?.let {
@@ -443,6 +446,7 @@ object HyperCarRepo {
         reconnectJob = null
         sessionHadLink = false
         sessionCarWithMode = SettingsStore.carWithMode
+        sessionIdentity = null
         sessionReceiverMac = null
         lateAirplayEndpoint.set(null)
         airplayHost = null
@@ -474,17 +478,55 @@ object HyperCarRepo {
      *
      * @return 给用户看的摘要（成功或拒绝原因）。
      */
-    fun resetPairingIdentity(): String {
-        if (sessionLive.get() || connecting || streaming) {
-            log("PAIR-RESET: 拒绝——当前会话还在（先点「断开连接」再重置）")
-            return "请先断开连接，再重置配对身份"
+    suspend fun resetPairingIdentity(mac: String): String = resetPairingData(mac)
+
+    suspend fun resetAllPairingIdentities(): String = resetPairingData(null)
+
+    private suspend fun resetPairingData(mac: String?): String = kotlinx.coroutines.withContext(Dispatchers.IO) {
+        val ctx = appContext() ?: return@withContext "应用上下文未就绪，稍后再试"
+        autoConnectChanges.lock()
+        try {
+            if (hasCurrentSession) return@withContext "请先断开连接，再重置配对身份"
+            if (mac != null && PairingEvidence.receiverKey(mac) == null) {
+                return@withContext "无效的车机地址，未清除配对信息"
+            }
+            stopStandbyListening() // RFCOMM callbacks must not recreate credentials during reset.
+            runCatching {
+                if (mac == null) {
+                    val summary = PairingReset.runAll(ctx, ::log)
+                    io.github.hypercar.autowake.CarCompanionWake.remove(ctx)
+                    io.github.hypercar.iap2.Iap2Peer.clear()
+                    updateTargetCar(null, null)
+                    return@runCatching summary
+                }
+                val summary = PairingReset.run(ctx, mac, ::log)
+                io.github.hypercar.settings.SettingsRevision.bump()
+                io.github.hypercar.autowake.CarCompanionWake.removeFor(ctx, mac)
+                if (mac.equals(io.github.hypercar.iap2.Iap2Peer.address, ignoreCase = true)) {
+                    io.github.hypercar.iap2.Iap2Peer.clear()
+                }
+                val cleared = synchronized(targetCarChanges) {
+                    if (SettingsStore.targetCarMac.equals(mac, ignoreCase = true)) {
+                        updateTargetCar(null, null)
+                        true
+                    } else false
+                }
+                if (cleared) "$summary，目标车机已设为未指定"
+                else "$summary，当前目标车机保持不变"
+            }.getOrElse {
+                log("PAIR-RESET: 清理失败，保留目标选择：${it.message}")
+                "重置失败，请重试：${it.message}"
+            }
+        } finally {
+            autoConnectChanges.unlock()
+            startAutomaticListening(ctx)
         }
-        val ctx = appContext() ?: return "应用上下文未就绪，稍后再试"
-        return PairingReset.run(ctx, ::log)
     }
 
+    private val targetCarChanges = Any()
+
     /** 切换目标立即更新后续入站过滤；只取消尚未建立会话的出站拨号。 */
-    fun updateTargetCar(mac: String?, name: String?) {
+    fun updateTargetCar(mac: String?, name: String?) = synchronized(targetCarChanges) {
         val target = mac?.trim()?.takeIf { it.isNotEmpty() }?.uppercase(java.util.Locale.ROOT)
         if (!target.orEmpty().equals(SettingsStore.targetCarMac.orEmpty(), ignoreCase = true)) {
             SettingsStore.lastAirplayEndpoint = "" // Legacy endpoint had no receiver association.
@@ -515,7 +557,8 @@ object HyperCarRepo {
                 if (userInitiated && SettingsStore.autoConnect) {
                     appContext()?.let { io.github.hypercar.autowake.AutomaticConnectionResume.pause(it) }
                     io.github.hypercar.settings.SettingsRevision.bump()
-                    log("AUTO: 手动停止，暂停全部自动连接 10 分钟；仍可手动启动")
+                    iap2?.pauseSessions()
+                    log("AUTO: 手动停止，暂停自动建链 10 分钟；保留 iPhone SDP，仍可手动启动")
                 }
                 userDisconnectRequested = !automaticConnectionAllowed
                 reconnectJob?.cancel()
@@ -528,6 +571,7 @@ object HyperCarRepo {
                 runDisconnect(reason, keepListening,
                     graceful = userInitiated)
                 if (keepListening) startStandbyListening()
+                else if (keepIdleIdentity) startIdentityOnly()
                 else stopStandbyListening()
                 appContext()?.let { scheduleAutomaticResume(it) }
             } finally { autoConnectChanges.unlock() }
@@ -577,7 +621,7 @@ object HyperCarRepo {
             try {
                 scheduleAutomaticResume(context)
                 if (SettingsStore.autoConnect && automaticPauseRemaining > 0) {
-                    if (!hasCurrentSession) stopStandbyListening()
+                    if (!hasCurrentSession) startIdentityOnly()
                     return@launch
                 }
                 if (SettingsStore.autoConnect) {
@@ -598,6 +642,7 @@ object HyperCarRepo {
                         log("AUTO: 自动模式=${SettingsStore.autoConnect}；保留当前会话")
                     }
                     AutomaticConnectionPolicy.IdleAction.START_LISTENING -> startStandbyListening()
+                    AutomaticConnectionPolicy.IdleAction.KEEP_IDENTITY -> startIdentityOnly()
                     AutomaticConnectionPolicy.IdleAction.STOP_LISTENING -> stopStandbyListening()
                 }
             } finally { autoConnectChanges.unlock() }
@@ -654,6 +699,33 @@ object HyperCarRepo {
             }
             log("AUTO: 待机监听已启用，等待车机；尚未发起 AirPlay 会话")
             updateCarProfileGuard(context)
+        }
+    }
+
+    private val keepIdleIdentity: Boolean get() = AutomaticConnectionPolicy.keepIdentityAfterStop(
+        SettingsStore.autoConnect, automaticPauseRemaining > 0)
+
+    /** Keep the same SDP/SCN, but never run a handshake or outbound probe during cooldown. */
+    private fun startIdentityOnly() {
+        if (!keepIdleIdentity || hasCurrentSession) return
+        val context = appContext() ?: return
+        stopWifiReconnectMonitor()
+        reconnectJob?.cancel()
+        reconnectJob = null
+        CarProfileGuard.stop()
+        standbyEndpoint.set(null)
+        val coordinator = coordinatorFor(context)
+        coordinator.keepIdentityOnly()
+        io.github.hypercar.carui.MusicNotificationListener.sync(context)
+        if (coordinator.isRunning) {
+            if (SettingsStore.standbyNotification) {
+                runCatching { context.startForegroundService(HyperCarService.identityIntent(context)) }
+                    .onFailure { log("SERVICE: 身份声明保活启动失败 ${it.message}") }
+            } else {
+                runCatching { context.startService(HyperCarService.identityIntent(context)) }
+                    .onFailure { log("SERVICE: 身份声明保活启动失败 ${it.message}") }
+            }
+            log("AUTO: 休眠中仅保留 iPhone/CarPlay 服务声明，不扫描、不拨号、不进行 iAP2 握手")
         }
     }
 
@@ -1071,9 +1143,13 @@ object HyperCarRepo {
             // 画面与音频由本机自绘界面自采自编，经 nativePushVideoFrame /
             // nativePushAudioPcm 投喂给引擎；这里只负责下发会话参数。
             sessionWifiSsid = carNetworkSsid
-            val identityPath = context.filesDir.resolve("controller_identity.txt").absolutePath
+            val receiver = receiverForEngine()
+            val identity = PairingIdentityFiles.location(context.filesDir, receiver)
+            ensurePairingIdentity(identity)
+            sessionIdentity = identity
+            val identityPath = identity.file.absolutePath
             val json = SettingsStore.engineConfigJson(apHostFinal, port, deviceMac, identityPath,
-                receiverBluetoothMac = receiverForEngine(), carWithSource = sessionCarWithMode)
+                receiverBluetoothMac = receiver, carWithSource = sessionCarWithMode)
             // 下发配置原样打一行（不含密钥）：分辨率/帧率一目了然，
             // 免得再靠猜「这次到底请求了多大尺寸」
             log("SESSION-ORIGIN: ctrlInvite=${advertiser.lastInvitation != null} endpointFromInvite=${endpoint.fromInvite} " +
@@ -1231,6 +1307,9 @@ object HyperCarRepo {
         if (keepListening) {
             standbyEndpoint.set(null)
             runCatching { iap2?.endCurrentSession() }
+        } else if (keepIdleIdentity) {
+            iap2?.pauseSessions()
+            standbyEndpoint.set(null)
         } else {
             runCatching { iap2?.stop() }
             iap2 = null
@@ -1249,6 +1328,7 @@ object HyperCarRepo {
         boundNetwork = null
         wifiReceiverMac = null
         sessionReceiverMac = null
+        sessionIdentity = null
         sessionWifiSsid = null
         appContext()?.let { io.github.hypercar.carui.MusicNotificationListener.sync(it) }
     }
@@ -1758,6 +1838,14 @@ object HyperCarRepo {
     // ---------------------------------------------------------------- socket 供给（移交 Rust）
 
 
+    /** 按 MAC 查已配对蓝牙设备的名称（缺 BLUETOOTH_CONNECT 时返回 null）。 */
+    @android.annotation.SuppressLint("MissingPermission")
+    private fun bondedNameOf(mac: String): String? = runCatching {
+        android.bluetooth.BluetoothAdapter.getDefaultAdapter()
+            ?.bondedDevices
+            ?.firstOrNull { it.address.equals(mac, ignoreCase = true) }
+            ?.name
+    }.getOrNull()
     /**
      * 配对身份自愈：**文件是主、SharedPreferences 是备份**。
      *
@@ -1767,18 +1855,13 @@ object HyperCarRepo {
      *  - 文件缺失 + 有备份 → 写回文件（**不会**重新生成，保住车机那边的配对）
      *  - 文件存在 → 更新备份（升级/换机后仍可恢复）
      */
-    /** 按 MAC 查已配对蓝牙设备的名称（缺 BLUETOOTH_CONNECT 时返回 null）。 */
-    @android.annotation.SuppressLint("MissingPermission")
-    private fun bondedNameOf(mac: String): String? = runCatching {
-        android.bluetooth.BluetoothAdapter.getDefaultAdapter()
-            ?.bondedDevices
-            ?.firstOrNull { it.address.equals(mac, ignoreCase = true) }
-            ?.name
-    }.getOrNull()
-    private fun ensurePairingIdentity(context: Context, path: java.io.File) {
+    private fun ensurePairingIdentity(identity: PairingIdentityFiles.Location) {
+        val path = identity.file
+        val key = identity.backupKey
+        val backup = if (key == null) SettingsStore.pairingIdentityBackup
+            else SettingsStore.receiverPairingIdentityBackup(key)
         runCatching {
             if (!path.exists()) {
-                val backup = SettingsStore.pairingIdentityBackup
                 if (backup.isNotBlank()) {
                     path.writeText(backup)
                     log("PAIR: 身份文件缺失——已用备份恢复（车机侧配对保持有效）")
@@ -1786,8 +1869,9 @@ object HyperCarRepo {
             }
             if (path.exists()) {
                 val text = path.readText().trim()
-                if (text.isNotBlank() && text != SettingsStore.pairingIdentityBackup) {
-                    SettingsStore.pairingIdentityBackup = text
+                if (text.isNotBlank() && text != backup) {
+                    if (key == null) SettingsStore.pairingIdentityBackup = text
+                    else SettingsStore.saveReceiverPairingIdentityBackup(key, text)
                     log("PAIR: 已备份配对身份到设置（换机/清缓存后可恢复）")
                 }
                 val pairingId = text.substringBefore(' ')
@@ -1905,6 +1989,7 @@ object HyperCarRepo {
                     push(link = LinkState.Negotiating(detail))
                 }
                 "connected" -> {
+                    sessionIdentity?.let { ensurePairingIdentity(it) }
                     val diagnosticId = connectionAttemptId
                     connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.RECORD)
                     connectionDiagnostics.report().lastOrNull()?.let { log(it) }
@@ -2322,7 +2407,7 @@ object HyperCarRepo {
         scope.launch {
             withTimeoutOrNull(JOIN_TIMEOUT_MILLIS) { previous?.join() }
             autoConnectChanges.lock()
-            try { startStandbyListening() }
+            try { if (keepIdleIdentity) startIdentityOnly() else startStandbyListening() }
             finally { autoConnectChanges.unlock() }
         }
     }

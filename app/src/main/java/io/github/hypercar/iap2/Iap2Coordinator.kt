@@ -91,20 +91,27 @@ class Iap2Coordinator(
      *
      * 可重复调用：已在运行时只更新回调，不重建蓝牙栈。
      */
-    fun start(onEndpoint: (CarPlayEndpoint) -> Unit) {
-        bluetooth?.setWifiHandoff(false)
-        endpointCallback = onEndpoint
+    fun start(onEndpoint: (CarPlayEndpoint) -> Unit) = startTransport(true, onEndpoint)
+
+    fun keepIdentityOnly() = startTransport(false, null)
+
+    fun pauseSessions() { bluetooth?.setSessionEnabled(false); endpointCallback = null }
+
+    private fun startTransport(allowSessions: Boolean, onEndpoint: ((CarPlayEndpoint) -> Unit)?) {
         synchronized(this) {
+            endpointCallback = onEndpoint
             bluetooth?.let { existing ->
                 if (existing.isRunning) {
+                    existing.setSessionEnabled(allowSessions)
+                    if (allowSessions) existing.setWifiHandoff(false)
                     refreshCarPlayMarker()
-                    log("IAP2: 已在运行，仅更新端点回调")
+                    log(if (allowSessions) "IAP2: 已在运行，允许会话且保留 SDP 注册" else "IAP2: 仅保留 iPhone 身份声明，暂停会话与出站；SDP 已注册=${existing.isListening}")
                     return
                 }
             }
             // 预解析真实 MAC：早失败早暴露（Shizuku 未就绪时占位值可能被真车拒绝）。
             // 一次性后台任务，不是长循环；解析结果由会话线程按需再取/重取。
-            Thread({ prefetchDeviceMac() }, "iap2-mac-prefetch").apply {
+            if (allowSessions) Thread({ prefetchDeviceMac() }, "iap2-mac-prefetch").apply {
                 isDaemon = true
                 start()
             }
@@ -121,6 +128,7 @@ class Iap2Coordinator(
                     onSessionEnded = { reason -> log("IAP2: 会话结束（$reason），继续监听/出站等待重连") },
                 )
             bluetooth = bt
+            bt.setSessionEnabled(allowSessions)
             bt.setCarPlayMarkerEnabled(io.github.hypercar.settings.SettingsStore.bluetoothCarPlayMarker)
             if (!bt.start()) {
                 log("IAP2: 蓝牙启动失败（权限/开关），请检查后重试")

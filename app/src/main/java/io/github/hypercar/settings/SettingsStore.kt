@@ -226,8 +226,30 @@ object SettingsStore {
         return hit.substringAfterLast('|').toLongOrNull()
     }
 
-    /** 清空「已配对」记录（重置配对身份时调用）。 */
-    fun clearPairedCars() = p().edit().remove(KEY_PAIRED_CARS).apply()
+    fun receiverPairingIdentityBackup(key: String): String =
+        p().getString("${KEY_PAIRING_IDENTITY}_$key", "").orEmpty()
+
+    fun saveReceiverPairingIdentityBackup(key: String, value: String) {
+        p().edit().putString("${KEY_PAIRING_IDENTITY}_$key", value).apply()
+    }
+
+    fun forgetAllCarPairings() {
+        val editor = p().edit().remove(KEY_PAIRING_IDENTITY).remove(KEY_PAIRED_CARS)
+            .remove(KEY_LAST_AIRPLAY_ENDPOINT).remove("known_car_networks")
+        p().all.keys.filter { it.startsWith("${KEY_PAIRING_IDENTITY}_bt_") }.forEach { editor.remove(it) }
+        editor.apply()
+    }
+
+    /** Preserve the shared phone identity and all other cars' records. Target selection is
+     * cleared separately by the session owner after file cleanup succeeds. */
+    fun forgetCarPairing(mac: String) {
+        val key = requireNotNull(io.github.hypercar.session.PairingEvidence.receiverKey(mac))
+        p().edit()
+            .putStringSet(KEY_PAIRED_CARS, io.github.hypercar.session.PairingResetRecords.pairedCars(pairedCars, mac))
+            .putStringSet("known_car_networks", io.github.hypercar.session.PairingResetRecords.networks(knownCarNetworks, mac))
+            .remove("${KEY_PAIRING_IDENTITY}_$key")
+            .apply()
+    }
     /** 屏幕推送分辨率**兜底值**（车机 `/info` 没回报尺寸时才用）。 */
     var videoWidth: Int
         get() = p().getInt(KEY_WIDTH, DEFAULT_VIDEO_WIDTH)

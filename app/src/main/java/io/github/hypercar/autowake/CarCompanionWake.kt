@@ -181,6 +181,19 @@ object CarCompanionWake {
     }
 
     @Suppress("DEPRECATION")
+    fun removeFor(context: Context, mac: String): Boolean {
+        if (!supported(context)) return false
+        val cdm = manager(context) ?: return false
+        return runCatching {
+            cdm.myAssociations.filter { mac.equals(it.deviceMacAddress?.toString(), ignoreCase = true) }.forEach {
+                runCatching { cdm.stopObservingDevicePresence(mac) }
+                cdm.disassociate(it.id)
+            }
+            true
+        }.onFailure { HyperCarRepo.log("COMPANION: 解除该车机关联失败 ${it.message}") }.getOrDefault(false)
+    }
+
+    @Suppress("DEPRECATION")
     fun remove(context: Context): Boolean {
         if (!supported(context)) return false
         val cdm = manager(context) ?: return false

@@ -152,7 +152,7 @@ fun SettingsScreen(
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
                             SettingsMenuItem("权限与后台", "系统权限、后台运行与 Shizuku 授权") { open(SettingsPage.Permissions) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-                            SettingsMenuItem("高级设置", "手动蓝牙地址与重置配对身份") { open(SettingsPage.Advanced) }
+                            SettingsMenuItem("高级设置", "手动蓝牙地址与清除全部配对身份") { open(SettingsPage.Advanced) }
                         }
                     }
                     SettingsPage.Car -> {
@@ -689,6 +689,9 @@ private fun TargetCarSection() {
     var dialogVisible by remember { mutableStateOf(false) }
     val context = androidx.compose.ui.platform.LocalContext.current
     val selectCar = rememberCarSelection()
+    val scope = rememberCoroutineScope()
+    var pendingClear by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var clearing by remember { mutableStateOf(false) }
     val enhanced = remember(expanded, revision) {
         io.github.hypercar.autowake.CarCompanionWake.associatedAddresses(context)
     }
@@ -710,6 +713,16 @@ private fun TargetCarSection() {
                     .orEmpty()
             }
         }.getOrDefault(emptyList())
+    }
+
+    // Keep saved CarPlay receivers visible even if their system Bluetooth bond was removed.
+    val candidates = remember(bonded, revision) {
+        val history = SettingsStore.pairedCars.mapNotNull { row ->
+            val mac = row.substringBefore('|')
+            if (io.github.hypercar.session.PairingEvidence.receiverKey(mac) == null) null
+            else row.substringBeforeLast('|').substringAfter('|').ifBlank { mac } to mac
+        }
+        (bonded + history).distinctBy { it.second.uppercase(java.util.Locale.ROOT) }.sortedBy { it.first }
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -774,11 +787,11 @@ private fun TargetCarSection() {
                             expanded = false
                         },
                     )
-                    if (bonded.isNotEmpty()) {
+                    if (candidates.isNotEmpty()) {
                         HorizontalDivider(color = StrokeGlass)
-                        bonded.forEach { (name, mac) ->
+                        candidates.forEach { (name, mac) ->
                             val pairedAt = SettingsStore.pairedCarAt(mac)
-                            val paired = pairedAt != null
+                            val paired = SettingsStore.isCarPaired(mac)
                             DropdownMenuItem(
                                 text = {
                                     Column {
@@ -791,7 +804,7 @@ private fun TargetCarSection() {
                                         )
                                         Row(verticalAlignment = Alignment.CenterVertically) {
                                             if (paired) {
-                                                TargetCarBadge("已配对 · " + agoText(pairedAt!!))
+                                                TargetCarBadge(if (pairedAt != null) "已配对 · " + agoText(pairedAt) else "已配对")
                                             }
                                             if (enhanced.any { it.equals(mac, ignoreCase = true) }) {
                                                 if (paired) Spacer(modifier = Modifier.width(6.dp))
@@ -809,6 +822,17 @@ private fun TargetCarSection() {
                                     expanded = false
                                     selectCar(mac, name)
                                 },
+                                trailingIcon = if (paired) ({
+                                    TextButton(
+                                        enabled = !clearing,
+                                        onClick = {
+                                            expanded = false
+                                            pendingClear = mac to name
+                                        },
+                                    ) {
+                                        Text("清除配对", color = AmberWarning, style = MaterialTheme.typography.labelMedium)
+                                    }
+                                }) else null,
                             )
                         }
                     }
@@ -846,33 +870,43 @@ private fun TargetCarSection() {
             },
         )
     }
+    val pending = pendingClear
+    if (pending != null) {
+        ResetPairingDialog(
+            targetName = pending.second,
+            onDismiss = { pendingClear = null },
+            onConfirm = {
+                pendingClear = null
+                clearing = true
+                scope.launch {
+                    try {
+                        val result = HyperCarRepo.resetPairingIdentity(pending.first)
+                        android.widget.Toast.makeText(context, result, android.widget.Toast.LENGTH_LONG).show()
+                    } finally { clearing = false }
+                }
+            },
+        )
+    }
+
 }
 
 @Composable
 private fun ResetPairingSection() {
     val context = LocalContext.current
-    // ---- 重置配对身份（车机端/手机端删过连接、两边状态对不上时用） ----
+    val scope = rememberCoroutineScope()
     var resetConfirm by remember { mutableStateOf(false) }
+    var resetting by remember { mutableStateOf(false) }
     GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp)) {
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(12.dp))
-                .clickable { resetConfirm = true }
-                .padding(vertical = 12.dp),
+            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                .clickable(enabled = !resetting) { resetConfirm = true }.padding(vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Column(modifier = Modifier.weight(1f)) {
+                Text("清除全部配对身份", style = MaterialTheme.typography.titleSmall, color = AmberWarning)
                 Text(
-                    text = "重置配对身份",
-                    style = MaterialTheme.typography.titleSmall,
-                    color = AmberWarning,
-                )
-                Text(
-                    text = "清掉本机的 AirPlay 身份 / 配对标记 / 端点记忆 / MFi 记忆。" +
-                        "车机端或手机端删过连接后两边对不上时用它（需先断开连接）。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TextSecondary,
+                    "清除所有车机的本地身份、配对记录与关联。仅清除某台车机，请使用目标车机列表右侧的按钮。",
+                    style = MaterialTheme.typography.bodySmall, color = TextSecondary,
                 )
             }
             Text("›", style = MaterialTheme.typography.titleLarge, color = AmberWarning)
@@ -883,17 +917,16 @@ private fun ResetPairingSection() {
             onDismiss = { resetConfirm = false },
             onConfirm = {
                 resetConfirm = false
-                val result = HyperCarRepo.resetPairingIdentity()
-                android.widget.Toast.makeText(
-                    context,
-                    result,
-                    android.widget.Toast.LENGTH_LONG,
-                ).show()
-                io.github.hypercar.settings.SettingsRevision.bump()
+                resetting = true
+                scope.launch {
+                    try {
+                        val result = HyperCarRepo.resetAllPairingIdentities()
+                        android.widget.Toast.makeText(context, result, android.widget.Toast.LENGTH_LONG).show()
+                    } finally { resetting = false }
+                }
             },
         )
     }
-
 }
 
 @Composable
@@ -908,6 +941,7 @@ private fun TargetCarBadge(text: String) {
 /** 「重置配对身份」确认弹窗：写清会删什么、以及车机端也要删。 */
 @Composable
 private fun ResetPairingDialog(
+    targetName: String? = null,
     onDismiss: () -> Unit,
     onConfirm: () -> Unit,
 ) {
@@ -934,18 +968,21 @@ private fun ResetPairingDialog(
                 contentPadding = PaddingValues(20.dp),
             ) {
                 Text(
-                    text = "重置配对身份",
+                    text = if (targetName == null) "清除全部配对身份" else "清除该车机配对",
                     style = MaterialTheme.typography.titleLarge,
                     color = TextPrimary,
                 )
                 Text(
-                    text = "会清除本机的：\n" +
-                        "· AirPlay 长期身份（下次连接重新生成，车机会当成新设备）\n" +
-                        "· 每台接收端的「已配对」标记\n" +
-                        "· 设置里的身份备份、上次成功的 AirPlay 端点\n" +
-                        "· MFi 挑战长度记忆\n\n" +
-                        "不受影响：分辨率、车机型号、目标车机、上车自动连接等设置。\n\n" +
-                        "⚠ 车机端也要把本机删除后重新配对，否则车机上会留下同名的旧记录。",
+                    text = if (targetName == null) {
+                        "将清除所有车机的本地配对身份、身份备份、已配对标记、Wi-Fi 关联、增强发现授权与 MFi 记忆。\n\n" +
+                            "目标车机设为未指定。分辨率、车机型号等设置与系统蓝牙配对保留。\n\n" +
+                            "下次连接将重新生成身份；请在车机端删除旧手机记录后重新配对。"
+                    } else "仅清除车机：$targetName\n\n" +
+                        "· 清除该车机的本地配对身份与已配对标记\n" +
+                        "· 清除该车机的 Wi-Fi 关联和增强发现授权\n" +
+                        "· 若当前指定的是该车机，则改为未指定\n\n" +
+                        "其它车机的配对与设置保留，本机系统蓝牙配对不删除。\n\n" +
+                        "下次连接会为该车机生成独立身份。请在该车机端删除旧手机记录后重新配对。",
                     style = MaterialTheme.typography.bodySmall,
                     color = TextSecondary,
                     modifier = Modifier.padding(top = 6.dp),
@@ -966,7 +1003,7 @@ private fun ResetPairingDialog(
                     )
                     Spacer(modifier = Modifier.width(12.dp))
                     CapsuleButton(
-                        text = "确认重置",
+                        text = if (targetName == null) "清除全部" else "清除该车机",
                         onClick = onConfirm,
                         modifier = Modifier.height(44.dp),
                         filled = true,

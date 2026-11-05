@@ -26,23 +26,30 @@ class HyperCarService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var listeningOnly = false
+    private var identityOnly = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val automatic = intent?.action != ACTION_SESSION
         val autoEnabled = io.github.hypercar.settings.SettingsStore.autoConnect
-        if (automatic && autoEnabled && io.github.hypercar.session.HyperCarRepo.automaticPauseRemaining > 0) {
-            io.github.hypercar.session.HyperCarRepo.startAutomaticListening(this)
-            if (!io.github.hypercar.session.HyperCarRepo.hasCurrentSession) {
+        val paused = autoEnabled && io.github.hypercar.session.HyperCarRepo.automaticPauseRemaining > 0
+        val requestedIdentity = intent?.action == ACTION_IDENTITY || (intent == null && paused)
+        if (automatic && io.github.hypercar.session.HyperCarRepo.hasCurrentSession &&
+            (requestedIdentity || intent == null || intent.action == ACTION_LISTEN)) return START_STICKY
+        if (automatic && paused) {
+            if (io.github.hypercar.session.HyperCarRepo.hasCurrentSession) return START_NOT_STICKY
+            if (!requestedIdentity) {
+                io.github.hypercar.session.HyperCarRepo.startAutomaticListening(this)
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 releaseLocks()
                 isRunning = false
                 stopSelf()
+                return START_NOT_STICKY
             }
-            return START_NOT_STICKY
         }
-        if (automatic && autoEnabled && !io.github.hypercar.session.HyperCarRepo.hasCurrentSession &&
+        identityOnly = requestedIdentity && paused
+        if (automatic && autoEnabled && !identityOnly && !io.github.hypercar.session.HyperCarRepo.hasCurrentSession &&
             !io.github.hypercar.session.StartupRequirements.read(this).automaticReady) {
             io.github.hypercar.session.HyperCarRepo.setAutoConnect(this, false)
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -66,7 +73,7 @@ class HyperCarService : Service() {
             return START_NOT_STICKY
         }
         if (automatic && !autoEnabled) return START_NOT_STICKY
-        listeningOnly = intent == null || intent.action == ACTION_LISTEN
+        listeningOnly = requestedIdentity || intent == null || intent.action == ACTION_LISTEN
         // 「待机通知」关掉时：待机不占前台，只做进程内监听（由 repo 用 startService 拉起，
         // 不会触发 startForegroundService 的 5s 超时）。会话仍然必须进前台保活。
         if (listeningOnly && !io.github.hypercar.settings.SettingsStore.standbyNotification) {
@@ -84,7 +91,7 @@ class HyperCarService : Service() {
             intent.getStringExtra(EXTRA_ADDRESS)?.let {
                 io.github.hypercar.session.HyperCarRepo.connectFromCompanion(applicationContext, it)
             }
-        } else if (intent == null && autoEnabled) {
+        } else if (autoEnabled && (intent == null || (requestedIdentity && !paused))) {
             // 系统回收后只恢复自动待机，不能凭空重建一轮手动会话。
             io.github.hypercar.session.HyperCarRepo.startAutomaticListening(applicationContext)
         }
@@ -109,7 +116,7 @@ class HyperCarService : Service() {
      * 至少保证会话能进前台（麦克风随后会在 AudioRecord 处再报一次原因）。
      */
     private fun startForegroundSafe() {
-        val micGranted =
+        val micGranted = !listeningOnly &&
             androidx.core.content.ContextCompat.checkSelfPermission(
                 this,
                 android.Manifest.permission.RECORD_AUDIO,
@@ -181,7 +188,11 @@ class HyperCarService : Service() {
         return NotificationCompat.Builder(this, HyperCarApp.CHANNEL_LINK)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentTitle(getString(R.string.notification_link_title))
-            .setContentText(if (listeningOnly) "正在监听车机，等待自动连接" else "正在保持与车机的连接")
+            .setContentText(when {
+                identityOnly -> "iPhone 身份已保留，自动连接暂停中"
+                listeningOnly -> "正在监听车机，等待自动连接"
+                else -> "正在保持与车机的连接"
+            })
             .setContentIntent(pending)
             .setOngoing(true)
             .setAutoCancel(false)
@@ -205,6 +216,7 @@ class HyperCarService : Service() {
 
         /** 上车：车机 ACL 连上时（经 AutoStart.handler）拉起本服务。 */
         const val ACTION_START = "io.github.hypercar.action.AUTO_START"
+        private const val ACTION_IDENTITY = "io.github.hypercar.action.IDENTITY_ONLY"
         private const val ACTION_LISTEN = "io.github.hypercar.action.LISTEN"
         private const val ACTION_SESSION = "io.github.hypercar.action.SESSION"
         private const val ACTION_COMPANION = "io.github.hypercar.action.COMPANION"
@@ -223,6 +235,9 @@ class HyperCarService : Service() {
 
         fun listenIntent(context: Context): Intent =
             Intent(context, HyperCarService::class.java).setAction(ACTION_LISTEN)
+
+        fun identityIntent(context: Context): Intent =
+            Intent(context, HyperCarService::class.java).setAction(ACTION_IDENTITY)
 
         fun sessionIntent(context: Context): Intent =
             Intent(context, HyperCarService::class.java).setAction(ACTION_SESSION)
