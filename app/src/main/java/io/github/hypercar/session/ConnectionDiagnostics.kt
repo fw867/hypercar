@@ -5,7 +5,8 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
     enum class Stage {
         REQUESTED, DEPENDENCIES_CHECKED, BLUETOOTH_LISTENING, IAP2_STARTED,
         IAP2_PARAMETERS, WIFI_BOUND, CTRL_REGISTERED, CTRL_INVITED, AIRPLAY_START,
-        RECORD, UI_STARTED,
+        RECORD, RESOURCES_ACCEPTED, CONTROL_READY, SCREEN_SETUP, VIDEO_CHANNEL_READY,
+        FIRST_VIDEO_FRAME, WAITING_INVITATION, UI_STARTED,
     }
     private data class Attempt(
         val id: Long, val source: String, val profile: String, val started: Long,
@@ -30,7 +31,10 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
     @Synchronized fun mark(id: Long, stage: Stage, detail: String = "") {
         val a = history.lastOrNull()?.takeIf { it.id == id && it.ended == null } ?: return
         a.reached.putIfAbsent(stage, (clockMillis() - a.started).coerceAtLeast(0))
-        if (stage == Stage.RECORD) a.outcome = "STREAMING"
+        if (stage == Stage.RECORD) a.outcome = "ACTIVATING"
+        if (stage == Stage.CONTROL_READY) a.outcome = "CONNECTED"
+        if (stage == Stage.FIRST_VIDEO_FRAME) a.outcome = "STREAMING"
+        if (stage == Stage.WAITING_INVITATION) a.outcome = "WAITING_INVITATION"
         if (detail.isNotBlank()) a.notes[stage] = clean(detail)
     }
 

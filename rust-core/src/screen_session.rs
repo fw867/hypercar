@@ -31,6 +31,7 @@ impl ScreenSession {
         let body=airplay::build_screen_setup(conn_id,&self.uuid);
         let response=self.control.request("SETUP","/",&body,"application/x-apple-binary-plist",&[],Duration::from_secs(8)).await?;
         if response.status()!=200 { return Err(format!("屏幕 SETUP 被拒 {}",response.first_line)); }
+        crate::pipeline::activation(&self.params.pipeline, "SCREEN_SETUP");
         let root=bplist::parse(&response.body).map_err(|e|format!("屏幕 SETUP 解析失败 {e}"))?;
         let port=root.get("streams").and_then(Value::as_array).and_then(|s|s.first())
             .map(|s|airplay::port_of(s.get("dataPort"))).unwrap_or(0);
@@ -47,6 +48,7 @@ impl ScreenSession {
         if self.params.carwith_stretch { sender.set_display_target(self.display.0,self.display.1); }
         sender.set_ownership(self.owned.clone());
         crate::emit_log(&format!("AIRPLAY: 主屏 TCP 就绪 dataPort={port} connId={conn_id} source={w}x{h}; new cipher/config state"));
+        crate::pipeline::activation(&self.params.pipeline, "VIDEO_CHANNEL_READY");
         Ok(sender)
     }
 

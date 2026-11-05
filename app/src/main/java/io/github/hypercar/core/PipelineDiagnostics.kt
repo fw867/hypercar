@@ -9,6 +9,11 @@ data class PipelineDiagnostics(
     val generation: Long = 0,
     val active: Boolean = false,
     val controlReady: Boolean = false,
+    val recordAccepted: Boolean = false,
+    val resourcesAccepted: Boolean = false,
+    val screenSetupAccepted: Boolean = false,
+    val videoChannelReady: Boolean = false,
+    val activationFailure: String? = null,
     val wifiIap2: String = "WAIT_SESSION",
     val screenOwned: Boolean? = null,
     val videoStream: String = "WAIT_SETUP",
@@ -81,6 +86,10 @@ data class PipelineDiagnostics(
                 if (this == null || isNull(key)) null else optLong(key).takeIf { it >= 0 }
             PipelineDiagnostics(
                 generation = generation, active = true,
+                recordAccepted = j.optBoolean("record_accepted"),
+                resourcesAccepted = j.optBoolean("resources_accepted"),
+                screenSetupAccepted = j.optBoolean("screen_setup_accepted"),
+                videoChannelReady = j.optBoolean("video_channel_ready"),
                 controlReady = j.optBoolean("control_ready"), wifiIap2 = j.optString("wifi_iap2", "WAIT_SESSION"),
                 screenOwned = if (j.isNull("screen_owned")) null else j.getBoolean("screen_owned"),
                 videoStream = j.optString("video_stream", "WAIT_SETUP"),

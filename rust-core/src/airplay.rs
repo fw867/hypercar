@@ -397,7 +397,7 @@ pub async fn negotiate(
     // BMW box activates the session before resource negotiation and video SETUP.
     let declaration = modes.lock().declaration();
     emit_log(&format!("TIMING: before RECORD {}",p.pipeline.lock().timing.summary()));
-    activate_session(&channel, &declaration).await?;
+    activate_session(&channel, &declaration, &p.pipeline).await?;
     emit_log(&format!("TIMING: after RECORD/resource response {}",p.pipeline.lock().timing.summary()));
     p.pipeline.lock().control_ready=true;
 
@@ -674,6 +674,43 @@ mod display_size_tests {
     }
 
     #[tokio::test]
+    async fn record_success_survives_peer_close_during_resource_declaration() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                buffer.extend_from_slice(&chunk[..n]);
+                for request in crate::rtsp::parse_rtsp_messages(&mut buffer) {
+                    if request.first_line.starts_with("POST /command ") {
+                        return; // BMW's observed EOF immediately following RECORD 200.
+                    }
+                    assert_eq!(request.first_line, "RECORD / RTSP/1.0");
+                    let response = format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n", request.cseq().unwrap());
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            }
+        });
+        let socket = TcpStream::connect(address).await.unwrap();
+        let (read, write) = socket.into_split();
+        let (channel, _) = RtspChannel::spawn(read, write, None);
+        let pipeline = Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
+        let error = activate_session(&channel, &crate::modes::Modes::initial().declaration(), &pipeline).await.unwrap_err();
+        assert!(error.contains("控制通道已关闭"), "{error}");
+        let p = pipeline.lock();
+        assert!(p.record_accepted);
+        assert!(!p.resources_accepted);
+        assert!(!p.video_channel_ready);
+        drop(p);
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn session_setup_and_info_precede_record_then_resource_declaration() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -734,7 +771,7 @@ mod display_size_tests {
         let display = &info.get("displays").unwrap().as_array().unwrap()[0];
         assert_eq!(uuid_text(display.get("uuid")).as_deref(), Some("actual-bmw-display"));
         assert_eq!(read_display_size(display), (2560, 744));
-        activate_session(&channel, &crate::modes::Modes::initial().declaration()).await.unwrap();
+        activate_session(&channel, &crate::modes::Modes::initial().declaration(), &Arc::new(Mutex::new(crate::pipeline::Pipeline::new()))).await.unwrap();
         drop(channel);
         assert_eq!(peer.await.unwrap().len(), 5);
     }
@@ -947,12 +984,14 @@ fn use_box_bootstrap(requested: bool, info: &Value) -> bool {
     })
 }
 
-async fn activate_session(channel: &Arc<RtspChannel>, declaration: &[u8]) -> Result<(), String> {
+async fn activate_session(channel: &Arc<RtspChannel>, declaration: &[u8], pipeline: &Arc<Mutex<crate::pipeline::Pipeline>>) -> Result<(), String> {
     emit_log("AIRPLAY: 开始 RECORD（屏幕流建立前）");
     record_session(channel).await?;
+    crate::pipeline::activation(pipeline, "RECORD");
     emit_log("AIRPLAY: ✓ RECORD 完成；声明资源后建立屏幕流");
     let reply = channel.request("POST", "/command", declaration, "application/x-apple-binary-plist", &[], Duration::from_secs(5)).await?;
     if reply.status() != 200 { return Err(format!("资源声明被拒 {}", reply.first_line)); }
+    crate::pipeline::activation(pipeline, "RESOURCES_ACCEPTED");
     emit_log("MODES: initial resource snapshot accepted");
     Ok(())
 }

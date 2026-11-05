@@ -73,6 +73,14 @@ fun ConnectionStageCard(pipeline: PipelineDiagnostics, modifier: Modifier = Modi
             if (p.generation <= 0) {
                 Text("正在读取本轮连接状态…", color = neutral, fontSize = 11.sp, lineHeight = 15.sp)
             } else {
+                fun activationColor(accepted: Boolean, attempted: Boolean = true) = when {
+                    accepted -> success
+                    p.activationFailure != null && attempted -> error
+                    else -> neutral
+                }
+                Facts("激活 " to neutral, (if (p.recordAccepted) "RECORD ✓" else "RECORD 等待") to activationColor(p.recordAccepted),
+                    "   ·   " to neutral, (if (p.resourcesAccepted) "资源 ✓" else "资源 未完成") to activationColor(p.resourcesAccepted, p.recordAccepted),
+                    "   ·   " to neutral, (if (p.videoChannelReady) "视频TCP ✓" else "视频TCP 等待") to activationColor(p.videoChannelReady, p.screenSetupAccepted))
                 Facts("控制 " to neutral, (if (p.controlReady) "✓ 就绪" else "协商中") to color(p.controlStatus),
                     "   ·   Wi-Fi iAP2 " to neutral, p.wifiLabel to color(p.wifiStatus))
                 Facts("视频 " to neutral, p.videoLabel to color(p.videoStatus),

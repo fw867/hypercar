@@ -4,6 +4,15 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PipelineDiagnosticsTest {
+    @org.junit.Test fun recordAcceptanceIsIndependentOfControlAndVideoReadiness() {
+        val p = PipelineDiagnostics.parse("""{"generation":7,"control_ready":false,"record_accepted":true,"resources_accepted":false,"screen_setup_accepted":false,"video_channel_ready":false}""")!!
+        org.junit.Assert.assertTrue(p.recordAccepted)
+        org.junit.Assert.assertFalse(p.controlReady)
+        org.junit.Assert.assertFalse(p.resourcesAccepted)
+        org.junit.Assert.assertFalse(p.screenSetupAccepted)
+        org.junit.Assert.assertFalse(p.videoChannelReady)
+    }
+
     @Test fun queueAndCumulativeRetransmitsDoNotTurnHealthyTransportRed() {
         val p=PipelineDiagnostics.parse("""{"generation":11,"control_ready":true,"wifi_iap2":"READY_TRANSPORT","video_stream":"READY","audio_ready":true,"timing":{"requests":20,"replies":20},"video_tcp":{"state":1,"acked_bytes":8192,"outq_bytes":1024,"total_retrans":9}}""")!!
         assertEquals(PipelineStatus.SUCCESS,p.controlStatus)

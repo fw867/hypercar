@@ -27,6 +27,8 @@ data class CarPlayEndpoint(
     val ipAddresses: List<String>,
     val gateway: String?,
     val fromInvite: Boolean = false,
+    /** Cached/discovered endpoint used without this round's activation invitation. */
+    val proactive: Boolean = false,
 )
 
 /**
