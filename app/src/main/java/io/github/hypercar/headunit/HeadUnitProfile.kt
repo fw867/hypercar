@@ -66,6 +66,15 @@ data class HeadUnitProfile(
     /** Wait for this connection's ctrl invite or iAP2 endpoint; an open port is not activation. */
     val requireAirplayActivation: Boolean = false,
 
+    /** Receiver-specific opt-out of the global cached/scanned Wi-Fi shortcut. */
+    val allowProactiveWifiSession: Boolean = true,
+
+    /** Some receivers invite over the already joined Wi-Fi before supplying 0x5703. Requires an explicit target. */
+    val advertiseOnCurrentWifi: Boolean = false,
+
+    /** Require a recent ctrl invitation even if iAP2/mDNS already supplied an address. */
+    val requireFreshCtrlInvite: Boolean = false,
+
     /** mDNS 拿不到（或不用 mDNS）时的兜底端口，按顺序试连。 */
     val fallbackAirplayPorts: List<Int> = listOf(7000, 7001, 7100, 17000),
 
@@ -162,36 +171,53 @@ object HeadUnitProfiles {
     )
 
     /**
-     * 奥迪 MIB3 / MIB3 3315 —— **未实车验证**（只有 cardeck 与历史日志的二手结论）。
-     *
-     * 已知（均来自代码注释里的实测记录）：
-     *  - 车机**会发** 0x4301，但可能晚到 2 分 35 秒（MIB3 3310 实测）；
-     *  - 控制消息会话 id = 1；0x4E0E 接受但从不 ACK；
-     *  - 触摸报告是 5 字节单指（Rust 侧已按长度自适应，无需配置）；
-     *  - 0x1D01 可收清单可能只有 5 项、不含 0x5702（清单只能证明"有"）。
-     *
-     * 未知：是否需要 EA 会话、`/info` 是否只认 POST、AirPlay 端口、
-     * 是否校验 deviceID、是否广播 `_airplay._tcp`。首次上车请按
-     * `docs/HEADUNIT-PROFILES.md` 的「症状 → 字段」表逐项校准后把 verified 改 true。
+     * 奥迪基础档案：对照 CarDeck 503ed37；尚未完成本项目实车验证。
+     * 6318 可能只给 Wi-Fi 凭据，端点由 mDNS 发现；9310 的 0x4301 可能晚到。
+     * 0x4300 / 0x4E0E 只发送，不等待 ACK；EA 仅打开车机声明的协议。
+     * 音频配置保护不等于断开 RFCOMM，控制链路需保留以接收后续通知。
+     * MFi 长度、触摸尺寸及端点继续按协商结果自适应，不按品牌固定。
      */
     val AUDI_MIB3 = HeadUnitProfile(
         id = "audi_mib3",
         label = "Audi MIB3",
-        model = "MIB3 / 3315",
-        notes = "未实车验证：车机会发 0x4301（可能晚到 2 分钟以上），控制会话 id=1，触摸为 5 字节单指。",
+        model = "MMI 6318 / 9310 / 3315（参考记录）",
+        notes = "未实车验证：保留蓝牙控制链路，兼容仅 mDNS 发现端点及晚到的 0x4301；按车机声明打开 EA 会话。",
         verified = false,
         validatesDeviceId = false,
-        sendCarPlayAvailability = false,
-        openEaSessions = false,
-        sendTransportIdentifier = false,
+        sendCarPlayAvailability = true,
+        openEaSessions = true,
+        sendTransportIdentifier = true,
         replyPowerUpdates = true,
         preferMdnsAirplay = true,
         fallbackAirplayPorts = listOf(7000, 7001, 7100, 17000),
         touchDisplay = null,
-        pairingHint = "首次要在 MMI 里选「Apple CarPlay」并确认这台手机（车机会弹提示）",
+        pairingHint = "在 MMI 中选择 Apple CarPlay 并确认手机；接受蓝牙与 Wi-Fi 提示，等待车机完成邀请",
     )
+    /** VW4131/VW4211 evidence from mcarplay; baseline only, not validated in this project. */
+    val VOLKSWAGEN = HeadUnitProfile(
+        id = "volkswagen_mib",
+        label = "大众 Volkswagen",
+        model = "VW4131 / VW4211（ID.7 / 帕萨特 2025）",
+        notes = "未实车验证：先选定目标车机并连接车机 Wi-Fi，保持蓝牙与广播，等待车机本轮邀请；不使用无邀请的主动直连。",
+        verified = false,
+        sendCarPlayAvailability = true,
+        openEaSessions = false,
+        sendTransportIdentifier = true,
+        replyPowerUpdates = true,
+        dropProfilesBeforeIap2 = false,
+        allowOutboundIap2 = true,
+        abortWhenCarPlayWindowClosed = false,
+        preferMdnsAirplay = true,
+        requireAirplayActivation = true,
+        allowProactiveWifiSession = false,
+        advertiseOnCurrentWifi = true,
+        requireFreshCtrlInvite = true,
+        fallbackAirplayPorts = listOf(7000, 7001, 7100, 17000),
+        pairingHint = "先完成系统蓝牙配对，在「目标车机」选定这台大众车机；首次请手动连接车机 Wi-Fi，并在车机确认 Apple CarPlay。",
+    )
+
     /** 内置档案（出厂就有的，断网也一定在）。宝马排第一：它是默认档案。 */
-    val builtin: List<HeadUnitProfile> = listOf(BMW_ID85, GENERIC, WINPLAY, AUDI_MIB3)
+    val builtin: List<HeadUnitProfile> = listOf(BMW_ID85, GENERIC, WINPLAY, AUDI_MIB3, VOLKSWAGEN)
 
     /**
      * 全部可用档案 = 内置 + 远程（GitHub 下发的 `profiles/headunits.json`）。

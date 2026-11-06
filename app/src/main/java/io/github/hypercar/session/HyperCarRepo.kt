@@ -7,6 +7,7 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import io.github.hypercar.net.SessionSocketLease
+import io.github.hypercar.headunit.HeadUnitActivationPolicy
 import android.net.NetworkRequest
 import android.net.NetworkCapabilities
 import android.os.ParcelFileDescriptor
@@ -793,6 +794,43 @@ object HyperCarRepo {
         return exact.singleOrNull() ?: networks.singleOrNull()
     }
 
+    /** VW may withhold 0x5703 until initial AirPlay pairing; advertise only for an explicitly selected peer. */
+    private suspend fun prepareInvitationNetwork(context: Context, advertiser: CarPlayCtrlAdvertiser) {
+        val profile = headUnitProfile
+        if (!profile.advertiseOnCurrentWifi) { resumeKnownCarNetwork(context, advertiser); return }
+        val target = SettingsStore.targetCarMac
+        if (!HeadUnitActivationPolicy.canAdvertiseCurrentWifi(profile, target, iap2?.activePeerAddress)) return
+        val ssid = currentWifiSsid(context) ?: return
+        val network = knownWifiNetwork(context, ssid) ?: return
+        val changed = boundNetwork != network || joinedSsid != ssid || wifiReceiverMac != target
+        if (changed) {
+            val cm = context.getSystemService(ConnectivityManager::class.java) ?: return
+            if (!cm.bindProcessToNetwork(network)) {
+                log("WIFI-INVITE: 当前 Wi-Fi 绑定失败，继续等车机热点/邀请")
+                return
+            }
+            wifiReceiverMac = target
+            sessionWifiSsid = ssid
+            boundNetwork = network
+            joinedNetwork = network
+            joinedSsid = ssid
+            watchSessionNetwork(context, network)
+            log("WIFI-INVITE: profile=${profile.id} target=$target network=#$network；先广播等邀请，不推断已配对或主动直连")
+        }
+        advertiser.ensureForNetwork(ssid, force = changed, network = network)
+    }
+
+    private fun usableCtrlInvitation(advertiser: CarPlayCtrlAdvertiser): CarPlayCtrlAdvertiser.Invitation? {
+        val invite = advertiser.lastInvitation ?: return null
+        val now = SystemClock.elapsedRealtime()
+        if (HeadUnitActivationPolicy.acceptsInvitation(headUnitProfile, invite.receivedAtMillis, now,
+                boundNetwork != null && invite.network == boundNetwork)) return invite
+        if (advertiser.discardInvitation(invite)) {
+            log("CTRL: 忽略过期/跨网络邀请 profile=${headUnitProfile.id} age=${now - invite.receivedAtMillis}ms inviteNetwork=${invite.network} currentNetwork=$boundNetwork，继续广播等本轮邀请")
+        }
+        return null
+    }
+
     private suspend fun resumeKnownCarNetwork(context: Context, advertiser: CarPlayCtrlAdvertiser) {
         val ssid = currentWifiSsid(context) ?: return
         val mac = knownWifiReceiver(ssid) ?: return
@@ -969,7 +1007,8 @@ object HyperCarRepo {
             log(
                 "PROFILE: ${p.id}（${p.label}）0x4300=${p.sendCarPlayAvailability} " +
                     "EA=${p.openEaSessions} 0x4E0E=${p.sendTransportIdentifier} " +
-                    "断HFP/A2DP=${p.dropProfilesBeforeIap2} 主动拨号=${p.allowOutboundIap2} 档案A退场=${p.abortWhenCarPlayWindowClosed} "
+                    "断HFP/A2DP=${p.dropProfilesBeforeIap2} 主动拨号=${p.allowOutboundIap2} 档案A退场=${p.abortWhenCarPlayWindowClosed} " +
+                    "主动WiFi=${HeadUnitActivationPolicy.permitsProactive(p)} 当前WiFi广播=${p.advertiseOnCurrentWifi} 新鲜邀请=${p.requireFreshCtrlInvite}"
             )
             val coordinator = coordinatorFor(context)
 
@@ -1157,6 +1196,10 @@ object HyperCarRepo {
                 airplayHost = apHost
                 airplayAttempts = 0
 
+                if (headUnitProfile.requireFreshCtrlInvite && usableCtrlInvitation(advertiser)?.host != apHost) {
+                    waitForInvitation("车机邀请已过期或端点已改变，等待新邀请", null)
+                    continue@activation
+                }
                 // ---- 连 AirPlay 控制端口并移交 FD ----
                 push(link = LinkState.Negotiating("连接车机 AirPlay 端口"))
                 val carNetworkSsid = currentWifiSsid(context)
@@ -1172,6 +1215,12 @@ object HyperCarRepo {
                 val apHostFinal = connected.target.host
                 val port = connected.target.port
                 val controlFd = connected.socket
+                val activationInvite = usableCtrlInvitation(advertiser)
+                if (headUnitProfile.requireFreshCtrlInvite && activationInvite?.host != apHostFinal) {
+                    runCatching { ParcelFileDescriptor.adoptFd(controlFd).close() }
+                    waitForInvitation("连接期间车机邀请失效，已关闭候选 socket，等待新邀请", null)
+                    continue@activation
+                }
                 airplayHost = apHostFinal
                 airplayPort = port
                 rememberAirplayEndpoint(carNetworkSsid, connected.target)
@@ -1196,7 +1245,7 @@ object HyperCarRepo {
                 // 这两行能区分「崩在 nativeStart 里」还是「崩在引擎跑起来之后」。
                 log("CORE: 调用 nativeStart（$apHostFinal:$port fd=$controlFd）")
                 connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.AIRPLAY_START)
-                val activation = if (endpoint.proactive) ProactiveActivation() else null
+                val activation = if (HeadUnitActivationPolicy.needsFallbackGate(headUnitProfile, endpoint.proactive)) ProactiveActivation() else null
                 proactiveActivation.set(activation)
                 val started = RustCoreBridge.nativeStart(json, controlFd, socketProvider(sockets))
                 log("CORE: nativeStart 返回 $started")
@@ -1225,6 +1274,10 @@ object HyperCarRepo {
                 sessionUiJob = null
                 CarUiCaster.stopAsync()
                 MusicBridge.onCarDisconnected()
+                // A failed VW activation must wait for another invitation, not reuse the
+                // consumed one. CAS preserves an invite that arrived during negotiation.
+                if (headUnitProfile.requireFreshCtrlInvite && activationInvite != null)
+                    advertiser.discardInvitation(activationInvite)
                 waitForInvitation(rejected, endpoint.copy(ipAddresses = listOf(apHostFinal),
                     airPlayPort = port, gateway = apHostFinal))
                 RustCoreBridge.nativeStop()
@@ -2115,7 +2168,7 @@ object HyperCarRepo {
     }
 
     private suspend fun proactiveWifiSessionAllowed(context: Context, enabled: Boolean): Boolean {
-        if (!enabled) return false
+        if (!enabled || !HeadUnitActivationPolicy.permitsProactive(headUnitProfile)) return false
         val ssid = currentWifiSsid(context)
         val receiver = knownWifiReceiver(ssid)
         val network = ssid?.let { knownWifiNetwork(context, it) }
@@ -2176,7 +2229,7 @@ object HyperCarRepo {
         // BMW's second-entry box trace still obtains Bluetooth credentials and a fresh ctrl invite.
         // Retain the network/identity shortcut, but never confuse a remembered/open port with activation.
         val profileRequiresActivation = headUnitProfile.requireAirplayActivation
-        val proactiveEnabled = SettingsStore.proactiveWifiSession
+        val proactiveEnabled = SettingsStore.proactiveWifiSession && HeadUnitActivationPolicy.permitsProactive(headUnitProfile)
         val proactiveDelay = ProactiveWifiSessionDelay()
         suspend fun proactiveReady(): Boolean {
             val eligible = proactiveWifiSessionAllowed(context, proactiveEnabled)
@@ -2190,7 +2243,7 @@ object HyperCarRepo {
             // endpoint or backoff from another receiver. Unknown networks remain invite-only.
             return knownWifiRetry.allowsRetry(eligible, automaticPauseRemaining > 0, network, receiver, now)
         }
-        resumeKnownCarNetwork(context, advertiser)
+        prepareInvitationNetwork(context, advertiser)
         var requireActivation = (invitationOnly || profileRequiresActivation) && !proactiveReady()
         log("WIFI-ACTIVE: 本轮开关=$proactiveEnabled 延时=${ProactiveWifiSessionPolicy.DELAY_MILLIS}ms 失败后已知网络恢复=$invitationOnly（需重新核实车机/网络及退避）；正常邀请优先，端口可连不代表车机已授权")
         if (requireActivation) {
@@ -2238,11 +2291,11 @@ object HyperCarRepo {
                     ticks++
                     // 手动连接可以早于车机热点出现。等待期间也检查已配对网络，
                     // 不等本轮 300s 超时；实验模式仅允许已配对且已绑定的车机网络主动尝试。
-                    resumeKnownCarNetwork(context, advertiser)
+                    prepareInvitationNetwork(context, advertiser)
                     // ① 车机已经来邀请过（GET /ctrl-int/1/connect）→ 直接用邀请方 IP 当端点。
                     //    BMW MGU-55 实测：清单里声明「0x4301 不发」，等它是死等；而邀请一旦
                     //    到达，TCP 对端地址就是车机在热点网段上的地址，AirPlay 控制面在 7000。
-                    val inviteIp = advertiser.lastInvitePeerIp
+                    val inviteIp = usableCtrlInvitation(advertiser)?.host
                     if (inviteIp != null) {
                         val base = lastSeen.get()
                         log("SESSION: ✓ 车机已邀请（$inviteIp）——用它当 AirPlay 端点 :7000")
@@ -2364,7 +2417,7 @@ object HyperCarRepo {
                 }
                 // Only fresh coordinator callbacks reach here; cached/scanned endpoints
                 // are gated separately during fallback. A fresh 0x4301 is also a receiver invitation.
-                if (pickHost(merged) != null) {
+                if (!headUnitProfile.requireFreshCtrlInvite && pickHost(merged) != null) {
                     usable = merged
                     continue
                 }

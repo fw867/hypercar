@@ -6,6 +6,32 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class RemoteProfilesTest {
+    @Test fun cachedSchemaSixCannotDisableAudiHandshakeMessages() {
+        val old = RemoteProfiles.parse("""{"_schema":6,"profiles":[{
+            "id":"audi_mib3","sendCarPlayAvailability":false,
+            "openEaSessions":false,"sendTransportIdentifier":false}]}""")
+        val effective = RemoteProfiles.merge(HeadUnitProfiles.builtin, old, 6)
+            .single { it.id == "audi_mib3" }
+        assertEquals(HeadUnitProfiles.AUDI_MIB3, effective)
+        assertTrue(effective.sendCarPlayAvailability)
+        assertTrue(effective.openEaSessions)
+        assertTrue(effective.sendTransportIdentifier)
+        // Credential-only MMI must still discover the endpoint without a ctrl invite.
+        assertFalse(effective.requireAirplayActivation)
+        assertFalse(effective.requireFreshCtrlInvite)
+    }
+
+    @Test fun volkswagenFieldsInheritAndRoundTripWithoutOldCacheOverridingTheGate() {
+        val vw = HeadUnitProfiles.VOLKSWAGEN
+        val inherited = RemoteProfiles.parse("""{"profiles":[{"id":"volkswagen_mib"}]}""").single()
+        assertEquals(vw, inherited)
+        val stale = vw.copy(requireFreshCtrlInvite = false, allowProactiveWifiSession = true)
+        val merged = RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(stale), 5)
+        assertEquals(vw, merged.single { it.id == vw.id })
+        assertEquals(listOf(vw), RemoteProfiles.parse(RemoteProfiles.encode(listOf(vw))))
+
+    }
+
     @Test fun omittedFieldsInheritEachBuiltinIncludingActivationAndHints() {
         for (builtin in HeadUnitProfiles.builtin) {
             val parsed = RemoteProfiles.parse("""[{"id":"${builtin.id}"}]""").single()

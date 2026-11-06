@@ -37,7 +37,7 @@ object RemoteProfiles {
      * 规则：**`_schema` 低于本常量的远程条目，只能新增车型，不能覆盖内置档案**
      * ——这样"修内置档案"必须显式升 schema 才会生效，旧缓存不会把修复顶回去。
      */
-    const val SCHEMA = 5
+    const val SCHEMA = 7
 
     /** 档案列表地址（raw.githubusercontent.com，改 `main` 为其它分支即可灰度）。 */
     const val DEFAULT_URL =
@@ -194,6 +194,9 @@ object RemoteProfiles {
             preferMdnsAirplay = o.optBoolean("preferMdnsAirplay", defaults.preferMdnsAirplay),
             requireAirplayActivation =
                 o.optBoolean("requireAirplayActivation", defaults.requireAirplayActivation),
+            allowProactiveWifiSession = o.optBoolean("allowProactiveWifiSession", defaults.allowProactiveWifiSession),
+            advertiseOnCurrentWifi = o.optBoolean("advertiseOnCurrentWifi", defaults.advertiseOnCurrentWifi),
+            requireFreshCtrlInvite = o.optBoolean("requireFreshCtrlInvite", defaults.requireFreshCtrlInvite),
             fallbackAirplayPorts = readPorts(o, defaults.fallbackAirplayPorts),
             touchDisplay = if (o.has("touchDisplay")) {
                 o.optString("touchDisplay", "").ifBlank { null }
@@ -231,6 +234,9 @@ object RemoteProfiles {
                     put("abortWhenCarPlayWindowClosed", p.abortWhenCarPlayWindowClosed)
                     put("preferMdnsAirplay", p.preferMdnsAirplay)
                     put("requireAirplayActivation", p.requireAirplayActivation)
+                    put("allowProactiveWifiSession", p.allowProactiveWifiSession)
+                    put("advertiseOnCurrentWifi", p.advertiseOnCurrentWifi)
+                    put("requireFreshCtrlInvite", p.requireFreshCtrlInvite)
                     put("fallbackAirplayPorts", JSONArray(p.fallbackAirplayPorts))
                     put("touchDisplay", p.touchDisplay ?: "")
                     put("pairingHint", p.pairingHint ?: "")
