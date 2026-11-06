@@ -1,10 +1,8 @@
 # HyperCar
 
-让 Android 手机通过经典蓝牙 iAP2 与 Wi-Fi AirPlay，向无线 CarPlay 车机传送自绘界面和系统音频。当前主线不依赖 CarLife、CarWith 或 PC hub，不需要 root。
+让 Android 手机通过经典蓝牙 iAP2 与 Wi-Fi AirPlay，向无线 CarPlay 车机传送自绘界面（需安装Shizuku）和系统音频。不需要 root。小米手机可以直接设置CarWith，可不用安装Shizuku。
  
- 小米手机可以直接设置CarWith，可不用安装Shizuku。
- 
-目前以 BMW MGU-55 / iD8.5 为实车开发基准。首次连接已获用户反馈稳定推流；二次上车的自动唤醒。WinPlay 用于桌面联调，Audi MIB3 档案尚未完成本项目实车验证。
+目前以 BMW MGU-55 / iD8.5 为实车开发基准，理论上支持BMW ID7 - ID9车机。首次连接已获用户反馈稳定推流；二次上车的自动唤醒。WinPlay 用于桌面联调，大众车机、Audi MIB3 档案尚未完成实车验证。
 
 ## 界面
 
