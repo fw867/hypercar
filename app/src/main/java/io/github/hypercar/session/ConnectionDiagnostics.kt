@@ -6,7 +6,7 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
         REQUESTED, DEPENDENCIES_CHECKED, BLUETOOTH_LISTENING, IAP2_STARTED,
         IAP2_PARAMETERS, WIFI_BOUND, CTRL_REGISTERED, CTRL_INVITED, AIRPLAY_START,
         RECORD, RESOURCES_ACCEPTED, CONTROL_READY, SCREEN_SETUP, VIDEO_CHANNEL_READY,
-        FIRST_VIDEO_FRAME, WAITING_INVITATION, UI_STARTED,
+        FIRST_VIDEO_FRAME, WAITING_INVITATION, WAITING_PROACTIVE_RETRY, UI_STARTED,
     }
     private data class Attempt(
         val id: Long, val source: String, val profile: String, val started: Long,
@@ -35,6 +35,7 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
         if (stage == Stage.CONTROL_READY) a.outcome = "CONNECTED"
         if (stage == Stage.FIRST_VIDEO_FRAME) a.outcome = "STREAMING"
         if (stage == Stage.WAITING_INVITATION) a.outcome = "WAITING_INVITATION"
+        if (stage == Stage.WAITING_PROACTIVE_RETRY) a.outcome = "RETRYING"
         if (detail.isNotBlank()) a.notes[stage] = clean(detail)
     }
 
