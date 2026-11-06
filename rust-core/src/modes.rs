@@ -104,6 +104,7 @@ impl Modes {
     /// /info.modes is a ChangeModes declaration, not an incoming modesChanged snapshot.
     /// Initial Take/Borrow have CatPlay's bootstrap semantics; do not replay them as live requests.
     pub fn from_info(info: &Value, enable_audio: bool, box_bootstrap: bool) -> Self {
+        crate::resource_trace::info_modes(info.get("modes"));
         let fallback = if box_bootstrap && !enable_audio { Self::box_initial() } else { Self::initial() };
         let mut value = match info.get("modes") {
             Some(params) => match Self::read_initial(params) {

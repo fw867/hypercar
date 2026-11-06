@@ -266,6 +266,7 @@ impl RtspChannel {
         let cseq = self.next_cseq();
         let started = std::time::Instant::now();
         let trace = path != "/feedback";
+        let diagnostic_kind = crate::resource_trace::trace_kind(method, path, body);
         if trace {
             let encrypted = self.cipher.lock().is_some();
             crate::emit_log(&format!("RTSP#{} TXQ CSeq={cseq} {method} {path} body={}B encrypted={} timeout={}ms", self.trace_id, body.len(), encrypted, timeout.as_millis()));
@@ -290,6 +291,11 @@ impl RtspChannel {
         let mut plaintext = Vec::with_capacity(head.len() + body.len());
         plaintext.extend_from_slice(head.as_bytes());
         plaintext.extend_from_slice(body);
+        if let Some(kind) = diagnostic_kind {
+            for line in crate::resource_trace::outbound(kind, self.trace_id, cseq, &plaintext, body) {
+                crate::emit_log(&line);
+            }
+        }
 
         {
             let mut w = tokio::time::timeout_at(deadline, self.write.lock()).await
@@ -316,6 +322,10 @@ impl RtspChannel {
             transaction.writing = false;
         }
 
+        if let Some(kind) = diagnostic_kind {
+            crate::emit_log(&format!("{kind} RTSP#{} CSeq={cseq} TX_WRITTEN bytes={} elapsed={}ms; socket write is not receiver acceptance",
+                self.trace_id, head.len() + body.len(), started.elapsed().as_millis()));
+        }
         let result = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(msg)) => Ok(msg),
             Ok(Err(_)) => {
@@ -329,6 +339,14 @@ impl RtspChannel {
             Ok(message) if trace || message.status() != 200 => crate::emit_log(&format!("RTSP#{} RX CSeq={cseq} status={} body={}B elapsed={}ms", self.trace_id, message.status(), message.body.len(), started.elapsed().as_millis())),
             Err(error) => crate::emit_log(&format!("RTSP#{} ERROR CSeq={cseq} elapsed={}ms {error}", self.trace_id, started.elapsed().as_millis())),
             _ => {}
+        }
+        if let Some(kind) = diagnostic_kind {
+            match &result {
+                Ok(message) => for line in crate::resource_trace::response(kind, self.trace_id, cseq, message) {
+                    crate::emit_log(&line);
+                },
+                Err(error) => crate::emit_log(&format!("{kind} RTSP#{} CSeq={cseq} RX_NONE rtsp_status=unavailable business_status=unavailable error={error:?}; no rejection code received", self.trace_id)),
+            }
         }
         result
     }
@@ -556,6 +574,36 @@ mod tests {
             };
             assert_eq!(response.status(),200); assert_eq!(response.cseq(),cseq); assert!(response.body.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn media_setup_trace_preserves_wire_request_and_empty_400_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = crate::airplay::build_screen_setup(42, "screen-id");
+        let expected = body.clone();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let request = loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                buffer.extend_from_slice(&chunk[..n]);
+                if let Some(request) = parse_rtsp_messages(&mut buffer).pop() { break request; }
+            };
+            assert_eq!(request.first_line, "SETUP / RTSP/1.0");
+            assert_eq!(request.body, expected);
+            let reply = format!("RTSP/1.0 400 Bad Request\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n", request.cseq().unwrap());
+            socket.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (read, write) = socket.into_split();
+        let (channel, _inbound) = RtspChannel::spawn(read, write, None);
+        let response = channel.request("SETUP", "/", &body, "application/x-apple-binary-plist", &[], Duration::from_secs(2)).await.unwrap();
+        assert_eq!(response.status(), 400);
+        assert!(response.body.is_empty());
+        peer.await.unwrap();
     }
 
     #[tokio::test]

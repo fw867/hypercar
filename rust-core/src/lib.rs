@@ -18,6 +18,8 @@ mod iap2_nav;
 mod modes;
 mod pairing;
 mod rtsp;
+mod resource_trace;
+mod rtsp_uri;
 mod screen;
 mod h264;
 mod pipeline;

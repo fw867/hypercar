@@ -1079,7 +1079,7 @@ async fn negotiate_audio(
     emit_log(&format!("AUDIO: SETUP PCM48k stereo SPF352 desktop={desktop} latencyMs={}", if desktop {250} else {0}));
     // 音频 SETUP 必须用**绝对 URI**（cardeck runAudioStream 同款：`rtsp://host:port/`）；
     // 屏幕流与初始 SETUP 才用相对路径。URI 用反会 400/404。
-    let audio_uri = format!("rtsp://{}:{}/", p.car_ip, p.airplay_port);
+    let audio_uri = crate::rtsp_uri::audio_uri(&p.car_ip, p.airplay_port);
     let resp = match channel
         .request(
             "SETUP",
