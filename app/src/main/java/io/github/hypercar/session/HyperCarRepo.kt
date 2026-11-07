@@ -2141,6 +2141,13 @@ object HyperCarRepo {
             appContext()?.let { MusicBridge.onCarMediaKey(it, usage) }
         }
 
+        override fun onVoiceAssistant() {
+            val attempt = connectionAttemptId
+            if (sessionLive.get()) io.github.hypercar.carui.CarVoiceAssistant.wake {
+                sessionLive.get() && connectionAttemptId == attempt
+            }
+        }
+
         override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {
             if (audioPlaying != lastAudioPlaying) {
                 lastAudioPlaying = audioPlaying

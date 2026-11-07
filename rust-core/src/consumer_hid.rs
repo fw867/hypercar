@@ -8,7 +8,7 @@ struct Field { id: u8, offset: usize, size: usize, count: usize, variable: bool,
 #[derive(Default)]
 struct Device { fields: Vec<Field>, has_ids: bool, pressed: HashMap<u8, BTreeSet<u32>> }
 
-fn supported(u: u32) -> bool { matches!(u, 0xb0|0xb1|0xb3|0xb4|0xb5|0xb6|0xb7|0xb9|0xcd) }
+fn supported(u: u32) -> bool { matches!(u, 0xb0|0xb1|0xb3|0xb4|0xb5|0xb6|0xb7|0xb9|0xcd|0xcf) }
 fn identity(v: &Value) -> Option<String> {
     v.as_str().map(|s| s.trim().to_ascii_lowercase().trim_start_matches("0x").to_string())
         .or_else(|| v.as_int().filter(|n| *n>=0).map(|n| format!("{n:x}")))
@@ -17,6 +17,17 @@ fn identity(v: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn voice_hid_has_down_and_up_edges_and_does_not_repeat() {
+        let mut h=ConsumerHid::default();
+        assert_eq!(h.report(None,&[0xcf]),Some(vec![0xcf]));
+        assert_eq!(h.report(None,&[0xcf]),Some(vec![]));
+        assert_eq!(h.report(None,&[0]),Some(vec![crate::voice_key::HID_UP]));
+        assert_eq!(h.report(None,&[0]),Some(vec![]));
+        let descriptor=[0x05,0x0c,0x09,1,0xa1,1,0x75,1,0x95,1,0x09,0xcf,0x81,2,0xc0];
+        let mut d=Device::parse(&descriptor).unwrap();
+        assert_eq!(d.report(&[1]),vec![0xcf]);
+        assert_eq!(d.report(&[0]),vec![crate::voice_key::HID_UP]);
+    }
     fn bitmap(id:bool)->Vec<u8> {
         let mut d=vec![0x05,0x0c,0x09,0x01,0xa1,0x01];
         if id {d.extend([0x85,7]);}
@@ -146,7 +157,9 @@ impl Device {
             }
         }
         let previous=self.pressed.entry(id).or_default();
-        let edges=down.difference(previous).copied().collect(); *previous=down; edges
+        let mut edges:Vec<u32>=down.difference(previous).copied().collect();
+        if previous.contains(&0xcf)&&!down.contains(&0xcf){edges.push(crate::voice_key::HID_UP);}
+        *previous=down; edges
     }
 }
 
@@ -179,7 +192,9 @@ impl ConsumerHid {
         if value==0||supported(value) {
             let down=if value==0 {BTreeSet::new()} else {BTreeSet::from([value])};
             let previous=self.raw.entry(id.unwrap_or_default()).or_default();
-            let edges=down.difference(previous).copied().collect();*previous=down;return Some(edges);
+            let mut edges:Vec<u32>=down.difference(previous).copied().collect();
+            if previous.contains(&0xcf)&&!down.contains(&0xcf){edges.push(crate::voice_key::HID_UP);}
+            *previous=down;return Some(edges);
         }
         if self.unknown<10 {
             self.unknown+=1;

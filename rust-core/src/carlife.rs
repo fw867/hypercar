@@ -138,10 +138,12 @@ pub struct CarLifeConfig {
 }
 
 /// Authenticated seven-channel CarWith gateway with video/audio events and touch input.
+struct QueuedControl { bytes:Vec<u8>, expires:Option<std::time::Instant> }
+
 pub struct CarLifeHub {
     owned_tasks: Vec<tokio::task::JoinHandle<()>>,
     touch_state: Arc<Mutex<session::TouchGesture>>,
-    touch_tx: mpsc::UnboundedSender<Vec<u8>>,
+    touch_tx: mpsc::UnboundedSender<QueuedControl>,
     /// 当前编码分辨率共享单元（与 AirPlay 协商/触摸换算共用）。
     encoder_size: Arc<Mutex<(u32, u32)>>,
     keyframe_request: Arc<Notify>,
@@ -162,12 +164,12 @@ impl CarLifeHub {
         let keyframe_request = Arc::new(Notify::new());
         let reset_request = keyframe_request.clone();
         let (events, event_rx) = mpsc::unbounded_channel();
-        let (touch_tx, mut touch_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (touch_tx, mut touch_rx) = mpsc::unbounded_channel::<QueuedControl>();
         let encoder_size = Arc::new(Mutex::new((cfg.width.max(2),cfg.height.max(2))));
         let requested = requested.unwrap_or_else(|| encoder_size.clone());
         let touch_state=Arc::new(Mutex::new(session::TouchGesture::default()));
         let round_touch=touch_state.clone();
-        let queue = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let queue = Arc::new(Mutex::new(Vec::<QueuedControl>::new()));
         let queue_fill=queue.clone(); let stop_fill=stop.clone();
         let fill_task = tokio::spawn(async move {
             loop { tokio::select! {
@@ -239,8 +241,15 @@ impl CarLifeHub {
     pub fn inject_touch(&self, action: u32, x: u32, y: u32) {
         let size=*self.encoder_size.lock();
         if let Some(frame)=self.touch_state.lock().accept(action,x,y,size) {
-            let _=self.touch_tx.send(frame);
+            let _=self.touch_tx.send(QueuedControl{bytes:frame,expires:None});
         }
+    }
+
+    pub fn voice_key(&self, start:bool) {
+        let code=if start {0x21} else {0x22};
+        let mut body=Vec::new();proto::varint(&mut body,1,code);
+        let packet=QueuedControl{bytes:build_cmd_frame(0x68008,&body),expires:Some(std::time::Instant::now()+Duration::from_secs(2))};
+        emit_log(&format!("VOICE-KEY: CarWith key=0x{code:x} queued={} (not recognition confirmation)",self.touch_tx.send(packet).is_ok()));
     }
 
 }

@@ -42,6 +42,8 @@ object RustCoreBridge {
         fun onNightMode(night: Boolean)
         /** Consumer-page HID Usage ID, one callback per key-down edge. */
         fun onMediaKey(usage: Int) {}
+        /** Voice button routed to the phone assistant only for the self-rendered source. */
+        fun onVoiceAssistant() {}
 
         /** 车机 forceKeyFrame：请求编码器立刻产出 IDR。 */
         fun onForceKeyFrame() {}

@@ -13,6 +13,7 @@ mod audio_out;
 mod audio_resource;
 mod bplist;
 mod consumer_hid;
+mod voice_key;
 mod crypto;
 mod carlife;
 mod engine;
@@ -148,6 +149,10 @@ pub(crate) fn emit_media_key(usage: u32) {
     call_listener("onMediaKey", |env, obj| {
         env.call_method(obj, "onMediaKey", "(I)V", &[(usage as jint).into()]).map(|_| ())
     });
+}
+
+pub(crate) fn emit_voice_assistant() {
+    call_listener("onVoiceAssistant", |env,obj| env.call_method(obj,"onVoiceAssistant","()V",&[]).map(|_| ()));
 }
 
 pub(crate) fn emit_night_mode(night: bool) {

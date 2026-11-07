@@ -116,19 +116,6 @@ pub async fn run_engine(
 ) -> Result<(), String> {
     let stop = shutdown.signal.clone();
     let mut tasks = EngineTasks::default();
-    let key_stop = stop.clone();
-    tasks.spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                _ = key_stop.notified() => return,
-                key = key_rx.recv() => match key {
-                    Some(usage) => crate::emit_media_key(usage),
-                    None => return,
-                }
-            }
-        }
-    });
     let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
     emit_state("negotiating", "AirPlay 会话启动");
     // 触摸/按键通道：CarPlay 事件通道把车机操作送到这里，P1 起交给自绘 UI 处理。
@@ -162,12 +149,13 @@ pub async fn run_engine(
                 let carwith_touch_size = touch_size.clone();
                 let vtx = video_tx.clone();
                 let atx = audio_tx.clone();
+                let voice_keys = key_tx.clone();
                 tasks.spawn(async move {
                     // Keep channel senders and the hub alive for the entire source task.
                     let _hub = hub;
                     while let Some(ev) = life_events.recv().await {
                         match ev {
-                            CarLifeEvent::SourceReset => { let _ = vtx.send(SourceEvent::ResetVideoSource); }
+                            CarLifeEvent::SourceReset => { let _ = voice_keys.send(crate::voice_key::RESET); let _ = vtx.send(SourceEvent::ResetVideoSource); }
                             CarLifeEvent::VideoFrame { pts_us, data } => {
                                 let _ = vtx.send(SourceEvent::VideoFrame { pts_us, data });
                             }
@@ -195,6 +183,33 @@ pub async fn run_engine(
             Err(error) => emit_log(&format!("CARLIFE: CarWith 模式连接失败：{error}")),
         }
     }
+    let key_stop=stop.clone();
+    let voice_hub=carwith_hub.clone();
+    let carwith_voice=cfg.carlife_source;
+    tasks.spawn(async move {
+        let mut voice=crate::voice_key::VoiceKey::default();
+        let clock=std::time::Instant::now();
+        loop {
+            tokio::select! {
+                biased;
+                _=key_stop.notified()=>return,
+                key=key_rx.recv()=>match key {
+                    Some(crate::voice_key::RESET)=>voice.reset(),
+                    Some(key)=>{
+                        if let Some(action)=crate::voice_key::action(key) {
+                            if let Some(command)=voice.receive(action,clock.elapsed().as_millis() as u64) {
+                                crate::emit_log(&format!("VOICE-KEY: action={command:?} source={}",if carwith_voice {"CarWith"} else {"phone-assistant"}));
+                                if carwith_voice {
+                                    if let Some(hub)=voice_hub.as_ref(){hub.voice_key(command==crate::voice_key::Command::Start);}
+                                } else if command==crate::voice_key::Command::Start {crate::emit_voice_assistant();}
+                            }
+                        } else {crate::emit_media_key(key);}
+                    },
+                    None=>return,
+                }
+            }
+        }
+    });
     {
         let stop_d = stop.clone();
         let claims = audio_claim_tx.clone();

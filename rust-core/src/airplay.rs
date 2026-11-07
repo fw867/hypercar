@@ -1276,6 +1276,11 @@ fn spawn_event_dispatcher(
                 emit_log(&format!("EVENT: 车机命令 type={cmd_type}（首次）"));
             }
             match cmd_type {
+                "requestSiri" => {
+                    let action=command.get("params").and_then(|v|v.get("siriAction")).or_else(||command.get("siriAction")).and_then(Value::as_int);
+                    emit_log(&format!("VOICE-KEY: requestSiri action={action:?}"));
+                    if let Some(key)=action.and_then(crate::voice_key::message) {let _=key_tx.send(key);}
+                }
                 "iAPSendMessage" => {
                     let data = command.get("params").and_then(|p| p.get("data")).and_then(Value::as_bytes);
                     if let Some(data) = data.filter(|d| !d.is_empty() && d.len() <= 65535) {
@@ -1323,7 +1328,7 @@ fn spawn_event_dispatcher(
                         }
                         if let Some(keys) = consumer_hid.report(uuid, report) {
                             for usage in keys {
-                                emit_log(&format!("HID-KEY: key down device={uuid:?} usage=0x{usage:02x}"));
+                                emit_log(&format!("HID-KEY: device={uuid:?} usage=0x{:02x} pressed={}",usage&0xffff,usage!=crate::voice_key::HID_UP));
                                 let _ = key_tx.send(usage);
                             }
                             continue;

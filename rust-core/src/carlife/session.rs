@@ -143,7 +143,10 @@ impl Session {
         if self.proof_ok && self.features_requested && !self.features_sent {
             self.features_sent = true;
             let mut entry = Vec::new(); proto::string(&mut entry, 1, "CONTENT_ENCRYPTION"); proto::varint(&mut entry, 2, 1);
-            let mut payload = Vec::new(); proto::varint(&mut payload, 1, 1); proto::bytes(&mut payload, 2, &entry);
+            let mut payload = Vec::new(); proto::varint(&mut payload, 1, 2); proto::bytes(&mut payload, 2, &entry);
+            // No accessory microphone stream exists: the CarWith source must record the phone mic.
+            let mut mic=Vec::new();proto::string(&mut mic,1,"VOICE_MIC");proto::varint(&mut mic,2,1);
+            proto::bytes(&mut payload,2,&mic);
             out.push((CMD_HU_FEATURE_CONFIG_RESPONSE, payload));
         }
         if self.proof_ok && self.admitted && self.ready && !self.init_sent {
@@ -247,15 +250,17 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
     }
 }
 
-pub(super) async fn control(mut stream: TcpStream, queue: Arc<Mutex<Vec<Vec<u8>>>>, state: Shared, stop: Arc<Notify>) {
+pub(super) async fn control(mut stream: TcpStream, queue: Arc<Mutex<Vec<QueuedControl>>>, state: Shared, stop: Arc<Notify>) {
     let mut sent=0u64;
     loop {
         let frame={let mut q=queue.lock(); if q.is_empty(){None}else{Some(q.remove(0))}};
-        if let Some(frame)=frame {
+        if let Some(packet)=frame {
+            if packet.expires.is_some_and(|at|std::time::Instant::now()>=at) {emit_log("VOICE-KEY: expired CarWith command dropped");continue;}
             let wire={
                 let s=state.lock();
-                if !s.started { continue; }
-                let Some((kind,body,_))=read_cmd_frame(&frame) else {continue};
+                if !s.started { if packet.expires.is_some(){emit_log("VOICE-KEY: CarWith is not ready; command dropped");} continue; }
+                let Some((kind,body,_))=read_cmd_frame(&packet.bytes) else {continue};
+                if kind==0x68008 {emit_log(&format!("VOICE-KEY: CarWith CTRL write key={:?}",first_int(&body,1)));}
                 let Ok(body)=s.encrypt(&body) else {return};
                 build_cmd_frame(kind,&body)
             };
@@ -269,6 +274,19 @@ pub(super) async fn control(mut stream: TcpStream, queue: Arc<Mutex<Vec<Vec<u8>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn voice_hard_keys_use_ctrl_protobuf_and_have_an_expiry() {
+        let (tx,mut rx)=mpsc::unbounded_channel();
+        let hub=CarLifeHub{owned_tasks:vec![],touch_state:Arc::new(Mutex::new(TouchGesture::default())),touch_tx:tx,
+            encoder_size:Arc::new(Mutex::new((1920,720))),keyframe_request:Arc::new(Notify::new())};
+        for (start,expected) in [(true,33),(false,34)] {
+            hub.voice_key(start);
+            let packet=rx.recv().await.unwrap();
+            assert!(packet.expires.unwrap()>std::time::Instant::now());
+            let (kind,body,_)=read_cmd_frame(&packet.bytes).unwrap();
+            assert_eq!(kind,0x68008);assert_eq!(first_int(&body,1),Some(expected));
+        }
+    }
     use tokio::net::TcpListener;
     fn cfg()->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:60,bt_address:"00:11:22:33:44:55".into(),bt_name:"HyperCar".into()}}
     fn info()->Vec<u8> {let mut out=Vec::new(); for (field,text) in [(4,"Xiaomi"),(14,"test"),(20,"37")] {proto::string(&mut out,field,text);} out}
@@ -314,7 +332,7 @@ mod tests {
         assert!(!s.init_sent);
         let actions=s.receive(CMD_MD_AUTHEN_RESPONSE,&proof(&s),&cfg()).unwrap();
         assert_eq!(actions.iter().map(|a|a.0).collect::<Vec<_>>(),vec![CMD_HU_AUTHEN_RESULT,CMD_HU_FEATURE_CONFIG_RESPONSE]);
-        assert_eq!(actions[1].1, b"\x08\x01\x12\x16\x0a\x12CONTENT_ENCRYPTION\x10\x01");
+        assert_eq!(actions[1].1, b"\x08\x02\x12\x16\x0a\x12CONTENT_ENCRYPTION\x10\x01\x12\x0d\x0a\x09VOICE_MIC\x10\x01");
         assert!(!s.init_sent);
         assert!(s.receive(CMD_MD_ENCRYPT_READY,&[],&cfg()).is_err());
     }
