@@ -130,7 +130,11 @@ class SpikeShellService : ISpikeShell.Stub {
                             display = vd
                             displays[vd.display.displayId] = vd
                             flagsUsed = candidate
-                            val msg = "OK id=${vd.display.displayId} flags=0x${candidate.toString(16)} package=$pkg"
+                            // Trusted secondary displays still default to FALLBACK_DISPLAY on some ROMs.
+                            // Set this before launching any activity so search keyboards join the encoded display.
+                            val ime = ShellDisplayIme.configure(vd.display.displayId, candidate and trusted != 0)
+                            val msg = "OK id=${vd.display.displayId} flags=0x${candidate.toString(16)} package=$pkg ime=$ime"
+                            Log.i(TAG, "createDisplay $msg")
                             SpikeReport.add("SHELL", "createDisplay $msg")
                             return msg
                         }
