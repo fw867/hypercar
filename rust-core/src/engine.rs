@@ -109,12 +109,26 @@ pub async fn run_engine(
     factory: Arc<dyn SocketProvider>,
     touch_tx: mpsc::UnboundedSender<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
+    mut key_rx: mpsc::UnboundedReceiver<u32>,
     mut source_rx: mpsc::UnboundedReceiver<SourceEvent>,
     shutdown: Arc<crate::shutdown::EngineShutdown>,
     touch_size: Arc<Mutex<(u32, u32)>>,
 ) -> Result<(), String> {
     let stop = shutdown.signal.clone();
     let mut tasks = EngineTasks::default();
+    let key_stop = stop.clone();
+    tasks.spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = key_stop.notified() => return,
+                key = key_rx.recv() => match key {
+                    Some(usage) => crate::emit_media_key(usage),
+                    None => return,
+                }
+            }
+        }
+    });
     let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
     emit_state("negotiating", "AirPlay 会话启动");
     // 触摸/按键通道：CarPlay 事件通道把车机操作送到这里，P1 起交给自绘 UI 处理。

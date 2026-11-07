@@ -366,6 +366,7 @@ pub async fn negotiate(
         p.screen_resource_lifecycle.then(|| screen_session.clone()),
         touch_tx,
         key_tx,
+        crate::consumer_hid::ConsumerHid::from_info(&info),
         // 触摸的「显示空间」分母，优先级：
         //  ① /info 报的显示器尺寸（真车会给真实值）
         //  ② `--touch-display` 手动指定（仅无有效上报时使用；历史 WinPlay 按窗口
@@ -1212,6 +1213,7 @@ fn spawn_event_dispatcher(
     screen_lifecycle: Option<Arc<crate::screen_session::ScreenSession>>,
     touch_tx: mpsc::UnboundedSender<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
+    mut consumer_hid: crate::consumer_hid::ConsumerHid,
     display_size: (u32, u32),
     touch_rect: Option<(u32, u32, u32, u32)>,
     target_size: Arc<Mutex<(u32, u32)>>,
@@ -1310,6 +1312,7 @@ fn spawn_event_dispatcher(
                                 .and_then(Value::as_bytes)
                         });
                     if let Some(report) = report {
+                        let uuid = command.get("uuid").or_else(||command.get("params").and_then(|p|p.get("uuid")));
                         hid_reports += 1;
                         if hid_reports <= 3 || hid_reports % 20 == 0 {
                             emit_log(&format!(
@@ -1317,6 +1320,13 @@ fn spawn_event_dispatcher(
                                 report.len(),
                                 report.iter().take(6).map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
                             ));
+                        }
+                        if let Some(keys) = consumer_hid.report(uuid, report) {
+                            for usage in keys {
+                                emit_log(&format!("HID-KEY: key down device={uuid:?} usage=0x{usage:02x}"));
+                                let _ = key_tx.send(usage);
+                            }
+                            continue;
                         }
                         handle_hid_report(
                             report,
@@ -1457,7 +1467,7 @@ fn value_as_bool(v: &bplist::Value) -> Option<bool> {
 fn handle_hid_report(
     report: &[u8],
     touch_tx: &mpsc::UnboundedSender<TouchInput>,
-    key_tx: &mpsc::UnboundedSender<u32>,
+    _key_tx: &mpsc::UnboundedSender<u32>,
     display: (u32, u32),
     touch_rect: Option<(u32, u32, u32, u32)>,
     target_size: &Arc<Mutex<(u32, u32)>>,
@@ -1465,10 +1475,7 @@ fn handle_hid_report(
     logged: &mut u32,
 ) {
     if report.len() < 5 {
-        // 短报告按 Consumer 媒体键候选处理（奥迪 uuid=0 是媒体键设备）
-        if let Some(code) = report.last().and_then(|_| consumer_key_of(report)) {
-            let _ = key_tx.send(code);
-        }
+        // Media reports are decoded by ConsumerHid, including device IDs and key edges.
         return;
     }
     // 每次触摸都读当前编码分辨率：手机可能把请求的分辨率压缩后回报，
@@ -1566,18 +1573,6 @@ fn handle_hid_report(
     *tip_down = pressed;
     let _ = touch_tx.send(TouchInput { action, x, y });
 }
-/// Consumer 页媒体键的极简映射。
-fn consumer_key_of(report: &[u8]) -> Option<u32> {
-    let usage = *report.last()?;
-    let code = match usage {
-        0xCD => 0x10, // play/pause
-        0xB5 => 0x0E, // next
-        0xB6 => 0x0F, // prev
-        _ => return None,
-    };
-    Some(code)
-}
-
 // ---------------------------------------------------------------- 工具
 
 /// RtspTransport 适配：pairing 层是同步 trait，跑在多线程 runtime 的 worker 上，

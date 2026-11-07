@@ -774,6 +774,33 @@ object MusicBridge {
         controller?.transportControls?.skipToNext()
     }
 
+    fun onCarMediaKey(context: Context, usage: Int) = onMusicThread(wait = false) {
+        if (!carConnected || CarMediaKeys.keyCode(usage) == 0) return@onMusicThread
+        // Explicit steering-wheel playback supersedes saved automatic resume requests.
+        autoPlayPending = false
+        resumePackage = null
+        playbackPrefs?.edit()?.remove("resume_package")?.apply()
+        if (usage == 0xB0 || usage == 0xCD && playback?.state != PlaybackState.STATE_PLAYING ||
+            (usage == 0xB5 || usage == 0xB6) && playback?.state == PlaybackState.STATE_PLAYING) requestPlaybackAudio()
+        runCatching {
+            val target = controller
+            val now = SystemClock.uptimeMillis()
+            fun event(code: Int, action: Int) = android.view.KeyEvent(now, now, action, code, 0)
+            val route = CarMediaKeys.dispatch(usage, session = { code ->
+                if (target == null) false else {
+                    val down = target.dispatchMediaButtonEvent(event(code, android.view.KeyEvent.ACTION_DOWN))
+                    val up = target.dispatchMediaButtonEvent(event(code, android.view.KeyEvent.ACTION_UP))
+                    down || up
+                }
+            }, system = { code ->
+                val audio = context.getSystemService(android.media.AudioManager::class.java) ?: error("AudioManager unavailable")
+                audio.dispatchMediaKeyEvent(event(code, android.view.KeyEvent.ACTION_DOWN))
+                audio.dispatchMediaKeyEvent(event(code, android.view.KeyEvent.ACTION_UP))
+            })
+            HyperCarRepo.log("MEDIA-KEY: usage=0x${usage.toString(16)} key=${CarMediaKeys.keyCode(usage)} route=$route target=${target?.packageName ?: "system"}（派发不代表播放器已执行）")
+        }.onFailure { HyperCarRepo.log("MEDIA-KEY: 派发失败 usage=0x${usage.toString(16)}: ${it.message}") }
+    }
+
     fun previous() {
         controller?.transportControls?.skipToPrevious()
     }

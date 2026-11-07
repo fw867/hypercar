@@ -12,6 +12,7 @@ mod airplay;
 mod audio_out;
 mod audio_resource;
 mod bplist;
+mod consumer_hid;
 mod crypto;
 mod carlife;
 mod engine;
@@ -143,6 +144,12 @@ pub(crate) fn emit_stats(
 }
 
 /// 车机日夜信号（AirPlay `setNightMode`）→ Kotlin，用于自动主题。
+pub(crate) fn emit_media_key(usage: u32) {
+    call_listener("onMediaKey", |env, obj| {
+        env.call_method(obj, "onMediaKey", "(I)V", &[(usage as jint).into()]).map(|_| ())
+    });
+}
+
 pub(crate) fn emit_night_mode(night: bool) {
     call_listener("onNightMode", |env, obj| {
         env.call_method(
@@ -508,7 +515,7 @@ fn native_start_impl(
     let carwith_source = cfg.carlife_source;
     let carwith_touch_source = cfg.carlife_source.then(|| source_tx.clone());
     let (touch_tx, mut touch_rx) = mpsc::unbounded_channel::<TouchInput>();
-    let (key_tx, _key_rx) = mpsc::unbounded_channel::<u32>();
+    let (key_tx, key_rx) = mpsc::unbounded_channel::<u32>();
     // 车机 HID 触摸 → Kotlin：airplay::handle_hid_report 只负责换算坐标与边沿，
     // 投递到这里后由独立任务回调监听器（P1 喂 Compose 首页，P2 注入 D2）。
     // 通道随引擎重建；监听器是独立 GlobalRef，不随引擎重启丢失。
@@ -544,6 +551,7 @@ fn native_start_impl(
             factory,
             touch_tx_engine,
             key_tx_engine,
+            key_rx,
             source_rx,
             stop_run,
             touch_size_engine,

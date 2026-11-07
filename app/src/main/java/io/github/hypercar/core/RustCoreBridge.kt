@@ -40,6 +40,8 @@ object RustCoreBridge {
 
         /** 车机日夜模式（AirPlay setNightMode）：true = 夜间。 */
         fun onNightMode(night: Boolean)
+        /** Consumer-page HID Usage ID, one callback per key-down edge. */
+        fun onMediaKey(usage: Int) {}
 
         /** 车机 forceKeyFrame：请求编码器立刻产出 IDR。 */
         fun onForceKeyFrame() {}

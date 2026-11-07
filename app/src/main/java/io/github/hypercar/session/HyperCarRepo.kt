@@ -2136,6 +2136,11 @@ object HyperCarRepo {
             log("CARUI: 车机日夜模式 night=$night")
         }
 
+        override fun onMediaKey(usage: Int) {
+            if (!sessionLive.get()) return
+            appContext()?.let { MusicBridge.onCarMediaKey(it, usage) }
+        }
+
         override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {
             if (audioPlaying != lastAudioPlaying) {
                 lastAudioPlaying = audioPlaying
