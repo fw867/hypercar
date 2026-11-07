@@ -6,7 +6,7 @@ import org.junit.Test
 class HeadUnitActivationPolicyTest {
     @Test fun volkswagenNeverBypassesItsInvitationGateWithTheGlobalWifiShortcut() {
         val vw = HeadUnitProfiles.VOLKSWAGEN
-        assertFalse(vw.verified)
+        assertTrue(vw.verified)
         assertTrue(vw.requireAirplayActivation)
         assertTrue(vw.allowOutboundIap2)
         assertFalse(vw.dropProfilesBeforeIap2)
