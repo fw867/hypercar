@@ -10,6 +10,7 @@
 
 mod airplay;
 mod audio_out;
+mod audio_resource;
 mod bplist;
 mod crypto;
 mod carlife;
@@ -690,6 +691,16 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeIsRunni
     } else {
         JNI_FALSE
     }
+}
+
+/// Request audio for a fresh playback action; this does not directly enable RTP.
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeRequestAudioOwnership(
+    _env: JNIEnv, _class: JClass,
+) -> jboolean {
+    if ENGINE.lock().as_ref().map(|h| h.source_tx.send(engine::SourceEvent::RequestAudioOwnership).is_ok()).unwrap_or(false) {
+        JNI_TRUE
+    } else { JNI_FALSE }
 }
 
 /// Ask the accessory to show its own UI; never stop the session or the audio pump.

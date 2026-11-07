@@ -93,6 +93,8 @@ object RustCoreBridge {
 
     /** Request native head-unit UI without tearing down CarPlay or its audio route. */
     external fun nativeRequestHostUi(): Boolean
+    /** Bounded claim for a new playback action; the core preserves receiver constraints. */
+    external fun nativeRequestAudioOwnership(): Boolean
 
     /** 投喂一帧 H.264（Annex B，本机 MediaCodec 编码输出）。[ptsUs] 为微秒时间戳。 */
     external fun nativePushVideoFrame(data: ByteArray, ptsUs: Long)

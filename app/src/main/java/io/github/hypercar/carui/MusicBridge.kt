@@ -17,6 +17,7 @@ import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import androidx.core.app.NotificationManagerCompat
 import io.github.hypercar.session.HyperCarRepo
+import io.github.hypercar.settings.SettingsStore
 import io.github.hypercar.shizuku.ShizukuTools
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -474,6 +475,7 @@ object MusicBridge {
     }
 
     private fun sessionCallback(generation: Long) = object : MediaController.Callback() {
+        private val audioResume = PlaybackAudioResume(playback?.state)
         override fun onMetadataChanged(value: MediaMetadata?) {
             if (generation != sessionGeneration) return
             metadata = value
@@ -481,7 +483,9 @@ object MusicBridge {
         }
         override fun onPlaybackStateChanged(value: PlaybackState?) {
             if (generation != sessionGeneration) return
+            val resumed = audioResume.onState(value?.state)
             playback = value
+            if (resumed) requestPlaybackAudio()
             if (value?.state == PlaybackState.STATE_PAUSED || value?.state == PlaybackState.STATE_STOPPED) {
                 manualPauseRequested = false
             }
@@ -755,8 +759,15 @@ object MusicBridge {
             c.transportControls.pause()
         } else {
             manualPauseRequested = false
+            requestPlaybackAudio()
             c.transportControls.play()
         }
+    }
+
+    private fun requestPlaybackAudio() {
+        if (!carConnected || !SettingsStore.enableAudio) return
+        runCatching { io.github.hypercar.core.RustCoreBridge.nativeRequestAudioOwnership() }
+            .onSuccess { HyperCarRepo.log("MUSIC: 恢复播放，音频资源申请已排队=$it（非车机出声确认）") }
     }
 
     fun next() {

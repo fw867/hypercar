@@ -76,6 +76,7 @@ pub struct TouchInput {
 }
 
 pub struct AirplayOutcome {
+    pub audio_resource: crate::audio_resource::AudioResource,
     pub control: Arc<RtspChannel>,
     pub audio: Option<AudioOut>,
     pub keepalive: KeepaliveTasks,
@@ -452,12 +453,13 @@ pub async fn negotiate(
     };
 
     p.pipeline.lock().audio_ready=audio.is_some();
-    if let Some(audio) = audio.as_mut() { audio.set_ownership(audio_owned); }
+    if let Some(audio) = audio.as_mut() { audio.set_ownership(audio_owned.clone()); }
 
     let mut streams = vec![Value::dict(vec![("type", Value::int(110)), ("uuid", Value::str(&screen_session.uuid))])];
     if audio.is_some() { streams.push(Value::dict(vec![("type", Value::int(100))])); }
     let teardown = bplist::encode(&Value::dict(vec![("streams", Value::array(streams))]));
     Ok(AirplayOutcome {
+        audio_resource: crate::audio_resource::AudioResource { control: channel.clone(), modes, owned: audio_owned },
         control: channel,
         audio,
         keepalive,

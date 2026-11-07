@@ -82,6 +82,7 @@ pub struct Modes {
     speech: i64,
     playback_enabled: bool,
     revision: u64,
+    audio_epoch: u64,
 }
 
 impl Modes {
@@ -92,6 +93,19 @@ impl Modes {
         value
     }
     pub fn audio_owned(&self) -> bool { self.resources[1].current == 1 }
+    pub fn audio_claim(&self, user_initiated: bool) -> Option<(u64, Self)> {
+        if !self.playback_enabled || self.audio_owned() { return None; }
+        let mut next = self.clone();
+        let priority = if user_initiated { USER_INITIATED } else { ANYTIME };
+        if !next.resources[1].take_by(1, priority, ANYTIME, ANYTIME) { return None; }
+        Some((self.audio_epoch, next))
+    }
+    pub fn commit_audio_claim(&mut self, epoch: u64, claim: &Self) -> bool {
+        if self.audio_epoch != epoch { return false; }
+        self.resources[1] = claim.resources[1];
+        self.audio_epoch = self.audio_epoch.wrapping_add(1);
+        true
+    }
     pub fn screen_owned(&self) -> bool { self.resources[0].current == 1 }
     pub fn screen_generation(&self) -> u64 { self.revision }
     pub fn diagnostics(&self) -> String {
@@ -192,6 +206,8 @@ impl Modes {
         if next.resources[0] != self.resources[0] {
             next.revision = self.revision.wrapping_add(1);
         }
+        // Even an identical receiver take supersedes a pending local audio claim.
+        next.audio_epoch = self.audio_epoch.wrapping_add(1);
         *self = next;
         true
     }
@@ -265,6 +281,32 @@ fn release_fields_empty(v: &Value) -> bool { ["transferPriority", "takeConstrain
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn audio_resume_obeys_user_constraint_and_never_changes_screen() {
+        let mut m = Modes::initial();
+        m.resources[1] = Resource::owned(2, USER_INITIATED, ANYTIME);
+        assert!(m.audio_claim(false).is_none());
+        let screen = m.resources[0];
+        let (epoch, claim) = m.audio_claim(true).unwrap();
+        assert!(!m.audio_owned()); // Preparing a request must not enable RTP.
+        assert!(m.commit_audio_claim(epoch, &claim));
+        assert!(m.audio_owned());
+        assert_eq!(screen, m.resources[0]);
+        m.resources[1] = Resource::owned(2, NEVER, ANYTIME);
+        assert!(m.audio_claim(true).is_none());
+        m.playback_enabled = false;
+        m.resources[1] = Resource::owned(2, ANYTIME, ANYTIME);
+        assert!(m.audio_claim(true).is_none());
+    }
+    #[test]
+    fn receiver_reasserting_same_take_invalidates_pending_audio_claim() {
+        let mut m = Modes::initial();
+        assert!(m.change(&change(2, 1)));
+        let (epoch, claim) = m.audio_claim(true).unwrap();
+        assert!(m.change(&change(2, 1)));
+        assert!(!m.commit_audio_claim(epoch, &claim));
+        assert!(!m.audio_owned());
+    }
     fn resource(id: i64, transfer: i64) -> Value {
         let mut fields = vec![("resourceID", Value::int(id)), ("transferType", Value::int(transfer))];
         if transfer == 1 { fields.extend([("transferPriority", Value::int(500)), ("takeConstraint", Value::int(100)), ("borrowConstraint", Value::int(100))]); }

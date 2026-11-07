@@ -29,6 +29,7 @@ pub enum SourceEvent {
     RequestCarWithKeyFrame,
     ResetVideoSource,
     RequestHostUi,
+    RequestAudioOwnership,
     /// 视频编码器产出一帧（H.264 Annex B，可能含 SPS/PPS/IDR）。
     VideoFrame { pts_us: u64, data: Vec<u8> },
     /// 编码器画布尺寸变化（对齐 AirPlay VideoConfig 宽高）。
@@ -121,6 +122,7 @@ pub async fn run_engine(
 
     // ---- 分发器：外部事件 → 视频泵 / 音频泵 ----
     let (host_ui_tx, mut host_ui_rx) = mpsc::channel::<()>(1);
+    let (audio_claim_tx, mut audio_claim_rx) = mpsc::channel::<(bool, std::time::Instant)>(4);
     let (video_tx, video_rx) = mpsc::unbounded_channel::<SourceEvent>();
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<SourceEvent>();
 
@@ -181,6 +183,7 @@ pub async fn run_engine(
     }
     {
         let stop_d = stop.clone();
+        let claims = audio_claim_tx.clone();
         tasks.spawn(async move {
             loop {
                 tokio::select! {
@@ -193,6 +196,7 @@ pub async fn run_engine(
                             if let Some(hub) = &carwith_hub { hub.inject_touch(t.action, t.x, t.y); }
                         }
                         Some(SourceEvent::RequestHostUi) => { let _ = host_ui_tx.try_send(()); }
+                        Some(SourceEvent::RequestAudioOwnership) => { let _ = claims.try_send((true, std::time::Instant::now())); }
                         Some(ev) => {
                             let to_audio = matches!(
                                 ev,
@@ -224,6 +228,7 @@ pub async fn run_engine(
     let audio_stats = Arc::new(Mutex::new(AudioPumpStat::default()));
     {
         let stop_a = stop.clone();
+        let claims = audio_claim_tx.clone();
         let stats = audio_stats.clone();
         tasks.spawn(async move {
             let mut out: Option<AudioOut> = None;
@@ -274,6 +279,9 @@ pub async fn run_engine(
                     }
                     ev = audio_rx.recv() => match ev {
                         Some(SourceEvent::AudioInit { tts, rate, channels }) => {
+                            // A new source session may reclaim only an ANYTIME grant. TTS and
+                            // continuous PCM never masquerade as a user-initiated media request.
+                            if !tts { let _ = claims.try_send((false, std::time::Instant::now())); }
                             if tts { tts_fmt = (rate.max(1), channels.max(1)); }
                             else { media_fmt = (rate.max(1), channels.max(1)); }
                             stats.lock().playing = true;
@@ -353,11 +361,13 @@ pub async fn run_engine(
                         if rate_mark.elapsed() >= Duration::from_secs(1) {
                             let secs = rate_mark.elapsed().as_secs_f64().max(0.001);
                             emit_log(&format!(
-                                "AUDIO: 发包 {:.0}/s（应 {:.0}/s） 队列 media={}ms tts={}ms",
+                                "AUDIO: 发包 {:.0}/s（应 {:.0}/s） 队列 media={}ms tts={}ms owner_phone={} blocked_samples={}",
                                 sent_packets as f64 / secs,
                                 TARGET_RATE as f64 / SPF as f64,
                                 media_mix.len() * 1000 / (TARGET_RATE as usize).max(1) / 2,
-                                tts_mix.len() * 1000 / (TARGET_RATE as usize).max(1) / 2
+                                tts_mix.len() * 1000 / (TARGET_RATE as usize).max(1) / 2,
+                                out.as_ref().map(|a| a.owns_audio()).unwrap_or(false),
+                                out.as_ref().map(|a| a.blocked_samples()).unwrap_or(0)
                             ));
                             sent_packets = 0;
                             rate_mark = std::time::Instant::now();
@@ -447,6 +457,25 @@ pub async fn run_engine(
     let mut teardown = outcome.teardown;
     let resource_session = outcome.resource_session;
     let had_audio = outcome.audio.is_some();
+    let audio_resource = outcome.audio_resource;
+    let stop_audio_claim = stop.clone();
+    tasks.spawn(async move {
+        loop {
+            tokio::select! {
+                _ = stop_audio_claim.notified() => return,
+                request = audio_claim_rx.recv() => {
+                    let Some(first) = request else { return; };
+                    let intent = fresh_audio_claim(first, &mut audio_claim_rx);
+                    if let Some(user) = intent.filter(|_| had_audio) {
+                        tokio::select! {
+                            _ = stop_audio_claim.notified() => return,
+                            _ = audio_resource.request(user) => {}
+                        }
+                    }
+                }
+            }
+        }
+    });
     let control = outcome.control;
     let close_control = control.clone();
     let stop_ui = stop.clone();
@@ -854,4 +883,33 @@ pub enum CarLifeEvent {
     /// 手机在 VIDEO_ENCODER_INIT_DONE 里回报的实际编码分辨率。
     EncoderResolution { width: u32, height: u32 },
     ClientLeft { video: bool },
+}
+
+fn fresh_audio_claim(first: (bool, std::time::Instant), pending: &mut mpsc::Receiver<(bool, std::time::Instant)>) -> Option<bool> {
+    let mut intent = None;
+    let mut next = Some(first);
+    while let Some((user, at)) = next {
+        if at.elapsed() < Duration::from_secs(2) { intent = Some(intent.unwrap_or(false) || user); }
+        next = pending.try_recv().ok();
+    }
+    intent
+}
+
+#[cfg(test)]
+mod audio_intent_tests {
+    use super::*;
+    #[test]
+    fn expired_user_action_cannot_promote_a_fresh_automatic_start() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send((false, std::time::Instant::now())).unwrap();
+        assert_eq!(fresh_audio_claim((true, std::time::Instant::now()-Duration::from_secs(3)), &mut rx), Some(false));
+        assert_eq!(fresh_audio_claim((true, std::time::Instant::now()-Duration::from_secs(3)), &mut rx), None);
+    }
+    #[test]
+    fn coalescing_preserves_a_fresh_explicit_play_action() {
+        let (tx, mut rx) = mpsc::channel(4);
+        tx.try_send((true, std::time::Instant::now())).unwrap();
+        tx.try_send((false, std::time::Instant::now())).unwrap();
+        assert_eq!(fresh_audio_claim((false, std::time::Instant::now()), &mut rx), Some(true));
+    }
 }

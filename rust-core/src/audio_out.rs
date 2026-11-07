@@ -63,6 +63,7 @@ pub struct AudioOut {
     /** 首包 Marker 待打标记（打完即清）。 */
     marker_pending: bool,
     ownership: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    blocked_samples: u64,
 }
 
 impl AudioOut {
@@ -85,6 +86,7 @@ impl AudioOut {
             sync_seq: 0,
             marker_pending: true,
             ownership: None,
+            blocked_samples: 0,
         }
     }
 
@@ -96,9 +98,17 @@ impl AudioOut {
     /// 采集是原生小端，漏换序实测得到「沙沙声」（cardeck 2026-10-10 真车验证）。
     /// AAC 通路不换序（比特流语义），本项目只走 PCM 故恒换序。
     pub fn set_ownership(&mut self, ownership: std::sync::Arc<std::sync::atomic::AtomicBool>) { self.ownership = Some(ownership); }
+    pub fn owns_audio(&self) -> bool {
+        self.ownership.as_ref().map(|v| v.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(true)
+    }
+    pub fn blocked_samples(&self) -> u64 { self.blocked_samples }
 
     pub async fn send_pcm(&mut self, frames: &[i16]) -> std::io::Result<()> {
-        if self.ownership.as_ref().map(|v| !v.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(false) { self.marker_pending = true; return Ok(()); }
+        if !self.owns_audio() {
+            self.blocked_samples = self.blocked_samples.saturating_add(frames.len() as u64);
+            self.marker_pending = true;
+            return Ok(());
+        }
         let samples_per_packet = SAMPLES_PER_PACKET * CHANNELS;
         for chunk in frames.chunks_exact(samples_per_packet) {
             // PCM 负载（交错立体声 16bit **BE**）
@@ -181,4 +191,30 @@ pub fn build_sync_packet(seq: u16, rtp_ts: u32, ntp_nanos: u64) -> Vec<u8> {
     let next = rtp_ts.wrapping_add(SAMPLES_PER_PACKET as u32);
     packet[16..20].copy_from_slice(&next.to_be_bytes());
     packet
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    #[tokio::test]
+    async fn muted_owner_sends_no_udp_and_a_new_grant_resumes_with_marker() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(receiver.local_addr().unwrap()).await.unwrap();
+        let owner = Arc::new(AtomicBool::new(false));
+        let mut audio = AudioOut::new(socket, None, [0u8;32], 100);
+        audio.set_ownership(owner.clone());
+        let samples = vec![100i16; SAMPLES_PER_PACKET * CHANNELS];
+        audio.send_pcm(&samples).await.unwrap();
+        assert_eq!(audio.packets_sent(), 0);
+        assert_eq!(audio.blocked_samples(), samples.len() as u64);
+        let mut packet = [0u8;2048];
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), receiver.recv(&mut packet)).await.is_err());
+        owner.store(true, Ordering::Release);
+        audio.send_pcm(&samples).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv(&mut packet)).await.unwrap().unwrap();
+        assert_eq!(audio.packets_sent(), 1);
+        assert_ne!(packet[1] & 0x80, 0);
+    }
 }
