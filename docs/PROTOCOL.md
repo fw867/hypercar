@@ -1,6 +1,6 @@
 # 当前协议与资源管理
 
-更新：2026-11-02。这里记录本项目代码与已采集数据能够支持的行为，不替代完整协议规范。
+更新：2026-11-07。这里记录本项目代码与已采集数据能够支持的行为，不替代完整协议规范。
 
 ## 蓝牙与 iAP2
 
@@ -26,7 +26,7 @@ CSM 格式为 `40 40 | total_len(u16BE) | message_id(u16BE) | parameters`，总�
 
 Wi-Fi iAP2 的入站是事件通道 `POST /command`，plist 中 `type=iAPSendMessage`、`params.data` 承载链路包；出站经客户端控制通道。必须处理链路 ACK 和 CSM；RTSP 200 不能代替 iAP2 消息完成。盒子样本中视频可早于 Wi-Fi 认证完成，不把后者设为所有视频启动的硬门槛。
 
-资源 take / borrow / return 与 modes 影响屏幕、音频归属。`requestUI` 是请求原生车机界面，不等于断连。当前电话状态回应不伪造 SIM、信号或通话能力；不保留未定义的参数 18。
+资源 take / borrow / return 与 modes 影响屏幕、音频归属。`requestUI` 的方向必须区分：手机主动发出时请求车机原生界面，车机发给手机时请求手机界面；均不等于断连。当前电话状态回应不伪造 SIM、信号或通话能力；不保留未定义的参数 18。
 
 UDP 心跳、feedback 与屏幕保活是不同机制，当前周期分别为 5 秒、1 秒和 1 秒。不能凭断开间隔直接认定某一心跳缺失。
 
@@ -39,3 +39,5 @@ ParcelFileDescriptor 从 Java Socket 取得原生 FD 后 detach；Rust 接管该
 故障 nativeStop 不发 TEARDOWN。退出信号持久保存，避免早于等待者时丢失；完成守卫处理正常、取消与异常退出。
 
 当前发送的是流 TEARDOWN，随后关闭控制连接，未实现一个额外的空 streams 整会话 TEARDOWN。因此不能声称获得了车机“整个业务会话已清理”的确认，也尚未证明此改动解决宝马残留状态。未确认通用 iAP2 退出消息，不在每次媒体退出时强发不可用通知。
+
+媒体资源、用户级音频恢复与键盘/方向盘事件分别见[视频](VIDEO-STREAM-REVIEW.md)、[音频](AUDIO.md)、[输入与语音](INPUT-AND-VOICE.md)。语音当前使用手机麦克风，没有车机麦克风上行。

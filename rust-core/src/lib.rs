@@ -36,6 +36,8 @@ mod wifi_iap2;
 mod auth_setup;
 mod display_layout;
 mod shutdown;
+#[cfg(test)]
+mod wire_compat;
 
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;

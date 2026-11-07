@@ -275,12 +275,13 @@ pub(super) async fn control(mut stream: TcpStream, queue: Arc<Mutex<Vec<QueuedCo
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn voice_hard_keys_use_ctrl_protobuf_and_have_an_expiry() {
+    async fn voice_start_uses_ctrl_protobuf_and_has_an_expiry() {
         let (tx,mut rx)=mpsc::unbounded_channel();
         let hub=CarLifeHub{owned_tasks:vec![],touch_state:Arc::new(Mutex::new(TouchGesture::default())),touch_tx:tx,
             encoder_size:Arc::new(Mutex::new((1920,720))),keyframe_request:Arc::new(Notify::new())};
-        for (start,expected) in [(true,33),(false,34)] {
-            hub.voice_key(start);
+        {
+            let expected=33;
+            hub.voice_start();
             let packet=rx.recv().await.unwrap();
             assert!(packet.expires.unwrap()>std::time::Instant::now());
             let (kind,body,_)=read_cmd_frame(&packet.bytes).unwrap();

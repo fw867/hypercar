@@ -1,64 +1,53 @@
-# 车机档案
+# 车机档案与验证范围
 
-更新：2026-11-07。权威来源是运行代码及有效远程配置，旧注释中的试验建议不作为当前值。
+更新：2026-11-07。所有车型统一在 [profiles/headunits.json](../profiles/headunits.json) 下发，App 按 ID 选择，不维护独立车型 JSON。
 
-## 内置档案
+## 内置策略
 
-| ID | 蓝牙音频配置保护 | 主动出站 iAP2 | 等待本轮 AirPlay 激活 | mDNS 优先 | 端口兜底 |
+| ID | 断 HFP/A2DP | 出站 iAP2 | 要求本轮激活 | 特殊门槛 | 验证范围 |
 |---|---|---|---|---|---|
-| bmw_id85 | false | false | true | true | 7000/7001/7100/17000 |
-| generic | true | true | false | true | 7000 |
-| winplay | false | true | false | false | 7000 |
-| audi_mib3 | true | true | false | true | 7000/7001/7100/17000 |
-| volkswagen_mib | false | true | true（且要求新鲜 ctrl 邀请） | true | 7000/7001/7100/17000 |
-| mercedes_mbux | false | true | true（接受本轮 0x4301，不强等 ctrl） | true | 7000 |
+| bmw_id85 | false | false | true | 允许用户开启已配对 Wi-Fi 主动恢复 | MGU-55 实车基准；不能代表所有 iDrive |
+| generic | true | true | false | 通用模板 | verified 不代表所有车型经过测试 |
+| winplay | false | true | false | deviceID 校验；7000端口 | PC 联调，不等于真实车机 |
+| audi_mib3 | true | true | false | mDNS 优先、兼容晚到端点 | 本项目未完成奥迪实车验证 |
+| volkswagen_mib | false | true | true | 当前目标 Wi-Fi 广播；必须新鲜 ctrl 邀请；禁用无邀请捷径 | 用户转述连接正常，未逐项验证功能 |
+| mercedes_mbux | false | true | true | 接受本轮 iAP2 端点；强制屏幕资源联动；禁用无邀请捷径 | MBUX 试验档案，未验证音视频正常 |
 
-BMW / generic / Audi 启用 sendCarPlayAvailability、openEaSessions、sendTransportIdentifier；WinPlay 关闭这三项。全部档案均回复电源更新，且不因 CarPlay 窗口关闭立即主动中止。WinPlay 校验 deviceID，并保留历史触摸兜底 2732×794；这不是宝马的固定分辨率。
+BMW/generic/Audi 启用0x4300、EA及0x4E0E；大众/奔驰启用0x4300、0x4E0E但不主动打开EA；WinPlay关闭三项。全部回复电源更新，不因CarPlay窗口关闭就主动中止。音频配置保护只涉及HFP/A2DP，不能因此提前断掉RFCOMM控制链。
 
-BMW MGU-55 是当前实车基准。Audi 尚未完成本项目实车验证；generic 的 verified 字段也不代表所有车型均已测试。未知 ID 回退到 BMW。
+默认及未知ID回退BMW，新增档案不自动切换用户选择。档案ID不同，连接参数不能因同名Wi-Fi混用。真实接收端身份与UI所选档案需同时记录。
 
-实现：[HeadUnitProfile](../app/src/main/java/io/github/hypercar/headunit/HeadUnitProfile.kt)。
+## 配置字段与覆盖
 
-## 远程配置
+当前 schema=8。达到当前schema的同ID远程条目可覆盖内置；旧schema只追加新ID，不能覆盖内置修复。缺省字段继承同ID内置值，新ID继承BMW模板；显式false是有效覆盖。touchDisplay/pairingHint空字符串可清除。导出保留策略及schema，刷新失败保留缓存并继续执行schema隔离。
 
-所有车型统一保存在一个文件中，App 按档案 ID 读取对应条目。配置源为 [headunits.json](../profiles/headunits.json)，解析与合并见 [RemoteProfiles](../app/src/main/java/io/github/hypercar/headunit/RemoteProfiles.kt)。
+| 字段组 | 内容 |
+|---|---|
+| iAP2 | validatesDeviceId、sendCarPlayAvailability、openEaSessions、sendTransportIdentifier、replyPowerUpdates、dropProfilesBeforeIap2、allowOutboundIap2、abortWhenCarPlayWindowClosed |
+| 激活/发现 | preferMdnsAirplay、requireAirplayActivation、allowProactiveWifiSession、advertiseOnCurrentWifi、requireFreshCtrlInvite、fallbackAirplayPorts |
+| 画面 | touchDisplay、useScreenResourceLifecycle |
+| 说明 | id、label、model、notes、verified、pairingHint |
 
-当前 schema 为 8。达到当前 schema 的同 ID 远程档案覆盖内置档案；旧 schema 仅追加新的 ID，不覆盖内置值，也不为内置条目显示“远程”角标。省略字段继承对应内置档案；新 ID 使用 BMW 模板。刷新失败保留缓存，但旧缓存仍受 schema 隔离。
+useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关，不改用户偏好。奔驰为true时设置页显示档案已启用且不可在该行关闭。旧 keepIap2AliveOnly 已移除，不恢复旧行为。
 
-仓库下发配置已与内置连接策略对齐：BMW 的 dropProfilesBeforeIap2=false、requireAirplayActivation=true，端口兜底包含 17000。诊断仍应记录有效档案及来源，因为自定义配置可以显式覆盖这些值。
+## 大众
 
-当前支持的策略字段包括：validatesDeviceId、sendCarPlayAvailability、openEaSessions、sendTransportIdentifier、replyPowerUpdates、dropProfilesBeforeIap2、allowOutboundIap2、abortWhenCarPlayWindowClosed、preferMdnsAirplay、requireAirplayActivation、fallbackAirplayPorts、touchDisplay，以及显示信息与 pairingHint。
+参考 mcarplay 的 VW4131/VW4211（ID.7、帕萨特2025）线索。必须明确目标车机才在当前Wi-Fi提前广播，不据此写入成功配对历史。ctrl邀请须属于当前Network且在20秒内，控制连接前后复核；过期候选关闭。20秒是兼容性经验，不是协议常量。失败后保留广播及蓝牙，等待新邀请，不能复用已消耗邀请。
 
-requireAirplayActivation 已补齐解析与导出：省略时继承，显式 false 可关闭门槛。pairingHint 与 touchDisplay 省略时也继承；显式空字符串可清除。导出携带当前 _schema，保留策略及可选字段的清除状态。已废弃的 keepIap2AliveOnly 从下发配置移除，不恢复其旧行为。
+2026-11-07 按用户转述将verified设为true，仅表示已有连接正常反馈，不证明所有大众车型/固件、音频、方向盘和语音都正常。另一个无声反馈接收端自报CarLetter；现象与修正见[音频](AUDIO.md)。
 
-新增车型先记录接收端角色、邀请、服务、触摸和日志证据，再修改对应字段；不要因另一车型文档中的固定端口、Session ID 或时间阈值就宣称已适配。
+## 奥迪
 
-2026-11-03：用户实测主动断开宝马 HFP/A2DP 未改善二次上车，关闭该策略以继续对照。内置与仓库配置同步关闭，schema 升至 5，阻止旧缓存重新启用；其它内置车型策略沿用。
+对照 CarDeck `503ed3730d5a9365272294b79306cea5fcce115b`。0x4300/0x4E0E只发送、不等ACK，EA仅对车机声明的协议尝试，缺EA回应不阻断。MMI6318可能只给热点凭据、端点靠mDNS；MMI9310的0x4301可能晚到2分35秒。保留两条发现路径，不套用大众新鲜邀请门槛。
 
-## 大众档案（2026-11-07，网友实车反馈连接正常）
+不按品牌固定网关、控制Session ID、触摸尺寸或MFi挑战长度。3315首次403后等待新邀请成功的第三方记录，不能推广为明文降级安全或本项目已完成验证。
 
-`volkswagen_mib` 对应 mcarplay 已记录的 VW4131 / VW4211（ID.7 / 帕萨特 2025）线索，不代表所有大众或所有 MIB 车机兼容。它启用 0x4300、0x4E0E 和电源更新，不发 BMW 专用 EA 探测，保留系统蓝牙音频连接。
+## 奔驰 MBUX
 
-新增策略字段：
+样本MB_E-P-4 / MBUX00081，verified=false。三份06:25/06:27/06:30导出存在包含关系，去重后8次引擎配置、7次屏幕SETUP空体400；能完成pair-verify、会话SETUP、RECORD及初始资源声明，不能用后续EOF掩盖最早明确400。车机提供0x4301热点和IPv6端点，无须强等ctrl GET。
 
-- `allowProactiveWifiSession`：默认 true；大众为 false，防止全局主动 Wi-Fi 开关跳过邀请。
-- `advertiseOnCurrentWifi`：默认 false；大众为 true，必须显式选定目标车机，才在已连接 Wi-Fi 上提前绑定并广播 ctrl，解决首次 0x5703 尚未到达的等待环。
-- `requireFreshCtrlInvite`：默认 false；大众为 true，只有 20 秒内的新鲜 ctrl 邀请可启动媒体。20 秒来自 mcarplay 的 VW4211 观察，并非协议常量。0x4301 只作为地址/凭据更新，不替代该邀请；连接前后再次检查，失效候选 FD 会被关闭。视频 TCP 建立前失败后保留广播与蓝牙，等待另一条邀请，不复用已消耗邀请。
+更新后的winplay.txt虽选择winplay档案，实际身份仍为奔驰，不是Windows接收端独立成功样本。06:36:35那轮屏幕SETUP400、音频SETUP400，CarWith本地7240持续拒绝；即使Wi-Fi iAP2传输READY，直到导出也无视频帧及音频包。修正IPv6音频URI仍不足以消除该轮400。试验档案保留控制和iAP2等待后续资源，不宣称解决屏幕拒绝。
 
-该次修改中其它四个档案保持默认值，BMW 已配对 Wi-Fi 延时重试继续有效。schema 升至 6，防止旧缓存覆盖新门槛；内置和仓库下发配置一致。配置统一见 [headunits.json](../profiles/headunits.json)，对照与限制见 [VOLKSWAGEN-ADAPTATION-20261106.md](VOLKSWAGEN-ADAPTATION-20261106.md)。
+复测使用奔驰档案，先确认CarWith七通道源就绪，再观察屏幕/音频SETUP应答及后续changeModes/requestUI。不要把“会话已连接”当成投屏成功，也不要因为档案名叫winplay就推断接收端为PC。
 
-## 奥迪基础档案（2026-11-06，未实车验证）
-
-对照 CarDeck `503ed3730d5a9365272294b79306cea5fcce115b`，启用 0x4300、0x4E0E 和按车机声明的 EA 会话。前两项不等待 ACK，EA 应答缺失不阻断后续流程。6318 可能仅提供热点凭据而不发 0x4301，9310 的 0x4301 可能晚到 2 分 35 秒，因此保留 mDNS 优先、晚到通知处理，不套用大众的新鲜 ctrl 邀请门槛。保留蓝牙音频配置保护与 RFCOMM 控制链路。
-
-不按品牌固定网关、显示尺寸、触摸范围或 MFi 挑战长度；以实际协商和自适应结果为准。schema 升至 7，避免旧缓存重新关闭三项消息。配置统一见 [headunits.json](../profiles/headunits.json)，证据和限制见 [AUDI-ADAPTATION-20261106.md](AUDI-ADAPTATION-20261106.md)。
-
-
-## 奔驰 MBUX 试验配置（2026-11-07）
-
-新增 `mercedes_mbux`，样本为 Mercedes-Benz MB_E-P-4 / MBUX 00081，`verified=false`。接受本轮 iAP2 下发端点，不把大众新鲜 ctrl 邀请要求套到奔驰；不走无本轮参数的主动 Wi-Fi 捷径，不主动断 HFP/A2DP，不使用 PC 触摸兜底或 BMW bootstrap。启用车机明示可收的 0x4300/0x4E0E，保留电源应答，不主动打开 EA。
-
-新增可选字段 `useScreenResourceLifecycle`：默认 false，奔驰为 true。引擎值为档案值 OR 用户“画面资源联动”开关；不改写用户保存值。用于屏幕协商失败时保留控制链路，不能据此宣称屏幕 400 已解决。远程 JSON 支持继承、显式覆盖和导出，添加奔驰时 schema 为 7；后续大众转正升至 8，防止旧缓存恢复未验证标识。详情见 [奔驰分析与配置](MERCEDES-MBUX-ADAPTATION-20261107.md)。
-
-
-2026-11-07：按用户转述的大众车主实车反馈，将 volkswagen_mib 标记为 verified=true；仅更新验证标识及说明，连接门槛、消息、端口、广播、重连策略不变。反馈未提供具体车型/固件与各项功能清单，不据此宣称全部大众车型及功能均已验证。奔驰仍为试验配置。
+代码：[HeadUnitProfile](../app/src/main/java/io/github/hypercar/headunit/HeadUnitProfile.kt)、[RemoteProfiles](../app/src/main/java/io/github/hypercar/headunit/RemoteProfiles.kt)。

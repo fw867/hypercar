@@ -245,8 +245,8 @@ impl CarLifeHub {
         }
     }
 
-    pub fn voice_key(&self, start:bool) {
-        let code=if start {0x21} else {0x22};
+    pub fn voice_start(&self) {
+        let code=0x21;
         let mut body=Vec::new();proto::varint(&mut body,1,code);
         let packet=QueuedControl{bytes:build_cmd_frame(0x68008,&body),expires:Some(std::time::Instant::now()+Duration::from_secs(2))};
         emit_log(&format!("VOICE-KEY: CarWith key=0x{code:x} queued={} (not recognition confirmation)",self.touch_tx.send(packet).is_ok()));

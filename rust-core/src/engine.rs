@@ -197,11 +197,11 @@ pub async fn run_engine(
                     Some(crate::voice_key::RESET)=>voice.reset(),
                     Some(key)=>{
                         if let Some(action)=crate::voice_key::action(key) {
-                            if let Some(command)=voice.receive(action,clock.elapsed().as_millis() as u64) {
-                                crate::emit_log(&format!("VOICE-KEY: action={command:?} source={}",if carwith_voice {"CarWith"} else {"phone-assistant"}));
+                            if voice.receive(action,clock.elapsed().as_millis() as u64) {
+                                crate::emit_log(&format!("VOICE-KEY: action=Start source={}",if carwith_voice {"CarWith"} else {"phone-assistant"}));
                                 if carwith_voice {
-                                    if let Some(hub)=voice_hub.as_ref(){hub.voice_key(command==crate::voice_key::Command::Start);}
-                                } else if command==crate::voice_key::Command::Start {crate::emit_voice_assistant();}
+                                    if let Some(hub)=voice_hub.as_ref(){hub.voice_start();}
+                                } else {crate::emit_voice_assistant();}
                             }
                         } else {crate::emit_media_key(key);}
                     },

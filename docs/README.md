@@ -1,23 +1,27 @@
 # 文档索引
 
-更新：2026-11-02。本文档集描述当前主线；实现事实、实测结果与验证边界分别记录。旧排查稿中的试验顺序、被后续修正的解释和计划不再作为使用说明，历史可从 Git 查询。
+更新：2026-11-07。文档描述当前代码，分别标注实现、现场证据和未验证范围。逐轮排查、旧构建哈希和已废弃方案从Git历史查询。
 
 | 文档 | 内容 |
 |---|---|
-| [架构](ARCHITECTURE.md) | Android、虚拟屏与 Rust 的分工 |
-| [可选 CarWith 画面源](CARWITH-SOURCE.md) | 本机七通道、认证/加密门控与验证范围 |
+| [架构](ARCHITECTURE.md) | Android、shell、虚拟屏与Rust分工 |
 | [构建](BUILD.md) | 编译、签名、安装与发布 |
-| [会话控制](SESSION-CONTROL.md) | 首次连接、自动唤醒、增强发现与退出 |
-| [协议](PROTOCOL.md) | 当前 iAP2、AirPlay、网络与关闭行为 |
-| [连接诊断](HANDSHAKE-DIAGNOSTICS.md) | 按实际到达阶段分析失败 |
-| [车机档案](HEADUNIT-PROFILES.md) | 内置值、远程覆盖及适用范围 |
-| [界面](CARUI-REDESIGN.md) | 首页、音乐卡片与操作能力 |
-| [地图](MAP-PROVIDERS.md) | 地图入口、卡片与全屏 |
-| [视频与音频](VIDEO-STREAM-REVIEW.md) | 尺寸、编码、触摸与系统音频 |
-| [日志采集](CAPTURE.md) | Android 蓝牙日志、导出与数据解释 |
-| [盒子流程](BMW-BOX-CARPLAY-FLOW.md) | 已采集的宝马盒子连接证据 |
-| [参考项目](REFERENCE-REVIEW.md) | 可复核的参考内容与角色区别 |
-| [LIVI 与 Android 主机源码对照](RECEIVER-SOURCE-REVIEW.md) | 重连、邀请、退出、多屏与厂商栈依赖 |
-| [验证记录](VALIDATION.md) | 实车、手机及测试各自证明了什么 |
+| [会话控制](SESSION-CONTROL.md) | 首次引导、待机、主动Wi-Fi及退出 |
+| [协议](PROTOCOL.md) | iAP2、AirPlay、资源及关闭边界 |
+| [连接诊断](HANDSHAKE-DIAGNOSTICS.md) | 按阶段、事务与通道定位失败 |
+| [车型档案](HEADUNIT-PROFILES.md) | 统一配置、覆盖及各车型证据 |
+| [CarWith源](CARWITH-SOURCE.md) | 本机七通道、认证加密及视频入流 |
+| [自绘界面](CARUI-REDESIGN.md) | 首页、音乐与应用能力 |
+| [地图与键盘](MAP-PROVIDERS.md) | 地图任务、全屏、返回按钮及IME |
+| [视频与触摸](VIDEO-STREAM-REVIEW.md) | 真实尺寸、资源及端点生命周期 |
+| [音频](AUDIO.md) | 采集、路由、资源申请与无声证据 |
+| [方向盘与语音](INPUT-AND-VOICE.md) | HID、播放器派发与助手路由 |
+| [日志采集](CAPTURE.md) | ADB、蓝牙记录、时间范围及隐私 |
+| [宝马盒子证据](BMW-BOX-CARPLAY-FLOW.md) | 固定样本、时序及结论边界 |
+| [参考实现](REFERENCE-REVIEW.md) | 源码版本、可借鉴机制与角色区别 |
+| [验证](VALIDATION.md) | 实测、单测与尚未完成的闭环 |
+| [滚动审计](AUDIT.md) | 最新审计问题、修正和检查结果 |
 
-当前已确认首次连接稳定；二次上车的最新发现与退出改动尚未完成实车闭环验证。已实现某项机制不等于已证明它能修复二次上车。
+## 维护约定
+
+新行为更新所属专题，不再创建日期后缀的功能分析文档。同一次审计只更新AUDIT；测试和实车状态集中在VALIDATION，不把每轮构建追加到多个文件。保留关键原始样本标识、可复核版本及未闭合问题，删除过时操作指引。已实现不等于已实车通过，verified不等于所有功能均可用。

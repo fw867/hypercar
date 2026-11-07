@@ -83,6 +83,7 @@ pub struct Modes {
     playback_enabled: bool,
     revision: u64,
     audio_epoch: u64,
+    audio_change_epoch: u64,
 }
 
 impl Modes {
@@ -93,6 +94,7 @@ impl Modes {
         value
     }
     pub fn audio_owned(&self) -> bool { self.resources[1].current == 1 }
+    pub fn audio_change_epoch(&self) -> u64 { self.audio_change_epoch }
     pub fn audio_claim(&self, user_initiated: bool) -> Option<(u64, Self)> {
         if !self.playback_enabled || self.audio_owned() { return None; }
         let mut next = self.clone();
@@ -190,6 +192,7 @@ impl Modes {
     }
     pub fn change(&mut self, params: &Value) -> bool {
         let mut next = self.clone();
+        let mut audio_request = false;
         if params.as_dict().is_none() { return false; }
         // CatPlay ignores initialPermanentEntity in live requests. Only /info can set the base.
         if let Some(values) = params.get("resources") {
@@ -197,6 +200,7 @@ impl Modes {
             if values.len() > 8 { return false; }
             for v in values {
                 let Some(id) = resource_id(v) else { return false; };
+                audio_request |= id == 1;
                 if !next.resources[id].request(v, 2) { return false; }
             }
         }
@@ -208,6 +212,9 @@ impl Modes {
         }
         // Even an identical receiver take supersedes a pending local audio claim.
         next.audio_epoch = self.audio_epoch.wrapping_add(1);
+        if audio_request || next.apps != self.apps || next.speech != self.speech {
+            next.audio_change_epoch = self.audio_change_epoch.wrapping_add(1);
+        }
         *self = next;
         true
     }
