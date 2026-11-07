@@ -37,7 +37,7 @@ object RemoteProfiles {
      * 规则：**`_schema` 低于本常量的远程条目，只能新增车型，不能覆盖内置档案**
      * ——这样"修内置档案"必须显式升 schema 才会生效，旧缓存不会把修复顶回去。
      */
-    const val SCHEMA = 7
+    const val SCHEMA = 8
 
     /** 档案列表地址（raw.githubusercontent.com，改 `main` 为其它分支即可灰度）。 */
     const val DEFAULT_URL =
@@ -197,6 +197,7 @@ object RemoteProfiles {
             allowProactiveWifiSession = o.optBoolean("allowProactiveWifiSession", defaults.allowProactiveWifiSession),
             advertiseOnCurrentWifi = o.optBoolean("advertiseOnCurrentWifi", defaults.advertiseOnCurrentWifi),
             requireFreshCtrlInvite = o.optBoolean("requireFreshCtrlInvite", defaults.requireFreshCtrlInvite),
+            useScreenResourceLifecycle = o.optBoolean("useScreenResourceLifecycle", defaults.useScreenResourceLifecycle),
             fallbackAirplayPorts = readPorts(o, defaults.fallbackAirplayPorts),
             touchDisplay = if (o.has("touchDisplay")) {
                 o.optString("touchDisplay", "").ifBlank { null }
@@ -237,6 +238,7 @@ object RemoteProfiles {
                     put("allowProactiveWifiSession", p.allowProactiveWifiSession)
                     put("advertiseOnCurrentWifi", p.advertiseOnCurrentWifi)
                     put("requireFreshCtrlInvite", p.requireFreshCtrlInvite)
+                    put("useScreenResourceLifecycle", p.useScreenResourceLifecycle)
                     put("fallbackAirplayPorts", JSONArray(p.fallbackAirplayPorts))
                     put("touchDisplay", p.touchDisplay ?: "")
                     put("pairingHint", p.pairingHint ?: "")

@@ -25,7 +25,7 @@ data class HeadUnitProfile(
     val notes: String,
 
     /**
-     * 是否经过**实车首手验证**。
+     * 是否已有本项目实车验证或用户明确反馈的实车验证。
      *
      * false 的档案（如奥迪）只有二手结论支撑，设置页会打「未实测」角标：
      * 免得用户以为是"官方支持"，也提醒后续贡献者优先补实测。
@@ -75,6 +75,9 @@ data class HeadUnitProfile(
     /** Require a recent ctrl invitation even if iAP2/mDNS already supplied an address. */
     val requireFreshCtrlInvite: Boolean = false,
 
+    /** Keep control/iAP2 alive if screen SETUP is rejected; applies independently of the user experiment. */
+    val useScreenResourceLifecycle: Boolean = false,
+
     /** mDNS 拿不到（或不用 mDNS）时的兜底端口，按顺序试连。 */
     val fallbackAirplayPorts: List<Int> = listOf(7000, 7001, 7100, 17000),
 
@@ -83,7 +86,9 @@ data class HeadUnitProfile(
 
     /** 首次连接引导里这个车机额外要提示的一句；null = 不提。 */
     val pairingHint: String? = null,
-)
+) {
+    fun screenResourceLifecycleEnabled(userEnabled: Boolean): Boolean = useScreenResourceLifecycle || userEnabled
+}
 
 /**
  * 内置档案表。新增品牌：在这里加一个 `val`，并在 [all] 里注册。
@@ -193,13 +198,13 @@ object HeadUnitProfiles {
         touchDisplay = null,
         pairingHint = "在 MMI 中选择 Apple CarPlay 并确认手机；接受蓝牙与 Wi-Fi 提示，等待车机完成邀请",
     )
-    /** VW4131/VW4211 evidence from mcarplay; baseline only, not validated in this project. */
+    /** VW4131/VW4211 baseline; confirmed connecting by community feedback on 2026-11-07. */
     val VOLKSWAGEN = HeadUnitProfile(
         id = "volkswagen_mib",
         label = "大众 Volkswagen",
         model = "VW4131 / VW4211（ID.7 / 帕萨特 2025）",
-        notes = "未实车验证：先选定目标车机并连接车机 Wi-Fi，保持蓝牙与广播，等待车机本轮邀请；不使用无邀请的主动直连。",
-        verified = false,
+        notes = "网友实车反馈连接正常：先选定目标车机并连接车机 Wi-Fi，保持蓝牙与广播，等待车机本轮邀请；不使用无邀请的主动直连。",
+        verified = true,
         sendCarPlayAvailability = true,
         openEaSessions = false,
         sendTransportIdentifier = true,
@@ -216,8 +221,34 @@ object HeadUnitProfiles {
         pairingHint = "先完成系统蓝牙配对，在「目标车机」选定这台大众车机；首次请手动连接车机 Wi-Fi，并在车机确认 Apple CarPlay。",
     )
 
+    /** MBUX MB_E-P-4: real 0x4301 includes AP and IPv6 endpoint; media still needs validation. */
+    val MERCEDES_MBUX = HeadUnitProfile(
+        id = "mercedes_mbux",
+        label = "奔驰 Mercedes-Benz MBUX",
+        model = "MB_E-P-4（MBUX 00081 日志样本）",
+        notes = "试验配置：接受本轮 0x4301 的热点和 IPv6 端点，不强等 ctrl 邀请；保留蓝牙音频，屏幕协商失败时保留控制链路。音视频尚待实车验证。",
+        verified = false,
+        validatesDeviceId = false,
+        sendCarPlayAvailability = true,
+        openEaSessions = false,
+        sendTransportIdentifier = true,
+        replyPowerUpdates = true,
+        dropProfilesBeforeIap2 = false,
+        allowOutboundIap2 = true,
+        abortWhenCarPlayWindowClosed = false,
+        preferMdnsAirplay = true,
+        requireAirplayActivation = true,
+        allowProactiveWifiSession = false,
+        advertiseOnCurrentWifi = false,
+        requireFreshCtrlInvite = false,
+        useScreenResourceLifecycle = true,
+        fallbackAirplayPorts = listOf(7000),
+        touchDisplay = null,
+        pairingHint = "在 MBUX 中选择 Apple CarPlay 并确认手机，接受 Wi-Fi 连接提示；屏幕尺寸按本轮协商获取。此配置尚未验证音视频正常。",
+    )
+
     /** 内置档案（出厂就有的，断网也一定在）。宝马排第一：它是默认档案。 */
-    val builtin: List<HeadUnitProfile> = listOf(BMW_ID85, GENERIC, WINPLAY, AUDI_MIB3, VOLKSWAGEN)
+    val builtin: List<HeadUnitProfile> = listOf(BMW_ID85, GENERIC, WINPLAY, AUDI_MIB3, VOLKSWAGEN, MERCEDES_MBUX)
 
     /**
      * 全部可用档案 = 内置 + 远程（GitHub 下发的 `profiles/headunits.json`）。

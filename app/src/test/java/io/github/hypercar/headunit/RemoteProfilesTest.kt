@@ -6,6 +6,16 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class RemoteProfilesTest {
+    @Test fun schemaSevenCannotRestoreVolkswagenUnverifiedLabelOrChangeItsHandshake() {
+        val old = RemoteProfiles.parse("""{"_schema":7,"profiles":[{
+            "id":"volkswagen_mib","verified":false,"notes":"未实车验证"}]}""")
+        val effective = RemoteProfiles.merge(HeadUnitProfiles.builtin, old, 7)
+            .single { it.id == "volkswagen_mib" }
+        assertEquals(HeadUnitProfiles.VOLKSWAGEN, effective)
+        assertTrue(effective.verified)
+        assertFalse(HeadUnitProfiles.MERCEDES_MBUX.verified)
+    }
+
     @Test fun cachedSchemaSixCannotDisableAudiHandshakeMessages() {
         val old = RemoteProfiles.parse("""{"_schema":6,"profiles":[{
             "id":"audi_mib3","sendCarPlayAvailability":false,

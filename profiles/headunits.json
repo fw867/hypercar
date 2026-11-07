@@ -1,7 +1,7 @@
 {
-  "version": 7,
-  "_schema": 7,
-  "updated": "2026-11-06",
+  "version": 8,
+  "_schema": 8,
+  "updated": "2026-11-07",
   "_comment": "HyperCar 车机档案下发文件。新增车型改这里 + push 即可，App 端「从 GitHub 更新车型列表」后立即出现。字段含义见 docs/HEADUNIT-PROFILES.md；除 id/label 外都可省略（省略 = 用同 id 内置档案的值）。_schema 必须 >= App 端 SCHEMA 才会覆盖内置档案（旧缓存不能把内置修复顶回去）。",
   "profiles": [
     {
@@ -101,8 +101,8 @@
       "id": "volkswagen_mib",
       "label": "大众 Volkswagen",
       "model": "VW4131 / VW4211（ID.7 / 帕萨特 2025）",
-      "notes": "未实车验证：先选定目标车机并连接车机 Wi-Fi，保持蓝牙与广播，等待车机本轮邀请；不使用无邀请的主动直连。",
-      "verified": false,
+      "notes": "网友实车反馈连接正常：先选定目标车机并连接车机 Wi-Fi，保持蓝牙与广播，等待车机本轮邀请；不使用无邀请的主动直连。",
+      "verified": true,
       "validatesDeviceId": false,
       "sendCarPlayAvailability": true,
       "openEaSessions": false,
@@ -123,6 +123,32 @@
         17000
       ],
       "pairingHint": "先完成系统蓝牙配对，在「目标车机」选定这台大众车机；首次请手动连接车机 Wi-Fi，并在车机确认 Apple CarPlay。"
+    },
+    {
+      "id": "mercedes_mbux",
+      "label": "奔驰 Mercedes-Benz MBUX",
+      "model": "MB_E-P-4（MBUX 00081 日志样本）",
+      "notes": "试验配置：接受本轮 0x4301 的热点和 IPv6 端点，不强等 ctrl 邀请；保留蓝牙音频，屏幕协商失败时保留控制链路。音视频尚待实车验证。",
+      "verified": false,
+      "validatesDeviceId": false,
+      "sendCarPlayAvailability": true,
+      "openEaSessions": false,
+      "sendTransportIdentifier": true,
+      "replyPowerUpdates": true,
+      "dropProfilesBeforeIap2": false,
+      "allowOutboundIap2": true,
+      "abortWhenCarPlayWindowClosed": false,
+      "preferMdnsAirplay": true,
+      "requireAirplayActivation": true,
+      "allowProactiveWifiSession": false,
+      "advertiseOnCurrentWifi": false,
+      "requireFreshCtrlInvite": false,
+      "useScreenResourceLifecycle": true,
+      "fallbackAirplayPorts": [
+        7000
+      ],
+      "touchDisplay": "",
+      "pairingHint": "在 MBUX 中选择 Apple CarPlay 并确认手机，接受 Wi-Fi 连接提示；屏幕尺寸按本轮协商获取。此配置尚未验证音视频正常。"
     }
   ]
 }

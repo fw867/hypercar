@@ -1246,6 +1246,9 @@ private fun BehaviorSection(startup: io.github.hypercar.session.StartupReadiness
     var carPlayMarker by rememberSaveable { mutableStateOf(SettingsStore.bluetoothCarPlayMarker) }
     var proactiveWifi by rememberSaveable { mutableStateOf(SettingsStore.proactiveWifiSession) }
     var resourceLifecycle by rememberSaveable { mutableStateOf(SettingsStore.screenResourceLifecycle) }
+    val profileLifecycle = remember(io.github.hypercar.settings.SettingsRevision.value) {
+        io.github.hypercar.headunit.HeadUnitProfiles.current().useScreenResourceLifecycle
+    }
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionLabel(text = "自动连接与恢复")
@@ -1312,8 +1315,10 @@ private fun BehaviorSection(startup: io.github.hypercar.session.StartupReadiness
             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
             SwitchRow(
                 title = "画面资源联动（实验）",
-                subtitle = "取得主屏后建立视频通道，车机收回主屏时释放视频并保留音频，下次连接生效",
-                checked = resourceLifecycle,
+                subtitle = if (profileLifecycle) "当前车机配置已启用；屏幕协商失败时保留控制连接，下次连接生效"
+                    else "取得主屏后建立视频通道，车机收回主屏时释放视频并保留音频，下次连接生效",
+                checked = profileLifecycle || resourceLifecycle,
+                enabled = !profileLifecycle,
                 onCheckedChange = {
                     SettingsStore.screenResourceLifecycle = it
                     resourceLifecycle = SettingsStore.screenResourceLifecycle

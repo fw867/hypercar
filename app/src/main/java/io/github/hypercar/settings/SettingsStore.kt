@@ -363,7 +363,8 @@ object SettingsStore {
         fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
         // 触摸兜底空间：车机档案若给了 touchDisplay 就用它；否则用设置里的
         // 屏幕推送分辨率（与视频编码一致）。真车 /info 有尺寸时仍优先 /info。
-        val profileTouch = io.github.hypercar.headunit.HeadUnitProfiles.current().touchDisplay
+        val profile = io.github.hypercar.headunit.HeadUnitProfiles.current()
+        val profileTouch = profile.touchDisplay
         val fallbackW = width.coerceAtLeast(2) / 2 * 2
         val fallbackH = height.coerceAtLeast(2) / 2 * 2
         val (tdW, tdH) = profileTouch
@@ -385,7 +386,7 @@ object SettingsStore {
             // CarWith 模式：视频/音频源改由本机 CarLife（CarWith）提供（2026-11-03）
             append("\"carlife_source\":").append(if (carWithSource) "true" else "false").append(",")
             append("\"carwith_stretch\":").append(if (carWithStretch) "true" else "false").append(",")
-            append("\"screen_resource_lifecycle\":").append(if (screenResourceLifecycle) "true" else "false").append(",")
+            append("\"screen_resource_lifecycle\":").append(if (profile.screenResourceLifecycleEnabled(screenResourceLifecycle)) "true" else "false").append(",")
             append("\"width\":").append(plan.width).append(",")
             append("\"height\":").append(plan.height).append(",")
             append("\"touch_display_w\":").append(tdW).append(",")
