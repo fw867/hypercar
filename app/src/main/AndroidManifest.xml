@@ -142,7 +142,7 @@
 
         <receiver android:name=".autowake.AutomaticConnectionResume" android:exported="false" />
 
-        <!-- 仅 DUMP 权限（adb shell）可触发：单独验证「shell 代绑高德 LinkSDK」，
+        <!-- 仅 DUMP 权限（adb shell）可触发：单独验证正式的高德 LinkSDK 绑定，
              正式 HUD 路径仍受会话/HUD 开关约束。 -->
         <receiver
             android:name=".debug.AmapLinkDebugReceiver"

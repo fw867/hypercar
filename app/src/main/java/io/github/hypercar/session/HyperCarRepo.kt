@@ -1070,7 +1070,7 @@ object HyperCarRepo {
             var invitationOnly = false
             val knownWifiRetry = KnownWifiActivationRetry()
             var retryEndpoint: CarPlayEndpoint? = null
-            suspend fun waitForInvitation(reason: String, failedEndpoint: CarPlayEndpoint?) {
+            suspend fun waitForInvitation(reason: String, failedEndpoint: CarPlayEndpoint?, activationClosed: Boolean = false) {
                 invitationOnly = true
                 sessionSockets?.invalidate() // Retire only the failed engine's socket factory, not Wi-Fi.
                 lateAirplayEndpoint.set(null)
@@ -1085,7 +1085,7 @@ object HyperCarRepo {
                 airplayHost = null
                 airplayPort = 0
                 val retryDelay = if (proactiveWifiSessionAllowed(context, SettingsStore.proactiveWifiSession)) {
-                    knownWifiRetry.failed(boundNetwork?.toString(), wifiReceiverMac, SystemClock.elapsedRealtime())
+                    knownWifiRetry.failed(boundNetwork?.toString(), wifiReceiverMac, SystemClock.elapsedRealtime(), activationClosed)
                 } else { knownWifiRetry.clear(); null }
                 retryEndpoint = failedEndpoint.takeIf { retryDelay != null }
                 connectionDiagnostics.mark(diagnosticId,
@@ -1095,6 +1095,9 @@ object HyperCarRepo {
                 if (retryDelay != null) {
                     log("ACTIVATION: 主动建链失败：$reason；保留身份/Wi-Fi，已配对车机网络将在至少 ${retryDelay / 1000}s 后重试，车机邀请仍优先")
                     push(link = LinkState.Negotiating("车机 Wi-Fi 恢复未完成，稍后自动重试"))
+                } else if (activationClosed) {
+                    log("ACTIVATION: RECORD 后、资源确认前关闭：$reason；本轮同一车机/网络停止主动重放，保留身份、Wi-Fi、广播和蓝牙监听，等待新邀请；未收到明确拒绝码")
+                    push(link = LinkState.Negotiating("车机尚未完成激活，等待新邀请"))
                 } else {
                     log("ACTIVATION: 主动建链失败：$reason；当前不满足已配对车机 Wi-Fi 条件，保留身份与广播，等待车机邀请")
                     push(link = LinkState.Negotiating("主动连接未获接受，等待车机邀请"))
@@ -1290,7 +1293,8 @@ object HyperCarRepo {
                 if (headUnitProfile.requireFreshCtrlInvite && activationInvite != null)
                     advertiser.discardInvitation(activationInvite)
                 waitForInvitation(rejected, endpoint.copy(ipAddresses = listOf(apHostFinal),
-                    airPlayPort = port, gateway = apHostFinal))
+                    airPlayPort = port, gateway = apHostFinal),
+                    activationClosed = endpoint.proactive && !endpoint.fromInvite && activation.requiresFreshInvitation)
                 RustCoreBridge.nativeStop()
                 proactiveActivation.compareAndSet(activation, null)
                 kotlinx.coroutines.currentCoroutineContext().ensureActive()
@@ -2034,6 +2038,7 @@ object HyperCarRepo {
             when (state) {
                 "activation" -> {
                     val stage = runCatching { ConnectionDiagnostics.Stage.valueOf(detail) }.getOrNull() ?: return
+                    activation?.stage(stage)
                     connectionDiagnostics.mark(connectionAttemptId, stage)
                     log("ACTIVATION: attempt=$connectionAttemptId core=${_snapshots.value.pipeline.generation} stage=$stage")
                     if (stage == ConnectionDiagnostics.Stage.VIDEO_CHANNEL_READY) activation?.videoReady()

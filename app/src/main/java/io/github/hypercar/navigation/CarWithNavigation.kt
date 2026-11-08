@@ -69,7 +69,8 @@ internal object CarWithCueMapper {
 internal object NavigationSources {
     fun snapshot(): NavigationCue? {
         if (!HyperCarRepo.hudNavigationAllowed) { clear(); return null }
-        return if (HyperCarRepo.carWithHudNavigationAllowed) CarWithNavigation.snapshot() else AmapNavigation.snapshot()
+        return if (HyperCarRepo.carWithHudNavigationAllowed) CarWithNavigation.snapshot()
+            else AmapLinkNavigation.snapshot() ?: AmapNavigation.snapshot()
     }
-    fun clear() { AmapNavigation.clear(); CarWithNavigation.clear(); AmapLinkProbe.stop() }
+    fun clear() { AmapNavigation.clear(); AmapLinkNavigation.clear(); CarWithNavigation.clear(); AmapLinkProbe.stop() }
 }

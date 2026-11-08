@@ -30,14 +30,6 @@ class SpikeShellService : ISpikeShell.Stub {
 
     private val playbackAudio = ShellPlaybackAudio()
     private val bluetoothDiscovery = ShellBluetoothDiscovery()
-    private val amapLink = ShellAmapLink()
-
-    override fun connectAmapLink(sink: IAmapLinkSink?): String = amapLink.connect(appContext, sink)
-
-    override fun disconnectAmapLink() = amapLink.disconnect()
-
-    override fun amapLinkStatus(): String = amapLink.status()
-
     override fun startBluetoothDiscoverable(owner: IBinder, token: String, seconds: Int): String {
         val identity = android.os.Binder.clearCallingIdentity()
         return try { bluetoothDiscovery.start(appContext, owner, token, seconds) }

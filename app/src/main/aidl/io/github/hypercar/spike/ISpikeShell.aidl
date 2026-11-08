@@ -4,7 +4,6 @@ package io.github.hypercar.spike;
 
 import android.os.ParcelFileDescriptor;
 import android.view.Surface;
-import io.github.hypercar.spike.IAmapLinkSink;
 
 interface ISpikeShell {
     /** 返回 "OK id=<n> flags=0x<hex>" 或 "ERR ..."。 */
@@ -48,12 +47,4 @@ interface ISpikeShell {
     String startBluetoothDiscoverable(IBinder owner, String token, int seconds);
     String stopBluetoothDiscoverable(String token);
 
-    /**
-     * 在 shell 进程里绑定高德 LinkSDK（com.autonavi.minimap/.wearable.connect.glass.AmapLinkService）。
-     * 必须由 shell 做：MIUI 的 WakePathChecker 会把普通 App 发起的 bindService 当"关联启动"拒绝，
-     * 而自绘 UI 本来就依赖 Shizuku，正好复用这条通道。
-     */
-    String connectAmapLink(in IAmapLinkSink sink);
-    void disconnectAmapLink();
-    String amapLinkStatus();
 }

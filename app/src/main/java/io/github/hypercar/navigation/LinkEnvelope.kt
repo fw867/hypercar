@@ -10,7 +10,7 @@ import org.json.JSONObject
 /** Public Link callback framing; the envelope carries its per-message key, not an authorization key. */
 internal object LinkEnvelope {
     fun decode(raw: String): String? = runCatching {
-        require(raw.length <= 131072)
+        require(raw.length <= LinkPayload.MAX_BYTES * 2)
         var content = raw.trim()
         if (content.startsWith("{")) {
             val json = JSONObject(content)
@@ -18,7 +18,7 @@ internal object LinkEnvelope {
             content = json.getString("content")
         }
         val bytes = Base64.getDecoder().decode(content.filterNot(Char::isWhitespace))
-        require(bytes.size in 36..65536)
+        require(bytes.size in 36..LinkPayload.MAX_BYTES)
         val b = ByteBuffer.wrap(bytes)
         val idSize = b.int
         require(idSize in 1..99 && b.remaining() >= idSize + 4)

@@ -11,6 +11,7 @@ internal class RouteGuidanceSession(private val log: (String) -> Unit) {
     private var previousEnabled = false
     private var nextUpdate = 0L
     private var dirty = false
+    private var diagnostic: String? = null
 
     private fun concat(vararg parts: ByteArray): ByteArray = parts.fold(byteArrayOf()) { a, b -> a + b }
 
@@ -37,6 +38,19 @@ internal class RouteGuidanceSession(private val log: (String) -> Unit) {
     }
 
     fun updates(now: Long, enabled: Boolean, cue: NavigationCue?): List<Iap2Csm.Frame> {
+        val status = when {
+            !enabled -> "disabled"
+            subscribers.isEmpty() && cue?.state == 1 -> "source_ready_wait_subscription"
+            subscribers.isEmpty() -> "wait_source_and_subscription"
+            cue == null -> "subscribed_wait_source"
+            cue.state != 1 -> "subscribed_no_active_route"
+            cue.maneuver == null -> "subscribed_unknown_maneuver"
+            else -> "source_and_subscription_ready"
+        }
+        if (diagnostic != status) {
+            diagnostic = status
+            log("HUD: status=$status subscribers=${subscribers.size}; source readiness is separate from vehicle subscription and display")
+        }
         if (subscribers.isEmpty()) { published = false; previous = null; return emptyList() }
         val current = cue.takeIf { enabled }
         // When scope/source disappears send one no-route update to clear the old arrow.

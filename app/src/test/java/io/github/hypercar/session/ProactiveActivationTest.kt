@@ -5,6 +5,27 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ProactiveActivationTest {
+    @Test fun recordWithoutResourcesRequiresAnInvitationAndLateStagesCannotUndoIt() = runBlocking {
+        val activation = ProactiveActivation()
+        activation.stage(ConnectionDiagnostics.Stage.RECORD)
+        activation.interceptTerminal("control EOF")
+        activation.stage(ConnectionDiagnostics.Stage.RESOURCES_ACCEPTED)
+        activation.interceptTerminal("event closed")
+        assertTrue(activation.requiresFreshInvitation)
+        assertEquals("control EOF", activation.result.await())
+    }
+
+    @Test fun transportFailureBeforeRecordAndMediaFailureAfterResourcesKeepRetryPolicy() {
+        val before = ProactiveActivation()
+        before.interceptTerminal("connect failed")
+        assertFalse(before.requiresFreshInvitation)
+        val after = ProactiveActivation()
+        after.stage(ConnectionDiagnostics.Stage.RECORD)
+        after.stage(ConnectionDiagnostics.Stage.RESOURCES_ACCEPTED)
+        after.interceptTerminal("screen SETUP failed")
+        assertFalse(after.requiresFreshInvitation)
+    }
+
     @Test fun repeatedClosureCannotEscapeDuringCleanupOrEraseFirstReason() = runBlocking {
         val activation = ProactiveActivation()
         assertTrue(activation.interceptTerminal("control EOF"))

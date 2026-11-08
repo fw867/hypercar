@@ -8,7 +8,7 @@ import io.github.hypercar.session.HyperCarRepo
 
 /**
  * 受 `android.permission.DUMP` 保护的调试入口：`adb shell am broadcast -a io.github.hypercar.DEBUG_AMAP_LINK`
- * 只用于在没有车机会话时单独验证「shell 代绑高德 LinkSDK」这条通道（HUD 正式路径仍受会话开关约束）。
+ * 在没有车机会话时验证正式的 App 绑定路径（HUD 正式路径仍受会话开关约束）。
  */
 class AmapLinkDebugReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {

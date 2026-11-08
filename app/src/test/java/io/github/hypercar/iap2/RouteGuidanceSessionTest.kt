@@ -8,6 +8,17 @@ class RouteGuidanceSessionTest {
     private val cue = NavigationCue("右转进入测试路", 2, 300)
     private fun start(id: Int) = Iap2Csm.Frame(0x5200, Iap2Csm.u16(0, id) + Iap2Csm.param(1, byteArrayOf()) + Iap2Csm.param(2, byteArrayOf()))
     private fun fields(f: Iap2Csm.Frame) = Iap2Csm.parseParams(f.body).associate { it.id to it.value }
+    @Test fun sourceReadyIsDiagnosedWithoutFabricatingASubscription() {
+        val logs = mutableListOf<String>()
+        val s = RouteGuidanceSession(logs::add)
+        assertTrue(s.updates(0, true, cue).isEmpty())
+        assertTrue(logs.single().contains("source_ready_wait_subscription"))
+        s.updates(1000, true, cue)
+        assertEquals(1, logs.size)
+        s.handle(start(42))
+        assertEquals(listOf(0x5202, 0x5201), s.updates(2000, true, cue).map { it.messageId })
+        assertTrue(logs.any { it.contains("source_and_subscription_ready") })
+    }
     @Test fun requiresSubscriptionAndScope() {
         val s = RouteGuidanceSession {}
         assertTrue(s.updates(0, true, cue).isEmpty())

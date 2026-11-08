@@ -526,6 +526,7 @@ class Iap2SenderSession(
     fun pumpIncomingForever() {
         enterPhase("MAINTAIN_LINK")
         log("SESSION 保活中（链路保持打开，持续处理配件消息）")
+        log("HUD: transport=Bluetooth peer_start_route=${peerIdentification?.declaresSend(0x5200)} peer_route_update=${peerIdentification?.declaresReceive(0x5201)}; absent declaration is not a subscription")
         // 同一消息 ID 连续到达时限流：车机进入媒体播放后会周期性发 NowPlaying 更新，
         // 逐条打日志会把文件日志撑爆（文件超限被删 = 丢掉真正有用的上下文）。
         var lastLoggedId = -1

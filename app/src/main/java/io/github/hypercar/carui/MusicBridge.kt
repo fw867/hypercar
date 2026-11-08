@@ -60,6 +60,8 @@ class MusicNotificationListener : NotificationListenerService() {
     }
 
     override fun onNotificationPosted(notification: android.service.notification.StatusBarNotification?) {
+        if (!shouldListen()) return
+        ensureAttached()
         notification?.let {
             MusicBridge.onNotificationChanged(it.packageName)
             io.github.hypercar.navigation.AmapNavigation.posted(it)
@@ -67,6 +69,8 @@ class MusicNotificationListener : NotificationListenerService() {
     }
 
     override fun onNotificationRemoved(notification: android.service.notification.StatusBarNotification?) {
+        if (!shouldListen()) return
+        ensureAttached()
         notification?.let {
             MusicBridge.onNotificationChanged(it.packageName)
             io.github.hypercar.navigation.AmapNavigation.removed(it)
@@ -77,18 +81,32 @@ class MusicNotificationListener : NotificationListenerService() {
         runCatching { activeNotifications?.forEach { io.github.hypercar.navigation.AmapNavigation.posted(it) } }
     }
 
+    private fun ensureAttached() {
+        if (!MusicBridge.isAttachedTo(this)) MusicBridge.attach(this)
+    }
+
+    override fun dump(fd: java.io.FileDescriptor, writer: java.io.PrintWriter, args: Array<out String>) {
+        writer.println("listenerConnected=${connected === this} observing=${shouldListen()}")
+        writer.println(MusicBridge.diagnostics())
+    }
+
+    override fun onDestroy() {
+        if (connected === this) connected = null
+        if (MusicBridge.isAttachedTo(this)) MusicBridge.detach()
+        super.onDestroy()
+    }
+
     override fun onListenerDisconnected() {
         io.github.hypercar.navigation.AmapNavigation.clear()
-        if (connected === this) {
-            connected = null
-            MusicBridge.detach()
-        }
+        if (connected === this) connected = null
+        if (MusicBridge.isAttachedTo(this)) MusicBridge.detach()
         super.onListenerDisconnected()
     }
 
     companion object {
         private val main = Handler(Looper.getMainLooper())
-        // Owned by the main thread; requestUnbind releases the SYSTEM binding, not permission.
+        // Keep the system-granted listener separate from optional media work. requestUnbind
+        // during an idle callback can race requestRebind and leave a bound but idle service.
         private var connected: MusicNotificationListener? = null
 
         private fun shouldListen() = HyperCarRepo.automaticConnectionAllowed ||
@@ -96,11 +114,10 @@ class MusicNotificationListener : NotificationListenerService() {
 
         private fun pauseListening() {
             val listener = connected ?: return
-            connected = null
-            MusicBridge.detach("连接监听已暂停")
-            runCatching { listener.requestUnbind() }
-                .onFailure { HyperCarRepo.log("MUSIC: 暂停系统绑定失败 ${it.message}") }
-            HyperCarRepo.log("MUSIC: 自动监听关闭或休眠且无会话，已暂停音乐监听")
+            if (MusicBridge.isAttachedTo(listener)) {
+                MusicBridge.detach("连接监听已暂停")
+                HyperCarRepo.log("MUSIC: 无活动连接，暂停媒体订阅，保留系统通知绑定供下次恢复")
+            }
         }
 
         /** Re-evaluate on delivery so rapid stop/start or switch changes cannot apply stale state. */
@@ -120,6 +137,7 @@ class MusicNotificationListener : NotificationListenerService() {
                 if (!shouldListen()) {
                     pauseListening()
                 } else if (connected != null) {
+                    connected?.ensureAttached()
                     connected?.replayNavigation()
                 } else if (MusicBridge.hasAccess(app)) {
                     runCatching { requestRebind(ComponentName(app, MusicNotificationListener::class.java)) }
@@ -153,6 +171,8 @@ object MusicBridge {
     private var playback: PlaybackState? = null
     private var ratingType = Rating.RATING_NONE
     private var sessionGeneration = 0L
+    private val snapshotEpoch = MusicSnapshotEpoch()
+    private var lastRefreshAt = 0L
     private var callback: MediaController.Callback? = null
     private val sessionQueries = musicQuery<SessionSnapshot>("music-session-query")
     private fun <T> musicQuery(name: String) = LatestMusicQuery<T>(
@@ -494,11 +514,13 @@ object MusicBridge {
         private val audioResume = PlaybackAudioResume(playback?.state)
         override fun onMetadataChanged(value: MediaMetadata?) {
             if (generation != sessionGeneration) return
+            snapshotEpoch.metadataChanged()
             metadata = value
             publish()
         }
         override fun onPlaybackStateChanged(value: PlaybackState?) {
             if (generation != sessionGeneration) return
+            snapshotEpoch.playbackChanged()
             val resumed = audioResume.onState(value?.state)
             playback = value
             if (resumed) requestPlaybackAudio()
@@ -517,6 +539,7 @@ object MusicBridge {
 
     private fun clearController() {
         sessionGeneration++
+        snapshotEpoch.sessionChanged()
         callback?.let { old -> runCatching { controller?.unregisterCallback(old) } }
         callback = null
         controller = null
@@ -528,6 +551,7 @@ object MusicBridge {
     private val ticker = object : Runnable {
         override fun run() {
             if (controller != null) publish()
+            if (CarUiCaster.running && SystemClock.elapsedRealtime() - lastRefreshAt >= 5_000) choose()
             resumeAfterReconnect()
             main.postDelayed(this, 1_000)
         }
@@ -608,6 +632,8 @@ object MusicBridge {
     }
 
     fun attach(service: NotificationListenerService) {
+        if (this.service === service) return
+        if (this.service != null) detach()
         HyperCarRepo.log("MUSIC: 通知监听已接入（attach）")
         this.service = service
         playbackPrefs = service.getSharedPreferences("car_playback", Context.MODE_PRIVATE)
@@ -653,6 +679,8 @@ object MusicBridge {
 
     private fun choose(provided: List<MediaController>? = null) {
         val s = service ?: return
+        lastRefreshAt = SystemClock.elapsedRealtime()
+        val epoch = snapshotEpoch.capture()
         val preferred = preferredPackage
         sessionQueries.submit({
             val msm = s.getSystemService(MediaSessionManager::class.java)
@@ -693,6 +721,12 @@ object MusicBridge {
                     lastChoiceKey = key
                     HyperCarRepo.log("MUSIC: 选中 ${target?.packageName ?: "-"}（共 ${snapshot.count} 个会话）")
                 }
+            } else if (target != null) {
+                // Notifications/refresh can repair a missing player callback, but a delayed
+                // discovery snapshot must not replace newer metadata or playback callbacks.
+                if (snapshotEpoch.acceptsMetadata(epoch)) metadata = snapshot.metadata
+                if (snapshotEpoch.acceptsPlayback(epoch)) playback = snapshot.playback
+                ratingType = snapshot.ratingType
             }
             publish()
         })
@@ -700,9 +734,18 @@ object MusicBridge {
 
     fun onNotificationChanged(packageName: String) {
         main.post {
-            if (controller?.packageName == packageName) { MusicArtwork.invalidate(); publish() }
+            if (controller?.packageName == packageName || controller == null) {
+                MusicArtwork.invalidate()
+                choose()
+            }
         }
     }
+
+    internal fun isAttachedTo(listener: NotificationListenerService): Boolean = service === listener
+
+    internal fun diagnostics(): String = "musicAttached=${service != null} selected=${controller?.packageName} " +
+        "metadata=${metadata != null} playback=${playback?.state} art=${_state.value.albumArt?.let { "${it.width}x${it.height}" }} " +
+        "playing=${_state.value.playing} sessionGeneration=$sessionGeneration"
 
     private fun publish() {
         val c = controller

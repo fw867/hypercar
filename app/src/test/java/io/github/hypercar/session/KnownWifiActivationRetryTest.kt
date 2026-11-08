@@ -7,6 +7,21 @@ class KnownWifiActivationRetryTest {
     private val car = "AA:BB:CC:DD:EE:01"
     private val other = "AA:BB:CC:DD:EE:02"
 
+    @Test fun activationClosureStopsReplayOnlyWithinTheFailedScopeAndAttempt() {
+        val retry = KnownWifiActivationRetry()
+        assertNull(retry.failed("121", car, 0, waitForInvitation = true))
+        assertFalse(retry.ready("121", car, 600_000))
+        assertFalse(retry.allowsRetry(true, false, "121", car, 600_000))
+        // A later error cannot turn the same activation closure into a timed retry.
+        assertNull(retry.failed("121", car, 600_000))
+        assertTrue(retry.allowsRetry(true, false, "122", car, 600_000))
+        assertTrue(retry.allowsRetry(true, false, "121", other, 600_000))
+        assertFalse(retry.ready("122", car, 600_000)) // no stale endpoint reuse
+        assertTrue(KnownWifiActivationRetry().allowsRetry(true, false, "121", car, 0))
+        retry.clear()
+        assertTrue(retry.allowsRetry(true, false, "121", car, 600_000))
+    }
+
     @Test fun failedKnownWifiActivationCanRetryWithoutAnyInvitation() {
         val stable = ProactiveWifiSessionDelay()
         val retry = KnownWifiActivationRetry()

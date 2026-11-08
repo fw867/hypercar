@@ -146,3 +146,26 @@ ADB确认CarWith HomeActivity与高德UcarMapActivity处于各自显示上的前
 575以HyperCar真实应用UID 10434绑定该服务，实测bind=true、authenticate=success、registered=true，收到7条真实回调，外层字段为bizType与datas。没有伪装包名、修改签名/白名单、注入高德或启动CarWith。回调解密使用消息自带的传输封装信息，和API授权凭证分开，不记录token、封装密钥或道路原文。此阶段仅确认独立回调入口可达，尚未确认datas中的导航字段。
 
 16:10:46地图旧任务清理执行force-stop，导致刚绑定的Link服务断开。576将绑定挪到自绘地图启动后，并在地图进程重启时作最多3次有界重新绑定；地图任务释放及会话退出均解绑。继续解析嵌套datas的字段形状后，才能确认是否可以作为HUD数据入口。
+
+## 实车失败与当前绑定修正
+
+11月8日下午实车：自绘来源的Link绑定持续失败；CarWith来源已收到真实转向和距离，但对应宝马蓝牙会话清单没有0x5200/0x5201，也没有实际导航订阅，Wi-Fi iAP2保持WAIT_PEER。未记录该轮导航报文发送，不能宣称HUD已工作，也不能由蓝牙清单推断车机所有承载均不支持导航。
+
+真机探针确认Android 17的bindService参数与原来的手写Parcel变体不一致；shell没有AMS登记的应用线程，caller=null调用即使找到服务也会被SecurityException拒绝。删除ShellActivityBind、ShellAmapLink及专用AIDL，统一使用App自己的ServiceConnection；不再以shell绕过“关联启动”。系统拒绝启动时仍需等待地图正常启动或用户授予关联启动权限。
+
+正式Reader按每次绑定隔离ServiceConnection、远程Binder和回调；绑定/授权/注册有超时，连续失败最多8次，间隔2至15秒；成功注册后重置预算，地图进程重启后重新绑定。旧回调不能写入新连接，退出会注销、解绑并关闭待处理FD。DUMP诊断入口复用同一实现，不额外启动地图或伪造路线。
+
+594手机实测21:57:57绑定/授权/注册成功并收到真实bizType=113回调；21:57:58地图服务断开，21:58:00重新绑定后回调恢复。后续再次绑定持续收到真实数据，包含type5.maneuverID。采样改为按业务类型有界保留，排除重复定位/GPS/缩放，避免首批定位记录占满导航样本。
+
+594—596阶段仅修复绑定，尚未转换Link业务；以下数据接入取代该阶段结论。CarWith结构化入口保持独立。
+
+
+## Link结构化导航接入
+
+598核对手机真实AIDL发现onAmapCallbackWithFd参数为metadata字符串、再到FD，旧实现漏读字符串并把数据截在64KiB，导致大包无法接收。已按真实布局接收，加入4MiB上限及按代次关闭FD，补齐有界分块重组；仅在授权和注册成功后使用服务签发的token请求导航关键数据刷新/结构查询，不记录token，不修改地图授权策略。协议依据见[高德Android Link接口](https://lbs.amap.com/api/aiot-sdk/guide/strong-ties/amaplinkclient-api)。
+
+实测收到160620字符大包，解封装后有完整路线数据，以及每秒type4导航更新。真实字段curManeuverID、segmentRemainDist、nextRouteName转换为NavigationCue；routeRemainDist是到终点距离，不用于下个路口倒计时。映射参考[高德ManeuverIconID](https://a.amap.com/amapauto/static/bl/500/android/api/classcom_1_1autonavi_1_1gbl_1_1guide_1_1model_1_1_maneuver_icon_i_d.html)，不混用CarLife枚举。未知图标无箭头，新方向先到时不沿用上个路口的距离/道路。
+
+自绘优先采用Link结构化状态，通知只作无结构化来源时的兜底；CarWith继续使用自己的token和数据。type100取消、type200到达；type7导航模式快照不能清除同批type4提示。旧绑定不能更新/清空新绑定，15秒无更新时清除箭头，显式停止不回退到旧通知。类型及生命周期依据[高德数据类型说明](https://lbs.amap.com/api/aiot-sdk/faq-old)。实际启动地图会恢复已耗尽的绑定重试预算，普通失败仍有界，不靠永久后台轮询。
+
+599现场可见左转38米、右转22米等真实更新，Wi-Fi iAP2消费者显示source_ready_wait_subscription。当前WinPlay空体0x5200不是有效组件订阅，未伪造组件或直接声称上报/显示成功；此前宝马车样本未有导航订阅、Wi-Fi iAP2停在WAIT_PEER仍是独立阻塞点。手机数据接收/转换已验证，宝马HUD显示需下次实车确认。
