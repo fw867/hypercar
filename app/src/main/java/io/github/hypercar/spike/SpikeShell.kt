@@ -40,6 +40,19 @@ object SpikeShell {
         call("startBluetoothDiscoverable") { it.startBluetoothDiscoverable(owner, token, seconds) }
     fun stopBluetoothDiscoverable(token: String): String =
         call("stopBluetoothDiscoverable") { it.stopBluetoothDiscoverable(token) }
+
+    /**
+     * 让 shell 进程代绑高德 LinkSDK（普通 App 直接 bind 会被 MIUI 当成"关联启动"拒绝）。
+     * 返回 "OK ..." 表示 shell 已开始绑定；回调经 [IAmapLinkSink] 送回 App。
+     */
+    fun connectAmapLink(sink: IAmapLinkSink): String =
+        call("connectAmapLink") { it.connectAmapLink(sink) }
+
+    fun disconnectAmapLink() {
+        runCatching { service?.disconnectAmapLink() }
+    }
+
+    fun amapLinkStatus(): String = service?.amapLinkStatus() ?: "shell disconnected"
     fun updateDisplaySurface(id: Int, surface: Surface?, width: Int, height: Int, dpi: Int): String =
         service?.updateDisplaySurface(id, surface, width, height, dpi) ?: "ERR shell disconnected"
 

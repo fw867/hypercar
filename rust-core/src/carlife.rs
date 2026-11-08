@@ -4,6 +4,7 @@
 //! CMD/CTRL/DATA use 8-byte headers; VIDEO/MEDIA/TTS/VR use 12-byte headers.
 //! CarWith DATA is port 9440. Do not mix generic CarLife assumptions with this path.
 
+pub(crate) mod navigation;
 mod session;
 mod video;
 
@@ -131,6 +132,7 @@ pub struct CarLifeConfig {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    pub navigation_updates: bool,
     /// `HU_INFO` 里 required 的 `btaddress`（车机蓝牙 MAC）。
     pub bt_address: String,
     /// `HU_INFO` 里 required 的 `btname`（车机蓝牙名）。
@@ -218,7 +220,7 @@ impl CarLifeHub {
                 children.spawn(drain_stream(sockets.next().unwrap()));
                 let ctrl=sockets.next().unwrap(); let q=queue.clone(); let cipher=state.clone(); let stop_ctrl=stop.clone();
                 children.spawn(async move { session::control(ctrl,q,cipher,stop_ctrl).await; });
-                children.spawn(drain_stream(sockets.next().unwrap()));
+                children.spawn(session::data(sockets.next().unwrap(),state.clone(),events_task.clone()));
                 let outcome=tokio::select! {
                     _=stop.notified()=>{children.abort_all(); return;},
                     _=children.join_next()=>Err("CarWith media/control channel closed".into()),
@@ -226,6 +228,7 @@ impl CarLifeHub {
                 };
                 children.abort_all(); while children.join_next().await.is_some() {}
                 queue.lock().clear();
+                let _ = events_task.send(CarLifeEvent::Navigation(None));
                 emit_log(&format!("CARWITH-HS: round closed: {}",outcome.err().unwrap_or_else(||"ended".into())));
                 tokio::select! { _=stop.notified()=>return, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
             }

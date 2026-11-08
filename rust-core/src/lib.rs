@@ -17,7 +17,6 @@ mod voice_key;
 mod crypto;
 mod carlife;
 mod engine;
-mod iap2_nav;
 mod modes;
 mod pairing;
 mod rtsp;
@@ -177,6 +176,15 @@ pub(crate) fn emit_force_keyframe() {
     call_listener("onForceKeyFrame", |env, obj| {
         env.call_method(obj, "onForceKeyFrame", "()V", &[])
             .map(|_| ())
+    });
+}
+
+pub(crate) fn emit_carwith_navigation(token:u64, update:Option<&carlife::navigation::NavigationUpdate>) {
+    if token==0 {return;}
+    let payload=update.and_then(|n|serde_json::to_string(n).ok()).unwrap_or_else(||"null".into());
+    call_listener("onCarWithNavigation", |env,obj| {
+        let data=env.new_string(payload)?;
+        env.call_method(obj,"onCarWithNavigation","(JLjava/lang/String;)V",&[(token as jlong).into(),(&data).into()]).map(|_|())
     });
 }
 
@@ -727,40 +735,3 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeRequest
         JNI_TRUE
     } else { JNI_FALSE }
 }
-
-/// 构造宝马 HUD 导航报文（iAP2 0x5200）；返回 jbyteArray（Rust 分配、JNI 拷贝）。
-#[no_mangle]
-pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeBuildIap2NavPacket<'local>(
-    mut env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    maneuver_type: jint,
-    current_street: JString<'local>,
-    next_street: JString<'local>,
-    dist_to_maneuver_m: jint,
-    remain_time_s: jint,
-    remain_dist_m: jint,
-) -> jni::sys::jbyteArray {
-    let cur: String = env
-        .get_string(&current_street)
-        .map(|s| s.into())
-        .unwrap_or_default();
-    let nxt: String = env
-        .get_string(&next_street)
-        .map(|s| s.into())
-        .unwrap_or_default();
-    let packet = iap2_nav::build_route_guidance_packet(
-        maneuver_type as u8,
-        &cur,
-        &nxt,
-        dist_to_maneuver_m.max(0) as u32,
-        remain_time_s.max(0) as u32,
-        remain_dist_m.max(0) as u32,
-    );
-    env.byte_array_from_slice(&packet)
-        .expect("jbyteArray 创建失败")
-        .into_raw()
-}
-
-
-
-

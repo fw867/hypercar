@@ -30,7 +30,9 @@ object WifiIap2Bridge {
     private class Worker(val id: Long, deviceId: String) {
         val input = ArrayBlockingQueue<ByteArray>(64)
         @Volatile private var closed = false
-        private val protocol = WifiIap2Protocol(deviceId, { HyperCarRepo.log("WIFI-IAP#$id: $it") })
+        private val protocol = WifiIap2Protocol(deviceId, { HyperCarRepo.log("WIFI-IAP#$id: $it") },
+            navigationEnabled = { HyperCarRepo.hudNavigationAllowed },
+            navigationCue = { io.github.hypercar.navigation.NavigationSources.snapshot() })
         val thread = Thread({
             var readyReported = false
             var lastPhase = ""

@@ -48,6 +48,7 @@ object CarUiSettings {
 
     fun updateDefaultMap(provider: MapProvider) {
         defaultMap = provider
+        io.github.hypercar.navigation.AmapNavigation.clear()
         prefs?.edit()?.putString("default_map", provider.id)?.apply()
     }
 

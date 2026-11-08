@@ -52,19 +52,33 @@ class MusicNotificationListener : NotificationListenerService() {
     override fun onListenerConnected() {
         super.onListenerConnected()
         connected = this
-        if (shouldListen()) MusicBridge.attach(this)
+        if (shouldListen()) {
+            MusicBridge.attach(this)
+            replayNavigation()
+        }
         else pauseListening()
     }
 
     override fun onNotificationPosted(notification: android.service.notification.StatusBarNotification?) {
-        notification?.let { MusicBridge.onNotificationChanged(it.packageName) }
+        notification?.let {
+            MusicBridge.onNotificationChanged(it.packageName)
+            io.github.hypercar.navigation.AmapNavigation.posted(it)
+        }
     }
 
     override fun onNotificationRemoved(notification: android.service.notification.StatusBarNotification?) {
-        notification?.let { MusicBridge.onNotificationChanged(it.packageName) }
+        notification?.let {
+            MusicBridge.onNotificationChanged(it.packageName)
+            io.github.hypercar.navigation.AmapNavigation.removed(it)
+        }
+    }
+
+    private fun replayNavigation() {
+        runCatching { activeNotifications?.forEach { io.github.hypercar.navigation.AmapNavigation.posted(it) } }
     }
 
     override fun onListenerDisconnected() {
+        io.github.hypercar.navigation.AmapNavigation.clear()
         if (connected === this) {
             connected = null
             MusicBridge.detach()
@@ -105,7 +119,9 @@ class MusicNotificationListener : NotificationListenerService() {
                 }.onFailure { HyperCarRepo.log("MUSIC: 恢复监听组件失败 ${it.message}") }
                 if (!shouldListen()) {
                     pauseListening()
-                } else if (connected == null && MusicBridge.hasAccess(app)) {
+                } else if (connected != null) {
+                    connected?.replayNavigation()
+                } else if (MusicBridge.hasAccess(app)) {
                     runCatching { requestRebind(ComponentName(app, MusicNotificationListener::class.java)) }
                         .onFailure { HyperCarRepo.log("MUSIC: 恢复系统绑定失败 ${it.message}") }
                 }

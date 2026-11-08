@@ -9,9 +9,12 @@ internal class WifiIap2Protocol(
     private val deviceId: String,
     private val log: (String) -> Unit,
     private val nonce: () -> ByteArray = { ByteArray(32).also(SecureRandom()::nextBytes) },
+    private val navigationEnabled: () -> Boolean = { false },
+    private val navigationCue: () -> io.github.hypercar.navigation.NavigationCue? = { null },
 ) {
     private val engine = Iap2LinkEngine(reliableTransport = true, declaredWindow = 32)
     private val parser = Iap2Csm.Parser()
+    private val navigation = RouteGuidanceSession(log)
     private var started = false
     private var phase = "LINK"
     private var deadline = 0L
@@ -86,6 +89,9 @@ internal class WifiIap2Protocol(
             nextWaitLog = now + 2_000
         }
         if (started && phase != "READY" && now > deadline) fail("phase=$phase timeout")
+        if (phase == "READY" && !failed && engine.queuedControlPackets == 0 && engine.outstandingPackets < 8) {
+            navigation.updates(now, navigationEnabled(), navigationCue()).forEach { send(it.messageId, it.body) }
+        }
         return engine.takeOutput()
     }
 
@@ -93,6 +99,12 @@ internal class WifiIap2Protocol(
         if (failed) return
         val id = frame.messageId
         if (phase != "READY" || seen.add(id)) log("RX phase=$phase id=0x${id.toString(16)} body=${frame.body.size}B")
+        if (id == 0x5200 || id == 0x5203) {
+            // Retain bounded per-component subscriptions, including those arriving before auth.
+            // advance() emits no navigation data until READY.
+            navigation.handle(frame)
+            return
+        }
         if (id == 0xae02) {
             deferred.remove(0xae00) // StopPowerUpdates cancels an early subscription as well.
             return // No CSM reply defined; link ACK was already emitted.

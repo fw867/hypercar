@@ -47,7 +47,10 @@ class WifiIap2ProtocolTest {
 
     private inner class Car(val window: Int = 32, val controlSession: Int = 1) {
         val logs = mutableListOf<String>()
-        val protocol = WifiIap2Protocol("test-device", { logs += it }, { ByteArray(32) { 7 } })
+        var navigationAllowed = false
+        var navigationCue: io.github.hypercar.navigation.NavigationCue? = null
+        val protocol = WifiIap2Protocol("test-device", { logs += it }, { ByteArray(32) { 7 } },
+            navigationEnabled = { navigationAllowed }, navigationCue = { navigationCue })
         var sequence = 86
         var ack = 0
         var time = 1L
@@ -70,8 +73,9 @@ class WifiIap2ProtocolTest {
         }
         fun message(id: Int, body: ByteArray = byteArrayOf()): List<Iap2Csm.Frame> =
             messages(feed(packet(0x40, ++sequence, ack, controlSession, Iap2Csm.encode(id, body))))
-        fun ready() {
+        fun ready(beforeIdentification: () -> Unit = {}) {
             assertEquals(listOf(0x1d00), start().map { it.messageId })
+            beforeIdentification()
             val identification = message(0x1d01)
             assertEquals(listOf(0x1d02, 0xaa00), identification.map { it.messageId })
             assertTrue(identification.last().body.isEmpty()) // CatPlay default: request certificate, not serial.
@@ -83,6 +87,20 @@ class WifiIap2ProtocolTest {
                 message(0xaa03, Iap2Csm.param(0, ByteArray(64) { 9 })).map { it.messageId })
             assertFalse(protocol.failed)
         }
+    }
+
+    @Test fun earlyHudSubscriptionWaitsForAuthenticationAndRealSource() {
+        val car = Car()
+        car.ready { assertTrue(car.message(0x5200, Iap2Csm.u16(0, 77)).isEmpty()) }
+        car.navigationAllowed = true
+        car.navigationCue = io.github.hypercar.navigation.NavigationCue("右转", 2, 100)
+        val replies = car.message(0x4154)
+        assertEquals(listOf(0x4155, 0x5202, 0x5201), replies.map { it.messageId })
+        val component = Iap2Csm.parseParams(replies.last().body).first { it.id == 0 }.value
+        assertArrayEquals(byteArrayOf(0, 77), component)
+        car.message(0x5203, Iap2Csm.u16(0, 77))
+        car.navigationCue = car.navigationCue!!.copy(distanceMeters = 50)
+        assertTrue(car.protocol.advance(car.time + 2000).isEmpty())
     }
 
     @Test fun communicationsReplyDoesNotClaimUnimplementedPhoneControlsOrInventSimState() {

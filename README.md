@@ -82,3 +82,5 @@ pwsh -File tools\build-local.ps1 -Release -SkipRust -BuildNumber <N>
 接收端未提供有效像素尺寸时使用设置兜底，应与实际触摸空间一致。音频依赖系统 REMOTE_SUBMIX，ROM 和播放器能力会影响使用。其他车机与 ROM 的表现需单独验证。
 
 仅个人研究用途，与宝马、百度、高德无隶属关系。CarPlay、AirPlay 为 Apple 商标。
+
+导航 HUD / 仪表首版范围与限制：[导航链路说明](docs/NAVIGATION.md)。

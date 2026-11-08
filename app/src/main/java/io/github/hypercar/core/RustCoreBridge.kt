@@ -34,6 +34,9 @@ object RustCoreBridge {
 
         fun onLog(line: String)
         fun onPipeline(json: String) {}
+        fun onCarWithNavigation(token: Long, json: String) {
+            io.github.hypercar.navigation.CarWithNavigation.receive(token, json)
+        }
 
         /** 统计心跳（约 1s 一次）：fps/frames/kbps/音频闪避。 */
         fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean)
@@ -112,17 +115,4 @@ object RustCoreBridge {
     /** Rust 侧是否在运行（诊断）。 */
     external fun nativeIsRunning(): Boolean
 
-    /**
-     * 构造宝马 HUD/仪表导航报文（iAP2 0x5200 TLV），返回完整报文字节。
-     * 由 iAP2 会话层在事件通道 iAPSendMessage 或蓝牙控制会话里发送。
-     */
-    external fun nativeBuildIap2NavPacket(
-        maneuverType: Int,
-        currentStreet: String,
-        nextStreet: String,
-        distToManeuverM: Int,
-        remainTimeS: Int,
-        remainDistM: Int
-    ): ByteArray
 }
-

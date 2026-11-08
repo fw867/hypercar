@@ -144,6 +144,7 @@ object HyperCarRepo {
         val sockets = sessionSockets ?: return
         scope.launch {
             if (sessionSockets !== sockets || !sessionLive.get()) return@launch
+            io.github.hypercar.navigation.CarWithNavigation.clear()
             runCatching { RustCoreBridge.nativeStop() }
             delay(AIRPLAY_RETRY_DELAY_MILLIS)
             if (sessionSockets !== sockets || !sessionLive.get()) return@launch
@@ -167,7 +168,7 @@ object HyperCarRepo {
             val json = SettingsStore.engineConfigJson(target.host, target.port, sessionDeviceMac, identityPath,
                 receiverBluetoothMac = receiver, carWithSource = sessionCarWithMode)
             log("CORE: 重试 nativeStart（$target fd=$fd，第 $attempt 次）")
-            val started = RustCoreBridge.nativeStart(json, fd, socketProvider(sockets))
+            val started = RustCoreBridge.nativeStart(io.github.hypercar.navigation.CarWithNavigation.prepareConfig(json), fd, socketProvider(sockets))
             log("CORE: 重试 nativeStart 返回 $started")
             if (!started) retryAirplayOrFail("核心层重启失败")
         }
@@ -398,6 +399,14 @@ object HyperCarRepo {
 
     val hasCurrentSession: Boolean get() = sessionLive.get() || connecting || streaming
 
+    /** BMW HUD: AMap notifications for self UI or structured CarWith data; other profiles send none. */
+    @Volatile private var hudSessionEnabled = false
+    internal val hudNavigationAllowed: Boolean get() = hudSessionEnabled && hasCurrentSession &&
+        sessionCarWithMode == SettingsStore.carWithMode &&
+        headUnitProfile.id == io.github.hypercar.headunit.HeadUnitProfiles.BMW_ID85.id &&
+        (sessionCarWithMode || io.github.hypercar.carui.CarUiSettings.defaultMap == io.github.hypercar.carui.MapProvider.AMAP)
+    internal val carWithHudNavigationAllowed: Boolean get() = hudNavigationAllowed && sessionCarWithMode
+
     fun connect(context: Context) = requestConnect(context, manual = true, source = "manual")
 
     private fun connectAutomatically(context: Context, source: String = "acl") =
@@ -446,6 +455,8 @@ object HyperCarRepo {
         reconnectJob = null
         sessionHadLink = false
         sessionCarWithMode = SettingsStore.carWithMode
+        hudSessionEnabled = true
+        io.github.hypercar.navigation.NavigationSources.clear()
         sessionIdentity = null
         sessionReceiverMac = null
         lateAirplayEndpoint.set(null)
@@ -1247,7 +1258,7 @@ object HyperCarRepo {
                 connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.AIRPLAY_START)
                 val activation = if (HeadUnitActivationPolicy.needsFallbackGate(headUnitProfile, endpoint.proactive)) ProactiveActivation() else null
                 proactiveActivation.set(activation)
-                val started = RustCoreBridge.nativeStart(json, controlFd, socketProvider(sockets))
+                val started = RustCoreBridge.nativeStart(io.github.hypercar.navigation.CarWithNavigation.prepareConfig(json), controlFd, socketProvider(sockets))
                 log("CORE: nativeStart 返回 $started")
                 if (!started) {
                     fail("核心层启动失败（查看日志）")
@@ -1400,6 +1411,8 @@ object HyperCarRepo {
 
     /** 释放保活服务、iAP2、Rust 和 WiFi 绑定；拆除与失败路径共用。 */
     private fun releaseSessionResources(keepListening: Boolean = false, graceful: Boolean = false) {
+        hudSessionEnabled = false
+        io.github.hypercar.navigation.NavigationSources.clear()
         sessionSockets?.invalidate() // 阻止旧引擎继续创建/移交 socket，先于 nativeStop。
         sessionSockets = null
         CarProfileGuard.stop() // 清除旧会话的延迟检查；重新待机时再启动。
@@ -2096,7 +2109,10 @@ object HyperCarRepo {
                             val result = runCatching { CarUiCaster.start(ctx, ::current) }
                                 .getOrElse { "启动失败: ${it.javaClass.simpleName}: ${it.message}" }
                             log("CARUI: $result")
-                            if (CarUiCaster.running) connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.UI_STARTED)
+                            if (CarUiCaster.running) {
+                                connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.UI_STARTED)
+                                io.github.hypercar.navigation.AmapLinkProbe.start(ctx)
+                            }
                         }
                     }
                 }

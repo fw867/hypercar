@@ -48,18 +48,25 @@ pub(super) struct Session {
     init_sent: bool,
     pub started: bool,
     matched: bool,
+    navigation_requested: bool,
+    navigation_started: bool,
 }
 
 impl Default for Session {
     fn default() -> Self {
         Self { challenge: format!("2.0;{}", uuid::Uuid::new_v4().simple()), info: None,
             proof_ok: false, admitted: false, features_requested: false, features_sent: false,
-            rsa: None, seed: None, ready: false, init_sent: false, started: false, matched: false }
+            rsa: None, seed: None, ready: false, init_sent: false, started: false, matched: false, navigation_requested: false, navigation_started: false }
     }
 }
 
 type Action = (u32, Vec<u8>);
+fn navigation_subscription()->Vec<u8> {
+    let mut module=Vec::new();proto::varint(&mut module,1,0);
+    let mut list=Vec::new();proto::varint(&mut list,1,1);proto::bytes(&mut list,2,&module);list
+}
 impl Session {
+    fn navigation_ready(&self) -> bool { self.proof_ok && self.admitted && self.ready }
     pub fn encrypt(&self, bytes: &[u8]) -> Result<Vec<u8>, String> { crypt(bytes, self.seed.as_deref(), true) }
     pub fn decrypt(&self, bytes: &[u8]) -> Result<Vec<u8>, String> { crypt(bytes, self.seed.as_deref(), false) }
 
@@ -133,6 +140,20 @@ impl Session {
                 if w < 2 || h < 2 { return Err("invalid encoder dimensions".into()); }
                 self.started = true;
                 out.push((CMD_VIDEO_ENCODER_START, vec![]));
+                if cfg.navigation_updates {
+                    self.navigation_requested=true;
+                    out.push((0x18043, navigation_subscription()));
+                }
+            }
+            0x10044 if self.navigation_requested && !self.navigation_started && self.navigation_ready() => {
+                if super::navigation::supports_turn_updates(body)==Some(true) {
+                    self.navigation_started=true;
+                    out.push((0x18045,navigation_subscription()));
+                    emit_log("CARWITH-NAV: peer supports module=0; START turn-by-turn subscription");
+                } else {
+                    self.navigation_requested=false;
+                    emit_log("CARWITH-NAV: module=0 unsupported or invalid capability response; do not subscribe");
+                }
             }
             CMD_FOREGROUND | CMD_SCREEN_ON => {
                 if self.matched { out.push((CMD_HU_GO_TO_FOREGROUND, vec![])); }
@@ -201,6 +222,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
     if !send_cmd(&mut wr, CMD_HU_PROTOCOL_VERSION, &proto_version_payload()).await { return Err("version write failed".into()); }
     let mut buf=Vec::new(); let mut chunk=[0;4096];
     let mut last_reset: Option<tokio::time::Instant> = None;
+    let mut navigation_diagnostics = super::navigation::Diagnostics::default();
     loop {
         let started=state.lock().started;
         let read = tokio::select! {
@@ -228,7 +250,12 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
             let cfg_copy=cfg.clone(); let session=state.clone(); let decoded=payload.clone();
             let actions=tokio::task::spawn_blocking(move || session.lock().receive(kind,&decoded,&cfg_copy)).await.map_err(|e|e.to_string())??;
             let status={let s=state.lock(); (s.proof_ok,s.admitted,s.ready)};
-            emit_log(&format!("CARWITH-HS: RX 0x{kind:x} {}B proof={} admitted={} encrypted={}",payload.len(),status.0,status.1,status.2));
+            if matches!(kind, super::navigation::NEXT_TURN | super::navigation::ASSISTANT) {
+                let trace=navigation_diagnostics.observe("CMD",kind,consumed-8,Some(payload.len()));
+                dispatch_navigation(kind,&payload,&state,&events,trace);
+            } else {
+                emit_log(&format!("CARWITH-HS: RX 0x{kind:x} {}B proof={} admitted={} encrypted={}",payload.len(),status.0,status.1,status.2));
+            }
             if kind==CMD_VIDEO_ENCODER_INIT_DONE {
                 let (w,h)=parse_encoder_info(&payload); *size.lock()=(w,h);
                 emit_log(&format!("CARWITH-SIZE: actual={w}x{h}; touch target uses actual source pixels"));
@@ -242,6 +269,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
                     emit_log(&format!("CARWITH-SIZE: receiver={}x{} request={}x{} cap=2560x2560",cfg.width,cfg.height,first_int(&body,1).unwrap_or(0),first_int(&body,2).unwrap_or(0)));
                 }
                 if id==CMD_VIDEO_ENCODER_START {
+                    emit_log("CARWITH-NAV: authenticated CMD/DATA monitoring 0x10030; dashboard card alone does not confirm HUD output");
                     let _=events.send(CarLifeEvent::Handshake);
                     emit_state("carlife_active","CarWith proof/admission/encryption complete; video START sent");
                 }
@@ -271,6 +299,39 @@ pub(super) async fn control(mut stream: TcpStream, queue: Arc<Mutex<Vec<QueuedCo
     }
 }
 
+fn dispatch_navigation(kind:u32, payload:&[u8], state:&Shared, events:&mpsc::UnboundedSender<CarLifeEvent>, trace:bool) {
+    if kind != super::navigation::NEXT_TURN {return;}
+    if !state.lock().navigation_ready() {
+        if trace {emit_log("CARWITH-NAV: ignored before authenticated source ready");}
+        return;
+    }
+    let update=super::navigation::decode(payload);
+    if trace {
+        if let Some(n)=&update {emit_log(&format!("CARWITH-NAV: decoded action={} turn={:?} distance={:?}m roadBytes={} (road/icon omitted)",n.action,n.turn,n.distance,n.road.len()));}
+        else {emit_log("CARWITH-NAV: invalid navigation payload; clear old guidance");}
+    }
+    let _=events.send(CarLifeEvent::Navigation(update));
+}
+
+pub(super) async fn data(mut stream:TcpStream,state:Shared,events:mpsc::UnboundedSender<CarLifeEvent>) {
+    emit_log("CARWITH-DATA: channel=DATA monitoring framed input (metadata only)");
+    let mut buf=Vec::new(); let mut chunk=[0u8;4096];
+    let mut diagnostic=super::navigation::Diagnostics::default();
+    loop {
+        let n=match stream.read(&mut chunk).await {Ok(0)|Err(_)=>return,Ok(n)=>n};
+        buf.extend_from_slice(&chunk[..n]);
+        while let Some((kind,payload,consumed))=read_cmd_frame(&buf) {
+            buf.drain(..consumed);
+            if matches!(kind, super::navigation::NEXT_TURN | super::navigation::ASSISTANT) && state.lock().navigation_ready() {
+                let plain=state.lock().decrypt(&payload);
+                let trace=diagnostic.observe("DATA",kind,payload.len(),plain.as_ref().ok().map(Vec::len));
+                if let Ok(plain)=plain {dispatch_navigation(kind,&plain,&state,&events,trace);}
+                else if kind==super::navigation::NEXT_TURN {let _=events.send(CarLifeEvent::Navigation(None));}
+            } else {diagnostic.observe("DATA",kind,payload.len(),None);}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,7 +350,7 @@ mod tests {
         }
     }
     use tokio::net::TcpListener;
-    fn cfg()->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:60,bt_address:"00:11:22:33:44:55".into(),bt_name:"HyperCar".into()}}
+    fn cfg()->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:60,navigation_updates:false,bt_address:"00:11:22:33:44:55".into(),bt_name:"HyperCar".into()}}
     fn info()->Vec<u8> {let mut out=Vec::new(); for (field,text) in [(4,"Xiaomi"),(14,"test"),(20,"37")] {proto::string(&mut out,field,text);} out}
     fn prepared()->Session {
         let mut s=Session::default();
@@ -440,5 +501,72 @@ mod tests {
         assert!(result.is_ok(),"CarWith did not produce decrypted video after authenticated handshake");
         assert!(authenticated && frames>=60);
         println!("CarWith verified: {frames} decrypted frames across {:?}",began.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::*;
+    fn ready_state() -> Shared {
+        let mut s=Session::default();
+        s.proof_ok=true; s.admitted=true; s.ready=true; s.started=true;
+        s.seed=Some(vec![7;16]);
+        Arc::new(Mutex::new(s))
+    }
+    #[test]
+    fn navigation_requires_auth_and_invalid_updates_clear_previous_data() {
+        let (tx,mut rx)=mpsc::unbounded_channel();
+        let unready=Arc::new(Mutex::new(Session::default()));
+        dispatch_navigation(0x10030,&[8,2,16,5,40,35],&unready,&tx,false);
+        assert!(rx.try_recv().is_err());
+        let state=ready_state();
+        dispatch_navigation(0x10030,&[8,2,16,5,40,35],&state,&tx,false);
+        assert!(matches!(rx.try_recv().unwrap(),CarLifeEvent::Navigation(Some(n)) if n.turn==Some(5) && n.distance==Some(35)));
+        dispatch_navigation(0x10047,&[8,2,16,5,40,35],&state,&tx,false);
+        assert!(rx.try_recv().is_err());
+        dispatch_navigation(0x10030,&[8,2,16],&state,&tx,false);
+        assert!(matches!(rx.try_recv().unwrap(),CarLifeEvent::Navigation(None)));
+    }
+    #[tokio::test]
+    async fn data_channel_reassembles_and_decrypts_fragmented_navigation() {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (server,_)=listener.accept().await.unwrap();
+        let state=ready_state();
+        let encrypted=state.lock().encrypt(&[8,2,16,5,40,35]).unwrap();
+        let frame=build_cmd_frame(0x10030,&encrypted);
+        let (tx,mut rx)=mpsc::unbounded_channel();
+        let task=tokio::spawn(data(server,state,tx));
+        for part in frame.chunks(3) {client.write_all(part).await.unwrap();}
+        let event=tokio::time::timeout(Duration::from_secs(2),rx.recv()).await.unwrap().unwrap();
+        assert!(matches!(event,CarLifeEvent::Navigation(Some(n)) if n.turn==Some(5) && n.distance==Some(35)));
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2),task).await.unwrap().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod navigation_subscription_tests {
+    use super::*;
+    fn config(enabled:bool)->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:30,navigation_updates:enabled,bt_address:String::new(),bt_name:String::new()}}
+    fn ready()->Session {let mut s=Session::default();s.proof_ok=true;s.admitted=true;s.ready=true;s.init_sent=true;s}
+    #[test] fn capability_query_ack_then_start_only_once() {
+        let mut s=ready();let c=config(true);
+        let actions=s.receive(CMD_VIDEO_ENCODER_INIT_DONE,&proto_encoder_info_payload(1280,720,30),&c).unwrap();
+        assert_eq!(actions.iter().map(|a|a.0).collect::<Vec<_>>(),vec![CMD_VIDEO_ENCODER_START,0x18043]);
+        assert_eq!(actions[1].1,vec![8,1,18,2,8,0]);
+        let response=[8,1,18,4,8,0,16,1];
+        let start=s.receive(0x10044,&response,&c).unwrap();
+        assert_eq!(start,vec![(0x18045,vec![8,1,18,2,8,0])]);
+        assert!(s.receive(0x10044,&response,&c).unwrap().is_empty());
+    }
+    #[test] fn disabled_unsupported_and_unsolicited_responses_do_not_start_subscription() {
+        let mut s=ready();let c=config(false);
+        assert_eq!(s.receive(CMD_VIDEO_ENCODER_INIT_DONE,&proto_encoder_info_payload(1280,720,30),&c).unwrap().len(),1);
+        assert!(s.receive(0x10044,&[8,1,18,4,8,0,16,1],&c).unwrap().is_empty());
+        let mut s=ready();let c=config(true);
+        s.receive(CMD_VIDEO_ENCODER_INIT_DONE,&proto_encoder_info_payload(1280,720,30),&c).unwrap();
+        assert!(s.receive(0x10044,&[8,1,18,4,8,0,16,0],&c).unwrap().is_empty());
+        assert!(super::super::navigation::supports_turn_updates(&[8,2,18,4,8,0,16,1]).is_none());
     }
 }

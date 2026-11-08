@@ -117,6 +117,7 @@ object MapPreview {
             }
             layoutMode = mode
             _status.value = ""
+            runCatching { io.github.hypercar.navigation.AmapLinkProbe.start(context) }
             HyperCarRepo.log("CARUI-PREVIEW: 保留地图任务 $update carMode=$carMode layout=$mode")
             return displayId
         }
@@ -146,6 +147,7 @@ object MapPreview {
         // 第一次以编码画布创建后也要立即适配卡片边界，避免首帧上下留边。
         val update = SpikeShell.updateDisplaySurface(displayId, output, w, h, MAP_DPI)
         check(update.startsWith("OK")) { update }
+        runCatching { io.github.hypercar.navigation.AmapLinkProbe.start(context) }
         HyperCarRepo.log("CARUI-PREVIEW: ${provider.label}初次启动 display=$displayId carMode=$carMode layout=$mode")
         HyperCarRepo.log("CARUI-PREVIEW: 自动巡航跟随${provider.label}原生设置")
         _status.value = ""
@@ -159,6 +161,7 @@ object MapPreview {
     }
 
     private suspend fun releaseMapTask() {
+        io.github.hypercar.navigation.AmapLinkProbe.stop()
         if (displayId > 0) SpikeShell.releaseDisplay(displayId)
         displayId = -1
         carMode = false

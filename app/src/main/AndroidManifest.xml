@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
@@ -141,6 +141,17 @@
         </service>
 
         <receiver android:name=".autowake.AutomaticConnectionResume" android:exported="false" />
+
+        <!-- 仅 DUMP 权限（adb shell）可触发：单独验证「shell 代绑高德 LinkSDK」，
+             正式 HUD 路径仍受会话/HUD 开关约束。 -->
+        <receiver
+            android:name=".debug.AmapLinkDebugReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="io.github.hypercar.DEBUG_AMAP_LINK" />
+            </intent-filter>
+        </receiver>
 
         <receiver
             android:name=".autowake.CarBluetoothReceiver"

@@ -62,6 +62,10 @@ pub struct EngineConfig {
     #[serde(default)]
     pub carlife_source: bool,
     #[serde(default)]
+    pub carwith_navigation_token: u64,
+    #[serde(default)]
+    pub carwith_navigation_enabled: bool,
+    #[serde(default)]
     pub carwith_stretch: bool,
     #[serde(default)]
     pub screen_resource_lifecycle: bool,
@@ -141,6 +145,7 @@ pub async fn run_engine(
             fps: cfg.fps,
             bt_address: cfg.device_id.clone(),
             bt_name: "BMW".to_string(),
+            navigation_updates: cfg.carwith_navigation_enabled,
         };
         match crate::carlife::CarLifeHub::connect(life_cfg, "127.0.0.1".to_string(), stop.clone(), carwith_display.clone()) {
             Ok((hub, mut life_events)) => {
@@ -150,12 +155,17 @@ pub async fn run_engine(
                 let vtx = video_tx.clone();
                 let atx = audio_tx.clone();
                 let voice_keys = key_tx.clone();
+                let navigation_token = cfg.carwith_navigation_token;
                 tasks.spawn(async move {
                     // Keep channel senders and the hub alive for the entire source task.
                     let _hub = hub;
                     while let Some(ev) = life_events.recv().await {
                         match ev {
-                            CarLifeEvent::SourceReset => { let _ = voice_keys.send(crate::voice_key::RESET); let _ = vtx.send(SourceEvent::ResetVideoSource); }
+                            CarLifeEvent::SourceReset => {
+                                crate::emit_carwith_navigation(navigation_token,None);
+                                let _ = voice_keys.send(crate::voice_key::RESET); let _ = vtx.send(SourceEvent::ResetVideoSource);
+                            }
+                            CarLifeEvent::Navigation(update) => crate::emit_carwith_navigation(navigation_token,update.as_ref()),
                             CarLifeEvent::VideoFrame { pts_us, data } => {
                                 let _ = vtx.send(SourceEvent::VideoFrame { pts_us, data });
                             }
@@ -903,6 +913,7 @@ struct AudioPumpStat {
 /// CarLife（HU 侧）向引擎上报的事件（2026-11-03 从 archive 分支取回，供 CarWith 模式使用）。
 #[derive(Debug, Clone)]
 pub enum CarLifeEvent {
+    Navigation(Option<crate::carlife::navigation::NavigationUpdate>),
     SourceReset,
     Handshake,
     VideoFrame { pts_us: u64, data: Vec<u8> },

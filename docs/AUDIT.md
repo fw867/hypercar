@@ -96,3 +96,27 @@ encode_int 现在对全部负数固定使用0x13及8字节有符号载荷；正�
 在Xiaomi M154FF（31a37894）执行完整Android原生测试：108 passed / 0 failed / 1 ignored，包含新增编码与已有音视频wire、资源、取消、音频恢复、方向盘和语音测试。release JVM：228 passed / 0 failed / 0 errors / 0 skipped。手机临时测试二进制已移除。后续仍需奔驰实车对照验证400是否消失，不能把编码回归通过当成车机已接受。
 
 Release Lint 0 Error / 47 Warning / 2 Information，APK构建及签名校验通过，包内原生库与本次编译输出逐字节一致。0.1.0.570 / 10570 已自动覆盖安装到31a37894，保留设置和配对数据。APK SHA-256：`9e85450ca70a9acc2b7b6f69a5dcf5205283ec954a22b57fec89c8ced052472e`。没有奔驰修复后实车结果，不更新该档案verified状态。
+
+
+## HUD/仪表导航链路完整性（2026-11-08 静态审计）
+
+下文保留3a7b099基线审计。后续已按用户指定范围新增宝马/自绘UI/高德通知提示适配、订阅及5201/5202发送，删除错误的未使用Rust构造器。仍不是完整结构化导航接入，尚无HUD实车显示证据；当前实现与限制见[NAVIGATION.md](NAVIGATION.md)。
+
+基线3a7b099。结论：未完整实现，当前不能把导航画面投屏等同于HUD导航数据输出。不是一个未开启的开关，而是采集、协议与会话发送尚未串联。
+
+| 环节 | 代码证据 | 状态 |
+|---|---|---|
+| 本机地图结构化引导 | MapApps/MapController/MapPreview负责启动车联Activity、虚拟屏及画面布局；未找到道路名、转向、距离等引导数据接收器或适配器 | 缺失 |
+| CarWith导航数据 | CarLifeEvent/SourceEvent及CarLifeHub只向引擎分发握手、视频、音频、分辨率、重置/断开，没有导航引导事件或转换 | 未接入 |
+| 导航报文构造 | iap2_nav.rs有build_route_guidance_packet，RustCoreBridge有nativeBuildIap2NavPacket JNI声明和导出；全仓查找没有生产调用点 | 孤立辅助函数 |
+| 车机订阅 | Iap2Messages把0x5200命名为START_ROUTE_GUIDANCE_UPDATES；Bluetooth maintainLink未接导航分支，Wi-Fi协议落入ACK-only | 未提供应用层导航上报 |
+| 实际发送及会话生命周期 | 无导航模型、活动会话发送队列衔接、订阅字段过滤、开始/取消/重规划、重连和旧数据清理 | 缺失 |
+| HUD实车确认 | 无本项目有效导航TX与HUD显示对应证据；未发现HUD专用端到端测试 | 未验证 |
+
+关键内部矛盾：iap2_nav构造器把0x5200当成手机向车机发送导航数据的消息号，但本项目Iap2Messages与参考CarDeck将同一编号定义为车机发来的StartRouteGuidanceUpdates。构造器的1–7号字段布局也只有注释，尚无协议对照或独立向量证明。不得直接把该辅助函数接上线即宣称HUD可用；正确上报消息、参数、方向与订阅流程均需先校准。
+
+实际日志佐证：hypercar-log-20261107-155000.txt下午5248–5249行、5932–5934行分别收到0x5200（14字节），随后只记录ACK-only。链路ACK只说明收到帧，不代表已响应导航数据；有订阅请求也不能证明具体车型已具备HUD显示能力或确认显示成功。
+
+还存在辅助函数边界问题：长度与TLV长度直接从usize转换u16，maneuverType从JNI int直接转换u8，没有导航语义及长度检查。由于当前没有调用，不是现有HUD运行异常的证据，但后续真正启用前需一并处理。
+
+建议实施顺序：先核实双方导航消息及字段 → 选择高德/百度自绘模式与CarWith各自的合法结构化数据入口 → 统一导航状态模型 → 按订阅状态通过当前Wi-Fi iAP2/必要蓝牙会话上报 → 补导航取消/重规划/重连与速率控制 → 用真实地图导航及车机HUD/仪表逐项验证。以上为基线审计时的结论；后续实现状态以NAVIGATION为准，不以模拟导航数据充当实车验证。

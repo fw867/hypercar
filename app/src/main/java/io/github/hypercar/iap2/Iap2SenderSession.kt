@@ -81,8 +81,11 @@ class Iap2SenderSession(
     private val onIdentification: (String) -> Unit = {},
     /** Actual RFCOMM peer, rather than a mutable UI selection or phone MAC. */
     private val receiverAddress: String? = null,
+    private val navigationEnabled: () -> Boolean = { false },
+    private val navigationCue: () -> io.github.hypercar.navigation.NavigationCue? = { null },
 ) {
     private val parser = Iap2Csm.Parser()
+    private val navigation = RouteGuidanceSession(log)
     private var phaseName = "IDLE"
     private var phaseStarted = nanoTime()
     private var tracedReceivedFrames = 0
@@ -529,6 +532,10 @@ class Iap2SenderSession(
         var repeatCount = 0
         while (true) {
             // 空闲轮询间隔要短于重探周期：否则「保活期一个包都不来」时永远轮不到重探
+            navigation.updates(nanoTime() / 1_000_000,
+                navigationEnabled(), navigationCue()).forEach {
+                sendFireAndForget(it.messageId, it.body)
+            }
             val frame = recvFrame(IDLE_POLL_MILLIS)
             if (frame == null) {
                 if (!channel.isAlive) break
@@ -540,6 +547,7 @@ class Iap2SenderSession(
             // 限流逻辑走，它要么被当成 keep-alive 只记长度，要么因与上一条同 ID 被
             // continue 掉——两种都等于丢弃（车机等 15 秒无人连入 AirPlay 就拆 RFCOMM）。
             when (frame.messageId) {
+                0x5200, 0x5203 -> navigation.handle(frame)
                 Iap2MessageIds.CARPLAY_START_SESSION -> handleLateStartSession(frame)
                 Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION -> handleLateWifiConfiguration(frame)
                 Iap2MessageIds.EA_SESSION_STATUS -> handleEaSessionStatus(frame, phase1 = false)
