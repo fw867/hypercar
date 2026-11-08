@@ -1,6 +1,6 @@
 # 车机档案与验证范围
 
-更新：2026-11-07。所有车型统一在 [profiles/headunits.json](../profiles/headunits.json) 下发，App 按 ID 选择，不维护独立车型 JSON。
+更新：2026-11-08。所有车型统一在 [profiles/headunits.json](../profiles/headunits.json) 下发，App 按 ID 选择，不维护独立车型 JSON。
 
 ## 内置策略
 
@@ -51,3 +51,22 @@ useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关�
 复测使用奔驰档案，先确认CarWith七通道源就绪，再观察屏幕/音频SETUP应答及后续changeModes/requestUI。不要把“会话已连接”当成投屏成功，也不要因为档案名叫winplay就推断接收端为PC。
 
 代码：[HeadUnitProfile](../app/src/main/java/io/github/hypercar/headunit/HeadUnitProfile.kt)、[RemoteProfiles](../app/src/main/java/io/github/hypercar/headunit/RemoteProfiles.kt)。
+
+
+### 15:50 导出日志的新证据（2026-11-08 复核）
+
+同步基线 `9ca7ae0`。输入 `/mnt/e/Downloads/hypercar-log-20261107-155000.txt`，导出版本0.1.0.514，上午历史仍在文件中；本次以4757行开始的下午两轮为准。两轮都实际选择mercedes_mbux，desktop_receiver=false、screen_resource_lifecycle=true，已排除仅因误用WinPlay档案导致失败的解释。
+
+| 阶段 | 第一轮 15:46 | 第二轮 15:48 |
+|---|---|---|
+| 控制与资源 | pair-verify、会话SETUP、/info、RECORD和资源声明成功 | 同样完成 |
+| 手机视频源 | 七通道握手及加密准入成功，实际1280×720，持续输出AU；最后source_units=1110 | 7240持续Connection refused，source_units=0 |
+| Wi-Fi iAP2 | 15:46:09.419传输READY，不能等同证书/签名验证 | 15:48:26.749传输READY |
+| 车机UI请求 | 15:46:17.813收到真实requestUI并回200，本地screen切到1/1 | 未收到requestUI，初始已为1/1 |
+| 屏幕SETUP | 15:46:17.834发出，.869收到400空体（CSeq52）；没有视频socket/写帧 | 15:48:25.843发出，.908收到400空体（CSeq14） |
+| 音频SETUP | 带方括号IPv6、desktop=false、latency=0，仍400空体 | 相同类别参数仍400空体 |
+
+第一轮说明：视频源已就绪，真实UI请求也已到达，且屏幕SETUP发生在Wi-Fi iAP2传输READY约8秒后；仍失败。因此“只需等源就绪/传输READY/补requestUI”不是这轮的完整解释。第二轮额外存在本地CarWith启动未落实的问题，不能把两轮都归为源未启动。两轮画面未出现的直接阻断仍是屏幕SETUP被拒，控制存活不是推流成功。
+
+
+2026-11-08 修复资源声明中的负数编码：原speechMode=-1被写为单字节FF、按Apple规则成为255，现固定8字节保留-1。该补丁是基础plist正确性修正，正数编码及其它车型策略不变；尚未获得奔驰修复后实车反馈，不更新verified标记。

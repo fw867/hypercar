@@ -36,3 +36,8 @@ The Rust reader also bounds each field by getsockopt's actual returned length.
 
 Tests compare the actual sender socket output to these fixed bytes; they do
 not validate playback on BMW, H.264 picture decoding, or physical audio output.
+
+
+## Binary plist integer fixtures
+
+`bplist-negative-integers.json` is generated independently with Python stdlib `plistlib.dumps(value, fmt=plistlib.FMT_BINARY)`. Its nine scalar negative values include -1, a negative business status and i64::MIN. The Rust regression compares complete encoded bytes, not only a local round trip. Apple CoreFoundation CFBinaryPList.c documents that bplist00 1/2/4-byte integers are unsigned and negative values use 8-byte signed integers. Positive widths are deliberately kept unchanged for existing receiver compatibility.

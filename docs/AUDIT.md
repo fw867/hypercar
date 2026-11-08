@@ -1,6 +1,6 @@
 # 代码审计与维护记录
 
-更新：2026-11-07。仅维护本文件，不再按日期或单项补丁新增分析稿。当前行为写专题文档，测试与实车边界写VALIDATION；历史完整过程从Git查询。
+更新：2026-11-08。仅维护本文件，不再按日期或单项补丁新增分析稿。当前行为写专题文档，测试与实车边界写VALIDATION；历史完整过程从Git查询。
 
 ## 本次审计范围
 
@@ -65,3 +65,34 @@
 - Kotlin测试228项通过；Debug Lint 0错误（47 Warning、2 Information）。
 - 18份专题/索引文档，本地链接校验及git diff --check通过；整理前31份文档与合并映射已在开发机诊断目录备份，Git仍保留原文。
 - Rust release与正式APK构建通过，包内原生库与本次产物SHA256一致；0.1.0.569 / 10569已安装启动。实车验证缺口见VALIDATION，不把单测或安装当作实车成功。
+
+
+## 奔驰资源报文负数编码缺陷（2026-11-08，已修复）
+
+同步9ca7ae0后，检查11月7日15:50导出的MBUX日志。按RTSP通道/CSeq归组分段hex、按offset拼接，并核对声明字节数和SHA-256；独立使用Python plistlib解析。下午5个完整modesChanged报文（RTSP#1 CSeq10/13/51，RTSP#3 CSeq9/12）的speechMode均为255。原始请求体包含1字节整数编码10ff。
+
+而modes.rs的初始speech为-1，snapshot直接调用Value::int(self.speech)；bplist.rs的encode_int按i8/i16/i32有符号范围压缩宽度，把-1编码成1字节FF。因此不仅是日志显示问题，而是实际出站字段发生了数值变化。同步后的修复前源码仍保留该实现；下面的补丁已替换负数编码分支。
+
+对照Apple CoreFoundation的CFBinaryPList.c解析实现（约1157–1159行），bplist00的1/2/4字节整数按无符号解释，8字节按有符号解释，负数应以8字节写出。CPython plistlib也按相同规则解析并把负数编码为0x13+8字节。来源：
+
+- https://github.com/apple/swift-corelibs-foundation/blob/main/Sources/CoreFoundation/CFBinaryPList.c
+- https://github.com/python/cpython/blob/3.14/Lib/plistlib.py
+
+此为已确认的编码兼容性错误，应优先修正负数编码并保留正数编码的现有兼容性；不能把所有短整数都改成有符号解析（会破坏端口/位图/音频格式等正数）。回归应覆盖-1、负业务错误码、边界整数，以及实际modesChanged由独立解析器读回speechMode=-1。协议整数头部注释也需要与真实规则一致。
+
+本日志中资源命令RTSP返回200且应答为Dict([])，屏幕SETUP返回400空体。没有接收端业务原因，故不能断言错误speechMode直接导致400，更不能称为已定位奔驰唯一根因。应将“编码缺陷可确定”和“它是否触发本车拒绝需对照验证”分别报告。
+
+首次诊断阶段仅同步与分析；用户要求修复后实施下述补丁。完整两轮对照见HEADUNIT-PROFILES中的15:50日志补充。
+
+
+### 修复与回归
+
+encode_int 现在对全部负数固定使用0x13及8字节有符号载荷；正数继续沿用既有保守宽度，包括端口35449仍为4字节。解析器、扩展长度、字典根偏移8和引用布局不变。同步纠正文件头及函数说明中的错误短整数符号扩展说法。本次没有修改Mercedes的SETUP字段、时序、资源优先级，也没有加入盲目重试CarWith入口的分支。
+
+新增5项原生测试：9个独立Python负数bplist字节向量（含-1/-6722/最小i64）、11个正数边界宽度、接收短整数的无符号语义、嵌套负状态与182字节/项扩展长度、实际Modes声明speechMode=-1及根字典布局。
+
+独立跨实现校验：在仓库外构建只引用真实bplist.rs及modes.rs的Rust宿主输出程序，生成20个正负整数文件和实际Modes::initial().declaration()；用Python标准库plistlib逐个解析并检查负数原始编码，21份全部通过，真实资源声明speechMode=-1。不能只用本项目编码器/解码器互相验证。
+
+在Xiaomi M154FF（31a37894）执行完整Android原生测试：108 passed / 0 failed / 1 ignored，包含新增编码与已有音视频wire、资源、取消、音频恢复、方向盘和语音测试。release JVM：228 passed / 0 failed / 0 errors / 0 skipped。手机临时测试二进制已移除。后续仍需奔驰实车对照验证400是否消失，不能把编码回归通过当成车机已接受。
+
+Release Lint 0 Error / 47 Warning / 2 Information，APK构建及签名校验通过，包内原生库与本次编译输出逐字节一致。0.1.0.570 / 10570 已自动覆盖安装到31a37894，保留设置和配对数据。APK SHA-256：`9e85450ca70a9acc2b7b6f69a5dcf5205283ec954a22b57fec89c8ced052472e`。没有奔驰修复后实车结果，不更新该档案verified状态。

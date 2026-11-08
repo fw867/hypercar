@@ -288,6 +288,17 @@ fn release_fields_empty(v: &Value) -> bool { ["transferPriority", "takeConstrain
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emitted_resource_declaration_preserves_unspecified_speech_mode() {
+        let body = Modes::initial().declaration();
+        let declaration = bplist::parse(&body).unwrap();
+        let apps = declaration.get("params").unwrap().get("appStates").unwrap().as_array().unwrap();
+        let speech = apps.iter().find(|app| app.get("appStateID").and_then(Value::as_int) == Some(1)).unwrap();
+        assert_eq!(speech.get("speechMode").and_then(Value::as_int), Some(-1));
+        assert_eq!(body[8] >> 4, 0xd, "old receivers still see root dictionary at byte 8");
+    }
+
     #[test]
     fn audio_resume_obeys_user_constraint_and_never_changes_screen() {
         let mut m = Modes::initial();

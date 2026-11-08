@@ -7,9 +7,10 @@
 //!    CarPlay 210.81 that hardcodes expected offset of the root object」）。
 //!    Apple 自家编码器本来就是根在前，这里用 `make_root_first` 按同一布局重排
 //!    以匹配真实 iPhone。
-//! 2. **整数按有符号范围选宽度**（1/2/4/8 字节）：bplist 规范里整数是有符号的，
-//!    读取端按符号扩展。曾按无符号阈值选宽度，端口 35449（0x8A79）被写成 2 字节，
-//!    Apple 侧按 int16 读成 -30087——落到 32768..65535 的端口全部中招。
+//! 2. **负整数固定写 8 字节**：Apple CoreFoundation 的 bplist00 将 1/2/4 字节整数
+//!    按无符号读取，仅 8 字节按有符号读取；-1 写成单字节 FF 会变成 255。
+//!    正数保留现有保守宽度（例如端口 35449 仍写 4 字节），避免无关的兼容性变更。
+//!    依据：swift-corelibs-foundation/Sources/CoreFoundation/CFBinaryPList.c 整数解析分支。
 //!
 //! 解析端覆盖 /info 与 RTSP 报文用到的类型：null/bool/int/real/date/data/
 //! ASCII/UTF-16BE/UTF-8 字符串/UID/UUID/array/set/dict；集合与字符串的扩展长度
@@ -125,7 +126,7 @@ const MAGIC: &[u8; 8] = b"bplist00";
 const MAX_OBJECTS: u64 = 1 << 20;
 
 /// bplist00 编码。**根对象会被重排到偏移 8**（老车机不读 trailer topObject）；
-/// map 键顺序 = `Value::Dict` 的插入顺序；整数按有符号范围选 1/2/4/8 字节宽度。
+/// map 键顺序 = `Value::Dict` 的插入顺序；负数固定 8 字节，正数沿用保守宽度。
 pub fn encode(root: &Value) -> Vec<u8> {
     // 预遍历：引用宽度必须按最终对象总数（含容器自身）确定
     let total = count_objects(root);
@@ -340,9 +341,11 @@ fn encode_uid(uid: u64) -> Vec<u8> {
     out
 }
 
-/// 整数按**有符号**范围选宽度（bplist 规范：整数有符号，读取端按符号扩展）。
+/// bplist00 短整数无符号，负数必须以 8 字节表示；正数保留已有宽度。
 fn encode_int(value: i64) -> Vec<u8> {
-    let size: usize = if (i8::MIN as i64..=i8::MAX as i64).contains(&value) {
+    let size: usize = if value < 0 {
+        8
+    } else if value <= i8::MAX as i64 {
         1
     } else if (i16::MIN as i64..=i16::MAX as i64).contains(&value) {
         2
@@ -669,4 +672,67 @@ fn element_count(bytes: &[u8], offset: usize, info: u8) -> Result<(usize, usize)
         return Err(format!("长度字段非法（count={} offset={}）", count, offset));
     }
     Ok((count as usize, offset + 2 + int_size))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negative_integers_match_independent_python_plist_fixtures() {
+        let fixtures: serde_json::Value = serde_json::from_str(include_str!("../testdata/bplist-negative-integers.json")).unwrap();
+        for case in fixtures["cases"].as_array().unwrap() {
+            let value = case["value"].as_i64().unwrap();
+            let hex = case["hex"].as_str().unwrap();
+            let expected: Vec<u8> = (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i+2], 16).unwrap()).collect();
+            let encoded = encode(&Value::Int(value));
+            assert_eq!(encoded, expected, "independent bplist bytes for {value}");
+            assert_eq!(parse(&encoded).unwrap(), Value::Int(value));
+            assert_eq!(encoded[8], 0x13);
+        }
+    }
+
+    #[test]
+    fn positive_integer_wire_widths_and_boundaries_remain_unchanged() {
+        for (value, width) in [
+            (0, 1), (127, 1), (128, 2), (255, 2), (32767, 2),
+            (32768, 4), (35449, 4), (65535, 4), (i32::MAX as i64, 4),
+            (i32::MAX as i64 + 1, 8), (i64::MAX, 8),
+        ] {
+            let encoded = encode_int(value);
+            assert_eq!(encoded.len(), width + 1, "width for {value}");
+            assert_eq!(&encoded[1..], &value.to_be_bytes()[8-width..]);
+            assert_eq!(parse(&encode(&Value::Int(value))).unwrap(), Value::Int(value));
+        }
+    }
+
+    #[test]
+    fn short_incoming_integers_keep_unsigned_semantics() {
+        // Root-first scalar fixtures emitted by independent parsers may use unsigned short ints.
+        for (value, width) in [(255i64, 1usize), (65535, 2), (u32::MAX as i64, 4)] {
+            let mut encoded = encode(&Value::Int(0));
+            let root_size = (1u8 << (encoded[8] & 0x0f)) as usize;
+            let old_table = encoded.len() - 32 - 1;
+            let exponent = match width { 1 => 0, 2 => 1, _ => 2 };
+            let mut object = vec![0x10 | exponent];
+            object.extend_from_slice(&value.to_be_bytes()[8-width..]);
+            encoded.splice(8..9+root_size, object);
+            let table = (old_table + width - root_size) as u64;
+            let n = encoded.len(); encoded[n-8..].copy_from_slice(&table.to_be_bytes());
+            assert_eq!(parse(&encoded).unwrap(), Value::Int(value));
+        }
+    }
+
+    #[test]
+    fn nested_negative_status_and_extended_lengths_survive_encoding() {
+        let input = Value::dict(vec![
+            ("status", Value::Int(-6722)),
+            ("items", Value::Array(vec![Value::Int(-1); 182])),
+            ("data", Value::Data(vec![0xab; 182])),
+        ]);
+        let encoded = encode(&input);
+        assert_eq!(encoded[8] >> 4, 0xd, "root stays first");
+        assert_eq!(parse(&encoded).unwrap(), input);
+    }
 }
