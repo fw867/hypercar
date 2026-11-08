@@ -7,7 +7,6 @@ import android.os.PowerManager
 import io.github.hypercar.core.RustCoreBridge
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.settings.SettingsStore
-import io.github.hypercar.shizuku.ShizukuTools
 import io.github.hypercar.spike.SpikeCaster
 import io.github.hypercar.spike.SpikeDisplay
 import io.github.hypercar.spike.SpikeShell
@@ -89,15 +88,10 @@ object CarUiCaster {
             caster = null
             return "编码器没有 InputSurface"
         }
-        // Old APK services can retain displays whose encoder surface has died. Only clean
-        // processes before binding; killing an already bound service leaves a stale Binder.
-        if (!SpikeShell.isConnected() && !SpikeShell.isBinding && ShizukuTools.isReady) {
-            runCatching { ShizukuTools.exec("pkill -f 'io.github.hypercar:spike'", 2_000) }
-            kotlinx.coroutines.delay(150)
-        }
         val bind = SpikeShell.connect(context)
-        // 清掉上一进程/上次会话残留的副屏（shell UserService 独立存活，不随 App 进程退出）
-        runCatching { SpikeShell.releaseDisplay() }
+        // Reclaim dead encoder displays without destroying the retained navigation task.
+        MapPreview.init(context)
+        MapPreview.prepareProjection()
         val created = SpikeShell.createDisplay(surface, width, height, DPI, 0, "hypercar-d1")
         val id = Regex("id=(\\d+)").find(created)?.groupValues?.get(1)?.toIntOrNull() ?: -1
         if (id <= 0) {
@@ -173,14 +167,13 @@ object CarUiCaster {
         runCatching(block).onFailure { HyperCarRepo.log("CARUI: 释放 $resource 失败 ${it.message}") }
     }
 
-    private fun stopLocked() {
+    private suspend fun stopLocked() {
         release("audio") { CarAudioCapture.stop() }
         if (!running && displayId < 0 && caster == null) return
-        // 先收地图（释放 D2/复原横屏覆盖），再收 D1
+        // Await surface detachment before destroying encoders; keep the map/navigation alive.
         release("map") { MapController.stop() }
-        release("map state") { MapController.reset() }
         release("touch") { RustCoreBridge.setTouchListener(null) }
-        if (displayId > 0) release("display") { SpikeShell.releaseDisplay() }
+        if (displayId > 0) release("display") { SpikeShell.releaseDisplay(displayId) }
         displayId = -1
         release("encoder") { caster?.stop() }
         caster = null
@@ -188,6 +181,15 @@ object CarUiCaster {
 
         release("wake lock") { cpuLock?.takeIf { it.isHeld }?.release() }
         cpuLock = null
-        HyperCarRepo.log("CARUI: 已停止（显示/编码器已释放）")
+        HyperCarRepo.log("CARUI: 投屏已停止（地图任务与导航保留，首页显示/编码器已释放）")
+    }
+
+    /** Source changes explicitly relinquish the self-drawn map instead of retaining two navigators. */
+    suspend fun releaseForCarWith() {
+        val retired = lifecycle.retire()
+        lifecycle.stop(retired) {
+            stopLocked()
+            MapPreview.release()
+        }
     }
 }

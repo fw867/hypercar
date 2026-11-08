@@ -31,6 +31,11 @@ class AutomaticConnectionResume : BroadcastReceiver() {
                 boot(context), SystemClock.elapsedRealtime(), System.currentTimeMillis()).encode()
         }
 
+        fun clear(context: Context) {
+            SettingsStore.automaticPause = ""
+            schedule(context, 0L)
+        }
+
         private fun pending(context: Context) = PendingIntent.getBroadcast(context, 551,
             Intent(context, AutomaticConnectionResume::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)

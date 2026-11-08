@@ -5,6 +5,7 @@ import android.net.Uri
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -26,6 +27,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.colorResource
@@ -68,14 +70,19 @@ fun AboutScreen(modifier: Modifier = Modifier) {
     ) {
         // ---- 品牌头 ----
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Image(
-                painter = painterResource(R.drawable.ic_launcher_glyph),
-                contentDescription = "HyperCar 标志",
-                modifier = Modifier
-                    .size(64.dp)
-                    .clip(RoundedCornerShape(18.dp))
+            Box(
+                Modifier.size(72.dp)
+                    .clip(RoundedCornerShape(20.dp))
                     .background(colorResource(R.color.ic_launcher_background)),
-            )
+            ) {
+                // The launcher foreground includes adaptive-icon safe-area padding.
+                // Enlarge only the artwork inside the badge, keeping its outer bounds clipped.
+                Image(
+                    painter = painterResource(R.drawable.ic_launcher_glyph),
+                    contentDescription = "HyperCar 标志",
+                    modifier = Modifier.fillMaxSize().scale(1.55f),
+                )
+            }
             Spacer(modifier = Modifier.width(14.dp))
             Column {
                 Text(

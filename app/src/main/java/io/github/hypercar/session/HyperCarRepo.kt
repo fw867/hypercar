@@ -35,6 +35,7 @@ import java.net.DatagramSocket
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.CancellationException
@@ -239,6 +240,7 @@ object HyperCarRepo {
     @Volatile private var sessionCarWithMode = false
     @Volatile private var sessionIdentity: PairingIdentityFiles.Location? = null
     private var automaticResumeJob: Job? = null
+    private val automaticModeRequest = AtomicLong()
 
     val automaticPauseRemaining: Long get() = appContext()?.let {
         io.github.hypercar.autowake.AutomaticConnectionResume.remaining(it)
@@ -438,6 +440,11 @@ object HyperCarRepo {
                         return@launch
                     }
                 }
+                if (manual) {
+                    // A deliberate start supersedes a previous manual-stop cooldown. Otherwise
+                    // a failed manual retry falls back into the old ten-minute identity-only state.
+                    clearAutomaticPause(context.applicationContext, "手动启动连接")
+                }
                 if (AutomaticConnectionPolicy.mayStart(manual, SettingsStore.autoConnect, automaticPauseRemaining > 0)) beginConnect(context, source)
             } finally { autoConnectChanges.unlock() }
         }
@@ -553,7 +560,20 @@ object HyperCarRepo {
         log("TARGET: 用户目标=${target ?: "自动"}，已清除旧 ACL 候选；入站过滤立即生效，已建立会话保持")
     }
 
-    fun disconnect() = disconnect(userInitiated = true)
+    fun disconnect(expectedAttempt: Long) = disconnect(userInitiated = true, expectedAttempt = expectedAttempt)
+
+    private fun clearAutomaticPause(context: Context, reason: String) {
+        val hadPause = SettingsStore.automaticPause.isNotEmpty()
+        automaticResumeJob?.cancel()
+        automaticResumeJob = null
+        runCatching { io.github.hypercar.autowake.AutomaticConnectionResume.clear(context) }
+            .onFailure { log("AUTO: 清除暂停恢复闹钟失败 ${it.message}") }
+        if (hadPause) {
+            io.github.hypercar.settings.SettingsRevision.bump()
+            log("AUTO: $reason，清除旧自动连接暂停记录")
+        }
+        if (SettingsStore.autoConnect) startWifiReconnectMonitor(context)
+    }
 
     private fun disconnect(
         userInitiated: Boolean,
@@ -564,12 +584,18 @@ object HyperCarRepo {
         scope.launch {
             autoConnectChanges.lock()
             try {
-                if (!userInitiated && connectionAttemptId != attempt) return@launch
-                if (userInitiated && SettingsStore.autoConnect) {
+                val decision = ConnectionStopPolicy.decide(userInitiated, attempt, connectionAttemptId,
+                    hasCurrentSession, _snapshots.value.link, SettingsStore.autoConnect)
+                if (decision == ConnectionStopPolicy.Decision.IGNORE_STALE ||
+                    decision == ConnectionStopPolicy.Decision.IGNORE_INACTIVE) {
+                    log("SESSION-CONTROL: 忽略停止请求 decision=$decision user=$userInitiated expected=$attempt current=$connectionAttemptId state=${_snapshots.value.link.javaClass.simpleName}")
+                    return@launch
+                }
+                if (decision == ConnectionStopPolicy.Decision.STOP_AND_PAUSE) {
                     appContext()?.let { io.github.hypercar.autowake.AutomaticConnectionResume.pause(it) }
                     io.github.hypercar.settings.SettingsRevision.bump()
                     iap2?.pauseSessions()
-                    log("AUTO: 手动停止，暂停自动建链 10 分钟；保留 iPhone SDP，仍可手动启动")
+                    log("AUTO: 手动停止 attempt=$attempt，暂停自动建链 10 分钟；保留 iPhone SDP，手动启动将解除暂停")
                 }
                 userDisconnectRequested = !automaticConnectionAllowed
                 reconnectJob?.cancel()
@@ -590,18 +616,30 @@ object HyperCarRepo {
     }
 
     fun setAutoConnect(context: Context, enabled: Boolean) {
-        if (enabled) {
-            val issues = StartupRequirements.read(context).automaticIssues
-            if (issues.isNotEmpty()) {
-                log("STARTUP: 无法开启自动上车连接：${issues.joinToString("；")}")
-                return
-            }
+        val request = automaticModeRequest.incrementAndGet()
+        val app = context.applicationContext
+        scope.launch {
+            autoConnectChanges.lock()
+            try {
+                if (request != automaticModeRequest.get()) return@launch
+                if (enabled) {
+                    val issues = StartupRequirements.read(app).automaticIssues
+                    if (issues.isNotEmpty()) {
+                        log("STARTUP: 无法开启自动上车连接：${issues.joinToString("；")}")
+                        return@launch
+                    }
+                }
+                SettingsStore.autoConnect = enabled
+                if (enabled) clearAutomaticPause(app, "用户开启自动连接")
+                else {
+                    stopWifiReconnectMonitor()
+                    reconnectJob?.cancel()
+                    reconnectJob = null
+                }
+                io.github.hypercar.settings.SettingsRevision.bump()
+            } finally { autoConnectChanges.unlock() }
+            startAutomaticListening(app)
         }
-        SettingsStore.autoConnect = enabled
-        if (!enabled) stopWifiReconnectMonitor()
-        io.github.hypercar.settings.SettingsRevision.bump()
-        if (!enabled) { reconnectJob?.cancel(); reconnectJob = null }
-        startAutomaticListening(context)
     }
 
     /**
@@ -2107,6 +2145,8 @@ object HyperCarRepo {
                             fun current() = sessionLive.get() && streaming && connectionAttemptId == diagnosticId
                             if (!current()) return@launch
                             if (sessionCarWithMode) {
+                                CarUiCaster.releaseForCarWith()
+                                if (!current()) return@launch
                                 val r = launchCarWith(ctx)
                                 log("CARWITH: $r")
                                 return@launch
@@ -2517,6 +2557,7 @@ object HyperCarRepo {
     private fun push(link: LinkState? = null) {
         _snapshots.update { s ->
             s.copy(
+                connectionAttemptId = connectionAttemptId,
                 link = link ?: s.link,
                 shizukuReady = ShizukuTools.isReady,
                 degradedPermissionGranted = degradedPermissionGranted(),

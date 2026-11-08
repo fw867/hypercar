@@ -2,22 +2,26 @@ package io.github.hypercar.carui
 
 import android.content.Context
 
+enum class MapPresentation(val mode: Int) { CARD(2), FULLSCREEN(1) }
+
 enum class MapProvider(val id: String, val label: String, val packageName: String) {
     AMAP("amap", "高德地图", "com.autonavi.minimap"),
     BAIDU("baidu", "百度地图", "com.baidu.BaiduMap");
 
-    val supportsLayoutIntent: Boolean get() = this == AMAP
-
-    fun carLaunchCommand(displayId: Int, mode: Int, initial: Boolean): String {
+    fun carLaunchCommand(displayId: Int, presentation: MapPresentation, initial: Boolean): String {
         val activity = when (this) {
             AMAP -> "com.autonavi.map.activity." + if (initial) "UcarSplashActivity" else "UcarMapActivity"
             BAIDU -> "com.baidu.hicar.HiCarWelcomeScreen"
         }
-        // 百度始终使用完整车联任务，卡片/全屏只重绑 Surface，不向导航任务再次发送 Intent。
-        val screenMode = if (this == BAIDU) 1 else mode
+        // CarWith uses the native preview contract, not a crop of the full map scene.
+        val category = if (this == AMAP && presentation == MapPresentation.CARD) "MAP_PREVIEW" else "UCAR"
+        val mode = if (this == AMAP) presentation.mode else 1
+        // Amap reads this option only in loadMainMap(), not when screenMode changes.
+        // Our card and full-screen share one activity, so both must initialize horizontal
+        // navigation. A portrait preview option would leak into full-screen and enlarge/crop UI.
         return "am start --activity-single-top -n $packageName/$activity " +
-            "-a com.ucar.intent.action.UCAR -c com.ucar.intent.category.UCAR " +
-            "--ez isUcarMode true --ei screenMode $screenMode --ei displayId $displayId " +
+            "-a com.ucar.intent.action.UCAR -c com.ucar.intent.category.$category " +
+            "--ez isUcarMode true --ei screenMode $mode --ei displayId $displayId " +
             "--ez isUCarNaviUseVerticalScreenLayout false --display $displayId"
     }
 

@@ -128,6 +128,7 @@ class SpikeShellService : ISpikeShell.Stub {
                         if (vd != null) {
                             display = vd
                             displays[vd.display.displayId] = vd
+                            displaySizes[vd.display.displayId] = Triple(width, height, dpi)
                             flagsUsed = candidate
                             // Trusted secondary displays still default to FALLBACK_DISPLAY on some ROMs.
                             // Set this before launching any activity so search keyboards join the encoded display.
@@ -162,7 +163,11 @@ class SpikeShellService : ISpikeShell.Stub {
     override fun updateDisplaySurface(displayId: Int, surface: Surface?, width: Int, height: Int, dpi: Int): String = synchronized(lock) {
         val vd = displays[displayId] ?: return@synchronized "ERR display=$displayId missing"
         runCatching {
-            if (width > 0 && height > 0 && dpi > 0) vd.resize(width, height, dpi)
+            val size = Triple(width, height, dpi)
+            if (width > 0 && height > 0 && dpi > 0 && displaySizes[displayId] != size) {
+                vd.resize(width, height, dpi)
+                displaySizes[displayId] = size
+            }
             vd.surface = surface
             "OK display=$displayId ${width}x$height surface=${surface != null}"
         }.getOrElse { "ERR ${it.message}" }
@@ -170,10 +175,24 @@ class SpikeShellService : ISpikeShell.Stub {
 
     override fun releaseDisplayById(displayId: Int): String = synchronized(lock) {
         val vd = displays.remove(displayId)
+        displaySizes.remove(displayId)
         runCatching { vd?.release() }
         if (display === vd) display = displays.values.lastOrNull()
         if (displays.isEmpty()) flagsUsed = 0
         "OK released=${vd != null} remaining=${displays.size}"
+    }
+
+    override fun prepareProjection(retainedMapName: String): String = synchronized(lock) {
+        val retained = displays.entries.lastOrNull {
+            retainedMapName.isNotEmpty() && it.value.display.isValid && it.value.display.name == retainedMapName
+        }?.key
+        displays.keys.toList().filter { it != retained }.forEach { releaseDisplayById(it) }
+        if (retained == null) return@synchronized "OK id=-1"
+        val vd = displays.getValue(retained)
+        // No resize or activity relaunch: navigation and the manually selected camera survive.
+        vd.surface = null
+        val size = displaySizes.getValue(retained)
+        "OK id=$retained width=${size.first} height=${size.second} dpi=${size.third}"
     }
 
     // ---- 物理主屏电源（真息屏；系统保持唤醒，虚拟屏继续渲染） ----
@@ -342,6 +361,20 @@ class SpikeShellService : ISpikeShell.Stub {
         ev.source = InputDevice.SOURCE_TOUCHSCREEN
         val ok = sendAsync(displayId, ev)
         return if (ok) "OK" else "ERR $inputError"
+    }
+
+    override fun touchEvent(displayId: Int, event: MotionEvent): String = synchronized(lock) {
+        if (!displays.containsKey(displayId)) {
+            event.recycle()
+            return@synchronized "ERR display=$displayId missing"
+        }
+        if (!ensureInput()) {
+            event.recycle()
+            return@synchronized "ERR $inputError"
+        }
+        event.source = InputDevice.SOURCE_TOUCHSCREEN
+        // This is the service's unmarshalled copy; sendAsync recycles it after injection.
+        if (sendAsync(displayId, event)) "OK" else "ERR $inputError"
     }
 
     private fun sendAsync(displayId: Int, event: MotionEvent): Boolean {
@@ -554,6 +587,7 @@ class SpikeShellService : ISpikeShell.Stub {
     private fun releaseLocked() {
         displays.values.forEach { runCatching { it.release() } }
         displays.clear()
+        displaySizes.clear()
         display = null
         flagsUsed = 0
     }
@@ -563,6 +597,7 @@ class SpikeShellService : ISpikeShell.Stub {
         private val lock = Any()
         private var display: VirtualDisplay? = null
         private val displays = LinkedHashMap<Int, VirtualDisplay>()
+        private val displaySizes = LinkedHashMap<Int, Triple<Int, Int, Int>>()
         private var flagsUsed: Int = 0
         private var appContext: Context? = null
 

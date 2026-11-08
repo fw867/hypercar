@@ -87,13 +87,14 @@ class CarHomeActivity : ComponentActivity() {
         super.onDestroy()
     }
 
-    /** Rust HID → UI：action 0=DOWN / 1=UP / 2=MOVE，坐标已是 D1 画布像素。 */
+    /** Rust HID → UI: DOWN/UP/MOVE/CANCEL, coordinates are already in D1 canvas pixels. */
     fun dispatchCarTouch(action: Int, x: Float, y: Float) {
         val now = SystemClock.uptimeMillis()
         val a = when (action) {
             0 -> MotionEvent.ACTION_DOWN
             1 -> MotionEvent.ACTION_UP
             2 -> MotionEvent.ACTION_MOVE
+            3 -> MotionEvent.ACTION_CANCEL
             else -> return
         }
         if (a == MotionEvent.ACTION_DOWN) downTime = now

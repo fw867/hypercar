@@ -36,6 +36,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -78,6 +79,7 @@ import kotlinx.coroutines.delay
 @Composable
 fun StatusHeroCard(
     link: LinkState,
+    connectionAttemptId: Long = 0L,
     autoConnectEnabled: Boolean = true,
     startEnabled: Boolean = true,
     startBlockReason: String? = null,
@@ -120,7 +122,11 @@ fun StatusHeroCard(
                 ) { state ->
                     HeroHeadline(link = state, nowMillis = nowMillis, profileLabel = profileLabel, autoConnectEnabled = autoConnectEnabled)
                 }
-                HeroAction(link = link, onStartClick = onStartClick, onStopClick = onStopClick, startEnabled = startEnabled)
+                // Replacing the action/attempt cancels a press that began on the old button.
+                // A touch-down on Start must never become Stop when automatic connection wins.
+                key(connectionAttemptId, link.javaClass) {
+                    HeroAction(link = link, onStartClick = onStartClick, onStopClick = onStopClick, startEnabled = startEnabled)
+                }
                 if (!startEnabled && link !is LinkState.Connected && link !is LinkState.Negotiating) {
                     Text(startBlockReason ?: "请先完成使用引导", color = AmberWarning,
                         style = MaterialTheme.typography.bodySmall)

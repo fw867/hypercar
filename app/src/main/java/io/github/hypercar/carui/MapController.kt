@@ -10,6 +10,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /** Fullscreen encoding and touch routing for Amap's persistent display, shared with the home card. */
 object MapController {
@@ -17,9 +19,9 @@ object MapController {
     private const val TAG = "CARUI-MAP"
     private var W = 1920
     private var H = 720
-    private val DPI: Int get() = CarUiCaster.DPI
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val transitions = Mutex()
 
     private var appContext: Context? = null
     private var homeCaster: SpikeCaster? = null
@@ -45,18 +47,13 @@ object MapController {
     }
     private var lastMoveInjectAt = 0L
 
-    fun init(context: Context, home: SpikeCaster) {
+    suspend fun init(context: Context, home: SpikeCaster) = transitions.withLock {
         appContext = context.applicationContext
         MapPreview.init(context)
         homeCaster = home
         W = CarUiCaster.plan.width
         H = CarUiCaster.plan.height
-        scope.launch { MapPreview.resumePreview() }
-    }
-
-    fun reset() {
-        appContext = null
-        homeCaster = null
+        MapPreview.resumePreview()
     }
 
     /** 引擎重连后重新上报编码尺寸（触摸目标），否则坐标按旧画布缩放。 */
@@ -67,9 +64,13 @@ object MapController {
     fun requestEnter() {
         if (mapActive || entering) return
         entering = true
+        val expectedHome = homeCaster
         scope.launch {
             try {
-                HyperCarRepo.log("CARUI-MAP: ${enter()}")
+                transitions.withLock {
+                    if (expectedHome != null && homeCaster === expectedHome)
+                        HyperCarRepo.log("CARUI-MAP: ${enter()}")
+                }
             } finally {
                 entering = false
             }
@@ -78,8 +79,12 @@ object MapController {
 
     fun requestExit() {
         if (!mapActive) return
+        val expectedCaster = mapCaster
         scope.launch {
-            HyperCarRepo.log("CARUI-MAP: ${exit()}")
+            transitions.withLock {
+                if (expectedCaster != null && mapCaster === expectedCaster)
+                    HyperCarRepo.log("CARUI-MAP: ${exit()}")
+            }
         }
     }
 
@@ -96,7 +101,7 @@ object MapController {
             c.startEncoder()
             val surface = c.encoderSurface ?: error("地图编码器没有 InputSurface")
             // Retarget the same display at the same density, preserving its navigation engine.
-            val id = MapPreview.showFullscreen(surface, W, H, DPI)
+            val id = MapPreview.showFullscreen(surface, W, H)
             mapDisplayId = id
             delay(350)
             home.setPushing(false)
@@ -244,9 +249,10 @@ object MapController {
         }
     }
 
-    /** 首页 caster 停止时的同步收尾（会话断开）：释放 D2、复原横屏覆盖。 */
-    fun stop() {
-        MapPreview.stop()
+    /** Stop projection only; retain the map display, task, route and native camera. */
+    suspend fun stop() = transitions.withLock {
+        runCatching { MapPreview.suspendProjection() }
+            .onFailure { HyperCarRepo.log("CARUI-MAP: 分离地图输出失败 ${it.message}") }
         mapActive = false
         mapCaster?.setPushing(false)
         runCatching { mapCaster?.stop() }
@@ -254,6 +260,8 @@ object MapController {
         mapDisplayId = -1
         MapHomeOverlay.detach()
         homeCaster?.setSuspended(false)
-        homeCaster?.setPushing(true)
+        homeCaster?.setPushing(false)
+        appContext = null
+        homeCaster = null
     }
 }

@@ -9,6 +9,22 @@ import org.junit.Test
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class SessionResourceLifecycleTest {
+    @Test fun reconnectWaitsForMapSurfaceDetachmentBeforeStartingNewEncoder() = runTest {
+        val lifecycle = SessionResourceLifecycle()
+        lifecycle.start(lifecycle.ticket(), { true }, {}) { Unit }
+        val detached = CompletableDeferred<Unit>()
+        val retired = lifecycle.retire()
+        val stop = async { lifecycle.stop(retired) { detached.await() } }
+        runCurrent()
+        var newEncoderStarted = false
+        val reconnect = async { lifecycle.start(lifecycle.ticket(), { true }, {}) { newEncoderStarted = true } }
+        runCurrent()
+        assertFalse(newEncoderStarted)
+        detached.complete(Unit)
+        stop.await(); reconnect.await()
+        assertTrue(newEncoderStarted)
+    }
+
     @Test fun stoppingDuringCreationDiscardsPartialResourcesBeforeNextStart() = runTest {
         val lifecycle = SessionResourceLifecycle()
         val release = CompletableDeferred<Unit>()

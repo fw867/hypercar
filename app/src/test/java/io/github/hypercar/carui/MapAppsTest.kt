@@ -22,26 +22,45 @@ class MapAppsTest {
     }
 
     @Test fun baiduUsesInstalledCarInterfaceOnTheSameDisplay() {
-        val launch = MapProvider.BAIDU.carLaunchCommand(42, 2, true)
+        val launch = MapProvider.BAIDU.carLaunchCommand(42, MapPresentation.CARD, true)
         assertTrue(launch.contains("com.baidu.BaiduMap/com.baidu.hicar.HiCarWelcomeScreen"))
         assertTrue(launch.contains("-a com.ucar.intent.action.UCAR"))
         assertTrue(launch.contains("--ei screenMode 1"))
         assertTrue(launch.endsWith("--display 42"))
-        assertFalse(MapProvider.BAIDU.supportsLayoutIntent)
     }
 
-    @Test fun amapKeepsExistingUcarLayoutContract() {
-        assertTrue(MapProvider.AMAP.carLaunchCommand(42, 2, true).contains("UcarSplashActivity"))
-        val update = MapProvider.AMAP.carLaunchCommand(42, 1, false)
-        assertTrue(update.contains("UcarMapActivity"))
-        assertTrue(update.contains("--ei screenMode 1"))
-        assertTrue(MapProvider.AMAP.supportsLayoutIntent)
+    @Test fun amapCardUsesNativeCarWithPreviewContract() {
+        val launch = MapProvider.AMAP.carLaunchCommand(42, MapPresentation.CARD, true)
+        assertTrue(launch.contains("UcarSplashActivity"))
+        assertTrue(launch.contains("--ei screenMode 2"))
+        assertTrue(launch.contains("-c com.ucar.intent.category.MAP_PREVIEW "))
+        assertTrue(launch.contains("--ez isUCarNaviUseVerticalScreenLayout false"))
+        assertFalse(launch.contains("--activity-clear-task"))
+    }
+
+    @Test fun fullscreenReusesMapActivityWithoutReenteringSplashOrPreview() {
+        val command = MapProvider.AMAP.carLaunchCommand(42, MapPresentation.FULLSCREEN, false)
+        assertTrue(command.contains("UcarMapActivity"))
+        assertTrue(command.contains("--ei screenMode 1"))
+        assertTrue(command.contains("-c com.ucar.intent.category.UCAR "))
+        assertFalse(command.contains("SplashActivity"))
+        assertFalse(command.contains("--activity-clear-task"))
+    }
+
+    @Test fun oneTimeNativeOrientationOptionCannotLeakPortraitLayoutFromCardIntoFullscreen() {
+        for (presentation in MapPresentation.entries) for (initial in listOf(true, false)) {
+            val command = MapProvider.AMAP.carLaunchCommand(42, presentation, initial)
+            assertTrue(command.contains("--ez isUCarNaviUseVerticalScreenLayout false"))
+            assertFalse(command.contains("--ez isUCarNaviUseVerticalScreenLayout true"))
+        }
     }
 
     @Test fun launchAndLayoutUpdatesLetMapControlItsOwnCruise() {
         for (provider in MapProvider.entries) {
-            assertFalse(provider.carLaunchCommand(42, 2, true).contains("-d "))
-            assertFalse(provider.carLaunchCommand(42, 1, false).contains("-d "))
+            for (presentation in MapPresentation.entries) {
+                assertFalse(provider.carLaunchCommand(42, presentation, true).contains("-d "))
+                assertFalse(provider.carLaunchCommand(42, presentation, false).contains("-d "))
+            }
         }
     }
 

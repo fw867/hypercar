@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.ServiceConnection
 import android.os.IBinder
 import android.view.Surface
+import android.view.MotionEvent
 import io.github.hypercar.BuildConfig
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -43,6 +44,12 @@ object SpikeShell {
 
     fun updateDisplaySurface(id: Int, surface: Surface?, width: Int, height: Int, dpi: Int): String =
         service?.updateDisplaySurface(id, surface, width, height, dpi) ?: "ERR shell disconnected"
+
+    fun touchEvent(displayId: Int, event: MotionEvent): String =
+        call("touchEvent") { it.touchEvent(displayId, event) }
+
+    fun prepareProjection(retainedMapName: String): String =
+        call("prepareProjection") { it.prepareProjection(retainedMapName) }
 
     /** 绑定（幂等）。返回人话结果，写进 spike 报告。 */
     suspend fun connect(context: Context): String {

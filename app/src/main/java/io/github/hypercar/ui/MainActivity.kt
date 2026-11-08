@@ -134,6 +134,7 @@ private enum class AppTab(val title: String, val icon: ImageVector) {
 @Composable
 private fun MainContent() {
     val snapshot by HyperCarRepo.snapshots.collectAsStateWithLifecycle()
+    val visibleConnectionAttempt = snapshot.connectionAttemptId
     val context = LocalContext.current
     var tabIndex by rememberSaveable { mutableIntStateOf(0) }
     val tabs = AppTab.entries
@@ -308,7 +309,7 @@ private fun MainContent() {
                         onRefreshSetup = { permVersion++ },
                         snapshot = snapshot,
                         onStart = { HyperCarRepo.connect(context) },
-                        onStop = { HyperCarRepo.disconnect() },
+                        onStop = { HyperCarRepo.disconnect(visibleConnectionAttempt) },
                         onToggleAutoConnect = { HyperCarRepo.setAutoConnect(context, it) },
                         onRequestDegradedPermission = {
                             permissionLauncher.launch(HyperCarRepo.degradedPermissionsToRequest())

@@ -38,6 +38,8 @@ data class AudioStats(
 
 /** UI 快照：Repo 每次变更推送给 Compose。 */
 data class SessionSnapshot(
+    /** Connection attempt rendered by the UI; stop actions must target this exact attempt. */
+    val connectionAttemptId: Long = 0L,
     val pipeline: PipelineDiagnostics = PipelineDiagnostics(),
     val link: LinkState = LinkState.Idle,
     val video: VideoStats = VideoStats(),

@@ -261,10 +261,12 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
                 } else if (about) {
                     CarAboutPage(Modifier.weight(1f)) { about = false }
                 } else if (apps) {
-                    AppsPage(Modifier.weight(1f), music, { settings = true }, { about = true }, enterMap)
+                    AppsPage(Modifier.weight(1f), music, { settings = true }, { about = true }) {
+                        apps = false
+                    }
                 } else {
                     Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
-                        MapCard(Modifier.weight(1f).fillMaxHeight(), enterMap)
+                        MapCard(Modifier.weight(1f).fillMaxHeight())
                         MusicCard(music, Modifier.width(musicCardWidth).fillMaxHeight())
                     }
                 }
@@ -355,12 +357,10 @@ private fun DockButton(
 }
 
 @Composable
-private fun MapCard(modifier: Modifier, onMap: () -> Unit) {
+private fun MapCard(modifier: Modifier) {
     val status by MapPreview.status.collectAsStateWithLifecycle()
     Box(modifier.clip(CardShape).background(Color(0xFF1B2637))) {
         MapPreviewView(Modifier.fillMaxSize())
-        // The card is an overview. Touch opens the fully interactive map on D2.
-        Box(Modifier.fillMaxSize().clickable(onClickLabel = "打开全屏地图") { onMap() })
         if (status != "") {
             Column(Modifier.align(Alignment.Center).clip(RoundedCornerShape(18.dp))
                 .background(if (CarThemeState.dark) Color(0xDD10141F) else Color(0xEAF6FAFF)).padding(22.dp), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -565,7 +565,7 @@ private fun launchMusic(context: android.content.Context, music: NowPlaying) {
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun AppsPage(modifier: Modifier, music: NowPlaying, onSettings: () -> Unit = {}, onAbout: () -> Unit = {}, onMap: () -> Unit = {}) {
+private fun AppsPage(modifier: Modifier, music: NowPlaying, onSettings: () -> Unit = {}, onAbout: () -> Unit = {}, onMapSelected: () -> Unit = {}) {
     val context = LocalContext.current
     val musicApps = remember(context) { MusicApps.installed(context) }
     val mapLabel = MapApps.selected(context)?.label ?: "地图"
@@ -590,9 +590,9 @@ private fun AppsPage(modifier: Modifier, music: NowPlaying, onSettings: () -> Un
                             label = provider.label,
                             onClickLabel = "使用${provider.label}",
                             label2 = if (provider == selectedMap) "当前" else null) {
-                            // 点哪个地图就把哪个设为默认，并直接进全屏地图
+                            // Select the map and return to its interactive home card. Dock opens fullscreen.
                             CarUiSettings.updateDefaultMap(provider)
-                            onMap()
+                            onMapSelected()
                         }
                     }
                 }

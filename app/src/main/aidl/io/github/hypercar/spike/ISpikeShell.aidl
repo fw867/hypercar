@@ -4,6 +4,7 @@ package io.github.hypercar.spike;
 
 import android.os.ParcelFileDescriptor;
 import android.view.Surface;
+import android.view.MotionEvent;
 
 interface ISpikeShell {
     /** 返回 "OK id=<n> flags=0x<hex>" 或 "ERR ..."。 */
@@ -46,5 +47,11 @@ interface ISpikeShell {
     /** 有界经典可发现；owner 死亡、显式停止或独立计时到期后结束。 */
     String startBluetoothDiscoverable(IBinder owner, String token, int seconds);
     String stopBluetoothDiscoverable(String token);
+
+    /** Release stale projection displays, retaining only the named map and detaching its surface. */
+    String prepareProjection(String retainedMapName);
+
+    /** Preserve the complete card gesture, including cancellation and any available pointers. */
+    String touchEvent(int displayId, in MotionEvent event);
 
 }
