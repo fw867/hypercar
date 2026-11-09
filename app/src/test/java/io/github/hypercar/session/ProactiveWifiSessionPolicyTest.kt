@@ -36,6 +36,13 @@ class ProactiveWifiSessionPolicyTest {
         assertFalse(ProactiveWifiSessionPolicy.allows(true, car, "22:33:44:55:66:77", true))
     }
 
+    @Test fun desktopReceiverDoesNotTrustAFormerPeerAtTheSameLanSsid() {
+        val speakerNow = "192.168.1.253:7000|YK"
+        assertNull(ProactiveWifiSessionPolicy.rememberedEndpoint(speakerNow, "YK", desktopReceiver = true))
+        assertEquals("192.168.1.253" to 7000,
+            ProactiveWifiSessionPolicy.rememberedEndpoint(speakerNow, "YK", desktopReceiver = false))
+    }
+
     @Test fun rememberedEndpointMustBelongToExactNetworkAndBeValidIpv4Port() {
         assertEquals("172.16.222.97" to 7000,
             ProactiveWifiSessionPolicy.rememberedEndpoint("172.16.222.97:7000|car", "car"))

@@ -1263,8 +1263,10 @@ object HyperCarRepo {
                 // （2026-10-26 12:47 桌面联调：0x4301 在 54.17s 就给了 192.168.1.208:7000，
                 //  我们还去等 3s mDNS，结果 57.3s 才去连、接收端已经把 7000 关了）。
                 val haveEndpoint = endpoint.ipAddresses.isNotEmpty() && endpoint.airPlayPort > 0
-                val mdnsEndpoint = if (headUnit.preferMdnsAirplay && !endpoint.fromInvite && !haveEndpoint) {
-                    AirplayServiceProbe(context, ::log).browse(boundNetwork)
+                val desktop = io.github.hypercar.headunit.ReceiverCompatibility.isDesktopReceiver(headUnit.id,
+                    io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(iap2?.activePeerAddress))
+                val mdnsEndpoint = if (desktop || (headUnit.preferMdnsAirplay && !endpoint.fromInvite && !haveEndpoint)) {
+                    AirplayServiceProbe(context, ::log).browse(boundNetwork, accept = ::matchesAirplayService)
                 } else {
                     when {
                         endpoint.fromInvite ->
@@ -1880,6 +1882,10 @@ object HyperCarRepo {
     }
 
     /** Fresh discovery is bound to this exact session's Network; never falls back to cellular. */
+    private fun matchesAirplayService(endpoint: AirplayServiceProbe.Endpoint): Boolean =
+        io.github.hypercar.headunit.ReceiverCompatibility.matchesAirplayService(headUnitProfile.id,
+            io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(iap2?.activePeerAddress), endpoint.instance, endpoint.model)
+
     private suspend fun connectAirplayEndpoint(
         context: Context,
         sockets: SessionSocketLease<Network>,
@@ -1888,8 +1894,7 @@ object HyperCarRepo {
         val attempt = connectionAttemptId
         val ssid = currentWifiSsid(context)
         val advertiser = ctrlAdvertiser
-        var invitation = advertiser?.lastInvitation
-        val hints = AirplayEndpointHints()
+        val hints = AirplayEndpointHints(initial.firstOrNull()?.port ?: 7000)
         var tries = 0
         return AirplayEndpointConnector(
             current = { connectionAttemptId == attempt && sessionLive.get() &&
@@ -1905,12 +1910,11 @@ object HyperCarRepo {
             updates = {
                 val late = lateAirplayEndpoint.getAndSet(null)
                 val next = advertiser?.lastInvitation
-                val newInvite = next?.takeIf { it !== invitation }
-                invitation = next
+                val newInvite = next?.let { hints.invitation(it, it.host) }
                 when {
                     late != null -> { log("ENDPOINT: 本轮 iAP2 更新 → $late"); listOf(hints.advertised(late)) }
                     newInvite != null -> {
-                        val target = hints.invited(newInvite.host)
+                        val target = newInvite
                         log("ENDPOINT: 新 ctrl 邀请 → $target（同地址保留明确端口）")
                         listOf(target)
                     }
@@ -1919,7 +1923,7 @@ object HyperCarRepo {
             },
             discover = {
                 log("ENDPOINT: 旧目标暂不可用，在网络 #${sockets.network} 重新查询 _airplay._tcp（最多 1500ms）")
-                val fresh = AirplayServiceProbe(context, ::log).browse(sockets.network, 1500, strictNetwork = true)
+                val fresh = AirplayServiceProbe(context, ::log).browse(sockets.network, 1500, strictNetwork = true, accept = ::matchesAirplayService)
                 if (fresh != null) {
                     log("ENDPOINT: 重新发现 → ${fresh.host}:${fresh.port}（${fresh.instance}）")
                     listOf(hints.advertised(AirplayTarget(fresh.host, fresh.port)))
@@ -2312,7 +2316,9 @@ object HyperCarRepo {
         val diagnosticId = connectionAttemptId
         val currentSsid = currentWifiSsid(context)
         val saved = SettingsStore.lastAirplayEndpoint
-        val remembered = ProactiveWifiSessionPolicy.rememberedEndpoint(saved, currentSsid) ?: return null
+        val desktop = io.github.hypercar.headunit.ReceiverCompatibility.isDesktopReceiver(headUnitProfile.id,
+            io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(coordinator.activePeerAddress))
+        val remembered = ProactiveWifiSessionPolicy.rememberedEndpoint(saved, currentSsid, desktop) ?: return null
         if (strictNetwork && knownWifiReceiver(currentSsid) == null) return null
         val (host, port) = remembered
         // Use the real control connection once, without a connect/disconnect preflight which
@@ -2430,7 +2436,7 @@ object HyperCarRepo {
                         usable = CarPlayEndpoint(
                             ssid = base?.ssid,
                             passphrase = base?.passphrase,
-                            airPlayPort = 7000,
+                            airPlayPort = headUnitProfile.fallbackAirplayPorts.firstOrNull() ?: 7000,
                             deviceIdentifier = base?.deviceIdentifier,
                             publicKeyHex = base?.publicKeyHex,
                             sourceVersion = base?.sourceVersion,
@@ -2476,7 +2482,7 @@ object HyperCarRepo {
                             if (isCarHotspot && localScanned.add(ssid)) {
                                 // 先试 mDNS（车机若广播 _airplay._tcp，这一步就能定端点，比扫网段快）
                                 val mdnsHere = runCatching {
-                                    AirplayServiceProbe(context, ::log).browse(boundNetwork)
+                                    AirplayServiceProbe(context, ::log).browse(boundNetwork, accept = ::matchesAirplayService)
                                 }.getOrNull()
                                 if (advertiser.lastInvitePeerIp != null) continue
                                 if (mdnsHere != null) {

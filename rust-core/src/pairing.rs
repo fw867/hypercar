@@ -305,6 +305,7 @@ impl PairVerifyClient {
             },
         ]);
         let m2 = tlv8::decode(&transport.exchange("/pair-verify", &request)?);
+        validate_verify_reply(&m2, 2)?;
         let receiver_ephemeral_bytes = m2
             .get(&tlv8::TYPE_PUBLIC_KEY)
             .ok_or_else(|| "pair-verify M2 缺少 publicKey".to_string())?;
@@ -386,11 +387,7 @@ impl PairVerifyClient {
             },
         ]);
         let m4 = tlv8::decode(&transport.exchange("/pair-verify", &request)?);
-        let state = m4.get(&tlv8::TYPE_STATE).and_then(|v| v.first().copied());
-        if state != Some(4) {
-            let error = m4.get(&tlv8::TYPE_ERROR).and_then(|v| v.first().copied());
-            return Err(format!("pair-verify M4 状态非 4：{:?}", error));
-        }
+        validate_verify_reply(&m4, 4)?;
         log("pair-verify: ✓ 完成，派生控制通道密钥");
 
         // 方向对照接收端实现：接收端 readKey="Control-Write-…"（即我们发出的方向）
@@ -446,3 +443,84 @@ fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+
+// A state number identifies the reply step, including replies that reject that step.
+// WinPlay returns State=4, Error=2 when the controller is unknown or its signature fails.
+fn validate_verify_reply(reply: &std::collections::HashMap<u8, Vec<u8>>, expected: u8) -> Result<(), String> {
+    if let Some(error) = reply.get(&tlv8::TYPE_ERROR) {
+        return Err(format!("pair-verify M{expected} 接收端拒绝：error={:?}", error));
+    }
+    if reply.get(&tlv8::TYPE_STATE).map(Vec::as_slice) != Some(&[expected][..]) {
+        return Err(format!("pair-verify M{expected} 状态无效"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::*;
+
+    struct Receiver {
+        reject: bool,
+        ephemeral: X25519KeyPair,
+        shared: Option<[u8; 32]>,
+    }
+
+    impl TlvTransport for Receiver {
+        fn exchange(&mut self, path: &str, body: &[u8]) -> Result<Vec<u8>, String> {
+            assert_eq!(path, "/pair-verify");
+            let request = tlv8::decode(body);
+            if request[&tlv8::TYPE_STATE] == [1] {
+                let peer: [u8; 32] = request[&tlv8::TYPE_PUBLIC_KEY].as_slice().try_into().unwrap();
+                let shared = self.ephemeral.shared(&peer);
+                self.shared = Some(shared);
+                let key = crypto::hkdf_sha512(&shared, b"Pair-Verify-Encrypt-Salt", b"Pair-Verify-Encrypt-Info", 32);
+                let inner = tlv8::encode(&[
+                    Item { t: tlv8::TYPE_IDENTIFIER, v: b"test-receiver".to_vec() },
+                    Item { t: tlv8::TYPE_SIGNATURE, v: vec![0; 64] },
+                ]);
+                Ok(tlv8::encode(&[
+                    Item { t: tlv8::TYPE_STATE, v: vec![2] },
+                    Item { t: tlv8::TYPE_PUBLIC_KEY, v: self.ephemeral.public.to_vec() },
+                    Item { t: tlv8::TYPE_ENCRYPTED_DATA, v: crypto::chacha_seal(&key, &crypto::nonce_label("PV-Msg02"), &inner, &[]) },
+                ]))
+            } else {
+                assert_eq!(request[&tlv8::TYPE_STATE], [3]);
+                let mut reply = vec![Item { t: tlv8::TYPE_STATE, v: vec![4] }];
+                if self.reject {
+                    reply.push(Item { t: tlv8::TYPE_ERROR, v: vec![2] });
+                }
+                Ok(tlv8::encode(&reply))
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_m4_never_produces_control_keys() {
+        let pair = Ed25519KeyPair::generate();
+        let identity = ControllerIdentity { pairing_id: "test-controller".into(), private_key: pair.private, public_key: pair.public };
+        for reject in [true, false] {
+            let mut receiver = Receiver { reject, ephemeral: X25519KeyPair::generate(), shared: None };
+            let result = PairVerifyClient::run(&identity, &mut receiver, None, &|_| {});
+            if reject {
+                let error = result.err().expect("State=4 plus Error=2 is a refusal");
+                assert!(error.contains("M4") && error.contains("[2]"));
+            } else {
+                let keys = result.ok().expect("successful M4 still derives keys");
+                assert_eq!(keys.shared_secret, receiver.shared.unwrap());
+                assert_eq!(keys.write_key.to_vec(), crypto::hkdf_sha512(&keys.shared_secret, b"Control-Salt", b"Control-Write-Encryption-Key", 32));
+            }
+        }
+    }
+
+    #[test]
+    fn verify_requires_exact_state_and_no_error_tlv() {
+        for step in [2, 4] {
+            let good = tlv8::decode(&[6, 1, step]);
+            assert!(validate_verify_reply(&good, step).is_ok());
+            for wire in [vec![6, 1, step, 7, 1, 2], vec![6, 1, step, 7, 0], vec![6, 1, step + 1], vec![6, 2, step, 0], vec![]] {
+                assert!(validate_verify_reply(&tlv8::decode(&wire), step).is_err());
+            }
+        }
+    }
+}

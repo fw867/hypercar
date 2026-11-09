@@ -12,6 +12,28 @@ class AirplayEndpointConnectorTest {
     private val old = AirplayTarget("192.168.1.1", 7000)
     private val fresh = AirplayTarget("192.168.1.2", 17000)
 
+    @Test fun existingIpv6InvitationWinsBeforeAnySpeakerCandidateIsOpened() = runTest {
+        val hints = AirplayEndpointHints()
+        val identity = Any()
+        val invitedHost = "fe80::dcf9:473e:5524:40f8%wlan0"
+        val speaker = AirplayTarget("192.168.1.253", 7000)
+        val opened = mutableListOf<AirplayTarget>()
+        val connector = AirplayEndpointConnector(current = { true }, now = { 0L },
+            open = { t: AirplayTarget -> opened += t; 42 }, close = { _: Int -> }, invalidate = {},
+            updates = { listOfNotNull(hints.invitation(identity, invitedHost)) },
+            discover = { fail("invitation must not fall back to unrelated mDNS"); emptyList() }, pause = {})
+        assertEquals(AirplayTarget(invitedHost, 7000), connector.connect(listOf(speaker), 8000)!!.target)
+        assertEquals(listOf(AirplayTarget(invitedHost, 7000)), opened)
+        assertNull(hints.invitation(identity, invitedHost))
+        assertEquals(AirplayTarget(invitedHost, 7000), hints.invitation(Any(), invitedHost))
+    }
+
+    @Test fun softwareInvitationUsesDiscoveredPortAndLegacyDefaultIsUnchanged() {
+        val host = "fe80::1%wlan0"
+        assertEquals(17000,AirplayEndpointHints(17000).invitation(Any(),host)!!.port)
+        assertEquals(7000,AirplayEndpointHints().invitation(Any(),host)!!.port)
+    }
+
     @Test fun sameHostInvitationPreservesExplicitPortButChangedHostUsesFallback() {
         val hints=AirplayEndpointHints()
         assertEquals(7000,hints.invited(old.host).port)

@@ -57,14 +57,15 @@
       "id": "winplay",
       "label": "WinPlay",
       "model": "PC AirPlay 接收端",
-      "notes": "接收端会校验 deviceID（SETUP 必须带本机真实蓝牙 MAC）；控制面固定 7000，/info 只认 GET。",
+      "notes": "接收端会校验 deviceID（SETUP 必须带本机真实蓝牙 MAC）；控制面优先采用 mDNS 公告端口，1.25 使用 17000，旧版 7000 兜底。",
       "verified": true,
       "validatesDeviceId": true,
       "replyPowerUpdates": true,
       "dropProfilesBeforeIap2": false,
       "abortWhenCarPlayWindowClosed": false,
-      "preferMdnsAirplay": false,
+      "preferMdnsAirplay": true,
       "fallbackAirplayPorts": [
+        17000,
         7000
       ],
       "touchDisplay": "2732x794",

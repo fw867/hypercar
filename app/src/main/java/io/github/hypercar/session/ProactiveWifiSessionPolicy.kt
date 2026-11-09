@@ -7,7 +7,9 @@ internal object ProactiveWifiSessionPolicy {
         enabled && networkBound && PairingEvidence.receiverKey(receiver) != null &&
             (activePeer == null || receiver.equals(activePeer, ignoreCase = true))
 
-    fun rememberedEndpoint(value: String, ssid: String?): Pair<String, Int>? {
+    fun rememberedEndpoint(value: String, ssid: String?, desktopReceiver: Boolean = false): Pair<String, Int>? {
+        // A shared LAN's SSID does not associate an old address with this software receiver.
+        if (desktopReceiver) return null
         if (ssid.isNullOrBlank() || value.substringAfterLast('|', "") != ssid) return null
         val endpoint = value.substringBeforeLast('|')
         val host = endpoint.substringBefore(':')

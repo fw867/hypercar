@@ -4,6 +4,15 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ReceiverCompatibilityTest {
+    @Test fun softwareDiscoveryRejectsSpeakersWithoutChangingVehicleDiscovery() {
+        assertFalse(ReceiverCompatibility.matchesAirplayService("winplay", null, "xiaomi sound-6270._airplay._tcp.local", "L16A"))
+        assertTrue(ReceiverCompatibility.matchesAirplayService("winplay", null, "WinPlay._airplay._tcp.local", "WinPlay"))
+        assertTrue(ReceiverCompatibility.matchesAirplayService("bmw_id85", "DiPlay", "Xcertplay._airplay._tcp.local", null))
+        assertFalse(ReceiverCompatibility.matchesAirplayService("bmw_id85", "DiPlay", "speaker._airplay._tcp.local", null))
+        assertTrue(ReceiverCompatibility.matchesAirplayService("bmw_id85", null, "BMW._airplay._tcp.local", "MGU"))
+        assertEquals(listOf(17000,7000), HeadUnitProfiles.WINPLAY.fallbackAirplayPorts)
+    }
+
     @Test fun mbuxBootstrapIsRestrictedToTheExperimentalMercedesProfile() {
         assertTrue(HeadUnitProfiles.MERCEDES_MBUX.mbuxScreenBootstrap)
         assertTrue(HeadUnitProfiles.MERCEDES_MBUX.screenResourceLifecycleEnabled(false))

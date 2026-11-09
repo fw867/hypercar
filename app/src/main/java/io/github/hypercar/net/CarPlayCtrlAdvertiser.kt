@@ -287,8 +287,8 @@ class CarPlayCtrlAdvertiser(
                         ?.trim()
                 inviteCount++
                 runCatching { onDiagnostic(Event.INVITED) }
-                if (peer != "?" && peer.contains('.')) {
-                    invitations.set(Invitation(peer, SystemClock.elapsedRealtime(), registeredNetwork))
+                EndpointScope.invitationHost(peer)?.let { host ->
+                    invitations.set(Invitation(host, SystemClock.elapsedRealtime(), registeredNetwork))
                 }
                 log("$TAG: ✓ 车机 ctrl 邀请（第 $inviteCount 次，receiver=${receiverId ?: "?"}）——AirPlay 窗口已开启")
             }

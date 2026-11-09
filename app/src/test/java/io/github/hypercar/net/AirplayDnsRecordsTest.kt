@@ -25,6 +25,18 @@ class AirplayDnsRecordsTest {
     private fun address(ttl: Int = 120) = rr("car.local", 1, ttl, byteArrayOf(192.toByte(), 168.toByte(), 1, 2))
     private fun AirplayDnsRecords.feed(bytes: ByteArray) = accept(bytes, bytes.size)
 
+    @Test fun aRejectedSpeakerDoesNotHideTheNextSoftwareReceiver() {
+        val records = AirplayDnsRecords()
+        records.feed(packet(listOf(srv(7000)), listOf(address())))
+        val winplay = "WinPlay._airplay._tcp.local"
+        records.feed(packet(listOf(rr(winplay,33,120,byteArrayOf(0,0,0,0,0x42,0x68) + name("pc.local"))),
+            listOf(rr("pc.local",1,120,byteArrayOf(192.toByte(),168.toByte(),1,206.toByte())))))
+        val result = records.first { it.instance.startsWith("winplay.") }!!
+        assertEquals("192.168.1.206",result.host)
+        assertEquals(17000,result.port)
+        assertNull(records.first { it.instance.startsWith("diplay.") })
+    }
+
     @Test fun resolvesSrvTargetAfterSixBytePrefixAndAdditionalAddress() {
         val records = AirplayDnsRecords()
         records.feed(packet(listOf(srv(17000)), listOf(address())))

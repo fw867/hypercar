@@ -42,7 +42,8 @@ class AirplayServiceProbe(
      *
      * 返回第一个「SRV 端口 + A 地址」都齐的实例；拿不到返回 null（调用方退回端口列表）。
      */
-    suspend fun browse(network: Network?, timeoutMillis: Long = 3_000, strictNetwork: Boolean = false): Endpoint? =
+    suspend fun browse(network: Network?, timeoutMillis: Long = 3_000, strictNetwork: Boolean = false,
+        accept: (Endpoint) -> Boolean = { true }): Endpoint? =
         withContext(Dispatchers.IO) {
             var socket: MulticastSocket? = null
             try {
@@ -72,7 +73,7 @@ class AirplayServiceProbe(
                     val received = runCatching { socket.receive(packet); true }.getOrDefault(false)
                     if (!received) break
                     records.accept(packet.data, packet.length)
-                    records.first()?.let { endpoint ->
+                    records.first { accept(Endpoint(it.host, it.port, it.instance, it.model)) }?.let { endpoint ->
                         log("$TAG: ✓ ${endpoint.instance} → ${endpoint.host}:${endpoint.port}")
                         return@withContext Endpoint(endpoint.host, endpoint.port, endpoint.instance, endpoint.model)
                     }

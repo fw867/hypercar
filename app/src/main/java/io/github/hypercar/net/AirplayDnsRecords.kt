@@ -80,14 +80,14 @@ internal class AirplayDnsRecords(private val now: () -> Long = { System.nanoTime
         }.onSuccess { actions.forEach { it() } }
     }
 
-    fun first(): Endpoint? {
+    fun first(accept: (Endpoint) -> Boolean = { true }): Endpoint? {
         val time = now()
         services.entries.removeAll { it.value.expires <= time }
         addresses.entries.removeAll { it.value.expires <= time }
         models.entries.removeAll { it.value.expires <= time }
         return services.entries.firstNotNullOfOrNull { (instance, service) ->
             val (port, host) = service.value
-            addresses[host]?.let { Endpoint(it.value, port, instance, models[instance]?.value) }
+            addresses[host]?.let { Endpoint(it.value, port, instance, models[instance]?.value).takeIf(accept) }
         }
     }
 }
