@@ -388,7 +388,10 @@ object HyperCarRepo {
                         return@handler
                     }
                     if (hasCurrentSession && wifiReceiverMac != null && boundNetwork != null) {
-                        log("WIFI-RESUME: 保留已知车机网络及监听；ACL 退场不代表激活成功，等待阶段可按新状态证据有界恢复")
+                        // BMW secondary: phone is often already on car Wi-Fi; ACL closes after a
+                        // short window. Refresh ctrl on that handoff so the car can invite on Wi-Fi.
+                        log("WIFI-RESUME: 保留已知车机网络及监听；ACL 短窗口退场属二次上车常见交接，刷新 ctrl 等 Wi-Fi 邀请")
+                        scope.launch { nudgeInvitationDiscovery(app, "ACL 退场交 Wi-Fi", handoffToWifi = true) }
                         logAclEvent(device, connected)
                         return@handler
                     }
@@ -465,23 +468,30 @@ object HyperCarRepo {
     }
 
     /**
-     * Waiting for a car invite with known Wi-Fi already up: ACL/companion is a rediscovery
-     * signal, not a cue to run the experimental proactive AirPlay switch.
+     * Known-Wi-Fi invite wait: ACL is often only a short BMW wake window before Wi-Fi takes
+     * over. Refresh `_carplay-ctrl._tcp` so the car can invite on Wi-Fi; do not start the
+     * experimental proactive AirPlay switch, and do not require a lasting BT iAP2 session.
      */
-    private suspend fun nudgeInvitationDiscovery(context: Context, reason: String) {
+    private suspend fun nudgeInvitationDiscovery(
+        context: Context,
+        reason: String,
+        handoffToWifi: Boolean = false,
+    ) {
         val advertiser = ctrlAdvertiser
         val now = SystemClock.elapsedRealtime()
         val keepWifi = runCatching { RustCoreBridge.nativeCanKeepWifiSession() }.getOrDefault(false)
         if (!InviteWakeNudge.shouldNudge(sessionLive.get(), streaming, keepWifi, advertiser != null,
-                now, lastInviteWakeNudgeAt)) return
+                now, lastInviteWakeNudgeAt, handoffToWifi)) return
         lastInviteWakeNudgeAt = now
         val ssid = sessionWifiSsid ?: currentWifiSsid(context)
         val network = boundNetwork
         val refreshed = advertiser?.nudgeWhileWaiting(reason, ssid, network) == true
-        val armed = io.github.hypercar.bluetooth.ReconnectDiscoverability.armForWake()
+        val armed = InviteWakeNudge.armDiscoverable(handoffToWifi) &&
+            io.github.hypercar.bluetooth.ReconnectDiscoverability.armForWake()
         log("INVITE-WAKE: $reason；刷新ctrl=${if (refreshed) "是" else "否"} 可发现再开=${if (armed) "是" else "否"}；" +
-            "继续等车机 iAP2/ctrl 邀请（不触发 Wi-Fi 主动建链）")
-        push(link = LinkState.Negotiating("车机已回连，等待 CarPlay 邀请"))
+            "继续等车机 Wi-Fi ctrl 邀请（宝马二次上车蓝牙短窗口后常退场，不触发主动建链）")
+        push(link = LinkState.Negotiating(
+            if (handoffToWifi) "蓝牙已交棒，等待车机 Wi-Fi 邀请" else "车机已回连，等待 CarPlay 邀请"))
     }
 
     private fun requestConnect(context: Context, manual: Boolean, source: String) {
@@ -2616,8 +2626,17 @@ object HyperCarRepo {
                         // 区分「车机根本没连进来」与「连进来了但没给凭据」——前者是车机
                         // 侧的问题（iDrive 里没把本机当 CarPlay 手机），后者才是协议问题。
                         if (requireActivation) {
-                            log("SESSION: 等待本轮车机邀请/0x4301，已等 ${waited}s；" +
-                                "蓝牙会话次数=${coordinator.sessionStartCount} 已收Wi-Fi凭据=${seen?.ssid != null}，保持广播与监听")
+                            val wifiBound = wifiReceiverMac != null && boundNetwork != null
+                            log(
+                                if (wifiBound) {
+                                    "SESSION: 等待本轮车机 Wi-Fi ctrl 邀请，已等 ${waited}s；" +
+                                        "已绑定已知车机网络，宝马二次上车蓝牙常仅短窗口后交棒，" +
+                                        "不以持续 iAP2 会话为成败（本轮蓝牙会话=${coordinator.sessionStartCount}）"
+                                } else {
+                                    "SESSION: 等待本轮车机邀请/0x4301，已等 ${waited}s；" +
+                                        "蓝牙会话次数=${coordinator.sessionStartCount} 已收Wi-Fi凭据=${seen?.ssid != null}，保持广播与监听"
+                                },
+                            )
                         } else if (seen == null && coordinator.sessionStartCount == 0 && wifiReceiverMac == null) {
                             log(
                                 "SESSION: ${waited}s 内车机一次都没发起 iAP2（ACL 已连但收不到 …cafe 连入）——" +

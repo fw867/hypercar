@@ -17,4 +17,13 @@ class InviteWakeNudgeTest {
         assertTrue(InviteWakeNudge.shouldNudge(true, false, false, true,
             10_000 + InviteWakeNudge.COOLDOWN_MILLIS, 10_000))
     }
+
+    @Test fun wifiHandoffUsesShorterCooldownAndSkipsDiscoverable() {
+        assertTrue(InviteWakeNudge.shouldNudge(true, false, false, true, 13_000, 10_000,
+            handoffToWifi = true))
+        assertFalse(InviteWakeNudge.shouldNudge(true, false, false, true, 12_000, 10_000,
+            handoffToWifi = true))
+        assertTrue(InviteWakeNudge.armDiscoverable(false))
+        assertFalse(InviteWakeNudge.armDiscoverable(true))
+    }
 }
