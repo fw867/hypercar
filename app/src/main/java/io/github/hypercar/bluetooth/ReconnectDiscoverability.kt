@@ -15,9 +15,17 @@ internal class ReconnectDiscoverabilityPolicy {
     private var readyAt = 0L
     private var attempted = false
     private var wakeArmed = false
+    /** Session already started — no further discoverable windows this watch. */
+    private var sessionClaimed = false
 
     fun shouldAttempt(enabled: Boolean, networkKey: String?, servicesReady: Boolean, sessionStarted: Boolean, now: Long): Boolean {
-        if (sessionStarted) { attempted = true; wakeArmed = false; return false }
+        if (sessionStarted) {
+            attempted = true
+            wakeArmed = false
+            sessionClaimed = true
+            return false
+        }
+        if (sessionClaimed) return false
         if (!enabled || networkKey == null || !servicesReady) { key = null; return false }
         if (wakeArmed) {
             wakeArmed = false
@@ -35,7 +43,7 @@ internal class ReconnectDiscoverabilityPolicy {
 
     /** Car ACL while still waiting for invite/iAP2: allow one extra discoverable window. */
     fun armForWake(): Boolean {
-        if (!attempted || wakeArmed) return false
+        if (sessionClaimed || !attempted || wakeArmed) return false
         wakeArmed = true
         return true
     }
