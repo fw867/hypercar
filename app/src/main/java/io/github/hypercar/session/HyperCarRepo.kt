@@ -289,7 +289,8 @@ object HyperCarRepo {
     /** 连续失败次数（成功进 connected 时清零），用来做退避与上限。 */
     private val reconnectBudget = ReconnectBudget()
     private val activationWakeEvidence = CarActivationWakeEvidence()
-    @Volatile private var lastInviteWakeNudgeAt = 0L
+    @Volatile private var lastConnectInviteNudgeAt = 0L
+    @Volatile private var lastHandoffInviteNudgeAt = 0L
     /** True while bound and waiting for ctrl invite / inbound iAP2 (not while streaming). */
     @Volatile private var awaitingCarInvitation = false
 
@@ -387,11 +388,37 @@ object HyperCarRepo {
                         logAclEvent(device, connected)
                         return@handler
                     }
-                    if (hasCurrentSession && wifiReceiverMac != null && boundNetwork != null) {
+                    val processBound = hasCurrentSession && wifiReceiverMac != null && boundNetwork != null
+                    if (processBound) {
                         // BMW secondary: phone is often already on car Wi-Fi; ACL closes after a
                         // short window. Refresh ctrl on that handoff so the car can invite on Wi-Fi.
                         log("WIFI-RESUME: 保留已知车机网络及监听；ACL 短窗口退场属二次上车常见交接，刷新 ctrl 等 Wi-Fi 邀请")
                         scope.launch { nudgeInvitationDiscovery(app, "ACL 退场交 Wi-Fi", handoffToWifi = true) }
+                        logAclEvent(device, connected)
+                        return@handler
+                    }
+                    if (hasCurrentSession && !streaming) {
+                        // Bind often finishes after this short ACL. Confirm the known car
+                        // network off the main thread before deciding to tear the wait down.
+                        val attempt = connectionAttemptId
+                        val address = runCatching { device.address }.getOrNull()
+                        scope.launch {
+                            val present = knownCarWifiAssociated(app)
+                            if (connectionAttemptId != attempt || !sessionLive.get()) return@launch
+                            val boundNow = wifiReceiverMac != null && boundNetwork != null
+                            if (!AclHandoffKeep.keepInviteWait(hasCurrentSession, streaming, boundNow, present)) {
+                                userDisconnectRequested = false
+                                if (address != null && address == aclCarMac) aclCarMac = null
+                                disconnect(userInitiated = false)
+                                return@launch
+                            }
+                            log(if (boundNow) {
+                                "WIFI-RESUME: 保留已知车机网络及监听；ACL 短窗口退场属二次上车常见交接，刷新 ctrl 等 Wi-Fi 邀请"
+                            } else {
+                                "WIFI-RESUME: ACL 退场时已知车机 Wi-Fi 已连接，进程绑定尚未完成，保留本轮等待"
+                            })
+                            nudgeInvitationDiscovery(app, "ACL 退场交 Wi-Fi", handoffToWifi = true)
+                        }
                         logAclEvent(device, connected)
                         return@handler
                     }
@@ -480,12 +507,17 @@ object HyperCarRepo {
         val advertiser = ctrlAdvertiser
         val now = SystemClock.elapsedRealtime()
         val keepWifi = runCatching { RustCoreBridge.nativeCanKeepWifiSession() }.getOrDefault(false)
+        val anchor = InviteWakeNudge.cooldownAnchor(
+            handoffToWifi, lastConnectInviteNudgeAt, lastHandoffInviteNudgeAt)
         if (!InviteWakeNudge.shouldNudge(sessionLive.get(), streaming, keepWifi, advertiser != null,
-                now, lastInviteWakeNudgeAt, handoffToWifi)) return
-        lastInviteWakeNudgeAt = now
+                now, anchor, handoffToWifi)) return
         val ssid = sessionWifiSsid ?: currentWifiSsid(context)
         val network = boundNetwork
         val refreshed = advertiser?.nudgeWhileWaiting(reason, ssid, network) == true
+        val stamped = InviteWakeNudge.rememberNudge(refreshed, now, anchor)
+        if (stamped != anchor) {
+            if (handoffToWifi) lastHandoffInviteNudgeAt = stamped else lastConnectInviteNudgeAt = stamped
+        }
         val armed = InviteWakeNudge.armDiscoverable(handoffToWifi) &&
             io.github.hypercar.bluetooth.ReconnectDiscoverability.armForWake()
         log("INVITE-WAKE: $reason；刷新ctrl=${if (refreshed) "是" else "否"} 可发现再开=${if (armed) "是" else "否"}；" +
@@ -577,6 +609,8 @@ object HyperCarRepo {
         airplayPort = 0
         connecting = true
         sessionLive.set(true)
+        lastConnectInviteNudgeAt = 0L
+        lastHandoffInviteNudgeAt = 0L
         io.github.hypercar.carui.MusicNotificationListener.sync(context)
         val profile = headUnitProfile
         connectionAttemptId = connectionDiagnostics.begin(source,
@@ -927,6 +961,13 @@ object HyperCarRepo {
         }
         sessionReceiverMac = selected
         return selected
+    }
+
+    /** Same trust as Wi-Fi resume: paired car, credential marker, and a live network for this SSID. */
+    private suspend fun knownCarWifiAssociated(context: Context): Boolean {
+        val ssid = currentWifiSsid(context) ?: return false
+        if (knownWifiReceiver(ssid) == null) return false
+        return knownWifiNetwork(context, ssid) != null
     }
 
     private fun knownWifiReceiver(ssid: String?): String? {

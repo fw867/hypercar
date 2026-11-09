@@ -26,4 +26,22 @@ class InviteWakeNudgeTest {
         assertTrue(InviteWakeNudge.armDiscoverable(false))
         assertFalse(InviteWakeNudge.armDiscoverable(true))
     }
+
+    @Test fun connectClockDoesNotBlockFollowingHandoff() {
+        val anchor = InviteWakeNudge.cooldownAnchor(
+            handoffToWifi = true, lastConnectNudgeAt = 10_000, lastHandoffNudgeAt = 0)
+        assertEquals(0L, anchor)
+        assertTrue(InviteWakeNudge.shouldNudge(true, false, false, true, 11_000, anchor,
+            handoffToWifi = true))
+    }
+
+    @Test fun failedRefreshDoesNotConsumeHandoffCooldown() {
+        val afterFail = InviteWakeNudge.rememberNudge(false, 11_000, 0)
+        assertEquals(0L, afterFail)
+        assertTrue(InviteWakeNudge.shouldNudge(true, false, false, true, 11_500, afterFail,
+            handoffToWifi = true))
+        val afterOk = InviteWakeNudge.rememberNudge(true, 11_500, afterFail)
+        assertFalse(InviteWakeNudge.shouldNudge(true, false, false, true, 12_000, afterOk,
+            handoffToWifi = true))
+    }
 }
