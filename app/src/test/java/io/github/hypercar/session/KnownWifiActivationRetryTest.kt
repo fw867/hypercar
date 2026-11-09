@@ -32,15 +32,21 @@ class KnownWifiActivationRetryTest {
         assertTrue(retry.allowsRetry(true, false, "121", car, 20_000))
     }
 
-    @Test fun repeatedFailuresBackOffButNeverLatchTrustedNetworkIntoInviteOnly() {
+    @Test fun sameNetworkRetriesAreBoundedButNewNetworkAndManualRoundCanStartFresh() {
         val retry = KnownWifiActivationRetry()
         var now = 0L
-        for (delay in listOf(10_000L, 20_000L, 40_000L) + List(20) { 60_000L }) {
+        for (delay in listOf(10_000L, 20_000L, 40_000L, 60_000L, 60_000L)) {
             assertEquals(delay, retry.failed("121", car, now))
             assertFalse(retry.allowsRetry(true, false, "121", car, now + delay - 1))
             now += delay
             assertTrue(retry.allowsRetry(true, false, "121", car, now))
         }
+        assertNull(retry.failed("121", car, now))
+        assertFalse(retry.allowsRetry(true, false, "121", car, now + 600_000))
+        assertTrue(retry.allowsRetry(true, false, "122", car, now))
+        assertTrue(retry.allowsRetry(true, false, "121", other, now))
+        retry.clear()
+        assertTrue(retry.allowsRetry(true, false, "121", car, now))
     }
 
     @Test fun oldEndpointCannotCrossReceiverOrNetworkEvenWhenBothCarsAreKnown() {

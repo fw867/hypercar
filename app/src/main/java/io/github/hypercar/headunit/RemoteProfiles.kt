@@ -198,6 +198,7 @@ object RemoteProfiles {
             advertiseOnCurrentWifi = o.optBoolean("advertiseOnCurrentWifi", defaults.advertiseOnCurrentWifi),
             requireFreshCtrlInvite = o.optBoolean("requireFreshCtrlInvite", defaults.requireFreshCtrlInvite),
             useScreenResourceLifecycle = o.optBoolean("useScreenResourceLifecycle", defaults.useScreenResourceLifecycle),
+            mbuxScreenBootstrap = o.optBoolean("mbuxScreenBootstrap", defaults.mbuxScreenBootstrap),
             fallbackAirplayPorts = readPorts(o, defaults.fallbackAirplayPorts),
             touchDisplay = if (o.has("touchDisplay")) {
                 o.optString("touchDisplay", "").ifBlank { null }
@@ -239,6 +240,7 @@ object RemoteProfiles {
                     put("advertiseOnCurrentWifi", p.advertiseOnCurrentWifi)
                     put("requireFreshCtrlInvite", p.requireFreshCtrlInvite)
                     put("useScreenResourceLifecycle", p.useScreenResourceLifecycle)
+                    put("mbuxScreenBootstrap", p.mbuxScreenBootstrap)
                     put("fallbackAirplayPorts", JSONArray(p.fallbackAirplayPorts))
                     put("touchDisplay", p.touchDisplay ?: "")
                     put("pairingHint", p.pairingHint ?: "")

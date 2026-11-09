@@ -144,6 +144,7 @@
       "advertiseOnCurrentWifi": false,
       "requireFreshCtrlInvite": false,
       "useScreenResourceLifecycle": true,
+      "mbuxScreenBootstrap": true,
       "fallbackAirplayPorts": [
         7000
       ],

@@ -4,6 +4,13 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ReceiverCompatibilityTest {
+    @Test fun mbuxBootstrapIsRestrictedToTheExperimentalMercedesProfile() {
+        assertTrue(HeadUnitProfiles.MERCEDES_MBUX.mbuxScreenBootstrap)
+        assertTrue(HeadUnitProfiles.MERCEDES_MBUX.screenResourceLifecycleEnabled(false))
+        HeadUnitProfiles.builtin.filter { it.id != "mercedes_mbux" }.forEach {
+            assertFalse(it.id, it.mbuxScreenBootstrap)
+        }
+    }
     @Test fun desktopAudioCompatibilityRequiresDesktopProfileOrCurrentIdentity() {
         assertTrue(ReceiverCompatibility.isDesktopReceiver("winplay", null))
         assertTrue(ReceiverCompatibility.isDesktopReceiver("bmw_id85", "WinPlay receiver"))

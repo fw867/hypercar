@@ -42,6 +42,7 @@ pub struct AirplayParams {
     pub enable_audio: bool,
     pub keep_alive_stats: bool,
     pub bmw_box_bootstrap: bool,
+    pub mbux_screen_bootstrap: bool,
     pub desktop_receiver: bool,
     /// 设置里的编码分辨率（仅作 `/info` 无显示器信息时的兜底）。
     pub width: u32,
@@ -248,11 +249,18 @@ pub async fn negotiate(
 
     let mut box_bootstrap = use_box_bootstrap(p.bmw_box_bootstrap, &info);
     if box_bootstrap { crate::auth_setup::run(&channel).await?; }
+    else if p.mbux_screen_bootstrap {
+        emit_log("MBUX: screen-before-RECORD bootstrap; auth-setup=true minimal_features=true latencyMs=100 deferred_audio=true");
+        if shared_secret.is_none() {
+            return Err("MBUX requires successful pair-verify; legacy SAP-only media is not enabled".into());
+        }
+        crate::auth_setup::run_with_policy(&channel, true).await?;
+    }
 
     // CatPlay bootstrap: 会话 SETUP → /info → 事件通道/保活 → 资源声明 → 屏幕流。
     let timing = TimingServer::start_with_pipeline(p.pipeline.clone()).map_err(|e| format!("计时服务启动失败: {e}"))?;
     let (root, session_info) = setup_and_read_info(
-        &channel, &p.device_id, timing.port, shared_secret.is_some(), info,
+        &channel, &p.device_id, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap,
     ).await?;
     info = session_info;
     // SETUP may be the first point at which /info reveals the real receiver identity.
@@ -303,7 +311,10 @@ pub async fn negotiate(
         .open_tcp(&p.car_ip, event_port, 5_000)
         .ok_or_else(|| format!("事件通道连接失败 {}:{event_port}", p.car_ip))?;
     let (ev_r, ev_w) = event_stream.into_split();
-    let modes = Arc::new(Mutex::new(crate::modes::Modes::from_info(&info, p.enable_audio, box_bootstrap)));
+    let initial_modes = if p.mbux_screen_bootstrap {
+        crate::modes::Modes::from_info_with_audio_policy(&info, p.enable_audio, false, true)
+    } else { crate::modes::Modes::from_info(&info, p.enable_audio, box_bootstrap) };
+    let modes = Arc::new(Mutex::new(initial_modes));
     let screen_owned = Arc::new(std::sync::atomic::AtomicBool::new(modes.lock().screen_owned()));
     let audio_owned = Arc::new(std::sync::atomic::AtomicBool::new(modes.lock().audio_owned()));
     let reply_audio = audio_owned.clone();
@@ -399,7 +410,11 @@ pub async fn negotiate(
     // BMW box activates the session before resource negotiation and video SETUP.
     let declaration = modes.lock().declaration();
     emit_log(&format!("TIMING: before RECORD {}",p.pipeline.lock().timing.summary()));
-    activate_session(&channel, &declaration, &p.pipeline).await?;
+    if p.mbux_screen_bootstrap {
+        screen_session.bootstrap_before_record(&modes).await?;
+    } else {
+        activate_session(&channel, &declaration, &p.pipeline).await?;
+    }
     emit_log(&format!("TIMING: after RECORD/resource response {}",p.pipeline.lock().timing.summary()));
     p.pipeline.lock().control_ready=true;
 
@@ -770,7 +785,7 @@ mod display_size_tests {
         let (read, write) = socket.into_split();
         let (channel, _) = RtspChannel::spawn(read, write, None);
         crate::auth_setup::run(&channel).await.unwrap();
-        let (_, info) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", 12345, true, Value::dict(vec![])).await.unwrap();
+        let (_, info) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", 12345, true, Value::dict(vec![]), false).await.unwrap();
         let display = &info.get("displays").unwrap().as_array().unwrap()[0];
         assert_eq!(uuid_text(display.get("uuid")).as_deref(), Some("actual-bmw-display"));
         assert_eq!(read_display_size(display), (2560, 744));
@@ -950,11 +965,11 @@ const CONTROLLER_FEATURES: &[&str] = &[
     "videoPlayback",
 ];
 
-fn build_session_setup(device_id: &str, timing_port: u16, encrypted: bool) -> Vec<u8> {
+fn build_session_setup(device_id: &str, timing_port: u16, encrypted: bool, mbux: bool) -> Vec<u8> {
     let session_uuid = random_uuid_upper();
     let mut fields: Vec<(&str, Value)> = vec![
         ("deviceID", Value::str(device_id)),
-        ("macAddress", Value::str("aa:bb:cc:dd:ee:ff")),
+        ("macAddress", Value::str(if mbux { device_id } else { "aa:bb:cc:dd:ee:ff" })),
         ("name", Value::str("iPhone")),
         ("model", Value::str("iPhone14,2")),
         ("osName", Value::str("iPhone OS")),
@@ -969,7 +984,7 @@ fn build_session_setup(device_id: &str, timing_port: u16, encrypted: bool) -> Ve
         ("keepAliveLowPower", Value::bool(true)),
         (
             "features",
-            Value::array(CONTROLLER_FEATURES.iter().map(|f| Value::str(f)).collect()),
+            Value::array(if mbux { vec![Value::str("viewAreas")] } else { CONTROLLER_FEATURES.iter().map(|f| Value::str(f)).collect() }),
         ),
     ];
     if !encrypted {
@@ -1011,9 +1026,9 @@ pub(crate) async fn record_session(channel: &Arc<RtspChannel>) -> Result<(), Str
 }
 
 async fn setup_and_read_info(
-    channel: &Arc<RtspChannel>, device_id: &str, timing_port: u16, encrypted: bool, previous_info: Value,
+    channel: &Arc<RtspChannel>, device_id: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool,
 ) -> Result<(Value, Value), String> {
-    let body = build_session_setup(device_id, timing_port, encrypted);
+    let body = build_session_setup(device_id, timing_port, encrypted, mbux);
     let reply = channel.request(
         "SETUP", "/setup", &body, "application/x-apple-binary-plist", &[], Duration::from_secs(10),
     ).await?;
@@ -1041,13 +1056,17 @@ async fn setup_and_read_info(
 }
 
 pub(crate) fn build_screen_setup(conn_id: i64, uuid: &str) -> Vec<u8> {
+    build_screen_setup_with_latency(conn_id, uuid, 25)
+}
+
+pub(crate) fn build_screen_setup_with_latency(conn_id: i64, uuid: &str, latency_ms: i64) -> Vec<u8> {
     bplist::encode(&Value::dict(vec![(
         "streams",
         Value::array(vec![Value::dict(vec![
             ("type", Value::int(110)), // 110=主屏（100 是音频，会开 UDP 端口）
             ("streamConnectionID", Value::int(conn_id)),
             ("uuid", Value::str(uuid)),
-            ("latencyMs", Value::int(25)),
+            ("latencyMs", Value::int(latency_ms)),
         ])]),
     )]))
 }
@@ -1709,4 +1728,20 @@ pub(crate) fn random_positive_i64() -> i64 {
 
 fn random_uuid_upper() -> String {
     uuid::Uuid::new_v4().simple().to_string().to_uppercase()
+}
+
+#[cfg(test)]
+mod mbux_profile_tests {
+    use super::*;
+    #[test]
+    fn minimal_features_and_100ms_latency_are_explicit_profile_choices() {
+        for mbux in [false,true] {
+            let body=bplist::parse(&build_session_setup("real-mac",1234,true,mbux)).unwrap();
+            let features=body.get("features").unwrap().as_array().unwrap();
+            assert_eq!(features.len(),if mbux {1} else {CONTROLLER_FEATURES.len()});
+            assert_eq!(body.get("macAddress").and_then(Value::as_str),Some(if mbux {"real-mac"} else {"aa:bb:cc:dd:ee:ff"}));
+        }
+        let body=bplist::parse(&build_screen_setup(42,"actual-display")).unwrap();
+        assert_eq!(body.get("streams").unwrap().as_array().unwrap()[0].get("latencyMs").and_then(Value::as_int),Some(25));
+    }
 }

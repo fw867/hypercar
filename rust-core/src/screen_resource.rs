@@ -13,6 +13,58 @@ pub(crate) struct ResourceStream {
 }
 
 impl ScreenSession {
+    /// MBUX opens the screen TCP endpoint before RECORD, but never exposes it to the pump
+    /// until RECORD succeeds. Event callbacks may arbitrate while this serialized bootstrap runs.
+    pub async fn bootstrap_before_record(&self, modes: &Arc<Mutex<Modes>>) -> Result<(), String> {
+        let mut state = self.resource_state.lock().await;
+        let (revision, owned, declaration) = {
+            let m = modes.lock();
+            (m.screen_generation(), m.screen_owned(), m.declaration())
+        };
+        let response = self.control.request("POST", "/command", &declaration,
+            "application/x-apple-binary-plist", &[], Duration::from_secs(5)).await?;
+        let business = bplist::parse(&response.body).ok().and_then(|v| v.get("status").and_then(Value::as_int));
+        if response.status() != 200 || business.is_some_and(|s| s != 0) {
+            return Err("MBUX 初始资源声明被拒".into());
+        }
+        crate::pipeline::activation(&self.params.pipeline, "RESOURCES_ACCEPTED");
+        crate::emit_log("MBUX: resource declaration accepted; preparing screen before RECORD");
+        let sender = if owned && modes.lock().can_restore_screen(revision) {
+            state.negotiated = true;
+            match self.open().await {
+                Ok(sender) => Some(sender),
+                Err(error) => {
+                    let _ = self.release_resource_stream(&mut state).await;
+                    return Err(error);
+                }
+            }
+        } else { None };
+        if let Err(error) = crate::airplay::record_session(&self.control).await {
+            drop(sender);
+            if state.negotiated { let _ = self.release_resource_stream(&mut state).await; }
+            return Err(error);
+        }
+        crate::pipeline::activation(&self.params.pipeline, "RECORD");
+        self.activated.store(true, Ordering::Release);
+        crate::emit_log("MBUX: RECORD accepted; video installation now permitted");
+        if let Some(sender) = sender {
+            let (done, installed) = tokio::sync::oneshot::channel();
+            // The pump verifies both the latest grant and its revision after the network awaits.
+            self.commands.send(ScreenCommand::InstallIfOwned {
+                sender, modes: modes.clone(), revision, reply: done,
+            }).await.map_err(|_| "视频泵已退出".to_string())?;
+            if installed.await.map_err(|_| "视频安装未确认".to_string())? {
+                state.revision = Some(revision);
+                state.ever_installed = true;
+                crate::pipeline::activation(&self.params.pipeline, "VIDEO_CHANNEL_READY");
+            } else {
+                self.release_resource_stream(&mut state).await?;
+            }
+        }
+        // A concurrent resource event can now reconcile; never keep the bootstrap lock across it.
+        Ok(())
+    }
+
     /// Query after event workers are stopped: graceful exit includes only negotiated streams.
     pub async fn resource_teardown(&self, audio: bool) -> Vec<u8> {
         let state = self.resource_state.lock().await;
@@ -156,7 +208,8 @@ mod tests {
     }
     impl Drop for Fixture {fn drop(&mut self) {self.pump.abort();}}
     impl Fixture {
-        async fn new(modes:Modes)->Self {
+        async fn new(modes:Modes)->Self { Self::with_bootstrap(modes, false).await }
+        async fn with_bootstrap(modes:Modes, mbux:bool)->Self {
             let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
             let socket=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
             let (car,_)=listener.accept().await.unwrap();let (r,w)=socket.into_split();
@@ -167,7 +220,7 @@ mod tests {
             let params=AirplayParams {
                 car_ip:"127.0.0.1".into(),airplay_port:7000,device_id:"test".into(),identity_path:"unused".into(),
                 receiver_id:None,receiver_previously_connected:true,enable_audio:true,keep_alive_stats:false,
-                bmw_box_bootstrap:true,desktop_receiver:false,width:1920,height:720,touch_display:None,touch_rect:None,
+                bmw_box_bootstrap:!mbux,mbux_screen_bootstrap:mbux,desktop_receiver:false,width:1920,height:720,touch_display:None,touch_rect:None,
                 encoder_size:Arc::new(Mutex::new((1920,720))),touch_size:Arc::new(Mutex::new((1920,720))),
                 carwith_display:None,carwith_stretch:false,screen_resource_lifecycle:true,pipeline:pipeline.clone(),
             };
@@ -175,7 +228,7 @@ mod tests {
             let pump=tokio::spawn(video_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(PumpStat::default())),true,pipeline,rx,video_rx));
             let owned=Arc::new(AtomicBool::new(modes.screen_owned()));
             let session=Arc::new(ScreenSession {control,factory:Arc::new(Factory),params,shared:Some([9;32]),uuid:"screen-test".into(),
-                keep_stats:false,display:(1920,720),owned,commands,activated:AtomicBool::new(true),resource_state:tokio::sync::Mutex::new(Default::default())});
+                keep_stats:false,display:(1920,720),owned,commands,activated:AtomicBool::new(!mbux),resource_state:tokio::sync::Mutex::new(Default::default())});
             Self {session,modes:Arc::new(Mutex::new(modes)),car,video,source,pump}
         }
         fn reconcile(&self)->tokio::task::JoinHandle<Result<(),String>> {
@@ -228,6 +281,63 @@ mod tests {
             }).await.unwrap();
         }
     }
+    #[tokio::test]
+    async fn mbux_screen_socket_precedes_record_but_frames_wait_for_success() {
+        for (record_status, revoke) in [(200, false), (403, false), (200, true)] {
+            let modes=Modes::from_info_with_audio_policy(&Value::dict(vec![]),true,false,true);
+            let mut f=Fixture::with_bootstrap(modes,true).await;
+            let session=f.session.clone();let modes=f.modes.clone();
+            let task=tokio::spawn(async move {session.bootstrap_before_record(&modes).await});
+            let declare=read(&mut f.car).await;
+            assert_eq!(declare.first_line,"POST /command RTSP/1.0");
+            let body=bplist::parse(&declare.body).unwrap();
+            let resources=body.get("params").unwrap().get("resources").unwrap().as_array().unwrap();
+            assert_eq!(resources[0].get("entity").and_then(Value::as_int),Some(1));
+            assert_eq!(resources[1].get("entity").and_then(Value::as_int),Some(2));
+            reply(&mut f.car,&declare,200,&[]).await;
+            let setup=read(&mut f.car).await;
+            let b=bplist::parse(&setup.body).unwrap();
+            assert_eq!(b.get("streams").unwrap().as_array().unwrap()[0].get("latencyMs").and_then(Value::as_int),Some(100));
+            let (mut video,id)=f.setup_reply(&setup).await;
+            let record=read(&mut f.car).await;
+            assert_eq!(record.first_line,"RECORD / RTSP/1.0");
+            assert!(!f.session.activated.load(Ordering::Acquire));
+            assert!(!f.session.params.pipeline.lock().video_channel_ready);
+            f.source.send(SourceEvent::VideoFrame {pts_us:1,data:vec![0,0,0,1,0x65,2]}).unwrap();
+            let mut byte=[0];
+            assert!(tokio::time::timeout(Duration::from_millis(30),video.read(&mut byte)).await.is_err());
+            if revoke {f.update(|m|borrow(m,1000));}
+            reply(&mut f.car,&record,record_status,&[]).await;
+            if record_status!=200 || revoke {
+                f.teardown_reply().await;
+                let result=task.await.unwrap();
+                assert_eq!(result.is_ok(),record_status==200);
+                let mut byte=[0];
+                assert_eq!(tokio::time::timeout(Duration::from_secs(1),video.read(&mut byte)).await.unwrap().unwrap(),0);
+                assert_eq!(f.session.params.pipeline.lock().video_frames_written,0);
+                assert!(!f.session.resource_state.lock().await.negotiated);
+            } else {
+                task.await.unwrap().unwrap();
+                assert!(f.session.activated.load(Ordering::Acquire));
+                f.video_frame(&mut video,id).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mbux_screen_rejection_does_not_send_record_or_report_ready() {
+        let mut f=Fixture::with_bootstrap(Modes::initial(),true).await;
+        let session=f.session.clone();let modes=f.modes.clone();
+        let task=tokio::spawn(async move {session.bootstrap_before_record(&modes).await});
+        f.modes_reply(1).await;
+        let setup=read(&mut f.car).await;assert!(setup.first_line.starts_with("SETUP "));
+        reply(&mut f.car,&setup,400,&[]).await;
+        f.teardown_reply().await;
+        assert!(task.await.unwrap().unwrap_err().contains("400"));
+        assert!(!f.session.activated.load(Ordering::Acquire));
+        assert!(!f.session.params.pipeline.lock().record_accepted);
+    }
+
     #[tokio::test]
     async fn no_setup_before_activation_or_screen_grant_and_never_is_respected() {
         let mut modes=Modes::initial();borrow(&mut modes,1000);modes.request_ui();assert!(!modes.screen_owned());

@@ -28,7 +28,9 @@ pub struct ScreenSession {
 impl ScreenSession {
     pub async fn open(&self) -> Result<ScreenSender,String> {
         let conn_id=airplay::random_positive_i64();
-        let body=airplay::build_screen_setup(conn_id,&self.uuid);
+        let body=if self.params.mbux_screen_bootstrap {
+            airplay::build_screen_setup_with_latency(conn_id,&self.uuid,100)
+        } else { airplay::build_screen_setup(conn_id,&self.uuid) };
         let response=self.control.request("SETUP","/",&body,"application/x-apple-binary-plist",&[],Duration::from_secs(8)).await?;
         if response.status()!=200 { return Err(format!("屏幕 SETUP 被拒 {}",response.first_line)); }
         crate::pipeline::activation(&self.params.pipeline, "SCREEN_SETUP");
@@ -48,7 +50,9 @@ impl ScreenSession {
         if self.params.carwith_stretch { sender.set_display_target(self.display.0,self.display.1); }
         sender.set_ownership(self.owned.clone());
         crate::emit_log(&format!("AIRPLAY: 主屏 TCP 就绪 dataPort={port} connId={conn_id} source={w}x{h}; new cipher/config state"));
-        crate::pipeline::activation(&self.params.pipeline, "VIDEO_CHANNEL_READY");
+        if !self.params.mbux_screen_bootstrap || self.activated.load(std::sync::atomic::Ordering::Acquire) {
+            crate::pipeline::activation(&self.params.pipeline, "VIDEO_CHANNEL_READY");
+        }
         Ok(sender)
     }
 

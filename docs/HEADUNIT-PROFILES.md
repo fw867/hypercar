@@ -70,3 +70,14 @@ useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关�
 
 
 2026-11-08 修复资源声明中的负数编码：原speechMode=-1被写为单字节FF、按Apple规则成为255，现固定8字节保留-1。该补丁是基础plist正确性修正，正数编码及其它车型策略不变；尚未获得奔驰修复后实车反馈，不更新verified标记。
+
+
+### BOX-OFF 屏幕路径校准（2026-11-09）
+
+用户确认 BOX-OFF 在奔驰有画面、可操作，仅无声音。静态差异见[参考分析](REFERENCE-REVIEW.md)。现仅 mercedes_mbux 内置档案启用 mbux_screen_bootstrap，其它内置档案默认false，也不启用BMW盒子交接逻辑。
+
+奔驰会话要求pair-verify成功后尝试/auth-setup；已配对时仅404/501按接口不存在继续，400/403、超时或损坏响应均保留失败。SAP复用现有X25519/AES交换解析，不宣称验证证书链或签名；支持有界可变签名长度，未启用SAP-only legacy AES媒体。初始SETUP能力缩为viewAreas，macAddress采用本轮deviceID；不修改配对身份、iPhone声明及既有屏幕UUID来源。
+
+初始资源保留车机音频归属，后续播放仍经独立音频资源申请，保留/info声明的约束。屏幕按100ms延迟执行资源声明→SETUP→连接dataPort→RECORD；只有RECORD成功后才向视频泵安装发送器，安装时再次核对屏幕代次。SETUP拒绝不会再仅凭控制存活显示已连接；RECORD拒绝或资源收回释放本轮屏幕通道。后续资源变化继续走已有串行生命周期，不重复全局RECORD。暂未修改音频格式/URI和全局RTSP Session头处理。
+
+该分支是根据成功样本静态路径校准的奔驰实验，不代表已在奔驰验证消除400；多个校准项同时启用，不能据一次成功反推唯一根因。回归及安装状态见VALIDATION。

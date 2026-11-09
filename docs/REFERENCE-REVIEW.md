@@ -1,6 +1,6 @@
 # 参考实现与证据边界
 
-更新：2026-11-07。仅记录已查看的源码/样本；接收端和手机发送端的角色不能互换，第三方成功不代表 HyperCar 已实车通过。
+更新：2026-11-09。仅记录已查看的源码/样本；接收端和手机发送端的角色不能互换，第三方成功不代表 HyperCar 已实车通过。
 
 | 来源 | 可借鉴内容 | 边界 |
 |---|---|---|
@@ -44,3 +44,48 @@ Showcase的source/carplay_services.m可对照资源变化及VideoConfig，carpla
 - extractor：42dd48aa801527256963d619579ed40f6b9fd4e2。
 
 来源没有覆盖到的内部逻辑不作肯定描述；单次反编译或看到符号名不等于已经恢复完整重连状态机。
+
+## BOX-OFF 8.1.1 APK 与奔驰媒体拒绝对照（2026-11-09）
+
+样本：用户提供的 `BOX-OFF-8.1.1-carplay.C-100022-debugfalse-r8.apk`，SHA256 `e9c03b4de4ddde00b6a7ce4602a6212e9b28af4f41635866bf581703644ef462`。BuildConfig 为 `APPLICATION_ID=com.baidu.carlife.xiaomi`、versionCode=100022、VERSION_NAME=8.1.1-carplay.C；文件名含 debugfalse，但 BuildConfig.DEBUG=true、BUILD_TYPE=debug，不能由文件名判断运行行为。该样本是 APK 静态分析，尚无它在同一奔驰上的 RTSP 抓包。用户已确认网友实测车机有画面、可操作，仅无声音：可作为用户反馈支持的奔驰屏幕/触控成功样本，不能作为音频成功基线；具体启用的档案、认证分支及实际出站报文仍待日志确认。
+
+反编译材料保存在仓库外 `/mnt/d/devtools/hypercar-diagnostics/box-off-8.1.1/`。Java/Kotlin 主实现位于 `decompiled/sources/io/github/iamr0s/carplay/`，主要协议不在 native 库。JADX 1.5.6 全量反编译报330项错误，其中主会话协程未能结构化还原；另以 simple 模式输出 `TestScreenSession-simple.java`，按实际调用、分支及诊断字符串交叉核对下表，不把反编译的 throw 占位视为 APK 的真实失败逻辑。未将 APK 或第三方源码加入仓库，未安装该 APK。
+
+以下对照的 HyperCar 基线为 `e9773bb`，实施状态见[奔驰档案](HEADUNIT-PROFILES.md)。
+
+| 项目 | APK 中的可复核行为 | 基线 HyperCar / 本轮奔驰日志 | 价值与限制 |
+|---|---|---|---|
+| 配对后的认证 | `TestScreenSession-simple.java:6525` 调用 `MfiAuthSetup.authenticate`，发生在初始SETUP前；有pairing时仍尝试POST `/auth-setup`；仅已配对且404/501允许跳过 | `rust-core/src/airplay.rs` 仅box_bootstrap开启时执行auth_setup；奔驰本轮false，日志没有该请求 | 值得隔离验证的认证阶段差异；pair-verify成功不证明另一个阶段必然无用，也不能凭静态分析断言奔驰强制要求 |
+| 初始能力 | `Ct5NegotiationProfile.initialSetupFeatures()` 默认空数组，modern-base仅`viewAreas` | HyperCar声明14项，含hevc、mainBuffered、altScreen、sessionManagement等 | 可比较实际协商出的能力；不能直接认定某项是400原因，不应全车型统一删减 |
+| 建链顺序 | `TestScreenSession-simple.java:5872/5964/5974/6026/6028`：声明modesChanged → 屏幕SETUP → 连接dataPort → RECORD | HyperCar先RECORD，再声明资源和屏幕SETUP；本轮媒体请求被400拒绝 | 直接相关的顺序差异；APK type130失败有继续屏幕流程分支，不能将type130一概列为硬前提 |
+| 初始资源 | SessionModes默认screen=1/1、audio=2/2，snapshot含permanentEntity；主路径使用该snapshot | 本轮HyperCar声明screen=1/1、audio=1/1 | APK先保留车机音频归属，后续独立申请音频；不是“完全没有音频实现” |
+| 屏幕参数 | type=110、非零正连接ID、latencyMs=100；显示uuid仅在车机返回String时加入 | 本轮type=110、latencyMs=25，uuid来自/info；请求字段其余基本相同 | 延迟是明确差异；当前样本已取得String UUID，不能声称APK不发uuid，也不能据此补造分辨率字段 |
+| 音频参数 | RtspAudioControl.setup使用相对URI `/`，输出latency=100、spf=采样率/200、sr=采样率、ct=1；按/info的type/audioType/audioOutputFormats选PCM格式 | HyperCar使用带方括号IPv6绝对URI，固定PCM48k双声道、spf352、latency0，无sr/ct；两轮均400 | 存在独立音频兼容性差异。APK在48k时spf240；是否被奔驰接受必须由APK日志确认，不能因其“能连接”便宣称音频参数正确 |
+| Session头 | RtspConnection保存成功响应Session头（去掉分号参数），后续请求带回 | HyperCar RtspChannel未自动保存/带回该头 | 可完善的协议兼容边界；现有HyperCar日志没有足够响应头证据，不能断言本车确实要求 |
+| UI请求 | 有处理车机requestUI/changeModes的路径；初始主链在屏幕SETUP之前没有无条件主动requestUI | 本轮requestUI计数0，屏幕SETUP400 | 不能把APK的成功解释为“补一个最高优先级requestUI”；命令方向和实际路径需分清 |
+
+### 与11月9日奔驰日志的约束
+
+输入 `hypercar-log-20261109-080432.txt`，导出版本0.1.0.523，实际车机为MBUX00081、所选档案mercedes_mbux。08:02:45.566及08:03:29.668屏幕SETUP400空体；08:02:45.672及08:03:29.725音频SETUP400空体。会话内/info已返回1624×1278和显示UUID，RECORD成功、feedback200；CarWith后续实际有SPS/PPS/IDR，但最后PIPELINE视频TCP帧0、音频包0。首次控制连接在RECORD附近被车机关闭，与后面控制保持但媒体均拒绝的两轮分开看。
+
+本次从完整TX_PREPARED_PLAINTEXT分段重组四个资源报文，用Python plistlib独立解码，确认出站speechMode均为-1；因此此前负数编码修复已实际进入这个样本，不能再将同一个编码错误当作本次400的解释。资源回复是200加空字典，没有明确status；本地resources=true、screen_phone=true不等于车机已授权或显示。Shizuku=false是独立环境限制，不能覆盖已明确收到的屏幕/音频拒绝原因。
+
+### 建议验证顺序（尚未实施）
+
+1. 用户已确认APK在奔驰有实际画面和触控，优先对照屏幕成功路径；继续取得同一车机的APK日志，以确认实际profile/认证路径、屏幕SETUP应答、Session头及出站报文。静态代码中的可选分支不能直接等同于该成功会话实际执行的分支。
+2. 优先在奔驰试验档案单独验证配对后auth-setup。已有HyperCar解析/解密交换代码不等于APK的签名验证与legacy AES密钥生命周期；不能为复用而全局打开BMW box bootstrap，它还改变其它业务分支。
+3. 再隔离验证“媒体SETUP在RECORD前”的顺序；最小能力声明、屏幕100ms延迟分别验证，避免同时更改而无法归因。保留原车型默认行为及当前资源代次/取消边界。
+4. 画面建链成功后再独立校准音频：能力选择、URI、sr/ct、spf与延迟。该APK无声反馈没有日志，无法判断是资源、SETUP、音源采集、RTP或车机播放问题。
+5. 如补Session头支持，按当前连接保存并清除，禁止旧连接Session泄漏到重连；先补充响应头诊断，不能凭缺少日志就推断它是本轮根因。
+
+### BOX-OFF 再次上车与宝马重连复核
+
+进一步沿接入层回调检查，不能只看ConnectionService单轮退出就认定没有自动重连：APK的Provider模式有上层重试。证据仍为同一APK静态代码，未取得宝马实车成功记录。
+
+- `provider/ProviderBluetoothReceiver.java:24`：监听ACL_CONNECTED，要求Provider已启用且CarlifeConnectService实例仍存在；随后按已选peer筛选，不是单凭广播冷启动整个接入层。
+- `com/baidu/carlife/service/CarlifeConnectService.java:699/725/739`：连接结束回调scheduleRetry；保留host Surface，按2/5/10/30/60秒安排最多五次重试；目标车蓝牙重新连接时触发restart。`provider/ProviderRetry.java`在ready后持续至少120秒再遇失败时清零失败次数，避免短暂成功无限重置重试预算。该机制不等同于休眠120秒才重连。
+- 同文件`connect():597`再次启动ConnectionService，传peer、wirelessExperiment=true、continuousWait=true。底层既可主动RFCOMM，也可持续等车机入站；同步实验的“第二轮”明确等待NEW car-initiated RFCOMM，是同步测试，不是已验证的宝马二次上车协议。
+- `ConnectionService.java:973/988`的无线入口仍先有BluetoothSocket及WirelessBootstrap，等待本轮无线参数（120秒超时），随后CarNetwork.join。`network/Ct5ExistingWifi.java:110`按本轮SSID、receiverId/BSSID、本机IPv4和到车机地址的路由匹配复用已有Wi-Fi，避免重复requestNetwork；这发生在已有本轮参数之后，不是“只连上保存Wi-Fi便主动Wi-Fi iAP2”的独立入口。
+- Wi-Fi丢失时`ConnectionService$runWireless$2$lost$1.java:67`关闭屏幕、发现和蓝牙socket并结束本轮，再由Provider决定重试。稳定PhoneIdentity持久化且不自动轮换配对密钥。运行期接管就绪后该APK也有主动关闭引导RFCOMM的分支，不代表必须断HFP/A2DP。
+
+对HyperCar的价值：复用正确车机网络、目标ACL唤醒、有界退避、稳定身份、旧会话资源清理均可对照，目前这些机制已有对应实现；其中HyperCar还存在已配对已知Wi-Fi主动建链入口和按车/Network隔离的失败退避。APK没有提供已验证的“宝马无蓝牙邀请时激活HMI”专用报文。不能因奔驰有画面就把609的奔驰认证、能力及屏幕顺序策略全局套到宝马，也不恢复已删除且实测无效的视频恢复实验。后续宝马无画面仍需比较相同车机上的真实SETUP/RECORD/资源回应和视频写帧，判断认证/顺序差异是否适用。

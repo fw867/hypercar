@@ -78,6 +78,9 @@ data class HeadUnitProfile(
     /** Keep control/iAP2 alive if screen SETUP is rejected; applies independently of the user experiment. */
     val useScreenResourceLifecycle: Boolean = false,
 
+    /** MBUX-only authenticated screen-before-RECORD bootstrap. */
+    val mbuxScreenBootstrap: Boolean = false,
+
     /** mDNS 拿不到（或不用 mDNS）时的兜底端口，按顺序试连。 */
     val fallbackAirplayPorts: List<Int> = listOf(7000, 7001, 7100, 17000),
 
@@ -226,7 +229,7 @@ object HeadUnitProfiles {
         id = "mercedes_mbux",
         label = "奔驰 Mercedes-Benz MBUX",
         model = "MB_E-P-4（MBUX 00081 日志样本）",
-        notes = "试验配置：接受本轮 0x4301 的热点和 IPv6 端点，不强等 ctrl 邀请；保留蓝牙音频，屏幕协商失败时保留控制链路。音视频尚待实车验证。",
+        notes = "试验配置：接受本轮 0x4301 的热点和 IPv6 端点，不强等 ctrl 邀请；保留蓝牙音频，配对后认证、主屏建链后激活。音视频尚待实车验证。",
         verified = false,
         validatesDeviceId = false,
         sendCarPlayAvailability = true,
@@ -242,6 +245,7 @@ object HeadUnitProfiles {
         advertiseOnCurrentWifi = false,
         requireFreshCtrlInvite = false,
         useScreenResourceLifecycle = true,
+        mbuxScreenBootstrap = true,
         fallbackAirplayPorts = listOf(7000),
         touchDisplay = null,
         pairingHint = "在 MBUX 中选择 Apple CarPlay 并确认手机，接受 Wi-Fi 连接提示；屏幕尺寸按本轮协商获取。此配置尚未验证音视频正常。",

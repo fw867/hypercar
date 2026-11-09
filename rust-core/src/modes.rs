@@ -120,8 +120,12 @@ impl Modes {
     /// /info.modes is a ChangeModes declaration, not an incoming modesChanged snapshot.
     /// Initial Take/Borrow have CatPlay's bootstrap semantics; do not replay them as live requests.
     pub fn from_info(info: &Value, enable_audio: bool, box_bootstrap: bool) -> Self {
+        Self::from_info_with_audio_policy(info, enable_audio, box_bootstrap, false)
+    }
+
+    pub fn from_info_with_audio_policy(info: &Value, enable_audio: bool, box_bootstrap: bool, defer_audio: bool) -> Self {
         crate::resource_trace::info_modes(info.get("modes"));
-        let fallback = if box_bootstrap && !enable_audio { Self::box_initial() } else { Self::initial() };
+        let fallback = if defer_audio || (box_bootstrap && !enable_audio) { Self::box_initial() } else { Self::initial() };
         let mut value = match info.get("modes") {
             Some(params) => match Self::read_initial(params) {
                 Some(value) => value,
@@ -135,7 +139,7 @@ impl Modes {
         value.resources[0].take_by(1, ANYTIME, ANYTIME, ANYTIME);
         // The user enabled application playback. Never override a receiver's Never constraint or
         // an uninterruptible borrow; publish this local decision with modesChanged, not changeModes.
-        if enable_audio { value.resources[1].take_by(1, USER_INITIATED, ANYTIME, ANYTIME); }
+        if enable_audio && !defer_audio { value.resources[1].take_by(1, USER_INITIATED, ANYTIME, ANYTIME); }
         crate::emit_log(&format!("MODES: initial source={} screen={}/{} audio={}/{} playback={enable_audio}",
             if info.get("modes").is_some() { "/info.modes" } else { "compatibility" },
             value.resources[0].current, value.resources[0].permanent,
@@ -360,6 +364,18 @@ mod tests {
         ])]))])));
         let revision=modes.screen_generation();modes.request_ui();
         assert!(!modes.screen_owned());assert_eq!(modes.screen_generation(),revision);
+    }
+
+    #[test] fn deferred_audio_preserves_constraints_and_later_playback_claims() {
+        let empty=Value::dict(vec![]);
+        assert!(Modes::from_info(&empty,true,false).audio_owned());
+        let deferred=Modes::from_info_with_audio_policy(&empty,true,false,true);
+        assert!(deferred.screen_owned());assert!(!deferred.audio_owned());
+        assert!(deferred.audio_claim(false).is_some());
+        let never=Modes::from_info_with_audio_policy(&info_audio(1000,false),true,false,true);
+        assert!(!never.audio_owned());assert!(never.audio_claim(true).is_none());
+        let disabled=Modes::from_info_with_audio_policy(&empty,false,false,true);
+        assert!(disabled.audio_claim(true).is_none());
     }
 
     #[test] fn info_initial_release_preserves_owner_and_constraints() {

@@ -255,6 +255,8 @@ class WifiJoiner(
      * 把进程 socket 绑到 [network]（mDNS/裸 socket 跟随进程默认网络，必须显式绑）。
      * 同一热点重复绑定走快路径：句柄未变时直接返回 true，不再重复 bind（避免无谓解绑/重绑抖动）。
      */
+    fun ownsBinding(network: Network): Boolean = boundNetwork.get() == network
+
     fun bindProcess(network: Network): Boolean = synchronized(bindLock) {
         if (boundNetwork.get() == network && connectivityManager.boundNetworkForProcess == network) return true // 快路径：已绑同一网络
         val ok = connectivityManager.bindProcessToNetwork(network)
