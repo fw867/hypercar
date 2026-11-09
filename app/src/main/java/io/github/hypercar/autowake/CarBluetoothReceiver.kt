@@ -39,7 +39,7 @@ class CarBluetoothReceiver : BroadcastReceiver() {
         }
         val app = context.applicationContext
         // 每次都读开关：进程可能刚被广播冷启动，无内存缓存可依赖
-        if (!SettingsStore.autoConnect && (connected || !io.github.hypercar.session.HyperCarRepo.hasCurrentSession)) return
+        if (!SettingsStore.autoConnect && !io.github.hypercar.session.HyperCarRepo.hasCurrentSession) return
 
         val device = deviceOf(intent)
         if (device == null) {
@@ -74,6 +74,10 @@ class CarBluetoothReceiver : BroadcastReceiver() {
             }
             return
         }
+        // Record actual, filtered classic edges once. A delayed service ACTION_START relay
+        // must not turn an old connected event into fresh evidence after a disconnect.
+        io.github.hypercar.session.HyperCarRepo.noteCarActivationWake(address, connected)
+        if (!SettingsStore.autoConnect && connected) return // observe an existing manual session only
         val handler = AutoStart.handler
         if (handler == null) {
             Log.i(TAG, "AutoStart.handler 未注入——放弃")

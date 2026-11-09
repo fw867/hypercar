@@ -288,6 +288,7 @@ object HyperCarRepo {
 
     /** 连续失败次数（成功进 connected 时清零），用来做退避与上限。 */
     private val reconnectBudget = ReconnectBudget()
+    private val activationWakeEvidence = CarActivationWakeEvidence()
 
     @Volatile
     private var userDisconnectRequested = false
@@ -381,7 +382,7 @@ object HyperCarRepo {
                         return@handler
                     }
                     if (hasCurrentSession && wifiReceiverMac != null && boundNetwork != null) {
-                        log("HANDOFF: 已知车机 Wi-Fi 恢复会话不依赖蓝牙 ACL，继续检查 AirPlay 链路")
+                        log("WIFI-RESUME: 保留已知车机网络及监听；ACL 退场不代表激活成功，等待阶段可按新状态证据有界恢复")
                         logAclEvent(device, connected)
                         return@handler
                     }
@@ -426,6 +427,11 @@ object HyperCarRepo {
     // ---------------------------------------------------------------- 对 UI
 
     val hasCurrentSession: Boolean get() = sessionLive.get() || connecting || streaming
+
+    /** Only the filtered classic ACL broadcast calls this, never the foreground-service relay. */
+    internal fun noteCarActivationWake(mac: String, connected: Boolean) {
+        activationWakeEvidence.observe(mac, connected, SystemClock.elapsedRealtime())
+    }
 
     /** BMW HUD: AMap notifications for self UI or structured CarWith data; other profiles send none. */
     @Volatile private var hudSessionEnabled = false
@@ -1155,6 +1161,12 @@ object HyperCarRepo {
             val knownWifiRetry = KnownWifiActivationRetry()
             var retryEndpoint: CarPlayEndpoint? = null
             suspend fun waitForInvitation(reason: String, failedEndpoint: CarPlayEndpoint?, activationClosed: Boolean = false) {
+                // Snapshot before the suspending network checks, so a later wake is not
+                // accidentally consumed as part of the old failure's baseline.
+                val failedAt = SystemClock.elapsedRealtime()
+                val failedNetwork = boundNetwork?.toString()
+                val failedReceiver = wifiReceiverMac
+                val failedWake = activationWakeEvidence.snapshot(failedReceiver)?.connectedRevision ?: 0L
                 invitationOnly = true
                 sessionSockets?.invalidate() // Retire only the failed engine's socket factory, not Wi-Fi.
                 lateAirplayEndpoint.set(null)
@@ -1168,10 +1180,13 @@ object HyperCarRepo {
                 lastSeen.set(null)
                 airplayHost = null
                 airplayPort = 0
-                val retryDelay = if (proactiveWifiSessionAllowed(context, SettingsStore.proactiveWifiSession)) {
-                    knownWifiRetry.failed(boundNetwork?.toString(), wifiReceiverMac, SystemClock.elapsedRealtime(), activationClosed)
-                } else { knownWifiRetry.clear(); null }
-                retryEndpoint = failedEndpoint.takeIf { retryDelay != null }
+                // A temporary eligibility loss must not replenish the same scope's budget.
+                val scheduledDelay = knownWifiRetry.failed(failedNetwork, failedReceiver, failedAt, activationClosed, failedWake)
+                val retryEligible = proactiveWifiSessionAllowed(context, SettingsStore.proactiveWifiSession)
+                val retryDelay = scheduledDelay.takeIf { retryEligible }
+                // Keep only a scoped hint. It remains gated by ready() until a fresh wake
+                // actually reserves recovery; no TCP probe or full subnet rescan while blocked.
+                retryEndpoint = failedEndpoint.takeIf { scheduledDelay != null || activationClosed }
                 connectionDiagnostics.mark(diagnosticId,
                     if (retryDelay != null) ConnectionDiagnostics.Stage.WAITING_PROACTIVE_RETRY
                     else ConnectionDiagnostics.Stage.WAITING_INVITATION, reason)
@@ -1179,9 +1194,9 @@ object HyperCarRepo {
                 if (retryDelay != null) {
                     log("ACTIVATION: 主动建链失败：$reason；保留身份/Wi-Fi，已配对车机网络将在至少 ${retryDelay / 1000}s 后重试，车机邀请仍优先")
                     push(link = LinkState.Negotiating("车机 Wi-Fi 恢复未完成，稍后自动重试"))
-                } else if (activationClosed) {
-                    log("ACTIVATION: RECORD 后、资源确认前关闭：$reason；本轮同一车机/网络停止主动重放，保留身份、Wi-Fi、广播和蓝牙监听，等待新邀请；未收到明确拒绝码")
-                    push(link = LinkState.Negotiating("车机尚未完成激活，等待新邀请"))
+                } else if (activationClosed && retryEligible) {
+                    log("ACTIVATION: RECORD 后、资源确认前关闭：$reason；等待新邀请或同车新 ACL 状态；距失败至少30s、状态安静10s后最多恢复${KnownWifiActivationRetry.MAX_STATE_RECOVERIES}次，计入${KnownWifiActivationRetry.MAX_RETRIES}次总重试；未收到明确拒绝码")
+                    push(link = LinkState.Negotiating("车机尚未激活，等待邀请或状态变化"))
                 } else {
                     log("ACTIVATION: 主动建链失败：$reason；当前不满足已配对车机 Wi-Fi 条件，保留身份与广播，等待车机邀请")
                     push(link = LinkState.Negotiating("主动连接未获接受，等待车机邀请"))
@@ -2366,13 +2381,25 @@ object HyperCarRepo {
         val proactiveEnabled = SettingsStore.proactiveWifiSession && HeadUnitActivationPolicy.permitsProactive(headUnitProfile)
         val proactiveDelay = ProactiveWifiSessionDelay()
         suspend fun proactiveReady(): Boolean {
-            val eligible = proactiveWifiSessionAllowed(context, proactiveEnabled)
+            val eligible = proactiveWifiSessionAllowed(context, proactiveEnabled && SettingsStore.proactiveWifiSession)
+            if (!sessionLive.get() || connectionAttemptId != diagnosticId || ctrlAdvertiser !== advertiser ||
+                iap2 !== coordinator) return false
             val now = SystemClock.elapsedRealtime()
             val network = boundNetwork?.toString()
             val receiver = wifiReceiverMac
             val stable = proactiveDelay.ready(eligible, network, now)
             if (!stable) return false
             if (!invitationOnly) return true // the user's explicit manual start can bypass idle cooldown
+            // Do not spend a recovery reservation on an invitation/endpoint already available.
+            if (usableCtrlInvitation(advertiser) != null || standbyEndpoint.get() != null) return false
+            val recovery = knownWifiRetry.recoverAfterStateChange(eligible, automaticPauseRemaining > 0,
+                network, receiver, now, activationWakeEvidence.snapshot(receiver))
+            if (recovery != null) {
+                log("ACTIVATION-RECOVERY: attempt=$diagnosticId network=$network 新车机 ACL 状态已安静10s，距失败至少30s；恢复${recovery.number}/${KnownWifiActivationRetry.MAX_STATE_RECOVERIES}，总重试${recovery.totalRetries}/${KnownWifiActivationRetry.MAX_RETRIES}；车机邀请仍优先")
+                connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.WAITING_PROACTIVE_RETRY,
+                    "车机状态变化后有界恢复 ${recovery.number}/${KnownWifiActivationRetry.MAX_STATE_RECOVERIES}")
+                push(link = LinkState.Negotiating("车机状态已稳定，恢复尝试 ${recovery.number}/${KnownWifiActivationRetry.MAX_STATE_RECOVERIES}"))
+            }
             // A newly bound trusted network needs its own stable grace; never inherit an old
             // endpoint or backoff from another receiver. Unknown networks remain invite-only.
             return knownWifiRetry.allowsRetry(eligible, automaticPauseRemaining > 0, network, receiver, now)
