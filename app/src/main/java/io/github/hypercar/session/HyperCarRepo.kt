@@ -289,6 +289,9 @@ object HyperCarRepo {
     /** 连续失败次数（成功进 connected 时清零），用来做退避与上限。 */
     private val reconnectBudget = ReconnectBudget()
     private val activationWakeEvidence = CarActivationWakeEvidence()
+    @Volatile private var lastInviteWakeNudgeAt = 0L
+    /** True while bound and waiting for ctrl invite / inbound iAP2 (not while streaming). */
+    @Volatile private var awaitingCarInvitation = false
 
     @Volatile
     private var userDisconnectRequested = false
@@ -361,7 +364,10 @@ object HyperCarRepo {
                         updateCarProfileGuard(app)
                         CarProfileGuard.onCarConnected(app, device, address)
                     }
-                    if (!HyperCarService.isRunning) {
+                    if (hasCurrentSession) {
+                        // Already waiting for invite/iAP2: refresh discovery on ACL, do not start AirPlay.
+                        scope.launch { nudgeInvitationDiscovery(app, "ACL 连上") }
+                    } else if (!HyperCarService.isRunning) {
                         runCatching {
                             app.startForegroundService(HyperCarService.startIntent(app, device))
                         }.onFailure {
@@ -382,7 +388,10 @@ object HyperCarRepo {
                         return@handler
                     }
                     if (hasCurrentSession && wifiReceiverMac != null && boundNetwork != null) {
-                        log("WIFI-RESUME: 保留已知车机网络及监听；ACL 退场不代表激活成功，等待阶段可按新状态证据有界恢复")
+                        // BMW secondary: phone is often already on car Wi-Fi; ACL closes after a
+                        // short window. Refresh ctrl on that handoff so the car can invite on Wi-Fi.
+                        log("WIFI-RESUME: 保留已知车机网络及监听；ACL 短窗口退场属二次上车常见交接，刷新 ctrl 等 Wi-Fi 邀请")
+                        scope.launch { nudgeInvitationDiscovery(app, "ACL 退场交 Wi-Fi", handoffToWifi = true) }
                         logAclEvent(device, connected)
                         return@handler
                     }
@@ -449,9 +458,40 @@ object HyperCarRepo {
     fun connectFromCompanion(context: Context, address: String) {
         if (!io.github.hypercar.autowake.CompanionWakePolicy.accepts(
                 SettingsStore.autoConnect, SettingsStore.targetCarMac, address,
-            ) || hasCurrentSession) return
+            )) return
+        if (hasCurrentSession) {
+            scope.launch { nudgeInvitationDiscovery(context.applicationContext, "companion") }
+            return
+        }
         log("COMPANION: 恢复监听并请求自动会话；仍等待本轮车机邀请")
         connectAutomatically(context, "companion")
+    }
+
+    /**
+     * Known-Wi-Fi invite wait: ACL is often only a short BMW wake window before Wi-Fi takes
+     * over. Refresh `_carplay-ctrl._tcp` so the car can invite on Wi-Fi; do not start the
+     * experimental proactive AirPlay switch, and do not require a lasting BT iAP2 session.
+     */
+    private suspend fun nudgeInvitationDiscovery(
+        context: Context,
+        reason: String,
+        handoffToWifi: Boolean = false,
+    ) {
+        val advertiser = ctrlAdvertiser
+        val now = SystemClock.elapsedRealtime()
+        val keepWifi = runCatching { RustCoreBridge.nativeCanKeepWifiSession() }.getOrDefault(false)
+        if (!InviteWakeNudge.shouldNudge(sessionLive.get(), streaming, keepWifi, advertiser != null,
+                now, lastInviteWakeNudgeAt, handoffToWifi)) return
+        lastInviteWakeNudgeAt = now
+        val ssid = sessionWifiSsid ?: currentWifiSsid(context)
+        val network = boundNetwork
+        val refreshed = advertiser?.nudgeWhileWaiting(reason, ssid, network) == true
+        val armed = InviteWakeNudge.armDiscoverable(handoffToWifi) &&
+            io.github.hypercar.bluetooth.ReconnectDiscoverability.armForWake()
+        log("INVITE-WAKE: $reason；刷新ctrl=${if (refreshed) "是" else "否"} 可发现再开=${if (armed) "是" else "否"}；" +
+            "继续等车机 Wi-Fi ctrl 邀请（宝马二次上车蓝牙短窗口后常退场，不触发主动建链）")
+        push(link = LinkState.Negotiating(
+            if (handoffToWifi) "蓝牙已交棒，等待车机 Wi-Fi 邀请" else "车机已回连，等待 CarPlay 邀请"))
     }
 
     private fun requestConnect(context: Context, manual: Boolean, source: String) {
@@ -477,8 +517,41 @@ object HyperCarRepo {
                     // a failed manual retry falls back into the old ten-minute identity-only state.
                     clearAutomaticPause(context.applicationContext, "手动启动连接")
                 }
+                if (WaitingInvitationRetryPolicy.shouldSoftRestart(manual, awaitingCarInvitation,
+                        hasCurrentSession, streaming)) {
+                    softRestartInvitationWait(context)
+                    return@launch
+                }
                 if (AutomaticConnectionPolicy.mayStart(manual, SettingsStore.autoConnect, automaticPauseRemaining > 0)) beginConnect(context, source)
             } finally { autoConnectChanges.unlock() }
+        }
+    }
+
+    /**
+     * Invite-wait rounds keep [sessionLive] true, so a normal CONNECT was ignored and the car
+     * tap/ACL path could not open a fresh attempt. Manual retry ends the wait without the
+     * ten-minute pause, then starts a new attempt with listening restored.
+     */
+    private suspend fun softRestartInvitationWait(context: Context) {
+        val attempt = connectionAttemptId
+        log("CONNECT: 等待邀请中手动重试——结束 attempt=$attempt 后重新开始，不创建10分钟暂停")
+        reconnectBudget.clear()
+        userDisconnectRequested = false
+        awaitingCarInvitation = false
+        reconnectJob?.cancel()
+        reconnectJob = null
+        sessionSockets?.invalidate()
+        val pending = connectJob
+        connectJob = null
+        pending?.cancel()
+        withTimeoutOrNull(JOIN_TIMEOUT_MILLIS) { pending?.join() }
+        // keepListening restores cafe accept without the ten-minute STOP_AND_PAUSE path.
+        runDisconnect("手动重试等待中的邀请轮次", keepListening = true, graceful = false)
+        reconnectJob?.cancel()
+        reconnectJob = null
+        connecting = false
+        if (AutomaticConnectionPolicy.mayStart(true, SettingsStore.autoConnect, automaticPauseRemaining > 0)) {
+            beginConnect(context, "manual-retry")
         }
     }
 
@@ -1168,6 +1241,7 @@ object HyperCarRepo {
                 val failedReceiver = wifiReceiverMac
                 val failedWake = activationWakeEvidence.snapshot(failedReceiver)?.connectedRevision ?: 0L
                 invitationOnly = true
+                awaitingCarInvitation = true
                 sessionSockets?.invalidate() // Retire only the failed engine's socket factory, not Wi-Fi.
                 lateAirplayEndpoint.set(null)
                 standbyEndpoint.set(null)
@@ -1438,8 +1512,10 @@ object HyperCarRepo {
                     s
                 }
             }
+            awaitingCarInvitation = false
             return
         }
+        awaitingCarInvitation = false
         push(link = LinkState.Stopping)
         closedPipelineGeneration.accumulateAndGet(_snapshots.value.pipeline.generation, ::maxOf)
         finishDiagnostic("STOPPED", reason)
@@ -2406,6 +2482,7 @@ object HyperCarRepo {
         }
         prepareInvitationNetwork(context, advertiser)
         var requireActivation = (invitationOnly || profileRequiresActivation) && !proactiveReady()
+        if (invitationOnly || profileRequiresActivation) awaitingCarInvitation = true
         log("WIFI-ACTIVE: 本轮开关=$proactiveEnabled 延时=${ProactiveWifiSessionPolicy.DELAY_MILLIS}ms 失败后已知网络恢复=$invitationOnly（需重新核实车机/网络及退避）；正常邀请优先，端口可连不代表车机已授权")
         if (requireActivation) {
             log("SESSION: 等待本轮 ctrl 邀请或 iAP2 端点；保持蓝牙监听与 Wi-Fi 广播，不预连记忆/扫描端口")
@@ -2418,7 +2495,10 @@ object HyperCarRepo {
                     SystemClock.elapsedRealtime())
             }
             if (candidate != null && advertiser.lastInvitePeerIp == null &&
-                (!invitationOnly || proactiveReady())) return@withTimeoutOrNull candidate
+                (!invitationOnly || proactiveReady())) {
+                awaitingCarInvitation = false
+                return@withTimeoutOrNull candidate
+            }
         }
 
         val callbacks = Channel<CarPlayEndpoint>(Channel.UNLIMITED)
@@ -2546,8 +2626,17 @@ object HyperCarRepo {
                         // 区分「车机根本没连进来」与「连进来了但没给凭据」——前者是车机
                         // 侧的问题（iDrive 里没把本机当 CarPlay 手机），后者才是协议问题。
                         if (requireActivation) {
-                            log("SESSION: 等待本轮车机邀请/0x4301，已等 ${waited}s；" +
-                                "蓝牙会话次数=${coordinator.sessionStartCount} 已收Wi-Fi凭据=${seen?.ssid != null}，保持广播与监听")
+                            val wifiBound = wifiReceiverMac != null && boundNetwork != null
+                            log(
+                                if (wifiBound) {
+                                    "SESSION: 等待本轮车机 Wi-Fi ctrl 邀请，已等 ${waited}s；" +
+                                        "已绑定已知车机网络，宝马二次上车蓝牙常仅短窗口后交棒，" +
+                                        "不以持续 iAP2 会话为成败（本轮蓝牙会话=${coordinator.sessionStartCount}）"
+                                } else {
+                                    "SESSION: 等待本轮车机邀请/0x4301，已等 ${waited}s；" +
+                                        "蓝牙会话次数=${coordinator.sessionStartCount} 已收Wi-Fi凭据=${seen?.ssid != null}，保持广播与监听"
+                                },
+                            )
                         } else if (seen == null && coordinator.sessionStartCount == 0 && wifiReceiverMac == null) {
                             log(
                                 "SESSION: ${waited}s 内车机一次都没发起 iAP2（ACL 已连但收不到 …cafe 连入）——" +
@@ -2592,6 +2681,7 @@ object HyperCarRepo {
                 }
             }
             log("SESSION: 端点就绪 ips=${usable?.ipAddresses} port=${usable?.airPlayPort}")
+            if (usable != null) awaitingCarInvitation = false
             usable
         } finally {
             callbacks.close()
