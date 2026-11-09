@@ -29,5 +29,18 @@ class ReconnectDiscoverabilityPolicyTest {
         p.shouldAttempt(true, "a", true, false, 0)
         assertFalse(p.shouldAttempt(true, "a", true, true, 4_000))
         assertFalse(p.shouldAttempt(true, "a", true, false, 60_000))
+        assertFalse(p.armForWake())
+    }
+
+    @Test fun aclWakeCanArmOneExtraWindowAfterTheInitialAttempt() {
+        val p = ReconnectDiscoverabilityPolicy()
+        assertFalse(p.armForWake())
+        assertFalse(p.shouldAttempt(true, "car", true, false, 0))
+        assertTrue(p.shouldAttempt(true, "car", true, false, 5_000))
+        assertTrue(p.armForWake())
+        assertFalse(p.armForWake()) // already armed
+        assertTrue(p.shouldAttempt(true, "car", true, false, 6_000))
+        assertFalse(p.shouldAttempt(true, "car", true, false, 7_000))
+        assertTrue(p.armForWake())
     }
 }

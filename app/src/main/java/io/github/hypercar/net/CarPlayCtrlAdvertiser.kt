@@ -50,7 +50,8 @@ class CarPlayCtrlAdvertiser(
         private const val PLACEHOLDER_MAC = "02:00:00:00:00:00"
         private const val REGISTRATION_TIMEOUT_MILLIS = 10_000L
         private const val REFRESH_INTERVAL_MILLIS = 30_000L
-        private const val MAX_WAITING_REFRESHES = 2
+        /** Keep announcing while the car may still browse; ACL wake can reset the budget. */
+        private const val MAX_WAITING_REFRESHES = 8
     }
 
     private val appContext = context.applicationContext
@@ -137,6 +138,18 @@ class CarPlayCtrlAdvertiser(
             ok = start()
         }
         return ok
+    }
+
+    /**
+     * ACL/companion wake while still waiting for an invite: replenish the refresh budget and
+     * re-announce on the bound car network. Does not start AirPlay by itself.
+     */
+    @Synchronized
+    fun nudgeWhileWaiting(reason: String, ssid: String?, network: Network?): Boolean {
+        if (ssid.isNullOrBlank() || network == null || lastInvitePeerIp != null) return false
+        waitingRefreshes = 0
+        log("$TAG: 车机状态变化（$reason）——重置等待刷新并重播 _carplay-ctrl._tcp")
+        return ensureForNetwork(ssid, force = true, network = network)
     }
 
     @Synchronized

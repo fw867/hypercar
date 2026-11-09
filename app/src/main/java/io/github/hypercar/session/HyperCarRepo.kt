@@ -289,6 +289,7 @@ object HyperCarRepo {
     /** 连续失败次数（成功进 connected 时清零），用来做退避与上限。 */
     private val reconnectBudget = ReconnectBudget()
     private val activationWakeEvidence = CarActivationWakeEvidence()
+    @Volatile private var lastInviteWakeNudgeAt = 0L
 
     @Volatile
     private var userDisconnectRequested = false
@@ -361,7 +362,10 @@ object HyperCarRepo {
                         updateCarProfileGuard(app)
                         CarProfileGuard.onCarConnected(app, device, address)
                     }
-                    if (!HyperCarService.isRunning) {
+                    if (hasCurrentSession) {
+                        // Already waiting for invite/iAP2: refresh discovery on ACL, do not start AirPlay.
+                        scope.launch { nudgeInvitationDiscovery(app, "ACL 连上") }
+                    } else if (!HyperCarService.isRunning) {
                         runCatching {
                             app.startForegroundService(HyperCarService.startIntent(app, device))
                         }.onFailure {
@@ -449,9 +453,33 @@ object HyperCarRepo {
     fun connectFromCompanion(context: Context, address: String) {
         if (!io.github.hypercar.autowake.CompanionWakePolicy.accepts(
                 SettingsStore.autoConnect, SettingsStore.targetCarMac, address,
-            ) || hasCurrentSession) return
+            )) return
+        if (hasCurrentSession) {
+            scope.launch { nudgeInvitationDiscovery(context.applicationContext, "companion") }
+            return
+        }
         log("COMPANION: 恢复监听并请求自动会话；仍等待本轮车机邀请")
         connectAutomatically(context, "companion")
+    }
+
+    /**
+     * Waiting for a car invite with known Wi-Fi already up: ACL/companion is a rediscovery
+     * signal, not a cue to run the experimental proactive AirPlay switch.
+     */
+    private suspend fun nudgeInvitationDiscovery(context: Context, reason: String) {
+        val advertiser = ctrlAdvertiser
+        val now = SystemClock.elapsedRealtime()
+        val keepWifi = runCatching { RustCoreBridge.nativeCanKeepWifiSession() }.getOrDefault(false)
+        if (!InviteWakeNudge.shouldNudge(sessionLive.get(), streaming, keepWifi, advertiser != null,
+                now, lastInviteWakeNudgeAt)) return
+        lastInviteWakeNudgeAt = now
+        val ssid = sessionWifiSsid ?: currentWifiSsid(context)
+        val network = boundNetwork
+        val refreshed = advertiser?.nudgeWhileWaiting(reason, ssid, network) == true
+        val armed = io.github.hypercar.bluetooth.ReconnectDiscoverability.armForWake()
+        log("INVITE-WAKE: $reason；刷新ctrl=${if (refreshed) "是" else "否"} 可发现再开=${if (armed) "是" else "否"}；" +
+            "继续等车机 iAP2/ctrl 邀请（不触发 Wi-Fi 主动建链）")
+        push(link = LinkState.Negotiating("车机已回连，等待 CarPlay 邀请"))
     }
 
     private fun requestConnect(context: Context, manual: Boolean, source: String) {
