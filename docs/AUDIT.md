@@ -147,6 +147,8 @@ Release Lint 0 Error / 47 Warning / 2 Information，APK构建及签名校验通�
 
 ## BOX-OFF 恢复预算与网络资源移植
 
+611回归修复：610新增Shizuku BSSID解析在手机运行时报PatternSyntaxException，导致正常取得iAP2参数后本地终止。桌面JVM测试没有覆盖这个Android运行时路径。现MAC与BSSID字段解析均不依赖正则，缺失/格式异常/读取失败返回空以继续正常入网，CancellationException仍传播；加入手机DEX执行验证，结果见VALIDATION。没有改动奔驰媒体请求参数以掩盖这次入网前错误。
+
 610修正控制connected立即清零重试、失败重试未建立链路就中止恢复链、同轮主动Wi-Fi激活无限退避三处预算缺口。采用独立ReconnectBudget，实际写帧后观察约两分钟，整会话恢复五次且不阻止手动/新邀请；已知网络内另有五次保守间隔预算。纯策略回归覆盖短暂成功、失败重试、耗尽、换车、手动重启及原有十分钟暂停。
 
 joinAndBind原缓存快路径未验证句柄存活，失败兜底还可取任意第一条Wi-Fi；改为实时匹配SSID/可用地址/路由与可用的BSSID。失败清理由任意IO/JNI回调直接操作全局资源改为按轮次排队，与启动/停止共锁；绑定及移交FD时再检查当前轮次，旧结果不能启动或停止新核心。未将第三方源码纳入仓库，未改动609的原生二进制及奔驰专用策略。验证状态见VALIDATION。

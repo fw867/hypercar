@@ -44,6 +44,8 @@ useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关�
 
 ## 奔驰 MBUX
 
+11月9日14:29导出日志（版本524）头部五次尝试均报BSSID辅助读取正则异常，正文后两轮也复现；阶段止于IAP2_PARAMETERS，没有/auth-setup、屏幕SETUP或RECORD。蓝牙已给出热点与端点，后续RFCOMM local_cancel=true由本地失败清理造成，不是本轮车机拒绝媒体的证据。路径对应610新增复用检查。611去掉该路径正则，用ASCII/标签扫描解析并把辅助读取失败降级为正常入网；保留取消，不降低网络复用的身份/地址校验。
+
 样本MB_E-P-4 / MBUX00081，verified=false。三份06:25/06:27/06:30导出存在包含关系，去重后8次引擎配置、7次屏幕SETUP空体400；能完成pair-verify、会话SETUP、RECORD及初始资源声明，不能用后续EOF掩盖最早明确400。车机提供0x4301热点和IPv6端点，无须强等ctrl GET。
 
 更新后的winplay.txt虽选择winplay档案，实际身份仍为奔驰，不是Windows接收端独立成功样本。06:36:35那轮屏幕SETUP400、音频SETUP400，CarWith本地7240持续拒绝；即使Wi-Fi iAP2传输READY，直到导出也无视频帧及音频包。修正IPv6音频URI仍不足以消除该轮400。试验档案保留控制和iAP2等待后续资源，不宣称解决屏幕拒绝。

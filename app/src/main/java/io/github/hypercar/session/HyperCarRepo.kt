@@ -1539,8 +1539,10 @@ object HyperCarRepo {
         var fallbackBssid = fallbackInfo?.bssid
         if (networks.size == 1 && io.github.hypercar.net.CarNetworkReuse.mac(endpoint.deviceIdentifier) != null &&
             io.github.hypercar.net.CarNetworkReuse.mac(fallbackBssid) == null && ShizukuTools.isReady) {
-            val status = ShizukuTools.exec("cmd wifi status", 3_000).out
-            fallbackBssid = Regex("""(?i)BSSID\s*[:=]\s*([0-9a-f:]{17})""").find(status)?.groupValues?.get(1)
+            fallbackBssid = io.github.hypercar.net.CarNetworkReuse.readBssid {
+                ShizukuTools.exec("cmd wifi status", 3_000).out
+            }
+            if (fallbackBssid == null) log("WIFI-REUSE: 未取得可靠 BSSID，继续正常入网，不中断 iAP2")
         }
         val peers = (endpoint.ipAddresses + listOfNotNull(endpoint.gateway)).mapNotNull {
             runCatching { android.net.InetAddresses.parseNumericAddress(it.substringBefore('%')) }.getOrNull()
