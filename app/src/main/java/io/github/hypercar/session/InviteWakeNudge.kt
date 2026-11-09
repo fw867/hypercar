@@ -25,6 +25,14 @@ internal object InviteWakeNudge {
         return true
     }
 
+    /** Connect and Wi-Fi handoff keep separate clocks so a short ACL cannot eat the handoff refresh. */
+    fun cooldownAnchor(handoffToWifi: Boolean, lastConnectNudgeAt: Long, lastHandoffNudgeAt: Long): Long =
+        if (handoffToWifi) lastHandoffNudgeAt else lastConnectNudgeAt
+
+    /** Cooldown starts only after ctrl was actually re-announced. A failed refresh leaves the clock unchanged. */
+    fun rememberNudge(refreshed: Boolean, now: Long, previous: Long): Long =
+        if (refreshed) now else previous
+
     /** Discoverable only helps while ACL may still be up; skip it on Wi-Fi handoff. */
     fun armDiscoverable(handoffToWifi: Boolean): Boolean = !handoffToWifi
 }
