@@ -290,6 +290,8 @@ object HyperCarRepo {
     private val reconnectBudget = ReconnectBudget()
     private val activationWakeEvidence = CarActivationWakeEvidence()
     @Volatile private var lastInviteWakeNudgeAt = 0L
+    /** True while bound and waiting for ctrl invite / inbound iAP2 (not while streaming). */
+    @Volatile private var awaitingCarInvitation = false
 
     @Volatile
     private var userDisconnectRequested = false
@@ -505,8 +507,41 @@ object HyperCarRepo {
                     // a failed manual retry falls back into the old ten-minute identity-only state.
                     clearAutomaticPause(context.applicationContext, "手动启动连接")
                 }
+                if (WaitingInvitationRetryPolicy.shouldSoftRestart(manual, awaitingCarInvitation,
+                        hasCurrentSession, streaming)) {
+                    softRestartInvitationWait(context)
+                    return@launch
+                }
                 if (AutomaticConnectionPolicy.mayStart(manual, SettingsStore.autoConnect, automaticPauseRemaining > 0)) beginConnect(context, source)
             } finally { autoConnectChanges.unlock() }
+        }
+    }
+
+    /**
+     * Invite-wait rounds keep [sessionLive] true, so a normal CONNECT was ignored and the car
+     * tap/ACL path could not open a fresh attempt. Manual retry ends the wait without the
+     * ten-minute pause, then starts a new attempt with listening restored.
+     */
+    private suspend fun softRestartInvitationWait(context: Context) {
+        val attempt = connectionAttemptId
+        log("CONNECT: 等待邀请中手动重试——结束 attempt=$attempt 后重新开始，不创建10分钟暂停")
+        reconnectBudget.clear()
+        userDisconnectRequested = false
+        awaitingCarInvitation = false
+        reconnectJob?.cancel()
+        reconnectJob = null
+        sessionSockets?.invalidate()
+        val pending = connectJob
+        connectJob = null
+        pending?.cancel()
+        withTimeoutOrNull(JOIN_TIMEOUT_MILLIS) { pending?.join() }
+        // keepListening restores cafe accept without the ten-minute STOP_AND_PAUSE path.
+        runDisconnect("手动重试等待中的邀请轮次", keepListening = true, graceful = false)
+        reconnectJob?.cancel()
+        reconnectJob = null
+        connecting = false
+        if (AutomaticConnectionPolicy.mayStart(true, SettingsStore.autoConnect, automaticPauseRemaining > 0)) {
+            beginConnect(context, "manual-retry")
         }
     }
 
@@ -1196,6 +1231,7 @@ object HyperCarRepo {
                 val failedReceiver = wifiReceiverMac
                 val failedWake = activationWakeEvidence.snapshot(failedReceiver)?.connectedRevision ?: 0L
                 invitationOnly = true
+                awaitingCarInvitation = true
                 sessionSockets?.invalidate() // Retire only the failed engine's socket factory, not Wi-Fi.
                 lateAirplayEndpoint.set(null)
                 standbyEndpoint.set(null)
@@ -1466,8 +1502,10 @@ object HyperCarRepo {
                     s
                 }
             }
+            awaitingCarInvitation = false
             return
         }
+        awaitingCarInvitation = false
         push(link = LinkState.Stopping)
         closedPipelineGeneration.accumulateAndGet(_snapshots.value.pipeline.generation, ::maxOf)
         finishDiagnostic("STOPPED", reason)
@@ -2434,6 +2472,7 @@ object HyperCarRepo {
         }
         prepareInvitationNetwork(context, advertiser)
         var requireActivation = (invitationOnly || profileRequiresActivation) && !proactiveReady()
+        if (invitationOnly || profileRequiresActivation) awaitingCarInvitation = true
         log("WIFI-ACTIVE: 本轮开关=$proactiveEnabled 延时=${ProactiveWifiSessionPolicy.DELAY_MILLIS}ms 失败后已知网络恢复=$invitationOnly（需重新核实车机/网络及退避）；正常邀请优先，端口可连不代表车机已授权")
         if (requireActivation) {
             log("SESSION: 等待本轮 ctrl 邀请或 iAP2 端点；保持蓝牙监听与 Wi-Fi 广播，不预连记忆/扫描端口")
@@ -2446,7 +2485,10 @@ object HyperCarRepo {
                     SystemClock.elapsedRealtime())
             }
             if (candidate != null && advertiser.lastInvitePeerIp == null &&
-                (!invitationOnly || proactiveReady())) return@withTimeoutOrNull candidate
+                (!invitationOnly || proactiveReady())) {
+                awaitingCarInvitation = false
+                return@withTimeoutOrNull candidate
+            }
         }
 
         val callbacks = Channel<CarPlayEndpoint>(Channel.UNLIMITED)
@@ -2620,6 +2662,7 @@ object HyperCarRepo {
                 }
             }
             log("SESSION: 端点就绪 ips=${usable?.ipAddresses} port=${usable?.airPlayPort}")
+            if (usable != null) awaitingCarInvitation = false
             usable
         } finally {
             callbacks.close()
