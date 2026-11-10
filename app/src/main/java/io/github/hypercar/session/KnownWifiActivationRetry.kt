@@ -12,6 +12,8 @@ internal class KnownWifiActivationRetry {
     private var activationFailedAt = 0L
     private var blockedWakeRevision = 0L
     private var stateRecoveries = 0
+    /** Uninvited self-dialed :7000 closed after RECORD. Do not replay that port. */
+    private var replayBlocked = false
 
     data class StateRetry(val number: Int, val totalRetries: Int)
 
@@ -25,6 +27,10 @@ internal class KnownWifiActivationRetry {
         if (!matches(network, mac)) clear()
         this.network = network
         receiver = key
+        if (replayBlocked) {
+            invitationRequired = true
+            return null
+        }
         if (waitForInvitation && !invitationRequired) {
             activationFailedAt = now
             blockedWakeRevision = wakeRevision
@@ -45,7 +51,7 @@ internal class KnownWifiActivationRetry {
         eligible: Boolean, paused: Boolean, network: String?, mac: String?, now: Long,
         wake: CarActivationWakeEvidence.Snapshot?,
     ): StateRetry? {
-        if (!eligible || paused || !matches(network, mac) || !invitationRequired || exhausted ||
+        if (replayBlocked || !eligible || paused || !matches(network, mac) || !invitationRequired || exhausted ||
             stateRecoveries >= MAX_STATE_RECOVERIES || failures >= MAX_RETRIES || wake == null ||
             wake.receiver != receiver || wake.connectedRevision <= blockedWakeRevision ||
             wake.lastChangedAt < activationFailedAt || now < activationFailedAt || now < wake.lastChangedAt ||
@@ -59,8 +65,21 @@ internal class KnownWifiActivationRetry {
         return StateRetry(stateRecoveries, failures)
     }
 
+    /** No ctrl invite and no iAP2: the head unit closed the phone-dialed :7000 after RECORD.
+     * Stay on the invite wait. A later ACL edge must not replay this port. */
+    fun suppressUninvitedReplay(network: String?, mac: String?) {
+        val key = PairingEvidence.receiverKey(mac)
+        if (network == null || key == null) return
+        if (!matches(network, mac)) clear()
+        this.network = network
+        receiver = key
+        invitationRequired = true
+        replayBlocked = true
+        retryAt = 0
+    }
+
     fun ready(network: String?, mac: String?, now: Long): Boolean =
-        matches(network, mac) && !invitationRequired && !exhausted && now >= retryAt
+        matches(network, mac) && !replayBlocked && !invitationRequired && !exhausted && now >= retryAt
 
     fun allowsRetry(eligible: Boolean, paused: Boolean, network: String?, mac: String?, now: Long): Boolean =
         eligible && !paused && network != null && PairingEvidence.receiverKey(mac) != null &&
@@ -68,7 +87,7 @@ internal class KnownWifiActivationRetry {
 
     fun clear() {
         network = null; receiver = null; failures = 0; retryAt = 0
-        invitationRequired = false; exhausted = false
+        invitationRequired = false; exhausted = false; replayBlocked = false
         activationFailedAt = 0; blockedWakeRevision = 0; stateRecoveries = 0
     }
 
@@ -78,5 +97,18 @@ internal class KnownWifiActivationRetry {
         const val ACTIVATION_COOLDOWN_MILLIS = 30_000L
         const val WAKE_SETTLE_MILLIS = 10_000L
         private val DELAYS = longArrayOf(10_000, 20_000, 40_000, 60_000)
+        const val UNINVITED_PORT = 7000
     }
 }
+
+/** Phone-dialed :7000 on known car Wi-Fi, with no ctrl invite and no iAP2, closed after RECORD. */
+internal fun suppressUninvitedPortReplay(
+    proactive: Boolean,
+    fromInvite: Boolean,
+    ctrlInvited: Boolean,
+    iap2Started: Boolean,
+    knownWifi: Boolean,
+    port: Int,
+    closedAfterRecord: Boolean,
+): Boolean = proactive && !fromInvite && !ctrlInvited && !iap2Started && knownWifi &&
+    port == KnownWifiActivationRetry.UNINVITED_PORT && closedAfterRecord

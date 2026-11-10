@@ -134,4 +134,34 @@ class ActivationStateRecoveryTest {
         assertNull(recover(71_016))
         assertEquals(KnownWifiActivationRetry.StateRetry(1, 1), recover(71_017))
     }
+
+    @Test fun uninvitedRecordCloseDoesNotReplayAfterAclSettles() {
+        assertTrue(suppressUninvitedPortReplay(
+            proactive = true, fromInvite = false, ctrlInvited = false, iap2Started = false,
+            knownWifi = true, port = 7000, closedAfterRecord = true))
+        assertFalse(suppressUninvitedPortReplay(
+            proactive = true, fromInvite = false, ctrlInvited = true, iap2Started = false,
+            knownWifi = true, port = 7000, closedAfterRecord = true))
+        assertFalse(suppressUninvitedPortReplay(
+            proactive = true, fromInvite = false, ctrlInvited = false, iap2Started = true,
+            knownWifi = true, port = 7000, closedAfterRecord = true))
+        assertFalse(suppressUninvitedPortReplay(
+            proactive = true, fromInvite = false, ctrlInvited = false, iap2Started = false,
+            knownWifi = true, port = 7100, closedAfterRecord = true))
+        assertFalse(suppressUninvitedPortReplay(
+            proactive = true, fromInvite = false, ctrlInvited = false, iap2Started = false,
+            knownWifi = false, port = 7000, closedAfterRecord = true))
+        retry.suppressUninvitedReplay("170", car)
+        signals.observe(car, true, 1_000)
+        signals.observe(car, false, 1_500)
+        assertNull(recover(60_000))
+        assertFalse(retry.ready("170", car, 60_000))
+        assertFalse(retry.allowsRetry(true, false, "170", car, 60_000))
+        assertNull(retry.failed("170", car, 60_000))
+        assertNull(recover(120_000))
+        retry.clear()
+        fail(130_000)
+        signals.observe(car, true, 131_000)
+        assertEquals(KnownWifiActivationRetry.StateRetry(1, 1), recover(160_000))
+    }
 }

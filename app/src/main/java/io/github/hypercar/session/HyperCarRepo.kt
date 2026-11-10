@@ -1284,7 +1284,12 @@ object HyperCarRepo {
             var invitationOnly = false
             val knownWifiRetry = KnownWifiActivationRetry()
             var retryEndpoint: CarPlayEndpoint? = null
-            suspend fun waitForInvitation(reason: String, failedEndpoint: CarPlayEndpoint?, activationClosed: Boolean = false) {
+            suspend fun waitForInvitation(
+                reason: String,
+                failedEndpoint: CarPlayEndpoint?,
+                activationClosed: Boolean = false,
+                suppressUninvitedReplay: Boolean = false,
+            ) {
                 // Snapshot before the suspending network checks, so a later wake is not
                 // accidentally consumed as part of the old failure's baseline.
                 val failedAt = SystemClock.elapsedRealtime()
@@ -1306,17 +1311,26 @@ object HyperCarRepo {
                 airplayHost = null
                 airplayPort = 0
                 // A temporary eligibility loss must not replenish the same scope's budget.
-                val scheduledDelay = knownWifiRetry.failed(failedNetwork, failedReceiver, failedAt, activationClosed, failedWake)
+                val scheduledDelay = if (suppressUninvitedReplay) {
+                    knownWifiRetry.suppressUninvitedReplay(failedNetwork, failedReceiver)
+                    null
+                } else {
+                    knownWifiRetry.failed(failedNetwork, failedReceiver, failedAt, activationClosed, failedWake)
+                }
                 val retryEligible = proactiveWifiSessionAllowed(context, SettingsStore.proactiveWifiSession)
                 val retryDelay = scheduledDelay.takeIf { retryEligible }
                 // Keep only a scoped hint. It remains gated by ready() until a fresh wake
                 // actually reserves recovery; no TCP probe or full subnet rescan while blocked.
-                retryEndpoint = failedEndpoint.takeIf { scheduledDelay != null || activationClosed }
+                // An uninvited :7000 closed after RECORD is not reserved for that wake.
+                retryEndpoint = failedEndpoint.takeIf { !suppressUninvitedReplay && (scheduledDelay != null || activationClosed) }
                 connectionDiagnostics.mark(diagnosticId,
                     if (retryDelay != null) ConnectionDiagnostics.Stage.WAITING_PROACTIVE_RETRY
                     else ConnectionDiagnostics.Stage.WAITING_INVITATION, reason)
                 connectionDiagnostics.report().lastOrNull()?.let { log(it) }
-                if (retryDelay != null) {
+                if (suppressUninvitedReplay) {
+                    log("ACTIVATION: 无 ctrl 邀请、无 iAP2 的 :${KnownWifiActivationRetry.UNINVITED_PORT} 在 RECORD 后被车机拆掉：$reason；不再对同一端口做状态恢复，等待车机发起 iAP2")
+                    push(link = LinkState.Negotiating("等待车机发起 iAP2"))
+                } else if (retryDelay != null) {
                     log("ACTIVATION: 主动建链失败：$reason；保留身份/Wi-Fi，已配对车机网络将在至少 ${retryDelay / 1000}s 后重试，车机邀请仍优先")
                     push(link = LinkState.Negotiating("车机 Wi-Fi 恢复未完成，稍后自动重试"))
                 } else if (activationClosed && retryEligible) {
@@ -1520,9 +1534,20 @@ object HyperCarRepo {
                 // consumed one. CAS preserves an invite that arrived during negotiation.
                 if (headUnitProfile.requireFreshCtrlInvite && activationInvite != null)
                     advertiser.discardInvitation(activationInvite)
+                val closedAfterRecord = endpoint.proactive && !endpoint.fromInvite && activation.requiresFreshInvitation
+                val suppressUninvitedReplay = suppressUninvitedPortReplay(
+                    proactive = endpoint.proactive,
+                    fromInvite = endpoint.fromInvite,
+                    ctrlInvited = advertiser.lastInvitation != null,
+                    iap2Started = coordinator.isSessionActive || coordinator.sessionStartCount > baselineSessions,
+                    knownWifi = wifiReceiverMac != null,
+                    port = port,
+                    closedAfterRecord = closedAfterRecord,
+                )
                 waitForInvitation(rejected, endpoint.copy(ipAddresses = listOf(apHostFinal),
                     airPlayPort = port, gateway = apHostFinal),
-                    activationClosed = endpoint.proactive && !endpoint.fromInvite && activation.requiresFreshInvitation)
+                    activationClosed = closedAfterRecord && !suppressUninvitedReplay,
+                    suppressUninvitedReplay = suppressUninvitedReplay)
                 RustCoreBridge.nativeStop()
                 proactiveActivation.compareAndSet(activation, null)
                 kotlinx.coroutines.currentCoroutineContext().ensureActive()
