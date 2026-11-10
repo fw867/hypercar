@@ -90,6 +90,18 @@ class Iap2Bluetooth(
 
         /** SDP 服务探测等待窗（fetchUuidsWithSdp → ACTION_UUID 广播）。 */
         private const val SDP_PROBE_TIMEOUT_MILLIS = 2_500L
+
+        /** 无本车凭证才附加首次说明；已有凭证时不要把这行读成首次配对。 */
+        internal fun handshakeBeginLine(
+            direction: String,
+            target: String,
+            identityPresent: Boolean,
+            receiverCredentialPresent: Boolean,
+        ): String {
+            val line = "BEGIN direction=$direction target=$target identity=$identityPresent receiverCredential=$receiverCredentialPresent"
+            return if (receiverCredentialPresent) line
+            else "$line；无本车凭证=首次或未知，不主动断系统配置文件"
+        }
     }
 
     private val appContext = context.applicationContext
@@ -695,7 +707,7 @@ class Iap2Bluetooth(
         val started = SystemClock.elapsedRealtime()
         val sessionLog: (String) -> Unit = { line -> log("HS#$handshakeId +${SystemClock.elapsedRealtime() - started}ms $line") }
         val evidence = io.github.hypercar.session.PairingEvidence.read(appContext.filesDir, safeAddress(socket.remoteDevice))
-        sessionLog("BEGIN direction=$tag target=${targetProvider() ?: "自动"} identity=${evidence.identityPresent} receiverCredential=${evidence.receiverCredentialPresent}；无本车凭证=首次或未知，不主动断系统配置文件")
+        sessionLog(handshakeBeginLine(tag, targetProvider() ?: "自动", evidence.identityPresent, evidence.receiverCredentialPresent))
         sessionLog("ROLE: iAP2 Device/iPhone，SDP=…cafe，deviceName=iPhone，保留无线可用性/传输身份声明")
         val channel = RfcommLinkChannel(socket, sessionLog)
         activeChannel.set(channel)

@@ -14,6 +14,7 @@ import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import io.github.hypercar.autowake.AutoStart
 import io.github.hypercar.bluetooth.CarProfileGuard
+import io.github.hypercar.bluetooth.ReconnectDiscoverability
 import io.github.hypercar.autowake.HyperCarService
 import io.github.hypercar.carui.CarUiCaster
 import io.github.hypercar.carui.MusicBridge
@@ -519,11 +520,20 @@ object HyperCarRepo {
             if (handoffToWifi) lastHandoffInviteNudgeAt = stamped else lastConnectInviteNudgeAt = stamped
         }
         val armed = InviteWakeNudge.armDiscoverable(handoffToWifi) &&
-            io.github.hypercar.bluetooth.ReconnectDiscoverability.armForWake()
+            ReconnectDiscoverability.armForWake()
         log("INVITE-WAKE: $reason；刷新ctrl=${if (refreshed) "是" else "否"} 可发现再开=${if (armed) "是" else "否"}；" +
             "继续等车机 Wi-Fi ctrl 邀请（宝马二次上车蓝牙短窗口后常退场，不触发主动建链）")
+        val waitingForCarIap2 = KnownWifiWaitCopy.awaitingHeadUnitIap2(
+            wifiReceiverMac != null && boundNetwork != null,
+            iap2?.sessionStartCount ?: 0,
+            ReconnectDiscoverability.firstWindowOver(),
+        )
         push(link = LinkState.Negotiating(
-            if (handoffToWifi) "蓝牙已交棒，等待车机 Wi-Fi 邀请" else "车机已回连，等待 CarPlay 邀请"))
+            when {
+                handoffToWifi && waitingForCarIap2 -> KnownWifiWaitCopy.HERO
+                handoffToWifi -> "蓝牙已交棒，等待车机 Wi-Fi 邀请"
+                else -> "车机已回连，等待 CarPlay 邀请"
+            }))
     }
 
     private fun requestConnect(context: Context, manual: Boolean, source: String) {
@@ -2668,16 +2678,30 @@ object HyperCarRepo {
                         // 侧的问题（iDrive 里没把本机当 CarPlay 手机），后者才是协议问题。
                         if (requireActivation) {
                             val wifiBound = wifiReceiverMac != null && boundNetwork != null
-                            log(
-                                if (wifiBound) {
-                                    "SESSION: 等待本轮车机 Wi-Fi ctrl 邀请，已等 ${waited}s；" +
-                                        "已绑定已知车机网络，宝马二次上车蓝牙常仅短窗口后交棒，" +
-                                        "不以持续 iAP2 会话为成败（本轮蓝牙会话=${coordinator.sessionStartCount}）"
-                                } else {
-                                    "SESSION: 等待本轮车机邀请/0x4301，已等 ${waited}s；" +
-                                        "蓝牙会话次数=${coordinator.sessionStartCount} 已收Wi-Fi凭据=${seen?.ssid != null}，保持广播与监听"
-                                },
-                            )
+                            val waitingForCarIap2 = KnownWifiWaitCopy.awaitingHeadUnitIap2(
+                                wifiBound, coordinator.sessionStartCount, ReconnectDiscoverability.firstWindowOver())
+                            if (waitingForCarIap2) {
+                                val current = _snapshots.value.link
+                                if (current !is LinkState.Negotiating || current.step != KnownWifiWaitCopy.HERO) {
+                                    push(link = LinkState.Negotiating(KnownWifiWaitCopy.HERO))
+                                }
+                                log(KnownWifiWaitCopy.progress(waited, coordinator.sessionStartCount))
+                            } else {
+                                val current = _snapshots.value.link
+                                if (current is LinkState.Negotiating && current.step == KnownWifiWaitCopy.HERO) {
+                                    push(link = LinkState.Negotiating("等待车机开启 CarPlay"))
+                                }
+                                log(
+                                    if (wifiBound) {
+                                        "SESSION: 等待本轮车机 Wi-Fi ctrl 邀请，已等 ${waited}s；" +
+                                            "已绑定已知车机网络，宝马二次上车蓝牙常仅短窗口后交棒，" +
+                                            "不以持续 iAP2 会话为成败（本轮蓝牙会话=${coordinator.sessionStartCount}）"
+                                    } else {
+                                        "SESSION: 等待本轮车机邀请/0x4301，已等 ${waited}s；" +
+                                            "蓝牙会话次数=${coordinator.sessionStartCount} 已收Wi-Fi凭据=${seen?.ssid != null}，保持广播与监听"
+                                    },
+                                )
+                            }
                         } else if (seen == null && coordinator.sessionStartCount == 0 && wifiReceiverMac == null) {
                             log(
                                 "SESSION: ${waited}s 内车机一次都没发起 iAP2（ACL 已连但收不到 …cafe 连入）——" +

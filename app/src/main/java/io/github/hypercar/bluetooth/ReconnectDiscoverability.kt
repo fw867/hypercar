@@ -51,8 +51,12 @@ internal class ReconnectDiscoverabilityPolicy {
 
 internal object ReconnectDiscoverability {
     @Volatile private var activePolicy: ReconnectDiscoverabilityPolicy? = null
+    /** 首扇窗已结束，或这轮不会再开窗。不在这里再武装第二扇。 */
+    @Volatile private var firstWindowFinished = false
 
     fun armForWake(): Boolean = activePolicy?.armForWake() == true
+
+    fun firstWindowOver(): Boolean = firstWindowFinished
 
     suspend fun watch(
         context: Context,
@@ -61,35 +65,42 @@ internal object ReconnectDiscoverability {
         sessionStarted: () -> Boolean,
         log: (String) -> Unit,
     ) {
+        firstWindowFinished = false
         val policy = ReconnectDiscoverabilityPolicy()
         activePolicy = policy
         try {
             while (currentCoroutineContext().isActive) {
                 if (sessionStarted()) return
+                if (!SettingsStore.bluetoothDiscoverableFallback) firstWindowFinished = true
                 val network = networkKey()
                 if (policy.shouldAttempt(SettingsStore.bluetoothDiscoverableFallback, network, servicesReady(), false,
                         SystemClock.elapsedRealtime())) {
-                    if (!ShizukuTools.isReady) { log("BT-DISCOVERY: 跳过短暂可发现，Shizuku 未就绪"); return }
-                    val bind = SpikeShell.connect(context)
-                    // 绑定 shell 可能花数秒，期间车机可能已建立会话、换网或用户关闭开关。
-                    if (sessionStarted() || !servicesReady() || networkKey() != network || !SettingsStore.bluetoothDiscoverableFallback) return
-                    if (!SpikeShell.isConnected()) { log("BT-DISCOVERY: shell 绑定未完成：$bind"); return }
-                    val token = UUID.randomUUID().toString()
-                    val owner = Binder()
                     try {
-                        val result = SpikeShell.startBluetoothDiscoverable(owner, token, 30)
-                        log("BT-DISCOVERY: 已配对车机 Wi-Fi/广播/监听就绪 5s 后：$result")
-                        if (!result.startsWith("OK")) return
-                        withTimeoutOrNull(30_000) {
-                            while (!sessionStarted() && networkKey() == network && SettingsStore.bluetoothDiscoverableFallback) {
-                                delay(250)
+                        if (!ShizukuTools.isReady) { log("BT-DISCOVERY: 跳过短暂可发现，Shizuku 未就绪"); return }
+                        val bind = SpikeShell.connect(context)
+                        // 绑定 shell 可能花数秒，期间车机可能已建立会话、换网或用户关闭开关。
+                        if (sessionStarted() || !servicesReady() || networkKey() != network || !SettingsStore.bluetoothDiscoverableFallback) return
+                        if (!SpikeShell.isConnected()) { log("BT-DISCOVERY: shell 绑定未完成：$bind"); return }
+                        val token = UUID.randomUUID().toString()
+                        val owner = Binder()
+                        try {
+                            val result = SpikeShell.startBluetoothDiscoverable(owner, token, 30)
+                            log("BT-DISCOVERY: 已配对车机 Wi-Fi/广播/监听就绪 5s 后：$result")
+                            if (!result.startsWith("OK")) return
+                            withTimeoutOrNull(30_000) {
+                                while (!sessionStarted() && networkKey() == network && SettingsStore.bluetoothDiscoverableFallback) {
+                                    delay(250)
+                                }
+                            }
+                        } finally {
+                            // 即使启动 binder 返回时取消，也用本轮 token 清理；旧轮次不会关闭新窗口。
+                            withContext(NonCancellable + Dispatchers.IO) {
+                                log("BT-DISCOVERY: ${SpikeShell.stopBluetoothDiscoverable(token)}")
                             }
                         }
                     } finally {
-                        // 即使启动 binder 返回时取消，也用本轮 token 清理；旧轮次不会关闭新窗口。
-                        withContext(NonCancellable + Dispatchers.IO) {
-                            log("BT-DISCOVERY: ${SpikeShell.stopBluetoothDiscoverable(token)}")
-                        }
+                        // 窗已关，或这轮没能开成。进度据此停止把空窗写成交棒完成。
+                        firstWindowFinished = true
                     }
                     // Stay in the loop so an ACL wake can arm one more window while still waiting.
                     continue
