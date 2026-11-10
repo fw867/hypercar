@@ -7,7 +7,7 @@ import org.junit.Test
 
 class KnownWifiWaitCopyTest {
     @Test fun boundWifiWithNoSessionAfterWindowIsNotAHandoff() {
-        assertTrue(KnownWifiWaitCopy.awaitingHeadUnitIap2(true, 0, true))
+        assertTrue(KnownWifiWaitCopy.awaitingHeadUnitIap2(true, 0, 0, true))
         assertEquals("车机尚未发起 iAP2，ctrl 邀请要等这次蓝牙连入", KnownWifiWaitCopy.HERO)
         val line = KnownWifiWaitCopy.progress(45, 0)
         assertTrue(line.contains(KnownWifiWaitCopy.HERO))
@@ -17,9 +17,25 @@ class KnownWifiWaitCopyTest {
         assertFalse(line.contains("不以持续 iAP2"))
     }
 
+    @Test fun earlierProcessSessionsDoNotCountAsThisRound() {
+        assertEquals(0, KnownWifiWaitCopy.sessionsThisRound(3, 3))
+        assertTrue(KnownWifiWaitCopy.awaitingHeadUnitIap2(
+            wifiBound = true,
+            sessionStartCount = 3,
+            roundBaseline = 3,
+            discoverableWindowOver = true,
+        ))
+        val line = KnownWifiWaitCopy.progress(45, KnownWifiWaitCopy.sessionsThisRound(3, 3))
+        assertTrue(line.contains("车机尚未发起 iAP2"))
+        assertTrue(line.contains("本轮蓝牙会话=0"))
+        assertFalse(line.contains("交棒"))
+        assertEquals(1, KnownWifiWaitCopy.sessionsThisRound(4, 3))
+        assertFalse(KnownWifiWaitCopy.awaitingHeadUnitIap2(true, 4, 3, true))
+    }
+
     @Test fun windowStillOpenOrSessionStartedKeepsTheHandoffWordingOut() {
-        assertFalse(KnownWifiWaitCopy.awaitingHeadUnitIap2(true, 0, false))
-        assertFalse(KnownWifiWaitCopy.awaitingHeadUnitIap2(true, 1, true))
-        assertFalse(KnownWifiWaitCopy.awaitingHeadUnitIap2(false, 0, true))
+        assertFalse(KnownWifiWaitCopy.awaitingHeadUnitIap2(true, 0, 0, false))
+        assertFalse(KnownWifiWaitCopy.awaitingHeadUnitIap2(true, 1, 0, true))
+        assertFalse(KnownWifiWaitCopy.awaitingHeadUnitIap2(false, 0, 0, true))
     }
 }

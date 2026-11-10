@@ -295,6 +295,12 @@ object HyperCarRepo {
     /** True while bound and waiting for ctrl invite / inbound iAP2 (not while streaming). */
     @Volatile private var awaitingCarInvitation = false
 
+    /**
+     * [Iap2Bluetooth.sessionStartCount] when this connect round started.
+     * The process counter is not cleared on standby, so "this round" is the delta.
+     */
+    @Volatile private var roundSessionBaseline = 0
+
     @Volatile
     private var userDisconnectRequested = false
 
@@ -526,6 +532,7 @@ object HyperCarRepo {
         val waitingForCarIap2 = KnownWifiWaitCopy.awaitingHeadUnitIap2(
             wifiReceiverMac != null && boundNetwork != null,
             iap2?.sessionStartCount ?: 0,
+            roundSessionBaseline,
             ReconnectDiscoverability.firstWindowOver(),
         )
         push(link = LinkState.Negotiating(
@@ -609,6 +616,7 @@ object HyperCarRepo {
         reconnectJob = null
         reconnectBudget.start(retryReceiver(), manual = source == "manual")
         sessionHadLink = false
+        roundSessionBaseline = iap2?.sessionStartCount ?: 0
         sessionCarWithMode = SettingsStore.carWithMode
         hudSessionEnabled = true
         io.github.hypercar.navigation.NavigationSources.clear()
@@ -1256,6 +1264,7 @@ object HyperCarRepo {
             ctrlAdvertiser = advertiser
             val lastSeen = AtomicReference<CarPlayEndpoint?>(null)
             val baselineSessions = coordinator.sessionStartCount
+            roundSessionBaseline = baselineSessions
             discoveryJob = CoroutineScope(kotlinx.coroutines.currentCoroutineContext()).launch {
                 try { io.github.hypercar.bluetooth.ReconnectDiscoverability.watch(context,
                     networkKey = {
@@ -2705,14 +2714,17 @@ object HyperCarRepo {
                         // 侧的问题（iDrive 里没把本机当 CarPlay 手机），后者才是协议问题。
                         if (requireActivation) {
                             val wifiBound = wifiReceiverMac != null && boundNetwork != null
+                            val sessionsThisRound = KnownWifiWaitCopy.sessionsThisRound(
+                                coordinator.sessionStartCount, roundSessionBaseline)
                             val waitingForCarIap2 = KnownWifiWaitCopy.awaitingHeadUnitIap2(
-                                wifiBound, coordinator.sessionStartCount, ReconnectDiscoverability.firstWindowOver())
+                                wifiBound, coordinator.sessionStartCount, roundSessionBaseline,
+                                ReconnectDiscoverability.firstWindowOver())
                             if (waitingForCarIap2) {
                                 val current = _snapshots.value.link
                                 if (current !is LinkState.Negotiating || current.step != KnownWifiWaitCopy.HERO) {
                                     push(link = LinkState.Negotiating(KnownWifiWaitCopy.HERO))
                                 }
-                                log(KnownWifiWaitCopy.progress(waited, coordinator.sessionStartCount))
+                                log(KnownWifiWaitCopy.progress(waited, sessionsThisRound))
                             } else {
                                 val current = _snapshots.value.link
                                 if (current is LinkState.Negotiating && current.step == KnownWifiWaitCopy.HERO) {
@@ -2722,7 +2734,7 @@ object HyperCarRepo {
                                     if (wifiBound) {
                                         "SESSION: 等待本轮车机 Wi-Fi ctrl 邀请，已等 ${waited}s；" +
                                             "已绑定已知车机网络，宝马二次上车蓝牙常仅短窗口后交棒，" +
-                                            "不以持续 iAP2 会话为成败（本轮蓝牙会话=${coordinator.sessionStartCount}）"
+                                            "不以持续 iAP2 会话为成败（本轮蓝牙会话=$sessionsThisRound）"
                                     } else {
                                         "SESSION: 等待本轮车机邀请/0x4301，已等 ${waited}s；" +
                                             "蓝牙会话次数=${coordinator.sessionStartCount} 已收Wi-Fi凭据=${seen?.ssid != null}，保持广播与监听"
