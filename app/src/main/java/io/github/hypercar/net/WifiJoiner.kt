@@ -179,6 +179,7 @@ class WifiJoiner(
             // 不能声明 NET_CAPABILITY_INTERNET（车机热点本就无外网，且 specifier 网络不允许）。
             val request = NetworkRequest.Builder()
                 .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
                 .setNetworkSpecifier(specifier)
                 .build()
 
@@ -193,6 +194,7 @@ class WifiJoiner(
         val result = AtomicReference<Network?>(null)
         // 立刻 onUnavailable 与「等到超时」是完全不同的病因，必须分开记
         val unavailable = java.util.concurrent.atomic.AtomicBoolean(false)
+        val started = SystemClock.elapsedRealtime()
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 if (callback.get() !== this) return
@@ -210,7 +212,7 @@ class WifiJoiner(
         }
         callback.set(cb)
         try {
-            // 带超时的 requestNetwork：系统确认框期间不超时，用户长期不点才失败
+            // 系统确认框和关联/DHCP 共用这一个超时窗口，不是单独计时。
             // （该重载的 timeout 参数是 Int，需从 Long 转换）
             connectivityManager.requestNetwork(request, cb, timeoutMs.toInt())
         } catch (t: Throwable) {
@@ -235,17 +237,12 @@ class WifiJoiner(
         if (network == null) {
             // 未拿到句柄（含用户拒绝/超时）：注销回调，别泄漏
             release()
-            lastFailureReason =
-                when {
-                    unavailable.get() && !isWifiEnabled() ->
-                        "系统立刻拒绝：Wi-Fi 开关是关的（没有弹窗是正常的）"
-                    unavailable.get() ->
-                        "系统立刻拒绝（onUnavailable）：通常因为 App 当时不在前台" +
-                            "（Android 10+ 的 WifiNetworkSpecifier 只给前台 App 弹确认框），" +
-                            "或该热点已被系统保存但处于拒绝状态"
-                    else ->
-                        "等 ${timeoutMs / 1000}s 没等到网络句柄：确认框没弹出/没点，或热点不在范围内/密码不对"
-                }
+            lastFailureReason = SpecifierJoinFailure.describe(
+                elapsedMs = SystemClock.elapsedRealtime() - started,
+                timeoutMs = timeoutMs,
+                unavailable = unavailable.get(),
+                wifiEnabled = isWifiEnabled(),
+            )
             return null
         }
         return network
@@ -365,7 +362,7 @@ class WifiJoiner(
         const val JOIN_WAIT_MS = 15_000L
         const val HANDLE_WAIT_MS = 15_000L
 
-        /** specifier 路径：首连要等用户点系统确认框，窗口给宽（30s）。 */
-        const val SPECIFIER_WAIT_MS = 30_000L
+        /** specifier 路径：首连要等用户点系统确认框，窗口给宽（60s）。 */
+        const val SPECIFIER_WAIT_MS = 60_000L
     }
 }

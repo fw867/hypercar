@@ -1377,7 +1377,7 @@ object HyperCarRepo {
                 val network = joinAndBind(context, endpoint)
                 if (network != null) connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.WIFI_BOUND)
                 if (network == null) {
-                    fail("没有可用的车机网络，停止本轮连接")
+                    fail("车机热点入网失败：${wifiJoiner?.lastFailureReason ?: "没有匹配本车且可绑定的有效网络"}")
                     return
                 }
                 val sockets = SessionSocketLease(network)
@@ -1749,7 +1749,9 @@ object HyperCarRepo {
         val ssid = endpoint.ssid
         val psk = endpoint.passphrase
         val network = if (!ssid.isNullOrBlank() && !psk.isNullOrBlank()) {
-            log("WIFI: 尝试静默加入热点 $ssid")
+            val shellJoin = ShizukuTools.isReady
+            push(link = LinkState.Negotiating(if (shellJoin) "加入车机热点" else "连接车机 Wi-Fi，请确认系统连接提示"))
+            log("WIFI: 加入热点 $ssid，方式=${if (shellJoin) "Shizuku" else "系统确认（最多60s）"}")
             when (val result = joiner.joinCarHotspotSilently(ssid, psk)) {
                 is WifiJoiner.JoinResult.Joined -> { markDegradedFirstConnectIfNeeded(); result.network }
                 else -> { log("WIFI: 入网未完成（${joiner.lastFailureReason ?: "不支持或连接失败"}），仅尝试已核实的当前网络"); null }
@@ -2725,10 +2727,12 @@ object HyperCarRepo {
                 lastSeen.set(merged)
                 // 0x5703 只给 ssid/psk：先入网 + 广播，车机才可能邀请并下发 0x4301
                 if (!wifiJoined && !merged.ssid.isNullOrBlank()) {
+                    log("SESSION: 已收到车机热点参数——先核实入网，再广播 _carplay-ctrl")
+                    val network = joinAndBind(context, merged)
+                        ?: throw IllegalStateException("车机热点入网失败：${wifiJoiner?.lastFailureReason ?: "没有匹配本车的有效网络"}")
                     wifiJoined = true
-                    log("SESSION: 先拿到热点凭据（0x5703）——立即入网 + 广播 _carplay-ctrl，再等 0x4301")
-                    joinAndBind(context, merged)
-                    advertiser.ensureForNetwork(merged.ssid, force = true, network = boundNetwork)
+                    connectionDiagnostics.mark(connectionAttemptId, ConnectionDiagnostics.Stage.WIFI_BOUND)
+                    advertiser.ensureForNetwork(merged.ssid, force = true, network = network)
                 }
                 // Only fresh coordinator callbacks reach here; cached/scanned endpoints
                 // are gated separately during fallback. A fresh 0x4301 is also a receiver invitation.
