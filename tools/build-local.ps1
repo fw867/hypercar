@@ -112,7 +112,7 @@ if (-not $SkipRust) {
   $env:RUSTUP_NO_UPDATE_CHECK = '1'
   if ($needAsciiBuildDir) {
     # target 目录也放纯 ASCII 路径：GNU ld 会从 cargo 的元数据里拿到 .rlib 的绝对路径，
-    # 中文路径它读不了（报 "ld: cannot find ...\软件开发\...\libsyn-xxx.rlib"）。
+    # 中文路径它读不了（报 "ld: cannot find ...\AI\...\libsyn-xxx.rlib"）。
     $env:CARGO_TARGET_DIR = Join-Path $devtools 'build\hypercar-core'
     New-Item -ItemType Directory -Force -Path $env:CARGO_TARGET_DIR | Out-Null
     Write-Host "Rust target: $env:CARGO_TARGET_DIR"
