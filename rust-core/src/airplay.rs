@@ -36,6 +36,7 @@ pub struct AirplayParams {
     pub airplay_port: u16,
     /// 本机真实蓝牙 MAC（WinPlay 等接收端按 SETUP deviceID 过滤，占位值必 403）。
     pub device_id: String,
+    pub device_name: String,
     pub identity_path: String,
     pub receiver_id: Option<String>,
     pub receiver_previously_connected: bool,
@@ -260,7 +261,7 @@ pub async fn negotiate(
     // CatPlay bootstrap: 会话 SETUP → /info → 事件通道/保活 → 资源声明 → 屏幕流。
     let timing = TimingServer::start_with_pipeline(p.pipeline.clone()).map_err(|e| format!("计时服务启动失败: {e}"))?;
     let (root, session_info) = setup_and_read_info(
-        &channel, &p.device_id, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap,
+        &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap,
     ).await?;
     info = session_info;
     // SETUP may be the first point at which /info reveals the real receiver identity.
@@ -357,7 +358,7 @@ pub async fn negotiate(
             stop_ev.notified().await;
         }));
     }
-    let wifi_iap = crate::wifi_iap2::WifiIap2::start(channel.clone(), &p.device_id, stop.clone());
+    let wifi_iap = crate::wifi_iap2::WifiIap2::start(channel.clone(), &p.device_id, &p.device_name, stop.clone());
     let wifi_iap_id = wifi_iap.id;
     p.pipeline.lock().wifi_id=wifi_iap_id;
     let initially_owned=modes.lock().screen_owned();
@@ -785,7 +786,7 @@ mod display_size_tests {
         let (read, write) = socket.into_split();
         let (channel, _) = RtspChannel::spawn(read, write, None);
         crate::auth_setup::run(&channel).await.unwrap();
-        let (_, info) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", 12345, true, Value::dict(vec![]), false).await.unwrap();
+        let (_, info) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", "Test phone", 12345, true, Value::dict(vec![]), false).await.unwrap();
         let display = &info.get("displays").unwrap().as_array().unwrap()[0];
         assert_eq!(uuid_text(display.get("uuid")).as_deref(), Some("actual-bmw-display"));
         assert_eq!(read_display_size(display), (2560, 744));
@@ -965,12 +966,12 @@ const CONTROLLER_FEATURES: &[&str] = &[
     "videoPlayback",
 ];
 
-fn build_session_setup(device_id: &str, timing_port: u16, encrypted: bool, mbux: bool) -> Vec<u8> {
+fn build_session_setup(device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, mbux: bool) -> Vec<u8> {
     let session_uuid = random_uuid_upper();
     let mut fields: Vec<(&str, Value)> = vec![
         ("deviceID", Value::str(device_id)),
         ("macAddress", Value::str(if mbux { device_id } else { "aa:bb:cc:dd:ee:ff" })),
-        ("name", Value::str("iPhone")),
+        ("name", Value::str(device_name)),
         ("model", Value::str("iPhone14,2")),
         ("osName", Value::str("iPhone OS")),
         ("osBuildVersion", Value::str("19A404")),
@@ -1026,9 +1027,10 @@ pub(crate) async fn record_session(channel: &Arc<RtspChannel>) -> Result<(), Str
 }
 
 async fn setup_and_read_info(
-    channel: &Arc<RtspChannel>, device_id: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool,
+    channel: &Arc<RtspChannel>, device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool,
 ) -> Result<(Value, Value), String> {
-    let body = build_session_setup(device_id, timing_port, encrypted, mbux);
+    emit_log(&format!("AIRPLAY: session device name={device_name}"));
+    let body = build_session_setup(device_id, device_name, timing_port, encrypted, mbux);
     let reply = channel.request(
         "SETUP", "/setup", &body, "application/x-apple-binary-plist", &[], Duration::from_secs(10),
     ).await?;
@@ -1736,7 +1738,8 @@ mod mbux_profile_tests {
     #[test]
     fn minimal_features_and_100ms_latency_are_explicit_profile_choices() {
         for mbux in [false,true] {
-            let body=bplist::parse(&build_session_setup("real-mac",1234,true,mbux)).unwrap();
+            let body=bplist::parse(&build_session_setup("real-mac","测试手机 \"BT\"",1234,true,mbux)).unwrap();
+            assert_eq!(body.get("name").and_then(Value::as_str),Some("测试手机 \"BT\""));
             let features=body.get("features").unwrap().as_array().unwrap();
             assert_eq!(features.len(),if mbux {1} else {CONTROLLER_FEATURES.len()});
             assert_eq!(body.get("macAddress").and_then(Value::as_str),Some(if mbux {"real-mac"} else {"aa:bb:cc:dd:ee:ff"}));

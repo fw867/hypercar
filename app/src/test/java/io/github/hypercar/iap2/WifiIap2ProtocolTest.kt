@@ -45,12 +45,12 @@ class WifiIap2ProtocolTest {
     }
     private fun messages(frames: List<Wire>) = frames.filter { it.session != 0 }.flatMap { Iap2Csm.Parser().offer(it.body) }
 
-    private inner class Car(val window: Int = 32, val controlSession: Int = 1) {
+    private inner class Car(val window: Int = 32, val controlSession: Int = 1, val deviceName: String = "HyperCar") {
         val logs = mutableListOf<String>()
         var navigationAllowed = false
         var navigationCue: io.github.hypercar.navigation.NavigationCue? = null
         val protocol = WifiIap2Protocol("test-device", { logs += it }, { ByteArray(32) { 7 } },
-            navigationEnabled = { navigationAllowed }, navigationCue = { navigationCue })
+            navigationEnabled = { navigationAllowed }, navigationCue = { navigationCue }, deviceName = deviceName)
         var sequence = 86
         var ack = 0
         var time = 1L
@@ -83,10 +83,17 @@ class WifiIap2ProtocolTest {
             val challenge = message(0xaa01, Iap2Csm.param(0, byteArrayOf(1, 2, 3))).single()
             assertEquals(0xaa02, challenge.messageId)
             assertEquals(32, Iap2Csm.parseParams(challenge.body).single().value.size)
-            assertEquals(listOf(0xaa05, 0x4e0c, 0xa100, 0x4e0a, 0x4e09, 0x4e0b),
-                message(0xaa03, Iap2Csm.param(0, ByteArray(64) { 9 })).map { it.messageId })
+            val greetings = message(0xaa03, Iap2Csm.param(0, ByteArray(64) { 9 }))
+            assertEquals(listOf(0xaa05, 0x4e0c, 0xa100, 0x4e0a, 0x4e09, 0x4e0b), greetings.map { it.messageId })
+            val name = Iap2Csm.parseParams(greetings.single { it.messageId == 0x4e09 }.body).single()
+            assertEquals(deviceName, name.asStringOrNull())
             assertFalse(protocol.failed)
         }
+    }
+
+    @Test fun deviceNameUsesSessionSnapshotAndSupportsUnicode() {
+        Car(deviceName = "我的手机 \"BMW\"").ready()
+        Car(deviceName = "重命名后的手机").ready()
     }
 
     @Test fun earlyHudSubscriptionWaitsForAuthenticationAndRealSource() {

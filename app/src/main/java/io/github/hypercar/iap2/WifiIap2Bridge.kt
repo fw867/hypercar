@@ -9,9 +9,9 @@ import java.util.concurrent.TimeUnit
 object WifiIap2Bridge {
     private var active: Worker? = null
 
-    @Synchronized fun start(id: Long, deviceId: String) {
+    @Synchronized fun start(id: Long, deviceId: String, deviceName: String) {
         active?.close()
-        active = Worker(id, deviceId).also { it.thread.start() }
+        active = Worker(id, deviceId, deviceName).also { it.thread.start() }
     }
 
     @Synchronized fun receive(id: Long, bytes: ByteArray) {
@@ -27,12 +27,13 @@ object WifiIap2Bridge {
         if (active?.id == id) { active?.close(); active = null }
     }
 
-    private class Worker(val id: Long, deviceId: String) {
+    private class Worker(val id: Long, deviceId: String, deviceName: String) {
         val input = ArrayBlockingQueue<ByteArray>(64)
         @Volatile private var closed = false
         private val protocol = WifiIap2Protocol(deviceId, { HyperCarRepo.log("WIFI-IAP#$id: $it") },
             navigationEnabled = { HyperCarRepo.hudNavigationAllowed },
-            navigationCue = { io.github.hypercar.navigation.NavigationSources.snapshot() })
+            navigationCue = { io.github.hypercar.navigation.NavigationSources.snapshot() },
+            deviceName = deviceName)
         val thread = Thread({
             var readyReported = false
             var lastPhase = ""

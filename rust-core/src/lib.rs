@@ -188,10 +188,11 @@ pub(crate) fn emit_carwith_navigation(token:u64, update:Option<&carlife::navigat
     });
 }
 
-pub(crate) fn emit_iap2_start(id: u64, device: &str) {
+pub(crate) fn emit_iap2_start(id: u64, device: &str, device_name: &str) {
     call_listener("onIap2Start", |env, obj| {
         let name = env.new_string(device)?;
-        env.call_method(obj, "onIap2Start", "(JLjava/lang/String;)V", &[(id as jlong).into(), (&name).into()]).map(|_| ())
+        let display_name = env.new_string(device_name)?;
+        env.call_method(obj, "onIap2Start", "(JLjava/lang/String;Ljava/lang/String;)V", &[(id as jlong).into(), (&name).into(), (&display_name).into()]).map(|_| ())
     });
 }
 

@@ -1,4 +1,4 @@
-﻿@file:Suppress("DEPRECATION")   // allNetworks/WifiInfo/getDefaultAdapter 等平台 API 已废弃但无替代
+@file:Suppress("DEPRECATION")   // allNetworks/WifiInfo/getDefaultAdapter 等平台 API 已废弃但无替代
 package io.github.hypercar.session
 
 import android.bluetooth.BluetoothDevice
@@ -2796,7 +2796,9 @@ object HyperCarRepo {
                 }
             }
             log("SESSION: 端点就绪 ips=${usable?.ipAddresses} port=${usable?.airPlayPort}")
-            if (usable != null) awaitingCarInvitation = false
+            // 上面 while (usable == null) 循环退出时 usable 已被智能转换为非空，
+            // 原来的 if (usable != null) 恒真，直接置位即可。
+            awaitingCarInvitation = false
             usable
         } finally {
             callbacks.close()

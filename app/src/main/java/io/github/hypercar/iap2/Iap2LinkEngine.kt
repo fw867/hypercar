@@ -196,7 +196,7 @@ class Iap2LinkEngine(
         if (passive) {
             passiveNegotiation = true
             lastOutputMillis = nowMillis
-            return // Reliable Wi-Fi peer initiates SYN; never open a competing negotiation.
+            return // 对端先发探测和 SYN。收到 FF 55 再回，不主动发同步包。
         }
         appendOutput(MARKER)
         markerDeadline = nowMillis + MARKER_RESEND_MILLIS

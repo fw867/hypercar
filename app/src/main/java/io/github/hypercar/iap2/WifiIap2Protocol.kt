@@ -11,6 +11,7 @@ internal class WifiIap2Protocol(
     private val nonce: () -> ByteArray = { ByteArray(32).also(SecureRandom()::nextBytes) },
     private val navigationEnabled: () -> Boolean = { false },
     private val navigationCue: () -> io.github.hypercar.navigation.NavigationCue? = { null },
+    private val deviceName: String = "HyperCar",
 ) {
     private val engine = Iap2LinkEngine(reliableTransport = true, declaredWindow = 32)
     private val parser = Iap2Csm.Parser()
@@ -187,7 +188,8 @@ internal class WifiIap2Protocol(
         send(0x4e0c, Iap2Csm.string(0, UUID.nameUUIDFromBytes(deviceId.toByteArray()).toString().uppercase()))
         send(0xa100, Iap2Csm.param(6, ByteArray(0)))
         send(0x4e0a, Iap2Csm.string(0, "zh"))
-        send(0x4e09, Iap2Csm.string(0, "iPhone"))
+        send(0x4e09, Iap2Csm.string(0, deviceName))
+        log("device name=$deviceName")
         send(0x4e0b, Iap2Messages.deviceTime(System.currentTimeMillis() / 1000, zone.getOffset(System.currentTimeMillis()) / 60_000, 0))
     }
 

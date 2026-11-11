@@ -68,7 +68,7 @@ class Iap2SenderSession(
     /** 本机真实蓝牙 MAC（0x4300/0x4E0E 的传输标识、0x4E0C UUID 派生源；真车会校验）。 */
     private val bluetoothMac: String = "02:00:00:00:00:00",
     /** 本机蓝牙名（0x4E09 设备信息）。 */
-    private val deviceName: String = "iPhone",
+    private val deviceName: String = "HyperCar",
     /** 每次拿到/更新端点即回调（0x5703 与 0x4301 各触发一次，保活期 0x4301 重发也触发）。 */
     private val onEndpoint: (CarPlayEndpoint) -> Unit,
     /** 仅用于 MFi 挑战长度的按车机持久化记忆；null = 只用进程内内存表（纯 JVM 单测）。 */
@@ -243,11 +243,16 @@ class Iap2SenderSession(
         send(Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED)
         log("iap2 tx=0xaa05 compatibility-result=$mfiResult（未做证书/签名验证，不代表标准认证通过）")
 
+        // 0x5702 与 0x4E0D 的先后只在这条链上调整：会发 0x5702 的车先发请求，再发可用性。
+        // 不发 0x5702 的车仍在问候里带上 0x4E0D。两条的正文都不改。
+        val wifiGen = ReceiverProfile.classifyWifiGen(ident.sendIds, ident.receiveIds)
+        val legacyWifiExchange = wifiGen != ReceiverProfile.WifiGen.NEW
+
         // ---- 设备状态问候：必须**紧贴** 0xAA05 突发（§9j 核心修复）----
         // 真 iPhone 在 0xAA05 之后立刻发 0x4E0C/0x4E0A/0x4E0B/0x4E09，然后才轮到
         // 订阅/请求。旧实现排在 0x5703 等待之后：BMW 等问候、我们等 0x5703，
         // 两轮实测稳定 5.37~5.45s 后车机拆 RFCOMM（另一台 MGU-86 五轮全败同签名）。
-        sendDeviceStateGreetings()
+        sendDeviceStateGreetings(includeWirelessUpdate = !legacyWifiExchange)
         enterPhase("EA_AND_HID")
 
         // ---- EA 会话（MFi 完成后发；认证前发会噎死 DiPlay）----
@@ -316,12 +321,10 @@ class Iap2SenderSession(
         // 0x5702，但它完整支持 0x5702→0x5703，而且**要靠收到 0x5702 才把 AirPlay 服务
         // 拉起来**——按清单跳过的那一版：0 次 0x5702 → 端口 7000 全程 ECONNREFUSED。
         // 明确声明 0x4301 且未声明 0x57xx 才优先新路径，不按清单数量推断完整性。
-        val wifiGen = ReceiverProfile.classifyWifiGen(ident.sendIds, ident.receiveIds)
         enterPhase("WIFI_CREDENTIALS")
         log("iap2 车机画像 wifiGen=${ReceiverProfile.describe(wifiGen)}")
         val declaresReceiveWifi = ident.declaresReceive(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION)
         val declaresSendWifi = ident.declaresSend(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION)
-        val legacyWifiExchange = wifiGen != ReceiverProfile.WifiGen.NEW
         if (legacyWifiExchange && (declaresReceiveWifi == false || declaresSendWifi == false)) {
             log(
                 "iap2 清单未声明 0x5702/0x5703（收=${declaresReceiveWifi ?: "未知"} " +
@@ -334,6 +337,7 @@ class Iap2SenderSession(
                 null
             } else {
                 send(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION)
+                sendWirelessCarPlayUpdate()
                 // 只占用本阶段预算，为 0x4300/0x4301 留出时间；4301 早到也立即结束等待。
                 val wifiDeadline = rescueDeadline(deadline, WIFI_EXCHANGE_BUDGET_MILLIS)
                 val credentialMessages = setOf(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION, Iap2MessageIds.CARPLAY_START_SESSION)
@@ -950,15 +954,19 @@ class Iap2SenderSession(
      * 而 BMW MGU-55 的 iAP2 可收清单里恰恰有 0x4E0D——车机可能就是靠它判断
      * 「这台设备是不是 CarPlay 设备」，没有就只给 iPod/BMW Apps 档案（不放 0x5703）。
      */
-    private fun sendDeviceStateGreetings(force: Boolean = false) {
-        if (greetingsSent && !force) return
-        greetingsSent = true
-        val timezoneMinutes = TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 60_000
-        val daylightSaving = if (TimeZone.getDefault().inDaylightTime(Date())) 1 else 0
+    private fun sendWirelessCarPlayUpdate() {
         send(
             Iap2MessageIds.WIRELESS_CARPLAY_UPDATE,
             Iap2Csm.u8(0, 1),
         )
+    }
+
+    private fun sendDeviceStateGreetings(force: Boolean = false, includeWirelessUpdate: Boolean = true) {
+        if (greetingsSent && !force) return
+        greetingsSent = true
+        val timezoneMinutes = TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 60_000
+        val daylightSaving = if (TimeZone.getDefault().inDaylightTime(Date())) 1 else 0
+        if (includeWirelessUpdate) sendWirelessCarPlayUpdate()
         send(
             Iap2MessageIds.DEVICE_UUID_UPDATE,
             Iap2Csm.string(0, deviceUuid()),
@@ -975,7 +983,10 @@ class Iap2SenderSession(
             Iap2MessageIds.DEVICE_INFORMATION_UPDATE,
             Iap2Csm.string(0, deviceName),
         )
-        log("iap2 tx=0x4e0d/0x4e0c/0x4e0a/0x4e0b/0x4e09 设备状态问候（name=$deviceName mac=$bluetoothMac）")
+        log(
+            "iap2 tx=${if (includeWirelessUpdate) "0x4e0d/" else ""}0x4e0c/0x4e0a/0x4e0b/0x4e09 " +
+                "设备状态问候（name=$deviceName mac=$bluetoothMac）",
+        )
     }
 
     /** 设备 UUID：由蓝牙 MAC 确定性派生，跨会话稳定（车机按它标识设备；大写输出）。 */

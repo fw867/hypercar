@@ -16,6 +16,7 @@ object SettingsStore {
     private var prefs: SharedPreferences? = null
 
     fun init(context: Context) {
+        io.github.hypercar.bluetooth.LocalDeviceName.init(context)
         if (prefs == null) {
             synchronized(this) {
                 if (prefs == null) {
@@ -381,6 +382,7 @@ object SettingsStore {
         return buildString {
             append("{")
             append("\"device_id\":\"").append(esc(deviceBluetoothMac)).append("\",")
+            append("\"device_name\":").append(org.json.JSONObject.quote(io.github.hypercar.bluetooth.LocalDeviceName.snapshot())).append(",")
             append("\"car_ip\":\"").append(esc(carIp)).append("\",")
             append("\"airplay_port\":").append(airplayPort).append(",")
             // CarWith 模式：视频/音频源改由本机 CarLife（CarWith）提供（2026-11-03）

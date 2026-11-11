@@ -6,6 +6,8 @@
 
 手机主 RFCOMM UUID 为 `00000000-deca-fade-deca-deafdecacafe`，附件端 UUID 为 `00000000-deca-fade-deca-deafdecacaff`。主监听使用安全 RFCOMM。蓝牙重启或监听异常后按代次恢复，旧回调不能覆盖新监听。
 
+设备显示名使用当前系统蓝牙名，无法读取或为空时回退到机型名，再回退到 `HyperCar`。蓝牙 iAP2 在握手开始时读取名称；AirPlay 建链时读取并将同一快照用于 SETUP `name` 和该会话的 Wi-Fi iAP2 `0x4E09`。这只改变显示名，不改变 MAC、设备 UUID、配对密钥或协议型号；会话期间修改蓝牙名在下次建链生效。
+
 Detect 标记 `FF550200EE10` 与后续 SYN/SYNACK 是不同阶段。蓝牙与 Wi-Fi iAP2 各自协商链路序列、窗口和 Session ID；不能把某次日志的控制 Session ID 固定成所有车机通用值。
 
 CSM 格式为 `40 40 | total_len(u16BE) | message_id(u16BE) | parameters`，总长度包含 6 字节头。参数的长度包含自身 4 字节头。消息 `0xAA06` 是认证序列的一部分；认证失败消息是 `0xAA04`。

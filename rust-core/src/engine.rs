@@ -46,6 +46,8 @@ pub enum SourceEvent {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct EngineConfig {
     pub device_id: String,
+    #[serde(default)]
+    pub device_name: String,
     pub car_ip: String,
     pub airplay_port: u16,
     pub width: u32,
@@ -451,6 +453,7 @@ pub async fn run_engine(
         car_ip: cfg.car_ip.clone(),
         airplay_port: cfg.airplay_port,
         device_id: cfg.device_id.clone(),
+        device_name: if cfg.device_name.trim().is_empty() { "HyperCar".into() } else { cfg.device_name.clone() },
         identity_path: cfg.identity_path.clone(),
         receiver_id: cfg.receiver_id.clone(),
         receiver_previously_connected: cfg.receiver_previously_connected,

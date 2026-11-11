@@ -54,7 +54,9 @@ object RustCoreBridge {
         fun onDisplaySize(width: Int, height: Int) {}
         fun onDisplayLayout(width: Int, height: Int, viewX: Int, viewY: Int, viewWidth: Int, viewHeight: Int,
                             safeX: Int, safeY: Int, safeWidth: Int, safeHeight: Int, drawOutside: Boolean) {}
-        fun onIap2Start(id: Long, deviceId: String) { io.github.hypercar.iap2.WifiIap2Bridge.start(id, deviceId) }
+        fun onIap2Start(id: Long, deviceId: String, deviceName: String) {
+            io.github.hypercar.iap2.WifiIap2Bridge.start(id, deviceId, deviceName)
+        }
         fun onIap2Bytes(id: Long, bytes: ByteArray) { io.github.hypercar.iap2.WifiIap2Bridge.receive(id, bytes) }
         fun onIap2Stop(id: Long) { io.github.hypercar.iap2.WifiIap2Bridge.stop(id) }
     }

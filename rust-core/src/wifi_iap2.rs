@@ -68,7 +68,7 @@ pub struct WifiIap2 {
 }
 
 impl WifiIap2 {
-    pub fn start(channel: Arc<RtspChannel>, device: &str, stop: Arc<Notify>) -> Self {
+    pub fn start(channel: Arc<RtspChannel>, device: &str, device_name: &str, stop: Arc<Notify>) -> Self {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::channel::<Outbound>(64);
         *OUTPUT.lock() = Some((id, tx));
@@ -114,7 +114,7 @@ impl WifiIap2 {
             clear_handoff(id);
             crate::emit_iap2_stop(id);
         });
-        crate::emit_iap2_start(id, device);
+        crate::emit_iap2_start(id, device, device_name);
         Self { id, task }
     }
 }
@@ -142,7 +142,7 @@ mod tests {
         let (mut car, _) = listener.accept().await.unwrap();
         let (r,w) = phone.into_split();
         let (channel, _) = RtspChannel::spawn(r,w,None);
-        let guard = WifiIap2::start(channel, "unit-test", Arc::new(Notify::new()));
+        let guard = WifiIap2::start(channel, "unit-test", "Test phone", Arc::new(Notify::new()));
         assert!(send(guard.id, vec![1,2,3]));
         assert!(send(guard.id, vec![4,5,6]));
         let requests = tokio::time::timeout(Duration::from_secs(1), async {

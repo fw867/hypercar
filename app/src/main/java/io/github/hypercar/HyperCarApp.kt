@@ -20,6 +20,7 @@ class HyperCarApp : Application() {
         createNotificationChannel()
         // 会话总管：注入 ACL 唤醒 handler + Rust 回调监听（秒连链路的第一环）
         HyperCarRepo.init(this)
+        HyperCarRepo.log("DEVICE-NAME: display=${io.github.hypercar.bluetooth.LocalDeviceName.snapshot()}（会话开始时读取，不修改系统蓝牙名）")
         if (SettingsStore.autoConnect) HyperCarRepo.startAutomaticListening(this)
         io.github.hypercar.carui.MusicNotificationListener.sync(this)
         // 触发 RustCoreBridge 类加载（loadLibrary + nativeInitLogger）。

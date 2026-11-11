@@ -73,7 +73,8 @@ class Iap2Bluetooth(
         val IPHONE_IAP2_UUID: UUID = UUID.fromString("00000000-deca-fade-deca-deafdecacafe")
         val ACCESSORY_IAP2_UUID: UUID = UUID.fromString("00000000-deca-fade-deca-deafdecacaff")
 
-        private const val SDP_NAME = "iAP2"
+        /** cafe 记录的 SDP 服务名。车机按 UUID 查找，这个名字不参与其它 Profile。 */
+        private const val SDP_NAME = "Wireless iAP"
         private const val SESSION_TIMEOUT_MILLIS = 90_000L
         private const val RETRY_DELAY_MILLIS = 3_000L
         private const val FAILURE_LOG_THROTTLE_MILLIS = 15_000L
@@ -708,7 +709,8 @@ class Iap2Bluetooth(
         val sessionLog: (String) -> Unit = { line -> log("HS#$handshakeId +${SystemClock.elapsedRealtime() - started}ms $line") }
         val evidence = io.github.hypercar.session.PairingEvidence.read(appContext.filesDir, safeAddress(socket.remoteDevice))
         sessionLog(handshakeBeginLine(tag, targetProvider() ?: "自动", evidence.identityPresent, evidence.receiverCredentialPresent))
-        sessionLog("ROLE: iAP2 Device/iPhone，SDP=…cafe，deviceName=iPhone，保留无线可用性/传输身份声明")
+        val deviceName = io.github.hypercar.bluetooth.LocalDeviceName.snapshot()
+        sessionLog("ROLE: iAP2 Device/iPhone，SDP=…cafe，deviceName=$deviceName，保留无线可用性/传输身份声明")
         val channel = RfcommLinkChannel(socket, sessionLog)
         activeChannel.set(channel)
         val session =
@@ -716,7 +718,7 @@ class Iap2Bluetooth(
                 channel = channel,
                 log = sessionLog,
                 bluetoothMac = bluetoothMacProvider(),
-                deviceName = "iPhone",
+                deviceName = deviceName,
                 onIdentification = { if (sessions.allows(ticket)) Iap2Peer.rememberIdentification(safeAddress(socket.remoteDevice), it) },
                 // 端点回调顺手标记「本轮已拿到凭据」：acceptLoop 用它决定是否允许
                 // 车机的新连入顶替本轮（空转轮次可顶替，有凭据的不许抢）
@@ -932,8 +934,9 @@ private class RfcommLinkChannel(
     private fun runReader() {
         try {
             synchronized(lock) {
-                engine.start(nowMillis())
-                drainOutputLocked()
+                // 车机连入后先发探测。这里只进入等待，不把探测和同步写出；
+                // 第一次 read 到 FF 55 之后，引擎再回探测，并等车机的 SYN。
+                engine.start(nowMillis(), passive = true)
             }
             val buffer = ByteArray(4096)
             val input: InputStream = socket.inputStream
