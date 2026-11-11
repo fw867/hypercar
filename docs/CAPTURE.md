@@ -1,6 +1,6 @@
 # 日志采集与解释
 
-更新：2026-11-02。
+更新：2026-11-11。
 
 ## Android
 
@@ -21,7 +21,7 @@ bugreport 可能包含 FS/data/misc/bluetooth/logs 下轮转的 btsnoop_hci 日�
 
 ## 其他已用数据
 
-iPhone PKLG 样本按记录边界解析：len(u32)、ts_sec(u32)、ts_usec(u32)、type(u8)、data；下一条偏移是当前偏移 + 4 + len。不要用搜索字节串代替结构解析。按原始时间与相对事件对齐，不固定套用时区偏移。蓝牙 HCI 记录不能证明 Wi-Fi 全部数据内容。
+新车型的 iPhone 蓝牙抓取步骤见 [iPhone HCI](IPHONE-HCI-CAPTURE.md)。样本按记录边界解析：len(u32)、ts_sec(u32)、ts_usec(u32)、type(u8)、data；下一条偏移是当前偏移 + 4 + len。不要用搜索字节串代替结构解析。按原始时间与相对事件对齐，不固定套用时区偏移。蓝牙 HCI 记录不能证明 Wi-Fi 全部数据内容。
 
 盒子 iAP2 摘要工具：[summarize-box-iap2.py](../tools/summarize-box-iap2.py)。工具输出与[盒子流程](BMW-BOX-CARPLAY-FLOW.md)应保留原始样本来源及角色信息；被截断的数据不能作为完整字段比对依据。
 

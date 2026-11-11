@@ -537,7 +537,9 @@ object HyperCarRepo {
         )
         push(link = LinkState.Negotiating(
             when {
-                handoffToWifi && waitingForCarIap2 -> KnownWifiWaitCopy.HERO
+                handoffToWifi && waitingForCarIap2 ->
+                    KnownWifiWaitCopy.boundNegotiatingStep(headUnitProfile.id, true)
+                        ?: KnownWifiWaitCopy.HERO
                 handoffToWifi -> "蓝牙已交棒，等待车机 Wi-Fi 邀请"
                 else -> "车机已回连，等待 CarPlay 邀请"
             }))
@@ -2572,8 +2574,13 @@ object HyperCarRepo {
         if (invitationOnly || profileRequiresActivation) awaitingCarInvitation = true
         log("WIFI-ACTIVE: 本轮开关=$proactiveEnabled 延时=${ProactiveWifiSessionPolicy.DELAY_MILLIS}ms 失败后已知网络恢复=$invitationOnly（需重新核实车机/网络及退避）；正常邀请优先，端口可连不代表车机已授权")
         if (requireActivation) {
-            log("SESSION: 等待本轮 ctrl 邀请或 iAP2 端点；保持蓝牙监听与 Wi-Fi 广播，不预连记忆/扫描端口")
-            push(link = LinkState.Negotiating("等待车机开启 CarPlay"))
+            if (KnownWifiWaitCopy.waitsForHeadUnitEndpoint(headUnitProfile.id)) {
+                log(KnownWifiWaitCopy.endpointOpening())
+                push(link = LinkState.Negotiating(KnownWifiWaitCopy.ENDPOINT_STEP))
+            } else {
+                log("SESSION: 等待本轮 ctrl 邀请或 iAP2 端点；保持蓝牙监听与 Wi-Fi 广播，不预连记忆/扫描端口")
+                push(link = LinkState.Negotiating("等待车机开启 CarPlay"))
+            }
         }
         if (!requireActivation) {
             val remembered = probeRememberedEndpoint(context, coordinator, profileRequiresActivation || invitationOnly)
@@ -2719,26 +2726,28 @@ object HyperCarRepo {
                             val waitingForCarIap2 = KnownWifiWaitCopy.awaitingHeadUnitIap2(
                                 wifiBound, coordinator.sessionStartCount, roundSessionBaseline,
                                 ReconnectDiscoverability.firstWindowOver())
-                            if (waitingForCarIap2) {
+                            if (wifiBound) {
+                                val step = KnownWifiWaitCopy.boundNegotiatingStep(
+                                    headUnitProfile.id, waitingForCarIap2)
                                 val current = _snapshots.value.link
-                                if (current !is LinkState.Negotiating || current.step != KnownWifiWaitCopy.HERO) {
-                                    push(link = LinkState.Negotiating(KnownWifiWaitCopy.HERO))
+                                if (step != null) {
+                                    if (current !is LinkState.Negotiating || current.step != step) {
+                                        push(link = LinkState.Negotiating(step))
+                                    }
+                                } else if (current is LinkState.Negotiating &&
+                                    current.step == KnownWifiWaitCopy.HERO) {
+                                    push(link = LinkState.Negotiating("等待车机开启 CarPlay"))
                                 }
-                                log(KnownWifiWaitCopy.progress(waited, sessionsThisRound))
+                                log(KnownWifiWaitCopy.boundProgress(
+                                    headUnitProfile.id, waited, sessionsThisRound, waitingForCarIap2))
                             } else {
                                 val current = _snapshots.value.link
                                 if (current is LinkState.Negotiating && current.step == KnownWifiWaitCopy.HERO) {
                                     push(link = LinkState.Negotiating("等待车机开启 CarPlay"))
                                 }
                                 log(
-                                    if (wifiBound) {
-                                        "SESSION: 等待本轮车机 Wi-Fi ctrl 邀请，已等 ${waited}s；" +
-                                            "已绑定已知车机网络，宝马二次上车蓝牙常仅短窗口后交棒，" +
-                                            "不以持续 iAP2 会话为成败（本轮蓝牙会话=$sessionsThisRound）"
-                                    } else {
-                                        "SESSION: 等待本轮车机邀请/0x4301，已等 ${waited}s；" +
-                                            "蓝牙会话次数=${coordinator.sessionStartCount} 已收Wi-Fi凭据=${seen?.ssid != null}，保持广播与监听"
-                                    },
+                                    "SESSION: 等待本轮车机邀请/0x4301，已等 ${waited}s；" +
+                                        "蓝牙会话次数=${coordinator.sessionStartCount} 已收Wi-Fi凭据=${seen?.ssid != null}，保持广播与监听",
                                 )
                             }
                         } else if (seen == null && coordinator.sessionStartCount == 0 && wifiReceiverMac == null) {
