@@ -21,6 +21,8 @@ pub struct ScreenSession {
     pub display: (u32,u32),
     pub owned: Arc<AtomicBool>,
     pub commands: mpsc::Sender<ScreenCommand>,
+    pub bootstrap_event: Option<Arc<RtspChannel>>,
+    pub bootstrap_hids: Vec<Value>,
     pub activated: AtomicBool,
     pub(crate) resource_state: tokio::sync::Mutex<crate::screen_resource::ResourceStream>,
 }
@@ -50,7 +52,7 @@ impl ScreenSession {
         if self.params.carwith_stretch { sender.set_display_target(self.display.0,self.display.1); }
         sender.set_ownership(self.owned.clone());
         crate::emit_log(&format!("AIRPLAY: 主屏 TCP 就绪 dataPort={port} connId={conn_id} source={w}x{h}; new cipher/config state"));
-        if !self.params.mbux_screen_bootstrap || self.activated.load(std::sync::atomic::Ordering::Acquire) {
+        if !(self.params.mbux_screen_bootstrap || self.params.id9_screen_bootstrap) || self.activated.load(std::sync::atomic::Ordering::Acquire) {
             crate::pipeline::activation(&self.params.pipeline, "VIDEO_CHANNEL_READY");
         }
         Ok(sender)

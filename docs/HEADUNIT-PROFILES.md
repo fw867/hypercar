@@ -1,12 +1,13 @@
 # 车机档案与验证范围
 
-更新：2026-11-08。所有车型统一在 [profiles/headunits.json](../profiles/headunits.json) 下发，App 按 ID 选择，不维护独立车型 JSON。
+更新：2026-11-12。所有车型统一在 [profiles/headunits.json](../profiles/headunits.json) 下发，App 按 ID 选择，不维护独立车型 JSON。
 
 ## 内置策略
 
 | ID | 断 HFP/A2DP | 出站 iAP2 | 要求本轮激活 | 特殊门槛 | 验证范围 |
 |---|---|---|---|---|---|
 | bmw_id85 | false | false | true | 允许用户开启已配对 Wi-Fi 主动恢复 | MGU-55 实车基准；不能代表所有 iDrive |
+| bmw_id9 | false | true | true | 新鲜0x4301；主屏/HID/视频TCP在RECORD前就绪；不继承MGU的SAP | ID9试验，仅模拟验证；AAC待实现 |
 | generic | true | true | false | 通用模板 | verified 不代表所有车型经过测试 |
 | winplay | false | true | false | deviceID 校验；7000端口 | PC 联调，不等于真实车机 |
 | audi_mib3 | true | true | false | mDNS 优先、兼容晚到端点 | 本项目未完成奥迪实车验证 |
@@ -19,13 +20,13 @@ BMW/generic/Audi 启用0x4300、EA及0x4E0E；大众/奔驰启用0x4300、0x4E0E
 
 ## 配置字段与覆盖
 
-当前 schema=8。达到当前schema的同ID远程条目可覆盖内置；旧schema只追加新ID，不能覆盖内置修复。缺省字段继承同ID内置值，新ID继承BMW模板；显式false是有效覆盖。touchDisplay/pairingHint空字符串可清除。导出保留策略及schema，刷新失败保留缓存并继续执行schema隔离。
+当前发布schema=9。覆盖门槛按档案区分：bmw_id9需要schema9，其余内置档案继续接受schema8，避免ID9升级使已有有效覆盖失效；低于该档案门槛的缓存仅能追加新ID。缺省字段继承同ID内置值，新ID继承BMW模板；显式false是有效覆盖。touchDisplay/pairingHint空字符串可清除。导出保留策略及schema，刷新失败保留缓存并继续执行schema隔离。
 
 | 字段组 | 内容 |
 |---|---|
 | iAP2 | validatesDeviceId、sendCarPlayAvailability、openEaSessions、sendTransportIdentifier、replyPowerUpdates、dropProfilesBeforeIap2、allowOutboundIap2、abortWhenCarPlayWindowClosed |
 | 激活/发现 | preferMdnsAirplay、requireAirplayActivation、allowProactiveWifiSession、advertiseOnCurrentWifi、requireFreshCtrlInvite、fallbackAirplayPorts |
-| 画面 | touchDisplay、useScreenResourceLifecycle |
+| 画面 | touchDisplay、useScreenResourceLifecycle、mbuxScreenBootstrap、id9ScreenBootstrap |
 | 说明 | id、label、model、notes、verified、pairingHint |
 
 useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关，不改用户偏好。奔驰为true时设置页显示档案已启用且不可在该行关闭。旧 keepIap2AliveOnly 已移除，不恢复旧行为。
@@ -83,3 +84,5 @@ useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关�
 初始资源保留车机音频归属，后续播放仍经独立音频资源申请，保留/info声明的约束。屏幕按100ms延迟执行资源声明→SETUP→连接dataPort→RECORD；只有RECORD成功后才向视频泵安装发送器，安装时再次核对屏幕代次。SETUP拒绝不会再仅凭控制存活显示已连接；RECORD拒绝或资源收回释放本轮屏幕通道。后续资源变化继续走已有串行生命周期，不重复全局RECORD。暂未修改音频格式/URI和全局RTSP Session头处理。
 
 该分支是根据成功样本静态路径校准的奔驰实验，不代表已在奔驰验证消除400；多个校准项同时启用，不能据一次成功反推唯一根因。回归及安装状态见VALIDATION。
+
+ID9当前路径：配对 → 会话SETUP → /info主屏UUID → 初始资源声明 → 按约束申请主屏 → HID mode0 → 主屏SETUP/TCP → RECORD → 资源版本仍有效才送帧。只对bmw_id9启用；不支持的PCM媒体档不尝试，AAC仍待接通。

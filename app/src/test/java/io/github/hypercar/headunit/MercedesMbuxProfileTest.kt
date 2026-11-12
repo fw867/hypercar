@@ -30,7 +30,7 @@ class MercedesMbuxProfileTest {
 
     @Test fun mbuxKeepsControlOnScreenRejectionWithoutChangingOtherProfilesOrUserSetting() {
         assertTrue(profile.screenResourceLifecycleEnabled(false))
-        for (other in HeadUnitProfiles.builtin.filter { it.id != profile.id }) {
+        for (other in HeadUnitProfiles.builtin.filter { it.id != profile.id && it.id != HeadUnitProfiles.BMW_ID9.id }) {
             assertFalse(other.id, other.screenResourceLifecycleEnabled(false))
             assertTrue(other.id, other.screenResourceLifecycleEnabled(true))
         }

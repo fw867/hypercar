@@ -81,6 +81,9 @@ data class HeadUnitProfile(
     /** MBUX-only authenticated screen-before-RECORD bootstrap. */
     val mbuxScreenBootstrap: Boolean = false,
 
+    /** IDC23 resource/HID/screen bootstrap before RECORD; separate from MGU and MBUX. */
+    val id9ScreenBootstrap: Boolean = false,
+
     /** mDNS 拿不到（或不用 mDNS）时的兜底端口，按顺序试连。 */
     val fallbackAirplayPorts: List<Int> = listOf(7000, 7001, 7100, 17000),
 
@@ -119,6 +122,31 @@ object HeadUnitProfiles {
         fallbackAirplayPorts = listOf(7000, 7001, 7100, 17000),
         touchDisplay = null,
         pairingHint = "首次要在 iDrive 里把这个设备选成 CarPlay 手机（车机会弹确认）",
+    )
+
+    /** IDC23 is kept separate from the existing MGU policy; media compatibility remains experimental. */
+    val BMW_ID9 = HeadUnitProfile(
+        id = "bmw_id9",
+        label = "BMW ID9",
+        model = "IDC23（ID9）",
+        notes = "IDC23 系列试验配置：保留系统蓝牙音频，接受本轮车机会话参数和 IPv6 端点。按主屏声明、HID、屏幕建链后再激活；AAC 音频仍在适配，尚未实车验证。",
+        verified = false,
+        validatesDeviceId = false,
+        sendCarPlayAvailability = true,
+        openEaSessions = false,
+        sendTransportIdentifier = false,
+        replyPowerUpdates = true,
+        dropProfilesBeforeIap2 = false,
+        allowOutboundIap2 = true,
+        preferMdnsAirplay = true,
+        requireAirplayActivation = true,
+        allowProactiveWifiSession = false,
+        advertiseOnCurrentWifi = false,
+        requireFreshCtrlInvite = false,
+        useScreenResourceLifecycle = true,
+        id9ScreenBootstrap = true,
+        fallbackAirplayPorts = listOf(7000),
+        pairingHint = "先在车机确认 Apple CarPlay 授权；此配置仍在适配中，尚未验证音视频正常。",
     )
 
     /**
@@ -252,7 +280,7 @@ object HeadUnitProfiles {
     )
 
     /** 内置档案（出厂就有的，断网也一定在）。宝马排第一：它是默认档案。 */
-    val builtin: List<HeadUnitProfile> = listOf(BMW_ID85, GENERIC, WINPLAY, AUDI_MIB3, VOLKSWAGEN, MERCEDES_MBUX)
+    val builtin: List<HeadUnitProfile> = listOf(BMW_ID85, BMW_ID9, GENERIC, WINPLAY, AUDI_MIB3, VOLKSWAGEN, MERCEDES_MBUX)
 
     /**
      * 全部可用档案 = 内置 + 远程（GitHub 下发的 `profiles/headunits.json`）。

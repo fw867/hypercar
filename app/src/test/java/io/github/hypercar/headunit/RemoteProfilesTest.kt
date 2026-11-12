@@ -64,6 +64,30 @@ class RemoteProfilesTest {
         assertEquals(HeadUnitProfiles.BMW_ID85.copy(id = "new_car", label = "New car"), parsed)
     }
 
+    @Test fun id9BootstrapIsInheritedAndCannotBeDisabledBySchemaEightCache() {
+        val id9 = HeadUnitProfiles.BMW_ID9
+        assertEquals(id9, RemoteProfiles.parse("""[{"id":"bmw_id9"}]""").single())
+        val old = id9.copy(id9ScreenBootstrap = false)
+        assertTrue(RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(old), 8).single { it.id == id9.id }.id9ScreenBootstrap)
+        assertEquals(id9, RemoteProfiles.parse(RemoteProfiles.encode(listOf(id9))).single())
+    }
+
+    @Test fun id9SchemaUpgradeDoesNotInvalidateExistingReceiversSchemaEightOverrides() {
+        val overrides = listOf(HeadUnitProfiles.BMW_ID85, HeadUnitProfiles.MERCEDES_MBUX,
+            HeadUnitProfiles.AUDI_MIB3, HeadUnitProfiles.VOLKSWAGEN, HeadUnitProfiles.WINPLAY,
+            HeadUnitProfiles.GENERIC).map { it.copy(preferMdnsAirplay = !it.preferMdnsAirplay) }
+        val oldId9 = HeadUnitProfiles.BMW_ID9.copy(id9ScreenBootstrap = false)
+        val effective = RemoteProfiles.merge(HeadUnitProfiles.builtin, overrides + oldId9, 8)
+        overrides.forEach { expected ->
+            assertEquals(expected.id, expected, effective.single { it.id == expected.id })
+            assertTrue(RemoteProfiles.canOverrideBuiltin(expected.id, 8))
+            assertFalse(RemoteProfiles.canOverrideBuiltin(expected.id, 7))
+        }
+        assertEquals(HeadUnitProfiles.BMW_ID9, effective.single { it.id == oldId9.id })
+        assertFalse(RemoteProfiles.canOverrideBuiltin(oldId9.id, 8))
+        assertTrue(RemoteProfiles.canOverrideBuiltin(oldId9.id, 9))
+    }
+
     @Test fun oldCacheCannotOverrideBuiltinsButCanAddProfiles() {
         val stale = HeadUnitProfiles.BMW_ID85.copy(
             requireAirplayActivation = false, dropProfilesBeforeIap2 = false,

@@ -44,6 +44,7 @@ pub struct AirplayParams {
     pub keep_alive_stats: bool,
     pub bmw_box_bootstrap: bool,
     pub mbux_screen_bootstrap: bool,
+    pub id9_screen_bootstrap: bool,
     pub desktop_receiver: bool,
     /// 设置里的编码分辨率（仅作 `/info` 无显示器信息时的兜底）。
     pub width: u32,
@@ -102,7 +103,10 @@ pub async fn negotiate(
 
     // 保留配对前的 best-effort 身份读取，供旧凭证公钥索引兼容使用。
     // 此阶段的 455 不表示缺少显示能力；显示信息在会话 SETUP 成功后重新读取。
-    let mut info = match fetch_info(&channel).await {
+    let mut info = if p.id9_screen_bootstrap {
+        emit_log("ID9: pair first; defer /info until authenticated session SETUP");
+        Value::dict(vec![])
+    } else { match fetch_info(&channel).await {
         Ok(v) => v,
         Err(e) => {
             emit_log(&format!(
@@ -111,6 +115,7 @@ pub async fn negotiate(
             ));
             Value::dict(vec![])
         }
+    }
     };
     let receiver_pk = info
         .get("pk")
@@ -248,7 +253,7 @@ pub async fn negotiate(
         }
     }
 
-    let mut box_bootstrap = use_box_bootstrap(p.bmw_box_bootstrap, &info);
+    let mut box_bootstrap = !p.id9_screen_bootstrap && use_box_bootstrap(p.bmw_box_bootstrap, &info);
     if box_bootstrap { crate::auth_setup::run(&channel).await?; }
     else if p.mbux_screen_bootstrap {
         emit_log("MBUX: screen-before-RECORD bootstrap; auth-setup=true minimal_features=true latencyMs=100 deferred_audio=true");
@@ -258,12 +263,17 @@ pub async fn negotiate(
         crate::auth_setup::run_with_policy(&channel, true).await?;
     }
 
+    if p.id9_screen_bootstrap && shared_secret.is_none() {
+        return Err("ID9 requires successful pair-verify; no plaintext media fallback".into());
+    }
+
     // CatPlay bootstrap: 会话 SETUP → /info → 事件通道/保活 → 资源声明 → 屏幕流。
     let timing = TimingServer::start_with_pipeline(p.pipeline.clone()).map_err(|e| format!("计时服务启动失败: {e}"))?;
     let (root, session_info) = setup_and_read_info(
         &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap,
     ).await?;
     info = session_info;
+    for line in audio_capability_lines(&info) { emit_log(&line); }
     // SETUP may be the first point at which /info reveals the real receiver identity.
     box_bootstrap = use_box_bootstrap(box_bootstrap, &info);
     emit_log(&format!("AIRPLAY: effective BMW box bootstrap={box_bootstrap} requested={}", p.bmw_box_bootstrap));
@@ -280,8 +290,11 @@ pub async fn negotiate(
             .get("keepAliveSendStatsAsBody")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-    let display = select_display(&info);
+    let display = if p.id9_screen_bootstrap { select_id9_display(&info) } else { select_display(&info) };
     let display_uuid = display.and_then(|d| uuid_text(d.get("uuid")));
+    if p.id9_screen_bootstrap && display_uuid.is_none() {
+        return Err("ID9 /info lacks a valid main display UUID/size; refusing guessed screen SETUP".into());
+    }
     let (disp_w, disp_h) = display.map(read_display_size).unwrap_or((0, 0));
     if let Some(requested) = &p.carwith_display {
         if disp_w >= 2 && disp_h >= 2 { *requested.lock() = (disp_w, disp_h); }
@@ -296,7 +309,7 @@ pub async fn negotiate(
     // The receiver defines the viewport ratio, not the phone's encoding workload.
     // Kotlin chooses a proportional capped canvas and reports the actual size before its first frame.
     crate::emit_display_size(disp_w, disp_h);
-    if let Some(layout) = crate::display_layout::read(&info, disp_w, disp_h, display_uuid.as_deref()) {
+    if let Some(layout) = crate::display_layout::read(if p.id9_screen_bootstrap { display.unwrap() } else { &info }, disp_w, disp_h, display_uuid.as_deref()) {
         emit_log(&format!("DISPLAY: canvas={disp_w}x{disp_h} view={:?} safe={:?} drawOutside={}", layout.view,layout.safe,layout.draw_outside));
         crate::emit_display_layout(disp_w,disp_h,&layout);
     }
@@ -309,7 +322,9 @@ pub async fn negotiate(
         .open_tcp(&p.car_ip, event_port, 5_000)
         .ok_or_else(|| format!("事件通道连接失败 {}:{event_port}", p.car_ip))?;
     let (ev_r, ev_w) = event_stream.into_split();
-    let initial_modes = if p.mbux_screen_bootstrap {
+    let initial_modes = if p.id9_screen_bootstrap {
+        crate::modes::Modes::id9_initial(&info, p.enable_audio)
+    } else if p.mbux_screen_bootstrap {
         crate::modes::Modes::from_info_with_audio_policy(&info, p.enable_audio, false, true)
     } else { crate::modes::Modes::from_info(&info, p.enable_audio, box_bootstrap) };
     let modes = Arc::new(Mutex::new(initial_modes));
@@ -343,6 +358,7 @@ pub async fn negotiate(
         let (read_key, write_key) = derive_event_keys(shared);
         event_channel.set_cipher(ControlCipher::new(read_key, write_key));
     }
+    let event_for_bootstrap = event_channel.clone();
     let mut keepalive = KeepaliveTasks(Vec::new(), None, None);
     // 事件通道必须活到会话结束：`RtspChannel` 的 `Drop` 会 abort 读任务并关闭 socket。
     // 之前这里只是临时变量，函数返回时就被丢弃 → 事件通道刚连上即被我们自己关掉，
@@ -365,6 +381,8 @@ pub async fn negotiate(
         uuid:display_uuid.clone().unwrap_or_else(|| "6E4E3B31-0E5B-4A8F-9F1B-2C5D7E9A0C11".into()),
         keep_stats:keep_alive_stats, display:(disp_w,disp_h), owned:screen_owned.clone(),
         commands:screen_ready,
+        bootstrap_event: if p.id9_screen_bootstrap { Some(event_for_bootstrap) } else { None },
+        bootstrap_hids: if p.id9_screen_bootstrap { id9_hid_ids(&info, display_uuid.as_deref()) } else { Vec::new() },
         activated:std::sync::atomic::AtomicBool::new(false), resource_state:tokio::sync::Mutex::new(Default::default()),
     });
     keepalive.0.push(spawn_event_dispatcher(
@@ -408,7 +426,7 @@ pub async fn negotiate(
     // BMW box activates the session before resource negotiation and video SETUP.
     let declaration = modes.lock().declaration();
     emit_log(&format!("TIMING: before RECORD {}",p.pipeline.lock().timing.summary()));
-    if p.mbux_screen_bootstrap {
+    if p.mbux_screen_bootstrap || p.id9_screen_bootstrap {
         screen_session.bootstrap_before_record(&modes).await?;
     } else {
         activate_session(&channel, &declaration, &p.pipeline).await?;
@@ -456,7 +474,10 @@ pub async fn negotiate(
     // The phone is the resource arbiter. CatPlay marks changeModes FromAccessory;
     // sending it to BMW returned 422. Initial local ownership was already published via
     // modesChanged before stream SETUP. Receiver borrow/take requests still gate packets.
-    let audio_allowed = p.enable_audio;
+    let audio_allowed = p.enable_audio && (!p.id9_screen_bootstrap || id9_pcm_media_supported(&info));
+    if p.id9_screen_bootstrap && p.enable_audio && !audio_allowed {
+        emit_log("ID9: receiver has no PCM48k media format; skip unsupported PCM SETUP, retain video/control (AAC pending)");
+    }
     audio_owned.store(modes.lock().audio_owned(), std::sync::atomic::Ordering::Release);
     emit_log(&format!("AUDIO: enabled={} box_bootstrap={box_bootstrap} setup_enabled={audio_allowed} owner_controller={}", p.enable_audio, modes.lock().audio_owned()));
     let mut audio = if audio_allowed {
@@ -547,6 +568,115 @@ mod shutdown_tests {
         finish_session(&control, &[], false).await;
         let mut buf = [0; 1];
         assert_eq!(tokio::time::timeout(Duration::from_millis(500), peer.read(&mut buf)).await.unwrap().unwrap(), 0);
+    }
+}
+
+/// Receiver declarations only: outgoing SETUP is never evidence of supported codecs.
+fn audio_capability_lines(info: &Value) -> Vec<String> {
+    let model = info.get("model").and_then(Value::as_str).unwrap_or("unknown");
+    let Some(formats) = info.get("audioFormats").and_then(Value::as_array).filter(|f| !f.is_empty()) else {
+        return vec![format!("AUDIO-CAPS: receiver={model} audioFormats absent/empty; AAC/PCM support unknown")];
+    };
+    let mut lines = vec![format!("AUDIO-CAPS: receiver={model} declared_formats={}", formats.len())];
+    for (index, f) in formats.iter().take(64).enumerate() {
+        let output = f.get("audioOutputFormats").and_then(Value::as_int);
+        let input = f.get("audioInputFormats").and_then(Value::as_int);
+        let bits = |v: Option<i64>| v.map(|n| format!("0x{n:x}")).unwrap_or_else(|| "unknown".into());
+        let flag = |bit| output.map(|n| (n & bit != 0).to_string()).unwrap_or_else(|| "unknown".into());
+        lines.push(format!("AUDIO-CAPS: [{index}] type={:?} audioType={} output={} input={} PCM48={} AAC44={} AAC48={}",
+            f.get("type").and_then(Value::as_int), f.get("audioType").and_then(Value::as_str).unwrap_or("unknown"),
+            bits(output), bits(input), flag(1 << 15), flag(1 << 22), flag(1 << 23)));
+    }
+    lines
+}
+
+/// Match the explicit main screen before considering the legacy type=0/unspecified form.
+fn select_id9_display(info: &Value) -> Option<&Value> {
+    let displays = info.get("displays")?.as_array()?;
+    let valid = |d: &&Value| {
+        let (w,h) = read_display_size(d);
+        w >= 2 && h >= 2 && w <= 16384 && h <= 16384 && uuid_text(d.get("uuid")).is_some()
+    };
+    for kind in [Some(110), Some(0), None] {
+        if let Some(display) = displays.iter().filter(valid).find(|d| d.get("type").and_then(Value::as_int) == kind) {
+            return Some(display);
+        }
+    }
+    None
+}
+
+fn id9_hid_ids(info: &Value, display_uuid: Option<&str>) -> Vec<Value> {
+    let mut ids = Vec::new();
+    for hid in info.get("hidDevices").and_then(Value::as_array).into_iter().flatten().take(32) {
+        if hid.get("displayUUID").and_then(Value::as_str).is_some_and(|id| Some(id) != display_uuid) { continue; }
+        let Some(id) = hid.get("uuid") else { continue; };
+        if !(id.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 128) || id.as_int().is_some_and(|v| v >= 0)) { continue; }
+        if !ids.contains(id) { ids.push(id.clone()); }
+    }
+    ids
+}
+
+fn id9_pcm_media_supported(info: &Value) -> bool {
+    info.get("audioFormats").and_then(Value::as_array).into_iter().flatten().any(|f|
+        f.get("type").and_then(Value::as_int) == Some(100) &&
+        f.get("audioType").and_then(Value::as_str) == Some("media") &&
+        f.get("audioOutputFormats").and_then(Value::as_int).is_some_and(|bits| bits & (1 << 15) != 0))
+}
+
+#[cfg(test)]
+mod id9_tests {
+    use super::*;
+    fn display(id: &str, kind: i64, w: i64) -> Value {
+        Value::dict(vec![("uuid",Value::str(id)),("type",Value::int(kind)),("widthPixels",Value::int(w)),("heightPixels",Value::int(960))])
+    }
+    #[test]
+    fn explicit_main_screen_wins_when_auxiliary_and_legacy_entries_come_first() {
+        let info=Value::dict(vec![("displays",Value::array(vec![display("aux",111,2240),display("legacy",0,1024),display("main",110,2880)]))]);
+        let selected=select_id9_display(&info).unwrap();
+        assert_eq!(selected.get("uuid").and_then(Value::as_str),Some("main"));
+        assert_eq!(read_display_size(selected),(2880,960));
+        for displays in [vec![display("aux",111,2240)],vec![display("bad",110,0)],vec![]] {
+            assert!(select_id9_display(&Value::dict(vec![("displays",Value::array(displays))])).is_none());
+        }
+    }
+    #[test]
+    fn nested_id9_view_area_is_kept_separate_from_canvas() {
+        let display=Value::dict(vec![("viewAreas",Value::array(vec![Value::dict(vec![
+            ("widthPixels",Value::int(2880)),("heightPixels",Value::int(840)),
+            ("safeArea",Value::dict(vec![("widthPixels",Value::int(2860)),("heightPixels",Value::int(836)),("originXPixels",Value::int(10)),("originYPixels",Value::int(4))])),
+        ])]))]);
+        let layout=crate::display_layout::read(&display,2880,960,Some("main")).unwrap();
+        assert_eq!((layout.view.w,layout.view.h),(2880,840));
+        assert_eq!((layout.safe.x,layout.safe.y,layout.safe.w,layout.safe.h),(10,4,2860,836));
+    }
+    #[test]
+    fn input_initialization_only_uses_declared_main_hid_devices() {
+        let hid=|id:&str,display:&str| Value::dict(vec![("uuid",Value::str(id)),("displayUUID",Value::str(display))]);
+        let info=Value::dict(vec![("hidDevices",Value::array(vec![hid("150B","main"),hid("150B","main"),hid("150C","main"),hid("other","aux")]))]);
+        assert_eq!(id9_hid_ids(&info,Some("main")),vec![Value::str("150B"),Value::str("150C")]);
+    }
+    #[test]
+    fn capability_diagnostics_distinguish_declarations_from_missing_info() {
+        let missing=audio_capability_lines(&Value::dict(vec![])).join("\n");
+        assert!(missing.contains("support unknown"));
+        assert!(!missing.contains("AAC48=false"));
+        let info=Value::dict(vec![("model",Value::str("MGU-fixture")),("audioFormats",Value::array(vec![Value::dict(vec![
+            ("type",Value::int(102)),("audioType",Value::str("media")),("audioOutputFormats",Value::int(0x800000)),
+        ])]))]);
+        let lines=audio_capability_lines(&info).join("\n");
+        assert!(lines.contains("receiver=MGU-fixture"));
+        assert!(lines.contains("type=Some(102) audioType=media output=0x800000"));
+        assert!(lines.contains("PCM48=false AAC44=false AAC48=true"));
+        // This is a synthetic capability fixture, not evidence from a real MGU head unit.
+    }
+    #[test]
+    fn aac_only_receiver_is_never_sent_unadvertised_pcm_media() {
+        let fmt=|kind,typ:&str,bits| Value::dict(vec![("type",Value::int(kind)),("audioType",Value::str(typ)),("audioOutputFormats",Value::int(bits))]);
+        let info=Value::dict(vec![("audioFormats",Value::array(vec![fmt(102,"media",0x800000),fmt(100,"default",0x30000000)]))]);
+        assert!(!id9_pcm_media_supported(&info));
+        assert!(!id9_pcm_media_supported(&Value::dict(vec![])));
+        assert!(!id9_pcm_media_supported(&Value::dict(vec![("audioFormats",Value::array(vec![fmt(100,"telephony",0x8000)]))])));
+        assert!(id9_pcm_media_supported(&Value::dict(vec![("audioFormats",Value::array(vec![fmt(100,"media",0x8000)]))])));
     }
 }
 

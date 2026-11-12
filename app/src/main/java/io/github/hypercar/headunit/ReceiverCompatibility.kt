@@ -16,5 +16,5 @@ internal object ReceiverCompatibility {
         }
     }
     fun useBmwBootstrap(profileId: String, receiverIdentity: String?): Boolean =
-        profileId.startsWith("bmw") && !isDesktopReceiver(profileId, receiverIdentity)
+        profileId.startsWith("bmw") && profileId != "bmw_id9" && !isDesktopReceiver(profileId, receiverIdentity)
 }

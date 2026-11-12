@@ -147,6 +147,19 @@ impl Modes {
         value
     }
 
+    /// IDC23 publishes the receiver's initial screen ownership before requesting it.
+    pub fn id9_initial(info: &Value, enable_audio: bool) -> Self {
+        let mut value = info.get("modes").and_then(Self::read_initial).unwrap_or_else(|| {
+            let mut value = Self::initial();
+            value.resources[0] = Resource::owned(2, ANYTIME, ANYTIME);
+            value.resources[1] = Resource::owned(2, ANYTIME, ANYTIME);
+            value
+        });
+        value.playback_enabled = enable_audio;
+        if enable_audio { value.resources[1].take_by(1, USER_INITIATED, ANYTIME, ANYTIME); }
+        value
+    }
+
     fn read_initial(params: &Value) -> Option<Self> {
         params.as_dict()?;
         let mut next = Self::initial();
@@ -437,5 +450,21 @@ mod tests {
         let response = m.response(&Value::dict(vec![("type",Value::str("changeModes")),("params",malformed_take)])).unwrap();
         let parsed = bplist::parse(&response).unwrap(); assert_eq!(parsed.get("status").and_then(Value::as_int),Some(1)); assert!(parsed.get("params").is_none());
         assert_eq!(before,m.snapshot());
+    }
+}
+
+#[cfg(test)]
+mod id9_bootstrap_tests {
+    use super::*;
+    #[test]
+    fn initial_receiver_ownership_is_reported_then_claimed_only_if_allowed() {
+        for constraint in [100,1000] {
+            let info=Value::dict(vec![("modes",Value::dict(vec![("resources",Value::array(vec![Value::dict(vec![
+                ("resourceID",Value::int(1)),("transferType",Value::int(1)),("takeConstraint",Value::int(constraint)),("borrowConstraint",Value::int(100)),
+            ])]))]))]);
+            let mut modes=Modes::id9_initial(&info,true);
+            assert!(!modes.screen_owned()); assert!(modes.audio_owned());
+            modes.request_ui(); assert_eq!(modes.screen_owned(),constraint==100);
+        }
     }
 }

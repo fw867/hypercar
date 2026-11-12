@@ -4,6 +4,25 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ReceiverCompatibilityTest {
+    @Test fun id9ProfileIsIsolatedFromMguAndMbuxBootstrap() {
+        val id9 = HeadUnitProfiles.BMW_ID9
+        assertEquals("bmw_id9", id9.id)
+        assertFalse(id9.verified)
+        assertTrue(id9.screenResourceLifecycleEnabled(false))
+        assertFalse(id9.mbuxScreenBootstrap)
+        assertTrue(id9.id9ScreenBootstrap)
+        HeadUnitProfiles.builtin.filter { it.id != id9.id }.forEach { assertFalse(it.id9ScreenBootstrap) }
+        assertFalse(ReceiverCompatibility.useBmwBootstrap(id9.id, "BMW IDC23"))
+        assertTrue(ReceiverCompatibility.useBmwBootstrap(HeadUnitProfiles.BMW_ID85.id, "BMW MGU"))
+        assertFalse(id9.dropProfilesBeforeIap2)
+        assertTrue(id9.allowOutboundIap2)
+        assertTrue(id9.requireAirplayActivation)
+        assertFalse(id9.requireFreshCtrlInvite)
+        assertFalse(id9.allowProactiveWifiSession)
+        assertEquals(listOf(7000), id9.fallbackAirplayPorts)
+        assertTrue(HeadUnitProfiles.builtin.any { it.id == id9.id })
+    }
+
     @Test fun softwareDiscoveryRejectsSpeakersWithoutChangingVehicleDiscovery() {
         assertFalse(ReceiverCompatibility.matchesAirplayService("winplay", null, "xiaomi sound-6270._airplay._tcp.local", "L16A"))
         assertTrue(ReceiverCompatibility.matchesAirplayService("winplay", null, "WinPlay._airplay._tcp.local", "WinPlay"))

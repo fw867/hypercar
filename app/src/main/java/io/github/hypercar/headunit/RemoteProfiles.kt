@@ -34,10 +34,10 @@ object RemoteProfiles {
      * 为什么需要：远程同 id 会覆盖内置，而**旧缓存**里可能写着已经验证是错的字段值
      * （2026-10-25 就踩了这个：内置已把宝马的 `sendCarPlayAvailability` 等改回 `true`，
      * 但设备上缓存的 v1 JSON 仍是 `false`，覆盖后 CarPlay 图标继续不出现）。
-     * 规则：**`_schema` 低于本常量的远程条目，只能新增车型，不能覆盖内置档案**
+     * 规则：**`_schema` 低于本档案要求版本的条目，只能新增车型，不能覆盖该内置档案**
      * ——这样"修内置档案"必须显式升 schema 才会生效，旧缓存不会把修复顶回去。
      */
-    const val SCHEMA = 8
+    const val SCHEMA = 9
 
     /** 档案列表地址（raw.githubusercontent.com，改 `main` 为其它分支即可灰度）。 */
     const val DEFAULT_URL =
@@ -84,12 +84,16 @@ object RemoteProfiles {
 
     /** 只有实际参与合并的远程档案才显示「远程」角标。 */
     fun isRemote(id: String): Boolean = cached().any { it.id == id } &&
-        (cachedSchema() >= SCHEMA || HeadUnitProfiles.builtin.none { it.id == id })
+        (canOverrideBuiltin(id, cachedSchema()) || HeadUnitProfiles.builtin.none { it.id == id })
+
+    /** ID9 alone changed in schema 9; existing profiles retain their schema-8 cache contract. */
+    internal fun canOverrideBuiltin(id: String, schema: Int): Boolean =
+        schema >= if (id == "bmw_id9") 9 else 8
 
     /**
      * 把内置表与远程表合并：内置保持原顺序（远程可覆盖同 id），远程独有项追加。
      *
-     * @param remoteSchema 远程配置声明的 `_schema`。**低于 [SCHEMA] 时不允许覆盖内置**
+     * @param remoteSchema 远程配置声明的 `_schema`。**低于本档案要求版本时不允许覆盖内置**
      *    （旧缓存会把已经修好的内置值顶回去，2026-10-25 现场教训），只能新增车型。
      */
     fun merge(
@@ -102,7 +106,7 @@ object RemoteProfiles {
         val merged =
             builtin.map { base ->
                 val fromRemote = remoteById[base.id]
-                if (fromRemote != null && remoteSchema >= SCHEMA) fromRemote else base
+                if (fromRemote != null && canOverrideBuiltin(base.id, remoteSchema)) fromRemote else base
             }
         val builtinIds = builtin.map { it.id }.toSet()
         return merged + remote.filter { it.id !in builtinIds }
@@ -199,6 +203,7 @@ object RemoteProfiles {
             requireFreshCtrlInvite = o.optBoolean("requireFreshCtrlInvite", defaults.requireFreshCtrlInvite),
             useScreenResourceLifecycle = o.optBoolean("useScreenResourceLifecycle", defaults.useScreenResourceLifecycle),
             mbuxScreenBootstrap = o.optBoolean("mbuxScreenBootstrap", defaults.mbuxScreenBootstrap),
+            id9ScreenBootstrap = o.optBoolean("id9ScreenBootstrap", defaults.id9ScreenBootstrap),
             fallbackAirplayPorts = readPorts(o, defaults.fallbackAirplayPorts),
             touchDisplay = if (o.has("touchDisplay")) {
                 o.optString("touchDisplay", "").ifBlank { null }
@@ -241,6 +246,7 @@ object RemoteProfiles {
                     put("requireFreshCtrlInvite", p.requireFreshCtrlInvite)
                     put("useScreenResourceLifecycle", p.useScreenResourceLifecycle)
                     put("mbuxScreenBootstrap", p.mbuxScreenBootstrap)
+                    put("id9ScreenBootstrap", p.id9ScreenBootstrap)
                     put("fallbackAirplayPorts", JSONArray(p.fallbackAirplayPorts))
                     put("touchDisplay", p.touchDisplay ?: "")
                     put("pairingHint", p.pairingHint ?: "")

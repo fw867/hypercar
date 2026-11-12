@@ -1,5 +1,13 @@
 # 代码审计与维护记录
 
+ID9改动隔离复审（628，2026-11-12）：逐项核对EngineConfig默认false、SettingsStore按当前档案注入、ReceiverCompatibility仅对bmw_id9排除MGU bootstrap、内置/远端各档案开关及共享屏幕资源方法。旧BMW/通用/奥迪/大众/WinPlay的配对前/info、SAP分流、RECORD与屏幕顺序、PCM协商均保持原分支；奔驰共享方法只有ID9条件块内新增第二次声明/HID，原100ms/SAP路径未变。发现627将SCHEMA整体升9会停用其它车型已有效的schema8远端覆盖，已改为按档案门槛：仅ID9需9，其他内置继续8，isRemote角标共用同一判定；新增六类档案缓存覆盖隔离回归。另同步ID9主动申请主屏后的pipeline.screen_owned，避免实际持屏而诊断仍显示旧归属。补充只读AUDIO-CAPS日志，按/info逐条记录type/audioType、收发格式位及PCM48/AAC44/AAC48声明；字段缺失明确记unknown，未改变任何档案音频选择。
+
+ID8.5 AAC证据边界：现有hypercar-log-20261112-101754.txt明确识别MGU-55-BMW，10:47:40固定type100/media/0x8000(PCM48k)的SETUP返回200并有后续发包；日志没有完整接收端audioFormats数组。因此只能确认接受该PCM协商，不能从我方出站audioFormat或/info.features反推AAC支持/不支持。新AUDIO-CAPS需下次真实连接读取，测试中MGU-fixture为合成样本，不能冒充车机证据。
+
+ID9主屏建链适配（627）：仅bmw_id9启用新id9ScreenBootstrap。配置schema升9，旧schema8缓存不能顶掉新内置策略。ID9先配对，验证失败不降级明文；会话SETUP后读取/info，优先有效type110主屏，兼容type0/无类型，拒绝只有副屏或缺UUID的盲猜SETUP；视区从选中display内嵌viewAreas读取。保留初始车机屏幕归属上报，按约束申请主屏，再上报当前归属；事件通道对主屏所属HID UUID发hidSetInputMode(0)。屏幕SETUP采用本轮UUID与25ms延迟，视频TCP先连，再RECORD，成功后且资源generation仍有效才安装视频泵。复用串行资源锁、400/RECORD失败清理与撤屏保护，奔驰仍用原先100ms与SAP策略，旧BMW继续原路径。ID9若只声明AAC而不声明现有PCM48k media，则不发送不受支持的PCM SETUP，以免影响视频验证；AAC编码/RTP仍待单独实现。没有伪造空400的具体拒绝理由，最终能否解决须ID9实车日志确认。
+
+ID9独立试验配置（626，2026-11-12）：新增bmw_id9，显示BMW ID9 / IDC23（ID9），verified=false；原bmw_id85及已保存设置不迁移。新鲜iAP2端点即足够，不额外强等ctrl；保留系统HFP/A2DP，支持主动iAP2，关闭无邀请的已知Wi-Fi主动激活实验，端口7000，屏幕拒绝时保留控制会话。配置不继承MGU的BMW box bootstrap，因而不会额外发/auth-setup；不复用奔驰mbuxScreenBootstrap。内置和远端JSON一致，远端缓存省略字段仍继承同ID默认。本轮只建立策略隔离，ID9屏幕前置及AAC-LC编码/RTP尚未实现，不能宣称ID9媒体可用。CarPToCarL核心按/info能力、receiverIdentity及学习结果分流，并非为ID9单列完整品牌档案。
+
 宝马徽标校正（624）：用户反馈手绘字母和圆环不准确，改为标准SVG的几何路径，转换为本地VectorDrawable；不再用系统字体拼BMW或手工计算分区。首页使用灰色透明圆环和标准蓝白内圆，暗色场景用相同路径的浅色外圈，继续无额外黑底。素材作者BMW，来源及公开几何标识说明：https://commons.wikimedia.org/wiki/File:BMW_logo_(gray).svg ，参考品牌设计说明：https://www.press.bmwgroup.com/global/article/detail/T0306305EN/introducing-bmw%E2%80%99s-new-brand-design-for-online-and-offline-communication 。
 
 车型显示调整（623）：按用户反馈撤去首页额外品牌栏，待机脉冲圆环内直接用透明品牌图形替换汽车图标，型号回到状态说明下方；品牌组件新增无框模式并适配浅色背景的线条对比度，菜单仍保留原有徽标卡样式。当前车型卡片最小高度140dp、增加垂直留白，型号独立显示，名称和说明取消行数截断，由内容继续撑高。沿用622现有原生连接核心，工作区其他修改保留。

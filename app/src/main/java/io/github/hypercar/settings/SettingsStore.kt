@@ -389,6 +389,7 @@ object SettingsStore {
             append("\"carlife_source\":").append(if (carWithSource) "true" else "false").append(",")
             append("\"carwith_stretch\":").append(if (carWithStretch) "true" else "false").append(",")
             append("\"mbux_screen_bootstrap\":").append(profile.mbuxScreenBootstrap).append(",")
+            append("\"id9_screen_bootstrap\":").append(profile.id9ScreenBootstrap).append(",")
             append("\"screen_resource_lifecycle\":").append(if (profile.screenResourceLifecycleEnabled(screenResourceLifecycle)) "true" else "false").append(",")
             append("\"width\":").append(plan.width).append(",")
             append("\"height\":").append(plan.height).append(",")

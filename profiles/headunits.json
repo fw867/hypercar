@@ -1,8 +1,8 @@
 {
-  "version": 8,
-  "_schema": 8,
-  "updated": "2026-11-07",
-  "_comment": "HyperCar 车机档案下发文件。新增车型改这里 + push 即可，App 端「从 GitHub 更新车型列表」后立即出现。字段含义见 docs/HEADUNIT-PROFILES.md；除 id/label 外都可省略（省略 = 用同 id 内置档案的值）。_schema 必须 >= App 端 SCHEMA 才会覆盖内置档案（旧缓存不能把内置修复顶回去）。",
+  "version": 9,
+  "_schema": 9,
+  "updated": "2026-11-12",
+  "_comment": "HyperCar 车机档案下发文件。新增车型改这里 + push 即可，App 端「从 GitHub 更新车型列表」后立即出现。字段含义见 docs/HEADUNIT-PROFILES.md；除 id/label 外都可省略（省略 = 用同 id 内置档案的值）。覆盖内置档案须达到各自要求的 schema：ID9 为9，其余内置档案为8（旧缓存不能把内置修复顶回去）。",
   "profiles": [
     {
       "id": "bmw_id85",
@@ -30,6 +30,34 @@
       "allowProactiveWifiSession": true,
       "advertiseOnCurrentWifi": false,
       "requireFreshCtrlInvite": false
+    },
+    {
+      "id": "bmw_id9",
+      "label": "BMW ID9",
+      "model": "IDC23（ID9）",
+      "notes": "IDC23 系列试验配置：保留系统蓝牙音频，接受本轮车机会话参数和 IPv6 端点。按主屏声明、HID、屏幕建链后再激活；AAC 音频仍在适配，尚未实车验证。",
+      "verified": false,
+      "validatesDeviceId": false,
+      "sendCarPlayAvailability": true,
+      "openEaSessions": false,
+      "sendTransportIdentifier": false,
+      "replyPowerUpdates": true,
+      "dropProfilesBeforeIap2": false,
+      "allowOutboundIap2": true,
+      "abortWhenCarPlayWindowClosed": false,
+      "preferMdnsAirplay": true,
+      "requireAirplayActivation": true,
+      "allowProactiveWifiSession": false,
+      "advertiseOnCurrentWifi": false,
+      "requireFreshCtrlInvite": false,
+      "useScreenResourceLifecycle": true,
+      "mbuxScreenBootstrap": false,
+      "id9ScreenBootstrap": true,
+      "fallbackAirplayPorts": [
+        7000
+      ],
+      "touchDisplay": null,
+      "pairingHint": "先在车机确认 Apple CarPlay 授权；此配置仍在适配中，尚未验证音视频正常。"
     },
     {
       "id": "generic",

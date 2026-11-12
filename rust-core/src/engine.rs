@@ -61,6 +61,8 @@ pub struct EngineConfig {
     pub bmw_box_bootstrap: bool,
     #[serde(default)]
     pub mbux_screen_bootstrap: bool,
+    #[serde(default)]
+    pub id9_screen_bootstrap: bool,
     /// CarWith 模式（2026-11-03）：视频/音频改由本机 CarLife（CarWith）的 H.264/PCM 提供，
     /// 不再使用自绘 UI 的编码器帧。
     #[serde(default)]
@@ -461,6 +463,7 @@ pub async fn run_engine(
         keep_alive_stats: cfg.keep_alive_stats,
         bmw_box_bootstrap: cfg.bmw_box_bootstrap,
         mbux_screen_bootstrap: cfg.mbux_screen_bootstrap,
+        id9_screen_bootstrap: cfg.id9_screen_bootstrap,
         desktop_receiver: cfg.desktop_receiver,
         width: cfg.width,
         height: cfg.height,
@@ -747,6 +750,7 @@ mod video_pump_tests {
         let config:EngineConfig=serde_json::from_value(json.clone()).unwrap();
         assert!(!config.screen_resource_lifecycle);assert!(config.enable_audio);
         assert!(!config.mbux_screen_bootstrap);
+        assert!(!config.id9_screen_bootstrap);
         json["screen_resource_lifecycle"]=serde_json::json!(true);
         let config:EngineConfig=serde_json::from_value(json).unwrap();
         assert!(config.screen_resource_lifecycle);assert!(config.enable_audio);
