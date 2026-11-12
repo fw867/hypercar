@@ -202,6 +202,7 @@ object MapPreview {
                 HyperCarRepo.log("CARUI-PREVIEW: 断开投屏，保留地图/导航 display=$displayId $result")
             }
         } finally {
+            MapDiagnostics.stop()
             io.github.hypercar.navigation.AmapLinkProbe.stop()
             // The TextureView owns its SurfaceTexture until its destruction callback.
             cardSurface?.release()
@@ -222,6 +223,7 @@ object MapPreview {
         val provider = MapApps.selected(context) ?: error("请在手机安装高德地图或百度地图")
         if (activeProvider != null && activeProvider != provider) releaseMapTask()
         activeProvider = provider
+        HyperCarRepo.log("MAP-SCENE: request provider=${provider.id} display=$displayId from=$presentation to=$nextPresentation size=${w}x$h carMode=$carMode fullscreen=$fullscreen")
         if (displayId > 0) {
             val update = SpikeShell.updateDisplaySurface(displayId, output, w, h, mapDpi)
             if (update.contains("missing")) {
@@ -239,6 +241,7 @@ object MapPreview {
                 presentation = nextPresentation
                 bindCardInput(nextPresentation, w, h)
                 _status.value = ""
+                MapDiagnostics.start(context, provider, displayId, nextPresentation, carMode)
                 runCatching { io.github.hypercar.navigation.AmapLinkProbe.start(context, mapStarted = true) }
                 HyperCarRepo.log("CARUI-PREVIEW: 复用地图任务 $update presentation=$presentation")
                 return displayId
@@ -269,6 +272,7 @@ object MapPreview {
                 "-n ${provider.packageName}/com.autonavi.map.activity.SplashActivity --display $displayId", 12000)
             check(launch.ok && !launch.err.contains("Error")) { "${provider.label}启动失败: ${launch.err}" }
         }
+        MapDiagnostics.start(context, provider, displayId, nextPresentation, carMode)
         runCatching { io.github.hypercar.navigation.AmapLinkProbe.start(context, mapStarted = true) }
         bindCardInput(nextPresentation, w, h)
         HyperCarRepo.log("CARUI-PREVIEW: ${provider.label}初次启动 display=$displayId carMode=$carMode ${w}x$h dpi=$mapDpi presentation=$presentation")
@@ -279,6 +283,7 @@ object MapPreview {
 
     private suspend fun releaseMapTask(terminateProvider: Boolean = true) {
         clearCardInput()
+        MapDiagnostics.stop()
         io.github.hypercar.navigation.AmapLinkProbe.stop()
         if (displayId > 0) SpikeShell.releaseDisplay(displayId)
         displayId = -1

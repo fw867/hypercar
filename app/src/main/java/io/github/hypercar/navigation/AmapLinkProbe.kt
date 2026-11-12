@@ -48,6 +48,8 @@ internal object AmapLinkProbe {
         private var count = 0
         private var fdCount = 0
         private var nextGuidanceLogAt = 0L
+        private val mapDiagnosticValues = mutableMapOf<Int, String>()
+        private var mapDiagnosticLines = 0
         private val capture = org.json.JSONArray()
         private val sampledTypes = mutableSetOf<Int>()
         private val captureFile = java.io.File(context.getExternalFilesDir("diagnostics"), "hud-link-capture.json")
@@ -213,6 +215,21 @@ internal object AmapLinkProbe {
         private fun receive(raw: String, navigationToken: Long) {
             val text = LinkEnvelope.decode(raw) ?: run { log("callback envelope invalid bytes=${raw.length}"); return }
             val json = JSONObject(text)
+            if (json.optInt("bizType") == 113 && io.github.hypercar.settings.SettingsStore.debugLogEnabled && mapDiagnosticLines < 64) {
+                val items = runCatching { org.json.JSONArray(json.optString("datas")) }.getOrNull()
+                if (items != null) for (i in 0 until minOf(items.length(), 64)) {
+                    val item = items.optJSONObject(i) ?: continue
+                    val type = item.optInt("type", -1)
+                    val value = item.opt("data")
+                    val data = value as? JSONObject ?: (value as? String)?.let { LinkJson.objectValue(it) }
+                    val diagnostic = MapNavigationDiagnostic.event(type, data) ?: continue
+                    if (mapDiagnosticValues[type] != diagnostic && mapDiagnosticLines < 64) {
+                        mapDiagnosticValues[type] = diagnostic
+                        mapDiagnosticLines++
+                        HyperCarRepo.log("MAP-NAV-EVENT: $diagnostic")
+                    }
+                }
+            }
             if (json.optInt("bizType") == 113 && navigationToken != 0L &&
                 HyperCarRepo.hudNavigationAllowed && !HyperCarRepo.carWithHudNavigationAllowed) {
                 val items = runCatching { org.json.JSONArray(json.optString("datas")) }.getOrNull()

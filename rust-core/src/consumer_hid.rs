@@ -72,6 +72,25 @@ mod tests {
         assert_eq!(h.report(Some(&zero),&[4]),Some(vec![]));
         assert_eq!(h.report(Some(&one),&[1]),Some(vec![0xb5]));
     }
+    #[test] fn diagnostics_expose_offsets_and_short_report_without_coordinates() {
+        let d=Device::parse(&bitmap(true)).unwrap();
+        let layout=d.diagnostic_layout();
+        assert!(layout.contains("id=7 offset=0 size=1 count=5"));
+        assert!(layout.contains("c00b5"));
+        assert!(d.diagnostic_report(&[7]).contains("short=true"));
+        assert!(d.diagnostic_report(&[7,4]).contains("short=false"));
+        assert!(d.diagnostic_report(&[6,4]).contains("fields=0"));
+    }
+    #[test] fn diagnostic_sampling_does_not_change_key_edges_or_exceed_budgets() {
+        let mut h=registry();
+        for _ in 0..100 {
+            assert_eq!(h.report(Some(&Value::int(0)),&[4]),Some(vec![0xb5]));
+            assert_eq!(h.report(Some(&Value::int(0)),&[0]),Some(vec![]));
+            assert!(h.report(Some(&Value::str("touch")),&[1,10,0,20,0]).is_none());
+        }
+        assert_eq!(h.short_logs,64);
+        assert_eq!(h.long_logs,8);
+    }
     #[test] fn direct_usage_fallback_deduplicates_but_never_guesses_04() {
         let mut h=ConsumerHid::default();
         assert_eq!(h.report(None,&[0xb5]),Some(vec![0xb5]));
@@ -139,6 +158,21 @@ impl Device {
         (!device.fields.is_empty()).then_some(device)
     }
 
+    fn diagnostic_layout(&self) -> String {
+        self.fields.iter().take(8).map(|f| format!(
+            "id={} offset={} size={} count={} variable={} min={} usages={:x?}",
+            f.id,f.offset,f.size,f.count,f.variable,f.min,
+            f.usages.iter().take(24).collect::<Vec<_>>()
+        )).collect::<Vec<_>>().join("; ")
+    }
+
+    fn diagnostic_report(&self, bytes: &[u8]) -> String {
+        let (id,len)=if self.has_ids { (bytes.first().copied().unwrap_or(0),bytes.len().saturating_sub(1)) } else { (0,bytes.len()) };
+        let fields:Vec<_>=self.fields.iter().filter(|f| f.id==id).collect();
+        let required=fields.iter().map(|f|f.offset+f.size*f.count).max().unwrap_or(0);
+        format!("report_id={id} fields={} bits={} required_bits={required} short={}", fields.len(),len*8,len*8<required)
+    }
+
     fn report(&mut self, bytes: &[u8]) -> Vec<u32> {
         let (id,body)=if self.has_ids {match bytes.split_first(){Some((id,b))=>(*id,b),None=>return vec![]}} else {(0,bytes)};
         let fields:Vec<_>=self.fields.iter().filter(|f|f.id==id).collect();
@@ -164,17 +198,20 @@ impl Device {
 }
 
 #[derive(Default)]
-pub struct ConsumerHid { devices: HashMap<String,Device>, raw: HashMap<String,BTreeSet<u32>>, unknown: usize }
+pub struct ConsumerHid { devices: HashMap<String,Device>, raw: HashMap<String,BTreeSet<u32>>, unknown: usize, short_logs: usize, long_logs: usize }
 impl ConsumerHid {
     pub fn from_info(info:&Value)->Self {
         let mut result=Self::default();
         for key in ["hidDevices","hids","hid"] {
-            for entry in info.get(key).and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]) {
+            for entry in info.get(key).and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]).iter().take(32) {
                 let Some(id)=entry.get("uuid").and_then(identity) else {continue;};
                 let descriptor=entry.get("hidDescriptor").or_else(||entry.get("reportDescriptor")).and_then(Value::as_bytes);
                 if let Some(device)=descriptor.and_then(Device::parse) {
                     crate::emit_log(&format!("HID-KEY: device={id} descriptor={}B consumer_fields={} report_ids={}",descriptor.unwrap().len(),device.fields.len(),device.has_ids));
+                    crate::emit_log(&format!("HID-LAYOUT: device={id} {}",device.diagnostic_layout()));
                     result.devices.insert(id,device);
+                } else {
+                    crate::emit_log(&format!("HID-LAYOUT: device={id} descriptor_bytes={:?} consumer_layout=unavailable; touch fallback preserved",descriptor.map(|d| d.len())));
                 }
             }
         }
@@ -184,6 +221,16 @@ impl ConsumerHid {
     /// Some = media/short report consumed (including releases). None = preserve existing touch path.
     pub fn report(&mut self,uuid:Option<&Value>,bytes:&[u8])->Option<Vec<u32>> {
         let id=uuid.and_then(identity);
+        let budget=if bytes.len()<5 { &mut self.short_logs } else { &mut self.long_logs };
+        let limit=if bytes.len()<5 {64} else {8};
+        if *budget<limit {
+            *budget+=1;
+            let device=id.as_ref().and_then(|id|self.devices.get(id));
+            let layout=device.map(|d|d.diagnostic_report(bytes)).unwrap_or_else(||"layout=unmatched".into());
+            // Never dump touch coordinates; short control reports alone get a hex sample.
+            let sample=if bytes.len()<5 {format!("{:02x?}",bytes)} else {"omitted-touch-or-long-report".into()};
+            crate::emit_log(&format!("HID-INPUT: device={id:?} bytes={} {layout} sample={sample} short_budget={}/64 long_budget={}/8",bytes.len(),self.short_logs,self.long_logs));
+        }
         if let Some(device)=id.as_ref().and_then(|id|self.devices.get_mut(id)) {return Some(device.report(bytes));}
         if id.is_none() && bytes.len()<5 && self.devices.len()==1 {return Some(self.devices.values_mut().next().unwrap().report(bytes));}
         if bytes.len()>=5 {return None;}

@@ -216,6 +216,7 @@ object MusicBridge {
 
     fun onCarConnected() = onMusicThread {
         carConnected = true
+        mediaDiagnosticCount = 0
         carAudioReady = false
         autoPlayPending = CarUiSettings.autoPlayOnConnect
         autoPlayDeadline = 0L
@@ -833,8 +834,16 @@ object MusicBridge {
         controller?.transportControls?.skipToNext()
     }
 
+    private var mediaDiagnosticCount = 0
+    private var mediaDiagnosticId = 0L
     fun onCarMediaKey(context: Context, usage: Int) = onMusicThread(wait = false) {
-        if (!carConnected || CarMediaKeys.keyCode(usage) == 0) return@onMusicThread
+        val diagnosticId = ++mediaDiagnosticId
+        val trace = mediaDiagnosticCount++ < 120
+        if (trace) HyperCarRepo.log("MEDIA-KEY: rx=$diagnosticId usage=0x${usage.toString(16)} connected=$carConnected audioReady=$carAudioReady listener=${service != null} denied=$permissionDenied target=${controller?.packageName ?: "none"} state=${playback?.state} actions=${playback?.actions}")
+        if (!carConnected || CarMediaKeys.keyCode(usage) == 0) {
+            if (trace) HyperCarRepo.log("MEDIA-KEY: drop=$diagnosticId reason=${if (!carConnected) "not-connected" else "unsupported-usage"}")
+            return@onMusicThread
+        }
         // Explicit steering-wheel playback supersedes saved automatic resume requests.
         autoPlayPending = false
         resumePackage = null
@@ -843,12 +852,16 @@ object MusicBridge {
             (usage == 0xB5 || usage == 0xB6) && playback?.state == PlaybackState.STATE_PLAYING) requestPlaybackAudio()
         runCatching {
             val target = controller
+            val beforeMetadata = metadata
+            val beforeState = playback?.state
+            val generation = sessionGeneration
             val now = SystemClock.uptimeMillis()
             fun event(code: Int, action: Int) = android.view.KeyEvent(now, now, action, code, 0)
             val route = CarMediaKeys.dispatch(usage, session = { code ->
                 if (target == null) false else {
                     val down = target.dispatchMediaButtonEvent(event(code, android.view.KeyEvent.ACTION_DOWN))
                     val up = target.dispatchMediaButtonEvent(event(code, android.view.KeyEvent.ACTION_UP))
+                    if (trace) HyperCarRepo.log("MEDIA-KEY: dispatch=$diagnosticId downAccepted=$down upAccepted=$up")
                     down || up
                 }
             }, system = { code ->
@@ -856,7 +869,12 @@ object MusicBridge {
                 audio.dispatchMediaKeyEvent(event(code, android.view.KeyEvent.ACTION_DOWN))
                 audio.dispatchMediaKeyEvent(event(code, android.view.KeyEvent.ACTION_UP))
             })
-            HyperCarRepo.log("MEDIA-KEY: usage=0x${usage.toString(16)} key=${CarMediaKeys.keyCode(usage)} route=$route target=${target?.packageName ?: "system"}（派发不代表播放器已执行）")
+            if (trace) main.postDelayed({
+                if (carConnected && mediaDiagnosticId == diagnosticId) {
+                    HyperCarRepo.log("MEDIA-KEY: observe=$diagnosticId after=1000ms sameSession=${sessionGeneration == generation && controller === target} metadataChanged=${metadata !== beforeMetadata} stateBefore=$beforeState stateNow=${playback?.state}; cached callbacks only, not execution confirmation")
+                }
+            }, 1000)
+            HyperCarRepo.log("MEDIA-KEY: id=$diagnosticId usage=0x${usage.toString(16)} key=${CarMediaKeys.keyCode(usage)} route=$route target=${target?.packageName ?: "system"}（派发不代表播放器已执行）")
         }.onFailure { HyperCarRepo.log("MEDIA-KEY: 派发失败 usage=0x${usage.toString(16)}: ${it.message}") }
     }
 
