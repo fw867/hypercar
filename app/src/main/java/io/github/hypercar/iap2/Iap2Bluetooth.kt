@@ -846,6 +846,12 @@ private class RfcommLinkChannel(
     override val isAlive: Boolean get() = !terminated
 
     init {
+        engine.onDetectionRestart = {
+            log("LINK: DETECT restart; retain RFCOMM, clear old control queue and sequence/window state")
+            controls.clear()
+            // Empty payload is an ordered CSM parser boundary, distinct from POISON by identity.
+            controls.offer(ByteArray(0))
+        }
         engine.onPeerSynchronizationAdopted = { sync ->
             log(
                 "LINK: 采纳对端会话表 maxOutgoing=${sync.maxOutgoing} maxLen=${sync.maxLength} " +

@@ -1,5 +1,7 @@
 # 代码审计与维护记录
 
+629 iAP2同传输重新检测（2026-11-12）：根据用户提供的凯迪拉克补丁README核对本项目源码，修复NORMAL态FF550200EE10被丢弃的问题；保留RFCOMM/AirPlay传输，重新进入被动协商，清理旧发送/确认序号、会话表、积压及重传，保留同次读取中的新SYN。检测回显按250ms限流，允许车机重试，避免立即反射循环；初始主动角色仍不回显自身探测的回包。新SYN前丢弃旧ACK/控制包；重复纯SYN继续幂等回显。蓝牙用有序空载荷边界清理上层CSM分片及待收消息、保留当前业务等待；Wi-Fi重置认证/延迟消息/HUD订阅并重新识别认证。4300字段及车型策略未改，不将文档固定75B作为通用规范；README未附成功抓包，不能据此认定ID9 SETUP 400或奔驰视频问题已解决。
+
 ID9改动隔离复审（628，2026-11-12）：逐项核对EngineConfig默认false、SettingsStore按当前档案注入、ReceiverCompatibility仅对bmw_id9排除MGU bootstrap、内置/远端各档案开关及共享屏幕资源方法。旧BMW/通用/奥迪/大众/WinPlay的配对前/info、SAP分流、RECORD与屏幕顺序、PCM协商均保持原分支；奔驰共享方法只有ID9条件块内新增第二次声明/HID，原100ms/SAP路径未变。发现627将SCHEMA整体升9会停用其它车型已有效的schema8远端覆盖，已改为按档案门槛：仅ID9需9，其他内置继续8，isRemote角标共用同一判定；新增六类档案缓存覆盖隔离回归。另同步ID9主动申请主屏后的pipeline.screen_owned，避免实际持屏而诊断仍显示旧归属。补充只读AUDIO-CAPS日志，按/info逐条记录type/audioType、收发格式位及PCM48/AAC44/AAC48声明；字段缺失明确记unknown，未改变任何档案音频选择。
 
 ID8.5 AAC证据边界：现有hypercar-log-20261112-101754.txt明确识别MGU-55-BMW，10:47:40固定type100/media/0x8000(PCM48k)的SETUP返回200并有后续发包；日志没有完整接收端audioFormats数组。因此只能确认接受该PCM协商，不能从我方出站audioFormat或/info.features反推AAC支持/不支持。新AUDIO-CAPS需下次真实连接读取，测试中MGU-fixture为合成样本，不能冒充车机证据。

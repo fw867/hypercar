@@ -14,8 +14,8 @@ internal class WifiIap2Protocol(
     private val deviceName: String = "HyperCar",
 ) {
     private val engine = Iap2LinkEngine(reliableTransport = true, declaredWindow = 32)
-    private val parser = Iap2Csm.Parser()
-    private val navigation = RouteGuidanceSession(log)
+    private var parser = Iap2Csm.Parser()
+    private var navigation = RouteGuidanceSession(log)
     private var started = false
     private var phase = "LINK"
     private var deadline = 0L
@@ -40,6 +40,18 @@ internal class WifiIap2Protocol(
         private set
 
     init {
+        engine.onDetectionRestart = {
+            log("LINK DETECT restart phase=$phase; reset old CSM/auth/subscriptions, retain AirPlay transport")
+            parser = Iap2Csm.Parser()
+            navigation = RouteGuidanceSession(log)
+            phase = "LINK"
+            deadline = now + 15_000
+            nextWaitLog = 0
+            retriedCertificate = false
+            seen.clear()
+            unknown.clear()
+            deferred.clear()
+        }
         // Metadata only: never log CSM certificate/challenge/signature payloads.
         engine.onFrameReceived = { ctl, seq, ack, session, size -> trace("RX", ctl, seq, ack, session, size) }
         engine.onFrameSent = { ctl, seq, ack, session, size -> trace("TX", ctl, seq, ack, session, size) }

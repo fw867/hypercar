@@ -16,7 +16,7 @@ private const val PHONE_DECLARED_MAX_OUTGOING = 0x7F
  *  3. 协商状态下收到 ACK / 数据帧即进入 NORMAL（控制会话可用）
  *
  * 数据帧：control=0x40（捎带 ACK），seq=发送序号（u8 回绕，初始 99），
- * ack=已按序收到的最新序号。对端 marker 会被帧头扫描自然丢弃。
+ * ack=已按序收到的最新序号。NORMAL 态再次收到检测标记时，在同一传输上重建链路协商。
  *
  * **BMW §9h 修复（2026-10-19 BMW 87866 实车定谳，必须保留）**：
  *  - 每条**纯 SYN**（SYN 位=1 且 ACK 位=0）都回一帧 SYN|ACK——BMW 每轮重试都用
@@ -184,6 +184,10 @@ class Iap2LinkEngine(
     /** 最近一次出向帧时刻（NORMAL 态裸 ACK 保活的基准）。 */
     private var lastOutputMillis: Long = 0
     private var passiveNegotiation = false
+    private var lastMarkerEchoMillis: Long? = null
+
+    /** Same-transport detection restart: consumers must discard partial CSMs from the old link. */
+    var onDetectionRestart: (() -> Unit)? = null
     // Reliable Wi-Fi drains CSM responses before falling back to a bare ACK (CatPlay/box).
     private var pendingReliableAck = false
 
@@ -304,16 +308,23 @@ class Iap2LinkEngine(
     // ---- 接收解析 ----
 
     private fun parseAvailable(nowMillis: Long): Boolean {
-        // 丢弃帧头前的杂字节（含对端 marker FF55…）
+        // Detect is valid between frames, never inside a length-delimited frame payload.
+        // Keep a partial marker until the next read; malformed prefixes still resynchronize.
         while (receive.size >= 2 &&
             !(receive[0] == 0xFF.toByte() && receive[1] == 0x5A.toByte())
         ) {
-            if (passiveNegotiation && state == State.NEGOTIATING && peerSynchronization == null &&
+            if ((state == State.NORMAL || (passiveNegotiation && state == State.NEGOTIATING)) &&
                 receive[0] == 0xFF.toByte() && receive[1] == 0x55.toByte()) {
                 if (receive.size < MARKER.size) return false
                 if (receive.peek(MARKER.size).contentEquals(MARKER)) {
                     receive.discard(MARKER.size)
-                    appendOutput(MARKER)
+                    if (state == State.NORMAL) restartDetection(nowMillis)
+                    // A reflected echo must not create a tight DETECT ping-pong. Real peer
+                    // retries (typically one second) still get a reply if the first is lost.
+                    if (lastMarkerEchoMillis?.let { nowMillis - it >= 250L } != false) {
+                        appendOutput(MARKER)
+                        lastMarkerEchoMillis = nowMillis
+                    }
                     return true
                 }
             }
@@ -352,6 +363,32 @@ class Iap2LinkEngine(
             nowMillis = nowMillis,
         )
         return true
+    }
+
+    private fun restartDetection(nowMillis: Long) {
+        state = State.NEGOTIATING
+        passiveNegotiation = true
+        peerSynchronization = null
+        adoptedSynchronization = null
+        adoptedPeerControlSessionId = null
+        sentSequence = INITIAL_SEQUENCE
+        lastSentAcknowledged = null
+        lastReceivedInOrder = 0
+        lastEchoPeerSequence = null
+        lastEchoOwnSequence = 0
+        declaredMaxOutgoing = maxOutgoing
+        markerDeadline = null
+        syncDeadline = null
+        retransmitDeadline = null
+        pendingReliableAck = false
+        lastMarkerEchoMillis = null
+        lastOutputMillis = nowMillis
+        unacknowledged.clear()
+        sendBacklog.clear()
+        pendingEvents.clear()
+        output.reset()
+        // Keep unread bytes: the new SYN can share this read with DETECT.
+        onDetectionRestart?.invoke()
     }
 
     private fun processFrame(
@@ -404,7 +441,7 @@ class Iap2LinkEngine(
                 completeNegotiationIfPending(nowMillis)
             }
         }
-        if (control and CONTROL_ACKNOWLEDGEMENT != 0) {
+        if (control and CONTROL_ACKNOWLEDGEMENT != 0 && peerSynchronization != null) {
             handleAcknowledgement(ack, nowMillis)
         }
         val isDataFrame =
@@ -413,6 +450,8 @@ class Iap2LinkEngine(
                 (control and CONTROL_SYNCHRONIZE) == 0 &&
                 (control and CONTROL_EXTENDED_ACKNOWLEDGEMENT) == 0
         if (isDataFrame) {
+            // A trailing old ACK/data packet after DETECT cannot establish the new link.
+            if (peerSynchronization == null) return
             // 序号属于整条链路；控制、EA、文件会话共同推进接收水位后再分派。
             // 但协商状态只能由控制会话推进：EA/文件会话早到不能把链路提前切到 NORMAL。
             if (sessionId == controlSessionId()) completeNegotiationIfPending(nowMillis)

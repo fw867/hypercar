@@ -24,7 +24,7 @@ interface Iap2LinkChannel {
         awaitAck: Boolean = true,
     ): Boolean
 
-    /** 取下一个控制载荷；超时或链路结束返回 null。 */
+    /** 取下一个控制载荷；空数组表示同一传输上的链路重建边界，null 表示超时或结束。 */
     fun recvControl(timeoutMillis: Long): ByteArray?
 
     val isAlive: Boolean
@@ -84,7 +84,7 @@ class Iap2SenderSession(
     private val navigationEnabled: () -> Boolean = { false },
     private val navigationCue: () -> io.github.hypercar.navigation.NavigationCue? = { null },
 ) {
-    private val parser = Iap2Csm.Parser()
+    private var parser = Iap2Csm.Parser()
     private val navigation = RouteGuidanceSession(log)
     private var phaseName = "IDLE"
     private var phaseStarted = nanoTime()
@@ -1134,6 +1134,13 @@ class Iap2SenderSession(
         }
         if (timeoutMillis <= 0) return null
         val bytes = channel.recvControl(timeoutMillis) ?: return null
+        if (bytes.isEmpty()) {
+            parser = Iap2Csm.Parser()
+            receivedFrames.clear()
+            pendingFrames.clear()
+            log("iap2 LINK DETECT restart: 清除旧 CSM 分片；保留 RFCOMM 和当前业务等待")
+            return null
+        }
         val frames = parser.offer(bytes)
         for (frame in frames) {
             if (tracedReceivedFrames++ < 192) {

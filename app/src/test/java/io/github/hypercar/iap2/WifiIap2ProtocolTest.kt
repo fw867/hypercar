@@ -91,6 +91,22 @@ class WifiIap2ProtocolTest {
         }
     }
 
+    @Test fun detectionRestartReauthenticatesOnSameAirplayTransportAndDropsOldHudSubscription() {
+        val car = Car()
+        car.ready()
+        car.message(0x5200, Iap2Csm.u16(0, 77))
+        // A partial old CSM must not swallow the new identification response.
+        val partial = Iap2Csm.encode(0x5000, ByteArray(100)).copyOfRange(0, 8)
+        car.feed(packet(0x40, ++car.sequence, car.ack, car.controlSession, partial))
+        car.ready() // Same WifiIap2Protocol, DETECT/SYN and complete auth again.
+        car.feed(packet(0x40, car.sequence, car.ack)) // ACK last greetings.
+        assertTrue(car.protocol.ready)
+        car.navigationAllowed = true
+        car.navigationCue = io.github.hypercar.navigation.NavigationCue("右转", 2, 100)
+        assertEquals(listOf(0x4155), car.message(0x4154).map { it.messageId })
+        assertTrue(car.logs.any { it.contains("DETECT restart") })
+    }
+
     @Test fun deviceNameUsesSessionSnapshotAndSupportsUnicode() {
         Car(deviceName = "我的手机 \"BMW\"").ready()
         Car(deviceName = "重命名后的手机").ready()
