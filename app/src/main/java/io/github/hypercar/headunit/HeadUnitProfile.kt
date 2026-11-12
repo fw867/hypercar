@@ -101,8 +101,8 @@ object HeadUnitProfiles {
     /** 宝马 iD8.5（MGU-86 / MGU-55）：真车实测过的那一套。 */
     val BMW_ID85 = HeadUnitProfile(
         id = "bmw_id85",
-        label = "BMW iD8.5",
-        model = "MGU-86 / MGU-55",
+        label = "BMW",
+        model = "ID7-ID9",
         notes = "兼容 MGU-86 / MGU-55；由车机发起 CarPlay，保留系统蓝牙音频连接。首次连接请在 iDrive 确认授权。",
         validatesDeviceId = false,
         // ↓ 这三项 2026-10-25 现场 A/B 恢复为 0.27 值：0.27 有 CarPlay 图标，停发后图标消失

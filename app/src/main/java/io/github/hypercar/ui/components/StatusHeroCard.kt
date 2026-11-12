@@ -90,6 +90,7 @@ fun StatusHeroCard(
     autoConnectToggleEnabled: Boolean = true,
     /** 当前车机档案名（显示在标题上方，小字）。 */
     profileLabel: String? = null,
+    profileId: String = "",
     modifier: Modifier = Modifier,
 ) {
     var nowMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
@@ -120,7 +121,7 @@ fun StatusHeroCard(
                     label = "hero-state",
                     modifier = Modifier.padding(end = if (onToggleAutoConnect != null) 48.dp else 0.dp),
                 ) { state ->
-                    HeroHeadline(link = state, nowMillis = nowMillis, profileLabel = profileLabel, autoConnectEnabled = autoConnectEnabled)
+                    HeroHeadline(link = state, nowMillis = nowMillis, profileId = profileId, profileLabel = profileLabel, autoConnectEnabled = autoConnectEnabled)
                 }
                 // Replacing the action/attempt cancels a press that began on the old button.
                 // A touch-down on Start must never become Stop when automatic connection wins.
@@ -160,7 +161,7 @@ fun StatusHeroCard(
 /* ---------- 头部：图形 + 文案 ---------- */
 
 @Composable
-private fun HeroHeadline(link: LinkState, nowMillis: Long, profileLabel: String? = null, autoConnectEnabled: Boolean = true) {
+private fun HeroHeadline(link: LinkState, nowMillis: Long, profileId: String, profileLabel: String?, autoConnectEnabled: Boolean = true) {
     val pauseRemaining = io.github.hypercar.session.HyperCarRepo.automaticPauseRemaining
     val paused = autoConnectEnabled && pauseRemaining > 0
     Row(
@@ -168,7 +169,7 @@ private fun HeroHeadline(link: LinkState, nowMillis: Long, profileLabel: String?
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(18.dp),
     ) {
-        HeroGlyph(link)
+        HeroGlyph(link, profileId, profileLabel.orEmpty())
         Column(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(6.dp),
@@ -186,14 +187,7 @@ private fun HeroHeadline(link: LinkState, nowMillis: Long, profileLabel: String?
                         style = MaterialTheme.typography.bodyMedium,
                         color = TextSecondary,
                     )
-                    if (!profileLabel.isNullOrBlank()) {
-                        // 车机型号放在「自动秒连建链」下面、左对齐（与标题同一左起点）
-                        Text(
-                            text = "当前车机型号：$profileLabel",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = TextSecondary.copy(alpha = 0.8f),
-                        )
-                    }
+
                 }
 
                 is LinkState.Negotiating -> {
@@ -279,6 +273,10 @@ private fun HeroHeadline(link: LinkState, nowMillis: Long, profileLabel: String?
                     )
                 }
             }
+            if (!profileLabel.isNullOrBlank()) {
+                Text(profileLabel, style = MaterialTheme.typography.labelMedium,
+                    color = TextSecondary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            }
         }
     }
 }
@@ -286,13 +284,13 @@ private fun HeroHeadline(link: LinkState, nowMillis: Long, profileLabel: String?
 /* ---------- 图形（每状态一个） ---------- */
 
 @Composable
-private fun HeroGlyph(link: LinkState) {
+private fun HeroGlyph(link: LinkState, profileId: String, profileLabel: String) {
     Box(
         modifier = Modifier.size(88.dp),
         contentAlignment = Alignment.Center,
     ) {
         when (link) {
-            is LinkState.Idle -> IdleGlyph()
+            is LinkState.Idle -> IdleGlyph(profileId, profileLabel)
             is LinkState.Negotiating -> ArcGlyph(
                 colors = listOf(ElectricCyan, NebulaViolet, ElectricCyan),
                 centerIcon = Icons.Rounded.Bluetooth,
@@ -310,7 +308,7 @@ private fun HeroGlyph(link: LinkState) {
 }
 
 @Composable
-private fun IdleGlyph() {
+private fun IdleGlyph(profileId: String, profileLabel: String) {
     val accent = ElectricCyan
 
     val transition = rememberInfiniteTransition(label = "idle-pulse")
@@ -339,12 +337,7 @@ private fun IdleGlyph() {
             style = Stroke(width = 1.5.dp.toPx()),
         )
     }
-    Icon(
-        imageVector = Icons.Rounded.DirectionsCar,
-        contentDescription = "待机",
-        tint = accent.copy(alpha = 0.9f),
-        modifier = Modifier.size(38.dp),
-    )
+    CarBrandBadge(profileId, profileLabel, size = 58.dp, framed = false)
 }
 
 @Composable

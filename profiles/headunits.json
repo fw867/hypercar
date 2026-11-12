@@ -6,8 +6,8 @@
   "profiles": [
     {
       "id": "bmw_id85",
-      "label": "BMW iD8.5",
-      "model": "MGU-86 / MGU-55",
+      "label": "BMW",
+      "model": "ID7-ID9",
       "notes": "兼容 MGU-86 / MGU-55；由车机发起 CarPlay，保留系统蓝牙音频连接。首次连接请在 iDrive 确认授权。",
       "verified": true,
       "validatesDeviceId": false,

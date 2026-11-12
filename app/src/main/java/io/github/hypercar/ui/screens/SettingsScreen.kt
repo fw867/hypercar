@@ -26,6 +26,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.Icons
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -79,6 +80,7 @@ import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.settings.SettingsStore
 import io.github.hypercar.shizuku.ShizukuState
 import io.github.hypercar.shizuku.ShizukuTools
+import io.github.hypercar.ui.components.CarBrandBadge
 import io.github.hypercar.ui.components.CapsuleButton
 import io.github.hypercar.ui.components.GlassPanel
 import io.github.hypercar.ui.components.InfoRow
@@ -762,7 +764,7 @@ private fun TargetCarSection() {
                 DropdownMenu(
                     expanded = expanded,
                     onDismissRequest = { expanded = false },
-                    modifier = Modifier.width(320.dp),
+                    modifier = Modifier.width(352.dp),
                     shape = RoundedCornerShape(14.dp),
                     containerColor = SurfaceInset,
                     border = androidx.compose.foundation.BorderStroke(1.dp, StrokeGlass),
@@ -1436,15 +1438,19 @@ private fun HeadUnitSection(connected: Boolean = false) {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .heightIn(min = 140.dp)
                         .clip(RoundedCornerShape(12.dp))
                         .clickable(enabled = !connected) { expanded = true }
-                        .padding(vertical = 12.dp, horizontal = 8.dp),
+                        .padding(vertical = 18.dp, horizontal = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Column(modifier = Modifier.weight(1f)) {
+                    CarBrandBadge(current.id, current.label, size = 48.dp)
+                    Spacer(Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
-                                text = "${current.label} · ${current.model}",
+                                text = current.label,
+                                modifier = Modifier.weight(1f),
                                 style = MaterialTheme.typography.bodyLarge,
                                 color = if (connected) TextSecondary else ElectricCyan,
                             )
@@ -1461,12 +1467,11 @@ private fun HeadUnitSection(connected: Boolean = false) {
                                 )
                             }
                         }
+                        Text(current.model, style = MaterialTheme.typography.labelMedium, color = TextSecondary)
                         Text(
                             text = current.notes,
-                            style = MaterialTheme.typography.labelSmall,
+                            style = MaterialTheme.typography.bodySmall,
                             color = TextSecondary,
-                            maxLines = 3,
-                            overflow = TextOverflow.Ellipsis,
                         )
                     }
                     Text(
@@ -1488,20 +1493,26 @@ private fun HeadUnitSection(connected: Boolean = false) {
                         // 车型之间加分隔线：原来几条连成一片，分不清边界
                         if (index > 0) HorizontalDivider(color = StrokeGlass)
                         DropdownMenuItem(
+                            modifier = Modifier.background(if (profile.id == selectedId) ElectricCyan.copy(alpha = 0.08f) else Color.Transparent),
+                            leadingIcon = { CarBrandBadge(profile.id, profile.label, size = 42.dp) },
+                            trailingIcon = {
+                                if (profile.id == selectedId) Icon(Icons.Rounded.Check, contentDescription = "已选择", tint = ElectricCyan, modifier = Modifier.size(20.dp))
+                            },
                             text = {
-                                Column {
+                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Text(
+                                        text = profile.label,
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = if (profile.id == selectedId) ElectricCyan else TextPrimary,
+                                    )
                                     Text(
                                         text = buildString {
-                                            append(profile.label)
-                                            append(" · ")
                                             append(profile.model)
-                                            if (io.github.hypercar.headunit.RemoteProfiles.isRemote(profile.id)) {
-                                                append("（远程）")
-                                            }
-                                            if (!profile.verified) append("（未实测）")
+                                            if (io.github.hypercar.headunit.RemoteProfiles.isRemote(profile.id)) append(" · 远程")
+                                            if (!profile.verified) append(" · 未实测")
                                         },
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        color = if (profile.id == selectedId) ElectricCyan else TextPrimary,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = TextSecondary,
                                     )
                                     Text(
                                         text = profile.notes,

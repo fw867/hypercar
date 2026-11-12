@@ -121,6 +121,7 @@ fun HomeScreen(
                         onToggleAutoConnect = onToggleAutoConnect,
                         autoConnectToggleEnabled = startup.automaticReady || autoConnect,
                         profileLabel = io.github.hypercar.headunit.HeadUnitProfiles.current().label,
+                        profileId = io.github.hypercar.headunit.HeadUnitProfiles.current().id,
                     )
                     StatGrid(
                         snapshot = snapshot,
@@ -164,6 +165,7 @@ fun HomeScreen(
                     onToggleAutoConnect = onToggleAutoConnect,
                     autoConnectToggleEnabled = startup.automaticReady || autoConnect,
                         profileLabel = io.github.hypercar.headunit.HeadUnitProfiles.current().label,
+                        profileId = io.github.hypercar.headunit.HeadUnitProfiles.current().id,
                 )
                 // 四枚状态芯片改成 2×2：原来单行横滑，Shizuku 在窄屏上被挤出屏幕
                 StatGrid(

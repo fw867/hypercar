@@ -280,10 +280,7 @@ pub async fn negotiate(
             .get("keepAliveSendStatsAsBody")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-    let display = info
-        .get("displays")
-        .and_then(Value::as_array)
-        .and_then(|a| a.first());
+    let display = select_display(&info);
     let display_uuid = display.and_then(|d| uuid_text(d.get("uuid")));
     let (disp_w, disp_h) = display.map(read_display_size).unwrap_or((0, 0));
     if let Some(requested) = &p.carwith_display {
@@ -292,7 +289,7 @@ pub async fn negotiate(
     // 车机能力位图：判断是否支持 HEVC 等能力，只能靠它（codec 由本机编码器决定）
     let car_features = info.get("features").and_then(Value::as_int).unwrap_or(0);
     emit_log(&format!(
-        "AIRPLAY: /info displays[0].uuid={:?} {}x{} features=0x{:x}",
+        "AIRPLAY: /info display uuid={:?} {}x{} features=0x{:x}",
         display_uuid, disp_w, disp_h, car_features
     ));
 
@@ -550,6 +547,81 @@ mod shutdown_tests {
         finish_session(&control, &[], false).await;
         let mut buf = [0; 1];
         assert_eq!(tokio::time::timeout(Duration::from_millis(500), peer.read(&mut buf)).await.unwrap().unwrap(), 0);
+    }
+}
+
+/// BOX-OFF 的规则：`displays` 里先取 `type` 整数为 0 的一项，没有再用第一项。
+/// 宝马、奔驰、ID9 都走这里。没有 uuid 时调用方仍用原来的常量。
+fn select_display(info: &Value) -> Option<&Value> {
+    let displays = info.get("displays")?.as_array()?;
+    displays.iter()
+        .find(|display| display.get("type").and_then(Value::as_int) == Some(0))
+        .or_else(|| displays.first())
+}
+
+#[cfg(test)]
+mod display_selection_tests {
+    use super::*;
+
+    fn display(uuid: &str, type_value: Option<i64>) -> Value {
+        let mut fields = vec![("uuid", Value::str(uuid))];
+        if let Some(type_value) = type_value {
+            fields.push(("type", Value::int(type_value)));
+        }
+        Value::dict(fields)
+    }
+
+    fn info(displays: Vec<Value>) -> Value {
+        Value::dict(vec![("displays", Value::array(displays))])
+    }
+
+    fn selected_uuid(info: &Value) -> Option<String> {
+        select_display(info).and_then(|display| uuid_text(display.get("uuid")))
+    }
+
+    #[test]
+    fn type_zero_later_in_the_list_replaces_the_first_uuid() {
+        let parsed = info(vec![
+            display("first-screen", Some(110)),
+            display("type-zero-screen", Some(0)),
+        ]);
+        assert_eq!(selected_uuid(&parsed).as_deref(), Some("type-zero-screen"));
+        let chosen = build_screen_setup(42, "type-zero-screen");
+        let previous_first = build_screen_setup(42, "first-screen");
+        assert_ne!(chosen, previous_first);
+        let body = bplist::parse(&chosen).unwrap();
+        let stream = &body.get("streams").unwrap().as_array().unwrap()[0];
+        assert_eq!(stream.get("uuid").and_then(Value::as_str), Some("type-zero-screen"));
+        assert_eq!(stream.get("type").and_then(Value::as_int), Some(110));
+        assert!(stream.get("viewAreas").is_none());
+    }
+
+    #[test]
+    fn first_type_zero_keeps_the_same_screen_setup_bytes() {
+        let parsed = info(vec![
+            display("first-type-zero", Some(0)),
+            display("later-screen", Some(110)),
+        ]);
+        assert_eq!(selected_uuid(&parsed).as_deref(), Some("first-type-zero"));
+        assert_eq!(
+            build_screen_setup(42, selected_uuid(&parsed).as_deref().unwrap()),
+            build_screen_setup(42, "first-type-zero"),
+        );
+    }
+
+    #[test]
+    fn missing_type_zero_keeps_the_first_display_and_the_uuid_constant() {
+        let parsed = info(vec![
+            display("only-screen", Some(110)),
+            display("another-screen", None),
+        ]);
+        assert_eq!(selected_uuid(&parsed).as_deref(), Some("only-screen"));
+        let without_uuid = info(vec![Value::dict(vec![("type", Value::int(0))])]);
+        assert_eq!(selected_uuid(&without_uuid), None);
+        let uuid = selected_uuid(&without_uuid)
+            .unwrap_or_else(|| "6E4E3B31-0E5B-4A8F-9F1B-2C5D7E9A0C11".into());
+        assert_eq!(uuid, "6E4E3B31-0E5B-4A8F-9F1B-2C5D7E9A0C11");
+        assert_eq!(select_display(&Value::dict(vec![])), None);
     }
 }
 
