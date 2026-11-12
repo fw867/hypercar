@@ -8,6 +8,10 @@ data class NavigationCue(
     val state: Int = 1,
     val nextRoad: String = "",
     val sourceName: String = "高德地图",
+    val currentRoad: String = "",
+    val remainingDistanceMeters: Long? = null,
+    val remainingTimeSeconds: Long? = null,
+    val lanes: List<NavigationLane> = emptyList(),
 ) {
     init {
         require(state in 0..6)
@@ -18,6 +22,9 @@ data class NavigationCue(
         require('\u0000' !in instruction && instruction.encodeToByteArray().size <= 512)
     }
 }
+
+/** AMap LaneAction, not the maneuver enum. Foreground 255 means this lane is not recommended. */
+data class NavigationLane(val direction: Int, val recommended: Boolean, val foregroundDirection: Int? = null)
 
 internal object AmapNotificationParser {
     private val distance = Regex("^(\\d+(?:\\.\\d+)?)\\s*(公里|千米|米|km|m)\\s*(?:后|後)?\\s*[,，:：]?\\s*(.+)$", RegexOption.IGNORE_CASE)

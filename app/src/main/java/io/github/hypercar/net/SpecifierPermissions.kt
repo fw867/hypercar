@@ -8,7 +8,7 @@ import android.os.Build
 import androidx.core.content.ContextCompat
 
 /**
- * 无 Shizuku 降级路径（WifiNetworkSpecifier）的运行时权限预检。
+ * 所有车机局域网连接（WifiNetworkSpecifier）的运行时权限预检。
  *
  * specifier 的 `requestNetwork` 在缺权限时会**直接 onUnavailable**（没有任何系统引导），
  * 所以必须在连接前主动检查、缺了给出可操作的引导，而不是让用户看到一次莫名的连车失败。
@@ -18,7 +18,7 @@ import androidx.core.content.ContextCompat
  *  - **Android 12 / 12L（API 31-32）**：需 `ACCESS_FINE_LOCATION`，**且定位服务必须开启**——
  *    只授权限不开定位，requestNetwork 照样失败。
  *
- * 有 Shizuku 时走 `cmd wifi` 路径，完全不需要这些权限，故这些函数只在降级模式下被调用。
+ * Shizuku 不再通过系统 connect-network 入网，因此有 Shizuku 时也必须满足这些权限。
  */
 object SpecifierPermissions {
 
@@ -60,9 +60,9 @@ object SpecifierPermissions {
      */
     fun degradeBlockReason(context: Context): String? = when {
         !isGranted(context) ->
-            "无 Shizuku 时需授予「${permissionLabel()}」权限才能连车机热点"
+            "需授予「${permissionLabel()}」权限才能连接车机局域网"
         !isLocationEnabled(context) ->
-            "无 Shizuku 时需在系统里开启定位服务才能连车机热点"
+            "需在系统里开启定位服务才能连接车机局域网"
         else -> null
     }
 }

@@ -46,6 +46,47 @@ class AmapLinkNavigationStateTest {
         assertFalse(state.accept(token, 7, JSONObject().put("naviMode", 0).put("naviType", 2), 1))
         assertEquals(2, state.snapshot(1)!!.maneuver)
     }
+    @Test fun mapCardKeepsTripFactsAndRecommendedLanesSeparateFromHudManeuver() {
+        val state = AmapLinkNavigationState(); val token = state.begin()
+        state.accept(token, 4, info().put("curRouteName", "当前测试路").put("routeRemainTime", 420), 100)
+        val lanes = JSONObject().put("laneCount", 4)
+            .put("backLane", org.json.JSONArray(listOf(0, 3, 3, 3)))
+            .put("frontLane", org.json.JSONArray(listOf(255, 3, 3, 3)))
+        assertTrue(state.accept(token, 14, lanes, 101))
+        val cue = state.snapshot(102)!!
+        assertEquals("当前测试路", cue.currentRoad)
+        assertEquals(31715L, cue.remainingDistanceMeters)
+        assertEquals(420L, cue.remainingTimeSeconds)
+        assertEquals(1L, cue.distanceMeters) // Never use total remaining as turn distance.
+        assertEquals(listOf(false, true, true, true), cue.lanes.map { it.recommended })
+        state.accept(token, 4, info(), 103)
+        assertEquals(4, state.snapshot(103)!!.lanes.size)
+        state.accept(token, 5, JSONObject().put("maneuverID", 2), 104)
+        assertTrue(state.snapshot(104)!!.lanes.isEmpty())
+    }
+    @Test fun malformedLaneDataDoesNotInventDirectionsAndHideClearsOldLanes() {
+        val state = AmapLinkNavigationState(); val token = state.begin()
+        state.accept(token, 4, info(), 0)
+        assertFalse(state.accept(token, 14, JSONObject().put("laneCount", 3)
+            .put("backLane", org.json.JSONArray(listOf(0))).put("frontLane", org.json.JSONArray(listOf(0))), 1))
+        assertTrue(state.snapshot(1)!!.lanes.isEmpty())
+        assertTrue(state.accept(token, 14, JSONObject().put("laneCount", 0), 2))
+        assertEquals(0, state.snapshot(15001)!!.state) // Lane updates cannot keep stale maneuver alive.
+        state.accept(token, 100, null, 15002)
+        assertFalse(state.accept(token, 14, JSONObject().put("laneCount", 0), 15003))
+    }
+    @Test fun laneCallbackMayPrecedeFirstGuidanceButCannotCrossBindingGeneration() {
+        val state = AmapLinkNavigationState(); val token = state.begin()
+        val lanes = JSONObject().put("laneCount", 1)
+            .put("backLane", org.json.JSONArray(listOf(3))).put("frontLane", org.json.JSONArray(listOf(3)))
+        assertTrue(state.accept(token, 14, lanes, 0)); assertNull(state.snapshot(1))
+        state.accept(token, 4, info(), 2)
+        assertEquals(1, state.snapshot(2)!!.lanes.size)
+        val fresh = state.begin()
+        assertFalse(state.accept(token, 14, lanes, 3))
+        state.accept(fresh, 4, info(), 4)
+        assertTrue(state.snapshot(4)!!.lanes.isEmpty())
+    }
     @Test fun missingUpdatesMalformedNumbersAndUnknownManeuversNeverInventAnArrow() {
         val state = AmapLinkNavigationState(); val token = state.begin()
         assertFalse(state.accept(token, 5, JSONObject().put("maneuverID", 3), 0))

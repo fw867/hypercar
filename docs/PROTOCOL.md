@@ -4,6 +4,8 @@
 
 ## 蓝牙与 iAP2
 
+车机热点通过 HyperCar 自己的 `WifiNetworkSpecifier` 局域网请求接入，保留请求到会话结束；不再用 `cmd wifi connect-network` 创建系统互联网 Wi-Fi。HyperCar 的车机流量绑定该网络，其它 App 使用系统互联网。未验证的系统互联网 Wi-Fi 不走复用快路径；已验证的家庭网络仍可供 WinPlay 使用。Shizuku 可迁移当前匹配的旧车机系统连接（关闭该保存网络的自动加入并断开，不删除凭据），不全局关闭 Wi-Fi/自动加入。Shizuku 通过 NETWORK_SETTINGS 注册有界匹配回调，核实活动请求的本应用 UID、包名、精确 SSID 和无 INTERNET 后，选择匹配热点；不建立系统互联网连接。回调在请求完成、取消、owner 死亡或 60 秒到期时释放。ROM 不支持此接口或无 Shizuku 时，首个局域网请求可能需要系统确认；不支持时明确失败，不退回抢占默认网络的旧路径。
+
 手机主 RFCOMM UUID 为 `00000000-deca-fade-deca-deafdecacafe`，附件端 UUID 为 `00000000-deca-fade-deca-deafdecacaff`。主监听使用安全 RFCOMM。蓝牙重启或监听异常后按代次恢复，旧回调不能覆盖新监听。
 
 设备显示名使用当前系统蓝牙名，无法读取或为空时回退到机型名，再回退到 `HyperCar`。蓝牙 iAP2 在握手开始时读取名称；AirPlay 建链时读取并将同一快照用于 SETUP `name` 和该会话的 Wi-Fi iAP2 `0x4E09`。这只改变显示名，不改变 MAC、设备 UUID、配对密钥或协议型号；会话期间修改蓝牙名在下次建链生效。

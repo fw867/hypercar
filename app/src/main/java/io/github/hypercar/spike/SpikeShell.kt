@@ -41,6 +41,10 @@ object SpikeShell {
         call("startBluetoothDiscoverable") { it.startBluetoothDiscoverable(owner, token, seconds) }
     fun stopBluetoothDiscoverable(token: String): String =
         call("stopBluetoothDiscoverable") { it.stopBluetoothDiscoverable(token) }
+    fun startWifiSelection(owner: IBinder, token: String, ssid: String, uid: Int): String =
+        call("startWifiSelection") { it.startWifiSelection(owner, token, ssid, uid) }
+    fun stopWifiSelection(token: String): String =
+        call("stopWifiSelection") { it.stopWifiSelection(token) }
 
     fun updateDisplaySurface(id: Int, surface: Surface?, width: Int, height: Int, dpi: Int): String =
         service?.updateDisplaySurface(id, surface, width, height, dpi) ?: "ERR shell disconnected"

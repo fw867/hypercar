@@ -68,7 +68,8 @@ internal object CarWithCueMapper {
 
 internal object NavigationSources {
     fun snapshot(): NavigationCue? {
-        if (!HyperCarRepo.hudNavigationAllowed) { clear(); return null }
+        // Local map guidance must survive when a receiver has no HUD subscription/support.
+        if (!HyperCarRepo.hudNavigationAllowed) return null
         return if (HyperCarRepo.carWithHudNavigationAllowed) CarWithNavigation.snapshot()
             else AmapLinkNavigation.snapshot() ?: AmapNavigation.snapshot()
     }

@@ -30,6 +30,19 @@ class SpikeShellService : ISpikeShell.Stub {
 
     private val playbackAudio = ShellPlaybackAudio()
     private val bluetoothDiscovery = ShellBluetoothDiscovery()
+    private val wifiSelection = ShellWifiSelection()
+    override fun startWifiSelection(owner: IBinder, token: String, ssid: String, uid: Int): String {
+        if (android.os.Binder.getCallingUid() != uid || appContext?.applicationInfo?.uid != uid)
+            return "ERR Wi-Fi request owner mismatch"
+        val identity = android.os.Binder.clearCallingIdentity()
+        return try { wifiSelection.start(owner, token, ssid, uid) }
+        finally { android.os.Binder.restoreCallingIdentity(identity) }
+    }
+    override fun stopWifiSelection(token: String): String {
+        val identity = android.os.Binder.clearCallingIdentity()
+        return try { wifiSelection.stop(token) }
+        finally { android.os.Binder.restoreCallingIdentity(identity) }
+    }
     override fun startBluetoothDiscoverable(owner: IBinder, token: String, seconds: Int): String {
         val identity = android.os.Binder.clearCallingIdentity()
         return try { bluetoothDiscovery.start(appContext, owner, token, seconds) }

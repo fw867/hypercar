@@ -22,7 +22,7 @@ internal object AmapLinkProbe {
     private val main = Handler(Looper.getMainLooper())
     private var active: Reader? = null
     @Synchronized fun start(context: Context, mapStarted: Boolean = false) {
-        if (!HyperCarRepo.hudNavigationAllowed || HyperCarRepo.carWithHudNavigationAllowed) return
+        if (!HyperCarRepo.mapNavigationAllowed) return
         if (active?.diagnosticOnly == true) { active?.close(); active = null }
         val reader = active ?: Reader(context.applicationContext, diagnosticOnly = false).also { active = it }
         reader.bind(mapStarted) // A real map launch renews an exhausted startup retry budget.
@@ -231,7 +231,7 @@ internal object AmapLinkProbe {
                 }
             }
             if (json.optInt("bizType") == 113 && navigationToken != 0L &&
-                HyperCarRepo.hudNavigationAllowed && !HyperCarRepo.carWithHudNavigationAllowed) {
+                HyperCarRepo.mapNavigationAllowed) {
                 val items = runCatching { org.json.JSONArray(json.optString("datas")) }.getOrNull()
                 val now = android.os.SystemClock.elapsedRealtime()
                 var changed = false

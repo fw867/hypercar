@@ -359,8 +359,19 @@ private fun DockButton(
 @Composable
 private fun MapCard(modifier: Modifier) {
     val status by MapPreview.status.collectAsStateWithLifecycle()
+    val guidance by produceState<io.github.hypercar.navigation.NavigationCue?>(null) {
+        while (true) {
+            value = if (io.github.hypercar.session.HyperCarRepo.mapNavigationAllowed)
+                io.github.hypercar.navigation.AmapLinkNavigation.snapshot()
+                    ?: io.github.hypercar.navigation.AmapNavigation.snapshot() else null
+            delay(500)
+        }
+    }
     Box(modifier.clip(CardShape).background(Color(0xFF1B2637))) {
         MapPreviewView(Modifier.fillMaxSize())
+        guidance?.takeIf { status.isEmpty() && it.state == 1 }?.let { cue ->
+            MapGuidanceOverlay(cue, Modifier.fillMaxSize())
+        }
         if (status != "") {
             Column(Modifier.align(Alignment.Center).clip(RoundedCornerShape(18.dp))
                 .background(if (CarThemeState.dark) Color(0xDD10141F) else Color(0xEAF6FAFF)).padding(22.dp), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -370,6 +381,64 @@ private fun MapCard(modifier: Modifier) {
             }
         }
     }
+}
+
+/** Read-only overlay: map taps and drags continue to reach the native map below. */
+@Composable
+private fun MapGuidanceOverlay(cue: io.github.hypercar.navigation.NavigationCue, modifier: Modifier) {
+    val panel = Color(0xEB152131)
+    Box(modifier.padding(14.dp)) {
+        // Leave the native map's top-left speed badge visible.
+        Column(Modifier.align(Alignment.TopStart).padding(start = 80.dp).widthIn(max = 290.dp)
+            .clip(RoundedCornerShape(18.dp)).background(panel).padding(horizontal = 16.dp, vertical = 12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(when (cue.maneuver) {
+                    1 -> "↰"; 2 -> "↱"; 3 -> "↑"; 4 -> "↶"
+                    13, 49 -> "↖"; 14, 50 -> "↗"; 47 -> "↙"; 48 -> "↘"
+                    else -> ""
+                }, color = White, fontSize = 38.sp, fontWeight = FontWeight.Bold)
+                Column {
+                    cue.distanceMeters?.let { Text(formatMapDistance(it), color = White,
+                        fontSize = 25.sp, fontWeight = FontWeight.Bold, maxLines = 1) }
+                    Text(cue.instruction.ifBlank { cue.nextRoad }, color = White, fontSize = 15.sp,
+                        maxLines = 2, overflow = TextOverflow.Ellipsis)
+                }
+            }
+            if (cue.lanes.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    cue.lanes.forEach { lane ->
+                        val symbol = mapLaneSymbol(lane.foregroundDirection ?: lane.direction)
+                        Text(symbol, color = if (lane.recommended) Color(0xFF73E8B4) else White.copy(alpha = .4f),
+                            modifier = Modifier.weight(1f), maxLines = 1,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                            fontSize = if (cue.lanes.size > 6) 12.sp else if (symbol.length > 1) 17.sp else 23.sp,
+                            fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+        val trip = listOfNotNull(
+            cue.currentRoad.takeIf { it.isNotBlank() },
+            cue.remainingDistanceMeters?.let { "剩余 ${formatMapDistance(it)}" },
+            cue.remainingTimeSeconds?.let { seconds ->
+                val minutes = (seconds + 59) / 60
+                if (minutes >= 60) "${minutes / 60}小时${minutes % 60}分" else "${minutes.coerceAtLeast(1)}分钟"
+            })
+        if (trip.isNotEmpty()) Text(trip.joinToString(" · "), Modifier.align(Alignment.BottomCenter)
+            .clip(RoundedCornerShape(14.dp)).background(panel).padding(horizontal = 16.dp, vertical = 9.dp),
+            color = White, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+private fun formatMapDistance(meters: Long): String = if (meters < 1000) "$meters 米"
+    else String.format(java.util.Locale.CHINA, "%.1f 公里", meters / 1000.0)
+
+// AMap LaneAction values; unknown directions have no invented turn arrow.
+private fun mapLaneSymbol(action: Int): String = when (action) {
+    0 -> "↑"; 1 -> "↰"; 2 -> "↰↑"; 3 -> "↱"; 4 -> "↑↱"; 5 -> "↶"
+    6 -> "↰↱"; 7 -> "↰↑↱"; 8 -> "↷"; 9 -> "↑↶"; 10 -> "↑↷"; 11 -> "↰↶"; 12 -> "↱↷"
+    else -> "·"
 }
 
 @Composable

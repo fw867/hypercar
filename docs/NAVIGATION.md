@@ -162,6 +162,8 @@ ADB确认CarWith HomeActivity与高德UcarMapActivity处于各自显示上的前
 
 ## Link结构化导航接入
 
+自绘首页地图卡直接展示 Link 的转向/路名、`routeRemainDist`、`routeRemainTime` 及 type14 车道。`backLane` 是可行动作，`frontLane` 是推荐动作，255 不推荐；按高德 LaneAction 编码绘制，不套用转向枚举。局部卡片不依赖车型或 iAP2/HUD 订阅；HUD 发送仍按原条件和车机实际订阅决定。停止、到达、过期或绑定代次变化会清除提示，车道更新不能延长旧转向的有效期。
+
 598核对手机真实AIDL发现onAmapCallbackWithFd参数为metadata字符串、再到FD，旧实现漏读字符串并把数据截在64KiB，导致大包无法接收。已按真实布局接收，加入4MiB上限及按代次关闭FD，补齐有界分块重组；仅在授权和注册成功后使用服务签发的token请求导航关键数据刷新/结构查询，不记录token，不修改地图授权策略。协议依据见[高德Android Link接口](https://lbs.amap.com/api/aiot-sdk/guide/strong-ties/amaplinkclient-api)。
 
 实测收到160620字符大包，解封装后有完整路线数据，以及每秒type4导航更新。真实字段curManeuverID、segmentRemainDist、nextRouteName转换为NavigationCue；routeRemainDist是到终点距离，不用于下个路口倒计时。映射参考[高德ManeuverIconID](https://a.amap.com/amapauto/static/bl/500/android/api/classcom_1_1autonavi_1_1gbl_1_1guide_1_1model_1_1_maneuver_icon_i_d.html)，不混用CarLife枚举。未知图标无箭头，新方向先到时不沿用上个路口的距离/道路。

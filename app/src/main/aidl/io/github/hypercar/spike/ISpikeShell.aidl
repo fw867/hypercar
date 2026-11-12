@@ -47,6 +47,9 @@ interface ISpikeShell {
     /** 有界经典可发现；owner 死亡、显式停止或独立计时到期后结束。 */
     String startBluetoothDiscoverable(IBinder owner, String token, int seconds);
     String stopBluetoothDiscoverable(String token);
+    /** Select only this app's active local-only Wi-Fi request, using shell NETWORK_SETTINGS. */
+    String startWifiSelection(IBinder owner, String token, String ssid, int uid);
+    String stopWifiSelection(String token);
 
     /** Release stale projection displays, retaining only the named map and detaching its surface. */
     String prepareProjection(String retainedMapName);

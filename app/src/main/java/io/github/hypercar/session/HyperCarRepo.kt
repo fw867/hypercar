@@ -61,7 +61,7 @@ import kotlinx.coroutines.withTimeoutOrNull
  *  车机蓝牙 ACL 连上 → （清单静态接收器冷启动进程）→ HyperCarService FGS
  *    → [AutoStart.handler] → [connect]
  *    → iAP2 协商（0x5703 热点凭据 / 0x4301 AirPlay 端点）
- *    → Shizuku 静默连车机热点 + bindProcessToNetwork
+ *    → HyperCar 专属局域网请求 + bindProcessToNetwork
  *    → 连 AirPlay 控制端口 → detachFd 移交 Rust → Rust 内完成全部 AirPlay 协商
  *    → 本机自绘界面自采自编，经 nativePushVideoFrame / nativePushAudioPcm 投喂 Rust
  */
@@ -483,6 +483,8 @@ object HyperCarRepo {
         headUnitProfile.id == io.github.hypercar.headunit.HeadUnitProfiles.BMW_ID85.id &&
         (sessionCarWithMode || io.github.hypercar.carui.CarUiSettings.defaultMap == io.github.hypercar.carui.MapProvider.AMAP)
     internal val carWithHudNavigationAllowed: Boolean get() = hudNavigationAllowed && sessionCarWithMode
+    internal val mapNavigationAllowed: Boolean get() = hasCurrentSession && !sessionCarWithMode &&
+        !SettingsStore.carWithMode && io.github.hypercar.carui.CarUiSettings.defaultMap == io.github.hypercar.carui.MapProvider.AMAP
 
     fun connect(context: Context) = requestConnect(context, manual = true, source = "manual")
 
@@ -1005,13 +1007,14 @@ object HyperCarRepo {
     private fun knownWifiNetwork(context: Context, ssid: String): Network? {
         val networks = wifiNetworks(context)
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return null
-        val exact = networks.filter { network ->
+        val usable = networks.filter { io.github.hypercar.net.CarWifiPolicy.canReuse(cm.getNetworkCapabilities(it)) }
+        val exact = usable.filter { network ->
             val info = cm.getNetworkCapabilities(network)?.transportInfo as? android.net.wifi.WifiInfo
             info?.ssid?.trim('"') == ssid
         }
         // Some ROMs redact WifiInfo; one Wi-Fi handle is unambiguous. Never choose an arbitrary
         // network when concurrent station connections are present and SSID information is hidden.
-        return exact.singleOrNull() ?: networks.singleOrNull()
+        return exact.singleOrNull() ?: networks.singleOrNull()?.takeIf { it in usable }
     }
 
     /** VW may withhold 0x5703 until initial AirPlay pairing; advertise only for an explicitly selected peer. */
@@ -1203,12 +1206,12 @@ object HyperCarRepo {
         log("PREFLIGHT: $preflight；${findings.joinToString("；").ifBlank { "依赖检查通过" }}")
         var discoveryJob: Job? = null
         try {
+            if (!precheckDegradedMode(context)) return
             // Shizuku 从「必须」降级为「可选增强」：没有它照样能连，只是两条路径降级——
             //  WiFi 走 WifiNetworkSpecifier（热点首连弹一次系统确认框）+ deviceID 用稳定伪 MAC。
             if (!ShizukuTools.isReady) {
                 // 降级模式预检：权限缺失/定位服务关闭时提前失败并给出可操作原因，
                 // 不要等 requestNetwork 静默 onUnavailable 才让用户一头雾水。
-                if (!precheckDegradedMode(context)) return
                 val first = !SettingsStore.degradedFirstConnectDone
                 log(
                     "SHIZUKU: 未就绪——降级模式" +
@@ -1727,6 +1730,9 @@ object HyperCarRepo {
         val peers = (endpoint.ipAddresses + listOfNotNull(endpoint.gateway)).mapNotNull {
             runCatching { android.net.InetAddresses.parseNumericAddress(it.substringBefore('%')) }.getOrNull()
         }
+        val actualPeerIdentity = iap2?.activePeerAddress?.let { io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(it) }
+            .orEmpty().lowercase()
+        val desktopPeer = actualPeerIdentity.contains("winplay") || actualPeerIdentity.contains("diplay")
         val eligible = networks.filter { network ->
             val caps = cm.getNetworkCapabilities(network)
             val lp = cm.getLinkProperties(network)
@@ -1737,10 +1743,12 @@ object HyperCarRepo {
                     (it.address is java.net.Inet6Address || !it.address.isLinkLocalAddress)
             } == true
             val route = lp?.routes?.any { r -> r.destination.prefixLength > 0 && peers.any { r.destination.contains(it) } } == true
-            caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
+            io.github.hypercar.net.CarWifiPolicy.canReuse(caps) &&
+                (io.github.hypercar.net.CarWifiPolicy.canReuseDesktop(desktopPeer, endpoint.ssid, ssid, hasAddress,
+                    caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true) ||
                 io.github.hypercar.net.CarNetworkReuse.accepts(endpoint.ssid, endpoint.deviceIdentifier, endpoint.fromInvite,
                     io.github.hypercar.net.CarNetworkReuse.Evidence(ssid, io.github.hypercar.net.CarNetworkReuse.mac(info?.bssid) ?: fallbackBssid,
-                        hasAddress, route, network == boundNetwork || network == joinedNetwork))
+                        hasAddress, route, network == boundNetwork || network == joinedNetwork)))
         }
         return eligible.firstOrNull { it == boundNetwork } ?: eligible.singleOrNull()
     }
@@ -1768,8 +1776,18 @@ object HyperCarRepo {
                 log("WIFI-REUSE: attempt=$attempt 已核实网络 #$reuse，复用现有车机 Wi-Fi，不重新入网")
                 return reuse
             }
+            // A local-only migration deliberately disconnects the old system AP. Its old loss
+            // callback must not cancel the new request as if the user had left the car.
+            sessionNetworkMonitor?.let { runCatching { cm.unregisterNetworkCallback(it) } }
+            sessionNetworkMonitor = null
+            val previousNetwork = boundNetwork
             wifiJoiner?.release()
             wifiJoiner = null
+            if (previousNetwork != null && cm.boundNetworkForProcess == previousNetwork)
+                runCatching { cm.bindProcessToNetwork(null) }
+            boundNetwork = null
+            joinedNetwork = null
+            joinedSsid = null
         } finally { autoConnectChanges.unlock() }
         lateinit var joiner: WifiJoiner
         joiner = WifiJoiner(context) {
@@ -1785,9 +1803,8 @@ object HyperCarRepo {
         val ssid = endpoint.ssid
         val psk = endpoint.passphrase
         val network = if (!ssid.isNullOrBlank() && !psk.isNullOrBlank()) {
-            val shellJoin = ShizukuTools.isReady
-            push(link = LinkState.Negotiating(if (shellJoin) "加入车机热点" else "连接车机 Wi-Fi，请确认系统连接提示"))
-            log("WIFI: 加入热点 $ssid，方式=${if (shellJoin) "Shizuku" else "系统确认（最多60s）"}")
+            push(link = LinkState.Negotiating("连接车机局域网，首次请确认系统提示"))
+            log("WIFI: 加入热点 $ssid，方式=HyperCar 专用局域网（最多60s）；其它 App 保留系统互联网")
             when (val result = joiner.joinCarHotspotSilently(ssid, psk)) {
                 is WifiJoiner.JoinResult.Joined -> { markDegradedFirstConnectIfNeeded(); result.network }
                 else -> { log("WIFI: 入网未完成（${joiner.lastFailureReason ?: "不支持或连接失败"}），仅尝试已核实的当前网络"); null }
@@ -1999,6 +2016,7 @@ object HyperCarRepo {
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return null
         val previous = boundNetwork
         for (network in boundNetwork?.let { listOf(it) } ?: wifiNetworks(context)) {
+            if (!io.github.hypercar.net.CarWifiPolicy.canReuse(cm.getNetworkCapabilities(network))) continue
             val gateway =
                 cm.getLinkProperties(network)
                     ?.routes
@@ -2877,15 +2895,14 @@ object HyperCarRepo {
         push()
     }
 
-    /** 降级模式下连热点的运行时权限是否已授予（有 Shizuku 时不需要，恒 true）。 */
-    private fun degradedPermissionGranted(): Boolean {        if (ShizukuTools.isReady) return true
+    /** 专属局域网请求所需的权限；有 Shizuku 时也需要。 */
+    private fun degradedPermissionGranted(): Boolean {
         val ctx = appCtx ?: return true
         return runCatching { SpecifierPermissions.isGranted(ctx) }.getOrDefault(false)
     }
 
     /** 系统定位服务是否开启（仅 12/12L 相关；13+ 用 NEARBY_WIFI_DEVICES，恒 true）。 */
     private fun degradedLocationOn(): Boolean {
-        if (ShizukuTools.isReady) return true
         val ctx = appCtx ?: return true
         return runCatching { SpecifierPermissions.isLocationEnabled(ctx) }.getOrDefault(true)
     }
@@ -2907,7 +2924,6 @@ object HyperCarRepo {
      * 而不是等 WifiNetworkSpecifier 的 requestNetwork 静默 onUnavailable 才懵。
      */
     private fun precheckDegradedMode(context: Context): Boolean {
-        if (ShizukuTools.isReady) return true
         val reason = SpecifierPermissions.degradeBlockReason(context)
         if (reason != null) {
             fail(reason)
@@ -2918,10 +2934,9 @@ object HyperCarRepo {
 
     /** 降级模式成功连上车机热点后：标记首连已完成（系统确认框已批准，后续静默）。 */
     private fun markDegradedFirstConnectIfNeeded() {
-        if (ShizukuTools.isReady) return
         if (!SettingsStore.degradedFirstConnectDone) {
             SettingsStore.degradedFirstConnectDone = true
-            log("PERM: ✓ 降级模式首连完成——此后上车自动连接将静默（不再弹确认框）")
+            log("PERM: ✓ 车机局域网首连完成；系统可复用本次授权，授权失效时仍需确认")
             push()
         }
     }
