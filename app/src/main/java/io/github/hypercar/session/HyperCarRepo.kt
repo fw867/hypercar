@@ -1753,7 +1753,8 @@ object HyperCarRepo {
         return eligible.firstOrNull { it == boundNetwork } ?: eligible.singleOrNull()
     }
 
-    private suspend fun joinAndBind(context: Context, endpoint: CarPlayEndpoint): Network? {
+    private suspend fun joinAndBind(context: Context, endpoint: CarPlayEndpoint,
+        latestBssid: () -> String? = { endpoint.deviceIdentifier }): Network? {
         val attempt = connectionAttemptId
         fun ensureCurrent() {
             if (!sessionLive.get() || connectionAttemptId != attempt) throw CancellationException("旧车机入网结果已失效")
@@ -1805,7 +1806,7 @@ object HyperCarRepo {
         val network = if (!ssid.isNullOrBlank() && !psk.isNullOrBlank()) {
             push(link = LinkState.Negotiating("连接车机局域网，首次请确认系统提示"))
             log("WIFI: 加入热点 $ssid，方式=HyperCar 专用局域网（最多60s）；其它 App 保留系统互联网")
-            when (val result = joiner.joinCarHotspotSilently(ssid, psk)) {
+            when (val result = joiner.joinCarHotspotSilently(ssid, psk) { ensureCurrent(); latestBssid() }) {
                 is WifiJoiner.JoinResult.Joined -> { markDegradedFirstConnectIfNeeded(); result.network }
                 else -> { log("WIFI: 入网未完成（${joiner.lastFailureReason ?: "不支持或连接失败"}），仅尝试已核实的当前网络"); null }
             }
@@ -2614,7 +2615,10 @@ object HyperCarRepo {
         }
 
         val callbacks = Channel<CarPlayEndpoint>(Channel.UNLIMITED)
+        val joinHints = AtomicReference<CarPlayEndpoint?>(null)
         coordinator.start { endpoint ->
+            if (connectionAttemptId == diagnosticId && sessionLive.get() && iap2 === coordinator)
+                joinHints.updateAndGet { mergeEndpoint(it, endpoint) }
             connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.IAP2_PARAMETERS,
                 "wifiCredentials=${!endpoint.ssid.isNullOrBlank()} endpoint=${endpoint.ipAddresses.isNotEmpty()}")
             callbacks.trySend(endpoint)
@@ -2792,7 +2796,11 @@ object HyperCarRepo {
                 // 0x5703 只给 ssid/psk：先入网 + 广播，车机才可能邀请并下发 0x4301
                 if (!wifiJoined && !merged.ssid.isNullOrBlank()) {
                     log("SESSION: 已收到车机热点参数——先核实入网，再广播 _carplay-ctrl")
-                    val network = joinAndBind(context, merged)
+                    val network = joinAndBind(context, merged) {
+                        // Never borrow a hint from another SSID/credentials or an older attempt.
+                        joinHints.get()?.takeIf { it.ssid == merged.ssid && it.passphrase == merged.passphrase }
+                            ?.deviceIdentifier ?: merged.deviceIdentifier
+                    }
                         ?: throw IllegalStateException("车机热点入网失败：${wifiJoiner?.lastFailureReason ?: "没有匹配本车的有效网络"}")
                     wifiJoined = true
                     connectionDiagnostics.mark(connectionAttemptId, ConnectionDiagnostics.Stage.WIFI_BOUND)

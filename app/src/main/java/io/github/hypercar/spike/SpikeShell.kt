@@ -41,8 +41,8 @@ object SpikeShell {
         call("startBluetoothDiscoverable") { it.startBluetoothDiscoverable(owner, token, seconds) }
     fun stopBluetoothDiscoverable(token: String): String =
         call("stopBluetoothDiscoverable") { it.stopBluetoothDiscoverable(token) }
-    fun startWifiSelection(owner: IBinder, token: String, ssid: String, uid: Int): String =
-        call("startWifiSelection") { it.startWifiSelection(owner, token, ssid, uid) }
+    fun startWifiSelection(owner: IBinder, token: String, ssid: String, bssid: String, uid: Int): String =
+        call("startWifiSelection") { it.startWifiSelection(owner, token, ssid, bssid, uid) }
     fun stopWifiSelection(token: String): String =
         call("stopWifiSelection") { it.stopWifiSelection(token) }
 

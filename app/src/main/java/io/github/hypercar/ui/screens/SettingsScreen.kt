@@ -1331,12 +1331,26 @@ private fun BehaviorSection(startup: io.github.hypercar.session.StartupReadiness
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AudioSection() {
     var enabled by rememberSaveable { mutableStateOf(SettingsStore.enableAudio) }
+    var codec by rememberSaveable { mutableStateOf(SettingsStore.audioCodec) }
     GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 2.dp)) {
         SwitchRow(title = "音频转发", subtitle = "将声音传到车机，下次连接生效", checked = enabled,
             onCheckedChange = { enabled = it; SettingsStore.enableAudio = it })
+        Text("音频格式", style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+        Spacer(Modifier.height(8.dp))
+        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+            listOf("auto" to "自动", "pcm" to "PCM", "aac" to "AAC 优先").forEachIndexed { index, (value, label) ->
+                SegmentedButton(selected = codec == value, enabled = enabled,
+                    onClick = { codec = value; SettingsStore.audioCodec = value },
+                    shape = SegmentedButtonDefaults.itemShape(index, 3), label = { Text(label) })
+            }
+        }
+        Text("自动保留已验证的 PCM；ID9 按能力选择。AAC 优先需车机声明支持，下次连接生效。",
+            style = MaterialTheme.typography.bodySmall, color = TextSecondary,
+            modifier = Modifier.padding(vertical = 10.dp))
     }
 }
 

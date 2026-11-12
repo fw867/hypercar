@@ -48,7 +48,7 @@ interface ISpikeShell {
     String startBluetoothDiscoverable(IBinder owner, String token, int seconds);
     String stopBluetoothDiscoverable(String token);
     /** Select only this app's active local-only Wi-Fi request, using shell NETWORK_SETTINGS. */
-    String startWifiSelection(IBinder owner, String token, String ssid, int uid);
+    String startWifiSelection(IBinder owner, String token, String ssid, String bssid, int uid);
     String stopWifiSelection(String token);
 
     /** Release stale projection displays, retaining only the named map and detaching its surface. */

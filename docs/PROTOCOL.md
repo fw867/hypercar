@@ -4,7 +4,7 @@
 
 ## 蓝牙与 iAP2
 
-车机热点通过 HyperCar 自己的 `WifiNetworkSpecifier` 局域网请求接入，保留请求到会话结束；不再用 `cmd wifi connect-network` 创建系统互联网 Wi-Fi。HyperCar 的车机流量绑定该网络，其它 App 使用系统互联网。未验证的系统互联网 Wi-Fi 不走复用快路径；已验证的家庭网络仍可供 WinPlay 使用。Shizuku 可迁移当前匹配的旧车机系统连接（关闭该保存网络的自动加入并断开，不删除凭据），不全局关闭 Wi-Fi/自动加入。Shizuku 通过 NETWORK_SETTINGS 注册有界匹配回调，核实活动请求的本应用 UID、包名、精确 SSID 和无 INTERNET 后，选择匹配热点；不建立系统互联网连接。回调在请求完成、取消、owner 死亡或 60 秒到期时释放。ROM 不支持此接口或无 Shizuku 时，首个局域网请求可能需要系统确认；不支持时明确失败，不退回抢占默认网络的旧路径。
+车机热点通过 HyperCar 自己的 `WifiNetworkSpecifier` 局域网请求接入，保留请求到会话结束；不再用 `cmd wifi connect-network` 创建系统互联网 Wi-Fi。HyperCar 的车机流量绑定该网络，其它 App 使用系统互联网。未验证的系统互联网 Wi-Fi 不走复用快路径；已验证的家庭网络仍可供 WinPlay 使用。Shizuku 可迁移当前匹配的旧车机系统连接（关闭该保存网络的自动加入并断开，不删除凭据），不全局关闭 Wi-Fi/自动加入。Shizuku 通过 NETWORK_SETTINGS 注册有界匹配回调，核实活动请求的本应用 UID、包名、精确 SSID 和无 INTERNET 后，选择匹配热点；不建立系统互联网连接。回调在请求完成、取消、owner 死亡或 60 秒到期时释放。入网准备结束前重新读取本轮晚到的0x4301；只有其MAC与相同SSID的扫描记录一致才加精确BSSID，新鲜记录可加信道提示。选择器先有界等待系统创建本应用的活动请求，再注册匹配回调；未取得选择回调前的onAbort按有界启动竞态处理，已确认活动请求后的onAbort才结束租约。对于已由本轮iAP2与扫描记录共同确认的精确AP，可在取得选择回调时直接选择缓存AP，不等待会被ROM中止的第二次扫描。不通过断开家庭Wi-Fi或改变其自动加入设置来恢复。ROM 不支持此接口或无 Shizuku 时，首个局域网请求可能需要系统确认；不支持时明确失败，不退回抢占默认网络的旧路径。
 
 手机主 RFCOMM UUID 为 `00000000-deca-fade-deca-deafdecacafe`，附件端 UUID 为 `00000000-deca-fade-deca-deafdecacaff`。主监听使用安全 RFCOMM。蓝牙重启或监听异常后按代次恢复，旧回调不能覆盖新监听。
 

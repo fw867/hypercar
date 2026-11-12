@@ -86,7 +86,7 @@ class WifiJoiner(
      * @param ssid 热点名（可能含空格/中文）。
      * @param psk  热点密码；空=开放热点；WEP 形态返回 [JoinResult.Unsupported]。
      */
-    suspend fun joinCarHotspotSilently(ssid: String, psk: String): JoinResult {
+    suspend fun joinCarHotspotSilently(ssid: String, psk: String, bssidHint: () -> String? = { null }): JoinResult {
         lastFailureReason = null
         // Password length alone cannot distinguish WEP from valid 10/13/26-character WPA2.
         if (isUnsupportedPassphrase(psk)) {
@@ -111,7 +111,13 @@ class WifiJoiner(
             Log.i(TAG, "local-only migration: ${migration.out.takeLast(400)} ${migration.err.takeLast(160)}")
         }
         Log.i(TAG, "申请 HyperCar 专用局域网；不保存系统热点，不接管其它 App 默认网络")
-        return joinViaSpecifier(ssid, psk)
+        // 0x4301 can arrive while shell preparation runs, after the initial 0x5703 snapshot.
+        val latestBssid = bssidHint()
+        val hint = if (ShizukuTools.isReady && CarNetworkReuse.mac(latestBssid) != null) {
+            val scan = ShizukuTools.exec("cmd wifi list-scan-results", 3_000)
+            WifiApHint.fromScan(scan.out, ssid, latestBssid)
+        } else null
+        return joinViaSpecifier(ssid, psk, hint)
     }
 
     /**
@@ -125,10 +131,18 @@ class WifiJoiner(
      * 用法是：装好后先手动打开一次 App 完成首连确认，之后「上车自动连接」才会全程静默。
      * 拿不到句柄（框弹不出/用户拒绝/超时）一律返回 Failed，由调用方降级到「绑定当前网络」。
      */
-    private suspend fun joinViaSpecifier(ssid: String, psk: String): JoinResult =
+    private suspend fun joinViaSpecifier(ssid: String, psk: String, hint: WifiApHint?): JoinResult =
         withContext(Dispatchers.IO) {
             val specifier = WifiNetworkSpecifier.Builder().apply {
                 setSsid(ssid)
+                // A specific, freshly invited AP can use the system's cached approval/scan
+                // immediately. SSID-only requests always start scans, which this ROM can abort.
+                hint?.let {
+                    setBssid(android.net.MacAddress.fromString(it.bssid))
+                    if (android.os.Build.VERSION.SDK_INT >= 34 && it.ageSeconds <= 30 && it.frequency in 2400..7125)
+                        setPreferredChannelsFrequenciesMhz(intArrayOf(it.frequency))
+                    Log.i(TAG, "local-only exact AP from invitation + scan bssid=${it.bssid} scan_age_s=${it.ageSeconds}")
+                }
                 // 开放网络：Builder 没有 setOpenNetwork()，不设任何密码方法即为开放；
                 // WPA2 只有 setWpa2Passphrase 一条路径。
                 if (psk.isNotBlank()) setWpa2Passphrase(psk)
@@ -142,7 +156,7 @@ class WifiJoiner(
                 .setNetworkSpecifier(specifier)
                 .build()
 
-            val network = awaitSpecifierHandle(request, ssid, SPECIFIER_WAIT_MS)
+            val network = awaitSpecifierHandle(request, ssid, hint, SPECIFIER_WAIT_MS)
                 ?: return@withContext JoinResult.Failed
             val caps = connectivityManager.getNetworkCapabilities(network)
             if (!CarWifiPolicy.canReuse(caps)) {
@@ -157,7 +171,7 @@ class WifiJoiner(
         }
 
     /** 用 specifier 请求拿 Network 句柄；首连时系统确认框的等待时间也算在 [timeoutMs] 内。 */
-    private suspend fun awaitSpecifierHandle(request: NetworkRequest, ssid: String, timeoutMs: Long): Network? {
+    private suspend fun awaitSpecifierHandle(request: NetworkRequest, ssid: String, hint: WifiApHint?, timeoutMs: Long): Network? {
         val latch = CountDownLatch(1)
         val result = AtomicReference<Network?>(null)
         // 立刻 onUnavailable 与「等到超时」是完全不同的病因，必须分开记
@@ -195,7 +209,7 @@ class WifiJoiner(
                 val token = java.util.UUID.randomUUID().toString()
                 selectionToken.set(token)
                 val selected = io.github.hypercar.spike.SpikeShell.startWifiSelection(
-                    selectionOwner, token, ssid, android.os.Process.myUid())
+                    selectionOwner, token, ssid, hint?.bssid.orEmpty(), android.os.Process.myUid())
                 Log.i(TAG, "local-only selection: $selected")
                 if (callback.get() !== cb || selectionToken.get() != token)
                     io.github.hypercar.spike.SpikeShell.stopWifiSelection(token)

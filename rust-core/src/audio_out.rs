@@ -64,6 +64,8 @@ pub struct AudioOut {
     marker_pending: bool,
     ownership: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     blocked_samples: u64,
+    aac: Option<crate::aac::AacEncoder>,
+    aac_needs_reset: bool,
 }
 
 impl AudioOut {
@@ -87,8 +89,18 @@ impl AudioOut {
             marker_pending: true,
             ownership: None,
             blocked_samples: 0,
+            aac: None,
+            aac_needs_reset: false,
         }
     }
+
+    pub fn new_aac(data: UdpSocket, sync: Option<UdpSocket>, key: [u8;32], encoder: crate::aac::AacEncoder) -> Self {
+        let mut output = Self::new(data, sync, key, 102);
+        output.aac = Some(encoder);
+        output
+    }
+    pub fn stream_type(&self) -> i64 { self.pt as i64 }
+    pub fn samples_per_packet(&self) -> usize { if self.pt == 102 { crate::aac::FRAMES } else { SAMPLES_PER_PACKET } }
 
     /// 发送交错 PCM（48kHz 立体声 i16）。内部按 352 帧切包逐包发送，
     /// **尾部不足一包的余数不发**（由调用方留存到下一批）。
@@ -96,7 +108,7 @@ impl AudioOut {
     /// 负载样本是 **16bit 大端**：CarPlay LPCM 线格式即大端，接收端收到后
     /// byteSwap 回小端喂 AudioTrack（DiPlay AndroidMediaSink 同款）；Android
     /// 采集是原生小端，漏换序实测得到「沙沙声」（cardeck 2026-10-10 真车验证）。
-    /// AAC 通路不换序（比特流语义），本项目只走 PCM 故恒换序。
+    /// AAC receives little-endian PCM at the encoder input; its raw output is never byte-swapped.
     pub fn set_ownership(&mut self, ownership: std::sync::Arc<std::sync::atomic::AtomicBool>) { self.ownership = Some(ownership); }
     pub fn owns_audio(&self) -> bool {
         self.ownership.as_ref().map(|v| v.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(true)
@@ -107,41 +119,54 @@ impl AudioOut {
         if !self.owns_audio() {
             self.blocked_samples = self.blocked_samples.saturating_add(frames.len() as u64);
             self.marker_pending = true;
+            if self.pt == 102 { self.aac.take(); self.aac_needs_reset = true; }
             return Ok(());
         }
-        let samples_per_packet = SAMPLES_PER_PACKET * CHANNELS;
-        for chunk in frames.chunks_exact(samples_per_packet) {
-            // PCM 负载（交错立体声 16bit **BE**）
-            let mut payload = Vec::with_capacity(samples_per_packet * 2);
-            for sample in chunk {
-                payload.extend_from_slice(&sample.to_be_bytes());
+        if self.pt == 102 {
+            if self.aac_needs_reset {
+                self.aac_needs_reset = false;
+                self.aac = Some(crate::aac::AacEncoder::new()?);
             }
-
-            let mut header = [0u8; RTP_HEADER_LEN];
-            header[0] = 0x80; // V=2
-            // M（首包标记）| PT（低 7 位）
-            header[1] = (self.pt & 0x7F) | if self.marker_pending { 0x80 } else { 0x00 };
-            header[2] = (self.seq >> 8) as u8;
-            header[3] = (self.seq & 0xFF) as u8;
-            header[4..8].copy_from_slice(&self.ts.to_be_bytes());
-            // SSRC(8..12) 保持 0——写死，部分车机按 SSRC 关联 SETUP，随机值会无声
-
-            // AAD = 头字节 4..12（timestamp + SSRC）
-            let sealed = chacha_seal(&self.key, &nonce64(self.nonce), &payload, &header[4..12]);
-
-            let mut wire = Vec::with_capacity(RTP_HEADER_LEN + sealed.len() + NONCE_TAIL_LEN);
-            wire.extend_from_slice(&header);
-            wire.extend_from_slice(&sealed); // 密文 || 16B tag
-            wire.extend_from_slice(&self.nonce.to_le_bytes()); // 尾部 8B 小端 nonce
-
-            self.udp.send(&wire).await?;
-
-            self.seq = self.seq.wrapping_add(1);
-            self.ts = self.ts.wrapping_add(SAMPLES_PER_PACKET as u32);
-            self.nonce = self.nonce.wrapping_add(1);
-            self.packets = self.packets.wrapping_add(1);
-            self.marker_pending = false;
+            let encoded = self.aac.as_mut().ok_or_else(|| std::io::Error::other("AAC encoder stopped"))?.encode(frames);
+            let encoded = match encoded { Ok(frames) => frames, Err(error) => { self.aac.take(); return Err(error); } };
+            for payload in encoded { self.send_payload(&payload, crate::aac::FRAMES as u32).await?; }
+        } else {
+            for chunk in frames.chunks_exact(SAMPLES_PER_PACKET * CHANNELS) {
+                let mut payload = Vec::with_capacity(chunk.len() * 2);
+                for sample in chunk { payload.extend_from_slice(&sample.to_be_bytes()); }
+                self.send_payload(&payload, SAMPLES_PER_PACKET as u32).await?;
+            }
         }
+        Ok(())
+    }
+
+    async fn send_payload(&mut self, payload: &[u8], sample_frames: u32) -> std::io::Result<()> {
+        // Recheck ownership after encoding; a resource handover may occur concurrently.
+        if !self.owns_audio() {
+            self.marker_pending = true;
+            if self.pt == 102 { self.aac.take(); self.aac_needs_reset = true; }
+            return Ok(());
+        }
+        let mut header = [0u8; RTP_HEADER_LEN];
+        header[0] = 0x80;
+        header[1] = (self.pt & 0x7f) | if self.marker_pending { 0x80 } else { 0 };
+        header[2..4].copy_from_slice(&self.seq.to_be_bytes());
+        header[4..8].copy_from_slice(&self.ts.to_be_bytes());
+        let sealed = chacha_seal(&self.key, &nonce64(self.nonce), payload, &header[4..12]);
+        let mut wire = Vec::with_capacity(RTP_HEADER_LEN + sealed.len() + NONCE_TAIL_LEN);
+        wire.extend_from_slice(&header);
+        wire.extend_from_slice(&sealed);
+        wire.extend_from_slice(&self.nonce.to_le_bytes());
+        // Never reuse an AEAD nonce after a send error (a send may have reached the peer).
+        self.nonce = self.nonce.wrapping_add(1);
+        self.seq = self.seq.wrapping_add(1);
+        self.ts = self.ts.wrapping_add(sample_frames);
+        self.udp.send(&wire).await?;
+        if self.packets == 0 && self.pt == 102 {
+            crate::emit_log(&format!("AUDIO: first AAC RTP type=102 SPF=1024 raw_bytes={}", payload.len()));
+        }
+        self.packets = self.packets.wrapping_add(1);
+        self.marker_pending = false;
         Ok(())
     }
 
@@ -153,7 +178,7 @@ impl AudioOut {
         let Some(sync) = self.sync.as_ref() else {
             return Ok(()); // 车机没下发 controlPort（旧车机）：只发音频
         };
-        let packet = build_sync_packet(self.sync_seq, rtp_ts, ntp_nanos);
+        let packet = build_sync_packet_for_frames(self.sync_seq, rtp_ts, ntp_nanos, self.samples_per_packet() as u32);
         sync.send(&packet).await?;
         self.sync_seq = self.sync_seq.wrapping_add(1);
         Ok(())
@@ -181,14 +206,14 @@ impl AudioOut {
 ///  - 字节 8..15：当前 NTP 时间（秒<<32 | 2^32 分数，大端），与 TimingServer 应答
 ///    给车机的同一时间基（单调时钟）
 ///  - 「下一包」时间戳 = 当前 + 每包样本帧数（352），对照 AudioSyncPacket.build
-pub fn build_sync_packet(seq: u16, rtp_ts: u32, ntp_nanos: u64) -> Vec<u8> {
+fn build_sync_packet_for_frames(seq: u16, rtp_ts: u32, ntp_nanos: u64, sample_frames: u32) -> Vec<u8> {
     let mut packet = vec![0u8; SYNC_PACKET_LEN];
     packet[0] = 0x80 | if seq == 0 { 0x10 } else { 0x00 };
     packet[1] = 0xD4;
     packet[2..4].copy_from_slice(&seq.to_be_bytes());
     packet[4..8].copy_from_slice(&rtp_ts.to_be_bytes());
     packet[8..16].copy_from_slice(&ntp_be(ntp_nanos));
-    let next = rtp_ts.wrapping_add(SAMPLES_PER_PACKET as u32);
+    let next = rtp_ts.wrapping_add(sample_frames);
     packet[16..20].copy_from_slice(&next.to_be_bytes());
     packet
 }
@@ -197,6 +222,45 @@ pub fn build_sync_packet(seq: u16, rtp_ts: u32, ntp_nanos: u64) -> Vec<u8> {
 mod ownership_tests {
     use super::*;
     use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    #[tokio::test]
+    async fn aac_rtp_preserves_raw_payload_and_advances_1024_with_unique_nonces() {
+        let receiver=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(receiver.local_addr().unwrap()).await.unwrap();
+        let key=[3u8;32];
+        let mut sender=AudioOut::new(socket,None,key,102);
+        let payload=[0x21,0x10,0x56,0xab];
+        let mut packet=[0u8;2048];
+        for i in 0..2u32 {
+            sender.send_payload(&payload,1024).await.unwrap();
+            let n=receiver.recv(&mut packet).await.unwrap();
+            assert_eq!(packet[1]&0x7f,102);
+            assert_eq!(packet[1]&0x80,if i==0 {0x80} else {0});
+            assert_eq!(u32::from_be_bytes(packet[4..8].try_into().unwrap()),i*1024);
+            assert_eq!(&packet[n-8..n],&(i as u64).to_le_bytes());
+            assert_eq!(crate::crypto::chacha_open(&key,&nonce64(i as u64),&packet[12..n-8],&packet[4..12]).unwrap(),payload);
+        }
+        let sync=build_sync_packet_for_frames(0,1024,123456,1024);
+        assert_eq!(u32::from_be_bytes(sync[16..20].try_into().unwrap()),2048);
+    }
+    #[cfg(target_os="android")]
+    #[tokio::test]
+    async fn aac_owner_loss_discards_encoder_and_buffered_audio() {
+        let receiver=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(receiver.local_addr().unwrap()).await.unwrap();
+        let owner=Arc::new(AtomicBool::new(true));
+        let mut sender=AudioOut::new_aac(socket,None,[0;32],crate::aac::AacEncoder::new().unwrap());
+        sender.set_ownership(owner.clone());
+        sender.send_pcm(&vec![500;704]).await.unwrap(); // Fractional AAC frame must not survive handover.
+        owner.store(false,Ordering::Release);
+        sender.send_pcm(&vec![500;704]).await.unwrap();
+        assert!(sender.aac.is_none()); assert_eq!(sender.packets_sent(),0);
+        owner.store(true,Ordering::Release);
+        sender.send_pcm(&vec![0;704]).await.unwrap();
+        assert!(sender.aac.is_some()); assert_eq!(sender.packets_sent(),0);
+        assert!(sender.marker_pending);
+    }
     #[tokio::test]
     async fn muted_owner_sends_no_udp_and_a_new_grant_resumes_with_marker() {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();

@@ -31,11 +31,11 @@ class SpikeShellService : ISpikeShell.Stub {
     private val playbackAudio = ShellPlaybackAudio()
     private val bluetoothDiscovery = ShellBluetoothDiscovery()
     private val wifiSelection = ShellWifiSelection()
-    override fun startWifiSelection(owner: IBinder, token: String, ssid: String, uid: Int): String {
+    override fun startWifiSelection(owner: IBinder, token: String, ssid: String, bssid: String, uid: Int): String {
         if (android.os.Binder.getCallingUid() != uid || appContext?.applicationInfo?.uid != uid)
             return "ERR Wi-Fi request owner mismatch"
         val identity = android.os.Binder.clearCallingIdentity()
-        return try { wifiSelection.start(owner, token, ssid, uid) }
+        return try { wifiSelection.start(owner, token, ssid, bssid, uid) }
         finally { android.os.Binder.restoreCallingIdentity(identity) }
     }
     override fun stopWifiSelection(token: String): String {

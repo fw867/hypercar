@@ -10,6 +10,7 @@
 
 mod airplay;
 mod audio_out;
+mod aac;
 mod audio_resource;
 mod bplist;
 mod consumer_hid;

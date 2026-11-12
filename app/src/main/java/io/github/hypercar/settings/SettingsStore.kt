@@ -295,6 +295,10 @@ object SettingsStore {
         get() = p().getBoolean(KEY_ENABLE_AUDIO, true)
         set(v) = p().edit().putBoolean(KEY_ENABLE_AUDIO, v).apply()
 
+    var audioCodec: String
+        get() = p().getString("audio_codec", "auto")?.takeIf { it in setOf("auto", "pcm", "aac") } ?: "auto"
+        set(v) { p().edit().putString("audio_codec", v.takeIf { it in setOf("auto", "pcm", "aac") } ?: "auto").apply() }
+
     /** 车机 /info 声明 keepAliveSendStatsAsBody 时置 true（屏幕 keepAlive 带统计体）。 */
     var keepAliveStats: Boolean
         get() = p().getBoolean(KEY_KEEP_ALIVE_STATS, false)
@@ -397,6 +401,7 @@ object SettingsStore {
             append("\"touch_display_h\":").append(tdH).append(",")
             append("\"fps\":").append(plan.fps).append(",")
             append("\"enable_audio\":").append(enableAudio).append(",")
+            append("\"audio_codec\":\"").append(audioCodec).append("\",")
             append("\"keep_alive_stats\":").append(keepAliveStats).append(",")
             append("\"bmw_box_bootstrap\":").append(io.github.hypercar.headunit.ReceiverCompatibility.useBmwBootstrap(
                 headUnitProfileId, io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(receiverBluetoothMac))).append(",")

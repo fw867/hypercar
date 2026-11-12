@@ -7,7 +7,7 @@
 | ID | 断 HFP/A2DP | 出站 iAP2 | 要求本轮激活 | 特殊门槛 | 验证范围 |
 |---|---|---|---|---|---|
 | bmw_id85 | false | false | true | 允许用户开启已配对 Wi-Fi 主动恢复 | MGU-55 实车基准；不能代表所有 iDrive |
-| bmw_id9 | false | true | true | 新鲜0x4301；主屏/HID/视频TCP在RECORD前就绪；不继承MGU的SAP | ID9试验，仅模拟验证；AAC待实现 |
+| bmw_id9 | false | true | true | 新鲜0x4301；主屏/HID/视频TCP在RECORD前就绪；不继承MGU的SAP | ID9实车待验证；AAC48已接通并通过DiPlay出声测试 |
 | generic | true | true | false | 通用模板 | verified 不代表所有车型经过测试 |
 | winplay | false | true | false | deviceID 校验；7000端口 | PC 联调，不等于真实车机 |
 | audi_mib3 | true | true | false | mDNS 优先、兼容晚到端点 | 本项目未完成奥迪实车验证 |
@@ -85,4 +85,4 @@ useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关�
 
 该分支是根据成功样本静态路径校准的奔驰实验，不代表已在奔驰验证消除400；多个校准项同时启用，不能据一次成功反推唯一根因。回归及安装状态见VALIDATION。
 
-ID9当前路径：配对 → 会话SETUP → /info主屏UUID → 初始资源声明 → 按约束申请主屏 → HID mode0 → 主屏SETUP/TCP → RECORD → 资源版本仍有效才送帧。只对bmw_id9启用；不支持的PCM媒体档不尝试，AAC仍待接通。
+ID9当前路径：配对 → 会话SETUP → /info主屏UUID → 初始资源声明 → 按约束申请主屏 → HID mode0 → 主屏SETUP/TCP → RECORD → 资源版本仍有效才送帧。只对bmw_id9启用；不支持的PCM媒体档不尝试；声明AAC-LC48媒体输出时可使用AAC，ID9实车仍待验证。

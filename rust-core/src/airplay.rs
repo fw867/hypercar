@@ -41,6 +41,7 @@ pub struct AirplayParams {
     pub receiver_id: Option<String>,
     pub receiver_previously_connected: bool,
     pub enable_audio: bool,
+    pub audio_codec: String,
     pub keep_alive_stats: bool,
     pub bmw_box_bootstrap: bool,
     pub mbux_screen_bootstrap: bool,
@@ -474,24 +475,24 @@ pub async fn negotiate(
     // The phone is the resource arbiter. CatPlay marks changeModes FromAccessory;
     // sending it to BMW returned 422. Initial local ownership was already published via
     // modesChanged before stream SETUP. Receiver borrow/take requests still gate packets.
-    let audio_allowed = p.enable_audio && (!p.id9_screen_bootstrap || id9_pcm_media_supported(&info));
-    if p.id9_screen_bootstrap && p.enable_audio && !audio_allowed {
-        emit_log("ID9: receiver has no PCM48k media format; skip unsupported PCM SETUP, retain video/control (AAC pending)");
-    }
+    let plan = audio_candidates(&info, &p.audio_codec, p.id9_screen_bootstrap);
     audio_owned.store(modes.lock().audio_owned(), std::sync::atomic::Ordering::Release);
-    emit_log(&format!("AUDIO: enabled={} box_bootstrap={box_bootstrap} setup_enabled={audio_allowed} owner_controller={}", p.enable_audio, modes.lock().audio_owned()));
-    let mut audio = if audio_allowed {
+    emit_log(&format!("AUDIO: enabled={} preference={} candidates={plan:?} owner_controller={}", p.enable_audio, p.audio_codec, modes.lock().audio_owned()));
+    let mut audio = None;
+    if p.enable_audio {
         let desktop = p.desktop_receiver || !use_box_bootstrap(true, &info);
-        negotiate_audio(&channel, &factory, shared_secret.as_ref(), p, desktop).await
-    } else {
-        None
-    };
+        for codec in plan {
+            audio = negotiate_audio(&channel, &factory, shared_secret.as_ref(), p, desktop, codec).await;
+            if audio.is_some() { break; }
+        }
+        if audio.is_none() { emit_log("AUDIO: no usable media stream; retain video/control"); }
+    }
 
     p.pipeline.lock().audio_ready=audio.is_some();
     if let Some(audio) = audio.as_mut() { audio.set_ownership(audio_owned.clone()); }
 
     let mut streams = vec![Value::dict(vec![("type", Value::int(110)), ("uuid", Value::str(&screen_session.uuid))])];
-    if audio.is_some() { streams.push(Value::dict(vec![("type", Value::int(100))])); }
+    if let Some(audio) = audio.as_ref() { streams.push(Value::dict(vec![("type", Value::int(audio.stream_type()))])); }
     let teardown = bplist::encode(&Value::dict(vec![("streams", Value::array(streams))]));
     Ok(AirplayOutcome {
         audio_resource: crate::audio_resource::AudioResource { control: channel.clone(), modes, owned: audio_owned },
@@ -813,6 +814,25 @@ mod display_size_tests {
             assert_eq!(stream.get("spf").and_then(Value::as_int),Some(352));
             assert_eq!(stream.get("audioFormat").and_then(Value::as_int),Some(1<<15));
             assert_eq!(stream.get("streamConnectionID").and_then(Value::as_int),Some(42));
+        }
+    }
+    #[test]
+    fn aac_setup_and_candidates_keep_pcm_default_and_respect_receiver_direction() {
+        let format=|kind,audio_type,bits| Value::dict(vec![("type",Value::int(kind)),
+            ("audioType",Value::str(audio_type)),("audioOutputFormats",Value::int(bits))]);
+        let info=|formats| Value::dict(vec![("audioFormats",Value::array(formats))]);
+        let aac_only=info(vec![format(102,"media",1<<23)]);
+        assert_eq!(audio_candidates(&aac_only,"auto",false),vec![AudioCodec::Pcm,AudioCodec::Aac]);
+        assert_eq!(audio_candidates(&aac_only,"auto",true),vec![AudioCodec::Aac]);
+        assert_eq!(audio_candidates(&aac_only,"pcm",true),vec![]);
+        assert_eq!(audio_candidates(&aac_only,"aac",false),vec![AudioCodec::Aac,AudioCodec::Pcm]);
+        assert_eq!(audio_candidates(&info(vec![format(102,"telephony",1<<23)]),"auto",true),vec![]);
+        assert_eq!(audio_candidates(&info(vec![format(100,"media",1<<23)]),"auto",true),vec![]);
+        assert_eq!(audio_candidates(&info(vec![]),"auto",false),vec![AudioCodec::Pcm]);
+        let setup=bplist::parse(&build_audio_setup_for_codec(42,true,AudioCodec::Aac)).unwrap();
+        let stream=&setup.get("streams").unwrap().as_array().unwrap()[0];
+        for (key,value) in [("type",102),("audioFormat",1<<23),("spf",1024),("ct",4),("sr",48000)] {
+            assert_eq!(stream.get(key).and_then(Value::as_int),Some(value));
         }
     }
     #[test]
@@ -1277,20 +1297,41 @@ pub(crate) fn build_screen_setup_with_latency(conn_id: i64, uuid: &str, latency_
 
 /// WinPlay treats zero latency as 1000 ms; 352-frame PCM then approaches its 128-packet limit.
 /// A positive 250 ms keeps its reorder queue below capacity without changing physical-car timing.
-fn build_audio_setup(conn_id: i64, desktop: bool) -> Vec<u8> {
-    bplist::encode(&Value::dict(vec![(
-        "streams",
-        Value::array(vec![Value::dict(vec![
-            ("type", Value::int(100)),          // 主音频
-            ("streamConnectionID", Value::int(conn_id)),
-            ("audioFormat", Value::int(1 << 15)), // PCM 48k 立体声位图
-            ("audioType", Value::str("media")),   // 必须 media（compatibility 档无声）
-            ("audioLatencyMs", Value::int(if desktop { 250 } else { 0 })),
-            ("input", Value::bool(false)),
-            ("supportsRTPPacketRedundancy", Value::bool(false)),
-            ("spf", Value::int(352)), // AirPlay 标准 SPF（512 在真车无声）
-        ])]),
-    )]))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioCodec { Pcm, Aac }
+impl AudioCodec {
+    fn stream_type(self) -> i64 { if self == Self::Aac { 102 } else { 100 } }
+    fn format(self) -> i64 { if self == Self::Aac { 1 << 23 } else { 1 << 15 } }
+    fn spf(self) -> i64 { if self == Self::Aac { 1024 } else { 352 } }
+}
+fn audio_candidates(info: &Value, preference: &str, strict: bool) -> Vec<AudioCodec> {
+    let aac = info.get("audioFormats").and_then(Value::as_array).into_iter().flatten().any(|f|
+        f.get("type").and_then(Value::as_int) == Some(102) &&
+        f.get("audioType").and_then(Value::as_str) == Some("media") &&
+        f.get("audioOutputFormats").and_then(Value::as_int).is_some_and(|bits| bits & (1 << 23) != 0));
+    let pcm = !strict || id9_pcm_media_supported(info);
+    let mut result = Vec::new();
+    if preference == "aac" && aac { result.push(AudioCodec::Aac); }
+    if pcm { result.push(AudioCodec::Pcm); }
+    if preference != "pcm" && aac && !result.contains(&AudioCodec::Aac) { result.push(AudioCodec::Aac); }
+    result
+}
+#[cfg(test)]
+fn build_audio_setup(conn_id: i64, desktop: bool) -> Vec<u8> { build_audio_setup_for_codec(conn_id, desktop, AudioCodec::Pcm) }
+fn build_audio_setup_for_codec(conn_id: i64, desktop: bool, codec: AudioCodec) -> Vec<u8> {
+    let mut stream = vec![
+        ("type", Value::int(codec.stream_type())),
+        ("streamConnectionID", Value::int(conn_id)),
+        ("audioFormat", Value::int(codec.format())),
+        ("audioType", Value::str("media")),
+        ("audioLatencyMs", Value::int(if desktop { 250 } else { 0 })),
+        ("input", Value::bool(false)),
+        ("supportsRTPPacketRedundancy", Value::bool(false)),
+        ("spf", Value::int(codec.spf())),
+    ];
+    // Leave the validated PCM proposal unchanged. AAC explicitly describes compression/rate.
+    if codec == AudioCodec::Aac { stream.extend([("ct",Value::int(4)),("sr",Value::int(48000))]); }
+    bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(stream)]))]))
 }
 
 async fn negotiate_audio(
@@ -1299,10 +1340,17 @@ async fn negotiate_audio(
     shared: Option<&[u8; 32]>,
     p: &AirplayParams,
     desktop: bool,
+    codec: AudioCodec,
 ) -> Option<AudioOut> {
+    let encoder = if codec == AudioCodec::Aac {
+        match crate::aac::AacEncoder::new() {
+            Ok(encoder) => { emit_log("AUDIO: AAC-LC encoder ready 48000Hz stereo 256kbps raw/SPF1024"); Some(encoder) }
+            Err(error) => { emit_log(&format!("AUDIO: AAC encoder unavailable: {error}")); return None; }
+        }
+    } else { None };
     let conn_id = random_positive_i64();
-    let body = build_audio_setup(conn_id, desktop);
-    emit_log(&format!("AUDIO: SETUP PCM48k stereo SPF352 desktop={desktop} latencyMs={}", if desktop {250} else {0}));
+    let body = build_audio_setup_for_codec(conn_id, desktop, codec);
+    emit_log(&format!("AUDIO: SETUP {codec:?}48k stereo SPF{} desktop={desktop} latencyMs={}", codec.spf(), if desktop {250} else {0}));
     // 音频 SETUP 必须用**绝对 URI**（cardeck runAudioStream 同款：`rtsp://host:port/`）；
     // 屏幕流与初始 SETUP 才用相对路径。URI 用反会 400/404。
     let audio_uri = crate::rtsp_uri::audio_uri(&p.car_ip, p.airplay_port);
@@ -1327,31 +1375,44 @@ async fn negotiate_audio(
         emit_log(&format!("AIRPLAY: 音频流被拒 [{}]", resp.first_line));
         return None;
     }
-    let root = bplist::parse(&resp.body).ok()?;
-    let stream = root.get("streams").and_then(Value::as_array)?.first()?;
-    let data_port = port_of(stream.get("dataPort"));
-    let control_port = port_of(stream.get("controlPort"));
-    if data_port == 0 {
-        emit_log("AIRPLAY: 音频流未返回 dataPort");
-        return None;
-    }
-    let key = match shared {
-        Some(s) => stream_key(s, conn_id as u64),
-        None => {
-            emit_log("AIRPLAY: 未配对会话无法派生音频密钥，跳过音频");
+    let result = async {
+        let root = bplist::parse(&resp.body).ok()?;
+        let stream = root.get("streams").and_then(Value::as_array)?.first()?;
+        let data_port = port_of(stream.get("dataPort"));
+        let control_port = port_of(stream.get("controlPort"));
+        if data_port == 0 {
+            emit_log("AIRPLAY: 音频流未返回 dataPort");
             return None;
         }
-    };
-    let udp = factory.open_udp(&p.car_ip, data_port)?;
-    let sync = if control_port != 0 {
-        factory.open_udp(&p.car_ip, control_port)
-    } else {
-        None
-    };
-    emit_log(&format!(
-        "AIRPLAY: ✓ 音频流就绪 data={data_port} control={control_port}（PCM48k/SPF352）"
-    ));
-    Some(AudioOut::new(udp, sync, key, 100))
+        let key = match shared {
+            Some(s) => stream_key(s, conn_id as u64),
+            None => {
+                emit_log("AIRPLAY: 未配对会话无法派生音频密钥，跳过音频");
+                return None;
+            }
+        };
+        let udp = factory.open_udp(&p.car_ip, data_port)?;
+        let sync = if control_port != 0 {
+            factory.open_udp(&p.car_ip, control_port)
+        } else {
+            None
+        };
+        emit_log(&format!(
+            "AIRPLAY: ✓ 音频流就绪 data={data_port} control={control_port}（{codec:?}48k/SPF{}）", codec.spf()
+        ));
+        Some(match encoder { Some(encoder) => AudioOut::new_aac(udp, sync, key, encoder), None => AudioOut::new(udp, sync, key, 100) })
+    }.await;
+    if result.is_none() {
+        // SETUP 200 can allocate a stream even when ports are missing or local socket creation fails.
+        // Retire just this audio type before trying another format; keep the screen/control alive.
+        let body=bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![
+            ("type",Value::int(codec.stream_type()))])]))]));
+        match channel.request("TEARDOWN","/",&body,"application/x-apple-binary-plist",&[],Duration::from_secs(2)).await {
+            Ok(reply) => emit_log(&format!("AUDIO: unusable {codec:?} SETUP cleanup status={}",reply.status())),
+            Err(error) => emit_log(&format!("AUDIO: unusable {codec:?} SETUP cleanup failed: {error}")),
+        }
+    }
+    result
 }
 
 // ---------------------------------------------------------------- 心跳

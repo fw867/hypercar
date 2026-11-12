@@ -245,7 +245,7 @@ mod tests {
             pipeline.lock().audio_ready=true;
             let params=AirplayParams {
                 car_ip:"127.0.0.1".into(),airplay_port:7000,device_id:"test".into(),device_name:"Test phone".into(),identity_path:"unused".into(),
-                receiver_id:None,receiver_previously_connected:true,enable_audio:true,keep_alive_stats:false,
+                receiver_id:None,receiver_previously_connected:true,enable_audio:true,audio_codec:String::new(),keep_alive_stats:false,
                 bmw_box_bootstrap:!mbux,mbux_screen_bootstrap:mbux,id9_screen_bootstrap:false,desktop_receiver:false,width:1920,height:720,touch_display:None,touch_rect:None,
                 encoder_size:Arc::new(Mutex::new((1920,720))),touch_size:Arc::new(Mutex::new((1920,720))),
                 carwith_display:None,carwith_stretch:false,screen_resource_lifecycle:true,pipeline:pipeline.clone(),

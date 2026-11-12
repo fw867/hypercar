@@ -56,6 +56,8 @@ pub struct EngineConfig {
     #[serde(default = "default_true")]
     pub enable_audio: bool,
     #[serde(default)]
+    pub audio_codec: String,
+    #[serde(default)]
     pub keep_alive_stats: bool,
     #[serde(default)]
     pub bmw_box_bootstrap: bool,
@@ -408,7 +410,7 @@ pub async fn run_engine(
                             emit_log(&format!(
                                 "AUDIO: 发包 {:.0}/s（应 {:.0}/s） 队列 media={}ms tts={}ms owner_phone={} blocked_samples={}",
                                 sent_packets as f64 / secs,
-                                TARGET_RATE as f64 / SPF as f64,
+                                TARGET_RATE as f64 / out.as_ref().map(|a| a.samples_per_packet()).unwrap_or(SPF) as f64,
                                 media_mix.len() * 1000 / (TARGET_RATE as usize).max(1) / 2,
                                 tts_mix.len() * 1000 / (TARGET_RATE as usize).max(1) / 2,
                                 out.as_ref().map(|a| a.owns_audio()).unwrap_or(false),
@@ -460,6 +462,7 @@ pub async fn run_engine(
         receiver_id: cfg.receiver_id.clone(),
         receiver_previously_connected: cfg.receiver_previously_connected,
         enable_audio: cfg.enable_audio,
+        audio_codec: cfg.audio_codec.clone(),
         keep_alive_stats: cfg.keep_alive_stats,
         bmw_box_bootstrap: cfg.bmw_box_bootstrap,
         mbux_screen_bootstrap: cfg.mbux_screen_bootstrap,
