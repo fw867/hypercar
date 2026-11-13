@@ -1,7 +1,7 @@
 # 编译、安装与发布
 
 更新：2026-11-02。当前默认分支为 `main`，使用 Android 自绘车机 UI 与 CarPlay / AirPlay。
-当前版本不需要安装 CarLife、CarWith，也不需要 PC hub。
+自绘模式需要 Shizuku，无需安装 CarLife、CarWith 或 PC hub；CarWith 模式需要系统已安装并启用 `com.miui.carlink`。
 
 ## 构建环境
 
@@ -61,15 +61,12 @@ BuildNumber；本地构建号高于 CI 时，较低版本的 CI APK 不能直接
    尝试一次最多 30 秒经典可发现窗口。连接开始、停止或到期后清理；无 Shizuku 时跳过。
    详见 [会话控制](SESSION-CONTROL.md)与[验证记录](VALIDATION.md)。
 
-连接后 HyperCar 自动创建自绘首页；地图使用安装版高德或百度，音乐从 MediaSession 获取元数据与控制能力。
+自绘模式连接后 HyperCar 自动创建首页；地图使用安装版高德或百度，音乐从 MediaSession 获取元数据与控制能力。CarWith 模式使用系统 CarWith 的画面与音频。
 无需再进入 CarLife 的“无线连接”入口。首页／全屏地图切换保留导航；“返回车机”保持 CarPlay 连接。
 
 ## 分辨率与帧率
 
-CarWith 可在「设置 → 画面与声音」开启「拉伸铺满车机屏幕」，默认关闭、下次连接生效。
-开启后保持 CarWith 的 H.264 码流与实际编码尺寸，将 AirPlay VideoConfig 显示目标设为车机
-`/info` 上报尺寸；未上报有效尺寸时维持原流程。触摸仍从车机显示空间映射到实际视频源空间。
-这是依赖接收端缩放行为的模式，铺满效果及触摸位置需实车验证；宽高比不同时会变形。
+「拉伸铺满车机屏幕」当前暂时停用，视频按实际编码尺寸发送。CarWith 的源分辨率需在系统 CarWith 中调整，App 提供「打开 CarWith 设置」快捷入口。
 
 优先读取 `/info` 的有效像素尺寸；缺失时使用手机设置页的宽高。使用原生尺寸，仅做偶数向下对齐，
 不再应用宽 1920、高 1080 或约 110 万像素上限。默认 60 fps，手动较低帧率仍有效，下次连接生效。
