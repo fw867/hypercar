@@ -11,6 +11,8 @@
 mod airplay;
 mod audio_out;
 mod aac;
+mod opus;
+mod mic_probe;
 mod audio_resource;
 mod bplist;
 mod consumer_hid;

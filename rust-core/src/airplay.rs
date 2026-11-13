@@ -42,6 +42,7 @@ pub struct AirplayParams {
     pub receiver_previously_connected: bool,
     pub enable_audio: bool,
     pub audio_codec: String,
+    pub microphone_probe: Option<Arc<crate::mic_probe::ProbeControl>>,
     pub keep_alive_stats: bool,
     pub bmw_box_bootstrap: bool,
     pub mbux_screen_bootstrap: bool,
@@ -488,6 +489,9 @@ pub async fn negotiate(
         if audio.is_none() { emit_log("AUDIO: no usable media stream; retain video/control"); }
     }
 
+    if let Some(task) = crate::mic_probe::spawn(channel.clone(), factory.clone(), shared_secret, p, &info, stop.clone()) {
+        keepalive.0.push(task);
+    }
     p.pipeline.lock().audio_ready=audio.is_some();
     if let Some(audio) = audio.as_mut() { audio.set_ownership(audio_owned.clone()); }
 

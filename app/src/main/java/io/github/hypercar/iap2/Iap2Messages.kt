@@ -46,7 +46,7 @@ object Iap2MessageIds {
     // ---- HID（接收端发 0x6800，触摸/HID 数据由 Rust 侧经 AirPlay 事件通道回传，
     //      iAP2 层不实现 0x68xx 出向，仅识别入向）----
     const val START_HID = 0x6800 // 配件 → 手机
-    const val DEVICE_HID_REPORT = 0x6801 // 手机 → 配件（应答，本项目不发）
+    const val DEVICE_HID_REPORT = 0x6801 // 手机 → 配件：描述符定义的输出报告，不是 StartHID 通用 ACK
     const val ACCESSORY_HID_REPORT = 0x6802 // 配件 → 手机（触摸/旋钮事件）
     const val STOP_HID = 0x6803
 
@@ -172,6 +172,7 @@ object Iap2Messages {
          * 两份 0x1D01 原始体对照定谳）。A/B 判定用它做第三判据。
          */
         val hasWirelessCarPlayComponent: Boolean,
+        val hidComponents: List<HidComponent> = emptyList(),
     ) {
         /** 车机是否声明会发某消息；null = 未提供清单（未知）。 */
         fun declaresSend(messageId: Int): Boolean? = sendIds?.contains(messageId)
@@ -179,6 +180,8 @@ object Iap2Messages {
         /** 车机是否声明能收某消息；null = 未提供清单（未知）。 */
         fun declaresReceive(messageId: Int): Boolean? = receiveIds?.contains(messageId)
     }
+
+    data class HidComponent(val identifier: Int, val function: Int)
 
     data class EaProtocol(
         val protocolId: Int,
@@ -236,6 +239,13 @@ object Iap2Messages {
             receiveIds = receiveIds,
             eaProtocols = ea,
             hasWirelessCarPlayComponent = firstById[IDENT_WIRELESS_CARPLAY_COMPONENT] != null,
+            hidComponents = params.filter { it.id == 0x12 }.take(32).mapNotNull { component ->
+                val fields = Iap2Csm.parseParams(component.value)
+                if (fields.sumOf { it.value.size + 4 } != component.value.size) return@mapNotNull null
+                val id = fields.singleOrNull { it.id == 0 }?.takeIf { it.value.size == 2 }?.asU16List()?.singleOrNull() ?: return@mapNotNull null
+                val function = fields.singleOrNull { it.id == 2 }?.takeIf { it.value.size == 1 }?.asU8() ?: return@mapNotNull null
+                HidComponent(id, function)
+            }.groupBy { it.identifier }.values.filter { it.size == 1 }.map { it.single() },
         )
     }
 

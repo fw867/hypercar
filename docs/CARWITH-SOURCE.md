@@ -34,3 +34,14 @@ CarWith入口可能使用手机蓝牙名称显示设备；该显示名不是AirP
 参考：[mcarplay固定版本](https://github.com/wangxso/mcarplay/tree/a3a4117ed60b864324d681e45086be594ed7233a) 的状态机、挑战绑定、七路连接、视频分片和入流门控；后续大众策略另参考 `f1ec3ffaa1f9c11b548ec1a8d8f7afff087d8627`。第三方成功不替代本项目验证。
 
 实现：`carlife.rs`、`carlife/session.rs`、`carlife/video.rs`。不再维护重复的通用回环监听/发现旧方案。
+
+
+## 2026-11-13 645：车机麦克风接入（实验）
+
+在CarWith模式的设置→音频新增“CarWith 使用车机麦克风（实验）”，默认关闭，重连生效。开启后VOICE_MIC=0；关闭仍为1，沿用手机收音。用户还需关闭CarWith/CarLife自身强制使用手机麦克风的选项，后者会覆盖车机声明。CarWith语音键/界面仍走原VR_START控制链，由已完成认证、准入、加密并开始视频的会话收到CMD 0x10024（MIC_RECORD_RECOG_START）才启动输入；0x10023结束。不响应0x10022持续唤醒词收音。
+
+沿用644的已声明type107/speechRecognition/Opus16k输入协商、Input密钥认证与Opus解码；将实际输出采样率按跨缓冲区连续相位的面积平均转换为16k单声道PCM16，按1024字节分包。VR使用12字节媒体头、service_type=0x58001，正文沿用当前CarLife AES密钥和PKCS7加密（1024明文→1040密文）；不会把媒体输出0x50003当输入。原7通道中的VR由只读排空改为单写入者；返回数据仍排空，其他音视频处理不变。
+
+队列最多8包，250ms以上旧音频丢弃，写入预算500ms。请求重复开始幂等，结束/新轮次更新代号并清空缓存；迟到输入和旧捕获任务的清理不能取消下一次识别。单次最长20秒、无认证RTP5秒和中断3秒退出，RTSP仅清理107，VR发送0x58009输入结束标记。写入任务取消、源重建和整个会话停止均退休输入。输入故障不会主动拆AirPlay音乐或画面流；VR socket失效依旧遵循原7通道一轮重建策略。
+
+诊断查看CARWITH-MIC（RECOG_START、VR_DATA包数和VR_AUDIO_DONE）与MIC-PROBE（输入SETUP、认证/解码和PCM电平）。这些计数不等于小爱识别成功；需要真实车机说话测试确认CarWith选用了HuMicRecorder、能显示正确识别文本并执行操作。保持自绘UI的独立收音测试和手机助手路由不变，不用该方案启动CarWith给自绘UI供识别。

@@ -58,6 +58,10 @@ pub struct EngineConfig {
     #[serde(default)]
     pub audio_codec: String,
     #[serde(default)]
+    pub microphone_probe: bool,
+    #[serde(default)]
+    pub carwith_microphone: bool,
+    #[serde(default)]
     pub keep_alive_stats: bool,
     #[serde(default)]
     pub bmw_box_bootstrap: bool,
@@ -145,6 +149,9 @@ pub async fn run_engine(
     // EngineTasks owns the hub. Restarting creates a fresh source immediately;
     // a time-based global guard also suppressed valid reconnects and mode switches.
     let carwith_display = cfg.carlife_source.then(|| Arc::new(Mutex::new((cfg.width, cfg.height))));
+    let microphone_probe = if cfg.carlife_source {
+        cfg.carwith_microphone.then(|| Arc::new(crate::mic_probe::ProbeControl::for_carwith()))
+    } else { cfg.microphone_probe.then(|| Arc::new(crate::mic_probe::ProbeControl::new())) };
     let mut carwith_hub = None;
     if cfg.carlife_source {
         let life_cfg = crate::carlife::CarLifeConfig {
@@ -154,6 +161,7 @@ pub async fn run_engine(
             bt_address: cfg.device_id.clone(),
             bt_name: "BMW".to_string(),
             navigation_updates: cfg.carwith_navigation_enabled,
+            microphone: microphone_probe.clone(),
         };
         match crate::carlife::CarLifeHub::connect(life_cfg, "127.0.0.1".to_string(), stop.clone(), carwith_display.clone()) {
             Ok((hub, mut life_events)) => {
@@ -201,6 +209,7 @@ pub async fn run_engine(
             Err(error) => emit_log(&format!("CARLIFE: CarWith 模式连接失败：{error}")),
         }
     }
+    let voice_probe = if cfg.carlife_source { None } else { microphone_probe.clone() };
     let key_stop=stop.clone();
     let voice_hub=carwith_hub.clone();
     let carwith_voice=cfg.carlife_source;
@@ -216,8 +225,10 @@ pub async fn run_engine(
                     Some(key)=>{
                         if let Some(action)=crate::voice_key::action(key) {
                             if voice.receive(action,clock.elapsed().as_millis() as u64) {
-                                crate::emit_log(&format!("VOICE-KEY: action=Start source={}",if carwith_voice {"CarWith"} else {"phone-assistant"}));
-                                if carwith_voice {
+                                crate::emit_log(&format!("VOICE-KEY: action=Start source={}",if voice_probe.is_some() {"car-microphone-probe"} else if carwith_voice {"CarWith"} else {"phone-assistant"}));
+                                if let Some(probe) = voice_probe.as_ref() {
+                                    probe.toggle();
+                                } else if carwith_voice {
                                     if let Some(hub)=voice_hub.as_ref(){hub.voice_start();}
                                 } else {crate::emit_voice_assistant();}
                             }
@@ -463,6 +474,7 @@ pub async fn run_engine(
         receiver_previously_connected: cfg.receiver_previously_connected,
         enable_audio: cfg.enable_audio,
         audio_codec: cfg.audio_codec.clone(),
+        microphone_probe,
         keep_alive_stats: cfg.keep_alive_stats,
         bmw_box_bootstrap: cfg.bmw_box_bootstrap,
         mbux_screen_bootstrap: cfg.mbux_screen_bootstrap,

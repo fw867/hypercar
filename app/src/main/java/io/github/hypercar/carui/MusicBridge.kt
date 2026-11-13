@@ -836,7 +836,8 @@ object MusicBridge {
 
     private var mediaDiagnosticCount = 0
     private var mediaDiagnosticId = 0L
-    fun onCarMediaKey(context: Context, usage: Int) = onMusicThread(wait = false) {
+    fun onCarMediaKey(context: Context, usage: Int, current: () -> Boolean = { true }) = onMusicThread(wait = false) {
+        if (!current()) return@onMusicThread
         val diagnosticId = ++mediaDiagnosticId
         val trace = mediaDiagnosticCount++ < 120
         if (trace) HyperCarRepo.log("MEDIA-KEY: rx=$diagnosticId usage=0x${usage.toString(16)} connected=$carConnected audioReady=$carAudioReady listener=${service != null} denied=$permissionDenied target=${controller?.packageName ?: "none"} state=${playback?.state} actions=${playback?.actions}")

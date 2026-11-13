@@ -59,7 +59,12 @@ internal class ShellWifiSelection {
                             selection = args?.getOrNull(0)
                             // A fresh iAP2 MAC corroborated by a matching scan can be selected
                             // directly. No need to wait for a second scan that this ROM aborts.
-                            if (bssid.isNotBlank()) choose(wifi.scanResults, cached = true)
+                            if (bssid.isNotBlank()) {
+                                try { choose(wifi.scanResults, cached = true) }
+                                catch (_: SecurityException) {
+                                    Log.w("HyperCar", "WIFI-SELECT: cached scan permission denied; wait for owned onMatch callback")
+                                }
+                            }
                             null
                         }
                         "onMatch" -> {

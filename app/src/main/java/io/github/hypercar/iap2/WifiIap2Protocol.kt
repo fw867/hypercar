@@ -12,9 +12,11 @@ internal class WifiIap2Protocol(
     private val navigationEnabled: () -> Boolean = { false },
     private val navigationCue: () -> io.github.hypercar.navigation.NavigationCue? = { null },
     private val deviceName: String = "HyperCar",
+    private val onMediaKey: (Int) -> Unit = {},
 ) {
     private val engine = Iap2LinkEngine(reliableTransport = true, declaredWindow = 32)
     private var parser = Iap2Csm.Parser()
+    private val media = Iap2MediaSession(log, onMediaKey)
     private var navigation = RouteGuidanceSession(log)
     private var started = false
     private var phase = "LINK"
@@ -43,6 +45,7 @@ internal class WifiIap2Protocol(
         engine.onDetectionRestart = {
             log("LINK DETECT restart phase=$phase; reset old CSM/auth/subscriptions, retain AirPlay transport")
             parser = Iap2Csm.Parser()
+            media.reset()
             navigation = RouteGuidanceSession(log)
             phase = "LINK"
             deadline = now + 15_000
@@ -111,6 +114,12 @@ internal class WifiIap2Protocol(
     private fun handle(frame: Iap2Csm.Frame) {
         if (failed) return
         val id = frame.messageId
+        if (media.handle(frame)) return
+        if (id == 0x1d01 && phase == "READY") {
+            media.identify(Iap2Messages.parseIdentification(frame.body).hidComponents)
+            send(0x1d02)
+            return
+        }
         if (phase != "READY" || seen.add(id)) log("RX phase=$phase id=0x${id.toString(16)} body=${frame.body.size}B")
         if (id == 0x5200 || id == 0x5203) {
             // Retain bounded per-component subscriptions, including those arriving before auth.
@@ -129,7 +138,9 @@ internal class WifiIap2Protocol(
         }
         when (id) {
             0x1d01 -> if (phase == "IDENTIFICATION") {
-                val serialSupported = Iap2Messages.parseIdentification(frame.body).declaresSend(0xaa06) == true
+                val identification = Iap2Messages.parseIdentification(frame.body)
+                media.identify(identification.hidComponents)
+                val serialSupported = identification.declaresSend(0xaa06) == true
                 send(0x1d02)
                 phase = "CERTIFICATE"
                 deadline = now + 10_000
@@ -164,6 +175,7 @@ internal class WifiIap2Protocol(
                 phase = "READY"
                 log("READY challenge response received; compatibility result only, certificate/signature not verified")
                 greetings()
+                media.authenticated()
                 val pending = deferred.values.toList()
                 deferred.clear()
                 pending.forEach(::handle)

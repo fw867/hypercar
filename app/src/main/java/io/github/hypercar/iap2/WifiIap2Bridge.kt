@@ -27,13 +27,16 @@ object WifiIap2Bridge {
         if (active?.id == id) { active?.close(); active = null }
     }
 
+    @Synchronized private fun isCurrent(id: Long): Boolean = active?.let { it.id == id && !it.closed } == true
+
     private class Worker(val id: Long, deviceId: String, deviceName: String) {
         val input = ArrayBlockingQueue<ByteArray>(64)
-        @Volatile private var closed = false
+        @Volatile var closed = false
         private val protocol = WifiIap2Protocol(deviceId, { HyperCarRepo.log("WIFI-IAP#$id: $it") },
             navigationEnabled = { HyperCarRepo.hudNavigationAllowed },
             navigationCue = { io.github.hypercar.navigation.NavigationSources.snapshot() },
-            deviceName = deviceName)
+            deviceName = deviceName,
+            onMediaKey = { usage -> HyperCarRepo.onIap2MediaKey(usage) { isCurrent(id) } })
         val thread = Thread({
             var readyReported = false
             var lastPhase = ""

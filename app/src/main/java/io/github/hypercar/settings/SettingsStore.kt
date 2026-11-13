@@ -295,6 +295,15 @@ object SettingsStore {
         get() = p().getBoolean(KEY_ENABLE_AUDIO, true)
         set(v) = p().edit().putBoolean(KEY_ENABLE_AUDIO, v).apply()
 
+    /** Phase-one receive/statistics only; never records files or feeds an assistant. */
+    var microphoneProbe: Boolean
+        get() = p().getBoolean("microphone_probe", false)
+        set(v) = p().edit().putBoolean("microphone_probe", v).apply()
+
+    var carWithMicrophone: Boolean
+        get() = p().getBoolean("carwith_microphone", false)
+        set(v) = p().edit().putBoolean("carwith_microphone", v).apply()
+
     var audioCodec: String
         get() = p().getString("audio_codec", "auto")?.takeIf { it in setOf("auto", "pcm", "aac") } ?: "auto"
         set(v) { p().edit().putString("audio_codec", v.takeIf { it in setOf("auto", "pcm", "aac") } ?: "auto").apply() }
@@ -402,6 +411,8 @@ object SettingsStore {
             append("\"fps\":").append(plan.fps).append(",")
             append("\"enable_audio\":").append(enableAudio).append(",")
             append("\"audio_codec\":\"").append(audioCodec).append("\",")
+            append("\"microphone_probe\":").append(microphoneProbe && !carWithMode).append(",")
+            append("\"carwith_microphone\":").append(carWithMicrophone && carWithMode).append(",")
             append("\"keep_alive_stats\":").append(keepAliveStats).append(",")
             append("\"bmw_box_bootstrap\":").append(io.github.hypercar.headunit.ReceiverCompatibility.useBmwBootstrap(
                 headUnitProfileId, io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(receiverBluetoothMac))).append(",")

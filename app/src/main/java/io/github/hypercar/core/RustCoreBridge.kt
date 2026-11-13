@@ -24,6 +24,7 @@ object RustCoreBridge {
      */
     interface SocketProvider {
         fun openTcpFd(host: String, port: Int, timeoutMs: Int): Int
+        /** port=0 binds an ephemeral, network-scoped receive socket without connecting a peer. */
         fun openUdpFd(host: String, port: Int): Int
     }
 

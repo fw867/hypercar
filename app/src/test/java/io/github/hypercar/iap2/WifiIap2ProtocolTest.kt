@@ -47,10 +47,11 @@ class WifiIap2ProtocolTest {
 
     private inner class Car(val window: Int = 32, val controlSession: Int = 1, val deviceName: String = "HyperCar") {
         val logs = mutableListOf<String>()
+        val mediaKeys = mutableListOf<Int>()
         var navigationAllowed = false
         var navigationCue: io.github.hypercar.navigation.NavigationCue? = null
         val protocol = WifiIap2Protocol("test-device", { logs += it }, { ByteArray(32) { 7 } },
-            navigationEnabled = { navigationAllowed }, navigationCue = { navigationCue }, deviceName = deviceName)
+            navigationEnabled = { navigationAllowed }, navigationCue = { navigationCue }, deviceName = deviceName, onMediaKey = mediaKeys::add)
         var sequence = 86
         var ack = 0
         var time = 1L
@@ -73,10 +74,10 @@ class WifiIap2ProtocolTest {
         }
         fun message(id: Int, body: ByteArray = byteArrayOf()): List<Iap2Csm.Frame> =
             messages(feed(packet(0x40, ++sequence, ack, controlSession, Iap2Csm.encode(id, body))))
-        fun ready(beforeIdentification: () -> Unit = {}) {
+        fun ready(identificationBody: ByteArray = byteArrayOf(), beforeIdentification: () -> Unit = {}) {
             assertEquals(listOf(0x1d00), start().map { it.messageId })
             beforeIdentification()
-            val identification = message(0x1d01)
+            val identification = message(0x1d01, identificationBody)
             assertEquals(listOf(0x1d02, 0xaa00), identification.map { it.messageId })
             assertTrue(identification.last().body.isEmpty()) // CatPlay default: request certificate, not serial.
             assertEquals(listOf(0xaa00), message(0xaa06).map { it.messageId })
@@ -105,6 +106,20 @@ class WifiIap2ProtocolTest {
         car.navigationCue = io.github.hypercar.navigation.NavigationCue("右转", 2, 100)
         assertEquals(listOf(0x4155), car.message(0x4154).map { it.messageId })
         assertTrue(car.logs.any { it.contains("DETECT restart") })
+    }
+
+    @Test fun authenticatedIap2MediaIsSeparateFromAirplayHidAndStopsOnResync() {
+        val car=Car()
+        val identity=Iap2Csm.group(0x12,Iap2Csm.u16(0,1),Iap2Csm.u8(2,1))
+        val descriptor=byteArrayOf(5,12,9,1,0xa1.toByte(),1,0x15,0,0x25,2,9,0,9,0xb5.toByte(),9,0xb6.toByte(),0x75,8,0x95.toByte(),1,0x81.toByte(),0,0xc0.toByte())
+        car.ready(identity)
+        assertTrue(car.message(0x6800,Iap2Csm.u16(0,1)+Iap2Csm.param(4,descriptor)).isEmpty())
+        fun press(value:Int) { car.message(0x6802,Iap2Csm.u16(0,1)+Iap2Csm.param(1,byteArrayOf(value.toByte()))) }
+        press(1);press(1);press(0);press(2)
+        assertEquals(listOf(0xb5,0xb6),car.mediaKeys)
+        car.message(0x6803,Iap2Csm.u16(0,1));press(1);assertEquals(2,car.mediaKeys.size)
+        car.ready(identity);press(1);assertEquals(2,car.mediaKeys.size)
+        assertTrue(car.logs.any { it.contains("IAP2-MEDIA: StartHID component=1") })
     }
 
     @Test fun deviceNameUsesSessionSnapshotAndSupportsUnicode() {

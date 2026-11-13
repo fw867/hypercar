@@ -83,8 +83,10 @@ class Iap2SenderSession(
     private val receiverAddress: String? = null,
     private val navigationEnabled: () -> Boolean = { false },
     private val navigationCue: () -> io.github.hypercar.navigation.NavigationCue? = { null },
+    private val onMediaKey: (Int) -> Unit = {},
 ) {
     private var parser = Iap2Csm.Parser()
+    private val media = Iap2MediaSession(log, onMediaKey)
     private val navigation = RouteGuidanceSession(log)
     private var phaseName = "IDLE"
     private var phaseStarted = nanoTime()
@@ -198,7 +200,7 @@ class Iap2SenderSession(
         /** 未知消息体 dump 上限（够看清 TLV 结构，又不刷屏）。 */
         const val BODY_DUMP_BYTES = 256
 
-        /** 等 0x6800 StartHID 的窗口（车机声明会发才等；应答 0x6801）。 */
+        /** 初次等待 0x6800 StartHID 的窗口；媒体组件在完整会话期持续处理。 */
         const val HID_WAIT_NANOS = 1_500_000_000L
     }
 
@@ -226,6 +228,7 @@ class Iap2SenderSession(
         val identFrame = expect(Iap2MessageIds.IDENTIFICATION_INFORMATION, deadline)
         val ident = Iap2Messages.parseIdentification(identFrame.body)
         peerIdentification = ident
+        media.identify(ident.hidComponents)
         onIdentification(listOfNotNull(ident.name, ident.model, ident.manufacturer).joinToString(" "))
         logIdentification(ident, identFrame)
         logWirelessCarPlayProfile(ident)
@@ -242,6 +245,7 @@ class Iap2SenderSession(
         ensureActive("MFi 结果发送前")
         send(Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED)
         log("iap2 tx=0xaa05 compatibility-result=$mfiResult（未做证书/签名验证，不代表标准认证通过）")
+        media.authenticated()
 
         // 0x5702 与 0x4E0D 的先后只在这条链上调整：会发 0x5702 的车先发请求，再发可用性。
         // 不发 0x5702 的车仍在问候里带上 0x4E0D。两条的正文都不改。
@@ -309,7 +313,7 @@ class Iap2SenderSession(
             )
         }
 
-        // ---- StartHID（0x6800 → 0x6801）：真 iPhone 会应答，漏了车机可能判定设备未就绪 ----
+        // ---- Optional HID registration; CSM receive continuously consumes declared media components. ----
         awaitOptionalHid(deadline)
 
         // ---- WiFi 配置交换（按「车机画像 wifiGen」分派，不按清单硬拦）----
@@ -683,6 +687,7 @@ class Iap2SenderSession(
     private fun handleReidentification(frame: Iap2Csm.Frame) {
         val ident = Iap2Messages.parseIdentification(frame.body)
         peerIdentification = ident
+        media.identify(ident.hidComponents)
         onIdentification(listOfNotNull(ident.name, ident.model, ident.manufacturer).joinToString(" "))
         log(
             "iap2 rx=0x1d01（重新识别）name=${ident.name} 发送清单=${ident.sendIds?.sorted()?.joinToString { "0x%04x".format(it) }} " +
@@ -698,16 +703,8 @@ class Iap2SenderSession(
         }
     }
 
-    /**
-     * StartHID（0x6800）：车机让设备开始上报 HID 时，真 iPhone 会回一条 0x6801
-     * `[u16 0][u8 0]`（cardeck 真车实测的应答形状）。hypercar 旧实现只把 0x6800 当日志、
-     * 从不回答——BMW 的发送清单里有 0x6800、可收清单里有 0x6801，缺应答会被车机当成
-     * 「HID 通道没建立」（触摸本身走 AirPlay 事件通道，但车机侧的就绪判定会受影响）。
-     *
-     * 窗口 [HID_WAIT_NANOS]：声明里没有 0x6800 就直接跳过（DiPlay/Audi 不发，旧流程白等）。
-     * 取帧用 [recvNewFrame] 而不是 [recvFrame]：后者优先消费暂存区，把非目标帧塞回去会
-     * 同一帧反复取出（活锁，见 [pendingFrames] 注释）；非目标帧统一进暂存区留待后续消费。
-     */
+    /** Bounded initial wait only. StartHID registers parameter-4 descriptors continuously;
+     * DeviceHIDReport (6801) is an OUTPUT report, not a generic registration ACK. */
     private fun awaitOptionalHid(deadline: Long) {
         if (peerIdentification?.declaresSend(Iap2MessageIds.START_HID) == false) {
             log("iap2 车机未声明会发 0x6800 StartHID——跳过等待")
@@ -715,6 +712,7 @@ class Iap2SenderSession(
         }
         val window = minOf(deadline, nanoTime() + HID_WAIT_NANOS)
         while (true) {
+            if (media.registeredCount > 0) return
             val remaining = (window - nanoTime()) / 1_000_000L
             if (remaining <= 0) {
                 log("iap2 未收到 0x6800（可选，继续）")
@@ -726,12 +724,7 @@ class Iap2SenderSession(
                 continue
             }
             if (frame.messageId == Iap2MessageIds.START_HID) {
-                log("iap2 rx=0x6800 start-hid bytes=${frame.body.size}——应答 0x6801")
-                send(
-                    Iap2MessageIds.DEVICE_HID_REPORT,
-                    Iap2Csm.u16(0, 0),
-                    Iap2Csm.param(1, byteArrayOf(0)),
-                )
+                log("iap2 rx=0x6800 non-media/undeclared HID bytes=${frame.body.size}; no fabricated component-zero output report")
                 return
             }
             log(
@@ -1118,40 +1111,52 @@ class Iap2SenderSession(
      * （保持到达顺序：暂存 > 新解析），再读新帧。
      */
     private fun recvFrame(timeoutMillis: Long): Iap2Csm.Frame? {
-        pendingFrames.firstOrNull()?.let {
-            pendingFrames.removeFirst()
-            return it
+        while (pendingFrames.isNotEmpty()) {
+            val frame = pendingFrames.removeFirst()
+            if (media.handle(frame)) continue
+            return frame
         }
         return recvNewFrame(timeoutMillis)
     }
 
     /** 只取新帧（先已解析队列、再读 socket）；绝不返回暂存区的帧。 */
     private fun recvNewFrame(timeoutMillis: Long): Iap2Csm.Frame? {
-        if (Thread.currentThread().isInterrupted || channel.isCancelled) throw InterruptedIOException("iAP2 接收已取消")
-        receivedFrames.firstOrNull()?.let {
-            receivedFrames.removeFirst()
-            return it
-        }
-        if (timeoutMillis <= 0) return null
-        val bytes = channel.recvControl(timeoutMillis) ?: return null
-        if (bytes.isEmpty()) {
-            parser = Iap2Csm.Parser()
-            receivedFrames.clear()
-            pendingFrames.clear()
-            log("iap2 LINK DETECT restart: 清除旧 CSM 分片；保留 RFCOMM 和当前业务等待")
-            return null
-        }
-        val frames = parser.offer(bytes)
-        for (frame in frames) {
-            if (tracedReceivedFrames++ < 192) {
-                log("RX phase=$phaseName id=0x${frame.messageId.toString(16)} bytes=${frame.body.size}（不记录凭据/签名内容）")
-            } else if (tracedReceivedFrames == 193) {
-                log("RX: 逐帧摘要达到 192 条，后续保留阶段/错误日志")
+        val deadline = nanoTime() + timeoutMillis.coerceAtLeast(0) * 1_000_000L
+        while (true) {
+            if (Thread.currentThread().isInterrupted || channel.isCancelled) throw InterruptedIOException("iAP2 接收已取消")
+            if (receivedFrames.isNotEmpty()) {
+                val frame = receivedFrames.removeFirst()
+                if (frame.messageId == Iap2MessageIds.IDENTIFICATION_INFORMATION && peerIdentification != null) {
+                    // Late identity can be queued by a Wi-Fi/credential wait. Its capability
+                    // boundary must precede the following StartHID, not wait for the keepalive pump.
+                    media.identify(Iap2Messages.parseIdentification(frame.body).hidComponents)
+                }
+                // Consume in wire order: Identification must configure the component before
+                // the following StartHID in the SAME read is registered.
+                if (media.handle(frame)) continue
+                return frame
+            }
+            val remaining = (deadline - nanoTime()) / 1_000_000L
+            if (remaining <= 0) return null
+            val bytes = channel.recvControl(remaining) ?: return null
+            if (bytes.isEmpty()) {
+                parser = Iap2Csm.Parser()
+                receivedFrames.clear()
+                pendingFrames.clear()
+                media.restartLink()
+                log("iap2 LINK DETECT restart: 清除旧 CSM 分片；保留 RFCOMM 和当前业务等待")
+                return null
+            }
+            val frames = parser.offer(bytes)
+            for (frame in frames) {
+                if (tracedReceivedFrames++ < 192) {
+                    log("RX phase=$phaseName id=0x${frame.messageId.toString(16)} bytes=${frame.body.size}（不记录凭据/签名内容）")
+                } else if (tracedReceivedFrames == 193) {
+                    log("RX: 逐帧摘要达到 192 条，后续保留阶段/错误日志")
+                }
+                receivedFrames += frame
             }
         }
-        if (frames.isEmpty()) return null
-        frames.forEachIndexed { index, frame -> if (index > 0) receivedFrames += frame }
-        return frames.first()
     }
 
     // ---- 日志 ----

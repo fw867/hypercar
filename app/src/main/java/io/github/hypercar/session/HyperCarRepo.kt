@@ -2278,7 +2278,10 @@ object HyperCarRepo {
             sockets.open(
                 create = { DatagramSocket(null as java.net.SocketAddress?) },
                 bind = { network, socket -> network.bindSocket(socket) },
-                connect = { it.connect(resolveEndpoint(host, port, sockets.network)) },
+                connect = {
+                    if (port == 0) it.bind(java.net.InetSocketAddress(0))
+                    else it.connect(resolveEndpoint(host, port, sockets.network))
+                },
                 handoff = { udp ->
                     val fd = ParcelFileDescriptor.fromDatagramSocket(udp).detachFd()
                     fd
@@ -2484,6 +2487,16 @@ object HyperCarRepo {
 
     @Volatile
     private var appCtx: android.content.Context? = null
+
+    /** CSM workers may outlive a UI stop; validate again on MusicBridge's dispatch thread. */
+    fun onIap2MediaKey(usage: Int, current: () -> Boolean) {
+        val attempt = connectionAttemptId
+        if (!sessionLive.get() || !current()) return
+        val context = appContext() ?: return
+        MusicBridge.onCarMediaKey(context, usage) {
+            sessionLive.get() && connectionAttemptId == attempt && current()
+        }
+    }
 
     private fun appContext(): android.content.Context? = appCtx
 

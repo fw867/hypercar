@@ -46,3 +46,11 @@ peak=0、rms=0 表示输入为零；active=false 优先核实播放器是否真�
 先核实播放器、源幅度与实际路由，再看音频归属、资源应答和 RTP。`AUDIO` 日志的 owner_phone、blocked_samples 与实际发包数区分门控、源静音及发送失败；`AUDIO-RESOURCE` 记录申请、拒绝和过期。RTSP 或 UDP 写入不是扬声器出声确认。语音麦克风见[输入与语音](INPUT-AND-VOICE.md)，测试边界见[验证](VALIDATION.md)。
 
 实现：`ShellPlaybackAudio`、`CarAudioCapture`、`audio_resource.rs`、`audio_out.rs`、`modes.rs`、`engine.rs`。
+
+
+## 644 输入收音实验
+
+自绘UI可在设置开启默认关闭的车机麦克风测试，重连后长按语音键触发。只协商已声明的type107/speechRecognition/Opus16k单声道输入，通过车机网络绑定UDP接收、Input密钥认证解密、Android NDK Opus解码，仅统计PCM音量。最长20秒，不保存录音，不送往助手；独立connectionID和单流TEARDOWN隔离媒体输出。设置关闭时不创建收音任务。详见[输入和语音](INPUT-AND-VOICE.md)。
+
+
+645新增独立的CarWith车机麦克风实验开关，默认关闭。启用后由CarWith识别开始/结束业务请求驱动车机type107收音，将Opus解码输出转换为16k单声道PCM16，经现有CarLife VR加密上行到内置小爱；不改变手机麦克风默认选项、自绘UI和媒体输出候选。详见[CarWith来源](CARWITH-SOURCE.md)。

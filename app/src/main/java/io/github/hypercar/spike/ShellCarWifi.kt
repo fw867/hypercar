@@ -85,6 +85,9 @@ object ShellCarWifi {
             phase = "disconnect"
             check(wifi.disconnect()) { "disconnect request rejected" }
             println("OK old car system Wi-Fi disconnected; autojoin disabled only for network=$id; use local-only request")
+        } catch (e: SecurityException) {
+            println("ERR migration phase=$phase SecurityException: ${e.message?.take(220)}")
+            kotlin.system.exitProcess(1)
         } catch (e: Exception) {
             val cause = e.cause ?: e
             println("ERR migration phase=$phase ${cause.javaClass.simpleName}: ${cause.message?.take(220)}")

@@ -60,13 +60,16 @@ impl Default for Session {
     }
 }
 
+#[cfg(test)]
+pub(super) fn microphone_test_session()->Shared { let mut s=Session::default();s.started=true;s.proof_ok=true;s.admitted=true;s.ready=true;s.seed=Some(vec![7;16]);Arc::new(Mutex::new(s)) }
+
 type Action = (u32, Vec<u8>);
 fn navigation_subscription()->Vec<u8> {
     let mut module=Vec::new();proto::varint(&mut module,1,0);
     let mut list=Vec::new();proto::varint(&mut list,1,1);proto::bytes(&mut list,2,&module);list
 }
 impl Session {
-    fn navigation_ready(&self) -> bool { self.proof_ok && self.admitted && self.ready }
+    pub(super) fn navigation_ready(&self) -> bool { self.proof_ok && self.admitted && self.ready }
     pub fn encrypt(&self, bytes: &[u8]) -> Result<Vec<u8>, String> { crypt(bytes, self.seed.as_deref(), true) }
     pub fn decrypt(&self, bytes: &[u8]) -> Result<Vec<u8>, String> { crypt(bytes, self.seed.as_deref(), false) }
 
@@ -158,6 +161,13 @@ impl Session {
             CMD_FOREGROUND | CMD_SCREEN_ON => {
                 if self.matched { out.push((CMD_HU_GO_TO_FOREGROUND, vec![])); }
             }
+            0x10024 if self.started && self.navigation_ready() => {
+                if let Some(mic) = cfg.microphone.as_ref() {
+                    emit_log("CARWITH-MIC: RECOG_START; request declared car microphone"); mic.request(true);
+                }
+            }
+            0x10023 => { if let Some(mic) = cfg.microphone.as_ref() { mic.request(false); } }
+            0x10022 => { if cfg.microphone.is_some() { emit_log("CARWITH-MIC: background WAKEUP_START ignored; recognition requests only"); } }
             CMD_MD_EXIT => return Err("peer exited CarWith".into()),
             _ => {}
         }
@@ -165,8 +175,7 @@ impl Session {
             self.features_sent = true;
             let mut entry = Vec::new(); proto::string(&mut entry, 1, "CONTENT_ENCRYPTION"); proto::varint(&mut entry, 2, 1);
             let mut payload = Vec::new(); proto::varint(&mut payload, 1, 2); proto::bytes(&mut payload, 2, &entry);
-            // No accessory microphone stream exists: the CarWith source must record the phone mic.
-            let mut mic=Vec::new();proto::string(&mut mic,1,"VOICE_MIC");proto::varint(&mut mic,2,1);
+            let mut mic=Vec::new();proto::string(&mut mic,1,"VOICE_MIC");proto::varint(&mut mic,2,if cfg.microphone.is_some(){0}else{1});
             proto::bytes(&mut payload,2,&mic);
             out.push((CMD_HU_FEATURE_CONFIG_RESPONSE, payload));
         }
@@ -350,7 +359,7 @@ mod tests {
         }
     }
     use tokio::net::TcpListener;
-    fn cfg()->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:60,navigation_updates:false,bt_address:"00:11:22:33:44:55".into(),bt_name:"HyperCar".into()}}
+    fn cfg()->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:60,navigation_updates:false,microphone:None,bt_address:"00:11:22:33:44:55".into(),bt_name:"HyperCar".into()}}
     fn info()->Vec<u8> {let mut out=Vec::new(); for (field,text) in [(4,"Xiaomi"),(14,"test"),(20,"37")] {proto::string(&mut out,field,text);} out}
     fn prepared()->Session {
         let mut s=Session::default();
@@ -397,6 +406,21 @@ mod tests {
         assert_eq!(actions[1].1, b"\x08\x02\x12\x16\x0a\x12CONTENT_ENCRYPTION\x10\x01\x12\x0d\x0a\x09VOICE_MIC\x10\x01");
         assert!(!s.init_sent);
         assert!(s.receive(CMD_MD_ENCRYPT_READY,&[],&cfg()).is_err());
+    }
+
+    #[test] fn car_microphone_requires_explicit_option_authentication_and_recognition() {
+        let mic=Arc::new(crate::mic_probe::ProbeControl::for_carwith());mic.arm_test();
+        let mut cfg=cfg();cfg.microphone=Some(mic.clone());
+        let mut session=prepared();
+        session.receive(0x10024,&[],&cfg).unwrap();assert_eq!(mic.generation()&1,0);
+        session.receive(CMD_MD_FEATURE_CONFIG_REQUEST,&[],&cfg).unwrap();
+        let actions=session.receive(CMD_MD_AUTHEN_RESPONSE,&proof(&session),&cfg).unwrap();
+        assert_eq!(*actions.last().unwrap().1.last().unwrap(),0);
+        session.started=true;session.admitted=true;session.ready=true;
+        session.receive(0x10022,&[],&cfg).unwrap();assert_eq!(mic.generation()&1,0);
+        session.receive(0x10024,&[],&cfg).unwrap();let first=mic.generation();assert_eq!(first&1,1);
+        session.receive(0x10024,&[],&cfg).unwrap();assert_eq!(mic.generation(),first);
+        session.receive(0x10023,&[],&cfg).unwrap();assert_eq!(mic.generation()&1,0);
     }
 
     #[test] fn invalid_proof_admission_and_stale_results_cannot_start_video() {
@@ -548,7 +572,7 @@ mod navigation_tests {
 #[cfg(test)]
 mod navigation_subscription_tests {
     use super::*;
-    fn config(enabled:bool)->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:30,navigation_updates:enabled,bt_address:String::new(),bt_name:String::new()}}
+    fn config(enabled:bool)->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:30,navigation_updates:enabled,microphone:None,bt_address:String::new(),bt_name:String::new()}}
     fn ready()->Session {let mut s=Session::default();s.proof_ok=true;s.admitted=true;s.ready=true;s.init_sent=true;s}
     #[test] fn capability_query_ack_then_start_only_once() {
         let mut s=ready();let c=config(true);

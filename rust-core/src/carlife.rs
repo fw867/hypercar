@@ -7,6 +7,7 @@
 pub(crate) mod navigation;
 mod session;
 mod video;
+pub(crate) mod microphone;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -133,6 +134,7 @@ pub struct CarLifeConfig {
     pub height: u32,
     pub fps: u32,
     pub navigation_updates: bool,
+    pub microphone: Option<Arc<crate::mic_probe::ProbeControl>>,
     /// `HU_INFO` 里 required 的 `btaddress`（车机蓝牙 MAC）。
     pub bt_address: String,
     /// `HU_INFO` 里 required 的 `btname`（车机蓝牙名）。
@@ -216,8 +218,11 @@ impl CarLifeHub {
                 ] {
                     children.spawn(handle_media_client(stream,events_task.clone(),kind,label,Some(state.clone())));
                 }
-                // VR remains connected and drained; no upstream microphone feature is exposed.
-                children.spawn(drain_stream(sockets.next().unwrap()));
+                let vr = sockets.next().unwrap();
+                if let Some(mic) = config.microphone.clone() {
+                    mic.request(false);
+                    children.spawn(microphone::run(vr, state.clone(), mic, stop.clone()));
+                } else { children.spawn(drain_stream(vr)); }
                 let ctrl=sockets.next().unwrap(); let q=queue.clone(); let cipher=state.clone(); let stop_ctrl=stop.clone();
                 children.spawn(async move { session::control(ctrl,q,cipher,stop_ctrl).await; });
                 children.spawn(session::data(sockets.next().unwrap(),state.clone(),events_task.clone()));
@@ -228,6 +233,7 @@ impl CarLifeHub {
                 };
                 children.abort_all(); while children.join_next().await.is_some() {}
                 queue.lock().clear();
+                if let Some(mic) = config.microphone.as_ref() { mic.request(false); }
                 let _ = events_task.send(CarLifeEvent::Navigation(None));
                 emit_log(&format!("CARWITH-HS: round closed: {}",outcome.err().unwrap_or_else(||"ended".into())));
                 tokio::select! { _=stop.notified()=>return, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
