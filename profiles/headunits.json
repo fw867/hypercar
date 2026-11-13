@@ -1,8 +1,8 @@
 {
-  "version": 9,
-  "_schema": 9,
-  "updated": "2026-11-12",
-  "_comment": "HyperCar 车机档案下发文件。新增车型改这里 + push 即可，App 端「从 GitHub 更新车型列表」后立即出现。字段含义见 docs/HEADUNIT-PROFILES.md；除 id/label 外都可省略（省略 = 用同 id 内置档案的值）。覆盖内置档案须达到各自要求的 schema：ID9 为9，其余内置档案为8（旧缓存不能把内置修复顶回去）。",
+  "version": 10,
+  "_schema": 10,
+  "updated": "2026-11-13",
+  "_comment": "HyperCar 车机档案下发文件。新增车型改这里 + push 即可，App 端「从 GitHub 更新车型列表」后立即出现。字段含义见 docs/HEADUNIT-PROFILES.md；除 id/label 外都可省略（省略 = 用同 id 内置档案的值）。覆盖内置档案须达到各自要求的 schema：奔驰为10，ID9 为9，其余内置档案为8（旧缓存不能把内置修复顶回去）。",
   "profiles": [
     {
       "id": "bmw_id85",
@@ -155,9 +155,9 @@
     },
     {
       "id": "mercedes_mbux",
-      "label": "奔驰 Mercedes-Benz MBUX",
-      "model": "MB_E-P-4（MBUX 00081 日志样本）",
-      "notes": "试验配置：接受本轮 0x4301 的热点和 IPv6 端点，不强等 ctrl 邀请；保留蓝牙音频，屏幕协商失败时保留控制链路。音视频尚待实车验证。",
+      "label": "奔驰 Mercedes-Benz",
+      "model": "MB_D-PP-3 / MB_D-PP-4（AirPlay 320.17.7）",
+      "notes": "MB_D-PP 接收端试验配置（2023 S 级参考报告）：每次会话仅激活一次 RECORD，音频加入和屏幕重建不重复激活；保留蓝牙。按车机协商尺寸及音频格式，尚未在本项目实车验证。",
       "verified": false,
       "validatesDeviceId": false,
       "sendCarPlayAvailability": true,
@@ -173,12 +173,12 @@
       "advertiseOnCurrentWifi": false,
       "requireFreshCtrlInvite": false,
       "useScreenResourceLifecycle": true,
-      "mbuxScreenBootstrap": true,
+      "mbuxScreenBootstrap": false,
       "fallbackAirplayPorts": [
         7000
       ],
       "touchDisplay": "",
-      "pairingHint": "在 MBUX 中选择 Apple CarPlay 并确认手机，接受 Wi-Fi 连接提示；屏幕尺寸按本轮协商获取。此配置尚未验证音视频正常。"
+      "pairingHint": "在车机确认 Apple CarPlay，接受 Wi-Fi 连接提示；适用于 MB_D-PP-3/4 参考车机，音视频尚待实车验证。"
     }
   ]
 }

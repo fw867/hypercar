@@ -73,7 +73,7 @@ class RemoteProfilesTest {
     }
 
     @Test fun id9SchemaUpgradeDoesNotInvalidateExistingReceiversSchemaEightOverrides() {
-        val overrides = listOf(HeadUnitProfiles.BMW_ID85, HeadUnitProfiles.MERCEDES_MBUX,
+        val overrides = listOf(HeadUnitProfiles.BMW_ID85,
             HeadUnitProfiles.AUDI_MIB3, HeadUnitProfiles.VOLKSWAGEN, HeadUnitProfiles.WINPLAY,
             HeadUnitProfiles.GENERIC).map { it.copy(preferMdnsAirplay = !it.preferMdnsAirplay) }
         val oldId9 = HeadUnitProfiles.BMW_ID9.copy(id9ScreenBootstrap = false)

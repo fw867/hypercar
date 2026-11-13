@@ -32,8 +32,8 @@ class ReceiverCompatibilityTest {
         assertEquals(listOf(17000,7000), HeadUnitProfiles.WINPLAY.fallbackAirplayPorts)
     }
 
-    @Test fun mbuxBootstrapIsRestrictedToTheExperimentalMercedesProfile() {
-        assertTrue(HeadUnitProfiles.MERCEDES_MBUX.mbuxScreenBootstrap)
+    @Test fun replacedMercedesProfileDisablesTheOldMbuxBootstrap() {
+        assertFalse(HeadUnitProfiles.MERCEDES_MBUX.mbuxScreenBootstrap)
         assertTrue(HeadUnitProfiles.MERCEDES_MBUX.screenResourceLifecycleEnabled(false))
         HeadUnitProfiles.builtin.filter { it.id != "mercedes_mbux" }.forEach {
             assertFalse(it.id, it.mbuxScreenBootstrap)

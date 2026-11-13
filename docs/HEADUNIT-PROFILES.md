@@ -1,6 +1,6 @@
 # 车机档案与验证范围
 
-更新：2026-11-12。所有车型统一在 [profiles/headunits.json](../profiles/headunits.json) 下发，App 按 ID 选择，不维护独立车型 JSON。
+更新：2026-11-13。所有车型统一在 [profiles/headunits.json](../profiles/headunits.json) 下发，App 按 ID 选择，不维护独立车型 JSON。
 
 ## 内置策略
 
@@ -12,7 +12,7 @@
 | winplay | false | true | false | deviceID 校验；7000端口 | PC 联调，不等于真实车机 |
 | audi_mib3 | true | true | false | mDNS 优先、兼容晚到端点 | 本项目未完成奥迪实车验证 |
 | volkswagen_mib | false | true | true | 当前目标 Wi-Fi 广播；必须新鲜 ctrl 邀请；禁用无邀请捷径 | 用户转述连接正常，未逐项验证功能 |
-| mercedes_mbux | false | true | true | 接受本轮 iAP2 端点；强制屏幕资源联动；禁用无邀请捷径 | MBUX 试验档案，未验证音视频正常 |
+| mercedes_mbux | false | true | true | 本轮 iAP2 端点；单次 RECORD 后协商屏幕/音频；关闭旧屏幕前置实验 | 已替换为 MB_D-PP-3/4 / 320.17.7 参考策略，未实车验证 |
 
 BMW/generic/Audi 启用0x4300、EA及0x4E0E；大众/奔驰启用0x4300、0x4E0E但不主动打开EA；WinPlay关闭三项。全部回复电源更新，不因CarPlay窗口关闭就主动中止。音频配置保护只涉及HFP/A2DP，不能因此提前断掉RFCOMM控制链。
 
@@ -20,7 +20,7 @@ BMW/generic/Audi 启用0x4300、EA及0x4E0E；大众/奔驰启用0x4300、0x4E0E
 
 ## 配置字段与覆盖
 
-当前发布schema=9。覆盖门槛按档案区分：bmw_id9需要schema9，其余内置档案继续接受schema8，避免ID9升级使已有有效覆盖失效；低于该档案门槛的缓存仅能追加新ID。缺省字段继承同ID内置值，新ID继承BMW模板；显式false是有效覆盖。touchDisplay/pairingHint空字符串可清除。导出保留策略及schema，刷新失败保留缓存并继续执行schema隔离。
+当前发布schema=10。覆盖门槛按档案区分：mercedes_mbux需要schema10，bmw_id9需要schema9，其余内置档案继续接受schema8，避免旧奔驰缓存恢复已移除的屏幕前置策略，同时保留其它档案已有有效覆盖；低于该档案门槛的缓存仅能追加新ID。缺省字段继承同ID内置值，新ID继承BMW模板；显式false是有效覆盖。touchDisplay/pairingHint空字符串可清除。导出保留策略及schema，刷新失败保留缓存并继续执行schema隔离。
 
 | 字段组 | 内容 |
 |---|---|
@@ -43,7 +43,17 @@ useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关�
 
 不按品牌固定网关、控制Session ID、触摸尺寸或MFi挑战长度。3315首次403后等待新邀请成功的第三方记录，不能推广为明文降级安全或本项目已完成验证。
 
-## 奔驰 MBUX
+## 奔驰 MB_D-PP
+
+参考 [mcarplay 提交 2b2ac6b](https://github.com/wangxso/mcarplay/commit/2b2ac6b67d09d5b9656fab28c8ce75495d9a1d02) 与 [issue #55](https://github.com/wangxso/mcarplay/issues/55)：同一台 2023 S 级在 iAP2 自报 MB_D-PP-3、/info 自报 MB_D-PP-4，AirPlay srcvers=320.17.7。报告显示仅视频会话正常，音频 SETUP 200 后第二次 RECORD 与随后 16–559ms 拆链相关。提交新增厂商为空或 Mercedes-Benz 时可手动开启的单次 RECORD 预设；不是奔驰全品牌认证、MFi 或蓝牙拆链策略。
+
+直接替换原奔驰档案内容，保留 `mercedes_mbux` ID，已保存的奔驰选择自动使用新策略，列表只保留一个奔驰条目。使用现有全局单次 RECORD 路径：初始激活 → 资源声明 → 屏幕 SETUP/TCP → 音频 SETUP；音频加入、屏幕借出归还均不补发 RECORD。HyperCar 原有音频路径已满足这一点，无需新增无实际行为差异的布尔开关。MB_E-P-4 的配对后 SAP、最小能力集、屏幕在 RECORD 前建立等实验不由 MB_D-PP 继承。
+
+保留蓝牙、本轮端点门槛和屏幕资源生命周期；尺寸及 UUID 使用协商结果，不固定为报告的 2570×1080。不引入奇瑞专用 MFi 或 disableBluetooth 行为。未引入字段，发布内容 version 与 schema 均升10；仅奔驰提高覆盖门槛，schema8/9 旧缓存不能恢复旧 bootstrap。以上是替换未跑通的奔驰实验并复用既有单次激活行为，尚无本项目 MB_D-PP 音画实测，也不能解释 MB_E-P-4 既有 SETUP 400。
+
+## 旧奔驰 MBUX 实验记录
+
+以下为 MB_E-P-4 的历史排查。原档案已被上述 MB_D-PP 参考策略替换，`mbuxScreenBootstrap` 当前关闭；这些记录不代表当前默认流程。
 
 11月9日14:29导出日志（版本524）头部五次尝试均报BSSID辅助读取正则异常，正文后两轮也复现；阶段止于IAP2_PARAMETERS，没有/auth-setup、屏幕SETUP或RECORD。蓝牙已给出热点与端点，后续RFCOMM local_cancel=true由本地失败清理造成，不是本轮车机拒绝媒体的证据。路径对应610新增复用检查。611去掉该路径正则，用ASCII/标签扫描解析并把辅助读取失败降级为正常入网；保留取消，不降低网络复用的身份/地址校验。
 
@@ -77,9 +87,9 @@ useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关�
 
 ### BOX-OFF 屏幕路径校准（2026-11-09）
 
-用户确认 BOX-OFF 在奔驰有画面、可操作，仅无声音。静态差异见[参考分析](REFERENCE-REVIEW.md)。现仅 mercedes_mbux 内置档案启用 mbux_screen_bootstrap，其它内置档案默认false，也不启用BMW盒子交接逻辑。
+用户确认 BOX-OFF 在奔驰有画面、可操作，仅无声音。静态差异见[参考分析](REFERENCE-REVIEW.md)。当时仅 mercedes_mbux 内置档案启用 mbux_screen_bootstrap；本轮替换后已关闭，也不启用BMW盒子交接逻辑。
 
-奔驰会话要求pair-verify成功后尝试/auth-setup；已配对时仅404/501按接口不存在继续，400/403、超时或损坏响应均保留失败。SAP复用现有X25519/AES交换解析，不宣称验证证书链或签名；支持有界可变签名长度，未启用SAP-only legacy AES媒体。初始SETUP能力缩为viewAreas，macAddress采用本轮deviceID；不修改配对身份、iPhone声明及既有屏幕UUID来源。
+旧奔驰实验要求pair-verify成功后尝试/auth-setup；已配对时仅404/501按接口不存在继续，400/403、超时或损坏响应均保留失败。SAP复用现有X25519/AES交换解析，不宣称验证证书链或签名；支持有界可变签名长度，未启用SAP-only legacy AES媒体。初始SETUP能力缩为viewAreas，macAddress采用本轮deviceID；不修改配对身份、iPhone声明及既有屏幕UUID来源。
 
 初始资源保留车机音频归属，后续播放仍经独立音频资源申请，保留/info声明的约束。屏幕按100ms延迟执行资源声明→SETUP→连接dataPort→RECORD；只有RECORD成功后才向视频泵安装发送器，安装时再次核对屏幕代次。SETUP拒绝不会再仅凭控制存活显示已连接；RECORD拒绝或资源收回释放本轮屏幕通道。后续资源变化继续走已有串行生命周期，不重复全局RECORD。暂未修改音频格式/URI和全局RTSP Session头处理。
 

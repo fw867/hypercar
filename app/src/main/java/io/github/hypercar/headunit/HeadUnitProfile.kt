@@ -252,12 +252,12 @@ object HeadUnitProfiles {
         pairingHint = "先完成系统蓝牙配对，在「目标车机」选定这台大众车机；首次请手动连接车机 Wi-Fi，并在车机确认 Apple CarPlay。",
     )
 
-    /** MBUX MB_E-P-4: real 0x4301 includes AP and IPv6 endpoint; media still needs validation. */
+    /** MB_D-PP reference policy replaces the unsuccessful MB_E-P-4 experiment; keep the saved ID. */
     val MERCEDES_MBUX = HeadUnitProfile(
         id = "mercedes_mbux",
-        label = "奔驰 Mercedes-Benz MBUX",
-        model = "MB_E-P-4（MBUX 00081 日志样本）",
-        notes = "试验配置：接受本轮 0x4301 的热点和 IPv6 端点，不强等 ctrl 邀请；保留蓝牙音频，配对后认证、主屏建链后激活。音视频尚待实车验证。",
+        label = "奔驰 Mercedes-Benz",
+        model = "MB_D-PP-3 / MB_D-PP-4（AirPlay 320.17.7）",
+        notes = "MB_D-PP 接收端试验配置（2023 S 级参考报告）：每次会话仅激活一次 RECORD，音频加入和屏幕重建不重复激活；保留蓝牙。按车机协商尺寸及音频格式，尚未在本项目实车验证。",
         verified = false,
         validatesDeviceId = false,
         sendCarPlayAvailability = true,
@@ -273,10 +273,10 @@ object HeadUnitProfiles {
         advertiseOnCurrentWifi = false,
         requireFreshCtrlInvite = false,
         useScreenResourceLifecycle = true,
-        mbuxScreenBootstrap = true,
+        mbuxScreenBootstrap = false,
         fallbackAirplayPorts = listOf(7000),
         touchDisplay = null,
-        pairingHint = "在 MBUX 中选择 Apple CarPlay 并确认手机，接受 Wi-Fi 连接提示；屏幕尺寸按本轮协商获取。此配置尚未验证音视频正常。",
+        pairingHint = "在车机确认 Apple CarPlay，接受 Wi-Fi 连接提示；适用于 MB_D-PP-3/4 参考车机，音视频尚待实车验证。",
     )
 
     /** 内置档案（出厂就有的，断网也一定在）。宝马排第一：它是默认档案。 */

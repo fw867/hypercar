@@ -6,6 +6,20 @@ import org.junit.Test
 class MercedesMbuxProfileTest {
     private val profile = HeadUnitProfiles.MERCEDES_MBUX
 
+    @Test fun replacementKeepsSavedIdAndRejectsOldBootstrapCaches() {
+        assertEquals("mercedes_mbux", profile.id)
+        assertFalse(profile.mbuxScreenBootstrap)
+        assertFalse(profile.id9ScreenBootstrap)
+        assertEquals(1, HeadUnitProfiles.builtin.count { it.id.startsWith("mercedes") })
+        val stale = profile.copy(mbuxScreenBootstrap = true)
+        for (schema in listOf(8, 9)) {
+            assertEquals(profile, RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(stale), schema).single { it.id == profile.id })
+            assertFalse(RemoteProfiles.canOverrideBuiltin(profile.id, schema))
+        }
+        val override = profile.copy(preferMdnsAirplay = false)
+        assertEquals(override, RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(override), 10).single { it.id == profile.id })
+    }
+
     @Test fun realIap2EndpointIsEnoughWithoutAnUnobservedCtrlInvitation() {
         assertTrue(profile.requireAirplayActivation)
         assertFalse(profile.requireFreshCtrlInvite)

@@ -37,7 +37,7 @@ object RemoteProfiles {
      * 规则：**`_schema` 低于本档案要求版本的条目，只能新增车型，不能覆盖该内置档案**
      * ——这样"修内置档案"必须显式升 schema 才会生效，旧缓存不会把修复顶回去。
      */
-    const val SCHEMA = 9
+    const val SCHEMA = 10
 
     /** 档案列表地址（raw.githubusercontent.com，改 `main` 为其它分支即可灰度）。 */
     const val DEFAULT_URL =
@@ -86,9 +86,13 @@ object RemoteProfiles {
     fun isRemote(id: String): Boolean = cached().any { it.id == id } &&
         (canOverrideBuiltin(id, cachedSchema()) || HeadUnitProfiles.builtin.none { it.id == id })
 
-    /** ID9 alone changed in schema 9; existing profiles retain their schema-8 cache contract. */
+    /** Mercedes changed in schema 10; preserve the existing cache contracts for other profiles. */
     internal fun canOverrideBuiltin(id: String, schema: Int): Boolean =
-        schema >= if (id == "bmw_id9") 9 else 8
+        schema >= when (id) {
+            "mercedes_mbux" -> 10
+            "bmw_id9" -> 9
+            else -> 8
+        }
 
     /**
      * 把内置表与远程表合并：内置保持原顺序（远程可覆盖同 id），远程独有项追加。
