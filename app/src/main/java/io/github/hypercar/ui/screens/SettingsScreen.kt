@@ -1305,13 +1305,13 @@ private fun BehaviorSection(startup: io.github.hypercar.session.StartupReadiness
             )
             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
             SwitchRow(
-                title = "车机 Wi-Fi 主动连接（实验）",
-                subtitle = "接入已配对车机 Wi-Fi 后等待 10 秒主动尝试；车机先邀请则立即连接。下次连接生效",
+                title = "车机 Wi-Fi 中断恢复（实验）",
+                subtitle = "正常连接意外中断后，网络可用即首次恢复；失败后退避，2 分钟内最多 5 次。首次连接及超时重连等车机邀请",
                 checked = proactiveWifi,
                 onCheckedChange = {
                     proactiveWifi = it
                     SettingsStore.proactiveWifiSession = it
-                    HyperCarRepo.log("WIFI-ACTIVE: 实验开关=${if (it) "开" else "关"}，下次连接生效")
+                    HyperCarRepo.log("WIFI-ACTIVE: 中断恢复开关=${if (it) "开" else "关"}，下次连接生效；不授权首次主动连接")
                 },
             )
             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))

@@ -28,12 +28,13 @@ class ProactiveWifiSessionPolicyTest {
     }
 
     @Test fun optInRequiresKnownBoundReceiverAndDoesNotOverrideDifferentPeer() {
-        assertTrue(ProactiveWifiSessionPolicy.allows(true, car, null, true))
-        assertTrue(ProactiveWifiSessionPolicy.allows(true, car, car.lowercase(), true))
-        assertFalse(ProactiveWifiSessionPolicy.allows(false, car, null, true))
-        assertFalse(ProactiveWifiSessionPolicy.allows(true, null, null, true))
-        assertFalse(ProactiveWifiSessionPolicy.allows(true, car, null, false))
-        assertFalse(ProactiveWifiSessionPolicy.allows(true, car, "22:33:44:55:66:77", true))
+        assertFalse(ProactiveWifiSessionPolicy.allows(true, car, null, true))
+        assertTrue(ProactiveWifiSessionPolicy.allows(true, car, null, true, recoveryAllowed = true))
+        assertTrue(ProactiveWifiSessionPolicy.allows(true, car, car.lowercase(), true, recoveryAllowed = true))
+        assertFalse(ProactiveWifiSessionPolicy.allows(false, car, null, true, recoveryAllowed = true))
+        assertFalse(ProactiveWifiSessionPolicy.allows(true, null, null, true, recoveryAllowed = true))
+        assertFalse(ProactiveWifiSessionPolicy.allows(true, car, null, false, recoveryAllowed = true))
+        assertFalse(ProactiveWifiSessionPolicy.allows(true, car, "22:33:44:55:66:77", true, recoveryAllowed = true))
     }
 
     @Test fun desktopReceiverDoesNotTrustAFormerPeerAtTheSameLanSsid() {
