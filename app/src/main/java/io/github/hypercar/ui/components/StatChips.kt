@@ -37,6 +37,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.hypercar.core.AudioStats
+import io.github.hypercar.core.PipelineDiagnostics
 import io.github.hypercar.core.SessionSnapshot
 import io.github.hypercar.core.VideoStats
 import io.github.hypercar.ui.theme.AmberWarning
@@ -74,7 +75,7 @@ fun StatGrid(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             VideoChip(snapshot.video, Modifier.weight(1f))
-            AudioChip(snapshot.audio, Modifier.weight(1f))
+            AudioChip(snapshot.audio, snapshot.pipeline, Modifier.weight(1f))
         }
         Spacer(modifier = Modifier.height(10.dp))
         ShizukuChip(
@@ -168,11 +169,18 @@ private fun VideoChip(video: VideoStats, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun AudioChip(audio: AudioStats, modifier: Modifier = Modifier) {
-    val (accent, value) = when {
+private fun AudioChip(audio: AudioStats, pipeline: PipelineDiagnostics, modifier: Modifier = Modifier) {
+    val (accent, state) = when {
+        !pipeline.active -> TextSecondary to "待机"
         audio.ducking -> AmberWarning to "导航闪避中"
         audio.playing -> MintGreen to "播放中"
             else -> TextSecondary to "待机"
+    }
+    val value = buildString {
+        if (pipeline.active && pipeline.audioReady && pipeline.audioCodec.isNotEmpty()) {
+            append(pipeline.audioCodec)
+            pipeline.audioKbps?.let { append(" · ").append(formatBitrate(it)) }
+        } else append(state)
     }
     StatChip(
         label = "音频",
@@ -180,6 +188,7 @@ private fun AudioChip(audio: AudioStats, modifier: Modifier = Modifier) {
         accent = accent,
         leadingIcon = Icons.Rounded.Navigation,
         modifier = modifier,
+        valueStyle = MonoMetric.copy(fontFamily = FontFamily.Default, fontSize = 11.sp, letterSpacing = 0.sp),
     )
 }
 

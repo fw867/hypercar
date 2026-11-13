@@ -24,10 +24,15 @@ import java.util.concurrent.atomic.AtomicReference
  * The NetworkCallback stays alive for the complete CarPlay session. */
 class WifiJoiner(
     private val context: Context,
+    private val diagnostic: (String) -> Unit = {},
     onLost: () -> Unit,
 ) {
     /** 构造参数转存：避免与 NetworkCallback.onLost 回调方法名冲突。 */
     private val lostCallback: () -> Unit = onLost
+    private fun diagnose(message: String) {
+        Log.i(TAG, message)
+        diagnostic("WIFI-JOIN: $message")
+    }
 
     /** 入网结果。 */
     sealed interface JoinResult {
@@ -86,7 +91,8 @@ class WifiJoiner(
      * @param ssid 热点名（可能含空格/中文）。
      * @param psk  热点密码；空=开放热点；WEP 形态返回 [JoinResult.Unsupported]。
      */
-    suspend fun joinCarHotspotSilently(ssid: String, psk: String, bssidHint: () -> String? = { null }): JoinResult {
+    suspend fun joinCarHotspotSilently(ssid: String, psk: String,
+        verifiedFallback: suspend () -> Network? = { null }, bssidHint: () -> String? = { null }): JoinResult {
         lastFailureReason = null
         // Password length alone cannot distinguish WEP from valid 10/13/26-character WPA2.
         if (isUnsupportedPassphrase(psk)) {
@@ -117,7 +123,7 @@ class WifiJoiner(
             val scan = ShizukuTools.exec("cmd wifi list-scan-results", 3_000)
             WifiApHint.fromScan(scan.out, ssid, latestBssid)
         } else null
-        return joinViaSpecifier(ssid, psk, hint)
+        return joinViaSpecifier(ssid, psk, hint, verifiedFallback)
     }
 
     /**
@@ -131,7 +137,7 @@ class WifiJoiner(
      * 用法是：装好后先手动打开一次 App 完成首连确认，之后「上车自动连接」才会全程静默。
      * 拿不到句柄（框弹不出/用户拒绝/超时）一律返回 Failed，由调用方降级到「绑定当前网络」。
      */
-    private suspend fun joinViaSpecifier(ssid: String, psk: String, hint: WifiApHint?): JoinResult =
+    private suspend fun joinViaSpecifier(ssid: String, psk: String, hint: WifiApHint?, verifiedFallback: suspend () -> Network?): JoinResult =
         withContext(Dispatchers.IO) {
             val specifier = WifiNetworkSpecifier.Builder().apply {
                 setSsid(ssid)
@@ -156,7 +162,7 @@ class WifiJoiner(
                 .setNetworkSpecifier(specifier)
                 .build()
 
-            val network = awaitSpecifierHandle(request, ssid, hint, SPECIFIER_WAIT_MS)
+            val network = awaitSpecifierHandle(request, ssid, hint, SPECIFIER_WAIT_MS, verifiedFallback)
                 ?: return@withContext JoinResult.Failed
             val caps = connectivityManager.getNetworkCapabilities(network)
             if (!CarWifiPolicy.canReuse(caps)) {
@@ -171,7 +177,8 @@ class WifiJoiner(
         }
 
     /** 用 specifier 请求拿 Network 句柄；首连时系统确认框的等待时间也算在 [timeoutMs] 内。 */
-    private suspend fun awaitSpecifierHandle(request: NetworkRequest, ssid: String, hint: WifiApHint?, timeoutMs: Long): Network? {
+    private suspend fun awaitSpecifierHandle(request: NetworkRequest, ssid: String, hint: WifiApHint?, timeoutMs: Long,
+        verifiedFallback: suspend () -> Network?): Network? {
         val latch = CountDownLatch(1)
         val result = AtomicReference<Network?>(null)
         // 立刻 onUnavailable 与「等到超时」是完全不同的病因，必须分开记
@@ -181,18 +188,26 @@ class WifiJoiner(
             override fun onAvailable(network: Network) {
                 if (callback.get() !== this) return
                 result.set(network)
+                diagnose("callback=available elapsed_ms=${SystemClock.elapsedRealtime() - started}; verifying capabilities/address")
                 latch.countDown()
             }
 
             override fun onUnavailable() {
                 if (callback.get() !== this) return
                 unavailable.set(true)
+                diagnose("callback=unavailable elapsed_ms=${SystemClock.elapsedRealtime() - started}; live network verification required")
                 latch.countDown()
             }
 
-            override fun onLost(network: Network) = handleNetworkLost(this, network)
+            override fun onLost(network: Network) {
+                if (callback.get() !== this) return
+                result.compareAndSet(network, null)
+                diagnose("callback=lost bound=${boundNetwork.get() == network}")
+                handleNetworkLost(this, network)
+            }
         }
         callback.set(cb)
+        diagnose("request timeout_ms=$timeoutMs exact_ap=${hint != null}; no SSID/password/address logged")
         try {
             // 系统确认框和关联/DHCP 共用这一个超时窗口，不是单独计时。
             // （该重载的 timeout 参数是 Int，需从 Long 转换）
@@ -218,19 +233,37 @@ class WifiJoiner(
                 currentCoroutineContext().ensureActive()
                 if (latch.await(200, TimeUnit.MILLISECONDS)) break
             }
+            // Do not unregister a potentially live request before checking the actual network.
+            // A system Wi-Fi association alone is insufficient: fallback must pass the caller's
+            // existing SSID/BSSID/address/route and local-only capability checks.
+            val remaining = (timeoutMs - (SystemClock.elapsedRealtime() - started)).coerceIn(0L, 3_000L)
+            val verified = VerifiedWifiWait.await(remaining, SystemClock::elapsedRealtime,
+                current = { callback.get() === cb }, probe = {
+                    result.get()?.takeIf { ready(it) } ?: verifiedFallback()?.takeIf { ready(it) }
+                })
+            if (verified != null) {
+                diagnose("verified=true callback_available=${result.get() != null} unavailable=${unavailable.get()}")
+                return verified
+            }
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
             if (callback.compareAndSet(cb, null)) {
                 runCatching { connectivityManager.unregisterNetworkCallback(cb) }
             }
             throw cancelled
+        } catch (error: Exception) {
+            release()
+            lastFailureReason = "入网状态复核异常：${error.javaClass.simpleName}"
+            diagnose("verification exception=${error.javaClass.simpleName}")
+            return null
         } finally {
             stopSelection()
         }
         val network = result.get()
-        if (network == null) {
+        if (network == null || !ready(network)) {
+            diagnose("verified=false candidate=${network != null} ${readiness(network)}")
             // 未拿到句柄（含用户拒绝/超时）：注销回调，别泄漏
             release()
-            lastFailureReason = SpecifierJoinFailure.describe(
+            lastFailureReason = if (network != null) "系统已返回 Wi-Fi 网络，但地址或局域网能力未就绪；请确认系统中的车机 Wi-Fi 连接状态" else SpecifierJoinFailure.describe(
                 elapsedMs = SystemClock.elapsedRealtime() - started,
                 timeoutMs = timeoutMs,
                 unavailable = unavailable.get(),
@@ -239,6 +272,22 @@ class WifiJoiner(
             return null
         }
         return network
+    }
+
+    private fun ready(network: Network): Boolean =
+        CarWifiPolicy.canReuse(connectivityManager.getNetworkCapabilities(network)) &&
+            connectivityManager.getLinkProperties(network)?.linkAddresses?.any {
+                !it.address.isAnyLocalAddress && !it.address.isLoopbackAddress && !it.address.isMulticastAddress &&
+                    (it.address is java.net.Inet6Address || !it.address.isLinkLocalAddress)
+            } == true
+
+    private fun readiness(network: Network?): String {
+        val caps = network?.let(connectivityManager::getNetworkCapabilities)
+        val addresses = network?.let(connectivityManager::getLinkProperties)?.linkAddresses.orEmpty()
+        return "wifi=${caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true} " +
+            "internet=${caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true} " +
+            "validated=${caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true} " +
+            "v4_count=${addresses.count { it.address is java.net.Inet4Address }} v6_count=${addresses.count { it.address is java.net.Inet6Address }}"
     }
 
     /**

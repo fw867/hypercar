@@ -4,6 +4,16 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PipelineDiagnosticsTest {
+    @Test fun audio_format_is_actual_negotiated_codec_and_rate_can_be_zero_or_unknown() {
+        val pcm=PipelineDiagnostics.parse("""{"generation":1,"audio_ready":true,"audio_codec":"PCM","audio_kbps":1536}""")!!
+        assertEquals("PCM",pcm.audioCodec);assertEquals(1536L,pcm.audioKbps)
+        val aac=PipelineDiagnostics.parse("""{"generation":2,"audio_ready":true,"audio_codec":"AAC","audio_kbps":0}""")!!
+        assertEquals("AAC",aac.audioCodec);assertEquals(0L,aac.audioKbps)
+        val old=PipelineDiagnostics.parse("""{"generation":3,"audio_ready":true}""")!!
+        assertEquals("",old.audioCodec);assertNull(old.audioKbps)
+        val invalid=PipelineDiagnostics.parse("""{"generation":4,"audio_codec":"auto","audio_kbps":-1}""")!!
+        assertEquals("",invalid.audioCodec);assertNull(invalid.audioKbps)
+    }
     @Test fun control_and_transport_do_not_confirm_receiver_presentation() {
         val control = PipelineDiagnostics(generation=1,active=true,controlReady=true,
             recordAccepted=true,resourcesAccepted=true,audioReady=true)

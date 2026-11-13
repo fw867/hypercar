@@ -58,6 +58,7 @@ pub struct AudioOut {
     pt: u8,
     /** 已发包数（对外统计）。 */
     packets: u64,
+    payload_bytes: u64,
     /** 同步包自己的序号（与音频 RTP 序号无关，独立递增）。 */
     sync_seq: u16,
     /** 首包 Marker 待打标记（打完即清）。 */
@@ -85,6 +86,7 @@ impl AudioOut {
             nonce: 0,
             pt: payload_type,
             packets: 0,
+            payload_bytes: 0,
             sync_seq: 0,
             marker_pending: true,
             ownership: None,
@@ -100,6 +102,8 @@ impl AudioOut {
         output
     }
     pub fn stream_type(&self) -> i64 { self.pt as i64 }
+    pub fn codec_name(&self) -> &'static str { match self.pt {100=>"PCM",102=>"AAC",_=>""} }
+    pub fn payload_bytes_sent(&self) -> u64 { self.payload_bytes }
     pub fn samples_per_packet(&self) -> usize { if self.pt == 102 { crate::aac::FRAMES } else { SAMPLES_PER_PACKET } }
 
     /// 发送交错 PCM（48kHz 立体声 i16）。内部按 352 帧切包逐包发送，
@@ -162,6 +166,7 @@ impl AudioOut {
         self.seq = self.seq.wrapping_add(1);
         self.ts = self.ts.wrapping_add(sample_frames);
         self.udp.send(&wire).await?;
+        self.payload_bytes = self.payload_bytes.saturating_add(payload.len() as u64);
         if self.packets == 0 && self.pt == 102 {
             crate::emit_log(&format!("AUDIO: first AAC RTP type=102 SPF=1024 raw_bytes={}", payload.len()));
         }
@@ -272,6 +277,7 @@ mod ownership_tests {
         let samples = vec![100i16; SAMPLES_PER_PACKET * CHANNELS];
         audio.send_pcm(&samples).await.unwrap();
         assert_eq!(audio.packets_sent(), 0);
+        assert_eq!(audio.payload_bytes_sent(),0);
         assert_eq!(audio.blocked_samples(), samples.len() as u64);
         let mut packet = [0u8;2048];
         assert!(tokio::time::timeout(std::time::Duration::from_millis(20), receiver.recv(&mut packet)).await.is_err());
@@ -279,6 +285,26 @@ mod ownership_tests {
         audio.send_pcm(&samples).await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv(&mut packet)).await.unwrap().unwrap();
         assert_eq!(audio.packets_sent(), 1);
+        assert_eq!(audio.codec_name(),"PCM");
+        assert_eq!(audio.payload_bytes_sent(),(samples.len()*2) as u64);
         assert_ne!(packet[1] & 0x80, 0);
+    }
+
+    #[tokio::test]
+    async fn measured_audio_bytes_exclude_rtp_crypto_overhead_and_failed_writes() {
+        let receiver=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut audio=AudioOut::new(socket,None,[0;32],102);
+        assert_eq!(audio.codec_name(),"AAC");
+        let payload=[1u8;32];
+        assert!(audio.send_payload(&payload,1024).await.is_err());
+        assert_eq!(audio.payload_bytes_sent(),0);
+        audio.udp.connect(receiver.local_addr().unwrap()).await.unwrap();
+        audio.send_payload(&payload,1024).await.unwrap();
+        let mut packet=[0u8;128];
+        let received=receiver.recv(&mut packet).await.unwrap();
+        assert_eq!(received,payload.len()+12+16+8);
+        assert_eq!(audio.payload_bytes_sent(),32);
+        assert_eq!(audio.packets_sent(),1);
     }
 }

@@ -18,6 +18,8 @@ pub struct Pipeline {
     pub video_source_units: u64,
     pub video_frames_written: u64,
     pub audio_ready: bool,
+    pub audio_codec: String,
+    pub audio_kbps: u64,
     pub audio_packets_written: u64,
     pub audio_signal_packets: u64,
     pub ui_requests: u64,
@@ -44,13 +46,13 @@ impl Pipeline {
         Self { generation: NEXT.fetch_add(1,Ordering::Relaxed), control_ready:false, record_accepted:false, resources_accepted:false,
             screen_setup_accepted:false,video_channel_ready:false,wifi_id:0,
             wifi_iap2:"WAIT_SESSION".into(),screen_owned:None,video_stream:"WAIT_SETUP".into(),
-            video_source_units:0,video_frames_written:0,audio_ready:false,audio_packets_written:0,
+            video_source_units:0,video_frames_written:0,audio_ready:false,audio_codec:String::new(),audio_kbps:0,audio_packets_written:0,
             audio_signal_packets:0,ui_requests:0,screen_rebuilds:0,timing:Default::default(),video_tcp:None }
     }
     pub fn summary(&self) -> String {
-        format!("PIPELINE#{}: control={} record={} resources={} screen_setup={} video_tcp_ready={} wifi_iap2={} screen_phone={:?} video={} source_units={} tcp_frames={} audio_ready={} rtp_packets={} signal_packets={} requestUI={} rebuilds={} timing=[{}] tcp=[{}] activation_gaps=[{}] receiver_display=unknown receiver_audio=unknown",
+        format!("PIPELINE#{}: control={} record={} resources={} screen_setup={} video_tcp_ready={} wifi_iap2={} screen_phone={:?} video={} source_units={} tcp_frames={} audio_ready={} audio_codec={} audio_kbps={} rtp_packets={} signal_packets={} requestUI={} rebuilds={} timing=[{}] tcp=[{}] activation_gaps=[{}] receiver_display=unknown receiver_audio=unknown",
             self.generation,self.control_ready,self.record_accepted,self.resources_accepted,self.screen_setup_accepted,self.video_channel_ready,self.wifi_iap2,self.screen_owned,self.video_stream,
-            self.video_source_units,self.video_frames_written,self.audio_ready,self.audio_packets_written,
+            self.video_source_units,self.video_frames_written,self.audio_ready,self.audio_codec,self.audio_kbps,self.audio_packets_written,
             self.audio_signal_packets,self.ui_requests,self.screen_rebuilds,self.timing.summary(),
             self.video_tcp.as_ref().map(|s|s.summary()).unwrap_or_else(||"not sampled".into()),self.activation_gaps())
     }

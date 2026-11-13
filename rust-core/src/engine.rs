@@ -332,7 +332,7 @@ pub async fn run_engine(
                             None => std::future::pending().await,
                         }
                     } => {
-                        if let Some(a) = r.flatten() { out = Some(a); }
+                        if let Some(a) = r.flatten() { stats.lock().codec = a.codec_name(); out = Some(a); }
                         ready = None;
                     }
                     ev = audio_rx.recv() => match ev {
@@ -412,6 +412,7 @@ pub async fn run_engine(
                             sent_packets += written;
                             let mut counters=stats.lock();
                             counters.packets += written;
+                            counters.payload_bytes = a.payload_bytes_sent();
                             if mixed.iter().any(|s| *s != 0) { counters.signal_packets += written; }
                         }
                         // 每秒报一次实际发包速率：48000/352 ≈ 136/s。低于它就是漏拍，
@@ -441,11 +442,21 @@ pub async fn run_engine(
         let health=pipeline.clone(); let vs=video_stats.clone(); let aus=audio_stats.clone(); let signal=stop.clone();
         tasks.spawn(async move {
             let mut last_key=String::new();
+            let mut last_audio_bytes=0u64;
+            let mut last_audio_tick=tokio::time::Instant::now();
             let mut last_log=tokio::time::Instant::now()-Duration::from_secs(10);
             loop {
                 let mut snapshot=health.lock().clone();
                 { let v=vs.lock(); snapshot.video_source_units=v.source_units; snapshot.video_frames_written=v.frames; }
-                { let a=aus.lock(); snapshot.audio_packets_written=a.packets; snapshot.audio_signal_packets=a.signal_packets; }
+                {
+                    let a=aus.lock();
+                    snapshot.audio_packets_written=a.packets; snapshot.audio_signal_packets=a.signal_packets;
+                    snapshot.audio_codec=a.codec.into();
+                    snapshot.audio_kbps=(a.payload_bytes.saturating_sub(last_audio_bytes) as f64 * 8.0 /
+                        last_audio_tick.elapsed().as_secs_f64().max(0.001) / 1000.0).round() as u64;
+                    last_audio_bytes=a.payload_bytes;
+                    last_audio_tick=tokio::time::Instant::now();
+                }
                 snapshot.wifi_iap2=crate::wifi_iap2::phase(snapshot.wifi_id);
                 let now_ms=crate::timing::monotonic_nanos()/1_000_000;
                 snapshot.timing.refresh_age(now_ms);
@@ -925,6 +936,8 @@ pub(crate) struct PumpStat {
 
 #[derive(Default)]
 struct AudioPumpStat {
+    codec: &'static str,
+    payload_bytes: u64,
     packets: u64,
     signal_packets: u64,
     playing: bool,

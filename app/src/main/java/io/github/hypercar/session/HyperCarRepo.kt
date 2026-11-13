@@ -1736,7 +1736,7 @@ object HyperCarRepo {
     // ---------------------------------------------------------------- WiFi
 
     /** Recheck the live OS link; a remembered handle or a shared SSID alone is insufficient. */
-    private suspend fun reusableCarNetwork(context: Context, endpoint: CarPlayEndpoint): Network? {
+    private suspend fun reusableCarNetwork(context: Context, endpoint: CarPlayEndpoint, explain: Boolean = false): Network? {
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return null
         val networks = wifiNetworks(context)
         val fallbackSsid = if (networks.size == 1) currentWifiSsid(context) else null
@@ -1749,7 +1749,7 @@ object HyperCarRepo {
             fallbackBssid = io.github.hypercar.net.CarNetworkReuse.readBssid {
                 ShizukuTools.exec("cmd wifi status", 3_000).out
             }
-            if (fallbackBssid == null) log("WIFI-REUSE: 未取得可靠 BSSID，继续正常入网，不中断 iAP2")
+            if (fallbackBssid == null && explain) log("WIFI-REUSE: 未取得可靠 BSSID，继续正常入网，不中断 iAP2")
         }
         val peers = (endpoint.ipAddresses + listOfNotNull(endpoint.gateway)).mapNotNull {
             runCatching { android.net.InetAddresses.parseNumericAddress(it.substringBefore('%')) }.getOrNull()
@@ -1767,13 +1767,24 @@ object HyperCarRepo {
                     (it.address is java.net.Inet6Address || !it.address.isLinkLocalAddress)
             } == true
             val route = lp?.routes?.any { r -> r.destination.prefixLength > 0 && peers.any { r.destination.contains(it) } } == true
-            io.github.hypercar.net.CarWifiPolicy.canReuse(caps) &&
-                (io.github.hypercar.net.CarWifiPolicy.canReuseDesktop(desktopPeer, endpoint.ssid, ssid, hasAddress,
+            val safe = io.github.hypercar.net.CarWifiPolicy.canReuse(caps)
+            val identity = io.github.hypercar.net.CarWifiPolicy.canReuseDesktop(desktopPeer, endpoint.ssid, ssid, hasAddress,
                     caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true) ||
                 io.github.hypercar.net.CarNetworkReuse.accepts(endpoint.ssid, endpoint.deviceIdentifier, endpoint.fromInvite,
                     io.github.hypercar.net.CarNetworkReuse.Evidence(ssid, io.github.hypercar.net.CarNetworkReuse.mac(info?.bssid) ?: fallbackBssid,
-                        hasAddress, route, network == boundNetwork || network == joinedNetwork)))
+                        hasAddress, route, network == boundNetwork || network == joinedNetwork))
+            if (explain) {
+                val expected = io.github.hypercar.net.CarNetworkReuse.mac(endpoint.deviceIdentifier)
+                val actual = io.github.hypercar.net.CarNetworkReuse.mac(info?.bssid) ?: io.github.hypercar.net.CarNetworkReuse.mac(fallbackBssid)
+                log("WIFI-VERIFY: safe=$safe identity=$identity ssid_match=${!endpoint.ssid.isNullOrBlank() && endpoint.ssid == ssid} " +
+                    "id_is_mac=${expected != null} bssid_known=${actual != null} bssid_match=${expected != null && expected == actual} " +
+                    "address=$hasAddress route_to_peer=$route ipv6=${lp?.linkAddresses?.any { it.address is java.net.Inet6Address } == true} " +
+                    "internet=${caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true} " +
+                    "validated=${caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true}")
+            }
+            safe && identity
         }
+        if (explain) log("WIFI-VERIFY: wifi_candidates=${networks.size} verified_candidates=${eligible.size}; association alone is not a usable network")
         return eligible.firstOrNull { it == boundNetwork } ?: eligible.singleOrNull()
     }
 
@@ -1815,7 +1826,7 @@ object HyperCarRepo {
             joinedSsid = null
         } finally { autoConnectChanges.unlock() }
         lateinit var joiner: WifiJoiner
-        joiner = WifiJoiner(context) {
+        joiner = WifiJoiner(context, diagnostic = ::log) {
             scope.launch {
                 if (connectionAttemptId == attempt && wifiJoiner === joiner && sessionLive.get()) {
                     log("WIFI: 当前车机热点消失（熄火/离开）")
@@ -1830,14 +1841,15 @@ object HyperCarRepo {
         val network = if (!ssid.isNullOrBlank() && !psk.isNullOrBlank()) {
             push(link = LinkState.Negotiating("连接车机局域网，首次请确认系统提示"))
             log("WIFI: 加入热点 $ssid，方式=HyperCar 专用局域网（最多60s）；其它 App 保留系统互联网")
-            when (val result = joiner.joinCarHotspotSilently(ssid, psk) { ensureCurrent(); latestBssid() }) {
+            when (val result = joiner.joinCarHotspotSilently(ssid, psk,
+                verifiedFallback = { ensureCurrent(); reusableCarNetwork(context, endpoint) }) { ensureCurrent(); latestBssid() }) {
                 is WifiJoiner.JoinResult.Joined -> { markDegradedFirstConnectIfNeeded(); result.network }
                 else -> { log("WIFI: 入网未完成（${joiner.lastFailureReason ?: "不支持或连接失败"}），仅尝试已核实的当前网络"); null }
             }
         } else null
         kotlinx.coroutines.currentCoroutineContext().ensureActive()
         ensureCurrent()
-        val effective = network ?: reusableCarNetwork(context, endpoint)
+        val effective = network ?: reusableCarNetwork(context, endpoint, explain = true)
         autoConnectChanges.lock()
         try {
             kotlinx.coroutines.currentCoroutineContext().ensureActive()

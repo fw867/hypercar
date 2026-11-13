@@ -165,7 +165,7 @@ fun SettingsScreen(
                     SettingsPage.Display -> {
                         CarSourceSection(startup, onRefreshSetup, connected = linkConnected,
                             title = "画面来源", compact = true)
-                        AudioSection(carWithMode = startup.source == "carwith")
+                        AudioSection(source = startup.source)
                         ResolutionSection()
                     }
                     SettingsPage.Permissions -> {
@@ -1333,7 +1333,7 @@ private fun BehaviorSection(startup: io.github.hypercar.session.StartupReadiness
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AudioSection(carWithMode: Boolean) {
+private fun AudioSection(source: String?) {
     var enabled by rememberSaveable { mutableStateOf(SettingsStore.enableAudio) }
     var codec by rememberSaveable { mutableStateOf(SettingsStore.audioCodec) }
     var microphoneProbe by rememberSaveable { mutableStateOf(SettingsStore.microphoneProbe) }
@@ -1342,17 +1342,18 @@ private fun AudioSection(carWithMode: Boolean) {
         SwitchRow(title = "音频转发", subtitle = "将声音传到车机，下次连接生效", checked = enabled,
             onCheckedChange = { enabled = it; SettingsStore.enableAudio = it })
         HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-        SwitchRow(title = "车机麦克风收音测试（实验）",
-            subtitle = if (carWithMode) "仅支持自绘 UI。只测收音，不保存录音，不接入助手，下次连接生效"
-                else "长按语音键开始收音，最多 20 秒；再次长按停止。仅统计音量，不保存录音，也不唤醒手机助手。下次连接生效",
-            checked = microphoneProbe, enabled = !carWithMode,
-            onCheckedChange = { microphoneProbe = it; SettingsStore.microphoneProbe = it })
-        HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-        SwitchRow(title = "CarWith 使用车机麦克风（实验）",
-            subtitle = if (carWithMode) "开启后由车机收音供 CarWith 小爱识别，单次最多 20 秒；关闭使用手机麦克风。需车机支持，下次连接生效"
-                else "请先将上方画面来源切换为 CarWith；自绘 UI 使用上方收音测试。此开关仅控制 CarWith 小爱取音",
-            checked = carWithMicrophone, enabled = carWithMode,
-            onCheckedChange = { carWithMicrophone = it; SettingsStore.carWithMicrophone = it })
+        if (source == "carwith") {
+            SwitchRow(title = "CarWith 使用车机麦克风（实验）",
+                subtitle = "开启后由车机收音供 CarWith 小爱识别，单次最多 20 秒；关闭使用手机麦克风。需车机支持，下次连接生效",
+                checked = carWithMicrophone,
+                onCheckedChange = { carWithMicrophone = it; SettingsStore.carWithMicrophone = it })
+        } else if (source == "car_ui") {
+            SwitchRow(title = "车机麦克风收音测试（实验）",
+                subtitle = "长按语音键开始收音，最多 20 秒；再次长按停止。仅统计音量，不保存录音，也不唤醒手机助手。下次连接生效",
+                checked = microphoneProbe,
+                onCheckedChange = { microphoneProbe = it; SettingsStore.microphoneProbe = it })
+        }
+        if (source == "carwith" || source == "car_ui") HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
         Text("音频格式", style = MaterialTheme.typography.bodySmall, color = TextSecondary)
         Spacer(Modifier.height(8.dp))
         SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
