@@ -96,3 +96,33 @@ CarWith内部DataBusService清单exported=false；本机adb am startservice明�
 
 
 646设置可见性修正：音频页始终显示CarWith麦克风开关，自绘模式置灰并提示切换画面来源。AudioSection显式接收startup.source对应的模式参数，避免直接读取非Compose状态的SharedPreferences造成跨区块切换后显示滞后。仅修改设置呈现，原生音频链路保持645版本。
+
+## iAP2 语音键与收音路径完善（2026-11-13）
+
+蓝牙与 Wi-Fi iAP2 的 MediaPlaybackRemote HID 现支持 Consumer 0xCF。按组件和 Report ID 聚合按下状态；重复报告不重复启动，最后一个持键组件释放才产生内部释放边沿。StopHID、描述符替换、重新识别或链路重置会释放旧状态，仍要求本轮组件声明、认证和 StartHID 注册，非法报告不推测按键。HyperCarRepo 将这两个语音边沿经 JNI 送到原生同一个 VoiceKey 队列，与 AirPlay requestSiri/hidSendReport 共用去重、CarWith VR_START、自绘手机助手或显式开启的麦克风测试路由。释放只清物理按键状态，不停止识别。原生输入携带引擎 token；停止中、无引擎、旧 token 或非按下/释放动作均不接收，旧传输仍受现有 connectionAttempt/归属检查。
+
+收音继续使用 /info 声明的独立 type107/speechRecognition/Opus16k 输入及已有 CarWith PCM 上行，不更换为主音频流附带端口的方案。两种入口各有接收端适用范围，尚无同车对照能证明任一方式普遍更好。完善现有107 RTP解析：按 CSRC 和扩展头长度定位密文，保持 Input 密钥、timestamp/SSRC AAD、尾部 nonce、来源检查及重放/序号保护；超限、截断、错误类型及当前未支持的 padding 报文拒绝。收音仍为显式实验、按识别开始请求启动、有界时长、不保存录音，未新增自动收音或格式盲试。
+
+## 自绘 UI 外部音频字幕验证（2026-11-14）
+
+新增默认关闭的“车机语音字幕验证（实验）”，与仅统计音量的收音测试在设置页互斥；仅自绘模式下传 self_microphone_asr，CarWith 的独立开关不变。重连后用语音键开始/再次按下停止，单次车机输入最多20秒。复用已声明的107/Opus16k收音与认证解码，PCM经捕获ID和原生引擎代号校验回传Kotlin；不保存音频，不调用手机默认助手作为降级。
+
+验证后端使用现成系统SpeechRecognizer，Android13+以ParcelFileDescriptor音频管道传入16000/mono/PCM16，申请中间结果并处理最终结果。只选择已启用、导出且使用平台识别绑定权限的服务；多个候选而没有有效默认值时要求先选择默认识别器。部分服务会忽略EXTRA_AUDIO_SOURCE并改用自身麦克风，因此识别结果始终标注“来源待验证”，写入管道的时长也不作为读取/采用音频的证明。包队列有界，管道非阻塞写入且有250ms预算，识别失败/超时/取消、旧会话和设置关闭都会清理任务；按捕获ID停止107，迟到取消不能停止后续识别。代码不自研语音模型，当前未比较各引擎识别准确率。
+
+D1自绘界面顶部新增提示框，显示状态、实际partial/final文字与取消按钮；设置音频区也能查看结果及检查识别服务。不自动执行指令，中间文字不提交助手。仅最终非空结果提供“交给手机小爱”，通过用户点击启动手机主屏上的文本入口，保留D1字幕。接口为当前已安装小爱8.2.70的导出ShareReceiverActivity，action=com.miui.voiceassist.action.PUSH_QUERY、type=text/plain、extra assist_query；没有调用受签名/特权保护的SpeechQueryService。不假设这是跨版本稳定SDK，也没有回传小爱回复或执行成功状态。
+
+手机核对：系统默认voice_recognition_service为空；查询仅发现com.xiaomi.mibrain.speech/.asr.AsrService，绑定权限为小米自定义signature权限，不能作为本应用可直接使用的标准后端。独立现成识别器仍需安装/启用并验证实际采用外部PCM；当前没有端到端语音字幕成功结论。用ASCII无害文本1+1调用小爱文本入口，Activity启动成功，手机日志确认handlePushQuery和VoiceService input_content收到相同文本，只证明文本送达引擎，不证明所有指令已执行。
+
+Android app_process检查中，PCM队列字节/EOF检查通过；该辅助进程的识别服务检查受到system-context归属校验影响，不能当作HyperCar正常进程下的识别器启动结果。实际服务可用性结论来自独立package查询/权限及默认设置读取。本轮未安装替换HyperCar；临时测试文件已清理。
+
+## 直接核对手机超级小爱的外部 ASR（2026-11-14）
+
+对象为本机已安装的 `com.miui.voiceassist` / 超级小爱8.2.70.8421（508002070），不是CarWith内置小爱。本轮直接对已提取APK的ExternalAsrService、OSbotSpeechService和PublicAsrProvider进行定点反编译，并核对当前manifest及手机权限拒绝结果。
+
+**发现真正的外部PCM入口**：`com.aios.osbot.external.ExternalAsrService`，action=`com.aios.osbot.action.EXTERNAL_ASR`，Binder接口`com.aios.apptoolsdk.aidl.IExternalAsrService`。`startAsr(AsrAudioConfig,IAsrCallback)`创建外部PCM识别会话并返回sessionId；`feedAudio(sessionId,byte[])`向ExternalAudioSource投喂；`stopAsr`结束识别，`cancelAsr`取消并释放。配置检查明确要求sampleRate=16000、channels=1、bitDepth=16、encoding=pcm（大小写不敏感），与我们解码后的目标PCM规格相符。回调含onPartialResult、onFinalResult、onSentenceEnd和onError；服务以continuous=true、enableCloudVad=true创建会话。由此确认“超级小爱内部没有外部音频识别接口”的说法不成立；正确结论是它有此接口，但当前应用没有调用授权。
+
+**当前授权限制已实测**：服务exported=true，但manifest要求`com.aios.osbot.permission.EXTERNAL_AGENT`，系统定义为signature|privileged。其startAsr内部还会按Binder调用方UID再次checkPermission，权限不满足返回`error:PERMISSION_DENIED`，onBind另有CallerVerifier检查：非调试超级小爱会明确拒绝uid2000的ADB shell，并校验调用方是否为系统应用或通过指定签名校验。普通HyperCar签名无法仅靠新增uses-permission或用户录音授权取得该权限。手机ADB shell直接尝试进入服务被系统以Requires permission拒绝，尚未执行startAsr/feedAudio，因此没有识别成功证据，也不能用Shizuku的shell身份当作已取得此授权。
+
+另外两路也已区分：`OSbotSpeechService`要求`com.xiaomi.speech.permission.BIND_SPEECH_SERVICE`（signature|privileged），getCapabilities的audio_source只声明internal_mic，不能当作外部PCM入口。`PublicAsrProvider`（content://com.miui.voiceassist.speech.api）要求`miui.permission.USE_INTERNAL_GENERAL_API`（本机同样为signature|privileged），start/stop/cancel/status由内部AsrProxyService处理；openFile提供的是闹钟TTS/新闻/BGM等输出文件，没有外部收音写入分支。shell访问该Provider同样在权限检查处被拒绝。
+
+完整定点源码和manifest保存在工作区外 `D:/devtools/hypercar-diagnostics/self-voice-20261114`。当前未改运行代码、未申请或绕过签名权限、未更改小爱包。后续若具备合法接口授权，可直接把现有type107解码后的PCM接到feedAudio，再将partial/final回调接到已经实现的顶部语音框，无须重新实现语音模型；在此之前继续区分可用的文本入口、受限的原生ASR入口和尚未实车完成的CarWith链路。

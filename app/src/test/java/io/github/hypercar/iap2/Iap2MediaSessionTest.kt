@@ -15,6 +15,37 @@ class Iap2MediaSessionTest {
     private fun identified(keys: MutableList<Int>, ready: Boolean = true): Iap2MediaSession =
         Iap2MediaSession({}, keys::add).also { it.identify(listOf(Iap2Messages.HidComponent(1,1), Iap2Messages.HidComponent(2,1))); if (ready) it.authenticated() }
 
+    private val voice = bytes(0x05,0x0c,0x09,1,0xa1,1,0x15,0,0x25,1,0x75,1,0x95,1,0x09,0xcf,0x81,2,0xc0)
+    @Test fun voiceEdgesAreAuthenticatedDeduplicatedAndReleasedOnStopOrResync() {
+        val keys=mutableListOf<Int>();val s=identified(keys,false)
+        s.handle(start(descriptor=voice));s.handle(report(1));assertTrue(keys.isEmpty())
+        s.authenticated();s.handle(report(1));s.handle(report(0));s.handle(report(0));s.handle(report(1))
+        s.handle(frame(0x6803));s.handle(report(1))
+        assertEquals(listOf(0xcf,0x100cf,0xcf,0x100cf),keys)
+        s.handle(start(descriptor=voice));s.handle(report(1));s.restartLink();s.handle(report(1))
+        assertEquals(listOf(0xcf,0x100cf),keys.takeLast(2))
+    }
+    @Test fun voiceComponentsAndReportIdsDoNotReleaseEachOthersHeldPress() {
+        val keys=mutableListOf<Int>();val s=identified(keys)
+        s.handle(start(1,voice));s.handle(start(2,voice));s.handle(report(1,1));s.handle(report(1,2))
+        s.handle(report(0,1));assertEquals(listOf(0xcf),keys)
+        s.handle(frame(0x6803,2));assertEquals(listOf(0xcf,0x100cf),keys)
+        val id1=voice.copyOfRange(0,6)+bytes(0x85,1)+voice.copyOfRange(6,voice.size)
+        val id2=bytes(0x85,2,0x09,0xcf,0x81,2)
+        val decoder=ConsumerReport.parse(id1.dropLast(1).toByteArray()+id2+bytes(0xc0))!!
+        assertEquals(listOf(0xcf),decoder.report(bytes(1,1)))
+        decoder.report(bytes(2,1));assertTrue(decoder.report(bytes(1,0)).isEmpty())
+        assertEquals(listOf(0x100cf),decoder.report(bytes(2,0)))
+    }
+    @Test fun malformedOrUndeclaredVoiceReportsCannotWakeOrRelease() {
+        val keys=mutableListOf<Int>();val s=identified(keys)
+        s.handle(start(descriptor=voice));s.handle(report(1))
+        s.handle(frame(0x6802,1,Iap2Csm.param(1,byteArrayOf())))
+        s.handle(report(0,3));assertEquals(listOf(0xcf),keys)
+        s.handle(start(descriptor=bitmap));assertEquals(listOf(0xcf,0x100cf),keys)
+        s.handle(report(4));assertEquals(0xb5,keys.last())
+    }
+
     @Test fun actualBmwComponentIsParsedSeparatelyFromAirplayUuid() {
         val body=Iap2Csm.group(0x12,Iap2Csm.u16(0,1),Iap2Csm.string(1,"CinemoHIDComponent"),Iap2Csm.u8(2,1))
         assertEquals(listOf(Iap2Messages.HidComponent(1,1)),Iap2Messages.parseIdentification(body).hidComponents)

@@ -1,5 +1,9 @@
 package io.github.hypercar.carui
 
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.ui.unit.dp
 import android.os.Bundle
 import android.os.SystemClock
 import android.view.InputDevice
@@ -58,7 +62,11 @@ class CarHomeActivity : ComponentActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
         setContent {
             HyperCarTheme {
-                CarHomeScreen()
+                androidx.compose.foundation.layout.Box(androidx.compose.ui.Modifier.fillMaxSize()) {
+                    CarHomeScreen()
+                    CarSpeechPanel(androidx.compose.ui.Modifier.align(androidx.compose.ui.Alignment.TopCenter)
+                        .fillMaxWidth(0.8f).padding(top = 16.dp))
+                }
             }
         }
         instance = this

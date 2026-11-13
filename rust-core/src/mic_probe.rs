@@ -3,10 +3,11 @@ use std::{sync::{Arc,atomic::{AtomicBool,Ordering}},time::Duration};
 use tokio::{sync::{watch,Notify}};
 use crate::{airplay::{AirplayParams,SocketProvider},bplist::{self,Value},rtsp::RtspChannel};
 
-pub struct ProbeControl {tx:watch::Sender<u64>,armed:AtomicBool,pub carwith:Option<Arc<crate::carlife::microphone::Microphone>>}
+pub struct ProbeControl {tx:watch::Sender<u64>,armed:AtomicBool,self_asr:bool,owner:u64,asr_token:std::sync::atomic::AtomicU64,pub carwith:Option<Arc<crate::carlife::microphone::Microphone>>}
 impl std::fmt::Debug for ProbeControl {fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.debug_struct("ProbeControl").field("carwith",&self.carwith.is_some()).finish()}}
 impl ProbeControl {
-    pub fn new()->Self {let(tx,_)=watch::channel(0);Self{tx,armed:AtomicBool::new(false),carwith:None}}
+    pub fn new()->Self {let(tx,_)=watch::channel(0);Self{tx,armed:AtomicBool::new(false),self_asr:false,owner:0,asr_token:std::sync::atomic::AtomicU64::new(0),carwith:None}}
+    pub fn for_self_asr(owner:u64)->Self {Self{self_asr:true,owner,..Self::new()}}
     pub fn for_carwith()->Self {Self{carwith:Some(Arc::new(Default::default())),..Self::new()}}
     #[cfg(test)] pub(crate) fn arm_test(&self){self.armed.store(true,Ordering::Release);}
     pub fn generation(&self)->u64 {*self.tx.borrow()}
@@ -18,11 +19,22 @@ impl ProbeControl {
             if let Some(sink)=self.carwith.as_ref(){sink.reset(*v);}true
         });
     }
+    pub fn cancel_asr(&self,id:u64) {
+        self.tx.send_if_modified(|v| {
+            if !self.self_asr || self.asr_token.load(Ordering::Acquire)!=id || *v&1==0 {return false;}
+            *v=v.wrapping_add(1);true
+        });
+    }
     pub fn toggle(&self){self.request(self.generation()&1==0);}
     fn finish(&self,generation:u64){
         self.tx.send_if_modified(|v| {if *v!=generation{return false;}*v=v.wrapping_add(1);if let Some(sink)=self.carwith.as_ref(){sink.reset(*v);}true});
     }
 }
+struct AsrLease(Option<(Arc<ProbeControl>,u64)>);
+impl Drop for AsrLease {fn drop(&mut self){if let Some((control,id))=&self.0 {
+    let _=control.asr_token.compare_exchange(*id,0,Ordering::AcqRel,Ordering::Acquire);
+    crate::emit_microphone_pcm(control.owner,*id,&[],16000,true);
+}}}
 struct Armed(Arc<ProbeControl>);
 impl Drop for Armed {fn drop(&mut self){self.0.armed.store(false,Ordering::Release);self.0.request(false);}}
 
@@ -80,14 +92,27 @@ fn accepted_stream(root:&Value,id:i64)->Result<&Value,String> {
     Ok(stream)
 }
 
+// Preserve the existing timestamp/SSRC AAD and explicit trailing nonce. Only the
+// payload offset varies when a receiver includes RTP CSRCs or an extension.
+fn input_rtp_header(wire:&[u8])->Option<usize> {
+    if wire.len()<36 || wire.len()>8192 || wire[0]&0xe0!=0x80 || wire[1]&127!=107 {return None;}
+    let mut header=12+usize::from(wire[0]&15)*4;
+    if wire[0]&0x10!=0 {
+        let extension=wire.get(header..header+4)?;
+        header+=4+usize::from(u16::from_be_bytes([extension[2],extension[3]]))*4;
+    }
+    let body=wire.len().checked_sub(header+8)?;
+    (16..=4112).contains(&body).then_some(header)
+}
+
 #[derive(Default,Debug)]
 pub struct Stats {pub packets:u64,pub authenticated:u64,pub samples:u64,pub peak:u32,pub lost:u64,pub duplicates:u64,pub reordered:u64,pub rejected:u64,pub decode_errors:u64,sum:f64,last_nonce:Option<u64>,last_seq:Option<u16>}
 impl Stats {
     fn open(&mut self,wire:&[u8],key:&[u8;32])->Result<Vec<u8>,&'static str>{
         self.packets+=1;
-        if wire.len()<36||wire.len()>4132||wire[0]!=0x80||wire[1]&127!=107 {self.rejected+=1;return Err("invalid RTP framing/type");}
+        let header = input_rtp_header(wire).ok_or_else(|| { self.rejected+=1; "invalid RTP framing/type" })?;
         let n=wire.len();let nonce=u64::from_le_bytes(wire[n-8..].try_into().unwrap());
-        let payload=crate::crypto::chacha_open(key,&crate::crypto::nonce64(nonce),&wire[12..n-8],&wire[4..12]).map_err(|_|{self.rejected+=1;"authentication failed"})?;
+        let payload=crate::crypto::chacha_open(key,&crate::crypto::nonce64(nonce),&wire[header..n-8],&wire[4..12]).map_err(|_|{self.rejected+=1;"authentication failed"})?;
         self.authenticated+=1;
         if self.last_nonce.is_some_and(|v|nonce<=v){self.duplicates+=1;return Err("replayed/reordered nonce");}
         let seq=u16::from_be_bytes(wire[2..4].try_into().unwrap());
@@ -132,6 +157,11 @@ async fn sample(control:Arc<RtspChannel>,factory:Arc<dyn SocketProvider>,shared:
     let data_port=data.local_addr().map_err(|e|e.to_string())?.port();let control_port=ctrl.local_addr().map_err(|e|e.to_string())?.port();
     if data_port==0||control_port==0{return Err("unbound receive port".into());}
     let id=(rand::random::<u64>()&i64::MAX as u64).max(1) as i64;let key=input_key(&shared,id as u64);
+    let self_asr=sink.as_ref().is_some_and(|(p,_)|p.self_asr);
+    let _asr_lease=AsrLease(if self_asr {
+        let trigger=sink.as_ref().unwrap().0.clone();
+        trigger.asr_token.store(id as u64,Ordering::Release);Some((trigger,id as u64))
+    } else {None});
     let uri=crate::rtsp_uri::audio_uri(host,port);
     let started=std::time::Instant::now();
     crate::emit_log(&format!("MIC-PROBE: RTSP#{} SETUP type107 input=true Opus16k mono dataPort={data_port} controlPort={control_port}",control.trace_id()));
@@ -171,6 +201,10 @@ async fn sample(control:Arc<RtspChannel>,factory:Arc<dyn SocketProvider>,shared:
                     stats.pcm(&pcm);
                     if let Some((control,generation))=sink.as_ref(){
                         if control.generation()!=*generation {return Err("capture superseded".into());}
+                        if control.self_asr {
+                            let bytes:Vec<u8>=pcm.iter().flat_map(|s|s.to_le_bytes()).collect();
+                            crate::emit_microphone_pcm(control.owner,id as u64,&bytes,decoder.rate,false);
+                        }
                         if let Some(target)=control.carwith.as_ref(){target.push(*generation,&pcm,decoder.rate)?;}
                     }
                 },Err(e)=>{stats.decode_errors+=1;if stats.decode_errors>=8{return Err(format!("Opus decode failed: {e}"));}}}
@@ -257,6 +291,34 @@ mod tests {
         assert!(stats.open(&packet(&key,4,3),&key).is_ok());
         assert!(stats.open(&[0;12],&key).is_err());
         stats.pcm(&[i16::MIN,i16::MAX]);assert_eq!(stats.peak,32768);assert_eq!(stats.samples,2);
+    }
+    #[test] fn input_rtp_extensions_and_csrc_keep_authenticated_payload_and_replay_checks() {
+        let key=input_key(&[7;32],42);
+        let fixed=packet(&key,1,0);
+        let mut extended=fixed[..12].to_vec();extended[0]=0x91; // one CSRC plus extension
+        extended.extend([0,0,0,2, 0xbe,0xde,0,1, 1,2,3,4]);
+        extended.extend_from_slice(&fixed[12..]);
+        let mut stats=Stats::default();
+        assert_eq!(stats.open(&extended,&key).unwrap(),vec![0xf8,0xff,0xfe]);
+        assert!(stats.open(&extended,&key).is_err());
+        let mut corrupt=extended.clone();corrupt[24]^=1;
+        assert!(Stats::default().open(&corrupt,&key).is_err());
+        for end in 0..extended.len() {let _=Stats::default().open(&extended[..end],&key);}
+        extended[18]=255;extended[19]=255;
+        assert!(Stats::default().open(&extended,&key).is_err());
+        let mut padded=fixed;padded[0]|=0x20;
+        assert!(Stats::default().open(&padded,&key).is_err());
+    }
+    #[test] fn self_asr_cancellation_is_capture_scoped_and_separate_from_carwith() {
+        let control=ProbeControl::for_self_asr(0);control.arm_test();control.request(true);
+        control.asr_token.store(42,Ordering::Release);let generation=control.generation();
+        control.cancel_asr(41);assert_eq!(control.generation(),generation);
+        control.cancel_asr(42);assert_eq!(control.generation()&1,0);
+        control.request(true);control.asr_token.store(43,Ordering::Release);
+        let next=control.generation();control.cancel_asr(42);assert_eq!(control.generation(),next);
+        let carwith=ProbeControl::for_carwith();carwith.arm_test();carwith.request(true);
+        carwith.asr_token.store(42,Ordering::Release);let generation=carwith.generation();
+        carwith.cancel_asr(42);assert_eq!(carwith.generation(),generation);
     }
     #[test] fn late_capture_cleanup_does_not_cancel_a_new_recognition_request(){
         let control=ProbeControl::for_carwith();control.arm_test();control.request(true);let old=control.generation();

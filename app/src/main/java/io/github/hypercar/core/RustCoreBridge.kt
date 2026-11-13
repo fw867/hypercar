@@ -48,6 +48,8 @@ object RustCoreBridge {
         fun onMediaKey(usage: Int) {}
         /** Voice button routed to the phone assistant only for the self-rendered source. */
         fun onVoiceAssistant() {}
+        /** Authenticated type107 PCM16 mono, scoped to one capture; empty/end closes its pipe. */
+        fun onMicrophonePcm(owner: Long, token: Long, pcm: ByteArray, rate: Int, end: Boolean) {}
 
         /** 车机 forceKeyFrame：请求编码器立刻产出 IDR。 */
         fun onForceKeyFrame() {}
@@ -92,6 +94,12 @@ object RustCoreBridge {
      * @param socketProvider 后续新端口的 socket 供给
      */
     external fun nativeStart(configJson: String, controlFd: Int, socketProvider: SocketProvider): Boolean
+
+    /** Capture the native engine generation; zero means no input receiver. */
+    external fun nativeVoiceKeyToken(): Long
+    external fun nativeCancelMicrophone(token: Long): Boolean
+    /** iAP2 voice edges share the AirPlay requestSiri/HID state machine. */
+    external fun nativeSendVoiceKey(token: Long, action: Int): Boolean
 
     external fun nativeStop()
     /** 主动退出：有界等待 TEARDOWN 和旧引擎资源释放，不用于网络丢失或蓝牙交接。 */

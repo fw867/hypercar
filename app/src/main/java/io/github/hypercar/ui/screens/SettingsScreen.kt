@@ -1336,6 +1336,7 @@ private fun BehaviorSection(startup: io.github.hypercar.session.StartupReadiness
 private fun AudioSection(source: String?) {
     var enabled by rememberSaveable { mutableStateOf(SettingsStore.enableAudio) }
     var codec by rememberSaveable { mutableStateOf(SettingsStore.audioCodec) }
+    var voiceRecognition by rememberSaveable { mutableStateOf(SettingsStore.carVoiceRecognition) }
     var microphoneProbe by rememberSaveable { mutableStateOf(SettingsStore.microphoneProbe) }
     var carWithMicrophone by rememberSaveable { mutableStateOf(SettingsStore.carWithMicrophone) }
     GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 2.dp)) {
@@ -1351,7 +1352,23 @@ private fun AudioSection(source: String?) {
             SwitchRow(title = "车机麦克风收音测试（实验）",
                 subtitle = "长按语音键开始收音，最多 20 秒；再次长按停止。仅统计音量，不保存录音，也不唤醒手机助手。下次连接生效",
                 checked = microphoneProbe,
-                onCheckedChange = { microphoneProbe = it; SettingsStore.microphoneProbe = it })
+                onCheckedChange = {
+                    microphoneProbe = it; SettingsStore.microphoneProbe = it
+                    if (it) { voiceRecognition = false; SettingsStore.carVoiceRecognition = false; io.github.hypercar.carui.CarSpeechValidation.cancel() }
+                })
+            SwitchRow(title = "车机语音字幕验证（实验）",
+                subtitle = "长按语音键使用车机收音，在顶部显示系统识别文字，不执行指令。结果需确认音频来源；下次连接生效",
+                checked = voiceRecognition,
+                onCheckedChange = {
+                    voiceRecognition = it; SettingsStore.carVoiceRecognition = it
+                    if (it) { microphoneProbe = false; SettingsStore.microphoneProbe = false }
+                    else io.github.hypercar.carui.CarSpeechValidation.cancel()
+                })
+            val speechContext = androidx.compose.ui.platform.LocalContext.current
+            TextButton(onClick = { io.github.hypercar.carui.CarSpeechValidation.inspect(speechContext) }) {
+                Text("检查系统识别服务")
+            }
+            io.github.hypercar.carui.CarSpeechPanel(Modifier.fillMaxWidth())
         }
         if (source == "carwith" || source == "car_ui") HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
         Text("音频格式", style = MaterialTheme.typography.bodySmall, color = TextSecondary)

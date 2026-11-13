@@ -1684,6 +1684,7 @@ object HyperCarRepo {
     /** 释放保活服务、iAP2、Rust 和 WiFi 绑定；拆除与失败路径共用。 */
     private fun releaseSessionResources(keepListening: Boolean = false, graceful: Boolean = false) {
         hudSessionEnabled = false
+        io.github.hypercar.carui.CarSpeechValidation.cancel()
         io.github.hypercar.navigation.NavigationSources.clear()
         sessionSockets?.invalidate() // 阻止旧引擎继续创建/移交 socket，先于 nativeStop。
         sessionSockets = null
@@ -2523,6 +2524,15 @@ object HyperCarRepo {
             appContext()?.let { MusicBridge.onCarMediaKey(it, usage) }
         }
 
+        override fun onMicrophonePcm(owner: Long, token: Long, pcm: ByteArray, rate: Int, end: Boolean) {
+            val attempt = connectionAttemptId
+            appContext()?.let { context ->
+                io.github.hypercar.carui.CarSpeechValidation.receive(context, token, pcm, rate, end) {
+                    sessionLive.get() && connectionAttemptId == attempt && RustCoreBridge.nativeVoiceKeyToken() == owner
+                }
+            }
+        }
+
         override fun onVoiceAssistant() {
             val attempt = connectionAttemptId
             if (sessionLive.get()) io.github.hypercar.carui.CarVoiceAssistant.wake {
@@ -2552,6 +2562,13 @@ object HyperCarRepo {
     fun onIap2MediaKey(usage: Int, current: () -> Boolean) {
         val attempt = connectionAttemptId
         if (!sessionLive.get() || !current()) return
+        if (usage == 0xcf || usage == 0x100cf) {
+            val token = RustCoreBridge.nativeVoiceKeyToken()
+            if (token != 0L && sessionLive.get() && connectionAttemptId == attempt && current()) {
+                RustCoreBridge.nativeSendVoiceKey(token, if (usage == 0xcf) 2 else 3)
+            }
+            return
+        }
         val context = appContext() ?: return
         MusicBridge.onCarMediaKey(context, usage) {
             sessionLive.get() && connectionAttemptId == attempt && current()

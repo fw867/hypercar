@@ -89,3 +89,26 @@ Showcase的source/carplay_services.m可对照资源变化及VideoConfig，carpla
 - Wi-Fi丢失时`ConnectionService$runWireless$2$lost$1.java:67`关闭屏幕、发现和蓝牙socket并结束本轮，再由Provider决定重试。稳定PhoneIdentity持久化且不自动轮换配对密钥。运行期接管就绪后该APK也有主动关闭引导RFCOMM的分支，不代表必须断HFP/A2DP。
 
 对HyperCar的价值：复用正确车机网络、目标ACL唤醒、有界退避、稳定身份、旧会话资源清理均可对照，目前这些机制已有对应实现；其中HyperCar还存在已配对已知Wi-Fi主动建链入口和按车/Network隔离的失败退避。APK没有提供已验证的“宝马无蓝牙邀请时激活HMI”专用报文。不能因奔驰有画面就把609的奔驰认证、能力及屏幕顺序策略全局套到宝马，也不恢复已删除且实测无效的视频恢复实验。后续宝马无画面仍需比较相同车机上的真实SETUP/RECORD/资源回应和视频写帧，判断认证/顺序差异是否适用。
+
+## CarPToCarL 麦克风与按键复核（2026-11-13）
+
+固定源码：[7c55ac0a15a59dae322d16fed8b07dc50f8c3011](https://github.com/jjuugk/CarPToCarL/tree/7c55ac0a15a59dae322d16fed8b07dc50f8c3011)，本轮读取 main 并与当前 HyperCar 对照；仅静态审查，未改运行逻辑、未构建或安装，也未新增实车成功结论。
+
+### 麦克风：两条不同输入机制
+
+CarPToCarL 的旧 `probeMicrophoneInput(input=true)` 已由 `MIC_PROBE_ENABLED=false` 停用，不能把它当成当前全部实现。当前 `MIC_UPLINK_ENABLED=true`：SessionController 在主音频 SETUP 前绑定 MicUplink UDP，把本地 dataPort 附在现有音频流中，仅在该候选 audioInputFormats 非零时声明（零或缺失不声明）。runAudioStream 对应 AirPlayClient.kt:2527；MicUplink 从相同 streamConnectionID 派生 Input 密钥，接收 RTP、认证解密，把负载按大端 PCM16 换为小端并允许导出最多20秒 WAV；音频流重建时 updateKey 重置格式探测。未发现该 PCM 写入 CarLife VR 的实现，CarLifeHuClient 的语音硬键仍注明使用手机麦克风。
+
+HyperCar 当前仅接受 /info 明确声明的 type107/speechRecognition/Opus16k 输入，独立 SETUP、独立连接 ID、绑定车机网络、认证解密、Opus 解码；CarWith 实验已进一步将其转换为16k单声道PCM16，经受限队列和加密 VR 0x58001 上行，结束0x58009。两条机制不能凭静态代码断言哪条适用所有实车。最有价值的候选是：针对明确声明主音频输入能力的接收端增加共享音频流收音策略，复用现有 CarWith PCM sink；保留 type107 路径，先取得目标车机 SETUP/RTP/格式证据，再决定是否启用。不能将“输入位非零”直接等同某个采样率/声道/PCM 格式已获支持，也不能把接收端 xcertplay 的规则上升为所有原厂车机规范。
+
+MicUplink 的 RTP 头解析支持 CSRC/扩展头；HyperCar Stats::open 固定 wire[0]==0x80、12字节头，若实际107回传包含扩展会被丢弃。这是值得完善的兼容及诊断点，目前没有目标车机发送扩展头的证据。格式探测虽使用 Poly1305 认证确认，但它的多种 nonce/AAD 候选和默认 PCM 假设不能直接套到 Opus 流。保持我们现有来源校验、重放/序号限制、会话代际隔离和按需收音；不照搬自动收音/WAV落盘。
+
+### 按键：明确缺口与已具备能力
+
+1. **iAP2 语音键缺口**：CarPToCarL 将 0x6802 的 Consumer 0xCF 与 requestSiri 接入同一 VoiceKeyRouter。HyperCar Rust AirPlay Consumer HID 已支持0xCF按下/释放及共享去重，但 Kotlin Iap2MediaSession.ConsumerReport.supported 不含0xCF，且 HyperCarRepo.onIap2MediaKey 仅派发 MusicBridge。应补齐 iAP2 语音边沿到已有统一语音路由，保留组件声明/认证/Report ID/传输代际校验，避免媒体和语音各自唤醒一次。
+2. **识别确认与状态诊断**：CarPToCarL 解析 MD_MODULE_STATUS=65574（0x10026），观察 module4/VR 的状态变化。HyperCar 当前通过 RECOG_START/STOP 控制收音，但未解析该模块状态；可用于区分“VR_START已排队/写出”“引擎进入语音态”“开始接收车机PCM”“实际识别”，模块状态本身也不是识别成功证明。其源码把VR=0直接归因硬键无效过强，不能照搬这个断言。
+3. **保持现有严格HID解析**：HyperCar 已具备按组件、Report ID、位偏移、Usage范围和Push/Pop解码。CarPToCarL 的 VirtualIap2Link 仍以“大于8字节的首参数”猜 StartHID 描述符，缺报告参数时回退任意短参数，并保存单个描述符；ConsumerKeys也较简化。我们应借鉴双通道入口和阶段诊断，不回退为任意参数/字节猜键，不把0x04固定当下一曲。
+4. **不照搬长按结束与旋钮假设**：参考实现按1.5秒长按释放发VR_STOP，这只是其策略；HyperCar 已有按业务识别结束及20秒收音上限，不改成按按键时长结束。源码的 KNOB_UUID_HEX 常量及“排除旋钮误判媒体键”不等于已完成旋钮到焦点导航的通用映射，不能作为现成方案移植。
+
+建议实施顺序：先补 iAP2 0xCF 与跨入口去重回归，再加 CarWith VR 状态观测，随后按目标车机证据实现共享音频流输入候选及必要的 RTP 头支持。保持其它车型默认媒体建链与收音开关不变。
+
+后续实施：已按用户要求补齐 iAP2 0xCF 到统一原生语音入口，并完善 type107 RTP 的 CSRC/扩展头定位。上文缺口为本轮实施前审查结论；主音频流共享输入及 VR 模块状态观测仍未引入。实现与验证见 INPUT-AND-VOICE、VALIDATION。

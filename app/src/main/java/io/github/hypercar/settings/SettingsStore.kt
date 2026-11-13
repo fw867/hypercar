@@ -300,6 +300,11 @@ object SettingsStore {
         get() = p().getBoolean("microphone_probe", false)
         set(v) = p().edit().putBoolean("microphone_probe", v).apply()
 
+    /** Self-rendered external-PCM recognition validation, opt-in and separate from CarWith. */
+    var carVoiceRecognition: Boolean
+        get() = p().getBoolean("car_voice_recognition", false)
+        set(v) = p().edit().putBoolean("car_voice_recognition", v).apply()
+
     var carWithMicrophone: Boolean
         get() = p().getBoolean("carwith_microphone", false)
         set(v) = p().edit().putBoolean("carwith_microphone", v).apply()
@@ -412,6 +417,7 @@ object SettingsStore {
             append("\"enable_audio\":").append(enableAudio).append(",")
             append("\"audio_codec\":\"").append(audioCodec).append("\",")
             append("\"microphone_probe\":").append(microphoneProbe && !carWithMode).append(",")
+            append("\"self_microphone_asr\":").append(carVoiceRecognition && !carWithMode).append(",")
             append("\"carwith_microphone\":").append(carWithMicrophone && carWithMode).append(",")
             append("\"keep_alive_stats\":").append(keepAliveStats).append(",")
             append("\"bmw_box_bootstrap\":").append(io.github.hypercar.headunit.ReceiverCompatibility.useBmwBootstrap(

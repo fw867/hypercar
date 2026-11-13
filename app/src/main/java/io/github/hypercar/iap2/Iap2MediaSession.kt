@@ -10,9 +10,22 @@ internal class Iap2MediaSession(private val log: (String) -> Unit, private val k
     private var diagnostics = 0
     val registeredCount: Int get() = devices.size
 
+    private var voiceDown = false
+    private fun releaseVoice() {
+        if (voiceDown) { voiceDown = false; key(ConsumerReport.VOICE_UP) }
+    }
+    private fun dispatch(edges: List<Int>) {
+        edges.filter { it != ConsumerReport.VOICE_DOWN && it != ConsumerReport.VOICE_UP }.forEach(key)
+        val down = devices.values.any { it.voicePressed }
+        if (down != voiceDown) {
+            voiceDown = down
+            key(if (down) ConsumerReport.VOICE_DOWN else ConsumerReport.VOICE_UP)
+        }
+    }
+
     fun identify(hids: List<Iap2Messages.HidComponent>) {
         val next = hids.filter { it.function == 1 }.take(32).map { it.identifier }.toSet()
-        if (identified && components != next) { devices.clear(); deferred.clear() }
+        if (identified && components != next) { releaseVoice(); devices.clear(); deferred.clear() }
         identified = true
         components.clear()
         components.addAll(next)
@@ -24,7 +37,7 @@ internal class Iap2MediaSession(private val log: (String) -> Unit, private val k
         queued.forEach(::handle)
     }
     /** Link-only resync keeps the business auth context; reports require a new StartHID. */
-    fun restartLink() { devices.clear(); deferred.clear() }
+    fun restartLink() { releaseVoice(); devices.clear(); deferred.clear() }
     fun reset() { restartLink(); components.clear(); identified = false; ready = false }
 
     fun handle(frame: Iap2Csm.Frame): Boolean {
@@ -45,8 +58,9 @@ internal class Iap2MediaSession(private val log: (String) -> Unit, private val k
             0x6800 -> {
                 val descriptor = params.singleOrNull { it.id == 4 }?.value
                 val parsed = descriptor?.let(ConsumerReport::parse)
-                if (parsed == null) { devices.remove(component); note("StartHID component=$component invalid/unsupported descriptor"); return true }
+                if (parsed == null) { devices.remove(component); dispatch(emptyList()); note("StartHID component=$component invalid/unsupported descriptor"); return true }
                 if (devices[component]?.descriptor?.contentEquals(descriptor) != true) devices[component] = parsed
+                dispatch(emptyList())
                 note("StartHID component=$component descriptor=${descriptor.size}B registered; no fabricated DeviceHIDReport")
             }
             0x6802 -> {
@@ -55,9 +69,9 @@ internal class Iap2MediaSession(private val log: (String) -> Unit, private val k
                 if (device == null || report == null) { note("report component=$component missing registration/report parameter1"); return true }
                 val edges = device.report(report)
                 note("report component=$component bytes=${report.size} edges=${edges.map { "0x${it.toString(16)}" }}")
-                edges.forEach { usage -> runCatching { key(usage) }.onFailure { note("dispatch failed component=$component error=${it.javaClass.simpleName}") } }
+                runCatching { dispatch(edges) }.onFailure { note("dispatch failed component=$component error=${it.javaClass.simpleName}") }
             }
-            0x6803 -> { devices.remove(component); note("StopHID component=$component") }
+            0x6803 -> { devices.remove(component); dispatch(emptyList()); note("StopHID component=$component") }
         }
         return true
     }
@@ -72,6 +86,7 @@ internal class ConsumerReport private constructor(val descriptor: ByteArray) {
     private val pressed = mutableMapOf<Int, Set<Int>>()
     private val lengths = mutableMapOf<Int, Int>()
     private var numbered = false
+    val voicePressed: Boolean get() = pressed.values.any { VOICE_DOWN in it }
     fun report(bytes: ByteArray): List<Int> {
         if (bytes.size > 4097) return emptyList()
         val id = if (numbered) bytes.firstOrNull()?.toInt()?.and(255) ?: return emptyList() else 0
@@ -94,12 +109,16 @@ internal class ConsumerReport private constructor(val descriptor: ByteArray) {
             } else f.usages.getOrNull((value - f.min).takeIf { it in 0..Int.MAX_VALUE }?.toInt() ?: continue)
             if (usage != null && usage ushr 16 == 0x0cL && (usage.toInt() and 0xffff) in supported) down += usage.toInt() and 0xffff
         }
-        val edges = down - pressed.getOrDefault(id, emptySet())
+        val wasVoicePressed = voicePressed
+        val edges = (down - pressed.getOrDefault(id, emptySet())).toMutableList()
         pressed[id] = down
-        return edges.toList()
+        if (wasVoicePressed && !voicePressed) edges += VOICE_UP
+        return edges
     }
     companion object {
-        private val supported = setOf(0xb0, 0xb1, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb9, 0xcd)
+        const val VOICE_DOWN = 0xcf
+        const val VOICE_UP = 0x100cf // Internal edge marker, never a wire usage.
+        private val supported = setOf(0xb0, 0xb1, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb9, 0xcd, VOICE_DOWN)
         fun parse(bytes: ByteArray): ConsumerReport? = runCatching {
             require(bytes.isNotEmpty() && bytes.size <= 4096)
             val result = ConsumerReport(bytes.copyOf())

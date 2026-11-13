@@ -29,6 +29,7 @@ pub enum SourceEvent {
     RequestCarWithKeyFrame,
     ResetVideoSource,
     RequestHostUi,
+    CancelSelfAsr(u64),
     RequestAudioOwnership,
     /// 视频编码器产出一帧（H.264 Annex B，可能含 SPS/PPS/IDR）。
     VideoFrame { pts_us: u64, data: Vec<u8> },
@@ -59,6 +60,10 @@ pub struct EngineConfig {
     pub audio_codec: String,
     #[serde(default)]
     pub microphone_probe: bool,
+    #[serde(default)]
+    pub self_microphone_asr: bool,
+    #[serde(skip)]
+    pub input_generation: u64,
     #[serde(default)]
     pub carwith_microphone: bool,
     #[serde(default)]
@@ -151,6 +156,8 @@ pub async fn run_engine(
     let carwith_display = cfg.carlife_source.then(|| Arc::new(Mutex::new((cfg.width, cfg.height))));
     let microphone_probe = if cfg.carlife_source {
         cfg.carwith_microphone.then(|| Arc::new(crate::mic_probe::ProbeControl::for_carwith()))
+    } else if cfg.self_microphone_asr {
+        Some(Arc::new(crate::mic_probe::ProbeControl::for_self_asr(cfg.input_generation)))
     } else { cfg.microphone_probe.then(|| Arc::new(crate::mic_probe::ProbeControl::new())) };
     let mut carwith_hub = None;
     if cfg.carlife_source {
@@ -242,6 +249,7 @@ pub async fn run_engine(
     {
         let stop_d = stop.clone();
         let claims = audio_claim_tx.clone();
+        let microphone_cancel=microphone_probe.clone();
         tasks.spawn(async move {
             loop {
                 tokio::select! {
@@ -252,6 +260,9 @@ pub async fn run_engine(
                         }
                         Some(SourceEvent::CarWithTouch(t)) => {
                             if let Some(hub) = &carwith_hub { hub.inject_touch(t.action, t.x, t.y); }
+                        }
+                        Some(SourceEvent::CancelSelfAsr(id)) => {
+                            if let Some(mic)=&microphone_cancel {mic.cancel_asr(id);}
                         }
                         Some(SourceEvent::RequestHostUi) => { let _ = host_ui_tx.try_send(()); }
                         Some(SourceEvent::RequestAudioOwnership) => { let _ = claims.try_send((true, std::time::Instant::now())); }
@@ -777,6 +788,7 @@ mod video_pump_tests {
         assert!(!config.screen_resource_lifecycle);assert!(config.enable_audio);
         assert!(!config.mbux_screen_bootstrap);
         assert!(!config.id9_screen_bootstrap);
+        assert!(!config.self_microphone_asr);
         json["screen_resource_lifecycle"]=serde_json::json!(true);
         let config:EngineConfig=serde_json::from_value(json).unwrap();
         assert!(config.screen_resource_lifecycle);assert!(config.enable_audio);

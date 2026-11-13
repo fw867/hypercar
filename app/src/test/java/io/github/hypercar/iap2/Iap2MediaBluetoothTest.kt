@@ -6,7 +6,7 @@ import org.junit.Test
 
 class Iap2MediaBluetoothTest {
     private val descriptor=byteArrayOf(5,12,9,1,0xa1.toByte(),1,0x15,0,0x25,2,9,0,9,0xb5.toByte(),9,0xb6.toByte(),0x75,8,0x95.toByte(),1,0x81.toByte(),0,0xc0.toByte())
-    private fun start()=Iap2Csm.encode(0x6800,Iap2Csm.u16(0,1)+Iap2Csm.param(4,descriptor))
+    private fun start(d:ByteArray=descriptor)=Iap2Csm.encode(0x6800,Iap2Csm.u16(0,1)+Iap2Csm.param(4,d))
     private fun report(value:Int)=Iap2Csm.encode(0x6802,Iap2Csm.u16(0,1)+Iap2Csm.param(1,byteArrayOf(value.toByte())))
     private fun identity()=Iap2Csm.encode(0x1d01,
         Iap2Csm.string(0,"BMW-test")+Iap2Csm.string(1,"MGU-fixture")+
@@ -42,6 +42,17 @@ class Iap2MediaBluetoothTest {
             return open
         }
     }
+    @Test fun authenticatedBluetoothVoiceEdgesUseTheSameCallbackAsWifiCsm() {
+        val channel=Channel();val keys=mutableListOf<Int>()
+        val session=Iap2SenderSession(channel,{},onEndpoint={},profile=HeadUnitProfiles.WINPLAY,
+            nanoTime={channel.time},onMediaKey={keys+=it})
+        session.run(10_000);keys.clear()
+        val voice=byteArrayOf(5,12,9,1,0xa1.toByte(),1,0x15,0,0x25,1,0x75,1,0x95.toByte(),1,9,0xcf.toByte(),0x81.toByte(),2,0xc0.toByte())
+        channel.queue+=start(voice)+report(1)+report(1)+report(0)
+        channel.endWhenEmpty=true;session.pumpIncomingForever()
+        assertEquals(listOf(0xcf,0x100cf),keys)
+    }
+
     @Test fun bluetoothSameReadRegistrationWaitsForAuthAndLateRestartRemainsLive() {
         val channel=Channel();val keys=mutableListOf<Int>()
         val session=Iap2SenderSession(channel,{},onEndpoint={},

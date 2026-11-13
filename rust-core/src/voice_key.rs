@@ -39,3 +39,40 @@ mod tests {
         assert_eq!(action(0xcf),Some(2));assert_eq!(action(HID_UP),Some(3));
     }
 }
+
+/// Generation-scoped iAP2 input into the existing AirPlay voice queue.
+pub struct Input {
+    pub token: u64,
+    sender: tokio::sync::mpsc::UnboundedSender<u32>,
+}
+impl Input {
+    pub fn new(sender: tokio::sync::mpsc::UnboundedSender<u32>) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self { token: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), sender }
+    }
+    pub fn send(&self, token: u64, action: i32) -> bool {
+        token == self.token && matches!(action, 2 | 3) &&
+            self.sender.send(message(i64::from(action)).unwrap()).is_ok()
+    }
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+    #[test] fn iap2_and_airplay_share_deduplication_and_stale_engines_cannot_inject() {
+        let (tx,mut rx)=tokio::sync::mpsc::unbounded_channel();
+        let input=Input::new(tx.clone());let next=Input::new(tx.clone());
+        assert!(!next.send(input.token,2));
+        for action in [-1,0,1,4] {assert!(!input.send(input.token,action));}
+        assert!(rx.try_recv().is_err());
+        assert!(input.send(input.token,2));
+        tx.send(message(2).unwrap()).unwrap(); // same press via requestSiri
+        assert!(input.send(input.token,3));
+        tx.send(HID_UP).unwrap();
+        assert!(input.send(input.token,2));
+        let mut voice=VoiceKey::default();let mut starts=0;
+        while let Ok(key)=rx.try_recv(){if voice.receive(action(key).unwrap(),100){starts+=1;}}
+        assert_eq!(starts,2);
+        drop(rx);assert!(!input.send(input.token,3));
+    }
+}

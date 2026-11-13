@@ -73,6 +73,7 @@ static LISTENER: RwLock<Option<GlobalRef>> = RwLock::new(None);
 static TOUCH_LISTENER: RwLock<Option<GlobalRef>> = RwLock::new(None);
 
 struct EngineHandle {
+    voice_input: voice_key::Input,
     shutdown: Arc<shutdown::EngineShutdown>,
     abort: tokio::task::AbortHandle,
     /// 自绘界面投喂给引擎的视频帧 / 音频 PCM（nativePushVideoFrame / nativePushAudioPcm）
@@ -484,7 +485,7 @@ fn native_start_impl(
         Ok(s) => s.into(),
         Err(_) => return JNI_FALSE,
     };
-    let cfg: engine::EngineConfig = match serde_json::from_str(&config_str) {
+    let mut cfg: engine::EngineConfig = match serde_json::from_str(&config_str) {
         Ok(c) => c,
         Err(e) => {
             emit_log(&format!("引擎配置解析失败: {e}"));
@@ -535,6 +536,8 @@ fn native_start_impl(
     let carwith_touch_source = cfg.carlife_source.then(|| source_tx.clone());
     let (touch_tx, mut touch_rx) = mpsc::unbounded_channel::<TouchInput>();
     let (key_tx, key_rx) = mpsc::unbounded_channel::<u32>();
+    let voice_input=voice_key::Input::new(key_tx.clone());
+    cfg.input_generation=voice_input.token;
     // 车机 HID 触摸 → Kotlin：airplay::handle_hid_report 只负责换算坐标与边沿，
     // 投递到这里后由独立任务回调监听器（P1 喂 Compose 首页，P2 注入 D2）。
     // 通道随引擎重建；监听器是独立 GlobalRef，不随引擎重启丢失。
@@ -595,6 +598,7 @@ fn native_start_impl(
     // 发送端留在句柄里（触摸/按键通道 P1 起接给自绘 UI）
     // 发送端留在句柄里，供 nativePushVideoFrame / nativePushAudioPcm 投喂数据
     *ENGINE.lock() = Some(EngineHandle {
+        voice_input,
         shutdown,
         abort,
         source_tx,
@@ -738,4 +742,41 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeRequest
     if ENGINE.lock().as_ref().map(|h| h.source_tx.send(engine::SourceEvent::RequestHostUi).is_ok()).unwrap_or(false) {
         JNI_TRUE
     } else { JNI_FALSE }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeVoiceKeyToken(
+    _env: JNIEnv, _class: JClass,
+) -> jlong {
+    ENGINE.lock().as_ref().filter(|h| !h.shutdown.requested())
+        .map_or(0, |h| h.voice_input.token as jlong)
+}
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendVoiceKey(
+    _env: JNIEnv, _class: JClass, token: jlong, action: jint,
+) -> jboolean {
+    if ENGINE.lock().as_ref().is_some_and(|h| !h.shutdown.requested() && h.voice_input.send(token as u64, action)) {
+        JNI_TRUE
+    } else { JNI_FALSE }
+}
+
+/// Authenticated, decoded self-rendered microphone PCM; never written to logs or disk.
+pub(crate) fn emit_microphone_pcm(owner:u64, token:u64, pcm:&[u8], rate:u32, end:bool) {
+    call_listener("onMicrophonePcm", |env,obj| {
+        let data=env.byte_array_from_slice(pcm)?;
+        env.call_method(obj,"onMicrophonePcm","(JJ[BIZ)V",&[
+            (owner as jlong).into(),(token as jlong).into(),(&data).into(),(rate as jint).into(),
+            (if end {JNI_TRUE}else{JNI_FALSE}).into(),
+        ]).map(|_|())
+    });
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeCancelMicrophone(
+    _env:JNIEnv,_class:JClass,token:jlong,
+)->jboolean {
+    if token>0 && ENGINE.lock().as_ref().is_some_and(|h|
+        !h.shutdown.requested() && h.source_tx.send(engine::SourceEvent::CancelSelfAsr(token as u64)).is_ok()) {
+        JNI_TRUE
+    } else {JNI_FALSE}
 }
