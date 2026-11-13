@@ -2300,7 +2300,10 @@ object HyperCarRepo {
     private val closedPipelineGeneration = java.util.concurrent.atomic.AtomicLong(0)
 
     private val rustListener = object : RustCoreBridge.EventListener {
-        override fun onPipeline(json: String) {
+        private var activationGeneration = 0L
+        private var activationKey = ""
+        private var activationReports = 0
+        @Synchronized override fun onPipeline(json: String) {
             val next = io.github.hypercar.core.PipelineDiagnostics.parse(json) ?: return
             if (!sessionLive.get() || proactiveActivation.get()?.rejected == true) return
             if (next.writtenFrames > 0 && next.videoChannelReady && next.recordAccepted &&
@@ -2313,6 +2316,21 @@ object HyperCarRepo {
                 if ((s.link !is LinkState.Negotiating && s.link !is LinkState.Connected) ||
                     next.generation <= closedPipelineGeneration.get() || next.generation < s.pipeline.generation) s
                 else s.copy(pipeline = next)
+            }
+            if (_snapshots.value.pipeline == next) {
+                // Bounded observation only: no retry, ownership claim or success inference.
+                val key = "${next.activationLabel}/${next.wifiIap2}/${next.audioReady}"
+                if (activationGeneration != next.generation) {
+                    activationGeneration = next.generation; activationKey = ""; activationReports = 0
+                }
+                if (key != activationKey && activationReports < 16) {
+                    activationKey = key; activationReports++
+                    log("ACTIVATION-GAP: attempt=$connectionAttemptId core=${next.generation} " +
+                        "stage=${next.activationLabel} wifi_iap2=${next.wifiIap2} " +
+                        "audio_setup=${next.audioReady} requestUI=${next.uiRequests}; " +
+                        "Wi-Fi iAP2 observed independently; receiver presentation unconfirmed")
+                    connectionDiagnostics.report().lastOrNull()?.let { log(it) }
+                }
             }
         }
         override fun onState(state: String, detail: String) {
@@ -3197,7 +3215,8 @@ object HyperCarRepo {
             appendLine("# 应用 ${DeviceInfo.appVersion(ctx)}")
             appendLine("# 设备 ${DeviceInfo.systemSummary()}")
             appendLine("# 说明：以下时间戳为本机时间；保留的落盘日志（含上一份轮转，读取失败时回退当前日志）共 ${logs.size} 行")
-            appendLine("# 连接摘要：WAITING=尚未完成 RECORD；STREAMING=已完成 RECORD；不代表实际画面/声音验证")
+            appendLine("# 连接摘要：CONTROL_READY=控制就绪；VIDEO_WRITING=已有视频写出；均不代表车机已进入桌面或实际出声")
+            appendLine("# ACTIVATION-GAP/PIPELINE.activation_gaps 分别核对邀请、iAP2、资源、主屏及媒体；Wi-Fi iAP2 未就绪是独立观察，不强制套用所有接收端")
             connectionDiagnostics.report().forEach { appendLine("# $it") }
             appendLine()
             logs.forEach { appendLine(it) }

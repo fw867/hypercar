@@ -1235,9 +1235,9 @@ async fn activate_session(channel: &Arc<RtspChannel>, declaration: &[u8], pipeli
     crate::pipeline::activation(pipeline, "RECORD");
     emit_log("AIRPLAY: ✓ RECORD 完成；声明资源后建立屏幕流");
     let reply = channel.request("POST", "/command", declaration, "application/x-apple-binary-plist", &[], Duration::from_secs(5)).await?;
-    if reply.status() != 200 { return Err(format!("资源声明被拒 {}", reply.first_line)); }
+    crate::resource_trace::validate_ack("RESOURCES", &reply)?;
     crate::pipeline::activation(pipeline, "RESOURCES_ACCEPTED");
-    emit_log("MODES: initial resource snapshot accepted");
+    emit_log("MODES: initial resource declaration acknowledged; ownership and receiver UI remain separate");
     Ok(())
 }
 
@@ -1246,9 +1246,7 @@ pub(crate) async fn record_session(channel: &Arc<RtspChannel>) -> Result<(), Str
     let reply = channel.request(
         "RECORD", "/", &[], "application/x-apple-binary-plist", &[], Duration::from_secs(5),
     ).await?;
-    if reply.status() != 200 {
-        return Err(format!("RECORD 被拒 [{}]", reply.first_line));
-    }
+    crate::resource_trace::validate_ack("RECORD", &reply)?;
     Ok(())
 }
 

@@ -32,8 +32,8 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
         val a = history.lastOrNull()?.takeIf { it.id == id && it.ended == null } ?: return
         a.reached.putIfAbsent(stage, (clockMillis() - a.started).coerceAtLeast(0))
         if (stage == Stage.RECORD) a.outcome = "ACTIVATING"
-        if (stage == Stage.CONTROL_READY) a.outcome = "CONNECTED"
-        if (stage == Stage.FIRST_VIDEO_FRAME) a.outcome = "STREAMING"
+        if (stage == Stage.CONTROL_READY && Stage.FIRST_VIDEO_FRAME !in a.reached) a.outcome = "CONTROL_READY"
+        if (stage == Stage.FIRST_VIDEO_FRAME) a.outcome = "VIDEO_WRITING"
         if (stage == Stage.WAITING_INVITATION) a.outcome = "WAITING_INVITATION"
         if (stage == Stage.WAITING_PROACTIVE_RETRY) a.outcome = "RETRYING"
         if (detail.isNotBlank()) a.notes[stage] = clean(detail)
@@ -50,6 +50,8 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
         val notes = a.notes.entries.joinToString("; ") { (stage, note) -> "$stage:$note" }
         "ATTEMPT#${a.id} source=${a.source} profile=${a.profile} outcome=${a.outcome} elapsed=${elapsed}ms " +
             "record=${Stage.RECORD in a.reached} invite=${Stage.CTRL_INVITED in a.reached} " +
+            "classic_iap2_started=${Stage.IAP2_STARTED in a.reached} iap2_parameters=${Stage.IAP2_PARAMETERS in a.reached} " +
+            "receiver_display=unknown receiver_audio=unknown " +
             "last=${a.reached.keys.last()} milestones=[$milestones] notes=[$notes] reason=${a.reason}"
     }
 

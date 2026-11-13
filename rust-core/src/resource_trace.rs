@@ -2,6 +2,24 @@
 use crate::{bplist::{self, Value}, rtsp::RtspMessage};
 use sha2::{Digest, Sha256};
 
+/// Transport ACK only. Empty bodies are legal, but never confirm resource ownership.
+pub(crate) fn validate_ack(stage:&str, reply:&RtspMessage)->Result<(),String> {
+    if reply.status()!=200 {return Err(format!("{stage} rejected RTSP status={}",reply.status()));}
+    if reply.body.is_empty() {
+        crate::emit_log(&format!("ACTIVATION: {stage} RTSP=200 business_status=absent_empty_body; receiver activation unconfirmed"));
+        return Ok(());
+    }
+    let value=bplist::parse(&reply.body).map_err(|_|format!("{stage} malformed response body"))?;
+    if value.as_dict().is_none(){return Err(format!("{stage} response is not a dictionary"));}
+    match value.get("status") {
+        Some(Value::Int(0))=>crate::emit_log(&format!("ACTIVATION: {stage} RTSP=200 business_status=0; receiver activation unconfirmed")),
+        Some(Value::Int(code))=>return Err(format!("{stage} business rejection status={code}")),
+        Some(_)=>return Err(format!("{stage} invalid business status type")),
+        None=>crate::emit_log(&format!("ACTIVATION: {stage} RTSP=200 business_status=absent; receiver activation unconfirmed")),
+    }
+    Ok(())
+}
+
 pub(crate) fn is_resource_request(method: &str, path: &str, body: &[u8]) -> bool {
     method == "POST" && path == "/command" && bplist::parse(body).ok()
         .and_then(|v| v.get("type").and_then(Value::as_str).map(str::to_owned))
@@ -133,6 +151,19 @@ mod tests {
         ] { assert_eq!(trace_kind("SETUP", "/", &body), None); }
         let resource = crate::modes::Modes::initial().declaration();
         assert_eq!(trace_kind("SETUP", "/", &resource), None);
+    }
+
+    #[test]
+    fn activation_ack_rejects_business_failure_despite_200() {
+        assert!(validate_ack("RECORD",&reply(200,Vec::new())).is_ok());
+        assert!(validate_ack("RESOURCE",&reply(200,bplist::encode(&Value::dict(vec![])))).is_ok());
+        assert!(validate_ack("RESOURCE",&reply(200,bplist::encode(&Value::dict(vec![("status",Value::int(0))])))).is_ok());
+        for body in [b"bad plist".to_vec(),bplist::encode(&Value::array(vec![])),
+            bplist::encode(&Value::dict(vec![("status",Value::str("0"))])),
+            bplist::encode(&Value::dict(vec![("status",Value::int(-6722))]))] {
+            assert!(validate_ack("RESOURCE",&reply(200,body)).is_err());
+        }
+        assert!(validate_ack("RECORD",&reply(455,Vec::new())).is_err());
     }
 
     #[test]

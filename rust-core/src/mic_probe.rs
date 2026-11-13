@@ -46,6 +46,40 @@ pub fn input_key(shared:&[u8;32],id:u64)->[u8;32]{
 }
 fn normalized(ip:std::net::IpAddr)->std::net::IpAddr {match ip {std::net::IpAddr::V6(v)=>v.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip),_=>ip}}
 
+// Only allowlisted scalar facts: never dump a response plist (keys, UUIDs or speech).
+fn scalar(value:Option<&Value>)->String {match value {
+    None=>"absent".into(), Some(Value::Int(n))=>n.to_string(),
+    Some(Value::Bool(b))=>b.to_string(), Some(_)=>"invalid-type".into(),
+}}
+fn setup_summary(root:&Value,id:i64)->String {
+    let streams=root.get("streams");
+    let shape=match streams {None=>"absent",Some(Value::Array(_))=>"array",Some(_)=>"invalid-type"};
+    let entries=streams.and_then(Value::as_array);
+    let details=entries.into_iter().flatten().take(8).enumerate().map(|(i,s)| {
+        let cid=match s.get("streamConnectionID") {None=>"absent",Some(Value::Int(n)) if *n==id=>"match",Some(Value::Int(_))=>"mismatch",Some(_)=>"invalid-type"};
+        let audio_type=match s.get("audioType") {None=>"absent",Some(Value::String(v)) if v=="speechRecognition"=>"speechRecognition",Some(_)=>"other"};
+        format!("#{i}[type={} status={} input={} audioType={audio_type} audioFormat={} id={cid} dataPort={} controlPort={} spf={}]",
+            scalar(s.get("type")),scalar(s.get("status")),scalar(s.get("input")),scalar(s.get("audioFormat")),
+            scalar(s.get("dataPort")),scalar(s.get("controlPort")),scalar(s.get("spf")))
+    }).collect::<Vec<_>>().join(" ");
+    format!("root={} status={} streams={shape} count={} entries=[{details}] (max8; IDs/keys omitted)",
+        if matches!(root,Value::Dict(_)){"dict"}else{"invalid-type"},scalar(root.get("status")),entries.map_or(0,Vec::len))
+}
+fn accepted_stream(root:&Value,id:i64)->Result<&Value,String> {
+    if !matches!(root,Value::Dict(_)){return Err("SETUP root is not a dictionary".into());}
+    if root.get("status").is_some_and(|s|s.as_int()!=Some(0)){return Err("SETUP root business rejection/invalid status".into());}
+    let streams=root.get("streams").and_then(Value::as_array).ok_or("SETUP streams absent/not array")?;
+    let mut matches=streams.iter().filter(|s|s.get("type").and_then(Value::as_int)==Some(107));
+    let stream=matches.next().ok_or("SETUP omitted type107 stream")?;
+    if matches.next().is_some(){return Err("SETUP ambiguous duplicate type107 streams".into());}
+    if stream.get("status").is_some_and(|s|s.as_int()!=Some(0)){return Err("SETUP stream business rejection/invalid status".into());}
+    if stream.get("streamConnectionID").is_some_and(|s|s.as_int()!=Some(id)){return Err("SETUP connection ID mismatch/invalid type".into());}
+    if stream.get("input").is_some_and(|v|v.as_bool()!=Some(true)){return Err("SETUP input direction mismatch".into());}
+    if stream.get("audioFormat").is_some_and(|v|v.as_int()!=Some(1<<28)){return Err("SETUP audio format mismatch".into());}
+    if stream.get("audioType").is_some_and(|v|v.as_str()!=Some("speechRecognition")){return Err("SETUP audio type mismatch".into());}
+    Ok(stream)
+}
+
 #[derive(Default,Debug)]
 pub struct Stats {pub packets:u64,pub authenticated:u64,pub samples:u64,pub peak:u32,pub lost:u64,pub duplicates:u64,pub reordered:u64,pub rejected:u64,pub decode_errors:u64,sum:f64,last_nonce:Option<u64>,last_seq:Option<u16>}
 impl Stats {
@@ -100,16 +134,17 @@ async fn sample(control:Arc<RtspChannel>,factory:Arc<dyn SocketProvider>,shared:
     let id=(rand::random::<u64>()&i64::MAX as u64).max(1) as i64;let key=input_key(&shared,id as u64);
     let uri=crate::rtsp_uri::audio_uri(host,port);
     let started=std::time::Instant::now();
-    crate::emit_log(&format!("MIC-PROBE: SETUP type107 input=true Opus16k mono dataPort={data_port} controlPort={control_port}"));
+    crate::emit_log(&format!("MIC-PROBE: RTSP#{} SETUP type107 input=true Opus16k mono dataPort={data_port} controlPort={control_port}",control.trace_id()));
     // Every attempted allocation is retired by type AND connection ID, including timeout/bad replies.
     let setup_body=description(id,data_port,control_port);
     let result=async {
         let reply=tokio::select!{biased;_=stop.notified()=>return Err("session stopped during SETUP".into()),_=rx.changed()=>{rx.borrow_and_update();return Err("cancelled during SETUP".into());},r=control.request("SETUP",&uri,&setup_body,"application/x-apple-binary-plist",&[],Duration::from_secs(3))=>r?};
+        let parsed=bplist::parse(&reply.body);
+        crate::emit_log(&format!("MIC-PROBE: RTSP#{} CSeq={:?} SETUP response status={} bytes={} {}; RTSP success alone is not input acceptance",
+            control.trace_id(),reply.cseq(),reply.status(),reply.body.len(),parsed.as_ref().map(|root|setup_summary(root,id)).unwrap_or_else(|_|"body=empty-or-invalid-bplist".into())));
         if reply.status()!=200{return Err(format!("input SETUP rejected status={}",reply.status()));}
-        let root=bplist::parse(&reply.body).map_err(|e|e.to_string())?;
-        let stream=root.get("streams").and_then(Value::as_array).and_then(|a|a.iter().find(|s|s.get("type").and_then(Value::as_int)==Some(107))).ok_or("SETUP omitted type107 stream")?;
-        if stream.get("streamConnectionID").and_then(Value::as_int).is_some_and(|v|v!=id){return Err("SETUP connection ID mismatch".into());}
-        if [root.get("status"),stream.get("status")].into_iter().flatten().any(|s|s.as_int()!=Some(0)){return Err("SETUP business rejection".into());}
+        let root=parsed.map_err(|_|"SETUP empty/invalid binary plist")?;
+        accepted_stream(&root,id)?;
         crate::emit_log("MIC-PROBE: SETUP accepted; awaiting authenticated RTP, not recording confirmation");
         let mut stats=Stats::default();let mut wire=[0u8;8192];let mut feedback=[0u8;2048];
         let mut tick=tokio::time::interval(Duration::from_secs(1));tick.tick().await;
@@ -127,9 +162,12 @@ async fn sample(control:Arc<RtspChannel>,factory:Arc<dyn SocketProvider>,shared:
             packet=data.recv_from(&mut wire)=>{
                 let(n,source)=packet.map_err(|e|e.to_string())?;
                 if normalized(source.ip())!=peer {continue;}
+                let before=stats.authenticated;
                 let Ok(payload)=stats.open(&wire[..n],&key) else{continue;};
+                if before==0 {crate::emit_log("MIC-PROBE: first authenticated RTP; decoder/recognition not yet confirmed");}
                 last_packet=std::time::Instant::now();
                 match decoder.decode(&payload){Ok(pcm)=>{
+                    if stats.samples==0 && !pcm.is_empty(){crate::emit_log("MIC-PROBE: first decoded PCM; assistant recognition and audible output remain unconfirmed");}
                     stats.pcm(&pcm);
                     if let Some((control,generation))=sink.as_ref(){
                         if control.generation()!=*generation {return Err("capture superseded".into());}
@@ -143,7 +181,7 @@ async fn sample(control:Arc<RtspChannel>,factory:Arc<dyn SocketProvider>,shared:
     drop(data);drop(ctrl);drop(decoder);
     if !control.is_closed(){
         match tokio::time::timeout(Duration::from_secs(2),control.request("TEARDOWN","/",&teardown(id),"application/x-apple-binary-plist",&[],Duration::from_secs(1))).await{
-            Ok(Ok(reply))=>crate::emit_log(&format!("MIC-PROBE: type107 cleanup status={}; type100/102/110 untouched",reply.status())),
+            Ok(Ok(reply))=>crate::emit_log(&format!("MIC-PROBE: selective type107 cleanup RTSP_status={}; request excludes type100/102/110; receiver release unconfirmed",reply.status())),
             _=>crate::emit_log("MIC-PROBE: type107 cleanup timeout/error; no whole-session teardown"),
         }
     }
@@ -153,6 +191,39 @@ async fn sample(control:Arc<RtspChannel>,factory:Arc<dyn SocketProvider>,shared:
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn setup_200_without_input_stream_is_not_acceptance() {
+        for root in [Value::dict(vec![]),Value::dict(vec![("streams",Value::array(vec![]))]),
+            Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![("dataPort",Value::int(6000))])]))]),
+            Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![("type",Value::int(110))])]))])] {
+            assert!(accepted_stream(&root,42).is_err());
+            let summary=setup_summary(&root,42);
+            assert!(summary.contains("streams="));assert!(!summary.contains("id=match"));
+        }
+    }
+    #[test] fn input_reply_checks_business_direction_format_and_id() {
+        let response=|fields|Value::dict(vec![("streams",Value::array(vec![Value::dict(fields)]))]);
+        assert!(accepted_stream(&response(vec![("type",Value::int(107))]),42).is_ok());
+        for (field,value) in [("status",Value::int(-6722)),("status",Value::str("0")),
+            ("streamConnectionID",Value::int(43)),("streamConnectionID",Value::str("42")),
+            ("input",Value::bool(false)),("audioFormat",Value::int(1<<29)),("audioType",Value::str("media"))] {
+            assert!(accepted_stream(&response(vec![("type",Value::int(107)),(field,value)]),42).is_err(),"{field}");
+        }
+        let mut root=response(vec![("type",Value::int(107)),("streamConnectionID",Value::int(42))]);
+        assert!(accepted_stream(&root,42).is_ok());
+        if let Value::Dict(fields)=&mut root {fields.push((Value::str("status"),Value::int(-1)));}
+        assert!(accepted_stream(&root,42).unwrap_err().contains("root business"));
+        assert!(accepted_stream(&Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![("type",Value::int(107))]);2]))]),42).is_err());
+    }
+    #[test] fn response_summary_is_bounded_and_does_not_expose_secrets() {
+        let root=Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![
+            ("type",Value::int(107)),("streamConnectionID",Value::int(987654321)),
+            ("audioType",Value::str("SECRET")),("shk",Value::str("SECRET")),("uuid",Value::str("SECRET")),
+        ]);20]))]);
+        let summary=setup_summary(&root,42);
+        assert!(summary.contains("count=20"));assert!(summary.contains("id=mismatch"));
+        assert!(summary.contains("#7["));assert!(!summary.contains("#8["));
+        assert!(!summary.contains("SECRET"));assert!(!summary.contains("987654321"));
+    }
     fn packet(key:&[u8;32],seq:u16,nonce:u64)->Vec<u8>{
         let mut header=vec![0x80,107];header.extend(seq.to_be_bytes());header.extend([0,0,0,0,0,0,0,1]);
         let cipher=crate::crypto::chacha_seal(key,&crate::crypto::nonce64(nonce),&[0xf8,0xff,0xfe],&header[4..12]);
@@ -206,7 +277,7 @@ mod tests {
         }
     }
     #[cfg(target_os="android")]
-    async fn fixture(send_audio:bool,reject:bool)->Result<Stats,String>{
+    async fn fixture(send_audio:bool,reply_kind:u8)->Result<Stats,String>{
         use tokio::io::{AsyncReadExt,AsyncWriteExt};
         async fn read(peer:&mut tokio::net::TcpStream)->crate::rtsp::RtspMessage {
             let mut bytes=Vec::new();let mut buf=[0;4096];loop {
@@ -227,8 +298,12 @@ mod tests {
         let request=read(&mut peer).await;assert!(request.first_line.starts_with("SETUP "));
         let root=bplist::parse(&request.body).unwrap();let stream=&root.get("streams").unwrap().as_array().unwrap()[0];
         let id=stream.get("streamConnectionID").unwrap().as_int().unwrap();let port=stream.get("dataPort").unwrap().as_int().unwrap() as u16;
-        let body=bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![("type",Value::int(107)),("streamConnectionID",Value::int(id))])]))]));
-        reply(&mut peer,request.cseq().unwrap(),if reject{400}else{200},&body).await;
+        let body=bplist::encode(&match reply_kind {
+            2=>Value::dict(vec![("streams",Value::array(vec![]))]),
+            3=>Value::dict(vec![("status",Value::int(-6722))]),
+            _=>Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![("type",Value::int(107)),("streamConnectionID",Value::int(id))])]))]),
+        });
+        reply(&mut peer,request.cseq().unwrap(),if reply_kind==1{400}else{200},&body).await;
         if send_audio {
             let udp=tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();let key=input_key(&[7;32],id as u64);
             for i in 0..12 {udp.send_to(&packet(&key,i,i as u64),("127.0.0.1",port)).await.unwrap();tokio::time::sleep(Duration::from_millis(20)).await;}
@@ -242,10 +317,14 @@ mod tests {
     }
     #[cfg(target_os="android")]
     #[tokio::test] async fn encrypted_rtp_decodes_and_only_input_stream_is_retired(){
-        let stats=fixture(true,false).await.unwrap();assert_eq!(stats.authenticated,12);assert!(stats.samples>0);
+        let stats=fixture(true,0).await.unwrap();assert_eq!(stats.authenticated,12);assert!(stats.samples>0);
     }
     #[cfg(target_os="android")]
-    #[tokio::test] async fn rejected_setup_still_retires_only_input_stream(){assert!(fixture(false,true).await.unwrap_err().contains("400"));}
+    #[tokio::test] async fn rejected_setup_still_retires_only_input_stream(){assert!(fixture(false,1).await.unwrap_err().contains("400"));}
     #[cfg(target_os="android")]
-    #[tokio::test] async fn bounded_silent_probe_does_not_stop_control_session(){let stats=fixture(false,false).await.unwrap();assert_eq!(stats.samples,0);}
+    #[tokio::test] async fn bounded_silent_probe_does_not_stop_control_session(){let stats=fixture(false,0).await.unwrap();assert_eq!(stats.samples,0);}
+    #[cfg(target_os="android")]
+    #[tokio::test] async fn missing_input_despite_200_only_retires_input_stream(){assert!(fixture(false,2).await.unwrap_err().contains("omitted type107"));}
+    #[cfg(target_os="android")]
+    #[tokio::test] async fn business_rejection_despite_200_only_retires_input_stream(){assert!(fixture(false,3).await.unwrap_err().contains("root business"));}
 }

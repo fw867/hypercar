@@ -4,6 +4,17 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PipelineDiagnosticsTest {
+    @Test fun control_and_transport_do_not_confirm_receiver_presentation() {
+        val control = PipelineDiagnostics(generation=1,active=true,controlReady=true,
+            recordAccepted=true,resourcesAccepted=true,audioReady=true)
+        assertEquals("等待车机交出主屏",control.activationLabel)
+        val video=control.copy(screenOwned=true,screenSetupAccepted=true,videoChannelReady=true)
+        assertEquals("等待首帧写出",video.activationLabel)
+        assertEquals("视频已写出 · 车机显示待确认",video.copy(writtenFrames=4187).activationLabel)
+        // No Wi-Fi iAP2 readiness requirement is imposed on PC or other receivers.
+        assertEquals("视频已写出 · 车机显示待确认",video.copy(writtenFrames=1,wifiIap2="WAIT_PEER_LONG").activationLabel)
+        assertEquals("主屏已交还车机",video.copy(videoStream="PAUSED",screenOwned=false).activationLabel)
+    }
     @org.junit.Test fun recordAcceptanceIsIndependentOfControlAndVideoReadiness() {
         val p = PipelineDiagnostics.parse("""{"generation":7,"control_ready":false,"record_accepted":true,"resources_accepted":false,"screen_setup_accepted":false,"video_channel_ready":false}""")!!
         org.junit.Assert.assertTrue(p.recordAccepted)

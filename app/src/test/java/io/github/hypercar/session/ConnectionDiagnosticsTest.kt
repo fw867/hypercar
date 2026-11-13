@@ -19,9 +19,12 @@ class ConnectionDiagnosticsTest {
         journal.mark(id, Stage.CTRL_INVITED)
         journal.mark(id, Stage.RESOURCES_ACCEPTED)
         journal.mark(id, Stage.CONTROL_READY)
-        assertTrue(journal.report().single().contains("outcome=CONNECTED"))
+        assertTrue(journal.report().single().contains("outcome=CONTROL_READY"))
         journal.mark(id, Stage.FIRST_VIDEO_FRAME)
-        assertTrue(journal.report().single().contains("outcome=STREAMING"))
+        assertTrue(journal.report().single().contains("outcome=VIDEO_WRITING"))
+        journal.mark(id, Stage.CONTROL_READY)
+        assertTrue(journal.report().single().contains("outcome=VIDEO_WRITING"))
+        assertTrue(journal.report().single().contains("receiver_display=unknown"))
     }
 
     @Test fun registeredAndRepeatedInvitesDoNotClaimRecordOrRestartAttempt() {

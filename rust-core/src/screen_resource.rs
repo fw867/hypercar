@@ -24,10 +24,7 @@ impl ScreenSession {
         };
         let response = self.control.request("POST", "/command", &declaration,
             "application/x-apple-binary-plist", &[], Duration::from_secs(5)).await?;
-        let business = bplist::parse(&response.body).ok().and_then(|v| v.get("status").and_then(Value::as_int));
-        if response.status() != 200 || business.is_some_and(|s| s != 0) {
-            return Err(format!("{label} 初始资源声明被拒"));
-        }
+        crate::resource_trace::validate_ack(&format!("{label} RESOURCES"), &response)?;
         if self.params.id9_screen_bootstrap {
             let claim = {
                 let mut m = modes.lock();
@@ -40,10 +37,7 @@ impl ScreenSession {
             };
             let response = self.control.request("POST", "/command", &claim,
                 "application/x-apple-binary-plist", &[], Duration::from_secs(5)).await?;
-            let business = bplist::parse(&response.body).ok().and_then(|v| v.get("status").and_then(Value::as_int));
-            if response.status() != 200 || business.is_some_and(|s| s != 0) {
-                return Err("ID9 主屏资源声明被拒".into());
-            }
+            crate::resource_trace::validate_ack("ID9 SCREEN_CLAIM", &response)?;
             if let Some(event) = &self.bootstrap_event {
                 for id in &self.bootstrap_hids {
                     let body = bplist::encode(&Value::dict(vec![("type",Value::str("hidSetInputMode")),

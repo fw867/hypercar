@@ -36,6 +36,20 @@ data class PipelineDiagnostics(
     val tcpState: Int? = null,
     val tcpInfoError: Long? = null,
 ) {
+    // Wi-Fi iAP2 is an independent observation; some receivers do not use it.
+    // A sent frame never proves that a receiver has opened its CarPlay desktop.
+    val activationLabel: String get() = when {
+        !active -> "会话已结束"
+        !recordAccepted -> "等待 RECORD"
+        !resourcesAccepted -> "等待资源协商"
+        !controlReady -> "等待控制就绪"
+        videoStream == "PAUSED" -> "主屏已交还车机"
+        screenOwned != true -> "等待车机交出主屏"
+        !screenSetupAccepted -> "等待视频 SETUP"
+        !videoChannelReady -> "等待视频通道"
+        writtenFrames == 0L -> "等待首帧写出"
+        else -> "视频已写出 · 车机显示待确认"
+    }
     private fun status(success: Boolean, error: Boolean = false) = when {
         !active || generation <= 0 -> PipelineStatus.NEUTRAL
         error -> PipelineStatus.ERROR
