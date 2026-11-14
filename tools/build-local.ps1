@@ -22,12 +22,11 @@
   跳过 Rust 交叉编译（只改 Kotlin 时用，直接复用上次编好的 .so）。
 
 .PARAMETER BuildNumber
-  正式包构建号（同 CI 的 run_number）：versionName 变成 0.1.0.<N>、versionCode=10000+N。
-  本地出正式包时给一个不小于当前线上版本的号，才能覆盖安装。需要 keystore.properties。
+  旧参数已停用；本地和 CI 都读取仓库根 version.properties，不能单独指定构建号。
 
 .EXAMPLE
   pwsh -File tools\build-local.ps1
-  pwsh -File tools\build-local.ps1 -Release -BuildNumber 10500
+  pwsh -File tools\build-local.ps1 -Release
   pwsh -File tools\build-local.ps1 -SkipRust
 #>
 param(
@@ -37,6 +36,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($BuildNumber -ne 0) { throw "-BuildNumber 已停用；请统一修改 version.properties" }
 # 原生命令（cargo/gradlew）往 stderr 打进度是正常行为，别被 Stop 策略当成致命错误。
 # 统一走 Invoke-Native：临时切回 Continue、把 stderr 并进普通输出、只认退出码。
 $PSNativeCommandUseErrorActionPreference = $false
@@ -136,18 +136,11 @@ if (-not $SkipRust) {
 
 $task = if ($Release) { ':app:assembleRelease' } else { ':app:assembleDebug' }
 if ($Release -and -not (Test-Path (Join-Path $root 'keystore.properties'))) {
-  Write-Warning "没有 keystore.properties：release 产物是未签名包（app-release-unsigned.apk），装不上。"
+  throw "正式构建需要 keystore.properties"
 }
 
 $gradleArgs = @($task, '--console=plain')
-if ($BuildNumber -gt 0) {
-  # 与 CI 同一套版本号规则：versionName=0.1.0.<N>、versionCode=10000+N。
-  # 本地出正式包时给一个 ≥ 当前 CI run_number 的数字，才能覆盖安装线上包。
-  if (-not (Test-Path (Join-Path $root 'keystore.properties'))) {
-    throw "-BuildNumber 需要正式签名材料（keystore.properties），否则 Gradle 会按设计直接失败"
-  }
-  $gradleArgs += "-Phypercar.buildNumber=$BuildNumber"
-}
+if ($Release) { $gradleArgs += '-Phypercar.officialBuild=true' }
 
 Write-Host "`n==> gradlew $($gradleArgs -join ' ')" -ForegroundColor Cyan
 Push-Location $root

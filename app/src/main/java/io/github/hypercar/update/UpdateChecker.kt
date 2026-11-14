@@ -11,11 +11,9 @@ import org.json.JSONObject
 /**
  * 自动更新：读 GitHub Releases API 比较版本。
  *
- * 版本约定（见 app/build.gradle.kts 与 .github/workflows/android-ci.yml）：
- *  - CI 每次推送 `versionName = 0.1.0.<run_number>`、`versionCode = 10000 + run`
- *  - Release tag = `v0.1.0.<run_number>`，资产名 `HyperCar-<版本>-release.apk`
- * 所以「本地版本 < 最新 tag」即视为有新版本；本地 develop 构建没有 run_number
- * （`0.1.0`），因此永远会被判定为"可更新"——这是期望行为。
+ * 本地和 CI 均读取 version.properties，Release tag 为 v<versionName>。
+ * 显示版本和安装编号独立递增；更新比较使用显示版本，不从版本名推算安装编号。
+ * 重复开发构建保留当前版本，发布新代码前统一升级版本文件。
  *
  * 不引第三方 HTTP/JSON 依赖：`HttpURLConnection` + `org.json` 足够，
  * 也避免为了一个检查功能把 APK 撑大（本项目刚把体积压到 3.3MB）。
@@ -51,7 +49,7 @@ object UpdateCenter {
     private val _state = MutableStateFlow<UpdateUiState>(UpdateUiState.Idle)
     val state: StateFlow<UpdateUiState> = _state
 
-    /** 当前安装版本（带 run_number 的形式，如 0.1.0.42）。 */
+    /** 当前安装版本（来自共享版本文件）。 */
     val currentVersion: String get() = BuildConfig.VERSION_NAME
 
     val currentBuild: Int get() = BuildConfig.VERSION_CODE

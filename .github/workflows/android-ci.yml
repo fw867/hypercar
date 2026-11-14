@@ -6,9 +6,8 @@
 # app/src/main/jniLibs/arm64-v8a/libhypercar_core.so），其余发布判定/签名闸门/
 # 版本累计机制同款。
 #
-# 版本号自动累计：`appVersionName` + (run_number + 400)。
-# 本地实测包已到 489；云端 run 89 后下一版为 490，保持可覆盖安装。
-#   基础版本仍只手改 app/build.gradle.kts 的 appVersionName。
+# 版本号与安装编号统一读取仓库根 version.properties；重跑不递增。
+# 发布新版本前修改该文件并提交，本地和 CI 使用同一版本。
 #
 # 发布规则（两种触发）：
 #   1. push 且**头提交**信息含 `[release]` / `[publish]`（必须在标题**末尾**）→ 构建后发布 Release（tag = v<版本>）
@@ -27,7 +26,7 @@
 #
 # **没有 KEYSTORE_BASE64 会直接失败**，绝不退回 debug 签名：
 # debug 证书签出去的包，日后换正式证书时所有用户必须卸载重装（签名是不可逆决定）。
-# Gradle 侧还有第二道闸：传了 -Phypercar.buildNumber 却没有 keystore.properties 就构建失败。
+# Gradle 侧还有第二道闸：正式构建缺少 keystore.properties 就构建失败。
 name: Build Release APK
 
 on:
@@ -43,9 +42,6 @@ on:
 # 发布 Release 需要写权限（创建 tag / Release）
 permissions:
   contents: write
-
-env:
-  HYPERCAR_BUILD_OFFSET: '400'
 
 concurrency:
   group: build-${{ github.ref }}
@@ -169,26 +165,40 @@ jobs:
         id: version
         run: |
           set -eu
-          BASE=$(sed -n 's/^val appVersionName = "\(.*\)"/\1/p' app/build.gradle.kts)
-          test -n "$BASE" || { echo "::error::无法从 app/build.gradle.kts 读取 appVersionName"; exit 1; }
-          BUILD_NUMBER=$((GITHUB_RUN_NUMBER + HYPERCAR_BUILD_OFFSET))
-          VERSION="${BASE}.${BUILD_NUMBER}"
-          echo "base=$BASE" >> "$GITHUB_OUTPUT"
-          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
-          echo "name=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "本次版本：$VERSION（versionCode = base*10000 + ${BUILD_NUMBER}）"
+          python3 - <<'PYVERSION'
+          import os, re
+          from pathlib import Path
+          values = dict(line.strip().split("=", 1) for line in Path("version.properties").read_text().splitlines()
+                        if line.strip() and not line.lstrip().startswith("#"))
+          version = values["versionName"].strip()
+          code = int(values["versionCode"].strip())
+          if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+", version) or not 1 <= code <= 2_100_000_000:
+              raise SystemExit("Invalid version.properties")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"name={version}\ncode={code}\ntag=v{version}\n")
+          print(f"本次版本：{version}（versionCode={code}，来自 version.properties）")
+          PYVERSION
 
-      # 版本号由 build.gradle.kts 计算，传入已包含本地测试版本偏移的构建号。
+      - name: 防止发布版本号指向不同代码
+        if: steps.meta.outputs.publish == 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -eu
+          refs=$(git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}")
+          existing=$(printf '%s\n' "$refs" | awk '/\^\{\}$/ {print $1; found=1} END {if (!found) exit 1}') || existing=$(printf '%s\n' "$refs" | awk 'NF {print $1; exit}')
+          if [ -n "$existing" ] && [ "$existing" != "$GITHUB_SHA" ]; then
+            echo "::error::该版本已用于其它提交，请先递增 version.properties 中的 versionName 和 versionCode"
+            exit 1
+          fi
+
       # Windows 上生成的 gradlew 在 git 里可能没有执行位（core.fileMode=false），
       # checkout 到 Linux runner 后补一次 chmod
       - name: 构建 Release APK
-        env:
-          BUILD_NUMBER: ${{ steps.version.outputs.build_number }}
         run: |
           set -eu
           chmod +x gradlew
-          ./gradlew :app:assembleRelease "-Phypercar.buildNumber=$BUILD_NUMBER" --stacktrace
+          ./gradlew :app:assembleRelease -Phypercar.officialBuild=true --stacktrace
 
       - name: 校验签名并打包
         id: package
@@ -351,7 +361,7 @@ jobs:
 
           安装：adb install -r ${NAME}
 
-          > 使用相同正式签名且 versionCode 不低于已安装版本时可覆盖安装。CI 版本号与本地 BuildNumber 分别设置；本地测试包构建号更高时，CI 包不能直接覆盖。
+          > 使用相同正式签名且 versionCode 不低于已安装版本时可覆盖安装。本地与 CI 均读取仓库 version.properties；重复构建不递增，发布前统一升级显示版本和安装编号。
           EOF
 
           if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then

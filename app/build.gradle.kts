@@ -6,15 +6,20 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
-// ---- 版本号机制（与 CI android-ci.yml 配套）----
-// 基础版本：发布时只手改这一行。
-val appVersionName = "0.1.0"
-
-// CI 构建号：`-Phypercar.buildNumber=<run_number + workflow offset>`（CI 每次 push 传入）。
-//   versionName = 0.1.0.<N>、versionCode = base*10000 + N —— 每次推送 +1，可覆盖安装。
-// 本地不传 -P 时就是纯 base 版本（0.1.0 / 1）。
-val buildNumber: Int? = providers.gradleProperty("hypercar.buildNumber").orNull?.toIntOrNull()
-val baseVersionCode = 1
+// Local and CI builds read the same checked-in version; rebuilds never increment it.
+val releaseVersion = Properties().apply {
+    rootProject.file("version.properties").inputStream().use { load(it) }
+}
+val appVersionName = releaseVersion.getProperty("versionName")?.trim()
+    ?.takeIf { Regex("[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+").matches(it) }
+    ?: throw GradleException("version.properties 的 versionName 必须为四段数字")
+val appVersionCode = releaseVersion.getProperty("versionCode")?.trim()?.toIntOrNull()
+    ?.takeIf { it in 1..2_100_000_000 }
+    ?: throw GradleException("version.properties 的 versionCode 无效")
+if (providers.gradleProperty("hypercar.buildNumber").isPresent) {
+    throw GradleException("不再接受 hypercar.buildNumber；请统一修改仓库 version.properties")
+}
+val officialBuild = providers.gradleProperty("hypercar.officialBuild").orNull == "true"
 
 android {
     namespace = "io.github.hypercar"
@@ -28,8 +33,8 @@ android {
         // targetSdk 34：与 cardeck 一致——Android 15+ 对 mediaProjection FGS 的
         // 额外 AppOps 校验、以及悬浮窗可见性补充条款都不触发（HyperOS4 实测宽容）。
         targetSdk = 34
-        versionCode = buildNumber?.let { baseVersionCode * 10_000 + it } ?: baseVersionCode
-        versionName = buildNumber?.let { "$appVersionName.$it" } ?: appVersionName
+        versionCode = appVersionCode
+        versionName = appVersionName
 
         ndk {
             abiFilters += "arm64-v8a"
@@ -50,11 +55,10 @@ android {
     signingConfigs {
         create("release") {
             val ks = rootProject.file("keystore.properties")
-            // 第二道闸（CarDeck 同款）：CI 传了构建号（=要出正式版）却没配 keystore
-            // 材料时直接失败——绝不让「带构建号的正式版」退回 debug 签名流出去。
-            if (buildNumber != null && !ks.exists()) {
+            // CI 和本地正式包均要求签名材料；版本号只来自 version.properties。
+            if (officialBuild && !ks.exists()) {
                 throw GradleException(
-                    "收到 -Phypercar.buildNumber=$buildNumber 但仓库根没有 keystore.properties——" +
+                    "正式构建缺少 keystore.properties——" +
                         "正式签名是不可逆决定，不允许 debug 签名的「正式版」流出去（见 .github/workflows/android-ci.yml）",
                 )
             }

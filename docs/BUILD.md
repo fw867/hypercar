@@ -1,6 +1,6 @@
 # 编译、安装与发布
 
-更新：2026-11-02。当前默认分支为 `main`，使用 Android 自绘车机 UI 与 CarPlay / AirPlay。
+更新：2026-11-14。当前默认分支为 `main`，使用 Android 自绘车机 UI 与 CarPlay / AirPlay。
 自绘模式需要 Shizuku，无需安装 CarLife、CarWith 或 PC hub；CarWith 模式需要系统已安装并启用 `com.miui.carlink`。
 
 ## 构建环境
@@ -12,11 +12,11 @@
 Windows 已有 `D:\devtools` 工具链时，优先使用仓库脚本：
 
 ```powershell
-# Rust + 正式签名 APK；N 为本地构建号
-pwsh -File tools\build-local.ps1 -Release -BuildNumber <N>
+# Rust + 正式签名 APK；版本读取仓库 version.properties
+pwsh -File tools\build-local.ps1 -Release
 
 # 仅改 Kotlin / 资源，复用上次编译的 Rust 库
-pwsh -File tools\build-local.ps1 -Release -SkipRust -BuildNumber <N>
+pwsh -File tools\build-local.ps1 -Release -SkipRust
 ```
 
 脚本处理中文路径的 ASCII junction 和 Rust 产物目录。签名配置 `keystore.properties` 与密钥文件放在
@@ -30,11 +30,11 @@ cargo install cargo-ndk
 cd rust-core
 cargo ndk -t arm64-v8a -o ../app/src/main/jniLibs build --release
 cd ..
-./gradlew :app:assembleRelease -Phypercar.buildNumber=<N>
+./gradlew :app:assembleRelease -Phypercar.officialBuild=true
 ./gradlew :app:testReleaseUnitTest
 ```
 
-以上手动命令用于已配置好环境的终端。Windows 中文路径优先使用 build-local.ps1；手动运行 Gradle 时使用脚本建立的 ASCII 路径，并将 PowerShell 中的属性参数整体加引号，例如 `'-Phypercar.buildNumber=493'`。
+以上手动命令用于已配置好环境的终端。Windows 中文路径优先使用 build-local.ps1；手动运行 Gradle 时使用脚本建立的 ASCII 路径。本地与 CI 均读取仓库根 version.properties，不再传 BuildNumber 或 hypercar.buildNumber。
 
 本项目 JNI 层依赖 Unix FD，完整 Rust crate 不能直接当作通用 Windows 程序测试。需要在 Android
 执行 Rust 测试时，使用 `cargo ndk -t arm64-v8a test --release --lib --no-run`，将生成的测试可执行文件
@@ -46,8 +46,11 @@ cd ..
 adb install -r app/build/outputs/apk/release/app-release.apk
 ```
 
-覆盖安装要求相同签名且 versionCode 不低于已安装版本。CI 使用 Actions run_number，本地使用
-BuildNumber；本地构建号高于 CI 时，较低版本的 CI APK 不能直接覆盖本地包。
+覆盖安装要求相同签名且 versionCode 不低于已安装版本。本地和 CI 共用 version.properties 中的 versionName、versionCode；重复编译或工作流重跑不会递增。同步代码时同时同步版本文件，不再另设本地编号。
+
+发布新版前只修改这一份文件并提交：显示版本按发布顺序递增，安装编号也必须增加。此次统一为显示版本 0.1.0.561、安装编号 10657，以便覆盖既有本地 656；两者不再通过固定偏移换算。之后每次发布分别递增即可，本地普通重编译保持原值。
+
+同一发布标签只允许对应同一提交，CI 会拒绝用同一版本发布不同代码；修订后再次发布前须升级版本文件。普通开发构建仍可使用当前版本反复覆盖安装，不代表与之前构建的代码内容完全相同。
 
 1. 在首页引导授予必需权限：附近设备、Android 13+ 通知；Android 12/12L 另需定位权限与定位服务。打开手机蓝牙和 Wi-Fi。
 2. 选择画面来源：自绘 UI 需安装、启动 Shizuku 并成功授权 HyperCar；未安装入口打开 GitHub 最新发布页。CarWith 需系统已安装并启用 `com.miui.carlink`，不要求 Shizuku。条件未满足时不能启动连接。
@@ -80,7 +83,7 @@ H.264 level 由编码器按尺寸和帧率选择。详见 [推流检查记录](V
 - 提交标题末尾加 `[release]` 或 `[publish]`：测试通过后自动创建 GitHub Release，并附 APK。
 - 提交标题含 `[skip ci]`：跳过工作流任务；适合仅文档／截图的修改。
 - Actions 手动运行并勾选 `publish` 也必须通过测试。
-- 版本号：`appVersionName` + `github.run_number + 400`，versionCode 为 `10000 + 构建号`。
+- 版本号与安装编号：统一读取仓库根 `version.properties`，Actions 运行次数不参与计算；本地脚本也不再单独指定构建号。
 - 必需 Secrets：`KEYSTORE_BASE64`、`KEYSTORE_PASSWORD`、`KEY_ALIAS`、`KEY_PASSWORD`；可选
   `EXPECTED_CERT_SHA256`。缺失正式签名材料会失败，不会退回 debug 签名。
 - Release 说明记录当前功能、环境要求、适配限制，以及本次提交、APK 大小和 SHA-256。
