@@ -100,7 +100,7 @@ pub async fn negotiate(
     stop: Arc<Notify>,
     screen_ready: tokio::sync::mpsc::Sender<crate::screen_session::ScreenCommand>,
 ) -> Result<AirplayOutcome, String> {
-    let (mut channel, _control_inbound) = RtspChannel::spawn(read, write, None);
+    let (mut channel, mut control_inbound) = RtspChannel::spawn(read, write, None);
     emit_log(&format!("AIRPLAY: 控制连接 RTSP#{} 开始", channel.trace_id()));
 
     // 保留配对前的 best-effort 身份读取，供旧凭证公钥索引兼容使用。
@@ -185,8 +185,9 @@ pub async fn negotiate(
                 match factory.open_tcp(&p.car_ip, p.airplay_port, 5_000) {
                     Some(stream) => {
                         let (r, w) = stream.into_split();
-                        let (fresh, _rx) = RtspChannel::spawn(r, w, None);
+                        let (fresh, rx) = RtspChannel::spawn(r, w, None);
                         channel = fresh;
+                        control_inbound = rx;
                         emit_log("PAIR: 已换新控制连接");
                     }
                     None => emit_log("PAIR: ⚠ 新控制连接打开失败，沿用旧连接"),
@@ -229,8 +230,9 @@ pub async fn negotiate(
             match factory.open_tcp(&p.car_ip, p.airplay_port, 5_000) {
                 Some(stream) => {
                     let (r, w) = stream.into_split();
-                    let (fresh, _rx) = RtspChannel::spawn(r, w, None);
+                    let (fresh, rx) = RtspChannel::spawn(r, w, None);
                     channel = fresh;
+                    control_inbound = rx;
                     emit_log("PAIR: 已换新控制连接");
                 }
                 None => emit_log("PAIR: ⚠ 新控制连接打开失败，沿用旧连接（可能仍被 403 污染）"),
@@ -376,6 +378,7 @@ pub async fn negotiate(
     let wifi_iap = crate::wifi_iap2::WifiIap2::start(channel.clone(), &p.device_id, &p.device_name, stop.clone());
     let wifi_iap_id = wifi_iap.id;
     p.pipeline.lock().wifi_id=wifi_iap_id;
+    keepalive.0.push(crate::wifi_iap2::spawn_control_ingress(control_inbound, wifi_iap_id, stop.clone()));
     let initially_owned=modes.lock().screen_owned();
     p.pipeline.lock().screen_owned=Some(initially_owned);
     let screen_session=Arc::new(crate::screen_session::ScreenSession {
@@ -436,6 +439,25 @@ pub async fn negotiate(
     emit_log(&format!("TIMING: after RECORD/resource response {}",p.pipeline.lock().timing.summary()));
     p.pipeline.lock().control_ready=true;
 
+    // The successful BMW box requests transport handoff BEFORE Wi-Fi iAP2 starts.
+    // This is a one-shot request, not proof of handoff completion. Keep-session policy
+    // still separately requires Wi-Fi iAP2 readiness and fresh feedback health.
+    if box_bootstrap && !p.desktop_receiver {
+        emit_log(&format!("HANDOFF: request after RECORD/resources, before video SETUP; wifi_phase={} {}; not waiting for Wi-Fi authentication",
+            crate::wifi_iap2::phase(wifi_iap_id), crate::wifi_iap2::ingress_summary(wifi_iap_id)));
+        let result=request_bluetooth_handoff(&channel, &p.device_id,
+            || crate::wifi_iap2::is_active(wifi_iap_id), stop.clone()).await;
+        match result {
+            Some(Ok(reply)) => {
+                let business=bplist::parse(&reply.body).ok().and_then(|v|v.get("status").and_then(Value::as_int));
+                emit_log(&format!("HANDOFF: disableBluetooth rtsp_status={} business_status={business:?}; request only, keep_session_allowed={} wifi_phase={} {}",
+                    reply.status(),crate::wifi_iap2::can_keep_generation(wifi_iap_id),crate::wifi_iap2::phase(wifi_iap_id),crate::wifi_iap2::ingress_summary(wifi_iap_id)));
+            }
+            Some(Err(error)) => emit_log(&format!("HANDOFF: disableBluetooth failed: {error}; no automatic resend")),
+            None => return Err("交接请求取消或会话代次已失效".into()),
+        }
+    }
+
     // ---- 6. 屏幕流 SETUP ----
     screen_session.activated.store(true, std::sync::atomic::Ordering::Release);
     emit_log(&format!("SCREEN-LIFECYCLE: session enabled={} initial={}", p.screen_resource_lifecycle,modes.lock().diagnostics()));
@@ -450,28 +472,6 @@ pub async fn negotiate(
         screen_session.install(screen).await?;
         emit_state("connected", "控制会话与视频通道就绪；车机显示尚未确认");
     }
-    if box_bootstrap {
-        let control = channel.clone(); let stop_h = stop.clone(); let device = p.device_id.clone();
-        keepalive.0.push(tokio::spawn(async move {
-            for _ in 0..150 {
-                tokio::select! { _ = stop_h.notified() => return, _ = tokio::time::sleep(Duration::from_millis(100)) => {} }
-                if crate::wifi_iap2::can_keep_generation(wifi_iap_id) {
-                    let command = bplist::encode(&Value::dict(vec![
-                        ("type", Value::str("disableBluetooth")),
-                        ("params", Value::dict(vec![("deviceID", Value::str(&device))])),
-                    ]));
-                    emit_log("HANDOFF: Wi-Fi iAP2 ready + feedback healthy; requesting receiver Bluetooth retirement");
-                    match control.request("POST", "/command", &command, "application/x-apple-binary-plist", &[], Duration::from_secs(3)).await {
-                        Ok(reply) => emit_log(&format!("HANDOFF: disableBluetooth status={}", reply.status())),
-                        Err(e) => emit_log(&format!("HANDOFF: disableBluetooth failed: {e}; keep existing transport")),
-                    }
-                    return;
-                }
-            }
-            emit_log("HANDOFF: Wi-Fi readiness timeout; no Bluetooth retirement requested");
-        }));
-    }
-
     // ---- 9. 音频流 SETUP（会话已激活后再试；失败只记录）----
     // The phone is the resource arbiter. CatPlay marks changeModes FromAccessory;
     // sending it to BMW returned 422. Initial local ownership was already published via
@@ -508,6 +508,23 @@ pub async fn negotiate(
     })
 }
 
+/// Request the receiver's CarPlay Bluetooth retirement once. Never disable Android Bluetooth.
+async fn request_bluetooth_handoff(
+    control: &RtspChannel, device: &str, current: impl Fn() -> bool, stop: Arc<Notify>,
+) -> Option<Result<crate::rtsp::RtspMessage, String>> {
+    if !current() || control.is_closed() { return None; }
+    let body=bplist::encode(&Value::dict(vec![
+        ("type",Value::str("disableBluetooth")),
+        ("params",Value::dict(vec![("deviceID",Value::str(device))])),
+    ]));
+    let reply=tokio::select! {
+        biased;
+        _=stop.notified()=>return None,
+        reply=control.request("POST","/command",&body,"application/x-apple-binary-plist",&[],Duration::from_secs(3))=>reply,
+    };
+    if current() { Some(reply) } else { None }
+}
+
 /// 主动停止才发 TEARDOWN；EOF/断网只清理。外层超时也覆盖等待 write 锁和写 socket。
 pub(crate) async fn finish_session(control: &RtspChannel, teardown: &[u8], graceful: bool) {
     if graceful && !control.is_closed() {
@@ -533,6 +550,70 @@ mod shutdown_tests {
         let (peer, _) = server.accept().await.unwrap();
         let (r, w) = client.into_split();
         (RtspChannel::spawn(r, w, None).0, peer)
+    }
+    async fn read_request(peer: &mut tokio::net::TcpStream) -> crate::rtsp::RtspMessage {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut data=Vec::new();
+            loop {
+                let mut buf=[0;4096]; let n=peer.read(&mut buf).await.unwrap(); assert!(n>0);
+                data.extend_from_slice(&buf[..n]);
+                if let Some(msg)=crate::rtsp::parse_rtsp_messages(&mut data).unwrap().pop() { return msg; }
+            }
+        }).await.unwrap()
+    }
+    #[tokio::test]
+    async fn handoff_requests_before_wifi_auth_and_rejection_is_not_replayed() {
+        for status in [200,503] {
+            let (control,mut peer)=pair().await;
+            let server=tokio::spawn(async move {
+                let msg=read_request(&mut peer).await;
+                assert_eq!(msg.first_line,"POST /command RTSP/1.0");
+                let body=bplist::parse(&msg.body).unwrap();
+                assert_eq!(body.get("type").and_then(Value::as_str),Some("disableBluetooth"));
+                assert_eq!(body.get("params").unwrap().get("deviceID").and_then(Value::as_str),Some("current-phone"));
+                peer.write_all(format!("RTSP/1.0 {status} Result\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",msg.headers.get("cseq").unwrap()).as_bytes()).await.unwrap();
+                let mut byte=[0];
+                assert!(tokio::time::timeout(Duration::from_millis(60),peer.read(&mut byte)).await.is_err());
+            });
+            let reply=request_bluetooth_handoff(&control,"current-phone",||true,Arc::new(Notify::new())).await.unwrap().unwrap();
+            assert_eq!(reply.status(),status); server.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn stale_or_cancelled_handoff_never_writes() {
+        for stale in [true,false] {
+            let (control,mut peer)=pair().await; let stop=Arc::new(Notify::new());
+            if !stale { stop.notify_one(); }
+            assert!(request_bluetooth_handoff(&control,"test",||!stale,stop).await.is_none());
+            assert!(tokio::time::timeout(Duration::from_millis(30),peer.read(&mut [0])).await.is_err());
+        }
+    }
+    #[tokio::test]
+    async fn silent_handoff_is_bounded_and_inflight_request_can_be_cancelled() {
+        for cancel in [true,false] {
+            let (control,mut peer)=pair().await; let stop=Arc::new(Notify::new()); let signal=stop.clone();
+            let server=tokio::spawn(async move {
+                let _=read_request(&mut peer).await;
+                if cancel {signal.notify_one();}
+                tokio::time::sleep(Duration::from_millis(3300)).await;
+            });
+            let started=std::time::Instant::now();
+            let reply=tokio::time::timeout(Duration::from_millis(3200),request_bluetooth_handoff(&control,"test",||true,stop)).await.unwrap();
+            if cancel {assert!(reply.is_none());assert!(started.elapsed()<Duration::from_secs(1));}
+            else {assert!(reply.unwrap().is_err());}
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn late_handoff_reply_cannot_confirm_replaced_session() {
+        use std::sync::atomic::{AtomicBool,Ordering};
+        let (control,mut peer)=pair().await; let current=Arc::new(AtomicBool::new(true)); let flag=current.clone();
+        let server=tokio::spawn(async move {
+            let msg=read_request(&mut peer).await; flag.store(false,Ordering::SeqCst);
+            peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",msg.headers.get("cseq").unwrap()).as_bytes()).await.unwrap();
+        });
+        assert!(request_bluetooth_handoff(&control,"test",||current.load(Ordering::SeqCst),Arc::new(Notify::new())).await.is_none());
+        server.await.unwrap();
     }
     #[tokio::test]
     async fn active_session_sends_teardown_then_closes_control_after_ack() {
@@ -1578,9 +1659,8 @@ fn spawn_event_dispatcher(
                     if let Some(key)=action.and_then(crate::voice_key::message) {let _=key_tx.send(key);}
                 }
                 "iAPSendMessage" => {
-                    let data = command.get("params").and_then(|p| p.get("data")).and_then(Value::as_bytes);
-                    if let Some(data) = data.filter(|d| !d.is_empty() && d.len() <= 65535) {
-                        crate::emit_iap2_bytes(wifi_iap_id, data);
+                    if let Some(data)=crate::wifi_iap2::command_bytes(&command) {
+                        crate::wifi_iap2::receive_bytes(wifi_iap_id, data, "event");
                     } else { emit_log("WIFI-IAP: missing/oversized params.data"); }
                 }
                 "changeModes" => {
