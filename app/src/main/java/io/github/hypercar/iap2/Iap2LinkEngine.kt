@@ -101,6 +101,7 @@ class Iap2LinkEngine(
     }
 
     sealed class Event {
+        class FileTransfer(val bytes: ByteArray) : Event()
         class Control(
             val bytes: ByteArray,
         ) : Event()
@@ -116,6 +117,8 @@ class Iap2LinkEngine(
         var retransmissions: Int = 0,
         var deadlineMillis: Long = 0,
         val awaitAck: Boolean = true,
+        val sessionId: Int? = null,
+        val optional: Boolean = false,
     )
 
     var state: State = State.IDLE
@@ -301,6 +304,19 @@ class Iap2LinkEngine(
             return false
         }
         sendBacklog += Packet(0, bytes.copyOf(), awaitAck = awaitAck)
+        drainSendWindow(nowMillis)
+        return true
+    }
+
+    /** Only a file-transfer session actually negotiated by this peer may carry artwork. */
+    val fileTransferSession: Int? get() = peerSynchronization?.sessions
+        ?.firstOrNull { it.kind == 1 && it.version == 2 && it.id != controlSessionId() && it.id in 1..255 }?.id
+
+    fun sendFileTransfer(bytes: ByteArray, nowMillis: Long): Boolean {
+        val session = fileTransferSession ?: return false
+        val limit = (peerSynchronization?.maxLength ?: 0) - HEADER_BYTES - 1
+        if (state != State.NORMAL || bytes.size !in 2..limit || sendBacklog.size >= 8) return false
+        sendBacklog += Packet(0, bytes.copyOf(), sessionId = session, optional = true)
         drainSendWindow(nowMillis)
         return true
     }
@@ -530,12 +546,12 @@ class Iap2LinkEngine(
         // RFCOMM 为可靠有序流，不会丢包；序号跳变只可能是对端把 ACK/SYN 也计入了序号
         // （各家实现账法不一致）。因此接受任意前进量并推进水位，避免死锁式丢帧。
         lastReceivedInOrder = sequence
-        if (sessionId == controlSessionId()) {
+        if (sessionId == controlSessionId() || sessionId == fileTransferSession) {
             if (pendingEvents.size >= 256) {
                 die("event queue overflow")
                 return
             }
-            pendingEvents += Event.Control(payload)
+            pendingEvents += if (sessionId == controlSessionId()) Event.Control(payload) else Event.FileTransfer(payload)
         } else {
             // 上层不消费该会话，仍须累计确认且对重复帧去重，不能让对端窗口被占满。
             unknownSessionDropped++
@@ -561,7 +577,7 @@ class Iap2LinkEngine(
             sentSequence = nextSequence(sentSequence)
             packet.sequence = sentSequence
             packet.deadlineMillis = nowMillis + retransmissionTimeoutMillis
-            writePacket(packet.payload, packet.sequence, CONTROL_ACKNOWLEDGEMENT, controlSessionId())
+            writePacket(packet.payload, packet.sequence, CONTROL_ACKNOWLEDGEMENT, packet.sessionId ?: controlSessionId())
             if (!packet.awaitAck) continue // 发后不管：不追踪、不重传（见 sendControl 注释）
             val peer = peerSynchronization
             if (peer == null || peer.maxRetransmissions > 0) {
@@ -581,11 +597,17 @@ class Iap2LinkEngine(
         val next = unacknowledged.minByOrNull { it.deadlineMillis } ?: return
         next.deadlineMillis = nowMillis + retransmissionTimeoutMillis
         next.retransmissions += 1
+        if (next.optional && next.retransmissions > 1) {
+            // Artwork has its own bounded business timeout. Its loss must not kill CarPlay.
+            unacknowledged.remove(next)
+            retransmitDeadline = unacknowledged.minOfOrNull { it.deadlineMillis }
+            return
+        }
         if (next.retransmissions > maxRetransmissions) {
             die("packet ${next.sequence} not acknowledged")
             return
         }
-        writePacket(next.payload, next.sequence, CONTROL_ACKNOWLEDGEMENT, controlSessionId())
+        writePacket(next.payload, next.sequence, CONTROL_ACKNOWLEDGEMENT, next.sessionId ?: controlSessionId())
         retransmitDeadline = unacknowledged.minOfOrNull { it.deadlineMillis }
     }
 

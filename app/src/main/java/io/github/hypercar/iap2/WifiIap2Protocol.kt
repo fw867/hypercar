@@ -13,11 +13,17 @@ internal class WifiIap2Protocol(
     private val navigationCue: () -> io.github.hypercar.navigation.NavigationCue? = { null },
     private val deviceName: String = "HyperCar",
     private val onMediaKey: (Int) -> Unit = {},
+    private val nowPlayingProvider: () -> Iap2NowPlaying = { Iap2NowPlaying() },
 ) {
     private val engine = Iap2LinkEngine(reliableTransport = true, declaredWindow = 32)
     private var parser = Iap2Csm.Parser()
     private val media = Iap2MediaSession(log, onMediaKey)
+    private val nowPlaying = Iap2NowPlayingSession(nowPlayingProvider, log)
     private var navigation = RouteGuidanceSession(log)
+    private val subscriptions = Iap2StatusSubscriptions {
+        // Preserve the existing Wi-Fi bridge's power compatibility values.
+        listOf(Iap2Csm.u8(4,1), Iap2Csm.u8(5,1), Iap2Csm.u16(6,100))
+    }
     private var started = false
     private var phase = "LINK"
     private var deadline = 0L
@@ -36,7 +42,6 @@ internal class WifiIap2Protocol(
     }
     private val seen = mutableSetOf<Int>()
     private val unknown = mutableSetOf<Int>()
-    private val deferred = linkedMapOf<Int, Iap2Csm.Frame>()
     val ready: Boolean get() = phase == "READY" && !failed && engine.queuedControlPackets == 0
     var failed = false
         private set
@@ -46,6 +51,8 @@ internal class WifiIap2Protocol(
             log("LINK DETECT restart phase=$phase; reset old CSM/auth/subscriptions, retain AirPlay transport")
             parser = Iap2Csm.Parser()
             media.reset()
+            nowPlaying.reset()
+            subscriptions.reset()
             navigation = RouteGuidanceSession(log)
             phase = "LINK"
             deadline = now + 15_000
@@ -53,7 +60,6 @@ internal class WifiIap2Protocol(
             retriedCertificate = false
             seen.clear()
             unknown.clear()
-            deferred.clear()
         }
         // Metadata only: never log CSM certificate/challenge/signature payloads.
         engine.onFrameReceived = { ctl, seq, ack, session, size -> trace("RX", ctl, seq, ack, session, size) }
@@ -97,6 +103,7 @@ internal class WifiIap2Protocol(
         while (true) {
             when (val event = engine.pollEvent() ?: break) {
                 is Iap2LinkEngine.Event.Control -> parser.offer(event.bytes).forEach(::handle)
+                is Iap2LinkEngine.Event.FileTransfer -> nowPlaying.fileResponse(event.bytes, now)
                 is Iap2LinkEngine.Event.Dead -> fail(event.reason ?: "link closed")
             }
         }
@@ -106,7 +113,16 @@ internal class WifiIap2Protocol(
         }
         if (started && phase != "READY" && now > deadline) fail("phase=$phase timeout")
         if (phase == "READY" && !failed && engine.queuedControlPackets == 0 && engine.outstandingPackets < 8) {
+            subscriptions.drain().forEach { send(it.messageId, it.body) }
             navigation.updates(now, navigationEnabled(), navigationCue()).forEach { send(it.messageId, it.body) }
+            val limit = (engine.peerSynchronization?.maxLength ?: 0xffff) - Iap2LinkEngine.HEADER_BYTES - 1
+            nowPlaying.poll(now, limit, engine.fileTransferSession != null).forEach {
+                when (it) {
+                    is Iap2NowPlayingSession.Output.Control -> send(Iap2MessageIds.NOW_PLAYING_UPDATE, it.body)
+                    is Iap2NowPlayingSession.Output.File -> if (!engine.sendFileTransfer(it.bytes, now))
+                        log("NOWPLAYING file packet not queued; optional artwork will expire")
+                }
+            }
         }
         return engine.takeOutput()
     }
@@ -114,7 +130,11 @@ internal class WifiIap2Protocol(
     private fun handle(frame: Iap2Csm.Frame) {
         if (failed) return
         val id = frame.messageId
-        if (media.handle(frame)) return
+        if (media.handle(frame) || nowPlaying.handle(frame)) return
+        if (subscriptions.handle(frame)) {
+            if (phase != "READY") log("DEFER phase=$phase id=0x${id.toString(16)} until authentication completes")
+            return
+        }
         if (id == 0x1d01 && phase == "READY") {
             media.identify(Iap2Messages.parseIdentification(frame.body).hidComponents)
             send(0x1d02)
@@ -125,15 +145,6 @@ internal class WifiIap2Protocol(
             // Retain bounded per-component subscriptions, including those arriving before auth.
             // advance() emits no navigation data until READY.
             navigation.handle(frame)
-            return
-        }
-        if (id == 0xae02) {
-            deferred.remove(0xae00) // StopPowerUpdates cancels an early subscription as well.
-            return // No CSM reply defined; link ACK was already emitted.
-        }
-        if (phase != "READY" && id in listOf(0xae00, 0x4154, 0x4157, 0x4170, 0xad00, 0x5000)) {
-            deferred[id] = frame
-            log("DEFER phase=$phase id=0x${id.toString(16)} until authentication completes")
             return
         }
         when (id) {
@@ -155,7 +166,7 @@ internal class WifiIap2Protocol(
                 send(0xaa00)
             }
             0xaa01 -> if (phase == "CERTIFICATE") {
-                if (Iap2Csm.parseParams(frame.body).none { it.id == 0 && it.value.isNotEmpty() }) {
+                if (!Iap2Csm.hasNonEmptyParameter(frame.body, 0)) {
                     fail("empty certificate")
                     return
                 }
@@ -167,7 +178,7 @@ internal class WifiIap2Protocol(
                 send(0xaa02, Iap2Csm.param(0, challenge))
             }
             0xaa03 -> if (phase == "CHALLENGE") {
-                if (Iap2Csm.parseParams(frame.body).none { it.id == 0 && it.value.isNotEmpty() }) {
+                if (!Iap2Csm.hasNonEmptyParameter(frame.body, 0)) {
                     fail("empty challenge response")
                     return
                 }
@@ -176,32 +187,11 @@ internal class WifiIap2Protocol(
                 log("READY challenge response received; compatibility result only, certificate/signature not verified")
                 greetings()
                 media.authenticated()
-                val pending = deferred.values.toList()
-                deferred.clear()
-                pending.forEach(::handle)
+                nowPlaying.authenticated()
+                subscriptions.authenticated()
+
             }
             0xaa04, 0x1d03 -> fail("peer rejected id=0x${id.toString(16)}")
-            0xae00 -> if (phase == "READY") {
-                send(0xae01, Iap2Csm.u8(4, 1))
-                send(0xae01, Iap2Csm.u8(5, 1))
-                send(0xae01, Iap2Csm.u16(6, 100))
-            }
-            0x4154 -> if (phase == "READY") send(0x4155, Iap2Csm.u8(2, 0))
-            0x4157 -> if (phase == "READY") {
-                // CatPlay CommunicationsUpdate: 5..8 are bridge capabilities, 12..17 call controls.
-                // No telephony bridge is wired. Do not invent SIM/signal/registration state,
-                // advertise working call controls, or emit undefined parameter 18.
-                send(0x4158, *intArrayOf(5, 6, 7, 8, 12, 13, 14, 15, 16, 17)
-                    .map { Iap2Csm.u8(it, 0) }.toTypedArray())
-            }
-            0x4170 -> if (phase == "READY") send(0x4171, Iap2Csm.u8(0, 0), Iap2Csm.u16(2, 0), Iap2Csm.u8(5, 0), Iap2Csm.u16(7, 0))
-            // Firmware 0x63cb4..0x63cc8: AD00 -> AD01, parameter 0 (u8) = 1.
-            0xad00 -> if (phase == "READY") send(0xad01, Iap2Csm.u8(0, 1))
-            0x5000 -> if (phase == "READY") {
-                send(0x5001,
-                    Iap2Csm.group(0, Iap2Csm.u8(1, 0), Iap2Csm.u32(4, 0), Iap2Csm.u8(6, 0), Iap2Csm.u8(12, 0), Iap2Csm.u8(26, 0)),
-                    Iap2Csm.group(1, Iap2Csm.u8(0, 0), Iap2Csm.u32(1, 0), Iap2Csm.u8(5, 0), Iap2Csm.u8(6, 0), Iap2Csm.u8(7, 0), Iap2Csm.u8(16, 0)))
-            }
             // Vehicle/location/HID subscriptions still receive link ACK. Unknown payloads are not guessed.
             else -> if (unknown.add(id)) log("ACK-only id=0x${id.toString(16)} body=${frame.body.size}B")
         }
@@ -210,7 +200,6 @@ internal class WifiIap2Protocol(
     private fun greetings() {
         val zone = TimeZone.getDefault()
         send(0x4e0c, Iap2Csm.string(0, UUID.nameUUIDFromBytes(deviceId.toByteArray()).toString().uppercase()))
-        send(0xa100, Iap2Csm.param(6, ByteArray(0)))
         send(0x4e0a, Iap2Csm.string(0, "zh"))
         send(0x4e09, Iap2Csm.string(0, deviceName))
         log("device name=$deviceName")
@@ -220,8 +209,16 @@ internal class WifiIap2Protocol(
     private fun send(id: Int, vararg parts: ByteArray) {
         if (failed) return
         val body = parts.fold(ByteArray(0)) { a, b -> a + b }
-        if (!engine.sendControl(Iap2Csm.encode(id, body), now)) fail("link refused id=0x${id.toString(16)}")
-        else log("QUEUED phase=$phase id=0x${id.toString(16)} body=${body.size}B pending=${engine.queuedControlPackets} outstanding=${engine.outstandingPackets}")
+        val frame = Iap2Csm.encode(id, body)
+        val limit = (engine.peerSynchronization?.maxLength ?: 0xffff) - Iap2LinkEngine.HEADER_BYTES - 1
+        if (limit <= 0) { fail("invalid negotiated payload limit"); return }
+        var offset = 0
+        while (offset < frame.size && !failed) {
+            val end = minOf(frame.size, offset + limit)
+            if (!engine.sendControl(frame.copyOfRange(offset, end), now)) fail("link refused id=0x${id.toString(16)}")
+            offset = end
+        }
+        if (!failed) log("QUEUED phase=$phase id=0x${id.toString(16)} body=${body.size}B pending=${engine.queuedControlPackets} outstanding=${engine.outstandingPackets}")
     }
 
     private fun trace(direction: String, ctl: Int, seq: Int, ack: Int, session: Int, size: Int) {

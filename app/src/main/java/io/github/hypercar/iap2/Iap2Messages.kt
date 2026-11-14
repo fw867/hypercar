@@ -59,9 +59,10 @@ object Iap2MessageIds {
     const val MFI_AUTHENTICATION_SUCCEEDED = 0xAA05 // 手机 → 配件（自报结果）
     const val ACCESSORY_AUTHENTICATION_SERIAL_NUMBER = 0xAA06 // 配件 → 手机，认证序列号通知
 
-    // ---- 配件 bring-up 期间发来的订阅请求（接收并记录即可）----
+    // ---- 配件订阅请求（认证后按通道回复，Stop 撤销未发应答）----
     const val START_NOW_PLAYING_UPDATES = 0x5000
-    const val STOP_NOW_PLAYING_UPDATES = 0x5001
+    const val NOW_PLAYING_UPDATE = 0x5001
+    const val STOP_NOW_PLAYING_UPDATES = 0x5002
     const val START_ROUTE_GUIDANCE_UPDATES = 0x5200
     const val START_POWER_UPDATES = 0xAE00
 
@@ -106,6 +107,7 @@ object Iap2MessageIds {
             EA_CLOSE_SESSION -> "StopEASession"
             EA_SESSION_STATUS -> "EASessionStatus"
             START_NOW_PLAYING_UPDATES -> "StartNowPlayingUpdates"
+            NOW_PLAYING_UPDATE -> "NowPlayingUpdate"
             STOP_NOW_PLAYING_UPDATES -> "StopNowPlayingUpdates"
             START_ROUTE_GUIDANCE_UPDATES -> "StartRouteGuidanceUpdates"
             START_POWER_UPDATES -> "StartPowerUpdates"
@@ -205,6 +207,8 @@ object Iap2Messages {
         val ipAddresses: List<String>,
         /** 无线组内解析出的 AP（新协议车机的唯一凭据来源；旧协议为 null，用 0x5703）。 */
         val wirelessAp: WifiConfiguration?,
+        val sdkVersion: String? = null,
+        val mutualAuth: Boolean? = null,
     )
 
     /**
@@ -265,8 +269,8 @@ object Iap2Messages {
      * #3=deviceIdentifier、#4=公钥、#5=sourceVersion。
      *
      * 新协议无线组与 CarPlay Addendum 的 AccessoryWiFiConfigurationInformation 同构
-     * （0/1=SSID/密码、2=信道、3=IP、4=安全类型），但个别实现从 1 起编号——两种都兼容：
-     * 前两个「非 IP」的 NUL 结尾字符串依次当 SSID/密码，单字节字段按取值范围归类。
+     * （0/1=SSID/密码、2=信道、3=IP、4=安全类型）。另一种观察到的布局与5703一致，
+     * 依字段形态区分，不能把整个消息机械地偏移一位；6=SDKVersion、8=mutualAuth仅作诊断。
      */
     fun parseStartSession(body: ByteArray): StartSession {
         val params = Iap2Csm.parseParams(body).associateBy { it.id }
@@ -298,7 +302,7 @@ object Iap2Messages {
                 l.startsWith("feb") || l.startsWith("fc") || l.startsWith("fd")
         }
         val raw =
-            (wireless.mapNotNull { it.asStringOrNull() } + params.values.mapNotNull { it.asStringOrNull() })
+            (wireless.filter { it.id !in 0..2 }.mapNotNull { it.asStringOrNull() } + params.values.filter { it.id !in setOf(3,4,5,6,8) }.mapNotNull { it.asStringOrNull() })
                 .map { it.trim() }
                 .filter { s ->
                     (ipv4Re.matches(s) && isPrivateIpv4(s)) ||
@@ -310,7 +314,7 @@ object Iap2Messages {
         val addresses = if (raw.isNotEmpty()) {
             raw
         } else {
-            (wireless.mapNotNull { it.asStringOrNull() } + params.values.mapNotNull { it.asStringOrNull() })
+            (wireless.filter { it.id !in 0..2 }.mapNotNull { it.asStringOrNull() } + params.values.filter { it.id !in setOf(3,4,5,6,8) }.mapNotNull { it.asStringOrNull() })
                 .map { it.trim() }
                 .filter { s ->
                     ipv4Re.matches(s) ||
@@ -320,40 +324,37 @@ object Iap2Messages {
                 .sortedBy { s -> if (ipv4Re.matches(s)) 0 else 1 }
         }
         return StartSession(
-            airPlayPort = params[START_SESSION_AIRPLAY_PORT]?.asU32() ?: 0,
+            airPlayPort = params[START_SESSION_AIRPLAY_PORT]?.asU32()?.takeIf { it in 1..65535 } ?: 0,
             deviceIdentifier = params[START_SESSION_DEVICE_IDENTIFIER]?.asStringOrNull(),
-            publicKeyHex = params[START_SESSION_PUBLIC_KEY]?.asStringOrNull(),
+            publicKeyHex = params[START_SESSION_PUBLIC_KEY]?.asStringOrNull()?.trim()?.take(64)
+                ?.takeIf { it.length == 64 && it.all { c -> c in "0123456789abcdefABCDEF" } },
             sourceVersion = params[START_SESSION_SOURCE_VERSION]?.asStringOrNull(),
             ipAddresses = addresses,
             wirelessAp = parseWirelessAp(wireless),
+            sdkVersion = params[6]?.asStringOrNull()?.takeIf { it.isNotBlank() && it.all { c -> c.code in 32..126 } }?.take(128),
+            mutualAuth = params[8]?.value?.singleOrNull()?.let { it != 0.toByte() },
         )
     }
 
-    /**
-     * 从 0x4301 的无线组里解析 AP 信息（新协议车机的唯一凭据来源）。
-     * 只取「不像 IP 地址」的 NUL 结尾字符串：第一个当 SSID、第二个当密码；
-     * 单字节字段按取值范围归类（信道 1..196、安全类型 0..4），信道优先 id=2、
-     * 其次 id=4/id=3 中不是安全类型的那个。解析不出来返回 null（调用方按「无 AP」处理）。
-     */
+    /** Decode the standard wireless layout or the observed Wi-Fi-configuration layout
+     * by field shape. SSID/password strings may legally contain colons or resemble IPs. */
     fun parseWirelessAp(group: List<Iap2Csm.Param>): WifiConfiguration? {
-        val ipv4 = Regex("^\\d{1,3}(\\.\\d{1,3}){3}$")
-        val strings =
-            group
-                .sortedBy { it.id }
-                .mapNotNull { it.asStringOrNull() }
-                .filter { it.isNotEmpty() && !ipv4.matches(it) && !it.contains(':') }
-        val ssid = strings.getOrNull(0)?.takeIf { it.length <= 32 } ?: return null
-        val passphrase = strings.getOrNull(1) ?: ""
-        val singles = group.filter { it.value.size == 1 }.associate { it.id to (it.value[0].toInt() and 0xFF) }
-        val security =
-            singles[4]?.takeIf { it in 0..4 }
-                ?: singles[3]?.takeIf { it in 0..4 }
-                ?: 0
-        val channel =
-            singles[2]?.takeIf { it in 1..196 }
-                ?: singles[4]?.takeIf { it in 1..196 && it != security }
-                ?: singles[3]?.takeIf { it in 1..196 && it != security }
-                ?: 0
+        val params = group.associateBy { it.id }
+        fun text(id: Int): String? {
+            val value = params[id]?.value ?: return null
+            if (value.isEmpty() || value.last() != 0.toByte()) return null
+            val decoded = runCatching { value.decodeToString(throwOnInvalidSequence = true).trimEnd('\u0000') }.getOrNull() ?: return null
+            return decoded.takeIf { it.none { c -> c.code < 32 || c.code == 127 } }
+        }
+        val singles = group.filter { it.value.size == 1 }.associate { it.id to (it.value[0].toInt() and 255) }
+        // A: 0=SSID 1=password 2=channel 3=IP 4=security.
+        // B: 0=BSSID 1=SSID 2=password 3=security 4=channel.
+        // Shape must precede value interpretation: a B channel of 1..4 is NOT security.
+        val layoutB = text(2) != null && singles[3] in 0..4 && singles[4] in 1..196
+        val ssid = text(if (layoutB) 1 else 0)?.takeIf { it.toByteArray(Charsets.UTF_8).size in 1..32 } ?: return null
+        val passphrase = text(if (layoutB) 2 else 1) ?: return null
+        val channel = singles[if (layoutB) 4 else 2]?.takeIf { it in 1..196 } ?: 0
+        val security = singles[if (layoutB) 3 else 4]?.takeIf { it in 0..4 } ?: 0
         return WifiConfiguration(ssid = ssid, passphrase = passphrase, channel = channel, securityType = security)
     }
 
@@ -364,22 +365,12 @@ object Iap2Messages {
         Iap2Csm.u8(0, protocolId) + Iap2Csm.string(1, protocolName)
 
 
-    /**
-     * 0xAE01 PowerUpdate：**原样重放真 iPhone 的报文**（2026-10-24 HCI 抓包，BMW MGU-55）。
-     *
-     * 参数语义尚未定谳（param 0x0006 / 0x0004，值按小端浮点解释疑似「电池电压 3.66」与
-     * 「供电状态」），所以这里**不解释、不自造数值**，直接复用真机字节：
-     * 车机要的是「有正常 iOS 设备的电源上报」，而不是某个具体读数。
-     *
-     * 原始抓包（含 msgID，供核对）：
-     *   ae01 0006 0006 004f6a40 0000
-     *   ae01 0005 0004 00bd40   0000
-     * 末尾 0000 是链路帧尾，不属于消息体。
-     */
+    /** Existing Bluetooth compatibility values, NOT a live Android battery reading.
+     * Respect each captured TLV length; old constants also included 6a40/bd40 tail bytes. */
     fun powerUpdates(): List<ByteArray> = listOf(
-        byteArrayOf(0x00, 0x06, 0x00, 0x06, 0x00, 0x4f, 0x6a, 0x40),
-        byteArrayOf(0x00, 0x05, 0x00, 0x04, 0x00, 0xbd.toByte(), 0x40),
-        byteArrayOf(0x00, 0x06, 0x00, 0x06, 0x00, 0x4f, 0x6a, 0x40),
+        Iap2Csm.u16(6, 0x4f),
+        Iap2Csm.u8(4, 0),
+        Iap2Csm.u16(6, 0x4f),
     )
     /** 0x4300：无线组件（transport=1 蓝牙）+ 传输标识（本机蓝牙 MAC）。 */
     fun carPlayAvailability(bluetoothMac: String): ByteArray =

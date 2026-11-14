@@ -46,6 +46,8 @@ data class NowPlaying(
     val reason: String = "",
     val liked: Boolean = false,
     val canLike: Boolean = false,
+    val album: String = "",
+    val playbackStatus: Int = 0,
 )
 
 class MusicNotificationListener : NotificationListenerService() {
@@ -782,6 +784,12 @@ object MusicBridge {
             title = title,
             artist = artist,
 
+            album = md?.getString(MediaMetadata.METADATA_KEY_ALBUM).orEmpty(),
+            playbackStatus = when (ps?.state) {
+                PlaybackState.STATE_PLAYING, PlaybackState.STATE_FAST_FORWARDING, PlaybackState.STATE_REWINDING -> 1
+                PlaybackState.STATE_PAUSED, PlaybackState.STATE_BUFFERING, PlaybackState.STATE_CONNECTING -> 2
+                else -> 0
+            },
             albumArt = art,
             playing = ps?.state == PlaybackState.STATE_PLAYING,
             positionMs = positionOf(ps),

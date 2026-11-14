@@ -36,6 +36,7 @@ object WifiIap2Bridge {
             navigationEnabled = { HyperCarRepo.hudNavigationAllowed },
             navigationCue = { io.github.hypercar.navigation.NavigationSources.snapshot() },
             deviceName = deviceName,
+            nowPlayingProvider = Iap2NowPlayingSource::snapshot,
             onMediaKey = { usage -> HyperCarRepo.onIap2MediaKey(usage) { isCurrent(id) } })
         val thread = Thread({
             var readyReported = false

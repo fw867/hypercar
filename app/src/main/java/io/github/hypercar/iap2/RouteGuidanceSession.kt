@@ -54,7 +54,6 @@ internal class RouteGuidanceSession(private val log: (String) -> Unit) {
         if (subscribers.isEmpty()) { published = false; previous = null; return emptyList() }
         val current = cue.takeIf { enabled }
         // When scope/source disappears send one no-route update to clear the old arrow.
-        if (!enabled && !published) return emptyList()
         if (now < nextUpdate || (!dirty && published && current == previous && enabled == previousEnabled)) return emptyList()
         val frames = mutableListOf<Iap2Csm.Frame>()
         for ((component, subscription) in subscribers) {

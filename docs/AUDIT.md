@@ -13,7 +13,7 @@
 - 手机系统交叉验证：Bluetooth历史10:31:47.480宝马A2DP CONNECTED，10:31:59.940/59.958断开；HFP随后断开，之后保留新的RFCOMM链路（10:32:01至10:34:09）。AVRCP Target的BTAudio Media Key Events为空。需核实媒体键是否要求AVRCP、其它控制通道或能力/订阅初始化；不能仅凭A2DP断开认定AVRCP就是宝马唯一通路，也不能强制恢复A2DP作为已证实修复。档案仍dropHfpA2dp=false，应用链路退出local_cancel=false，谁触发配置文件退出缺少完整HCI依据。
 - 语音输入：10:32:59、10:33:05、15、38、50这五次为Prewarm=1→约750ms后Down=2→Up=3，均进入phone-assistant；10:33:23.647→24.042为只有1/3的短按，不启动是当前协议规则，不能把Prewarm当正式按下。系统logcat对应五次keycode219 down/up、VoiceInteractionManager.showSessionForActiveService；当时screenOn=true、keyguardActive=false，故这五次没有证据支持锁屏拦截。默认助手确为小爱AssistInteractionService。同一手机ADB执行现有input keyevent219后mShown由false变true，验证手机端助手可唤起；不证明车内当时已识别或执行口令。自绘代码没有助手界面投到副屏、语音识别结果桥接或车机麦克风上行，当前仅唤醒手机助手并用手机麦克风，不能按完整CarPlay Siri体验验收。
 - 今日错误：crash buffer 10:29:36/37是com.android.mms:mms_service、libRcsStack.so，FORTIFY FD_SET descriptor1068>=1024。HyperCar exit-info无今早崩溃/ANR，最近记录为01:41系统OneKeyClean。短信RCS原生崩溃不能当作HyperCar或语音助手崩溃；与车机网络切换是否有关尚无因果证据。
-- 额外目录校准：CatPlay同一固定版本明确0x5001=NowPlayingUpdate、0x5002=StopNowPlayingUpdates、0x5003=SetNowPlayingInformation。本项目Iap2Messages的STOP_NOW_PLAYING_UPDATES=0x5001及名称诊断有误，目前未作为实际订阅停止处理；该误标不是本次已观察的切歌根因。不能将这三条消息直接映射为下一曲。
+- 额外目录校准：CatPlay同一固定版本明确0x5001=NowPlayingUpdate、0x5002=StopNowPlayingUpdates、0x5003=SetNowPlayingInformation。当时本项目Iap2Messages误将STOP_NOW_PLAYING_UPDATES标为0x5001，尚未作为实际订阅停止处理；563已校正并补齐媒体信息及封面同步。该误标不是本次已观察的切歌根因。不能将这三条消息直接映射为下一曲。
 
 本轮完成分析、合并和手机只读采样（另做一次现有语音唤醒命令的可逆验证），未改协议、配对或网络，也未编译新APK。下一步媒体方向需取得宝马按键实际控制通道及初始化证据，再决定实现；语音若需要车机内可见/可交互，需要另行接入助手展示/结果及麦克风，不能只依靠219的命令返回值。
 

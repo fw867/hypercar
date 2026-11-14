@@ -22,7 +22,11 @@ class RouteGuidanceSessionTest {
     @Test fun requiresSubscriptionAndScope() {
         val s = RouteGuidanceSession {}
         assertTrue(s.updates(0, true, cue).isEmpty())
-        s.handle(start(42)); assertTrue(s.updates(1, false, cue).isEmpty())
+        s.handle(start(42))
+        val idle = s.updates(1, false, cue).single()
+        assertEquals(0x5201,idle.messageId)
+        assertArrayEquals(byteArrayOf(0),fields(idle)[1])
+        assertTrue(s.updates(2000,false,cue).isEmpty())
     }
     @Test fun realComponentAndManeuverBeforeReference() {
         val s = RouteGuidanceSession {}; s.handle(start(0x1234))

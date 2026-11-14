@@ -110,7 +110,12 @@ object SettingsStore {
         get() = p().getBoolean("bluetooth_carplay_marker", true)
         set(v) = p().edit().putBoolean("bluetooth_carplay_marker", v).apply()
 
-    /** 实验：已配对车机 Wi-Fi 上不等邀请，主动建立 AirPlay / Wi-Fi iAP2。 */
+    /** Restore the pre-recovery-only path as a separate opt-in, without changing existing installs. */
+    var proactiveWifiReconnect: Boolean
+        get() = p().getBoolean("proactive_wifi_reconnect", false)
+        set(v) = p().edit().putBoolean("proactive_wifi_reconnect", v).apply()
+
+    /** 实验：本次已正常工作的连接意外中断后，在短窗口内主动恢复。 */
     var proactiveWifiSession: Boolean
         get() = p().getBoolean("proactive_wifi_session", false)
         set(v) = p().edit().putBoolean("proactive_wifi_session", v).apply()

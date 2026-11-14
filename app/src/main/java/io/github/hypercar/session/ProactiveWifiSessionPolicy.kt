@@ -1,11 +1,17 @@
 package io.github.hypercar.session
 
-/** Opt-in repair only with a recent interrupted-session grant; pairing alone grants nothing. */
+/** Two independent opt-ins share receiver/network checks, never another peer or manual pause. */
 internal object ProactiveWifiSessionPolicy {
     const val DELAY_MILLIS = 10_000L
+    enum class Mode { INVITATION_ONLY, KNOWN_NETWORK, INTERRUPTION_RECOVERY }
+    fun mode(knownNetworkStart: Boolean, interruptionRecovery: Boolean, recoveryAllowed: Boolean): Mode = when {
+        interruptionRecovery && recoveryAllowed -> Mode.INTERRUPTION_RECOVERY
+        knownNetworkStart -> Mode.KNOWN_NETWORK
+        else -> Mode.INVITATION_ONLY
+    }
     fun allows(enabled: Boolean, receiver: String?, activePeer: String?, networkBound: Boolean,
-        recoveryAllowed: Boolean = false): Boolean =
-        enabled && recoveryAllowed && networkBound && PairingEvidence.receiverKey(receiver) != null &&
+        recoveryAllowed: Boolean = false, knownNetworkStart: Boolean = false, paused: Boolean = false): Boolean =
+        enabled && !paused && (recoveryAllowed || knownNetworkStart) && networkBound && PairingEvidence.receiverKey(receiver) != null &&
             (activePeer == null || receiver.equals(activePeer, ignoreCase = true))
 
     fun rememberedEndpoint(value: String, ssid: String?, desktopReceiver: Boolean = false): Pair<String, Int>? {

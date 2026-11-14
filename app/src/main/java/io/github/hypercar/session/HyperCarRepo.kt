@@ -1339,7 +1339,7 @@ object HyperCarRepo {
                 } else {
                     knownWifiRetry.failed(failedNetwork, failedReceiver, failedAt, activationClosed, failedWake)
                 }
-                val retryEligible = proactiveWifiSessionAllowed(context, SettingsStore.proactiveWifiSession)
+                val retryEligible = proactiveWifiSessionAllowed(context)
                 val retryDelay = scheduledDelay.takeIf { retryEligible }
                 // Keep only a scoped hint. It remains gated by ready() until a fresh wake
                 // actually reserves recovery; no TCP probe or full subnet rescan while blocked.
@@ -1477,12 +1477,22 @@ object HyperCarRepo {
                     continue@activation
                 }
                 // ---- 连 AirPlay 控制端口并移交 FD ----
-                if (endpoint.proactive && !endpoint.fromInvite && usableCtrlInvitation(advertiser)?.host != apHost &&
-                    (!proactiveWifiSessionAllowed(context, SettingsStore.proactiveWifiSession) ||
-                        !wifiSessionRecovery.reserve(retryReceiver(), currentWifiSsid(context), SystemClock.elapsedRealtime()))) {
-                    log("WIFI-RECOVERY: 无本次正常连接中断凭证或恢复窗口/次数已耗尽；等待车机邀请")
-                    waitForInvitation("等待车机邀请（首次连接不主动推流）", null)
-                    continue@activation
+                var knownNetworkActivation = false
+                if (endpoint.proactive && !endpoint.fromInvite && usableCtrlInvitation(advertiser)?.host != apHost) {
+                    val mode = proactiveWifiSessionMode(context)
+                    val reserved = when (mode) {
+                        ProactiveWifiSessionPolicy.Mode.KNOWN_NETWORK -> true
+                        ProactiveWifiSessionPolicy.Mode.INTERRUPTION_RECOVERY ->
+                            wifiSessionRecovery.reserve(retryReceiver(), currentWifiSsid(context), SystemClock.elapsedRealtime())
+                        ProactiveWifiSessionPolicy.Mode.INVITATION_ONLY -> false
+                    }
+                    if (!reserved) {
+                        log("WIFI-ACTIVE: 主动授权已失效或中断恢复预算耗尽；等待车机邀请")
+                        waitForInvitation("等待车机邀请（主动连接条件未满足）", null)
+                        continue@activation
+                    }
+                    knownNetworkActivation = mode == ProactiveWifiSessionPolicy.Mode.KNOWN_NETWORK
+                    log("WIFI-ACTIVE: 开始候选连接 mode=$mode；端口可连不代表车机接受投屏")
                 }
                 push(link = LinkState.Negotiating("连接车机 AirPlay 端口"))
                 val carNetworkSsid = currentWifiSsid(context)
@@ -1499,6 +1509,12 @@ object HyperCarRepo {
                 val port = connected.target.port
                 val controlFd = connected.socket
                 val activationInvite = usableCtrlInvitation(advertiser)
+                if (knownNetworkActivation && (!SettingsStore.proactiveWifiReconnect || !proactiveWifiSessionAllowed(context)) &&
+                    activationInvite?.host != apHostFinal) {
+                    runCatching { ParcelFileDescriptor.adoptFd(controlFd).close() }
+                    waitForInvitation("主动连接开关或网络条件已变化，等待车机邀请", null)
+                    continue@activation
+                }
                 if (headUnitProfile.requireFreshCtrlInvite && activationInvite?.host != apHostFinal) {
                     runCatching { ParcelFileDescriptor.adoptFd(controlFd).close() }
                     waitForInvitation("连接期间车机邀请失效，已关闭候选 socket，等待新邀请", null)
@@ -2612,14 +2628,34 @@ object HyperCarRepo {
             ?: endpoint.gateway?.takeIf { it.isNotBlank() }
     }
 
-    private suspend fun proactiveWifiSessionAllowed(context: Context, enabled: Boolean): Boolean {
-        if (!enabled || !HeadUnitActivationPolicy.permitsProactive(headUnitProfile)) return false
+    /** Live opt-ins are checked both while discovering and before consuming a socket. */
+    private suspend fun proactiveWifiSessionMode(context: Context): ProactiveWifiSessionPolicy.Mode {
+        val none = ProactiveWifiSessionPolicy.Mode.INVITATION_ONLY
+        val knownStart = SettingsStore.proactiveWifiReconnect
+        val recoveryEnabled = SettingsStore.proactiveWifiSession
+        if ((!knownStart && !recoveryEnabled) || !HeadUnitActivationPolicy.permitsProactive(headUnitProfile) ||
+            !sessionLive.get() || userDisconnectRequested) return none
         val ssid = currentWifiSsid(context)
         val receiver = knownWifiReceiver(ssid)
         val network = ssid?.let { knownWifiNetwork(context, it) }
-        return ProactiveWifiSessionPolicy.allows(enabled, receiver, iap2?.activePeerAddress,
+        val recoveryAllowed = recoveryEnabled && wifiSessionRecovery.allows(
+            "${headUnitProfile.id}:${PairingEvidence.receiverKey(receiver)}", ssid, SystemClock.elapsedRealtime())
+        val mode = ProactiveWifiSessionPolicy.mode(knownStart, recoveryEnabled, recoveryAllowed)
+        val allowed = ProactiveWifiSessionPolicy.allows(mode != none, receiver, iap2?.activePeerAddress,
             network != null && network == boundNetwork && receiver == wifiReceiverMac,
-            recoveryAllowed = wifiSessionRecovery.allows("${headUnitProfile.id}:${PairingEvidence.receiverKey(receiver)}", ssid, SystemClock.elapsedRealtime()))
+            recoveryAllowed = mode == ProactiveWifiSessionPolicy.Mode.INTERRUPTION_RECOVERY,
+            knownNetworkStart = mode == ProactiveWifiSessionPolicy.Mode.KNOWN_NETWORK,
+            paused = automaticPauseRemaining > 0)
+        return if (allowed) mode else none
+    }
+
+    private suspend fun proactiveWifiSessionAllowed(context: Context): Boolean =
+        proactiveWifiSessionMode(context) != ProactiveWifiSessionPolicy.Mode.INVITATION_ONLY
+
+    fun onProactiveWifiOptionsChanged() {
+        // A known Wi-Fi network may already be available; do not require a new network edge.
+        // This does not start anything with automatic mode off or during the manual pause.
+        queueWifiReconnectCheck()
     }
 
     private suspend fun probeRememberedEndpoint(
@@ -2677,19 +2713,20 @@ object HyperCarRepo {
         // BMW's second-entry box trace still obtains Bluetooth credentials and a fresh ctrl invite.
         // Retain the network/identity shortcut, but never confuse a remembered/open port with activation.
         val profileRequiresActivation = headUnitProfile.requireAirplayActivation
-        val proactiveEnabled = SettingsStore.proactiveWifiSession && HeadUnitActivationPolicy.permitsProactive(headUnitProfile)
         val proactiveDelay = ProactiveWifiSessionDelay()
         suspend fun proactiveReady(): Boolean {
-            val eligible = proactiveWifiSessionAllowed(context, proactiveEnabled && SettingsStore.proactiveWifiSession)
+            val mode = proactiveWifiSessionMode(context)
+            val eligible = mode != ProactiveWifiSessionPolicy.Mode.INVITATION_ONLY
             if (!sessionLive.get() || connectionAttemptId != diagnosticId || ctrlAdvertiser !== advertiser ||
                 iap2 !== coordinator) return false
             val now = SystemClock.elapsedRealtime()
             val network = boundNetwork?.toString()
             val receiver = wifiReceiverMac
-            val immediate = eligible && wifiSessionRecovery.firstAttempt(retryReceiver(), currentWifiSsid(context), now)
+            val immediate = mode == ProactiveWifiSessionPolicy.Mode.INTERRUPTION_RECOVERY &&
+                wifiSessionRecovery.firstAttempt(retryReceiver(), currentWifiSsid(context), now)
             val stable = proactiveDelay.ready(eligible, network, now, immediate = immediate)
             if (!stable) return false
-            if (!invitationOnly) return true // recent interruption still required; first/manual start grants none
+            if (!invitationOnly) return true // Explicit known-network opt-in or a verified interruption grant.
             // Do not spend a recovery reservation on an invitation/endpoint already available.
             if (usableCtrlInvitation(advertiser) != null || standbyEndpoint.get() != null) return false
             if (immediate) return true // only the first repair of a verified interrupted session
@@ -2708,9 +2745,11 @@ object HyperCarRepo {
         prepareInvitationNetwork(context, advertiser)
         var requireActivation = (invitationOnly || profileRequiresActivation) && !proactiveReady()
         if (invitationOnly || profileRequiresActivation) awaitingCarInvitation = true
-        log("WIFI-ACTIVE: 中断恢复开关=$proactiveEnabled 首次恢复立即尝试，后续稳定延时=${ProactiveWifiSessionPolicy.DELAY_MILLIS}ms；仅本次正常邀请且已有视频写出后意外中断可用，窗口120s/最多5次；首轮及超时重连等待邀请")
+        log("WIFI-ACTIVE: 已知网络主动连接=${SettingsStore.proactiveWifiReconnect} 中断恢复=${SettingsStore.proactiveWifiSession}；主动连接需网络稳定10s，短时中断恢复保持120s/最多5次，车机邀请优先")
         if (requireActivation) {
-            if (KnownWifiWaitCopy.waitsForHeadUnitEndpoint(headUnitProfile.id)) {
+            if (SettingsStore.proactiveWifiReconnect && HeadUnitActivationPolicy.permitsProactive(headUnitProfile)) {
+                push(link = LinkState.Negotiating("等待已配对车机 Wi-Fi 稳定后主动连接"))
+            } else if (KnownWifiWaitCopy.waitsForHeadUnitEndpoint(headUnitProfile.id)) {
                 log(KnownWifiWaitCopy.endpointOpening())
                 push(link = LinkState.Negotiating(KnownWifiWaitCopy.ENDPOINT_STEP))
             } else {
@@ -2789,7 +2828,7 @@ object HyperCarRepo {
                     val waitBefore = requireActivation
                     requireActivation = (invitationOnly || profileRequiresActivation) && !proactiveReady()
                     if (waitBefore && !requireActivation) {
-                        log("WIFI-RECOVERY: 本次正常连接意外中断，恢复条件已满足，尝试限时恢复；首次不等待10s，新邀请优先")
+                        log("WIFI-ACTIVE: 主动尝试条件已满足 mode=${proactiveWifiSessionMode(context)}；已配对/网络归属核验通过，新邀请仍优先")
                         val remembered = probeRememberedEndpoint(context, coordinator, true)
                         if (advertiser.lastInvitePeerIp != null) continue
                         if (proactiveReady()) {

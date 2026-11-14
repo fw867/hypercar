@@ -156,6 +156,13 @@ object Iap2Csm {
         return params
     }
 
+    /** Authentication data cannot be accepted from a partial TLV or duplicate parameter. */
+    fun hasNonEmptyParameter(body: ByteArray, id: Int): Boolean {
+        val params = parseParams(body)
+        return params.sumOf { it.value.size + 4 } == body.size &&
+            params.singleOrNull { it.id == id }?.value?.isNotEmpty() == true
+    }
+
     fun u32Bytes(value: Long): ByteArray =
         byteArrayOf(
             (value ushr 24).toByte(),

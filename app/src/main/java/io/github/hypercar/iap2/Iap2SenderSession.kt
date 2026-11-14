@@ -33,6 +33,10 @@ interface Iap2LinkChannel {
     val closeReason: String? get() = null
     val isCancelled: Boolean get() = false
 
+    val supportsFileTransfer: Boolean get() = false
+    val canQueueMedia: Boolean get() = true
+    fun recvFileTransfer(): ByteArray? = null
+    fun sendFileTransfer(bytes: ByteArray): Boolean = false
     fun close()
 }
 
@@ -84,10 +88,13 @@ class Iap2SenderSession(
     private val navigationEnabled: () -> Boolean = { false },
     private val navigationCue: () -> io.github.hypercar.navigation.NavigationCue? = { null },
     private val onMediaKey: (Int) -> Unit = {},
+    private val nowPlayingProvider: () -> Iap2NowPlaying = { Iap2NowPlaying() },
 ) {
     private var parser = Iap2Csm.Parser()
     private val media = Iap2MediaSession(log, onMediaKey)
+    private val nowPlaying = Iap2NowPlayingSession(nowPlayingProvider, log)
     private val navigation = RouteGuidanceSession(log)
+    private val subscriptions = Iap2StatusSubscriptions()
     private var phaseName = "IDLE"
     private var phaseStarted = nanoTime()
     private var tracedReceivedFrames = 0
@@ -113,7 +120,6 @@ class Iap2SenderSession(
     private val pendingFrames = ArrayDeque<Iap2Csm.Frame>()
 
     /** 是否已经打过「开始回应电源更新」的日志（车机周期发 0xAE00，日志只留第一条）。 */
-    private var powerUpdateReplied = false
 
     /** 暂存区上限：车机订阅类消息可能在长等待期间持续到达，无上限会吃内存。 */
     private val maxPendingFrames = 256
@@ -238,14 +244,15 @@ class Iap2SenderSession(
         // ---- MFi（跳过校验：0xAA05 自报成功）----
         enterPhase("MFI_EXCHANGE")
         val identityText = listOfNotNull(ident.name, ident.model, ident.manufacturer).joinToString(" ").lowercase()
-        send(Iap2MessageIds.MFI_REQUEST_CERTIFICATE)
-        val certificate = expect(Iap2MessageIds.MFI_CERTIFICATE, deadline)
+        val certificate = requestCertificate(ident, deadline)
         log("iap2 rx=0xaa01 certificate bytes=${certificate.body.size}（跳过校验）")
         val mfiResult = runMfiChallenge(deadline, receiverKey = MfiLengthMemory.receiverKey(identityText, receiverAddress))
         ensureActive("MFi 结果发送前")
         send(Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED)
         log("iap2 tx=0xaa05 compatibility-result=$mfiResult（未做证书/签名验证，不代表标准认证通过）")
         media.authenticated()
+        nowPlaying.authenticated()
+        subscriptions.authenticated()
 
         // 0x5702 与 0x4E0D 的先后只在这条链上调整：会发 0x5702 的车先发请求，再发可用性。
         // 不发 0x5702 的车仍在问候里带上 0x4E0D。两条的正文都不改。
@@ -541,10 +548,6 @@ class Iap2SenderSession(
         var repeatCount = 0
         while (true) {
             // 空闲轮询间隔要短于重探周期：否则「保活期一个包都不来」时永远轮不到重探
-            navigation.updates(nanoTime() / 1_000_000,
-                navigationEnabled(), navigationCue()).forEach {
-                sendFireAndForget(it.messageId, it.body)
-            }
             val frame = recvFrame(IDLE_POLL_MILLIS)
             if (frame == null) {
                 if (!channel.isAlive) break
@@ -561,17 +564,6 @@ class Iap2SenderSession(
                 Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION -> handleLateWifiConfiguration(frame)
                 Iap2MessageIds.EA_SESSION_STATUS -> handleEaSessionStatus(frame, phase1 = false)
                 Iap2MessageIds.IDENTIFICATION_INFORMATION -> handleReidentification(frame)
-                // 车机要「电源更新」：真 iPhone 会回 3 条 0xAE01（HCI 实测），我们此前从不回。
-                // 只回一次就够（车机周期发 0xAE00，我们也跟着周期回），避免刷屏。
-                Iap2MessageIds.START_POWER_UPDATES -> {
-                    if (!powerUpdateReplied) {
-                        powerUpdateReplied = true
-                        log("iap2 rx=0xae00 StartPowerUpdates → 回 3 条 0xae01 PowerUpdate（对齐真 iPhone）")
-                    }
-                    for (body in Iap2Messages.powerUpdates()) {
-                        runCatching { sendFireAndForget(Iap2MessageIds.POWER_UPDATE, body) }
-                    }
-                }
                 else -> Unit
             }
             // 未知消息的报文结构只能靠原始体定谳；每个 id 只 dump 一次
@@ -732,29 +724,8 @@ class Iap2SenderSession(
                     "(${Iap2MessageIds.nameOf(frame.messageId)})，非预期，暂存待后续消费",
             )
             dumpBodyOnce(frame)
-            // 0xAE00 在 Phase 1 的等待窗口里也会到（车机一问就要答）；
-            // 若只靠主循环的 when 分支，第一条就被暂存区吞掉了——这里直接回。
-            if (frame.messageId == Iap2MessageIds.START_POWER_UPDATES) {
-                replyPowerUpdates()
-            }
             pendingFrames += frame
             if (pendingFrames.size > maxPendingFrames) pendingFrames.removeFirst()
-        }
-    }
-
-    /**
-     * 回 0xAE01 PowerUpdate（3 条，与真 iPhone 一致）。
-     *
-     * 车机在 MFi 通过后立刻发 0xAE00 要电源状态；真 iPhone 回 3 条、我们此前一条不回。
-     * 报文来自真机抓包（见 `Iap2Messages.powerUpdates`），只重放不自造数值。
-     */
-    private fun replyPowerUpdates() {
-        if (!powerUpdateReplied) {
-            powerUpdateReplied = true
-            log("iap2 rx=0xae00 StartPowerUpdates → 回 3 条 0xae01 PowerUpdate（对齐真 iPhone）")
-        }
-        for (body in Iap2Messages.powerUpdates()) {
-            runCatching { sendFireAndForget(Iap2MessageIds.POWER_UPDATE, body) }
         }
     }
 
@@ -785,11 +756,16 @@ class Iap2SenderSession(
     ): CarPlayEndpoint {
         logStartSessionRaw(frame)
         val parsed = Iap2Messages.parseStartSession(frame.body)
+        if (lastStartSession == null || parsed.sdkVersion != lastStartSession?.sdkVersion ||
+            parsed.mutualAuth != lastStartSession?.mutualAuth) {
+            log("iap2 START_SESSION sdk=${parsed.sdkVersion ?: "not-declared"} mutualAuth=${parsed.mutualAuth?.toString() ?: "not-declared"}; observation only, not authentication success")
+        }
         lastStartSession = parsed
-        // 新协议车机：0x4301 无线组是唯一的 AP 来源——解析出来就缓存，供端点合成
-        if (wifi == null && parsed.wirelessAp != null) {
+        // A newly supplied AP supersedes earlier credentials; absent AP keeps the latest 5703.
+        if (parsed.wirelessAp != null) {
+            val changed = wifi != parsed.wirelessAp
             wifi = parsed.wirelessAp
-            log("iap2 0x4301 自带 AP：ssid=${parsed.wirelessAp.ssid}——已缓存")
+            if (changed) log("iap2 0x4301 自带 AP 已更新（不记录热点名称/密码）")
         }
         val endpoint = endpointOf(parsed, wifi)
         if (endpointEmitted && endpoint.hashCode() == lastLateStartSessionSignature) {
@@ -837,6 +813,32 @@ class Iap2SenderSession(
         )
 
     // ---- MFi 挑战 ----
+
+    /** AA06 may precede AA01. One follow-up request, with the original deadline unchanged. */
+    private fun requestCertificate(ident: Iap2Messages.Identification, deadline: Long): Iap2Csm.Frame {
+        if (ident.declaresSend(Iap2MessageIds.ACCESSORY_AUTHENTICATION_SERIAL_NUMBER) == true)
+            send(Iap2MessageIds.MFI_REQUEST_CERTIFICATE, Iap2Csm.param(0, byteArrayOf()))
+        else send(Iap2MessageIds.MFI_REQUEST_CERTIFICATE)
+        var followedSerial = false
+        while (true) {
+            val frame = expectAnyOrNull(setOf(Iap2MessageIds.MFI_CERTIFICATE,
+                Iap2MessageIds.ACCESSORY_AUTHENTICATION_SERIAL_NUMBER,
+                Iap2MessageIds.MFI_AUTHENTICATION_FAILED, Iap2MessageIds.IDENTIFICATION_REJECTED), deadline)
+                ?: throw IOException("等待 MFi 证书超时")
+            when (frame.messageId) {
+                Iap2MessageIds.MFI_CERTIFICATE -> {
+                    if (!Iap2Csm.hasNonEmptyParameter(frame.body, 0)) throw IOException("MFi 证书缺少完整参数")
+                    return frame
+                }
+                Iap2MessageIds.ACCESSORY_AUTHENTICATION_SERIAL_NUMBER -> if (!followedSerial) {
+                    followedSerial = true
+                    send(Iap2MessageIds.MFI_REQUEST_CERTIFICATE)
+                    log("iap2 rx=0xaa06 → 请求完整证书（不延长认证预算）")
+                }
+                else -> throw IOException("MFi 证书阶段被拒 id=0x${frame.messageId.toString(16)}")
+            }
+        }
+    }
 
     private enum class MfiResult { RESPONSE_RECEIVED_UNVERIFIED, TIMEOUT_COMPATIBILITY }
 
@@ -894,6 +896,7 @@ class Iap2SenderSession(
                 }
                 when (frame.messageId) {
                     Iap2MessageIds.MFI_RESPONSE -> {
+                        if (!Iap2Csm.hasNonEmptyParameter(frame.body, 0)) throw IOException("MFi 响应缺少完整签名参数")
                         log("iap2 rx=0xaa03 signature bytes=${frame.body.size}（跳过校验）")
                         gotResponse = true
                     }
@@ -1113,7 +1116,8 @@ class Iap2SenderSession(
     private fun recvFrame(timeoutMillis: Long): Iap2Csm.Frame? {
         while (pendingFrames.isNotEmpty()) {
             val frame = pendingFrames.removeFirst()
-            if (media.handle(frame)) continue
+            if (frame.messageId == Iap2MessageIds.IDENTIFICATION_REJECTED) throw IOException("车机拒绝 iAP2 设备识别")
+            if (media.handle(frame) || nowPlaying.handle(frame) || subscriptions.handle(frame) || navigation.handle(frame)) continue
             return frame
         }
         return recvNewFrame(timeoutMillis)
@@ -1126,6 +1130,7 @@ class Iap2SenderSession(
             if (Thread.currentThread().isInterrupted || channel.isCancelled) throw InterruptedIOException("iAP2 接收已取消")
             if (receivedFrames.isNotEmpty()) {
                 val frame = receivedFrames.removeFirst()
+                if (frame.messageId == Iap2MessageIds.IDENTIFICATION_REJECTED) throw IOException("车机拒绝 iAP2 设备识别")
                 if (frame.messageId == Iap2MessageIds.IDENTIFICATION_INFORMATION && peerIdentification != null) {
                     // Late identity can be queued by a Wi-Fi/credential wait. Its capability
                     // boundary must precede the following StartHID, not wait for the keepalive pump.
@@ -1133,17 +1138,24 @@ class Iap2SenderSession(
                 }
                 // Consume in wire order: Identification must configure the component before
                 // the following StartHID in the SAME read is registered.
-                if (media.handle(frame)) continue
+                if (media.handle(frame) || nowPlaying.handle(frame) || subscriptions.handle(frame) || navigation.handle(frame)) continue
                 return frame
             }
             val remaining = (deadline - nanoTime()) / 1_000_000L
             if (remaining <= 0) return null
-            val bytes = channel.recvControl(remaining) ?: return null
+            serviceControlUpdates()
+            val bytes = channel.recvControl(minOf(remaining, if (nowPlaying.hasFileWork) 100L else 1_000L))
+            if (bytes == null) {
+                if (!channel.isAlive || nanoTime() >= deadline) return null
+                continue
+            }
             if (bytes.isEmpty()) {
                 parser = Iap2Csm.Parser()
                 receivedFrames.clear()
                 pendingFrames.clear()
                 media.restartLink()
+                nowPlaying.restartLink()
+                subscriptions.restartLink()
                 log("iap2 LINK DETECT restart: 清除旧 CSM 分片；保留 RFCOMM 和当前业务等待")
                 return null
             }
@@ -1155,6 +1167,28 @@ class Iap2SenderSession(
                     log("RX: 逐帧摘要达到 192 条，后续保留阶段/错误日志")
                 }
                 receivedFrames += frame
+            }
+        }
+    }
+
+    private fun serviceControlUpdates() {
+        val now = nanoTime() / 1_000_000
+        subscriptions.drain().forEach { sendFireAndForget(it.messageId, it.body) }
+        if (subscriptions.isAuthenticated) {
+            navigation.updates(now, navigationEnabled(), navigationCue()).forEach {
+                sendFireAndForget(it.messageId, it.body)
+            }
+        }
+        for (index in 0 until 64) {
+            val bytes = channel.recvFileTransfer() ?: break
+            nowPlaying.fileResponse(bytes, now)
+        }
+        if (!channel.canQueueMedia) return
+        nowPlaying.poll(now, channel.peerMaxControlPayload() ?: 2_000, channel.supportsFileTransfer).forEach {
+            when (it) {
+                is Iap2NowPlayingSession.Output.Control -> sendFireAndForget(Iap2MessageIds.NOW_PLAYING_UPDATE, it.body)
+                is Iap2NowPlayingSession.Output.File -> if (!channel.sendFileTransfer(it.bytes))
+                    log("IAP2-NOWPLAYING: file packet not queued; optional artwork will expire")
             }
         }
     }

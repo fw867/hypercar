@@ -721,6 +721,7 @@ class Iap2Bluetooth(
                     channel = openedChannel,
                     log = sessionLog,
                     bluetoothMac = bluetoothMacProvider(),
+                nowPlayingProvider = Iap2NowPlayingSource::snapshot,
                     deviceName = deviceName,
                     onIdentification = { if (sessions.allows(ticket)) Iap2Peer.rememberIdentification(safeAddress(socket.remoteDevice), it) },
                     // 端点回调顺手标记「本轮已拿到凭据」：acceptLoop 用它决定是否允许
@@ -827,6 +828,7 @@ private class RfcommLinkChannel(
     private val openedAt = SystemClock.elapsedRealtime()
     private var socketReadBytes = 0L
     private var socketWriteBytes = 0L
+    private val files = java.util.concurrent.ArrayBlockingQueue<ByteArray>(64)
     private val controls = LinkedBlockingQueue<ByteArray?>()
     private val readyLatch = CountDownLatch(1)
 
@@ -853,6 +855,7 @@ private class RfcommLinkChannel(
     init {
         engine.onDetectionRestart = {
             log("LINK: DETECT restart; retain RFCOMM, clear old control queue and sequence/window state")
+            files.clear()
             controls.clear()
             // Empty payload is an ordered CSM parser boundary, distinct from POISON by identity.
             controls.offer(ByteArray(0))
@@ -909,6 +912,14 @@ private class RfcommLinkChannel(
         synchronized(lock) {
             engine.peerSynchronization?.maxLength?.minus(Iap2LinkEngine.HEADER_BYTES + 1)
         }
+
+    override val supportsFileTransfer: Boolean get() = synchronized(lock) { engine.fileTransferSession != null }
+    override val canQueueMedia: Boolean get() = synchronized(lock) { !terminated && engine.queuedControlPackets < 4 && engine.outstandingPackets < 8 }
+    override fun recvFileTransfer(): ByteArray? = files.poll()
+    override fun sendFileTransfer(bytes: ByteArray): Boolean = synchronized(lock) {
+        if (terminated) return@synchronized false
+        engine.sendFileTransfer(bytes, nowMillis()).also { drainOutputLocked() }
+    }
 
     override fun sendControl(
         bytes: ByteArray,
@@ -1010,6 +1021,10 @@ private class RfcommLinkChannel(
                     }
                 }
 
+                is Iap2LinkEngine.Event.FileTransfer -> {
+                    // Optional artwork cannot occupy the control queue or block the reader.
+                    files.offer(event.bytes)
+                }
                 is Iap2LinkEngine.Event.Dead -> {
                     finishLocked(IOException(event.reason ?: "link died"))
                     signalReadyLocked()
@@ -1045,6 +1060,7 @@ private class RfcommLinkChannel(
             if (terminated) return
             terminationReason = reason?.message ?: if (locallyCancelled) "本地取消" else "链路结束"
             terminated = true
+            files.clear()
             controls.offer(POISON) // 哨兵：唤醒阻塞的接收方（LBQ 不接受 null）
             readyLatch.countDown()
             runCatching { socket.close() }
