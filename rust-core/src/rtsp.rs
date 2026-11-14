@@ -295,7 +295,7 @@ impl RtspChannel {
         let head = format!(
             "{method} {path} RTSP/1.0\r\n\
              CSeq: {cseq}\r\n\
-             User-Agent: AirPlay/566.25.21\r\n\
+             User-Agent: AirPlay/770.8.1\r\n\
              Content-Type: {content_type}\r\n\
              Content-Length: {}\r\n\
              {extra}\r\n",

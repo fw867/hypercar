@@ -1193,17 +1193,17 @@ const CONTROLLER_FEATURES: &[&str] = &[
 ];
 
 fn build_session_setup(device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, mbux: bool) -> Vec<u8> {
-    let session_uuid = random_uuid_upper();
+    let session_uuid = box_session_uuid();
     let mut fields: Vec<(&str, Value)> = vec![
         ("deviceID", Value::str(device_id)),
         // This is the resolved phone identity (real or existing stable fallback), not an AP BSSID.
         ("macAddress", Value::str(device_id)),
         ("name", Value::str(device_name)),
-        ("model", Value::str("iPhone14,2")),
+        ("model", Value::str("iPhone16,1")),
         ("osName", Value::str("iPhone OS")),
-        ("osBuildVersion", Value::str("19A404")),
-        ("osVersion", Value::str("15.0.2")),
-        ("sourceVersion", Value::str("566.25.21")),
+        ("osBuildVersion", Value::str("21F90")),
+        ("osVersion", Value::str("17.5.1")),
+        ("sourceVersion", Value::str("770.8.1")),
         ("timingPort", Value::int(timing_port as i64)),
         ("sessionUUID", Value::str(&session_uuid)),
         ("sessionCorrelationUUID", Value::str(&random_uuid_upper())),
@@ -2003,6 +2003,11 @@ pub(crate) fn random_positive_i64() -> i64 {
     (i64::from_le_bytes(b) & i64::MAX).max(1)
 }
 
+// Box 0x25adc uses this template with two runtime fields; do not copy a device's UUID.
+fn box_session_uuid() -> String {
+    format!("{:04X}8CD2-3073-4550-{:04X}-93D6385B7331", rand::random::<u16>(), rand::random::<u16>())
+}
+
 fn random_uuid_upper() -> String {
     uuid::Uuid::new_v4().simple().to_string().to_uppercase()
 }
@@ -2010,6 +2015,22 @@ fn random_uuid_upper() -> String {
 #[cfg(test)]
 mod mbux_profile_tests {
     use super::*;
+    #[test]
+    fn box_session_uuid_changes_per_attempt_without_replacing_phone_identity() {
+        let mut sessions=std::collections::HashSet::new();
+        for _ in 0..16 {
+            let body=bplist::parse(&build_session_setup("phone-device","phone",1234,true,false)).unwrap();
+            assert_eq!(body.get("deviceID").and_then(Value::as_str),Some("phone-device"));
+            let id=body.get("sessionUUID").and_then(Value::as_str).unwrap();
+            assert_eq!(id.len(),36);
+            assert_eq!(&id[4..19],"8CD2-3073-4550-");
+            assert_eq!(&id[23..],"-93D6385B7331");
+            assert!(uuid::Uuid::parse_str(id).is_ok());
+            assert!(sessions.insert(id.to_owned()));
+            assert_ne!(body.get("sessionCorrelationUUID").and_then(Value::as_str),Some(id));
+        }
+    }
+
     #[test]
     fn all_session_profiles_use_the_resolved_phone_identity_without_a_fixed_placeholder() {
         for encrypted in [true,false] {

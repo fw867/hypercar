@@ -208,7 +208,8 @@ class WifiIap2ProtocolTest {
     @Test fun communicationsReplyDoesNotClaimUnimplementedPhoneControlsOrInventSimState() {
         val car = Car()
         car.ready()
-        val reply = car.message(0x4157).single()
+        val request = (0..18).fold(byteArrayOf()) { body, id -> body + Iap2Csm.param(id, byteArrayOf()) }
+        val reply = car.message(0x4157, request).single()
         assertEquals(0x4158, reply.messageId)
         val params = Iap2Csm.parseParams(reply.body)
         // CatPlay iap2.rs CommunicationsUpdate: carrier requires cellular support;
@@ -304,6 +305,36 @@ class WifiIap2ProtocolTest {
         assertTrue(car.message(0xaa06).isEmpty())
         assertFalse(car.protocol.ready)
         car.message(0xaa03, Iap2Csm.param(0, ByteArray(64)))
+        assertTrue(car.protocol.ready)
+    }
+
+    @Test fun wifiDeviceUuidIsRandomAndSharedAcrossRetryInstances() {
+        val a=Car();a.ready();val b=Car();b.ready()
+        fun device(car: Car) = Iap2Csm.parseParams(car.authenticationOutput.single { it.messageId==0x4e0c }.body).single().asStringOrNull()!!
+        val id=device(a)
+        assertEquals(id,device(b))
+        assertEquals(Iap2DeviceUuid.value,id)
+        assertEquals(4,java.util.UUID.fromString(id).version())
+        assertNotEquals(java.util.UUID.nameUUIDFromBytes("test-device".toByteArray()).toString().uppercase(),id)
+    }
+
+    @Test fun wifiListReplyUsesBoxFieldsThroughAuthenticatedLink() {
+        val car = Car(); car.ready()
+        val request = byteArrayOf(0,4,0,1) // request field 1 only, independent wire fixture
+        val reply = car.message(0x4170, request).single()
+        assertEquals(0x4171, reply.messageId)
+        assertArrayEquals(byteArrayOf(0,5,0,0,0), reply.body)
+        val other = car.message(0x4170, byteArrayOf(0,4,0,6)).single()
+        assertArrayEquals(byteArrayOf(0,5,0,5,0), other.body)
+        assertTrue(car.protocol.ready)
+    }
+
+    @Test fun wifiCommunicationsReplyFiltersRequestedFieldsThroughAuthenticatedLink() {
+        val car = Car(); car.ready()
+        val reply = car.message(0x4157, byteArrayOf(0,4,0,8,0,4,0,5,0,4,0,4)).single()
+        assertEquals(0x4158, reply.messageId)
+        assertArrayEquals(byteArrayOf(0,5,0,5,0,0,5,0,8,0), reply.body)
+        assertTrue(car.message(0x4159).isEmpty())
         assertTrue(car.protocol.ready)
     }
 

@@ -5,7 +5,6 @@ import java.io.InterruptedIOException
 import java.security.SecureRandom
 import java.util.Date
 import java.util.TimeZone
-import java.util.UUID
 
 /**
  * 会话层看到的链路通道（由 [Iap2Bluetooth] 用 RFCOMM + [Iap2LinkEngine] 实现；
@@ -69,7 +68,7 @@ class NoCarPlayWindowException(message: String) : IOException(message)
 class Iap2SenderSession(
     private val channel: Iap2LinkChannel,
     private val log: (String) -> Unit,
-    /** 本机真实蓝牙 MAC（0x4300/0x4E0E 的传输标识、0x4E0C UUID 派生源；真车会校验）。 */
+    /** 本机真实蓝牙 MAC（0x4300/0x4E0E 的传输标识；真车会校验）。 */
     private val bluetoothMac: String = "02:00:00:00:00:00",
     /** 本机蓝牙名（0x4E09 设备信息）。 */
     private val deviceName: String = "HyperCar",
@@ -94,7 +93,7 @@ class Iap2SenderSession(
     private val media = Iap2MediaSession(log, onMediaKey)
     private val nowPlaying = Iap2NowPlayingSession(nowPlayingProvider, log)
     private val navigation = RouteGuidanceSession(log)
-    private val subscriptions = Iap2StatusSubscriptions()
+    private val subscriptions = Iap2StatusSubscriptions(log = log)
     private var phaseName = "IDLE"
     private var phaseStarted = nanoTime()
     private var tracedReceivedFrames = 0
@@ -965,7 +964,7 @@ class Iap2SenderSession(
         if (includeWirelessUpdate) sendWirelessCarPlayUpdate()
         send(
             Iap2MessageIds.DEVICE_UUID_UPDATE,
-            Iap2Csm.string(0, deviceUuid()),
+            Iap2Csm.string(0, Iap2DeviceUuid.value),
         )
         send(
             Iap2MessageIds.DEVICE_LANGUAGE_UPDATE,
@@ -984,13 +983,6 @@ class Iap2SenderSession(
                 "设备状态问候（name=$deviceName mac=$bluetoothMac）",
         )
     }
-
-    /** 设备 UUID：由蓝牙 MAC 确定性派生，跨会话稳定（车机按它标识设备；大写输出）。 */
-    private fun deviceUuid(): String =
-        UUID
-            .nameUUIDFromBytes(bluetoothMac.toByteArray())
-            .toString()
-            .uppercase()
 
     // ---- 帧收发 ----
 

@@ -18,7 +18,7 @@ CSM 格式为 `40 40 | total_len(u16BE) | message_id(u16BE) | parameters`，总�
 
 ## 控制广播与网络
 
-控制服务为 `_carplay-ctrl._tcp`，实例名 `sender`，TXT 包括真实蓝牙 MAC 的 `id` 与 `srcvers=950.7.1`。API 33+ 可通过 NsdServiceInfo.setNetwork 指定车机 Network，较低版本依赖进程网络绑定。注册请求发出不等于服务就绪，只有当前代次成功回调才能置为 ready。
+控制服务为 `_carplay-ctrl._tcp`，实例名 `sender`，TXT 包括真实蓝牙 MAC 的 `id` 与 `srcvers=770.8.1`，与 AirPlay SETUP 的 sourceVersion、RTSP User-Agent 统一。手机侧 SETUP 声明型号 iPhone16,1、系统版本 17.5.1、构建号 21F90，按盒子固件对照；设备名称、MAC 和配对身份仍由本机解析。0x4E0C 设备 UUID 改为进程内随机生成一次，蓝牙/Wi-Fi 及重试共用；AirPlay sessionUUID 按盒子 `%04X8CD2-3073-4550-%04X-93D6385B7331` 模板生成，两处动态字段使用本地随机值，不复制设备实例值，不改变配对密钥。API 33+ 可通过 NsdServiceInfo.setNetwork 指定车机 Network，较低版本依赖进程网络绑定。注册请求发出不等于服务就绪，只有当前代次成功回调才能置为 ready。
 
 同一网络久无邀请时可有限刷新注册，保留端口；当前策略是间隔 30 秒、最多两次成功刷新，挂起注册 10 秒超时后允许重试。旧注册回调会被丢弃和清理。
 

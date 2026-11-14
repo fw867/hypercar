@@ -8,6 +8,7 @@ import android.os.IBinder
 import android.util.Log
 import io.github.hypercar.net.WifiRequestOwner
 import io.github.hypercar.net.WifiRequestRegistration
+import io.github.hypercar.net.WifiHandoffLease
 import java.lang.reflect.Proxy
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -20,26 +21,35 @@ internal class ShellWifiSelection {
         Thread(r, "car-wifi-selection").apply { isDaemon = true }
     }
     private data class Lease(val token: String, val binder: IBinder, val death: IBinder.DeathRecipient,
-        val wifi: WifiManager, val callbackType: Class<*>, val callback: Any)
+        val wifi: WifiManager, val callbackType: Class<*>, val callback: Any, val recovery: WifiHandoffLease)
     private var lease: Lease? = null
 
     @Synchronized fun start(owner: IBinder, token: String, ssid: String, bssid: String, uid: Int): String {
         lease?.let { stop(it.token) }
         if (token.isBlank() || ssid.isBlank() || uid < 10000) return "ERR invalid Wi-Fi selection scope"
         return try {
-            val wifi = ShellCarWifi.managers().first
+            val (wifi, connectivity) = ShellCarWifi.managers()
+            val recovery = WifiHandoffLease()
             val type = Class.forName("android.net.wifi.WifiManager\$NetworkRequestMatchCallback")
+            fun savedNetworks(): List<WifiConfiguration> = try { wifi.configuredNetworks.orEmpty() }
+            catch (denied: SecurityException) {
+                Log.w("HyperCar", "WIFI-SELECT: saved network permission denied; handoff unavailable")
+                throw denied
+            }
             val gate = WifiRequestRegistration()
             var selection: Any? = null
             var selected = false
             var registered = false
             lateinit var register: () -> Unit
-            fun choose(candidates: List<ScanResult>, cached: Boolean) {
+            fun choose(candidates: List<ScanResult>, cached: Boolean, since: Long = 0) {
                 synchronized(this) {
                     if (lease?.token != token || selected || selection == null) return
-                    val ap = candidates.filter { it.SSID == ssid && (bssid.isBlank() || it.BSSID.equals(bssid, true)) &&
-                        (!cached || android.os.SystemClock.elapsedRealtime() - it.timestamp / 1000 in 0..300_000) }
-                        .maxByOrNull { it.level } ?: return
+                    val matching = candidates.filter { it.SSID == ssid && (bssid.isBlank() || it.BSSID.equals(bssid, true)) &&
+                        (!cached || (android.os.SystemClock.elapsedRealtime() - it.timestamp / 1000 in 0..30_000 &&
+                            it.timestamp / 1000 >= since)) }
+                    // A polled cache without an AP hint must not choose between same-name APs.
+                    if (cached && bssid.isBlank() && matching.map { it.BSSID.lowercase() }.distinct().size != 1) return
+                    val ap = matching.maxByOrNull { it.level } ?: return
                     if (!activeRequestOwned(uid, ssid)) return
                     val config = WifiConfiguration().apply { SSID = "\"$ssid\""; BSSID = ap.BSSID }
                     val selectionType = Class.forName("android.net.wifi.WifiManager\$NetworkRequestUserSelectionCallback")
@@ -47,6 +57,69 @@ internal class ShellWifiSelection {
                     selected = true
                     Log.i("HyperCar", "WIFI-SELECT: selected own local-only request uid=$uid cached_exact_ap=$cached")
                 }
+            }
+            fun pollRecovery(since: Long, until: Long) {
+                worker.schedule({
+                    synchronized(this) {
+                        if (lease?.token == token && !selected && android.os.SystemClock.elapsedRealtime() < until) {
+                            try { choose(wifi.scanResults, cached = true, since = since) }
+                            catch (_: SecurityException) {
+                                Log.w("HyperCar", "WIFI-SELECT: recovery scan permission denied")
+                            } catch (error: Exception) {
+                                Log.w("HyperCar", "WIFI-SELECT: recovery scan read failed ${error.javaClass.simpleName}")
+                            }
+                            if (!selected) pollRecovery(since, until)
+                        }
+                    }
+                }, 400, TimeUnit.MILLISECONDS)
+            }
+            fun armRecovery() {
+                worker.schedule({
+                    synchronized(this) {
+                        if (lease?.token != token || selected || selection == null) return@synchronized
+                        try {
+                            val since = android.os.SystemClock.elapsedRealtime()
+                            val recovered = recovery.recover(ssid,
+                                owned = { lease?.token == token && !selected && selection != null && activeRequestOwned(uid, ssid) },
+                                current = {
+                                    val info = wifi.connectionInfo
+                                    val name = info.ssid.trim('"')
+                                    val internet = connectivity.allNetworks.any { network ->
+                                        val caps = connectivity.getNetworkCapabilities(network)
+                                        caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true &&
+                                            caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                                            caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                                    }
+                                    if (!internet || name.contains("unknown", true)) null else
+                                        WifiHandoffLease.currentSavedNetwork(info.networkId, name,
+                                            savedNetworks().filter {
+                                                it.networkId == info.networkId && it.SSID?.trim('"') == name
+                                            }.map { config ->
+                                                WifiHandoffLease.SavedNetwork(config.networkId, name,
+                                                    config.javaClass.getField("allowAutojoin").getBoolean(config))
+                                            })
+                                },
+                                isCurrent = { previous ->
+                                    val info = wifi.connectionInfo
+                                    info.networkId == previous.id && info.ssid.trim('"') == previous.ssid
+                                },
+                                autojoin = { previous, enabled ->
+                                    // Never restore a deleted/replaced saved config under a recycled ID.
+                                    if (savedNetworks().any {
+                                        it.networkId == previous.id && it.SSID?.trim('"') == previous.ssid
+                                    } == true) WifiManager::class.java.getMethod("allowAutojoin",
+                                        Int::class.javaPrimitiveType, Boolean::class.javaPrimitiveType)
+                                        .invoke(wifi, previous.id, enabled)
+                                },
+                                disconnect = { wifi.disconnect() },
+                                scan = { Log.i("HyperCar", "WIFI-SELECT: bounded other-WiFi handoff; scan_requested=${wifi.startScan()}") },
+                            )
+                            if (recovered) pollRecovery(since, since + 8_000)
+                        } catch (error: Exception) {
+                            Log.w("HyperCar", "WIFI-SELECT: handoff recovery failed ${(error.cause ?: error).javaClass.simpleName}")
+                        }
+                    }
+                }, 2_000, TimeUnit.MILLISECONDS)
             }
             val callback = Proxy.newProxyInstance(type.classLoader, arrayOf(type)) { proxy, method, args ->
                 try {
@@ -57,6 +130,8 @@ internal class ShellWifiSelection {
                         "onUserSelectionCallbackRegistration" -> {
                             gate.acknowledge()
                             selection = args?.getOrNull(0)
+                            Log.i("HyperCar", "WIFI-SELECT: own selection callback ready; bounded recovery armed")
+                            armRecovery()
                             // A fresh iAP2 MAC corroborated by a matching scan can be selected
                             // directly. No need to wait for a second scan that this ROM aborts.
                             if (bssid.isNotBlank()) {
@@ -112,7 +187,7 @@ internal class ShellWifiSelection {
                 }
             }
             val death = IBinder.DeathRecipient { stop(token) }
-            lease = Lease(token, owner, death, wifi, type, callback)
+            lease = Lease(token, owner, death, wifi, type, callback, recovery)
             owner.linkToDeath(death, 0)
             worker.execute { register() }
             worker.schedule({ stop(token) }, 60, TimeUnit.SECONDS)
@@ -126,6 +201,9 @@ internal class ShellWifiSelection {
     @Synchronized fun stop(token: String): String {
         val current = lease?.takeIf { it.token == token } ?: return "SKIP Wi-Fi selector inactive"
         lease = null
+        runCatching { current.recovery.close() }.onFailure {
+            Log.w("HyperCar", "WIFI-SELECT: previous autojoin restore failed ${it.javaClass.simpleName}")
+        }
         runCatching { current.binder.unlinkToDeath(current.death, 0) }
         runCatching { current.wifi.javaClass.getMethod("unregisterNetworkRequestMatchCallback", current.callbackType)
             .invoke(current.wifi, current.callback) }

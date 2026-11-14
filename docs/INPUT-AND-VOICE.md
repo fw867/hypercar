@@ -22,6 +22,8 @@
 
 AirPlay hidSendReport解码和大众已验证路径保持原行为。没有新增DETECT、强制HID启用或A2DP操作；仅具备组件声明不代表车机已发送StartHID，更不代表实车切歌已成功。诊断使用IAP2-MEDIA观察声明/注册/报告边沿，随后用MEDIA-KEY确认派发。
 
+宝马本轮持续音视频连接中，Wi-Fi iAP2 未收到对端初始化，未见媒体 StartHID/AccessoryHIDReport；AirPlay HID 只声明返回键，未见媒体报告或 MEDIA-KEY 派发。经典蓝牙随后由车机结束，系统 AVRCP 也未建链。该轮方向盘切歌仍未验证成功，收到 requestSiri 仅证明独立语音入口可达。应继续核对媒体控制通道的交接与激活。
+
 ## iAP2 媒体卡（563）
 
 曲目信息与媒体按键分别处理：`5000` 订阅、`5001` 更新、`5002` 停止，不能作为切歌指令解释。蓝牙和 Wi-Fi 共用 Iap2NowPlayingSession；来源为 MusicBridge 的缓存快照，订阅后先回当前状态，稍后元数据到达继续补推，停止或重建后不继续旧订阅。

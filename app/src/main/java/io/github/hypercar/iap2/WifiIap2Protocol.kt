@@ -2,7 +2,6 @@ package io.github.hypercar.iap2
 
 import java.security.SecureRandom
 import java.util.TimeZone
-import java.util.UUID
 
 /** One Wi-Fi link per AirPlay generation. All methods run on the bridge's single worker. */
 internal class WifiIap2Protocol(
@@ -20,10 +19,10 @@ internal class WifiIap2Protocol(
     private val media = Iap2MediaSession(log, onMediaKey)
     private val nowPlaying = Iap2NowPlayingSession(nowPlayingProvider, log)
     private var navigation = RouteGuidanceSession(log)
-    private val subscriptions = Iap2StatusSubscriptions {
+    private val subscriptions = Iap2StatusSubscriptions(power = {
         // Preserve the existing Wi-Fi bridge's power compatibility values.
         listOf(Iap2Csm.u8(4,1), Iap2Csm.u8(5,1), Iap2Csm.u16(6,100))
-    }
+    }, log = log)
     private var started = false
     private var phase = "LINK"
     private var deadline = 0L
@@ -199,7 +198,7 @@ internal class WifiIap2Protocol(
 
     private fun greetings() {
         val zone = TimeZone.getDefault()
-        send(0x4e0c, Iap2Csm.string(0, UUID.nameUUIDFromBytes(deviceId.toByteArray()).toString().uppercase()))
+        send(0x4e0c, Iap2Csm.string(0, Iap2DeviceUuid.value))
         send(0x4e0a, Iap2Csm.string(0, "zh"))
         send(0x4e09, Iap2Csm.string(0, deviceName))
         log("device name=$deviceName")

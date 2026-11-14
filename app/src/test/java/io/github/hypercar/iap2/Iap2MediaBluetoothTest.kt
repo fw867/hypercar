@@ -16,10 +16,13 @@ class Iap2MediaBluetoothTest {
     private inner class Channel(val subscribeEarly: Boolean = false,
         val serial:Boolean=false,val statusEarly:Boolean=false,val rejectIdentification:Boolean=false,
         val certificateBody:ByteArray=Iap2Csm.param(0,byteArrayOf(1)),
-        val signatureBody:ByteArray=Iap2Csm.param(0,byteArrayOf(1))) : Iap2LinkChannel {
+        val signatureBody:ByteArray=Iap2Csm.param(0,byteArrayOf(1)),
+        val communicationsBody:ByteArray=byteArrayOf()) : Iap2LinkChannel {
         val queue=ArrayDeque<ByteArray>()
         val sent=mutableListOf<Int>()
         val updates=mutableListOf<Iap2Csm.Frame>()
+        val deviceUuids=mutableListOf<String>()
+        val statusUpdates=mutableListOf<Iap2Csm.Frame>()
         var time=1_000_000L
         var open=true
         var endWhenEmpty=false
@@ -35,8 +38,11 @@ class Iap2MediaBluetoothTest {
         }
         override fun sendControl(bytes:ByteArray,awaitAck:Boolean):Boolean {
             for(frame in Iap2Csm.Parser().offer(bytes)) {
-                if(frame.messageId in listOf(0x4155,0x4158,0x4171,0xae01))
+                if(frame.messageId==0x4e0c) deviceUuids += Iap2Csm.parseParams(frame.body).single().asStringOrNull()!!
+                if(frame.messageId in listOf(0x4155,0x4158,0x4171,0xae01)) {
                     assertTrue("Status subscriptions must wait for auth",0xaa05 in sent)
+                    statusUpdates += frame
+                }
                 if(frame.messageId==0x5001) {
                     assertTrue("Metadata must wait for authentication",0xaa05 in sent)
                     updates+=frame
@@ -44,7 +50,7 @@ class Iap2MediaBluetoothTest {
                 sent+=frame.messageId
                 when(frame.messageId){
                     0x1d00->queue+=(if(rejectIdentification) Iap2Csm.encode(0x1d03) else identity(serial))+start()+report(1)+(if(subscribeEarly) Iap2Csm.encode(0x5000) else byteArrayOf())+
-                        (if(statusEarly) listOf(0x4154,0x4157,0x4170,0xae00).fold(byteArrayOf()){a,id->a+Iap2Csm.encode(id)} else byteArrayOf()) // All in ONE RFCOMM read, before auth.
+                        (if(statusEarly) listOf(0x4154,0x4157,0x4170,0xae00).fold(byteArrayOf()){a,id->a+Iap2Csm.encode(id,if(id==0x4157) communicationsBody else byteArrayOf())} else byteArrayOf()) // All in ONE RFCOMM read, before auth.
                     0xaa00->queue+=if(serial && frame.body.isNotEmpty()) Iap2Csm.encode(0xaa06,Iap2Csm.param(0,byteArrayOf(1)))
                         else Iap2Csm.encode(0xaa01,certificateBody)
                     0xaa02->queue+=Iap2Csm.encode(0xaa03,signatureBody)
@@ -54,6 +60,23 @@ class Iap2MediaBluetoothTest {
             return open
         }
     }
+    @Test fun bluetoothUsesTheSameRandomDeviceUuidAsTheWifiTransport() {
+        val channel=Channel()
+        Iap2SenderSession(channel,{},onEndpoint={},profile=HeadUnitProfiles.WINPLAY,
+            nanoTime={channel.time}).run(10_000)
+        assertTrue(channel.deviceUuids.isNotEmpty())
+        assertTrue(channel.deviceUuids.all { it==Iap2DeviceUuid.value })
+        assertEquals(4,java.util.UUID.fromString(channel.deviceUuids.first()).version())
+    }
+
+    @Test fun bluetoothEarlyCommunicationsSubscriptionUsesTheSharedFilteredReply() {
+        val channel = Channel(statusEarly=true, communicationsBody=byteArrayOf(0,4,0,17,0,4,0,6))
+        Iap2SenderSession(channel,{},onEndpoint={},profile=HeadUnitProfiles.WINPLAY,
+            nanoTime={channel.time}).run(10_000)
+        assertArrayEquals(byteArrayOf(0,5,0,6,0,0,5,0,17,0),
+            channel.statusUpdates.single { it.messageId==0x4158 }.body)
+    }
+
     @Test fun identificationRejectionFailsImmediatelyInsteadOfWaitingForTimeout() {
         val channel=Channel(rejectIdentification=true)
         val session=Iap2SenderSession(channel,{},onEndpoint={},profile=HeadUnitProfiles.WINPLAY,nanoTime={channel.time})

@@ -23,9 +23,9 @@ import java.net.Socket
  * 不邀请 → 0x4301 永不到达 → 上层只能干等（hypercar 旧实现正是如此：只有 0x4301 一条
  * 端点来源，而且从不在 WiFi 上露面）。
  *
- * 三条硬约束（cardeck 真车实测，改动前请先复测）：
- *  1. **TXT `srcvers` 必须是 950.7.1**：改成 catplay 的 566.25.21 后车机连 ctrl-int 探测
- *     都不再发、0x4301 永不到达（奥迪 MMI 3315 对照：950.7.1 时 0.65s 就下发）。
+ * 注册与身份约束：
+ *  1. TXT `srcvers` 与 AirPlay SETUP / User-Agent 统一为盒子固件的 770.8.1。
+ *     旧奥迪记录曾使用 950.7.1；该记录不构成当前版本已在奥迪验证的证据。
  *  2. **TXT `id` 必须是本机真实蓝牙 MAC**：车机按它匹配「待邀请的手机」，占位值
  *     （02:00:…）会导致永不邀请。
  *  3. Android 13+ 通过 NsdServiceInfo.network 限定本轮车机网络；较旧系统保留进程绑定。
@@ -43,7 +43,7 @@ class CarPlayCtrlAdvertiser(
     companion object {
         const val SERVICE_TYPE = "_carplay-ctrl._tcp"
         private const val SERVICE_NAME = "sender"
-        private const val SRCVERS = "950.7.1"
+        private const val SRCVERS = "770.8.1"
         private const val TAG = "CTRL"
         private const val MAX_HEAD_BYTES = 16 * 1024
         private const val PLACEHOLDER_MAC = "02:00:00:00:00:00"
