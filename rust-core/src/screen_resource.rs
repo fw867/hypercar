@@ -367,6 +367,28 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn screen_business_rejection_or_missing_port_never_opens_data_socket_or_marks_setup() {
+        for reject_business in [true, false] {
+            let mut f=Fixture::new(Modes::initial()).await;
+            let session=f.session.clone();
+            let task=tokio::spawn(async move { session.open().await.err().unwrap() });
+            let setup=read(&mut f.car).await;
+            assert_eq!(setup.first_line,"SETUP / RTSP/1.0");
+            let body=if reject_business {
+                // A transport 200 and a plausible port must not override a business rejection.
+                Value::dict(vec![("status",Value::int(-1)),("streams",Value::array(vec![Value::dict(vec![
+                    ("type",Value::int(110)),("dataPort",Value::int(f.video.local_addr().unwrap().port() as i64)),
+                ])]))])
+            } else { Value::dict(vec![("streams",Value::array(vec![]))]) };
+            reply(&mut f.car,&setup,200,&bplist::encode(&body)).await;
+            let error=task.await.unwrap();
+            assert!(error.contains(if reject_business { "business rejection" } else { "dataPort" }));
+            assert!(!f.session.params.pipeline.lock().screen_setup_accepted);
+            assert!(tokio::time::timeout(Duration::from_millis(60),f.video.accept()).await.is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn id9_hid_initialization_uses_event_channel_before_screen_setup() {
         let mut f=Fixture::new(Modes::id9_initial(&Value::dict(vec![]),true)).await;
         enable_id9(&mut f);

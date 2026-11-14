@@ -272,7 +272,7 @@ pub async fn negotiate(
     // CatPlay bootstrap: 会话 SETUP → /info → 事件通道/保活 → 资源声明 → 屏幕流。
     let timing = TimingServer::start_with_pipeline(p.pipeline.clone()).map_err(|e| format!("计时服务启动失败: {e}"))?;
     let (root, session_info) = setup_and_read_info(
-        &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap,
+        &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap, p.id9_screen_bootstrap,
     ).await?;
     info = session_info;
     for line in audio_capability_lines(&info) { emit_log(&line); }
@@ -1012,7 +1012,7 @@ mod display_size_tests {
         let (read, write) = socket.into_split();
         let (channel, _) = RtspChannel::spawn(read, write, None);
         crate::auth_setup::run(&channel).await.unwrap();
-        let (_, info) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", "Test phone", 12345, true, Value::dict(vec![]), false).await.unwrap();
+        let (_, info) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", "Test phone", 12345, true, Value::dict(vec![]), false, false).await.unwrap();
         let display = &info.get("displays").unwrap().as_array().unwrap()[0];
         assert_eq!(uuid_text(display.get("uuid")).as_deref(), Some("actual-bmw-display"));
         assert_eq!(read_display_size(display), (2560, 744));
@@ -1196,7 +1196,8 @@ fn build_session_setup(device_id: &str, device_name: &str, timing_port: u16, enc
     let session_uuid = random_uuid_upper();
     let mut fields: Vec<(&str, Value)> = vec![
         ("deviceID", Value::str(device_id)),
-        ("macAddress", Value::str(if mbux { device_id } else { "aa:bb:cc:dd:ee:ff" })),
+        // This is the resolved phone identity (real or existing stable fallback), not an AP BSSID.
+        ("macAddress", Value::str(device_id)),
         ("name", Value::str(device_name)),
         ("model", Value::str("iPhone14,2")),
         ("osName", Value::str("iPhone OS")),
@@ -1251,10 +1252,15 @@ pub(crate) async fn record_session(channel: &Arc<RtspChannel>) -> Result<(), Str
 }
 
 async fn setup_and_read_info(
-    channel: &Arc<RtspChannel>, device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool,
+    channel: &Arc<RtspChannel>, device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool, id9: bool,
 ) -> Result<(Value, Value), String> {
     emit_log(&format!("AIRPLAY: session device name={device_name}"));
     let body = build_session_setup(device_id, device_name, timing_port, encrypted, mbux);
+    if id9 {
+        // Only booleans/counts: session SETUP carries identity, so never dump its raw bytes.
+        emit_log(&format!("ID9: session SETUP identity_consistent=true features={} timing_port_valid={}",
+            CONTROLLER_FEATURES.len(), timing_port != 0));
+    }
     let reply = channel.request(
         "SETUP", "/setup", &body, "application/x-apple-binary-plist", &[], Duration::from_secs(10),
     ).await?;
@@ -1375,6 +1381,10 @@ async fn negotiate_audio(
     };
     if resp.status() != 200 {
         emit_log(&format!("AIRPLAY: 音频流被拒 [{}]", resp.first_line));
+        return None;
+    }
+    if let Err(error) = crate::resource_trace::validate_ack("AUDIO_SETUP", &resp) {
+        emit_log(&format!("AUDIO: {error}"));
         return None;
     }
     let result = async {
@@ -2001,13 +2011,37 @@ fn random_uuid_upper() -> String {
 mod mbux_profile_tests {
     use super::*;
     #[test]
+    fn all_session_profiles_use_the_resolved_phone_identity_without_a_fixed_placeholder() {
+        for encrypted in [true,false] {
+            for mbux in [false,true] {
+                for device_id in ["02:11:22:33:44:55", "02:66:77:88:99:00"] {
+                    let body=bplist::parse(&build_session_setup(device_id,"test phone",1234,encrypted,mbux)).unwrap();
+                    assert_eq!(body.get("macAddress").and_then(Value::as_str),Some(device_id));
+                    assert_eq!(body.get("deviceID"),body.get("macAddress"));
+                    assert_eq!(body.get("name").and_then(Value::as_str),Some("test phone"));
+                    assert_eq!(body.get("timingPort").and_then(Value::as_int),Some(1234));
+                    assert_eq!(body.get("statsCollectionEnabled").and_then(Value::as_bool),Some(false));
+                    assert_eq!(body.get("et").and_then(Value::as_int),if encrypted {None} else {Some(1)});
+                    let features=body.get("features").unwrap().as_array().unwrap();
+                    assert_eq!(features.len(),if mbux {1} else {CONTROLLER_FEATURES.len()});
+                    if !mbux {
+                        for capability in ["viewAreas","uiContext","focusTransfer","mainBuffered","iAPChannel"] {
+                            assert!(features.iter().any(|v|v.as_str()==Some(capability)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn minimal_features_and_100ms_latency_are_explicit_profile_choices() {
         for mbux in [false,true] {
             let body=bplist::parse(&build_session_setup("real-mac","测试手机 \"BT\"",1234,true,mbux)).unwrap();
             assert_eq!(body.get("name").and_then(Value::as_str),Some("测试手机 \"BT\""));
             let features=body.get("features").unwrap().as_array().unwrap();
             assert_eq!(features.len(),if mbux {1} else {CONTROLLER_FEATURES.len()});
-            assert_eq!(body.get("macAddress").and_then(Value::as_str),Some(if mbux {"real-mac"} else {"aa:bb:cc:dd:ee:ff"}));
+            assert_eq!(body.get("macAddress").and_then(Value::as_str),Some("real-mac"));
         }
         let body=bplist::parse(&build_screen_setup(42,"actual-display")).unwrap();
         assert_eq!(body.get("streams").unwrap().as_array().unwrap()[0].get("latencyMs").and_then(Value::as_int),Some(25));

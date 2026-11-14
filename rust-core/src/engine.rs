@@ -166,7 +166,7 @@ pub async fn run_engine(
             height: cfg.height,
             fps: cfg.fps,
             bt_address: cfg.device_id.clone(),
-            bt_name: "BMW".to_string(),
+            bt_name: "HyperCar".to_string(),
             navigation_updates: cfg.carwith_navigation_enabled,
             microphone: microphone_probe.clone(),
         };

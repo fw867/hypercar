@@ -38,7 +38,7 @@ pub(crate) fn trace_kind(method: &str, path: &str, body: &[u8]) -> Option<&'stat
     let mut screen = false;
     for stream in streams {
         match stream.get("type").and_then(Value::as_int) {
-            Some(100) => audio = true,
+            Some(100 | 102 | 103) => audio = true,
             Some(110) => screen = true,
             _ => return None,
         }
@@ -135,6 +135,14 @@ mod tests {
         assert_eq!(trace_kind("SETUP", "/", &screen), Some("SCREEN_SETUP"));
         assert_eq!(trace_kind("SETUP", "rtsp://[fe80::1]:7000/", &audio), Some("AUDIO_SETUP"));
         assert_eq!(trace_kind("POST", "/command", &crate::modes::Modes::initial().declaration()), Some("RESOURCE"));
+        for stream_type in [102,103] {
+            let aac=bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![
+                ("type",Value::int(stream_type)), ("audioType",Value::str("media")),
+                ("audioFormat",Value::int(1 << 23)), ("spf",Value::int(1024)),
+            ])]))]));
+            assert_eq!(trace_kind("SETUP", "rtsp://[fe80::1]:7000/", &aac),Some("AUDIO_SETUP"));
+            assert_eq!(trace_kind("SETUP", "/setup", &aac),None);
+        }
         for path in ["/setup", "/pair-setup", "/pair-verify", "/auth-setup"] {
             assert_eq!(trace_kind("SETUP", path, &screen), None);
         }

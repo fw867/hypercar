@@ -60,7 +60,7 @@ object BluetoothMac {
         localAddress()?.let { return it }
         val r = ShizukuTools.exec("content query --uri content://settings/secure/bluetooth_address", 4_000)
         if (!r.ok) return null
-        return MAC_REGEX.find(r.out)?.value?.uppercase()?.takeIf { it != PLACEHOLDER_MAC }
+        return PhoneIdentitySnapshot.normalize(MAC_REGEX.find(r.out)?.value)
     }
 
     /**
@@ -73,7 +73,7 @@ object BluetoothMac {
     private fun localAddress(): String? = runCatching {
         val adapter = android.bluetooth.BluetoothAdapter.getDefaultAdapter() ?: return null
         val addr = adapter.address ?: return null
-        addr.uppercase().takeIf { MAC_REGEX.matches(it) && it != PLACEHOLDER_MAC }
+        PhoneIdentitySnapshot.normalize(addr)
     }.getOrNull()
 
     /**
@@ -87,7 +87,7 @@ object BluetoothMac {
      * 要么手动填一次真值。
      */
     suspend fun resolveOrStable(force: Boolean = false): String {
-        SettingsStore.manualBtMac?.let { return it }
+        PhoneIdentitySnapshot.normalize(SettingsStore.manualBtMac)?.let { return it }
         return resolve(force) ?: SettingsStore.stableDeviceId
     }
 

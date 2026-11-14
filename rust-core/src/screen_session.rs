@@ -35,11 +35,12 @@ impl ScreenSession {
         } else { airplay::build_screen_setup(conn_id,&self.uuid) };
         let response=self.control.request("SETUP","/",&body,"application/x-apple-binary-plist",&[],Duration::from_secs(8)).await?;
         if response.status()!=200 { return Err(format!("屏幕 SETUP 被拒 {}",response.first_line)); }
-        crate::pipeline::activation(&self.params.pipeline, "SCREEN_SETUP");
+        crate::resource_trace::validate_ack("SCREEN_SETUP", &response)?;
         let root=bplist::parse(&response.body).map_err(|e|format!("屏幕 SETUP 解析失败 {e}"))?;
         let port=root.get("streams").and_then(Value::as_array).and_then(|s|s.first())
             .map(|s|airplay::port_of(s.get("dataPort"))).unwrap_or(0);
         if port==0 { return Err("屏幕 SETUP 没有 dataPort".into()); }
+        crate::pipeline::activation(&self.params.pipeline, "SCREEN_SETUP");
         let cipher=match &self.shared {
             Some(shared)=>ScreenCipher::ChaCha(airplay::stream_key(shared,conn_id as u64)),
             None=>{let (key,iv)=airplay::aes_stream_keys_zero(conn_id as u64);ScreenCipher::AesCtr(crate::crypto::Aes128CtrStream::new(&key,&iv))},

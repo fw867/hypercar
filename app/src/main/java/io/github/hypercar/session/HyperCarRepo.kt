@@ -889,7 +889,10 @@ object HyperCarRepo {
             context,
             targetMac = { SettingsStore.targetCarMac },
             preferredMac = { aclCarMac },
-            deviceMacProvider = { BluetoothMac.resolveOrStable(force = true) },
+            deviceMacProvider = {
+                sessionDeviceMac.takeIf { sessionLive.get() && it.isNotBlank() }
+                    ?: BluetoothMac.resolveOrStable(force = true)
+            },
             dropProfilesBeforeIap2 = profile.dropProfilesBeforeIap2,
             allowOutboundIap2 = profile.allowOutboundIap2,
             log = ::log,
@@ -1233,18 +1236,14 @@ object HyperCarRepo {
             // WinPlay 就是拿它和「目标蓝牙设备」（Windows 里配对的经典蓝牙地址）比，
             // 不一致直接对会话级 SETUP 回 403（cpStack.ts 的 deviceFilter）。
             // 所以这里明确区分「真实 MAC」和「伪 MAC」，伪 MAC 时把后果写进日志。
-            val realMac = BluetoothMac.resolve(force = true)
-            val deviceMac = realMac ?: BluetoothMac.resolveOrStable(force = true)
+            sessionDeviceMac = ""
+            val deviceMac = coordinatorFor(context).deviceMacForSession()
             sessionDeviceMac = deviceMac
-            if (realMac == null) {
-                log(
-                    "BT: ⚠ 未解析到真实蓝牙 MAC，本次用伪 ID $deviceMac——" +
-                        "按 deviceID 过滤的接收端（WinPlay / 部分车机）会直接 403；" +
-                        "装 Shizuku 或到设置里「手动指定蓝牙 MAC」填真实地址即可",
-                )
-            } else {
-                log("BT: 使用真实蓝牙 MAC $deviceMac")
-            }
+            log(when {
+                deviceMac == SettingsStore.stableDeviceId -> "BT: 使用已有稳定手机标识；真实蓝牙地址未取得，严格接收端仍可能拒绝"
+                SettingsStore.manualBtMac.equals(deviceMac, ignoreCase = true) -> "BT: 使用手动指定手机标识；iAP2、mDNS 与 AirPlay 共用"
+                else -> "BT: 使用已解析手机标识；iAP2、mDNS 与 AirPlay 共用"
+            })
 
             // ---- iAP2 协商（蓝牙侧）----
             push(link = LinkState.Negotiating("等待车机蓝牙 iAP2 协商"))
@@ -1725,6 +1724,8 @@ object HyperCarRepo {
         if (previousNetwork != null && cm?.boundNetworkForProcess == previousNetwork)
             runCatching { cm.bindProcessToNetwork(null) }
         wifiJoiner = null
+        sessionDeviceMac = ""
+        iap2?.invalidatePhoneIdentity()
         joinedSsid = null
         joinedNetwork = null
         boundNetwork = null

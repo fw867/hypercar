@@ -51,7 +51,6 @@ object SettingsStore {
     private const val KEY_PAIRED_CARS = "paired_cars"
 
     /** MAC 格式（字段写入前先大写归一，再按此校验；不合法直接存 null）。 */
-    private val MAC_PATTERN = Regex("([0-9A-F]{2}:){5}[0-9A-F]{2}")
 
     /** 目标车机（多车场景）：null = 自动（来者不拒）。 */
     var targetCarMac: String?
@@ -346,9 +345,9 @@ object SettingsStore {
      * 优先级：手动值 > 自动解析（Shizuku/getAddress）> 稳定伪 ID。设为 null 即恢复自动。
      */
     var manualBtMac: String?
-        get() = p().getString(KEY_MANUAL_BT_MAC, null)
+        get() = io.github.hypercar.net.PhoneIdentitySnapshot.normalize(p().getString(KEY_MANUAL_BT_MAC, null))
         set(v) {
-            val normalized = v?.trim()?.uppercase()?.takeIf { MAC_PATTERN.matches(it) }
+            val normalized = io.github.hypercar.net.PhoneIdentitySnapshot.normalize(v)
             p().edit().putString(KEY_MANUAL_BT_MAC, normalized).apply()
         }
 

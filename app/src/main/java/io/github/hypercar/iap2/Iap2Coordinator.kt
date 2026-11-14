@@ -57,10 +57,6 @@ class Iap2Coordinator(
     private val allowOutboundIap2: Boolean = true,
     private val log: (String) -> Unit,
 ) {
-    companion object {
-        /** 未拿到真实 MAC 时的兜底占位（仅保底可用性；真车可能校验传输标识）。 */
-        private const val PLACEHOLDER_MAC = "02:00:00:00:00:00"
-    }
 
     private val appContext = context.applicationContext
 
@@ -70,8 +66,7 @@ class Iap2Coordinator(
     @Volatile
     private var endpointCallback: ((CarPlayEndpoint) -> Unit)? = null
 
-    @Volatile
-    private var resolvedMac: String? = null
+    private val phoneIdentity = io.github.hypercar.net.PhoneIdentitySnapshot()
 
     val isRunning: Boolean get() = bluetooth?.isRunning == true
     val activePeerAddress: String? get() = bluetooth?.activePeerAddress
@@ -148,6 +143,14 @@ class Iap2Coordinator(
             bluetooth = null
         }
         endpointCallback = null
+        phoneIdentity.invalidate()
+    }
+
+    fun invalidatePhoneIdentity() = phoneIdentity.invalidate()
+
+    /** Adopt an already active iAP2 identity; never resolve a different identity for AirPlay. */
+    suspend fun deviceMacForSession(): String = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        phoneIdentity.peek()?.takeIf { isSessionActive } ?: resolvePhoneIdentity()
     }
 
     /**
@@ -163,57 +166,17 @@ class Iap2Coordinator(
 
     // ---- 内部 ----
 
-    /**
-     * 当前会话用的本机 MAC：优先真实值（缓存），未解析到时现场 runBlocking 取一次
-     * （会话线程是后台线程，阻塞安全）。
-     *
-     * deviceMacProvider 已是「真 MAC 或稳定伪 MAC」（BluetoothMac.resolveOrStable），
-     * 返回的一定是合法 MAC 格式——无 Shizuku 时的稳定伪 MAC 也是有效值，直接采用。
-     */
-    private fun currentBluetoothMac(): String {
-        resolvedMac?.let { return it }
-        val mac =
-            runCatching { runBlocking { deviceMacProvider() } }
-                .getOrNull()
-                ?.trim()
-                ?.takeIf { it.isNotEmpty() }
-        if (mac != null) {
-            resolvedMac = mac
-            if (mac == io.github.hypercar.settings.SettingsStore.stableDeviceId) {
-                log(
-                    "IAP2: ⚠ 本轮用的是**稳定伪 MAC** $mac（真 MAC 未解析到）——车机若按设备身份认 CarPlay，" +
-                        "伪 ID 会被当成另一台设备；请确认 Shizuku 已授权或到设置里手动填真实蓝牙 MAC",
-                )
-            } else {
-                log("IAP2: 本机蓝牙标识=$mac")
-            }
-            return mac
-        }
-        log("IAP2: ⚠ deviceMacProvider 未返回值，本轮用稳定伪 MAC 兜底")
-        return PLACEHOLDER_MAC
-    }
+    /** Both prefetch and live handshakes use the injected provider and the same snapshot. */
+    private suspend fun resolvePhoneIdentity(): String = phoneIdentity.resolve(
+        io.github.hypercar.settings.SettingsStore.manualBtMac,
+        deviceMacProvider,
+        { io.github.hypercar.settings.SettingsStore.stableDeviceId },
+    )
 
-    /**
-     * 预解析真实 MAC。
-     *
-     * **必须 force**：`BluetoothMac.resolve()` 解析失败后有 10s 静默窗，而上下层在
-     * 差不多同一毫秒都会发起解析——非 force 调用会正好落在「另一次解析正在进行」的窗口里
-     * 返回 null → 退回稳定伪 MAC（2026-10-25 现场日志：`BT: 使用真实蓝牙 MAC 84:AE:…`
-     * 但 `IAP2: 本机蓝牙标识预解析成功=B6:65:…`，同一轮出现两个身份）。
-     */
+    private fun currentBluetoothMac(): String = runBlocking { resolvePhoneIdentity() }
+
     private fun prefetchDeviceMac() {
-        if (resolvedMac != null) return
-        val mac =
-            runCatching { runBlocking { io.github.hypercar.net.BluetoothMac.resolveOrStable(force = true) } }
-                .getOrNull()
-                ?.trim()
-                ?.takeIf { it.isNotEmpty() }
-                ?: return
-        resolvedMac = mac
-        if (mac == io.github.hypercar.settings.SettingsStore.stableDeviceId) {
-            log("IAP2: ⚠ 预解析到的是**稳定伪 MAC** $mac（真 MAC 不可用）——车机可能不认这台设备")
-        } else {
-            log("IAP2: 本机蓝牙标识预解析成功=$mac")
-        }
+        runCatching { runBlocking { resolvePhoneIdentity() } }
+            .onFailure { log("IAP2: 手机身份预解析未完成，握手时将重新解析") }
     }
 }
