@@ -119,13 +119,16 @@ class WifiJoiner(
             Log.i(TAG, "local-only migration: ${migration.out.takeLast(400)} ${migration.err.takeLast(160)}")
         }
         Log.i(TAG, "申请 HyperCar 专用局域网；不保存系统热点，不接管其它 App 默认网络")
-        // A device identifier is only an AP candidate when a matching SSID/BSSID scan corroborates it.
-        // A different identifier must not restrict an SSID-only request.
-        val identifierCandidate = deviceIdentifierHint()
-        val hint = if (ShizukuTools.isReady && CarNetworkReuse.mac(identifierCandidate) != null) {
-            val scan = ShizukuTools.exec("cmd wifi list-scan-results", 3_000)
-            WifiApHint.fromScan(scan.out, ssid, identifierCandidate)
+        // Scan hints help ROMs that abandon SSID-only scans. They are optional evidence,
+        // not proof that every SSID-only failure has the same cause.
+        val hint = if (ShizukuTools.isReady) withContext(Dispatchers.IO) {
+            WifiApHint.resolve(ssid, deviceIdentifierHint,
+                scan = { ShizukuTools.exec("cmd wifi list-scan-results", 3_000).out },
+                startScan = { ShizukuTools.exec("cmd wifi start-scan", 3_000); Unit },
+                now = SystemClock::elapsedRealtime)
         } else null
+        currentCoroutineContext().ensureActive()
+        diagnose("scan_hint=${hint != null} freq=${hint?.frequency ?: 0} age_s=${hint?.ageSeconds ?: -1.0}; no AP address logged")
         requestIdentity = CarWifiRequestIdentity(ssid, psk)
         return joinViaSpecifier(ssid, psk, hint, verifiedFallback)
     }
