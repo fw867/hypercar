@@ -1,7 +1,7 @@
 {
   "version": 10,
   "_schema": 10,
-  "updated": "2026-11-13",
+  "updated": "2026-11-14",
   "_comment": "HyperCar 车机档案下发文件。新增车型改这里 + push 即可，App 端「从 GitHub 更新车型列表」后立即出现。字段含义见 docs/HEADUNIT-PROFILES.md；除 id/label 外都可省略（省略 = 用同 id 内置档案的值）。覆盖内置档案须达到各自要求的 schema：奔驰为10，ID9 为9，其余内置档案为8（旧缓存不能把内置修复顶回去）。",
   "profiles": [
     {
@@ -156,8 +156,8 @@
     {
       "id": "mercedes_mbux",
       "label": "奔驰 Mercedes-Benz",
-      "model": "MB_D-PP-3 / MB_D-PP-4（AirPlay 320.17.7）",
-      "notes": "MB_D-PP 接收端试验配置（2023 S 级参考报告）：每次会话仅激活一次 RECORD，音频加入和屏幕重建不重复激活；保留蓝牙。按车机协商尺寸及音频格式，尚未在本项目实车验证。",
+      "model": "MBUX（MB_D-PP / MB_E-P）",
+      "notes": "奔驰统一试验路径：MB_D-PP、MB_E-P 均按 MB_D-PP 参考策略，每次会话仅激活一次 RECORD，音频加入和屏幕重建不重复激活；保留蓝牙。尺寸和音频按车机协商，音视频仍待实车验证。",
       "verified": false,
       "validatesDeviceId": false,
       "sendCarPlayAvailability": true,
@@ -178,7 +178,7 @@
         7000
       ],
       "touchDisplay": "",
-      "pairingHint": "在车机确认 Apple CarPlay，接受 Wi-Fi 连接提示；适用于 MB_D-PP-3/4 参考车机，音视频尚待实车验证。"
+      "pairingHint": "在车机确认 Apple CarPlay，接受 Wi-Fi 连接提示；MB_D-PP 与 MB_E-P 使用统一奔驰路径，音视频尚待实车验证。"
     }
   ]
 }

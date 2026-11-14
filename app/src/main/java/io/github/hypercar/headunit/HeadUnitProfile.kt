@@ -93,7 +93,14 @@ data class HeadUnitProfile(
     /** 首次连接引导里这个车机额外要提示的一句；null = 不提。 */
     val pairingHint: String? = null,
 ) {
-    fun screenResourceLifecycleEnabled(userEnabled: Boolean): Boolean = useScreenResourceLifecycle || userEnabled
+    /** All Mercedes receivers use the MB_D-PP reference policy, including MB_E-P models.
+     * Retired remote/cache switches must not restore the unsuccessful screen-first experiment. */
+    fun connectionPolicy(): HeadUnitProfile = if (id == "mercedes_mbux") {
+        copy(mbuxScreenBootstrap = false, id9ScreenBootstrap = false, useScreenResourceLifecycle = true)
+    } else this
+
+    fun screenResourceLifecycleEnabled(userEnabled: Boolean): Boolean =
+        id == "mercedes_mbux" || useScreenResourceLifecycle || userEnabled
 }
 
 /**
@@ -256,8 +263,8 @@ object HeadUnitProfiles {
     val MERCEDES_MBUX = HeadUnitProfile(
         id = "mercedes_mbux",
         label = "奔驰 Mercedes-Benz",
-        model = "MB_D-PP-3 / MB_D-PP-4（AirPlay 320.17.7）",
-        notes = "MB_D-PP 接收端试验配置（2023 S 级参考报告）：每次会话仅激活一次 RECORD，音频加入和屏幕重建不重复激活；保留蓝牙。按车机协商尺寸及音频格式，尚未在本项目实车验证。",
+        model = "MBUX（MB_D-PP / MB_E-P）",
+        notes = "奔驰统一试验路径：MB_D-PP、MB_E-P 均按 MB_D-PP 参考策略，每次会话仅激活一次 RECORD，音频加入和屏幕重建不重复激活；保留蓝牙。尺寸和音频按车机协商，音视频仍待实车验证。",
         verified = false,
         validatesDeviceId = false,
         sendCarPlayAvailability = true,
@@ -276,7 +283,7 @@ object HeadUnitProfiles {
         mbuxScreenBootstrap = false,
         fallbackAirplayPorts = listOf(7000),
         touchDisplay = null,
-        pairingHint = "在车机确认 Apple CarPlay，接受 Wi-Fi 连接提示；适用于 MB_D-PP-3/4 参考车机，音视频尚待实车验证。",
+        pairingHint = "在车机确认 Apple CarPlay，接受 Wi-Fi 连接提示；MB_D-PP 与 MB_E-P 使用统一奔驰路径，音视频尚待实车验证。",
     )
 
     /** 内置档案（出厂就有的，断网也一定在）。宝马排第一：它是默认档案。 */

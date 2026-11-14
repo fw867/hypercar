@@ -382,7 +382,7 @@ object SettingsStore {
         fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
         // 触摸兜底空间：车机档案若给了 touchDisplay 就用它；否则用设置里的
         // 屏幕推送分辨率（与视频编码一致）。真车 /info 有尺寸时仍优先 /info。
-        val profile = io.github.hypercar.headunit.HeadUnitProfiles.current()
+        val profile = io.github.hypercar.headunit.HeadUnitProfiles.current().connectionPolicy()
         val profileTouch = profile.touchDisplay
         val fallbackW = width.coerceAtLeast(2) / 2 * 2
         val fallbackH = height.coerceAtLeast(2) / 2 * 2

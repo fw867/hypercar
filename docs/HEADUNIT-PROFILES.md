@@ -12,7 +12,7 @@
 | winplay | false | true | false | deviceID 校验；7000端口 | PC 联调，不等于真实车机 |
 | audi_mib3 | true | true | false | mDNS 优先、兼容晚到端点 | 本项目未完成奥迪实车验证 |
 | volkswagen_mib | false | true | true | 当前目标 Wi-Fi 广播；必须新鲜 ctrl 邀请；禁用无邀请捷径 | 用户转述连接正常，未逐项验证功能 |
-| mercedes_mbux | false | true | true | 本轮 iAP2 端点；单次 RECORD 后协商屏幕/音频；关闭旧屏幕前置实验 | 已替换为 MB_D-PP-3/4 / 320.17.7 参考策略，未实车验证 |
+| mercedes_mbux | false | true | true | 本轮 iAP2 端点；单次 RECORD 后协商屏幕/音频；关闭旧屏幕前置实验 | MB_D-PP 与 MB_E-P 统一使用 MB_D-PP 参考策略，未实车验证 |
 
 BMW/generic/Audi 启用0x4300、EA及0x4E0E；大众/奔驰启用0x4300、0x4E0E但不主动打开EA；WinPlay关闭三项。全部回复电源更新，不因CarPlay窗口关闭就主动中止。音频配置保护只涉及HFP/A2DP，不能因此提前断掉RFCOMM控制链。
 
@@ -20,7 +20,7 @@ BMW/generic/Audi 启用0x4300、EA及0x4E0E；大众/奔驰启用0x4300、0x4E0E
 
 ## 配置字段与覆盖
 
-当前发布schema=10。覆盖门槛按档案区分：mercedes_mbux需要schema10，bmw_id9需要schema9，其余内置档案继续接受schema8，避免旧奔驰缓存恢复已移除的屏幕前置策略，同时保留其它档案已有有效覆盖；低于该档案门槛的缓存仅能追加新ID。缺省字段继承同ID内置值，新ID继承BMW模板；显式false是有效覆盖。touchDisplay/pairingHint空字符串可清除。导出保留策略及schema，刷新失败保留缓存并继续执行schema隔离。
+当前发布schema=10。覆盖门槛按档案区分：mercedes_mbux需要schema10，bmw_id9需要schema9，其余内置档案继续接受schema8，避免旧奔驰缓存恢复已移除的屏幕前置策略，同时保留其它档案已有有效覆盖；低于该档案门槛的缓存仅能追加新ID。缺省字段继承同ID内置值，新ID继承BMW模板；显式false通常是有效覆盖；奔驰例外：mbuxScreenBootstrap/id9ScreenBootstrap固定false，useScreenResourceLifecycle固定true，解析、合并和引擎配置均按统一策略处理。touchDisplay/pairingHint空字符串可清除。导出保留策略及schema，刷新失败保留缓存并继续执行schema隔离。
 
 | 字段组 | 内容 |
 |---|---|
@@ -43,7 +43,7 @@ useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关�
 
 不按品牌固定网关、控制Session ID、触摸尺寸或MFi挑战长度。3315首次403后等待新邀请成功的第三方记录，不能推广为明文降级安全或本项目已完成验证。
 
-## 奔驰 MB_D-PP
+## 奔驰统一路径（以 MB_D-PP 为准）
 
 参考 [mcarplay 提交 2b2ac6b](https://github.com/wangxso/mcarplay/commit/2b2ac6b67d09d5b9656fab28c8ce75495d9a1d02) 与 [issue #55](https://github.com/wangxso/mcarplay/issues/55)：同一台 2023 S 级在 iAP2 自报 MB_D-PP-3、/info 自报 MB_D-PP-4，AirPlay srcvers=320.17.7。报告显示仅视频会话正常，音频 SETUP 200 后第二次 RECORD 与随后 16–559ms 拆链相关。提交新增厂商为空或 Mercedes-Benz 时可手动开启的单次 RECORD 预设；不是奔驰全品牌认证、MFi 或蓝牙拆链策略。
 
@@ -53,7 +53,7 @@ useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关�
 
 ## 旧奔驰 MBUX 实验记录
 
-以下为 MB_E-P-4 的历史排查。原档案已被上述 MB_D-PP 参考策略替换，`mbuxScreenBootstrap` 当前关闭；这些记录不代表当前默认流程。
+以下为 MB_E-P-4 的失败实验历史。MB_E-P-4 没有独立现行路径，也没有成功样本；它与 MB_D-PP 共用上述奔驰档案。`mbuxScreenBootstrap` 固定关闭，远程配置或缓存不能重开；这些历史参数不代表当前流程。
 
 11月9日14:29导出日志（版本524）头部五次尝试均报BSSID辅助读取正则异常，正文后两轮也复现；阶段止于IAP2_PARAMETERS，没有/auth-setup、屏幕SETUP或RECORD。蓝牙已给出热点与端点，后续RFCOMM local_cancel=true由本地失败清理造成，不是本轮车机拒绝媒体的证据。路径对应610新增复用检查。611去掉该路径正则，用ASCII/标签扫描解析并把辅助读取失败降级为正常入网；保留取消，不降低网络复用的身份/地址校验。
 
@@ -96,3 +96,5 @@ useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关�
 该分支是根据成功样本静态路径校准的奔驰实验，不代表已在奔驰验证消除400；多个校准项同时启用，不能据一次成功反推唯一根因。回归及安装状态见VALIDATION。
 
 ID9当前路径：配对 → 会话SETUP → /info主屏UUID → 初始资源声明 → 按约束申请主屏 → HID mode0 → 主屏SETUP/TCP → RECORD → 资源版本仍有效才送帧。只对bmw_id9启用；不支持的PCM媒体档不尝试；声明AAC-LC48媒体输出时可使用AAC，ID9实车仍待验证。
+
+2026-11-14 656：保留mercedes_mbux ID，MB_D-PP/MB_E-P不按接收端型号分流；统一按11月13日MB_D-PP单次RECORD策略。新增connectionPolicy在远端解析、合并和引擎JSON入口规范化旧开关，保留其它远端可调参数和其它车机档案策略。schema仍为10，没有新增字段；即使schema10及之后的缓存包含旧实验开关也会规范化。11月14日MB_E日志实际也已经走默认单次RECORD，不能把其失败归因为按型号回退旧实验。

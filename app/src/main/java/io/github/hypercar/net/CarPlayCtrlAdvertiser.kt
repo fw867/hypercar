@@ -46,12 +46,8 @@ class CarPlayCtrlAdvertiser(
         private const val SRCVERS = "950.7.1"
         private const val TAG = "CTRL"
         private const val MAX_HEAD_BYTES = 16 * 1024
-        private const val FORCE_COOLDOWN_MILLIS = 2_000L
         private const val PLACEHOLDER_MAC = "02:00:00:00:00:00"
         private const val REGISTRATION_TIMEOUT_MILLIS = 10_000L
-        private const val REFRESH_INTERVAL_MILLIS = 30_000L
-        /** Keep announcing while the car may still browse; ACL wake can reset the budget. */
-        private const val MAX_WAITING_REFRESHES = 8
     }
 
     private val appContext = context.applicationContext
@@ -68,7 +64,6 @@ class CarPlayCtrlAdvertiser(
     private var registeredNetwork: Network? = null
     private var registeredAtMillis = 0L
     private var registeredMac: String? = null
-    private var waitingRefreshes = 0
 
     /** 车机 ctrl 邀请计数（每收到一次 `GET /ctrl-int/1/connect` 加一）。 */
     @Volatile
@@ -92,72 +87,56 @@ class CarPlayCtrlAdvertiser(
     /** 已注册的端口（-1 = 未启动）。 */
     val port: Int get() = serverSocket?.localPort ?: -1
 
-    /**
-     * 确保广播在 [ssid] 对应的车机网络上可见（拿到 0x5703 并绑网后调用）。
-     *
-     * @param force true = 无论是否同 SSID 都重注册（绑网后的时机修正：注册必须在绑定之后）
-     */
+    /** Keep the same service alive across ACL edges and polling; replace only a changed identity or failed registration. */
     @Synchronized
-    fun ensureForNetwork(
-        ssid: String,
-        force: Boolean = false,
-        network: Network? = null,
-    ): Boolean {
-        val macPlaceholder = (registeredMac ?: PLACEHOLDER_MAC) == PLACEHOLDER_MAC
+    fun ensureForNetwork(ssid: String, network: Network? = null): Boolean {
         val effectiveNetwork = network ?: registeredNetwork
-        val same = registeredSsid == ssid && registeredNetwork == effectiveNetwork && !macPlaceholder
+        val currentMac = bluetoothMacProvider()
+        val same = registeredSsid == ssid && registeredNetwork == effectiveNetwork &&
+            registeredMac.equals(currentMac, ignoreCase = true)
         val age = SystemClock.uptimeMillis() - registeredAtMillis
-        if (same && registration.pending && age < REGISTRATION_TIMEOUT_MILLIS) return true
-        if (same && registration.ready) {
-            if (force && age < FORCE_COOLDOWN_MILLIS) return true
-            if (!force) {
-                // NSD 自身会维护公告；仅在无邀请的等待期有限刷新，保留 TCP 端口。
-                if (lastInvitePeerIp != null || age < REFRESH_INTERVAL_MILLIS || waitingRefreshes >= MAX_WAITING_REFRESHES) return true
-                waitingRefreshes++
-                log("$TAG: 等待邀请，刷新广播 $waitingRefreshes/$MAX_WAITING_REFRESHES network=$effectiveNetwork port=$port")
-            }
+        val socket = serverSocket?.takeUnless { it.isClosed }
+        if (socket != null && registration.canReuse(same, age, REGISTRATION_TIMEOUT_MILLIS)) {
+            ensureAcceptThread(socket)
+            return true
         }
-        if (!same) waitingRefreshes = 0
         if (registeredNetwork != effectiveNetwork) invitations.set(null)
         if (registrationListener != null) {
-            log("$TAG: 重新注册 mDNS 广播（${registeredSsid ?: "?"} → $ssid，端口 ${port} 不变）")
-            // **只换 mDNS 注册，不换 socket/端口**（cardeck 2026-10-22 实测）：
-            // 旧实现每次重注册都新建 ServerSocket（端口 43857→33383→…），中间还有最长
-            // 1.2s 的「服务空窗」——车机正好在这时按旧端口连进来就会失败。
+            log("$TAG: 更新 mDNS 注册 reason=${if (!same) "network/identity changed" else "registration/listener unavailable"} network=$effectiveNetwork port=$port")
             unregisterMdns()
         }
         registeredSsid = ssid
         registeredNetwork = effectiveNetwork
-        var ok = start()
-        if (!ok) {
-            try {
-                Thread.sleep(1_200)
-            } catch (_: InterruptedException) {
-                return false
-            }
-            ok = start()
-        }
-        return ok
+        // A rejected request is retried by the existing wait loop, without blocking or withdrawing a healthy service.
+        return start()
     }
 
-    /**
-     * ACL/companion wake while still waiting for an invite: replenish the refresh budget and
-     * re-announce on the bound car network. Does not start AirPlay by itself.
-     */
+    /** Bluetooth is an independent transport: its edges must not withdraw a healthy Wi-Fi service. */
     @Synchronized
     fun nudgeWhileWaiting(reason: String, ssid: String?, network: Network?): Boolean {
         if (ssid.isNullOrBlank() || network == null || lastInvitePeerIp != null) return false
-        waitingRefreshes = 0
-        log("$TAG: 车机状态变化（$reason）——重置等待刷新并重播 _carplay-ctrl._tcp")
-        return ensureForNetwork(ssid, force = true, network = network)
+        val token = registration.currentGeneration
+        val ensured = ensureForNetwork(ssid, network)
+        if (ensured) {
+            log("$TAG: 车机状态变化（$reason）——${if (token == registration.currentGeneration) "保留现有 mDNS 注册，无注销重播" else "修复/建立 mDNS 注册"} network=$network port=$port")
+        }
+        return ensured
+    }
+
+    private fun ensureAcceptThread(socket: ServerSocket) {
+        if (acceptThread?.isAlive != true) {
+            acceptThread = Thread({ acceptLoop(socket) }, "carplay-ctrl-accept").apply {
+                isDaemon = true
+                start()
+            }
+        }
     }
 
     @Synchronized
     fun start(): Boolean {
-        if (registration.ready || registration.pending) return true
         // socket 与 accept 线程**只在第一次创建**，之后重注册一直复用（端口稳定）
         val socket =
-            serverSocket
+            serverSocket?.takeUnless { it.isClosed }
                 ?: try {
                     ServerSocket(0).also {
                         serverSocket = it
@@ -166,14 +145,8 @@ class CarPlayCtrlAdvertiser(
                     log("$TAG: 监听端口创建失败 - ${error.message}")
                     return false
                 }
-        // accept 线程若意外退出（socket 异常/被系统回收）要补起来，否则邀请永远没人接
-        if (acceptThread?.isAlive != true) {
-            acceptThread =
-                Thread({ acceptLoop(socket) }, "carplay-ctrl-accept").apply {
-                    isDaemon = true
-                    start()
-                }
-        }
+        ensureAcceptThread(socket)
+        if (registration.ready || registration.pending) return true
         val token = registration.begin()
         return try {
             val mac = bluetoothMacProvider()

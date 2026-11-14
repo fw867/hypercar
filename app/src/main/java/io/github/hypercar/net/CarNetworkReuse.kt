@@ -5,6 +5,7 @@ internal object CarNetworkReuse {
     data class Evidence(
         val ssid: String?, val bssid: String?, val hasAddress: Boolean,
         val routeToPeer: Boolean, val pinned: Boolean,
+        val ownedRequest: Boolean = false,
     )
     private fun hex(c: Char) = c in '0'..'9' || c in 'a'..'f' || c in 'A'..'F'
 
@@ -54,14 +55,17 @@ internal object CarNetworkReuse {
         throw cancelled
     } catch (_: Exception) { null }
 
-    fun accepts(ssid: String?, receiverId: String?, invited: Boolean, link: Evidence): Boolean {
+    /** apBssid must be an independently verified AP address, never an iAP2 deviceIdentifier. */
+    fun accepts(ssid: String?, apBssid: String?, invited: Boolean, link: Evidence): Boolean {
         if (!link.hasAddress) return false
         if (!ssid.isNullOrBlank()) {
-            if (link.ssid != ssid) return false
+            if (link.ssid != ssid && !link.ownedRequest) return false
         } else if (!link.pinned && !invited) return false
-        val expected = mac(receiverId)
+        val expected = mac(apBssid)
+        if (apBssid != null && expected == null) return false
         if (expected != null && mac(link.bssid) != expected) return false
         // A matched BSSID can identify the hotspot before iAP2 supplies endpoint addresses.
-        return link.routeToPeer || (link.pinned && !ssid.isNullOrBlank()) || expected != null
+        return link.routeToPeer || (link.ownedRequest && !ssid.isNullOrBlank()) ||
+            (link.pinned && !ssid.isNullOrBlank()) || expected != null
     }
 }

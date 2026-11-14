@@ -54,6 +54,8 @@ class WifiJoiner(
 
     /** 当前已绑定的网络（bindProcess 记录，供快路径与 onLost 解绑）。 */
     private val boundNetwork = AtomicReference<Network?>(null)
+    @Volatile private var requestIdentity: CarWifiRequestIdentity? = null
+    private val requestedNetwork = AtomicReference<Network?>(null)
     private val selectionOwner = android.os.Binder()
     private val selectionToken = AtomicReference<String?>(null)
 
@@ -92,7 +94,7 @@ class WifiJoiner(
      * @param psk  热点密码；空=开放热点；WEP 形态返回 [JoinResult.Unsupported]。
      */
     suspend fun joinCarHotspotSilently(ssid: String, psk: String,
-        verifiedFallback: suspend () -> Network? = { null }, bssidHint: () -> String? = { null }): JoinResult {
+        verifiedFallback: suspend () -> Network? = { null }, deviceIdentifierHint: () -> String? = { null }): JoinResult {
         lastFailureReason = null
         // Password length alone cannot distinguish WEP from valid 10/13/26-character WPA2.
         if (isUnsupportedPassphrase(psk)) {
@@ -117,12 +119,14 @@ class WifiJoiner(
             Log.i(TAG, "local-only migration: ${migration.out.takeLast(400)} ${migration.err.takeLast(160)}")
         }
         Log.i(TAG, "申请 HyperCar 专用局域网；不保存系统热点，不接管其它 App 默认网络")
-        // 0x4301 can arrive while shell preparation runs, after the initial 0x5703 snapshot.
-        val latestBssid = bssidHint()
-        val hint = if (ShizukuTools.isReady && CarNetworkReuse.mac(latestBssid) != null) {
+        // A device identifier is only an AP candidate when a matching SSID/BSSID scan corroborates it.
+        // A different identifier must not restrict an SSID-only request.
+        val identifierCandidate = deviceIdentifierHint()
+        val hint = if (ShizukuTools.isReady && CarNetworkReuse.mac(identifierCandidate) != null) {
             val scan = ShizukuTools.exec("cmd wifi list-scan-results", 3_000)
-            WifiApHint.fromScan(scan.out, ssid, latestBssid)
+            WifiApHint.fromScan(scan.out, ssid, identifierCandidate)
         } else null
+        requestIdentity = CarWifiRequestIdentity(ssid, psk)
         return joinViaSpecifier(ssid, psk, hint, verifiedFallback)
     }
 
@@ -188,6 +192,7 @@ class WifiJoiner(
             override fun onAvailable(network: Network) {
                 if (callback.get() !== this) return
                 result.set(network)
+                requestedNetwork.set(network)
                 diagnose("callback=available elapsed_ms=${SystemClock.elapsedRealtime() - started}; verifying capabilities/address")
                 latch.countDown()
             }
@@ -195,6 +200,7 @@ class WifiJoiner(
             override fun onUnavailable() {
                 if (callback.get() !== this) return
                 unavailable.set(true)
+                requestedNetwork.set(null)
                 diagnose("callback=unavailable elapsed_ms=${SystemClock.elapsedRealtime() - started}; live network verification required")
                 latch.countDown()
             }
@@ -202,6 +208,7 @@ class WifiJoiner(
             override fun onLost(network: Network) {
                 if (callback.get() !== this) return
                 result.compareAndSet(network, null)
+                requestedNetwork.compareAndSet(network, null)
                 diagnose("callback=lost bound=${boundNetwork.get() == network}")
                 handleNetworkLost(this, network)
             }
@@ -296,6 +303,11 @@ class WifiJoiner(
      */
     fun ownsBinding(network: Network): Boolean = boundNetwork.get() == network
 
+    /** An available callback for these exact credentials proves ownership even if SSID is redacted. */
+    fun ownsHotspot(network: Network, ssid: String?, passphrase: String?): Boolean =
+        callback.get() != null && requestedNetwork.get() == network &&
+            requestIdentity?.matches(ssid, passphrase) == true
+
     fun bindProcess(network: Network): Boolean = synchronized(bindLock) {
         if (boundNetwork.get() == network && connectivityManager.boundNetworkForProcess == network) return true // 快路径：已绑同一网络
         if (!CarWifiPolicy.canReuse(connectivityManager.getNetworkCapabilities(network))) {
@@ -323,6 +335,8 @@ class WifiJoiner(
 
     /** Release only this instance's process binding and callback. */
     fun release() = synchronized(bindLock) {
+        requestIdentity = null
+        requestedNetwork.set(null)
         stopSelection()
         callback.getAndSet(null)?.let {
             runCatching { connectivityManager.unregisterNetworkCallback(it) }

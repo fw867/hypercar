@@ -105,12 +105,12 @@ object RemoteProfiles {
         remote: List<HeadUnitProfile>,
         remoteSchema: Int = SCHEMA,
     ): List<HeadUnitProfile> {
-        if (remote.isEmpty()) return builtin
+        if (remote.isEmpty()) return builtin.map { it.connectionPolicy() }
         val remoteById = remote.associateBy { it.id }
         val merged =
             builtin.map { base ->
                 val fromRemote = remoteById[base.id]
-                if (fromRemote != null && canOverrideBuiltin(base.id, remoteSchema)) fromRemote else base
+                (if (fromRemote != null && canOverrideBuiltin(base.id, remoteSchema)) fromRemote else base).connectionPolicy()
             }
         val builtinIds = builtin.map { it.id }.toSet()
         return merged + remote.filter { it.id !in builtinIds }
@@ -215,7 +215,7 @@ object RemoteProfiles {
             pairingHint = if (o.has("pairingHint")) {
                 o.optString("pairingHint", "").ifBlank { null }
             } else defaults.pairingHint,
-        )
+        ).connectionPolicy()
     }
 
     private fun readPorts(o: JSONObject, fallback: List<Int>): List<Int> {

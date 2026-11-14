@@ -49,8 +49,26 @@ class CarNetworkReuseTest {
     }
     @Test fun sameBssidCanIdentifyEarlyCredentialsAndOpaqueIdsAreNotMistakenForMacs() {
         assertTrue(CarNetworkReuse.accepts("car", link.bssid, false, link.copy(routeToPeer = false)))
-        assertTrue(CarNetworkReuse.accepts("car", "receiver-uuid", false, link))
+        assertTrue(CarNetworkReuse.accepts("car", null, false, link))
+        assertFalse(CarNetworkReuse.accepts("car", "receiver-uuid", false, link))
         assertFalse(CarNetworkReuse.accepts("car", "receiver-uuid", false, link.copy(routeToPeer = false)))
+    }
+    @Test fun liveRequestCanSupplyRedactedSsidButStaleHandleCannot() {
+        val hidden = link.copy(ssid = null, routeToPeer = false, pinned = true)
+        assertFalse(CarNetworkReuse.accepts("car", null, false, hidden))
+        assertTrue(CarNetworkReuse.accepts("car", null, false, hidden.copy(ownedRequest = true)))
+        assertFalse(CarNetworkReuse.accepts("car", null, false,
+            hidden.copy(ownedRequest = true, hasAddress = false)))
+        // A known AP restriction still applies to an owned request.
+        assertFalse(CarNetworkReuse.accepts("car", "aa:bb:cc:dd:ee:00", false,
+            hidden.copy(ownedRequest = true)))
+    }
+    @Test fun deviceIdentityIsNotAnApRestrictionAndRouteRemainsRequired() {
+        // The production caller supplies no AP restriction from the receiver deviceIdentifier.
+        assertTrue(CarNetworkReuse.accepts("car", null, false, link))
+        assertFalse(CarNetworkReuse.accepts("car", null, false, link.copy(routeToPeer = false)))
+        assertFalse(CarNetworkReuse.accepts("other car", null, false, link))
+        assertFalse(CarNetworkReuse.accepts("car", null, false, link.copy(hasAddress = false)))
     }
     @Test fun missingSsidNeedsAnOwnedLinkOrAnInvitationAndARealPeerRoute() {
         assertFalse(CarNetworkReuse.accepts(null, null, false, link))

@@ -8,6 +8,12 @@ internal class ServiceRegistrationState {
     @Volatile var ready = false
         private set
 
+    val currentGeneration: Long @Synchronized get() = generation
+
+    /** Success has no application TTL. Pending requests alone have a bounded probe budget. */
+    @Synchronized fun canReuse(sameIdentity: Boolean, ageMillis: Long, pendingTimeoutMillis: Long): Boolean =
+        sameIdentity && (ready || (pending && ageMillis >= 0 && ageMillis < pendingTimeoutMillis))
+
     @Synchronized fun begin(): Long {
         generation++
         pending = true

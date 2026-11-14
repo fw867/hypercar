@@ -50,11 +50,30 @@ class MercedesMbuxProfileTest {
         }
     }
 
-    @Test fun remoteProfileInheritsLifecycleAndCanExplicitlyOverrideIt() {
+    @Test fun remoteProfileCannotReenableRetiredMercedesPath() {
         assertEquals(profile, RemoteProfiles.parse("""[{"id":"mercedes_mbux"}]""").single())
         assertEquals(listOf(profile), RemoteProfiles.parse(RemoteProfiles.encode(listOf(profile))))
         val custom = RemoteProfiles.parse("""[{"id":"mercedes_mbux","useScreenResourceLifecycle":false}]""").single()
-        assertFalse(custom.screenResourceLifecycleEnabled(false))
+        assertTrue(custom.screenResourceLifecycleEnabled(false))
         assertTrue(custom.screenResourceLifecycleEnabled(true))
+        val stale = profile.copy(mbuxScreenBootstrap = true, id9ScreenBootstrap = true,
+            useScreenResourceLifecycle = false)
+        assertEquals(profile, stale.connectionPolicy())
+        assertEquals(profile, RemoteProfiles.merge(listOf(profile), listOf(stale), 10).single())
+        val oldJson = """[{"id":"mercedes_mbux","mbuxScreenBootstrap":true,
+            "id9ScreenBootstrap":true,"useScreenResourceLifecycle":false}]"""
+        assertEquals(profile, RemoteProfiles.parse(oldJson).single())
+    }
+
+    @Test fun unificationOnlyAppliesToMercedesAndRetainsNegotiatedModelIndependence() {
+        for (other in HeadUnitProfiles.builtin.filter { it.id != profile.id }) {
+            assertSame(other.id, other, other.connectionPolicy())
+        }
+        for (model in listOf("MB_D-PP-3", "MB_D-PP-4", "MB_E-P-4")) {
+            val selected = profile.copy(model = model, mbuxScreenBootstrap = true).connectionPolicy()
+            assertFalse(selected.mbuxScreenBootstrap)
+            assertFalse(selected.id9ScreenBootstrap)
+            assertTrue(selected.screenResourceLifecycleEnabled(false))
+        }
     }
 }
