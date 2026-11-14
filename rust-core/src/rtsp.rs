@@ -121,27 +121,44 @@ impl RtspMessage {
 }
 
 /// 增量重组：从裸字节流切出完整 RTSP 消息，残余留在 buf。
-pub fn parse_rtsp_messages(buf: &mut Vec<u8>) -> Vec<RtspMessage> {
+// Bounds apply to each message, not to a batch of pipelined messages.
+const MAX_RTSP_HEADER: usize = 64 * 1024;
+const MAX_RTSP_BODY: usize = 16 * 1024 * 1024;
+
+pub fn parse_rtsp_messages(buf: &mut Vec<u8>) -> Result<Vec<RtspMessage>, String> {
     let mut messages = Vec::new();
     loop {
         let head_end = match find_head_separator(buf) {
             Some(idx) => idx,
+            None if buf.len() > MAX_RTSP_HEADER => return Err("RTSP header too large".into()),
             None => break,
         };
+        if head_end > MAX_RTSP_HEADER { return Err("RTSP header too large".into()); }
         let head_text = String::from_utf8_lossy(&buf[..head_end]).to_string();
         let mut lines = head_text.split("\r\n");
         let first_line = lines.next().unwrap_or("").trim().to_string();
         let mut headers: HashMap<String, String> = HashMap::new();
         for line in lines {
             if let Some((k, v)) = line.split_once(':') {
-                headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+                let key = k.trim().to_ascii_lowercase();
+                let value = v.trim().to_string();
+                if key == "content-length" {
+                    if let Some(previous) = headers.get(&key) {
+                        if previous != &value { return Err("RTSP conflicting Content-Length".into()); }
+                    }
+                }
+                headers.insert(key, value);
             }
         }
-        let content_length: usize = headers
-            .get("content-length")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let total = head_end + 4 + content_length;
+        let content_length = match headers.get("content-length") {
+            None => 0,
+            Some(value) if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) =>
+                value.parse::<usize>().map_err(|_| "RTSP invalid Content-Length")?,
+            Some(_) => return Err("RTSP invalid Content-Length".into()),
+        };
+        if content_length > MAX_RTSP_BODY { return Err("RTSP body too large".into()); }
+        let total = head_end.checked_add(4).and_then(|n| n.checked_add(content_length))
+            .ok_or("RTSP message length overflow")?;
         if buf.len() < total {
             break;
         }
@@ -153,7 +170,7 @@ pub fn parse_rtsp_messages(buf: &mut Vec<u8>) -> Vec<RtspMessage> {
         });
         buf.drain(..total);
     }
-    messages
+    Ok(messages)
 }
 
 fn find_head_separator(buf: &[u8]) -> Option<usize> {
@@ -471,7 +488,14 @@ async fn reader_loop(
         };
 
         // 2) 切出完整 RTSP 消息并派发
-        for msg in parse_rtsp_messages(stream) {
+        let messages = match parse_rtsp_messages(stream) {
+            Ok(messages) => messages,
+            Err(error) => {
+                crate::emit_log(&format!("RTSP#{trace_id}: invalid framing: {error}; closing reader"));
+                break;
+            }
+        };
+        for msg in messages {
             if msg.is_response() {
                 if let Some(c) = msg.cseq() {
                     if let Some(tx) = pending.lock().remove(&c) {
@@ -549,6 +573,56 @@ async fn respond_ok(write: &SharedWrite, cipher: &SharedCipher, cseq: Option<i32
 mod tests {
     use super::*;
 
+    #[test]
+    fn framing_rejects_invalid_and_oversized_lengths_without_consuming_input() {
+        for length in ["-1".to_string(), "+1".into(), "NaN".into(), usize::MAX.to_string(),
+                       (MAX_RTSP_BODY + 1).to_string(), "99999999999999999999999999999".into()] {
+            let mut bytes = format!("RTSP/1.0 200 OK\r\nContent-Length: {length}\r\n\r\n").into_bytes();
+            let original = bytes.clone();
+            assert!(parse_rtsp_messages(&mut bytes).is_err(), "length={length}");
+            assert_eq!(bytes, original);
+        }
+        let mut conflict = b"RTSP/1.0 200 OK\r\nContent-Length: 0\r\ncontent-length: 5\r\n\r\n".to_vec();
+        assert!(parse_rtsp_messages(&mut conflict).is_err());
+        assert!(parse_rtsp_messages(&mut vec![b'x'; MAX_RTSP_HEADER + 1]).is_err());
+    }
+
+    #[test]
+    fn fragmented_bodies_and_pipelined_messages_keep_framing() {
+        let mut bytes = b"RTSP/1.0 200 OK\r\nCSeq: 7\r\nContent-Length: 5\r\n\r\nhe".to_vec();
+        assert!(parse_rtsp_messages(&mut bytes).unwrap().is_empty());
+        bytes.extend_from_slice(b"lloRTSP/1.0 200 OK\r\nCSeq: 8\r\n\r\npartial");
+        let messages = parse_rtsp_messages(&mut bytes).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].body, b"hello");
+        assert_eq!(messages[1].cseq(), Some(8));
+        assert_eq!(bytes, b"partial");
+    }
+
+    #[tokio::test]
+    async fn malformed_response_wakes_pending_transaction_without_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let phone = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut car, _) = listener.accept().await.unwrap();
+        let (r, w) = phone.into_split();
+        let (channel, _) = RtspChannel::spawn(r, w, None);
+        let peer = tokio::spawn(async move {
+            let mut request = [0; 4096];
+            assert!(car.read(&mut request).await.unwrap() > 0);
+            car.write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: -1\r\n\r\n").await.unwrap();
+            // Keep TCP open: prompt failure must come from parsing, not EOF.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let result = tokio::time::timeout(Duration::from_secs(1), channel.request(
+            "GET", "/info", &[], "", &[], Duration::from_secs(30)
+        )).await.expect("invalid response must wake its waiter");
+        assert!(result.unwrap_err().contains("控制通道已关闭"));
+        assert!(channel.is_closed());
+        assert!(channel.pending.lock().is_empty());
+        peer.abort();
+    }
+
+
     #[tokio::test]
     async fn ui_commands_receive_empty_200_with_optional_cseq_before_dispatch() {
         for (kind,cseq) in [("requestUI",Some(19)),("changeUIContext",None)] {
@@ -570,7 +644,7 @@ mod tests {
             let response=loop {
                 let n=tokio::time::timeout(Duration::from_secs(1),car.read(&mut chunk)).await.unwrap().unwrap();
                 assert!(n>0); buffer.extend_from_slice(&chunk[..n]);
-                if let Some(response)=parse_rtsp_messages(&mut buffer).pop() { break response; }
+                if let Some(response)=parse_rtsp_messages(&mut buffer).unwrap().pop() { break response; }
             };
             assert_eq!(response.status(),200); assert_eq!(response.cseq(),cseq); assert!(response.body.is_empty());
         }
@@ -590,7 +664,7 @@ mod tests {
                 let n = socket.read(&mut chunk).await.unwrap();
                 assert!(n > 0);
                 buffer.extend_from_slice(&chunk[..n]);
-                if let Some(request) = parse_rtsp_messages(&mut buffer).pop() { break request; }
+                if let Some(request) = parse_rtsp_messages(&mut buffer).unwrap().pop() { break request; }
             };
             assert_eq!(request.first_line, "SETUP / RTSP/1.0");
             assert_eq!(request.body, expected);
@@ -622,7 +696,7 @@ mod tests {
         let response = loop {
             let n = car.read(&mut chunk).await.unwrap(); assert!(n>0);
             buffer.extend_from_slice(&chunk[..n]);
-            if let Some(message) = parse_rtsp_messages(&mut buffer).pop() { break message; }
+            if let Some(message) = parse_rtsp_messages(&mut buffer).unwrap().pop() { break message; }
         };
         assert_eq!(response.cseq(), Some(19));
         assert_eq!(response.status(), 200);
@@ -646,7 +720,7 @@ mod tests {
                 let (decoded, used) = cipher.decrypt(&wire).expect("wire order must match nonce order");
                 wire.drain(..used);
                 plain.extend_from_slice(&decoded);
-                if let Some(request) = parse_rtsp_messages(&mut plain).pop() {
+                if let Some(request) = parse_rtsp_messages(&mut plain).unwrap().pop() {
                     assert_eq!(request.first_line, "RECORD / RTSP/1.0");
                     let response = format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n", request.cseq().unwrap());
                     socket.write_all(&cipher.encrypt(response.as_bytes())).await.unwrap();
@@ -693,7 +767,7 @@ mod cancellation_tests {
             let n = peer.read(&mut chunk).await.unwrap();
             assert!(n > 0);
             bytes.extend_from_slice(&chunk[..n]);
-            if let Some(message) = parse_rtsp_messages(&mut bytes).pop() { return message; }
+            if let Some(message) = parse_rtsp_messages(&mut bytes).unwrap().pop() { return message; }
         }
     }
 

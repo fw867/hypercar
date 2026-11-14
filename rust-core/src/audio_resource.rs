@@ -88,7 +88,7 @@ mod tests {
                     let mut chunk = [0u8;4096];
                     let n = peer.read(&mut chunk).await.unwrap(); assert!(n>0);
                     buffer.extend_from_slice(&chunk[..n]);
-                    if let Some(message) = crate::rtsp::parse_rtsp_messages(&mut buffer).into_iter().next() { break message; }
+                    if let Some(message) = crate::rtsp::parse_rtsp_messages(&mut buffer).unwrap().into_iter().next() { break message; }
                 }
             }).await.unwrap();
             assert!(!owned.load(Ordering::Acquire));
@@ -114,7 +114,7 @@ mod tests {
                     loop {
                         let mut chunk=[0;4096];let n=peer.read(&mut chunk).await.unwrap();assert!(n>0);
                         buffer.extend_from_slice(&chunk[..n]);
-                        if let Some(m)=crate::rtsp::parse_rtsp_messages(&mut buffer).into_iter().next(){break m;}
+                        if let Some(m)=crate::rtsp::parse_rtsp_messages(&mut buffer).unwrap().into_iter().next(){break m;}
                     }
                 }).await.unwrap();
                 assert!(!owned.load(Ordering::Acquire));

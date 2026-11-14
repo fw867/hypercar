@@ -64,7 +64,7 @@ mod tests {
                 let mut buffer=Vec::new();let mut chunk=[0;4096];
                 let request=loop {
                     let n=peer.read(&mut chunk).await.unwrap();assert!(n>0);buffer.extend_from_slice(&chunk[..n]);
-                    if let Some(request)=crate::rtsp::parse_rtsp_messages(&mut buffer).pop() {break request;}
+                    if let Some(request)=crate::rtsp::parse_rtsp_messages(&mut buffer).unwrap().pop() {break request;}
                 };
                 assert_eq!(request.first_line,"POST /auth-setup RTSP/1.0");
                 assert_eq!(request.body.len(),33);

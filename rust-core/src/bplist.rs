@@ -124,6 +124,23 @@ impl Value {
 
 const MAGIC: &[u8; 8] = b"bplist00";
 const MAX_OBJECTS: u64 = 1 << 20;
+const MAX_PARSE_DEPTH: usize = 128;
+const MAX_DECODED_BYTES: usize = 32 * 1024 * 1024;
+
+// Object count in the trailer does not bound an expanded tree: references can be
+// cyclic or can repeatedly share a large subtree. Bound visits and copied payloads.
+struct ParseBudget { remaining_nodes: usize, remaining_bytes: usize }
+impl ParseBudget {
+    fn visit(&mut self, depth: usize) -> Result<(), String> {
+        if depth > MAX_PARSE_DEPTH { return Err("plist nesting too deep or cyclic".into()); }
+        self.remaining_nodes = self.remaining_nodes.checked_sub(1).ok_or("plist expanded object budget exceeded")?;
+        Ok(())
+    }
+    fn copy(&mut self, bytes: usize) -> Result<(), String> {
+        self.remaining_bytes = self.remaining_bytes.checked_sub(bytes).ok_or("plist decoded byte budget exceeded")?;
+        Ok(())
+    }
+}
 
 /// bplist00 编码。**根对象会被重排到偏移 8**（老车机不读 trailer topObject）；
 /// map 键顺序 = `Value::Dict` 的插入顺序；负数固定 8 字节，正数沿用保守宽度。
@@ -525,9 +542,12 @@ pub fn parse(bytes: &[u8]) -> Result<Value, String> {
     let table = offset_table_offset as usize;
     let mut offsets: Vec<u64> = Vec::with_capacity(count);
     for index in 0..count {
-        offsets.push(read_uint(bytes, table + index * offset_int_size, offset_int_size)?);
+        let offset = read_uint(bytes, table + index * offset_int_size, offset_int_size)?;
+        if offset < 8 || offset >= offset_table_offset { return Err("plist object outside object table".into()); }
+        offsets.push(offset);
     }
-    parse_object(bytes, offsets[top_object as usize] as usize, object_ref_size, &offsets)
+    let mut budget = ParseBudget { remaining_nodes: MAX_OBJECTS as usize, remaining_bytes: MAX_DECODED_BYTES };
+    parse_object(&bytes[..table], offsets[top_object as usize] as usize, object_ref_size, &offsets, 0, &mut budget)
 }
 
 /// 递归解析单个对象（下标经 offsets 表换算成绝对偏移）。
@@ -536,7 +556,10 @@ fn parse_object(
     offset: usize,
     ref_size: usize,
     offsets: &[u64],
+    depth: usize,
+    budget: &mut ParseBudget,
 ) -> Result<Value, String> {
+    budget.visit(depth)?;
     let marker = *bytes
         .get(offset)
         .ok_or_else(|| format!("对象标记越界（offset={} body={}B）", offset, bytes.len()))?;
@@ -566,17 +589,20 @@ fn parse_object(
 
         0x4 => {
             let (count, start) = element_count(bytes, offset, info)?;
+            budget.copy(count)?;
             Ok(Value::Data(slice_of(bytes, start, count, "data")?.to_vec()))
         }
 
         0x5 => {
             let (count, start) = element_count(bytes, offset, info)?;
+            budget.copy(mul_usize(count, 3)?)?;
             let raw = slice_of(bytes, start, count, "ASCII 字符串")?;
             Ok(Value::String(String::from_utf8_lossy(raw).into_owned()))
         }
 
         0x6 => {
             let (count, start) = element_count(bytes, offset, info)?;
+            budget.copy(mul_usize(count, 5)?)?;
             let raw = slice_of(bytes, start, mul_usize(count, 2)?, "UTF-16 字符串")?;
             let units: Vec<u16> = raw
                 .chunks_exact(2)
@@ -589,6 +615,7 @@ fn parse_object(
 
         0x7 => {
             let (count, start) = element_count(bytes, offset, info)?;
+            budget.copy(mul_usize(count, 3)?)?;
             let raw = slice_of(bytes, start, count, "UTF-8 字符串")?;
             Ok(Value::String(String::from_utf8_lossy(raw).into_owned()))
         }
@@ -608,6 +635,8 @@ fn parse_object(
         0xA | 0xC => {
             // array / set
             let (count, start) = element_count(bytes, offset, info)?;
+            slice_of(bytes, start, mul_usize(count, ref_size)?, "array references")?;
+            if count > budget.remaining_nodes { return Err("plist expanded object budget exceeded".into()); }
             let mut items: Vec<Value> = Vec::with_capacity(count.min(MAX_OBJECTS as usize));
             for index in 0..count {
                 let reference =
@@ -617,7 +646,7 @@ fn parse_object(
                     .get(reference)
                     .ok_or_else(|| format!("对象引用越界（ref={}）", reference))?
                     as usize;
-                items.push(parse_object(bytes, object_offset, ref_size, offsets)?);
+                items.push(parse_object(bytes, object_offset, ref_size, offsets, depth + 1, budget)?);
             }
             Ok(Value::Array(items))
         }
@@ -625,6 +654,8 @@ fn parse_object(
         0xD => {
             // dict：前 count 个引用是键、后 count 个是值，保持出现顺序
             let (count, start) = element_count(bytes, offset, info)?;
+            slice_of(bytes, start, mul_usize(mul_usize(count, 2)?, ref_size)?, "dict references")?;
+            if mul_usize(count, 2)? > budget.remaining_nodes { return Err("plist expanded object budget exceeded".into()); }
             let mut pairs: Vec<(Value, Value)> = Vec::with_capacity(count.min(MAX_OBJECTS as usize));
             for index in 0..count {
                 let key_at = add_usize(start, mul_usize(index, ref_size)?)?;
@@ -639,8 +670,8 @@ fn parse_object(
                     .get(value_reference)
                     .ok_or_else(|| format!("值引用越界（ref={}）", value_reference))?
                     as usize;
-                let key = parse_object(bytes, key_offset, ref_size, offsets)?;
-                let value = parse_object(bytes, value_offset, ref_size, offsets)?;
+                let key = parse_object(bytes, key_offset, ref_size, offsets, depth + 1, budget)?;
+                let value = parse_object(bytes, value_offset, ref_size, offsets, depth + 1, budget)?;
                 pairs.push((key, value));
             }
             Ok(Value::Dict(pairs))
@@ -678,6 +709,55 @@ fn element_count(bytes: &[u8], offset: usize, info: u8) -> Result<(usize, usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn graph_fixture(objects: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = MAGIC.to_vec();
+        let mut offsets = Vec::new();
+        for object in objects {
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(object);
+        }
+        let table = bytes.len();
+        for offset in offsets { write_uint_vec(&mut bytes, offset as u64, 4); }
+        bytes.extend_from_slice(&[0; 6]);
+        bytes.extend_from_slice(&[4, 1]);
+        write_uint_vec(&mut bytes, objects.len() as u64, 8);
+        write_uint_vec(&mut bytes, 0, 8);
+        write_uint_vec(&mut bytes, table as u64, 8);
+        bytes
+    }
+
+    #[test]
+    fn cyclic_and_excessively_deep_reference_graphs_are_errors() {
+        let cyclic = graph_fixture(&[vec![0xa1, 0]]);
+        assert!(parse(&cyclic).unwrap_err().contains("nesting"));
+        let mut objects: Vec<Vec<u8>> = (0..MAX_PARSE_DEPTH + 2)
+            .map(|i| vec![0xa1, (i + 1) as u8]).collect();
+        objects.push(vec![0x09]);
+        assert!(parse(&graph_fixture(&objects)).unwrap_err().contains("nesting"));
+    }
+
+    #[test]
+    fn shared_references_are_valid_but_expansion_has_a_budget() {
+        let bytes = graph_fixture(&[vec![0xa2, 1, 1], vec![0x44, 1, 2, 3, 4]]);
+        assert_eq!(parse(&bytes).unwrap(), Value::Array(vec![Value::Data(vec![1,2,3,4]); 2]));
+        let mut budget = ParseBudget { remaining_nodes: 10, remaining_bytes: 7 };
+        assert!(parse_object(&bytes, 8, 1, &[8, 11], 0, &mut budget)
+            .unwrap_err().contains("byte budget"));
+        let mut budget = ParseBudget { remaining_nodes: 2, remaining_bytes: 100 };
+        assert!(parse_object(&bytes, 8, 1, &[8, 11], 0, &mut budget)
+            .unwrap_err().contains("object budget"));
+    }
+
+    #[test]
+    fn object_offsets_cannot_reference_header_or_offset_table() {
+        for bad_offset in [0u64, 9] {
+            let mut bytes = graph_fixture(&[vec![0x09]]);
+            bytes[9..13].copy_from_slice(&(bad_offset as u32).to_be_bytes());
+            assert!(parse(&bytes).unwrap_err().contains("outside object table"));
+        }
+    }
+
 
     #[test]
     fn negative_integers_match_independent_python_plist_fixtures() {

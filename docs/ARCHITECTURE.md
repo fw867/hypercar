@@ -26,4 +26,4 @@ Android 最低 API 31；当前构建为 arm64。没有 Shizuku 时应用可启�
 
 交互与协议细节分别见[界面](CARUI-REDESIGN.md)、[协议](PROTOCOL.md)和[会话控制](SESSION-CONTROL.md)。验证范围见[验证记录](VALIDATION.md)。
 
-音频采集/资源恢复见[AUDIO](AUDIO.md)，方向盘和手机助手路由见[INPUT-AND-VOICE](INPUT-AND-VOICE.md)。车机麦克风上行不在当前实现范围。
+音频采集/资源恢复见[AUDIO](AUDIO.md)，方向盘和手机助手路由见[INPUT-AND-VOICE](INPUT-AND-VOICE.md)。车机麦克风上行已有实验采集及 CarWith 接入路径；实际助手识别与车型兼容性仍需实车验证。

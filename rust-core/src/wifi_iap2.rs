@@ -150,7 +150,7 @@ mod tests {
             while requests.len() < 2 {
                 let n = car.read(&mut chunk).await.unwrap(); assert!(n>0);
                 buffer.extend_from_slice(&chunk[..n]);
-                requests.extend(crate::rtsp::parse_rtsp_messages(&mut buffer));
+                requests.extend(crate::rtsp::parse_rtsp_messages(&mut buffer).unwrap());
             }
             requests
         }).await.unwrap();

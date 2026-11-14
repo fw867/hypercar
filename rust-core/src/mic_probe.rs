@@ -344,7 +344,7 @@ mod tests {
         async fn read(peer:&mut tokio::net::TcpStream)->crate::rtsp::RtspMessage {
             let mut bytes=Vec::new();let mut buf=[0;4096];loop {
                 let n=peer.read(&mut buf).await.unwrap();assert!(n>0);bytes.extend(&buf[..n]);
-                if let Some(request)=crate::rtsp::parse_rtsp_messages(&mut bytes).pop(){return request;}
+                if let Some(request)=crate::rtsp::parse_rtsp_messages(&mut bytes).unwrap().pop(){return request;}
             }
         }
         async fn reply(peer:&mut tokio::net::TcpStream,cseq:i32,status:u16,body:&[u8]){

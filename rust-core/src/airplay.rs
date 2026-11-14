@@ -544,7 +544,7 @@ mod shutdown_tests {
                 let n = peer.read(&mut buf).await.unwrap();
                 assert!(n > 0, "must not close control before TEARDOWN");
                 data.extend_from_slice(&buf[..n]);
-                if let Some(msg) = crate::rtsp::parse_rtsp_messages(&mut data).into_iter().next() { break msg }
+                if let Some(msg) = crate::rtsp::parse_rtsp_messages(&mut data).unwrap().into_iter().next() { break msg }
             };
             assert!(request.first_line.starts_with("TEARDOWN "));
             assert!(request.first_line.starts_with("TEARDOWN / RTSP/1.0"));
@@ -901,7 +901,7 @@ mod display_size_tests {
         let read_request = |mut car: tokio::net::TcpStream| async move {
             let mut buffer=Vec::new(); let mut chunk=[0;4096];
             loop { let n=car.read(&mut chunk).await.unwrap(); assert!(n>0); buffer.extend_from_slice(&chunk[..n]);
-                let messages=crate::rtsp::parse_rtsp_messages(&mut buffer);
+                let messages=crate::rtsp::parse_rtsp_messages(&mut buffer).unwrap();
                 if !messages.is_empty() { assert_eq!(messages.len(),1); return (car,messages.into_iter().next().unwrap()); }
             }
         };
@@ -931,7 +931,7 @@ mod display_size_tests {
                 let n = socket.read(&mut chunk).await.unwrap();
                 assert!(n > 0);
                 buffer.extend_from_slice(&chunk[..n]);
-                for request in crate::rtsp::parse_rtsp_messages(&mut buffer) {
+                for request in crate::rtsp::parse_rtsp_messages(&mut buffer).unwrap() {
                     if request.first_line.starts_with("POST /command ") {
                         return; // BMW's observed EOF immediately following RECORD 200.
                     }
@@ -968,7 +968,7 @@ mod display_size_tests {
             while let Ok(n) = socket.read(&mut chunk).await {
                 if n == 0 { break; }
                 buffer.extend_from_slice(&chunk[..n]);
-                for request in crate::rtsp::parse_rtsp_messages(&mut buffer) {
+                for request in crate::rtsp::parse_rtsp_messages(&mut buffer).unwrap() {
                     requests.push(request.first_line.clone());
                     let body = match requests.len() - 1 {
                         0 => {
@@ -1047,7 +1047,7 @@ mod display_size_tests {
                 let n = socket.read(&mut chunk).await.unwrap();
                 assert!(n > 0);
                 buffer.extend_from_slice(&chunk[..n]);
-                for request in crate::rtsp::parse_rtsp_messages(&mut buffer) {
+                for request in crate::rtsp::parse_rtsp_messages(&mut buffer).unwrap() {
                     match request.first_line.as_str() {
                         "RECORD / RTSP/1.0" => {
                             assert!(request.body.is_empty(), "CatPlay RECORD has no plist body");
@@ -1097,7 +1097,7 @@ mod display_size_tests {
             while let Ok(n) = socket.read(&mut chunk).await {
                 if n == 0 { break; }
                 buffer.extend_from_slice(&chunk[..n]);
-                for request in crate::rtsp::parse_rtsp_messages(&mut buffer) {
+                for request in crate::rtsp::parse_rtsp_messages(&mut buffer).unwrap() {
                     methods.push(request.first_line.clone());
                     assert!(!request.first_line.contains("/pair-"), "diagnostic changed pairing state");
                     let response = format!("RTSP/1.0 455 Method Not Valid In This State\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n", request.cseq().unwrap());

@@ -696,51 +696,53 @@ class Iap2Bluetooth(
                 return
             }
             lastWorkerAt = SystemClock.elapsedRealtime()
-            log("BT-WORKER: entry=$tag ticket=$ticket peer=${safeAddress(socket.remoteDevice)} ${diagnosticSummary()}")
             sessionSocket.set(socket)
             sessionStarts.incrementAndGet()
             sessionProductive = false
             currentSocket.set(socket)
         }
-        // 记住本轮对端车机（ACL 广播可能没收到，记录「已配对车机」要靠它拿 MAC）
-        runCatching { Iap2Peer.remember(safeAddress(socket.remoteDevice), safeName(socket.remoteDevice)) }
         val handshakeId = HANDSHAKE_IDS.incrementAndGet()
         val started = SystemClock.elapsedRealtime()
         val sessionLog: (String) -> Unit = { line -> log("HS#$handshakeId +${SystemClock.elapsedRealtime() - started}ms $line") }
-        val evidence = io.github.hypercar.session.PairingEvidence.read(appContext.filesDir, safeAddress(socket.remoteDevice))
-        sessionLog(handshakeBeginLine(tag, targetProvider() ?: "自动", evidence.identityPresent, evidence.receiverCredentialPresent))
-        val deviceName = io.github.hypercar.bluetooth.LocalDeviceName.snapshot()
-        sessionLog("ROLE: iAP2 Device/iPhone，SDP=…cafe，deviceName=$deviceName，保留无线可用性/传输身份声明")
-        val channel = RfcommLinkChannel(socket, sessionLog)
-        activeChannel.set(channel)
-        val session =
-            Iap2SenderSession(
-                channel = channel,
-                log = sessionLog,
-                bluetoothMac = bluetoothMacProvider(),
-                deviceName = deviceName,
-                onIdentification = { if (sessions.allows(ticket)) Iap2Peer.rememberIdentification(safeAddress(socket.remoteDevice), it) },
-                // 端点回调顺手标记「本轮已拿到凭据」：acceptLoop 用它决定是否允许
-                // 车机的新连入顶替本轮（空转轮次可顶替，有凭据的不许抢）
-                onEndpoint = { endpoint ->
-                    if (sessions.allows(ticket)) {
-                        if (!endpoint.ssid.isNullOrBlank() || endpoint.ipAddresses.isNotEmpty()) {
-                            sessionProductive = true
-                        }
-                        onEndpoint(endpoint)
-                    }
-                },
-                context = appContext,
-                receiverAddress = safeAddress(socket.remoteDevice),
-                navigationEnabled = { sessions.allows(ticket) && io.github.hypercar.session.HyperCarRepo.hudNavigationAllowed },
-                navigationCue = { io.github.hypercar.navigation.NavigationSources.snapshot() },
-                onMediaKey = { usage -> io.github.hypercar.session.HyperCarRepo.onIap2MediaKey(usage) { sessions.allows(ticket) } },
-                // **必须显式传当前车机档案**：不传就一直用构造函数默认值 BMW_ID85，
-                // 设置页切成 通用(0.27)/WinPlay/Audi（或远程下发的档案）后，
-                // 0x4300 / EA / 0x4E0E / 档案A退场这些差异全都不生效（2026-10-25 定谳）。
-                profile = io.github.hypercar.headunit.HeadUnitProfiles.current(),
-            )
+        var channel: RfcommLinkChannel? = null
         try {
+            log("BT-WORKER: entry=$tag ticket=$ticket peer=${safeAddress(socket.remoteDevice)} ${diagnosticSummary()}")
+            // 记住本轮对端车机（ACL 广播可能没收到，记录「已配对车机」要靠它拿 MAC）
+            runCatching { Iap2Peer.remember(safeAddress(socket.remoteDevice), safeName(socket.remoteDevice)) }
+            val evidence = io.github.hypercar.session.PairingEvidence.read(appContext.filesDir, safeAddress(socket.remoteDevice))
+            sessionLog(handshakeBeginLine(tag, targetProvider() ?: "自动", evidence.identityPresent, evidence.receiverCredentialPresent))
+            val deviceName = io.github.hypercar.bluetooth.LocalDeviceName.snapshot()
+            sessionLog("ROLE: iAP2 Device/iPhone，SDP=…cafe，deviceName=$deviceName，保留无线可用性/传输身份声明")
+            val openedChannel = RfcommLinkChannel(socket, sessionLog)
+            channel = openedChannel
+            activeChannel.set(openedChannel)
+            val session =
+                Iap2SenderSession(
+                    channel = openedChannel,
+                    log = sessionLog,
+                    bluetoothMac = bluetoothMacProvider(),
+                    deviceName = deviceName,
+                    onIdentification = { if (sessions.allows(ticket)) Iap2Peer.rememberIdentification(safeAddress(socket.remoteDevice), it) },
+                    // 端点回调顺手标记「本轮已拿到凭据」：acceptLoop 用它决定是否允许
+                    // 车机的新连入顶替本轮（空转轮次可顶替，有凭据的不许抢）
+                    onEndpoint = { endpoint ->
+                        if (sessions.allows(ticket)) {
+                            if (!endpoint.ssid.isNullOrBlank() || endpoint.ipAddresses.isNotEmpty()) {
+                                sessionProductive = true
+                            }
+                            onEndpoint(endpoint)
+                        }
+                    },
+                    context = appContext,
+                    receiverAddress = safeAddress(socket.remoteDevice),
+                    navigationEnabled = { sessions.allows(ticket) && io.github.hypercar.session.HyperCarRepo.hudNavigationAllowed },
+                    navigationCue = { io.github.hypercar.navigation.NavigationSources.snapshot() },
+                    onMediaKey = { usage -> io.github.hypercar.session.HyperCarRepo.onIap2MediaKey(usage) { sessions.allows(ticket) } },
+                    // **必须显式传当前车机档案**：不传就一直用构造函数默认值 BMW_ID85，
+                    // 设置页切成 通用(0.27)/WinPlay/Audi（或远程下发的档案）后，
+                    // 0x4300 / EA / 0x4E0E / 档案A退场这些差异全都不生效（2026-10-25 定谳）。
+                    profile = io.github.hypercar.headunit.HeadUnitProfiles.current(),
+                )
             session.run(SESSION_TIMEOUT_MILLIS)
             // Phase 1 完成：进入保活泵，直到链路断开（0x4301 等生命周期消息在此处理）
             session.pumpIncomingForever()
@@ -763,11 +765,13 @@ class Iap2Bluetooth(
             log("$tag SESSION 异常: ${error.javaClass.simpleName}: ${error.message}")
             onSessionEnded("异常: ${error.javaClass.simpleName}")
         } finally {
-            sessionLog("END alive=${channel.isAlive} cancelled=${channel.isCancelled} reason=${channel.closeReason ?: "会话层退出"}")
-            activeChannel.compareAndSet(channel, null)
+            channel?.let { opened ->
+                runCatching { sessionLog("END alive=${opened.isAlive} cancelled=${opened.isCancelled} reason=${opened.closeReason ?: "会话层退出"}") }
+                activeChannel.compareAndSet(opened, null)
+            }
             sessionSocket.compareAndSet(socket, null)
             currentSocket.compareAndSet(socket, null)
-            runCatching { channel.close() }
+            runCatching { channel?.close() }
             runCatching { socket.close() }
             sessionActive.set(false)
             log("$tag 会话结束（RFCOMM 已关闭；监听与出站循环仍在运行）")

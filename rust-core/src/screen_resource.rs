@@ -208,7 +208,7 @@ mod tests {
             loop {
                 let n=car.read(&mut chunk).await.unwrap();assert!(n>0);
                 buffer.extend_from_slice(&chunk[..n]);
-                if let Some(message)=crate::rtsp::parse_rtsp_messages(&mut buffer).pop() {return message;}
+                if let Some(message)=crate::rtsp::parse_rtsp_messages(&mut buffer).unwrap().pop() {return message;}
             }
         }).await.unwrap()
     }
@@ -408,7 +408,7 @@ mod tests {
             let mut chunk=[0u8;4096];
             let n=tokio::time::timeout(Duration::from_secs(2),car_event.read(&mut chunk)).await.unwrap().unwrap();
             assert!(n>0);buffer.extend_from_slice(&chunk[..n]);
-            for request in crate::rtsp::parse_rtsp_messages(&mut buffer) {
+            for request in crate::rtsp::parse_rtsp_messages(&mut buffer).unwrap() {
                 let body=bplist::parse(&request.body).unwrap();
                 assert_eq!(body.get("type").and_then(Value::as_str),Some("hidSetInputMode"));
                 received.push(body.get("params").unwrap().get("uuid").and_then(Value::as_str).unwrap().to_owned());
