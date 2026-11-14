@@ -1273,7 +1273,14 @@ const CONTROLLER_FEATURES: &[&str] = &[
     "videoPlayback",
 ];
 
-fn build_session_setup(device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, mbux: bool) -> Vec<u8> {
+fn session_features(mbux: bool, id9: bool) -> Vec<Value> {
+    if mbux { return vec![Value::str("viewAreas")]; }
+    // ID9 single-variable experiment: keep every other feature and stream parameter.
+    CONTROLLER_FEATURES.iter().filter(|f| !(id9 && **f == "hevc"))
+        .map(|f| Value::str(f)).collect()
+}
+
+fn build_session_setup(device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, mbux: bool, id9: bool) -> Vec<u8> {
     let session_uuid = box_session_uuid();
     let mut fields: Vec<(&str, Value)> = vec![
         ("deviceID", Value::str(device_id)),
@@ -1293,7 +1300,7 @@ fn build_session_setup(device_id: &str, device_name: &str, timing_port: u16, enc
         ("keepAliveLowPower", Value::bool(true)),
         (
             "features",
-            Value::array(if mbux { vec![Value::str("viewAreas")] } else { CONTROLLER_FEATURES.iter().map(|f| Value::str(f)).collect() }),
+            Value::array(session_features(mbux, id9)),
         ),
     ];
     if !encrypted {
@@ -1336,11 +1343,11 @@ async fn setup_and_read_info(
     channel: &Arc<RtspChannel>, device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool, id9: bool,
 ) -> Result<(Value, Value), String> {
     emit_log(&format!("AIRPLAY: session device name={device_name}"));
-    let body = build_session_setup(device_id, device_name, timing_port, encrypted, mbux);
+    let body = build_session_setup(device_id, device_name, timing_port, encrypted, mbux, id9);
     if id9 {
         // Only booleans/counts: session SETUP carries identity, so never dump its raw bytes.
-        emit_log(&format!("ID9: session SETUP identity_consistent=true features={} timing_port_valid={}",
-            CONTROLLER_FEATURES.len(), timing_port != 0));
+        emit_log(&format!("ID9: session SETUP identity_consistent=true features={} hevc_proposed=false timing_port_valid={}",
+            session_features(mbux, id9).len(), timing_port != 0));
     }
     let reply = channel.request(
         "SETUP", "/setup", &body, "application/x-apple-binary-plist", &[], Duration::from_secs(10),
@@ -1387,6 +1394,8 @@ pub(crate) fn build_screen_setup_with_latency(conn_id: i64, uuid: &str, latency_
 /// WinPlay treats zero latency as 1000 ms; 352-frame PCM then approaches its 128-packet limit.
 /// A positive 250 ms keeps its reorder queue below capacity without changing physical-car timing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// type100 = Main; type102 = MainHigh (UDP). MainBuffered is type103 (TCP),
+// which this sender does not implement. The session feature is a separate capability.
 enum AudioCodec { Pcm, Aac }
 impl AudioCodec {
     fn stream_type(self) -> i64 { if self == Self::Aac { 102 } else { 100 } }
@@ -2099,7 +2108,7 @@ mod mbux_profile_tests {
     fn box_session_uuid_changes_per_attempt_without_replacing_phone_identity() {
         let mut sessions=std::collections::HashSet::new();
         for _ in 0..16 {
-            let body=bplist::parse(&build_session_setup("phone-device","phone",1234,true,false)).unwrap();
+            let body=bplist::parse(&build_session_setup("phone-device","phone",1234,true,false,false)).unwrap();
             assert_eq!(body.get("deviceID").and_then(Value::as_str),Some("phone-device"));
             let id=body.get("sessionUUID").and_then(Value::as_str).unwrap();
             assert_eq!(id.len(),36);
@@ -2116,7 +2125,7 @@ mod mbux_profile_tests {
         for encrypted in [true,false] {
             for mbux in [false,true] {
                 for device_id in ["02:11:22:33:44:55", "02:66:77:88:99:00"] {
-                    let body=bplist::parse(&build_session_setup(device_id,"test phone",1234,encrypted,mbux)).unwrap();
+                    let body=bplist::parse(&build_session_setup(device_id,"test phone",1234,encrypted,mbux,false)).unwrap();
                     assert_eq!(body.get("macAddress").and_then(Value::as_str),Some(device_id));
                     assert_eq!(body.get("deviceID"),body.get("macAddress"));
                     assert_eq!(body.get("name").and_then(Value::as_str),Some("test phone"));
@@ -2136,9 +2145,32 @@ mod mbux_profile_tests {
     }
 
     #[test]
+    fn id9_session_removes_only_hevc_and_preserves_other_profiles() {
+        for encrypted in [false, true] {
+            for mbux in [false, true] {
+                let baseline = bplist::parse(&build_session_setup("phone", "name", 1234, encrypted, mbux, false)).unwrap();
+                let id9 = bplist::parse(&build_session_setup("phone", "name", 1234, encrypted, mbux, true)).unwrap();
+                let expected: Vec<_> = baseline.get("features").unwrap().as_array().unwrap().iter()
+                    .filter(|f| f.as_str() != Some("hevc")).cloned().collect();
+                assert_eq!(id9.get("features").unwrap().as_array().unwrap(), &expected);
+                assert_eq!(expected.len(), if mbux { 1 } else { 13 });
+                // These two UUIDs intentionally change on every build of a session body.
+                let stable_fields = |v: &Value| v.as_dict().unwrap().iter()
+                    .filter(|(k, _)| !matches!(k.as_str(), Some("features" | "sessionUUID" | "sessionCorrelationUUID")))
+                    .cloned().collect::<Vec<_>>();
+                assert_eq!(stable_fields(&baseline), stable_fields(&id9));
+                assert_eq!(baseline.get("features").unwrap().as_array().unwrap(), &session_features(mbux, false));
+                if !mbux {
+                    assert_eq!(session_features(false, false), CONTROLLER_FEATURES.iter().map(|f| Value::str(f)).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn minimal_features_and_100ms_latency_are_explicit_profile_choices() {
         for mbux in [false,true] {
-            let body=bplist::parse(&build_session_setup("real-mac","测试手机 \"BT\"",1234,true,mbux)).unwrap();
+            let body=bplist::parse(&build_session_setup("real-mac","测试手机 \"BT\"",1234,true,mbux,false)).unwrap();
             assert_eq!(body.get("name").and_then(Value::as_str),Some("测试手机 \"BT\""));
             let features=body.get("features").unwrap().as_array().unwrap();
             assert_eq!(features.len(),if mbux {1} else {CONTROLLER_FEATURES.len()});

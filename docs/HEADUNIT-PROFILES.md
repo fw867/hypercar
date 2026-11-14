@@ -97,4 +97,8 @@ useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关�
 
 ID9当前路径：配对 → 会话SETUP → /info主屏UUID → 初始资源声明 → 按约束申请主屏 → HID mode0 → 主屏SETUP/TCP → RECORD → 资源版本仍有效才送帧。只对bmw_id9启用；不支持的PCM媒体档不尝试；声明AAC-LC48媒体输出时可使用AAC，ID9实车仍待验证。
 
+2026-11-14 ID9单变量验证：仅当 `id9_screen_bootstrap` 启用时从会话 features 移除 `hevc`，完整能力列表由14项变为13项；日志增加 `hevc_proposed=false`。保留 `mainBuffered` 等其余能力、屏幕四字段与25ms延迟、会话 `/setup` / 屏幕 `/` / 音频绝对URI及启动顺序。ID8.5和其它档案保留原能力列表，原MBUX最小能力路径仍只提议viewAreas。此变更用于验证HEVC声明是否参与400，尚未证明根因或实车修复。
+
+本地验证：Android arm64原生测试184通过、0失败、1忽略，包含ID9只移除HEVC及其余会话字段/其它能力列表保持的回归；正式APK构建通过。0.1.0.567（10663）已通过adb install -r覆盖安装到已连接M154FF，安装后核实版本一致，保留应用数据。尚未获得本版ID9实车连接日志。
+
 2026-11-14 656：保留mercedes_mbux ID，MB_D-PP/MB_E-P不按接收端型号分流；统一按11月13日MB_D-PP单次RECORD策略。新增connectionPolicy在远端解析、合并和引擎JSON入口规范化旧开关，保留其它远端可调参数和其它车机档案策略。schema仍为10，没有新增字段；即使schema10及之后的缓存包含旧实验开关也会规范化。11月14日MB_E日志实际也已经走默认单次RECORD，不能把其失败归因为按型号回退旧实验。
