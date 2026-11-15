@@ -15,6 +15,47 @@ class Iap2MediaSessionTest {
     private fun identified(keys: MutableList<Int>, ready: Boolean = true): Iap2MediaSession =
         Iap2MediaSession({}, keys::add).also { it.identify(listOf(Iap2Messages.HidComponent(1,1), Iap2Messages.HidComponent(2,1))); if (ready) it.authenticated() }
 
+    @Test fun undeclaredHidIsDiagnosedWithoutInterpretingItAsMedia() {
+        val keys = mutableListOf<Int>(); val logs = mutableListOf<String>()
+        val session = Iap2MediaSession(logs::add, keys::add)
+        session.identify(listOf(Iap2Messages.HidComponent(1, 1))); session.authenticated()
+        assertFalse(session.handle(report(1, 7)))
+        assertTrue(keys.isEmpty())
+        assertTrue(logs.any { "component=7" in it && "undeclared-component" in it })
+    }
+
+    // Catches the former permanent 96-line silence and counts replay separately from ingress.
+    @Test fun diagnosticsRemainBoundedAndRecoverWithCumulativeCountsAfterIdle() {
+        var now = 0L
+        val logs = mutableListOf<String>(); val keys = mutableListOf<Int>()
+        val session = Iap2MediaSession(logs::add, keys::add, { now })
+        session.identify(listOf(Iap2Messages.HidComponent(1, 1)))
+        session.handle(start()); session.authenticated()
+        repeat(1000) { session.handle(report(1)) }
+        assertEquals(listOf(0xb5), keys)
+        assertTrue(logs.size < 30)
+        now = 10_000; session.diagnosticsTick()
+        val summary = logs.last()
+        assertTrue(summary.contains("reports=1000"))
+        assertTrue(summary.contains("starts=1"))
+        assertTrue(summary.contains("registered=1"))
+        val count = logs.size
+        repeat(1000) { session.diagnosticsTick() }
+        assertEquals(count, logs.size)
+        now = 20_000; session.diagnosticsTick()
+        assertEquals(count + 1, logs.size)
+    }
+
+    @Test fun malformedReportsExplainRejectionWithoutChangingHeldEdges() {
+        val logs = mutableListOf<String>(); val keys = mutableListOf<Int>()
+        val session = Iap2MediaSession(logs::add, keys::add)
+        session.identify(listOf(Iap2Messages.HidComponent(1, 1))); session.authenticated()
+        session.handle(start()); session.handle(frame(0x6802, 1, Iap2Csm.param(1, byteArrayOf())))
+        session.handle(report(1))
+        assertEquals(listOf(0xb5), keys)
+        assertTrue(logs.any { "short-report" in it && "bytes=0" in it })
+    }
+
     private val voice = bytes(0x05,0x0c,0x09,1,0xa1,1,0x15,0,0x25,1,0x75,1,0x95,1,0x09,0xcf,0x81,2,0xc0)
     @Test fun voiceEdgesAreAuthenticatedDeduplicatedAndReleasedOnStopOrResync() {
         val keys=mutableListOf<Int>();val s=identified(keys,false)

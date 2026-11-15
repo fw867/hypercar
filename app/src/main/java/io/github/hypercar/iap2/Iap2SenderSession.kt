@@ -1135,6 +1135,7 @@ class Iap2SenderSession(
     private fun recvNewFrame(timeoutMillis: Long): Iap2Csm.Frame? {
         val deadline = nanoTime() + timeoutMillis.coerceAtLeast(0) * 1_000_000L
         while (true) {
+            media.diagnosticsTick()
             if (Thread.currentThread().isInterrupted || channel.isCancelled) throw InterruptedIOException("iAP2 接收已取消")
             if (receivedFrames.isNotEmpty()) {
                 val frame = receivedFrames.removeFirst()

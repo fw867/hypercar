@@ -26,6 +26,16 @@ internal class WifiIap2Protocol(
     private var nextWaitLog = 0L
     private var retriedCertificate = false
     private var tracedFrames = 0
+    private var receivedFrames = 0L
+    private var sentFrames = 0L
+    private var lastRx = "none"
+    private var lastTx = "none"
+    private var lastReceivedMessage: Int? = null
+    private var lastQueuedMessage: Int? = null
+    val diagnosticSummary: String get() = "phase=$diagnosticPhase pending=${engine.queuedControlPackets} outstanding=${engine.outstandingPackets} " +
+        "rx_frames=$receivedFrames tx_frames=$sentFrames $lastRx $lastTx " +
+        "last_rx_csm=${lastReceivedMessage?.let { "0x${it.toString(16)}" } ?: "none"} " +
+        "last_queued_csm=${lastQueuedMessage?.let { "0x${it.toString(16)}" } ?: "none"}; link output/queue only, RTSP acceptance separate"
     private var now = 0L
     private var peerWaitSince: Long? = null
     private var nextPeerWaitLog = 0L
@@ -82,6 +92,7 @@ internal class WifiIap2Protocol(
     fun advance(nowMillis: Long): ByteArray {
         if (failed) return ByteArray(0)
         now = nowMillis
+        media.diagnosticsTick()
         if (!started) {
             if (peerWaitSince == null) peerWaitSince = now
             if (now >= nextPeerWaitLog) {
@@ -126,6 +137,7 @@ internal class WifiIap2Protocol(
     private fun handle(frame: Iap2Csm.Frame) {
         if (failed) return
         val id = frame.messageId
+        lastReceivedMessage = id
         if (media.handle(frame) || nowPlaying.handle(frame)) return
         if (subscriptions.handle(frame)) {
             if (phase != "READY") log("DEFER phase=$phase id=0x${id.toString(16)} until authentication completes")
@@ -214,11 +226,22 @@ internal class WifiIap2Protocol(
             if (!engine.sendControl(frame.copyOfRange(offset, end), now)) fail("link refused id=0x${id.toString(16)}")
             offset = end
         }
-        if (!failed) log("QUEUED phase=$phase id=0x${id.toString(16)} body=${body.size}B pending=${engine.queuedControlPackets} outstanding=${engine.outstandingPackets}")
+        if (!failed) {
+            lastQueuedMessage = id
+            log("QUEUED phase=$phase id=0x${id.toString(16)} body=${body.size}B pending=${engine.queuedControlPackets} outstanding=${engine.outstandingPackets}")
+        }
     }
 
     private fun trace(direction: String, ctl: Int, seq: Int, ack: Int, session: Int, size: Int) {
-        if (tracedFrames++ < 32) log("LINK $direction ctl=0x${ctl.toString(16)} seq=$seq ack=$ack session=$session bytes=$size")
+        if (direction == "RX") {
+            receivedFrames++
+            lastRx = "rx_seq=$seq rx_ack=$ack rx_session=$session rx_bytes=$size"
+        } else {
+            sentFrames++
+            lastTx = "tx_seq=$seq tx_ack=$ack tx_session=$session tx_bytes=$size"
+        }
+        if (tracedFrames++ < 128) log("LINK $direction ctl=0x${ctl.toString(16)} seq=$seq ack=$ack session=$session bytes=$size")
+        else if (tracedFrames == 129) log("LINK trace limit reached; terminal summary continues counting all frames")
     }
 
     private fun fail(reason: String) {

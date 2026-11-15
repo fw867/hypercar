@@ -30,6 +30,8 @@ internal class Iap2NowPlayingSession(
     }
     private var authenticated = false
     private var subscribed = false
+    // An empty legacy Start requests the compatibility snapshot; explicit groups select fields.
+    private var requested: Map<Int, Set<Int>>? = null
     private var force = false
     private var nextPoll = 0L
     private var lastBody: ByteArray? = null
@@ -48,13 +50,23 @@ internal class Iap2NowPlayingSession(
     fun authenticated() { authenticated = true }
     fun restartLink() { val wasAuthenticated = authenticated; reset(); authenticated = wasAuthenticated }
     fun reset() {
-        authenticated = false; subscribed = false; force = false; nextPoll = 0
+        authenticated = false; subscribed = false; requested = null; force = false; nextPoll = 0
         lastBody = null; pending = null; cancelId = null; artwork = null; artworkId = null
         // Do not recycle transfer IDs across link resynchronization on the same transport.
     }
     fun handle(frame: Iap2Csm.Frame): Boolean = when (frame.messageId) {
         Iap2MessageIds.START_NOW_PLAYING_UPDATES -> {
-            subscribed = true; force = true; nextPoll = 0; true
+            val groups = Iap2Csm.parseParams(frame.body)
+            val fields = groups.associate { it.id to Iap2Csm.parseParams(it.value) }
+            if (fields.size != groups.size || groups.sumOf { it.value.size + 4 } != frame.body.size ||
+                groups.any { group -> fields.getValue(group.id).sumOf { it.value.size + 4 } != group.value.size }) {
+                note("malformed Start ignored body_bytes=${frame.body.size}")
+            } else {
+                requested = if (frame.body.isEmpty()) null else fields.mapValues { (_, values) -> values.map { it.id }.toSet() }
+                note("Start body_bytes=${frame.body.size} fields=${requested?.entries?.take(8)?.associate { it.key to it.value.sorted().take(32) } ?: "legacy-default"}; values omitted")
+                subscribed = true; force = true; nextPoll = 0
+            }
+            true
         }
         Iap2MessageIds.STOP_NOW_PLAYING_UPDATES -> {
             subscribed = false; lastBody = null; cancelPending(); artwork = null; artworkId = null; true
@@ -84,7 +96,7 @@ internal class Iap2NowPlayingSession(
             val np = try { snapshot() } catch (error: Exception) {
                 note("snapshot unavailable: ${error.javaClass.simpleName}"); return out
             }
-            val nextArt = np.artwork?.takeIf { filesSupported && maxPayload >= 12 && it.isNotEmpty() && it.size <= MAX_ARTWORK }
+            val nextArt = np.artwork?.takeIf { wants(0,26) && filesSupported && maxPayload >= 12 && it.isNotEmpty() && it.size <= MAX_ARTWORK }
             var setup: ByteArray? = null
             if (nextArt !== artwork) {
                 cancelPending()
@@ -100,11 +112,11 @@ internal class Iap2NowPlayingSession(
                     } + byteArrayOf(0, 2)
                 }
             }
-            val body = np.body(artworkId)
+            val body = select(np.body(artworkId))
             // Elapsed changes are useful but do not flood the link every polling interval.
-            val content = np.copy(elapsedMs = 0).body(artworkId)
-            if (force || !content.contentEquals(lastBody) || (np.status == 1 && now - lastProgressAt >= 5_000)) {
-                out += Output.Control(body)
+            val content = select(np.copy(elapsedMs = 0).body(artworkId))
+            if (force || !content.contentEquals(lastBody) || (wants(1,1) && np.status == 1 && now - lastProgressAt >= 5_000)) {
+                if (body.isNotEmpty()) out += Output.Control(body)
                 lastBody = content
                 lastProgressAt = now
                 force = false
@@ -130,6 +142,15 @@ internal class Iap2NowPlayingSession(
             }
         }
         return out
+    }
+    private fun wants(group: Int, field: Int): Boolean = requested?.let { field in it[group].orEmpty() } ?: true
+    private fun select(body: ByteArray): ByteArray {
+        if (requested == null) return body
+        return Iap2Csm.parseParams(body).fold(byteArrayOf()) { selected, group ->
+            val fields = Iap2Csm.parseParams(group.value).filter { wants(group.id, it.id) }
+            if (fields.isEmpty()) selected else selected + Iap2Csm.param(group.id,
+                fields.fold(byteArrayOf()) { bytes, field -> bytes + Iap2Csm.param(field.id, field.value) })
+        }
     }
     private fun note(message: String) { if (diagnostics++ < 64) log("IAP2-NOWPLAYING: $message") }
     companion object { const val MAX_ARTWORK = 256 * 1024 }

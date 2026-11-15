@@ -2,6 +2,14 @@
 
 更新：2026-11-13。先找最后完成的阶段，再判断哪些代码实际执行过。
 
+571新增诊断入口：
+
+- `IAP2-NOWPLAYING: Start`只输出订阅字段ID，不含媒体文字；对照5001及文件传输是否仅包含已订阅字段。
+- `WIFI-IAP ... END`含全部链路收发计数、最近seq/ACK、CSM类型、pending/outstanding及native入队量。详细LINK日志限128帧，摘要仍继续累计；队列接受不等于RTSP写出或车机业务接受。
+- `IAP2-MEDIA: summary`每10秒记录starts/reports/parsed/rejected/edges。reports=0表示此iAP2媒体入口未收到报告；不能单凭StartHID注册认定按键已到。随后查`MEDIA-KEY-GATE`的会话过滤/排队/工作线程结果及原`MEDIA-KEY`播放器派发日志。
+- `CARWITH-CHANNEL`每5秒记录MEDIA/TTS/VR入口字节、服务类型、解密API结果及PCM/转发计数；结合`signal_packets`与混音队列区分无输入、丢弃、未转发和纯静音。VR只观察，不接播放；decryptOk在未建立密钥时可能表示原样返回。
+- `AUDIO-PACING`记录漏拍、跳过源帧和丢旧队列情况；低发包后集中追发已改为跳时恢复。仍应结合TCP RTT/重传/发送积压区分网络与调度问题，不能从本机UDP成功推算车机丢包率。
+
 | 证据 | 可确认 | 尚不能确认 |
 |---|---|---|
 | 系统配对、ACL或入网 | 系统链路/网络存在 | iAP2、邀请和媒体可用 |

@@ -2613,20 +2613,43 @@ object HyperCarRepo {
     @Volatile
     private var appCtx: android.content.Context? = null
 
+    private val mediaKeyGateCounts = linkedMapOf<String, Long>()
+    private var mediaKeyGateLastLog = 0L
+    private var mediaKeyGateDetails = 0
+
+    /** Fixed reason labels only: no report bytes, identity or media metadata. */
+    @Synchronized
+    private fun mediaKeyGateDiagnostic(reason: String) {
+        mediaKeyGateCounts[reason] = (mediaKeyGateCounts[reason] ?: 0L) + 1
+        val now = System.nanoTime() / 1_000_000L
+        if (now - mediaKeyGateLastLog >= 10_000) {
+            mediaKeyGateLastLog = now
+            mediaKeyGateDetails = 0
+            log("MEDIA-KEY-GATE: totals=$mediaKeyGateCounts")
+        }
+        if (mediaKeyGateDetails++ < 8) log("MEDIA-KEY-GATE: result=$reason")
+    }
+
     /** CSM workers may outlive a UI stop; validate again on MusicBridge's dispatch thread. */
     fun onIap2MediaKey(usage: Int, current: () -> Boolean) {
         val attempt = connectionAttemptId
-        if (!sessionLive.get() || !current()) return
+        if (!sessionLive.get()) { mediaKeyGateDiagnostic("session-not-live"); return }
+        if (!current()) { mediaKeyGateDiagnostic("transport-not-current"); return }
         if (usage == 0xcf || usage == 0x100cf) {
             val token = RustCoreBridge.nativeVoiceKeyToken()
             if (token != 0L && sessionLive.get() && connectionAttemptId == attempt && current()) {
+                mediaKeyGateDiagnostic("voice-forward")
                 RustCoreBridge.nativeSendVoiceKey(token, if (usage == 0xcf) 2 else 3)
-            }
+            } else mediaKeyGateDiagnostic(if (token == 0L) "voice-no-token" else "voice-session-changed")
             return
         }
-        val context = appContext() ?: return
+        val context = appContext()
+        if (context == null) { mediaKeyGateDiagnostic("no-context"); return }
+        mediaKeyGateDiagnostic("music-queued")
         MusicBridge.onCarMediaKey(context, usage) {
-            sessionLive.get() && connectionAttemptId == attempt && current()
+            val allowed = sessionLive.get() && connectionAttemptId == attempt && current()
+            mediaKeyGateDiagnostic(if (allowed) "music-thread-accepted" else "music-thread-session-changed")
+            allowed
         }
     }
 

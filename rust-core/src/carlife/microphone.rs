@@ -44,14 +44,35 @@ impl Microphone {
 struct CaptureLease(Arc<crate::mic_probe::ProbeControl>);
 impl Drop for CaptureLease {fn drop(&mut self){self.0.request(false);}}
 
+// Observe framing and cryptographic success only. Incoming VR semantics and
+// reply format are deliberately left uninterpreted; nothing reaches playback.
+pub(super) fn observe_incoming(observer:&mut channel_diagnostics::Observer,stats:&mut channel_diagnostics::Stats,state:&session::Shared,input:&[u8]) {
+    observer.push(input,stats,|_service,payload,stats| {
+        stats.observed_only+=1;
+        if payload.is_empty() {stats.empty+=1;return;}
+        match state.lock().decrypt(payload) {
+            Ok(_)=>stats.decrypt_ok+=1,
+            Err(_)=>stats.decrypt_fail+=1,
+        }
+    });
+}
+
 pub(super) async fn run(stream:TcpStream,state:session::Shared,control:Arc<crate::mic_probe::ProbeControl>,stop:Arc<Notify>) {
     let _lease=CaptureLease(control.clone());
     let (mut rd,mut wr)=stream.into_split();let mut discard=[0;4096];
     let mut tick=tokio::time::interval(Duration::from_millis(8));
     let mut previous=0;let mut packets=0u64;
+    let mut observer=channel_diagnostics::Observer::default();
+    let mut stats=channel_diagnostics::Stats::default();
+    let mut diagnostics=tokio::time::interval(Duration::from_secs(5));
+    diagnostics.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {tokio::select! {biased;
-        _=stop.notified()=>{control.request(false);return;},
-        received=rd.read(&mut discard)=>{if !matches!(received,Ok(n) if n>0) {control.request(false);return;}},
+        _=stop.notified()=>{emit_log(&stats.report("VR","stopped",observer.pending()));control.request(false);return;},
+        _=diagnostics.tick()=>emit_log(&stats.report("VR","periodic",observer.pending())),
+        received=rd.read(&mut discard)=>{match received {
+            Ok(n) if n>0=>observe_incoming(&mut observer,&mut stats,&state,&discard[..n]),
+            result=>{emit_log(&stats.report("VR",if matches!(result,Ok(0)){"eof"}else{"ioError"},observer.pending()));control.request(false);return;}
+        }},
         _=tick.tick()=>{
             let generation=control.generation();
             if previous!=0 && previous!=generation {

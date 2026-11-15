@@ -4,6 +4,25 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class WifiIap2ProtocolTest {
+    @Test fun explicitNowPlayingSubscriptionIsHonoredThroughWifiLink() {
+        val car=Car();car.nowPlaying=Iap2NowPlaying(title="track",artwork=byteArrayOf(1));car.ready()
+        val output=car.feed(packet(0x40,++car.sequence,car.ack,car.controlSession,
+            Iap2Csm.encode(0x5000,byteArrayOf(0,8,0,1,0,4,0,0))))
+        assertTrue(output.none { it.session==2 })
+        val update=messages(output).single { it.messageId==0x5001 }
+        assertArrayEquals(byteArrayOf(0,9,0,1,0,5,0,0,0),update.body)
+    }
+
+    @Test fun linkDiagnosticsRetainLatestFrameAfterTraceBudgetIsExhausted() {
+        val car=Car();car.ready()
+        repeat(140) { car.message(0x1234) }
+        // Each request receives a bare ACK; the terminal summary must still retain its watermark.
+        val summary=car.protocol.diagnosticSummary
+        assertTrue(summary.contains("rx_seq=${car.sequence and 255}"))
+        assertTrue(summary.contains("tx_ack=${car.sequence and 255}"))
+        assertTrue(summary.contains("pending=0"))
+        assertTrue(car.logs.any { it.startsWith("LINK trace limit") })
+    }
     @Test fun noPeerBytesStayPassiveAndDoNotFailMediaSession() {
         val logs = mutableListOf<String>()
         val p = WifiIap2Protocol("test-device", { logs += it })

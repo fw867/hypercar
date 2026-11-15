@@ -41,6 +41,8 @@ object WifiIap2Bridge {
         val thread = Thread({
             var readyReported = false
             var lastPhase = ""
+            var queuedFrames = 0L
+            var queuedBytes = 0L
             try {
                 while (!closed && !protocol.failed) {
                     val bytes = input.poll(20, TimeUnit.MILLISECONDS)
@@ -55,7 +57,11 @@ object WifiIap2Bridge {
                     // The box sends each separately; don't rely on BMW consuming concatenated frames.
                     val frames = WifiIap2Framing.split(output)
                     if (frames.size > 1) HyperCarRepo.log("WIFI-IAP#$id: split output into ${frames.size} commands bytes=${frames.joinToString { it.size.toString() }}")
-                    if (frames.any { !RustCoreBridge.nativeSendIap2(id, it) }) {
+                    if (frames.any {
+                        val accepted = RustCoreBridge.nativeSendIap2(id, it)
+                        if (accepted) { queuedFrames++; queuedBytes += it.size }
+                        !accepted
+                    }) {
                         HyperCarRepo.log("WIFI-IAP#$id: transport closed or output queue full")
                         break
                     }
@@ -70,6 +76,7 @@ object WifiIap2Bridge {
                 HyperCarRepo.log("WIFI-IAP#$id: ${error.javaClass.simpleName}: ${error.message}")
             } finally {
                 closed = true
+                HyperCarRepo.log("WIFI-IAP#$id: END ${protocol.diagnosticSummary} native_queued_frames=$queuedFrames native_queued_bytes=$queuedBytes input_pending=${input.size}")
                 RustCoreBridge.nativeMarkWifiIap2Ready(id, false)
                 RustCoreBridge.nativeSetWifiIap2Phase(id, if (protocol.failed) "FAILED" else "STOPPED")
                 input.clear()

@@ -4,6 +4,49 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class Iap2NowPlayingTest {
+    @Test fun explicitSubscriptionEmitsOnlyRequestedSupportedFields() {
+        val session = Iap2NowPlayingSession({ Iap2NowPlaying(title="track", artist="artist", status=1) })
+        session.authenticated()
+        // Independent wire fixture: group 0/title and group 1/status; both request flags are empty.
+        session.handle(Iap2Csm.Frame(0x5000, byteArrayOf(0,8,0,0,0,4,0,1,0,8,0,1,0,4,0,0)))
+        val groups = Iap2Csm.parseParams(controls(session.poll(0,2048,true)).single().body)
+        assertEquals(listOf(0,1), groups.map { it.id })
+        assertEquals(listOf(1), Iap2Csm.parseParams(groups[0].value).map { it.id })
+        assertEquals(listOf(0), Iap2Csm.parseParams(groups[1].value).map { it.id })
+        assertTrue(session.poll(6000,2048,true).isEmpty()) // No elapsed-time subscription.
+    }
+
+    @Test fun subscriptionWithoutArtworkDoesNotStartFileTransfer() {
+        val session = Iap2NowPlayingSession({ Iap2NowPlaying(title="track", artwork=byteArrayOf(1,2,3)) })
+        session.authenticated()
+        session.handle(Iap2Csm.Frame(0x5000, byteArrayOf(0,8,0,0,0,4,0,1)))
+        val output = session.poll(0,2048,true)
+        assertNull(artId(controls(output).single().body))
+        assertTrue(files(output).isEmpty())
+        assertFalse(session.hasFileWork)
+    }
+
+    @Test fun malformedSubscriptionDoesNotEnableUpdatesOrReplaceAnExistingSelection() {
+        val session = Iap2NowPlayingSession()
+        session.authenticated()
+        session.handle(Iap2Csm.Frame(0x5000, byteArrayOf(0,8,0,0,0,5,0,1)))
+        assertTrue(session.poll(0,2048,true).isEmpty())
+        session.handle(Iap2Csm.Frame(0x5000, byteArrayOf(0,8,0,1,0,4,0,0)))
+        val first = controls(session.poll(1,2048,true)).single().body
+        session.handle(Iap2Csm.Frame(0x5000, byteArrayOf(0,8,0,0,0,4,0,1,0)))
+        assertTrue(session.poll(2,2048,true).isEmpty())
+        assertEquals(listOf(1), Iap2Csm.parseParams(first).map { it.id })
+    }
+
+    @Test fun resubscriptionCancelsArtworkWhenItIsNoLongerRequested() {
+        val session = subscribed { Iap2NowPlaying(artwork=byteArrayOf(1)) }
+        val id = artId(controls(session.poll(0,2048,true)).single().body)!!
+        session.handle(Iap2Csm.Frame(0x5000, byteArrayOf(0,8,0,1,0,4,0,0)))
+        val output = session.poll(1,2048,true)
+        assertEquals(listOf(1), Iap2Csm.parseParams(controls(output).single().body).map { it.id })
+        assertArrayEquals(byteArrayOf(id.toByte(),2),files(output).single())
+        assertFalse(session.hasFileWork)
+    }
     private fun frame(id: Int) = Iap2Csm.Frame(id, byteArrayOf())
     private fun controls(output: List<Iap2NowPlayingSession.Output>) = output.filterIsInstance<Iap2NowPlayingSession.Output.Control>()
     private fun files(output: List<Iap2NowPlayingSession.Output>) = output.filterIsInstance<Iap2NowPlayingSession.Output.File>().map { it.bytes }

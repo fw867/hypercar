@@ -320,19 +320,9 @@ pub async fn run_engine(
             let mut duck_hold: u32 = 0;
             let mut last_audio_at: Option<std::time::Instant> = None;
             let mut gain: f32 = 1.0;
-            // 音频发包节拍：**绝不漂移**。
-            //
-            // cardeck 的节奏天然正确——它由 AudioRecord.read() 的阻塞读取驱动，
-            // 硬件按 48k 实时吐 352 帧，一包一发，永不累计误差。
-    // 我们这里是「收 PCM → 自己重排节奏」，所以必须用绝对时刻对齐：
-            //  - Burst：漏掉的拍**立刻补发**（Delay 会永久丢拍 → RTP 时钟持续落后于
-            //    墙钟，接收端表现为 late/discontinuity 一直涨、听感断续）。
-            //  - 补发仍受混音队列上限（~0.5s）约束，不会无限喷包。
-            // 现场 2026-10-23 23:45：WinPlay 侧统计 packets 只有 ~68/s（应为 48000/352≈136/s），
-            // 正好少一半，印证漏拍。
-            let mut tick =
-                tokio::time::interval(Duration::from_nanos((SPF as u64) * 1_000_000_000 / TARGET_RATE as u64));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+            // Retain absolute pacing. A stalled worker skips expired source blocks and
+            // advances the RTP clock instead of flooding the receiver with catch-up audio.
+            let mut tick = crate::audio_pacing::interval();
             let mut sync_tick = tokio::time::interval(Duration::from_secs(1));
             sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // 发包速率自测：每秒记一行，联调时能直接看出节拍对不对。
@@ -340,6 +330,12 @@ pub async fn run_engine(
             let mut audio_errors: u64 = 0;
             let mut rate_mark = std::time::Instant::now();
             let mut mixed = vec![0i16; SPF * 2];
+            let mut pacing_recoveries=0u64;
+            let mut skipped_source_frames=0u64;
+            let mut dropped_media_frames=0u64;
+            let mut dropped_tts_frames=0u64;
+            let mut max_late_us=0u128;
+            let mut pacing_log=std::time::Instant::now();
             loop {
                 tokio::select! {
                     _ = stop_a.notified() => return,
@@ -397,7 +393,26 @@ pub async fn run_engine(
                             let _ = a.send_sync_now(crate::timing::monotonic_nanos()).await;
                         }
                     }
-                    _ = tick.tick() => {
+                    scheduled = tick.tick() => {
+                        let now=tokio::time::Instant::now();
+                        let skipped=crate::audio_pacing::missed_source_frames(scheduled,now);
+                        max_late_us=max_late_us.max(now.saturating_duration_since(scheduled).as_micros());
+                        if skipped>0 {
+                            pacing_recoveries+=1; skipped_source_frames=skipped_source_frames.saturating_add(skipped);
+                            let media_drop=((skipped as u128*2).min(media_mix.len() as u128)) as usize;
+                            let tts_drop=((skipped as u128*2).min(tts_mix.len() as u128)) as usize;
+                            media_mix.drain(..media_drop); tts_mix.drain(..tts_drop);
+                            dropped_media_frames+=(media_drop/2) as u64; dropped_tts_frames+=(tts_drop/2) as u64;
+                            media_remain.clear(); tts_remain.clear();
+                            if let Some(a)=out.as_mut() {
+                                a.skip_source_frames(skipped);
+                                let _=a.send_sync_now(crate::timing::monotonic_nanos()).await;
+                            }
+                        }
+                        if pacing_log.elapsed()>=Duration::from_secs(5) {
+                            emit_log(&format!("AUDIO-PACING: recoveries={pacing_recoveries} skipped_source_frames={skipped_source_frames} dropped_media_frames={dropped_media_frames} dropped_tts_frames={dropped_tts_frames} max_late_us={max_late_us}; cumulative, no catch-up burst"));
+                            pacing_log=std::time::Instant::now();
+                        }
                         if duck_hold > 0 { duck_hold -= 1; }
                         let tts_active = !tts_mix.is_empty();
                         if tts_active { duck_hold = 40; } // ~410ms 尾音保持

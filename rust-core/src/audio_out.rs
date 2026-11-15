@@ -69,6 +69,7 @@ pub struct AudioOut {
     aac_needs_reset: bool,
     sample_rate: u32,
     resampler: Option<crate::audio_resample::Stereo48To441>,
+    skipped_rate_remainder: u64,
 }
 
 impl AudioOut {
@@ -97,6 +98,7 @@ impl AudioOut {
             aac_needs_reset: false,
             sample_rate: 48000,
             resampler: None,
+            skipped_rate_remainder: 0,
         }
     }
 
@@ -125,6 +127,19 @@ impl AudioOut {
         self.ownership.as_ref().map(|v| v.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(true)
     }
     pub fn blocked_samples(&self) -> u64 { self.blocked_samples }
+
+    /// Retire elapsed source time without sending late packets. Sequence and AEAD nonce
+    /// count transmitted attempts only; the sample clock advances across the discontinuity.
+    pub(crate) fn skip_source_frames(&mut self, source_frames: u64) {
+        if source_frames == 0 { return; }
+        let scaled=source_frames as u128*self.sample_rate as u128+self.skipped_rate_remainder as u128;
+        self.skipped_rate_remainder=(scaled%48_000) as u64;
+        self.ts=self.ts.wrapping_add((scaled/48_000) as u32);
+        self.marker_pending=true;
+        // Retain the codec's partial frame and resampler phase. stop/create/start here
+        // can itself miss the next deadline and repeatedly starve AAC before 1024 frames.
+        // Expired PCM is retired in the mix queues; no elapsed ticks enter this encoder.
+    }
 
     pub async fn send_pcm(&mut self, frames: &[i16]) -> std::io::Result<()> {
         if !self.owns_audio() {
@@ -239,6 +254,43 @@ mod ownership_tests {
     use super::*;
     use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
     #[tokio::test]
+    async fn missed_pcm_time_is_skipped_without_sending_or_reusing_nonce() {
+        let receiver=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(receiver.local_addr().unwrap()).await.unwrap();
+        let mut sender=AudioOut::new(socket,None,[3;32],100);
+        let pcm=vec![100;704];
+        let mut packet=[0;2048];
+        sender.send_pcm(&pcm).await.unwrap();
+        receiver.recv(&mut packet).await.unwrap();
+        sender.skip_source_frames(352*13);
+        assert_eq!(sender.packets_sent(),1);
+        sender.send_pcm(&pcm).await.unwrap();
+        let n=receiver.recv(&mut packet).await.unwrap();
+        assert_eq!(u16::from_be_bytes(packet[2..4].try_into().unwrap()),1);
+        assert_eq!(u32::from_be_bytes(packet[4..8].try_into().unwrap()),4928);
+        assert_eq!(packet[1]&0x80,0x80);
+        assert_eq!(&packet[n-8..n],&1u64.to_le_bytes());
+        assert!(crate::crypto::chacha_open(&[3;32],&nonce64(1),&packet[12..n-8],&packet[4..12]).is_ok());
+        assert_eq!(sender.packets_sent(),2);
+    }
+
+    #[test]
+    fn missed_aac441_time_preserves_fractional_sample_rate_and_wraps_rtp() {
+        let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let socket=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut sender=AudioOut::new(socket,None,[0;32],102);
+            sender.sample_rate=44100;
+            sender.ts=u32::MAX-100;
+            for _ in 0..10 { sender.skip_source_frames(352); }
+            assert_eq!(sender.ts,(u32::MAX-100).wrapping_add(3234));
+            assert_eq!(sender.seq,0);
+            assert_eq!(sender.nonce,0);
+            assert!(sender.marker_pending);
+        });
+    }
+    #[tokio::test]
     async fn aac_rtp_preserves_raw_payload_and_advances_1024_with_unique_nonces() {
         let receiver=UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let socket=UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -258,6 +310,27 @@ mod ownership_tests {
         }
         let sync=build_sync_packet_for_frames(0,1024,123456,1024);
         assert_eq!(u32::from_be_bytes(sync[16..20].try_into().unwrap()),2048);
+    }
+    #[cfg(target_os="android")]
+    #[tokio::test]
+    async fn repeated_late_ticks_preserve_aac_encoder_and_still_emit_audio() {
+        let receiver=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(receiver.local_addr().unwrap()).await.unwrap();
+        let mut sender=AudioOut::new_aac(socket,None,[4;32],crate::aac::AacEncoder::at_rate(44100).unwrap());
+        sender.send_pcm(&vec![1200;704]).await.unwrap();
+        assert_eq!(sender.packets_sent(),0);
+        sender.skip_source_frames(352);
+        assert!(sender.aac.is_some(),"recovery must not synchronously destroy/recreate the codec on every late tick");
+        assert_eq!(sender.ts,323);
+        assert!(sender.marker_pending);
+        for _ in 0..60 {
+            sender.send_pcm(&vec![0;704]).await.unwrap();
+            sender.skip_source_frames(352);
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+        }
+        assert!(sender.packets_sent()>=12,"AAC output must make progress despite repeated late worker ticks");
+        assert!(sender.packets_sent()<=22);
     }
     #[cfg(target_os="android")]
     #[tokio::test]

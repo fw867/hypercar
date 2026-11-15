@@ -8,6 +8,7 @@ pub(crate) mod navigation;
 mod session;
 mod video;
 pub(crate) mod microphone;
+pub(super) mod channel_diagnostics;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -222,7 +223,7 @@ impl CarLifeHub {
                 if let Some(mic) = config.microphone.clone() {
                     mic.request(false);
                     children.spawn(microphone::run(vr, state.clone(), mic, stop.clone()));
-                } else { children.spawn(drain_stream(vr)); }
+                } else { children.spawn(drain_stream(vr, state.clone())); }
                 let ctrl=sockets.next().unwrap(); let q=queue.clone(); let cipher=state.clone(); let stop_ctrl=stop.clone();
                 children.spawn(async move { session::control(ctrl,q,cipher,stop_ctrl).await; });
                 children.spawn(session::data(sockets.next().unwrap(),state.clone(),events_task.clone()));
@@ -496,9 +497,16 @@ async fn handle_media_client(
     let mut hb = tokio::time::interval(Duration::from_secs(1));
     hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut hb_sent: u64 = 0;
+    let mut channel_stats = channel_diagnostics::Stats::default();
+    let mut diagnostics = tokio::time::interval(Duration::from_secs(5));
+    diagnostics.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         let read = tokio::select! {
+            _ = diagnostics.tick(), if !is_video => {
+                emit_log(&channel_stats.report(label,"periodic",buf.len()));
+                continue;
+            }
             _ = hb.tick(), if is_video => {
                 let timestamp = if encryption.is_some() {
                     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as u32
@@ -517,10 +525,12 @@ async fn handle_media_client(
         };
         match read {
             Ok(0) => {
+                if !is_video {emit_log(&channel_stats.report(label,"eof",buf.len()));}
                 let _ = events.send(CarLifeEvent::ClientLeft { video: is_video });
                 return;
             }
             Ok(n) => {
+                if !is_video {channel_stats.rx_bytes+=n as u64;}
                 if is_video && diag_reads < 5 {
                     diag_reads += 1;
                     let hex: String = chunk[..n.min(24)]
@@ -534,13 +544,18 @@ async fn handle_media_client(
                 }
                 buf.extend_from_slice(&chunk[..n])
             }
-            Err(_) => return,
+            Err(_) => {if !is_video {emit_log(&channel_stats.report(label,"ioError",buf.len()));}return;},
         }
         if buf.len() > 8 * 1024 * 1024 {
+            if !is_video {channel_stats.parse_fail+=1;}
             buf.clear();
         }
         while let Some((service_type, ts_ms, payload, consumed)) = read_media_frame(&buf) {
             buf.drain(..consumed);
+            if !is_video {
+                channel_stats.frame(service_type);
+                if service_type==0 {channel_stats.parse_fail+=1;}
+            }
             if service_type == VIDEO_DATA && encryption.as_ref().is_some_and(|s| !s.lock().started) {
                 continue; // A landing-page frame is not proof of a completed CarWith handshake.
             }
@@ -548,10 +563,13 @@ async fn handle_media_client(
             let raw_pcm = matches!(kind, MediaKind::Media) && service_type == MEDIA_DATA;
             let payload = if let Some(state) = encryption.as_ref().filter(|_| !raw_pcm) {
                 match state.lock().decrypt(&payload) {
-                    Ok(bytes) => bytes,
-                    Err(error) => { emit_log(&format!("CARWITH-HS: {label} decrypt failed: {error}")); return; }
+                    Ok(bytes) => {if !is_video {channel_stats.decrypt_ok+=1;}bytes},
+                    Err(error) => {
+                        if !is_video {channel_stats.decrypt_fail+=1;emit_log(&channel_stats.report(label,"decryptFailed",buf.len()));}
+                        emit_log(&format!("CARWITH-HS: {label} decrypt failed: {error}")); return;
+                    }
                 }
-            } else { payload };
+            } else {if !is_video {channel_stats.plain+=1;}payload};
             match kind {
                 MediaKind::Video => match service_type {
                     VIDEO_DATA => {
@@ -596,20 +614,21 @@ async fn handle_media_client(
                             if (1..=2).contains(&c) {
                                 channels = c as u8;
                             }
-                            let _ = events.send(CarLifeEvent::AudioInit {
+                            if events.send(CarLifeEvent::AudioInit {
                                 tts,
                                 rate,
                                 channels,
-                            });
+                            }).is_err() {channel_stats.event_closed+=1;}
                             emit_log(&format!(
                                 "CARLIFE: {} 音频初始化 {rate}Hz {channels}ch",
                                 if tts { "TTS" } else { "MEDIA" }
                             ));
                         }
                         MEDIA_STOP | TTS_STOP => {
-                            let _ = events.send(CarLifeEvent::AudioStop { tts });
+                            if events.send(CarLifeEvent::AudioStop { tts }).is_err() {channel_stats.event_closed+=1;}
                         }
                         MEDIA_DATA | TTS_DATA => {
+                            channel_stats.pcm(&payload);
                             if !payload.is_empty() {
                                 // **剥掉 12 字节 PCM 包头**（2026-10-27 23:56 定案）：
                                 // 反编译 `PCMPackageHead` 明确 mMediaHeadLen=12/mTTSHeadLen=12，
@@ -617,22 +636,18 @@ async fn handle_media_client(
                                 // 现场取证 `00 00 00 00 00 00 00 00 01 00 00 00` 正是 type=1 的包头；
                                 // 不剥掉就会被当样本播 → 每包一次"咔"（破音）。
                                 {
-                                    let _ = events.send(CarLifeEvent::AudioData {
+                                    if events.send(CarLifeEvent::AudioData {
                                         tts,
                                         rate,
                                         channels,
                                         data: payload.to_vec(),
-                                    });
+                                    }).is_ok() {channel_stats.forwarded+=1;} else {channel_stats.event_closed+=1;}
                                 }
-                            }
+                            } else {channel_stats.empty+=1;}
                         }
                         other => {
-                            if other != 0 {
-                                emit_log(&format!(
-                                    "CARLIFE: {} 未处理 0x{other:08x}",
-                                    if tts { "TTS" } else { "MEDIA" }
-                                ));
-                            }
+                            let _=other;
+                            channel_stats.unknown+=1;
                         }
                     }
                 }
@@ -772,13 +787,20 @@ async fn dial(host: &str, port: u16) -> Result<TcpStream, std::io::Error> {
 }
 
 /// 只读消费一个连接（VR 通道：保活即可，不消费语义）。
-async fn drain_stream(mut stream: TcpStream) {
+async fn drain_stream(mut stream: TcpStream, state:session::Shared) {
     let mut buf = [0u8; 2048];
+    let mut observer=channel_diagnostics::Observer::default();
+    let mut stats=channel_diagnostics::Stats::default();
+    let mut diagnostics=tokio::time::interval(Duration::from_secs(5));
+    diagnostics.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
-        match stream.read(&mut buf).await {
-            Ok(0) => return,
-            Ok(_) => {}
-            Err(_) => return,
+        tokio::select! {
+            _=diagnostics.tick()=>emit_log(&stats.report("VR/noCapture","periodic",observer.pending())),
+            received=stream.read(&mut buf)=>match received {
+                Ok(0)=>{emit_log(&stats.report("VR/noCapture","eof",observer.pending()));return;},
+                Ok(n)=>microphone::observe_incoming(&mut observer,&mut stats,&state,&buf[..n]),
+                Err(_)=>{emit_log(&stats.report("VR/noCapture","ioError",observer.pending()));return;},
+            }
         }
     }
 }
