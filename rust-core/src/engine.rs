@@ -33,6 +33,7 @@ pub enum SourceEvent {
     RequestAudioOwnership,
     /// 视频编码器产出一帧（H.264 Annex B，可能含 SPS/PPS/IDR）。
     VideoFrame { pts_us: u64, data: Vec<u8> },
+    VideoFrameTagged { pts_us:u64, data:Vec<u8>, codec:crate::video_format::VideoCodec },
     /// 编码器画布尺寸变化（对齐 AirPlay VideoConfig 宽高）。
     EncoderResolution { width: u32, height: u32 },
     /// 音频流开始（tts=true 表示提示音，参与闪避混音）。
@@ -58,6 +59,10 @@ pub struct EngineConfig {
     pub enable_audio: bool,
     #[serde(default)]
     pub audio_codec: String,
+    #[serde(default)]
+    pub video_codec: String,
+    #[serde(default)]
+    pub bmw_capabilities: bool,
     #[serde(default)]
     pub microphone_probe: bool,
     #[serde(default)]
@@ -197,6 +202,9 @@ pub async fn run_engine(
                             CarLifeEvent::Navigation(update) => crate::emit_carwith_navigation(navigation_token,update.as_ref()),
                             CarLifeEvent::VideoFrame { pts_us, data } => {
                                 let _ = vtx.send(SourceEvent::VideoFrame { pts_us, data });
+                            }
+                            CarLifeEvent::VideoFrameTagged { pts_us, data, codec } => {
+                                let _=vtx.send(SourceEvent::VideoFrameTagged {pts_us,data,codec});
                             }
                             CarLifeEvent::EncoderResolution { width, height } => {
                                 *carwith_touch_size.lock() = (width, height);
@@ -517,6 +525,8 @@ pub async fn run_engine(
         receiver_previously_connected: cfg.receiver_previously_connected,
         enable_audio: cfg.enable_audio,
         audio_codec: cfg.audio_codec.clone(),
+        video_codec: cfg.video_codec.clone(),
+        bmw_capabilities: cfg.bmw_capabilities,
         microphone_probe,
         keep_alive_stats: cfg.keep_alive_stats,
         bmw_box_bootstrap: cfg.bmw_box_bootstrap,
@@ -729,9 +739,21 @@ pub(crate) async fn video_pump(
                         pending_size = Some((width, height));
                     }
                 }
-                Some(SourceEvent::VideoFrame { pts_us, data }) => {
+                Some(ev @ (SourceEvent::VideoFrame { .. } | SourceEvent::VideoFrameTagged { .. })) => {
+                    let (pts_us,data,codec)=match ev {
+                        SourceEvent::VideoFrame {pts_us,data}=>(pts_us,data,crate::video_format::VideoCodec::H264),
+                        SourceEvent::VideoFrameTagged {pts_us,data,codec}=>(pts_us,data,codec),
+                        _=>unreachable!(),
+                    };
                     stats.lock().source_units += 1;
                     if let Some(s) = sender.as_mut() {
+                        if let Err(error)=s.set_video_codec(codec) {
+                            // CarWith has no evidenced source codec request. Do not silently
+                            // keep a black screen or invent a transcoding fallback.
+                            emit_log(&format!("VIDEO-CODEC: rejected {}: {error}",codec.as_str()));
+                            emit_state("ended", "视频源为 HEVC，但本次车机会话未允许 HEVC；请改用 H.264 视频源，或选择 HEVC 优先后重新连接");
+                            return;
+                        }
                         let before_frames = s.frames_sent();
                         let before_bytes = s.bytes_per_second();
                         // 编码尺寸变化时先切画布，保证随后 send_config 标注正确。
@@ -994,6 +1016,7 @@ pub enum CarLifeEvent {
     SourceReset,
     Handshake,
     VideoFrame { pts_us: u64, data: Vec<u8> },
+    VideoFrameTagged { pts_us:u64, data:Vec<u8>, codec:crate::video_format::VideoCodec },
     AudioInit { tts: bool, rate: u32, channels: u8 },
     AudioStop { tts: bool },
     AudioData { tts: bool, rate: u32, channels: u8, data: Vec<u8> },

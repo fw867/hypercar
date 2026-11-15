@@ -113,6 +113,8 @@ object HyperCarRepo {
      * 用户看到的现象正是「装了新版本后车机上没有 CarPlay 图标了」。
      * 现在保留链路、按 2.5s 间隔重试 [AIRPLAY_MAX_ATTEMPTS] 次，仍不行才真失败。
      */
+    private val videoCapabilityGeneration = java.util.concurrent.atomic.AtomicLong()
+
     private suspend fun startNativeForSession(
         fd: Int, sockets: SessionSocketLease<Network>, attempt: Long, configure: () -> String,
     ): Boolean {
@@ -124,6 +126,16 @@ object HyperCarRepo {
                 if (!sessionLive.get() || connectionAttemptId != attempt || sessionSockets !== sockets)
                     throw CancellationException("旧核心启动结果已失效")
                 val json = io.github.hypercar.navigation.CarWithNavigation.prepareConfig(configure())
+                val videoGeneration = videoCapabilityGeneration.incrementAndGet()
+                SettingsStore.videoCapabilities.begin(videoGeneration)
+                RustCoreBridge.setListener(object : RustCoreBridge.EventListener by rustListener {
+                    override fun onVideoCapabilities(hevcAllowed: Boolean) {
+                        if (!sessionLive.get() || connectionAttemptId != attempt || sessionSockets !== sockets ||
+                            videoCapabilityGeneration.get() != videoGeneration) return
+                        if (SettingsStore.videoCapabilities.accept(videoGeneration, hevcAllowed))
+                            log("VIDEO: receiver HEVC allowed=$hevcAllowed preference=${SettingsStore.videoCodec}")
+                    }
+                })
                 transferred = true
                 return RustCoreBridge.nativeStart(json, fd, socketProvider(sockets))
             } finally { autoConnectChanges.unlock() }
@@ -1632,6 +1644,8 @@ object HyperCarRepo {
         keepListening: Boolean = AutomaticConnectionPolicy.keepListeningAfterStop(SettingsStore.autoConnect, automaticPauseRemaining > 0),
         graceful: Boolean = false,
     ) {
+        videoCapabilityGeneration.incrementAndGet()
+        SettingsStore.videoCapabilities.clear()
         // 幂等：重复的断开事件（ACL 断开广播 + 引擎 ended + service 转交）只真正拆一次。
         // 但**状态必须回 Idle**——曾经这里直接 return，导致链路已断、界面还显示"已连接"。
         if (!sessionLive.compareAndSet(true, false)) {

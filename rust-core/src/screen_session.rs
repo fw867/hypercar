@@ -22,6 +22,7 @@ pub struct ScreenSession {
     pub shared: Option<[u8;32]>,
     pub uuid: String,
     pub keep_stats: bool,
+    pub hevc_allowed: bool,
     pub display: (u32,u32),
     pub owned: Arc<AtomicBool>,
     pub commands: mpsc::Sender<ScreenCommand>,
@@ -36,6 +37,14 @@ impl ScreenSession {
         let conn_id=airplay::random_positive_i64();
         let body=if self.params.mbux_screen_bootstrap {
             airplay::build_screen_setup_with_latency(conn_id,&self.uuid,100)
+        } else if self.params.id9_screen_bootstrap {
+            // xiap2 0x3abac..0x3abb8 proposes 75ms. Keep this ID9 comparison
+            // independent of SAP, HEVC and resource/RECORD ordering.
+            crate::emit_log("ID9: screen SETUP latencyMs=75 reference=box-firmware; receiver acceptance pending");
+            airplay::build_screen_setup_with_latency(conn_id,&self.uuid,75)
+        } else if self.params.bmw_capabilities && self.params.bmw_box_bootstrap && !self.params.nbt_audio_first && !self.software_receiver {
+            crate::emit_log("BMW-MGU: screen SETUP latencyMs=75 reference=box-firmware; vehicle validation pending");
+            airplay::build_screen_setup_with_latency(conn_id,&self.uuid,75)
         } else { airplay::build_screen_setup(conn_id,&self.uuid) };
         let response=self.control.request("SETUP","/",&body,"application/x-apple-binary-plist",&[],Duration::from_secs(8)).await?;
         if response.status()!=200 { return Err(format!("屏幕 SETUP 被拒 {}",response.first_line)); }
@@ -54,6 +63,7 @@ impl ScreenSession {
         let (_,write)=socket.into_split();
         let (w,h)=*self.params.encoder_size.lock();
         let mut sender=ScreenSender::new(write,cipher,w,h,self.keep_stats);
+        sender.set_hevc_allowed(self.hevc_allowed);
         sender.attach_diagnostics(self.params.pipeline.clone(),conn_id as u64);
         if self.params.carwith_stretch { sender.set_display_target(self.display.0,self.display.1); }
         sender.set_ownership(self.owned.clone());

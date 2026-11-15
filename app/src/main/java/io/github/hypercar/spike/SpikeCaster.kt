@@ -1,6 +1,9 @@
 package io.github.hypercar.spike
 
 import android.media.MediaCodec
+import android.media.MediaCodecList
+import io.github.hypercar.settings.VideoCodec
+import io.github.hypercar.settings.VideoCodecPolicy
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Handler
@@ -10,7 +13,7 @@ import android.view.Surface
 import io.github.hypercar.core.RustCoreBridge
 
 /**
- * Production D1/D2 encoder: Surface → MediaCodec AVC → nativePushVideoFrame.
+ * Production D1/D2 encoder: Surface → hardware HEVC / AVC fallback → explicit-codec JNI.
  *
  * Virtual displays are owned by the shell service; this class owns only encoding resources.
  *
@@ -25,6 +28,7 @@ class SpikeCaster(
     private val fps: Int = 60,
     private val bitrate: Int = 8_000_000,
     private val tag: String = "S3",
+    val preferredCodec: VideoCodec = VideoCodec.H264,
 ) {
 
     private val lock = Any()
@@ -59,6 +63,9 @@ class SpikeCaster(
     private var latIdx = 0
     private val gaps = LongArray(2048)
     private var gapIdx = 0
+
+    @Volatile var actualCodec: VideoCodec = VideoCodec.H264
+        private set
 
     val isRunning: Boolean get() = running
 
@@ -100,13 +107,30 @@ class SpikeCaster(
     /** 只启编码器，不建屏（建屏交给 shell UserService / 调用方）。 */
     fun startEncoder(): String {
         if (running) return "已经在跑"
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+        VideoCodecPolicy.start(preferredCodec) { selected ->
+            try { startEncoder(selected) }
+            catch (error: Exception) {
+                if (selected == VideoCodec.HEVC) SpikeReport.add(tag, "HEVC 硬件编码不可用，重建 H.264: ${error.message}")
+                throw error
+            }
+        }
+        return "编码器启动：${width}x${height}@${fps} codec=$actualCodec encoder=${codec?.name}"
+    }
+
+    private fun startEncoder(selected: VideoCodec) {
+        actualCodec = selected
+        synchronized(lock) {
+            csdFromConfig.reset()
+            csdFromFormat.reset()
+            awaitingKeyFrame = true
+        }
+        val format = MediaFormat.createVideoFormat(selected.mime, width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
             setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, fps.toFloat())
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+            setInteger(MediaFormat.KEY_PROFILE, if (selected == VideoCodec.HEVC) MediaCodecInfo.CodecProfileLevel.HEVCProfileMain else MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
             // Let MediaCodec choose the level required by the native size and frame rate.
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
             setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
@@ -119,12 +143,25 @@ class SpikeCaster(
                 runCatching { setInteger(MediaFormat.KEY_LATENCY, 0) }
             }
         }
-        val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        val enc = if (selected == VideoCodec.HEVC) {
+            val candidate = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull { info ->
+                info.isEncoder && info.isHardwareAccelerated && info.supportedTypes.any { it.equals(selected.mime, true) } &&
+                    runCatching {
+                        val caps = info.getCapabilitiesForType(selected.mime)
+                        caps.colorFormats.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface) &&
+                            caps.profileLevels.any { it.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain } &&
+                            caps.videoCapabilities.areSizeAndRateSupported(width, height, fps.toDouble()) &&
+                            caps.isFormatSupported(format)
+                    }.getOrDefault(false)
+            } ?: error("no hardware HEVC Main Surface encoder for ${width}x${height}@$fps")
+            MediaCodec.createByCodecName(candidate.name)
+        } else MediaCodec.createEncoderByType(selected.mime)
         codec = enc
         try {
             try {
                 enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             } catch (t: Throwable) {
+                if (selected == VideoCodec.HEVC) throw t
                 SpikeReport.add(tag, "configure 带 profile/level/bitrateMode 失败（${t.message}），去掉后重试")
                 format.removeKey(MediaFormat.KEY_PROFILE)
                 format.removeKey(MediaFormat.KEY_LEVEL)
@@ -161,7 +198,6 @@ class SpikeCaster(
             val msg = "编码器启动：${width}x${height}@${fps} ${bitrate / 1000}kbps " +
                 "surface=${surface.isValid} encoder=${enc.name}"
             SpikeReport.add(tag, msg)
-            return msg
         } catch (error: Throwable) {
             stop()
             throw error
@@ -171,8 +207,10 @@ class SpikeCaster(
     fun stop() {
         val wasRunning = running
         running = false
-        runCatching { codec?.stop() }
-        runCatching { codec?.release() }
+        val retiredCodec = codec
+        codec = null
+        runCatching { retiredCodec?.stop() }
+        runCatching { retiredCodec?.release() }
         runCatching { inputSurface?.release() }
         runCatching { thread?.quitSafely() }
         codec = null
@@ -206,6 +244,7 @@ class SpikeCaster(
 
         override fun onOutputBufferAvailable(codec: MediaCodec, index: Int, info: MediaCodec.BufferInfo) {
             try {
+                if (codec !== this@SpikeCaster.codec) return
                 if (info.size > 0) {
                     val buf = codec.getOutputBuffer(index)
                     if (buf != null) {
@@ -234,7 +273,7 @@ class SpikeCaster(
                             synchronized(lock) {
                                 if (pushing && (!awaitingKeyFrame || key)) {
                                     awaitingKeyFrame = false
-                                    RustCoreBridge.nativePushVideoFrame(payload, info.presentationTimeUs)
+                                    RustCoreBridge.nativePushVideoFrameWithCodec(payload, info.presentationTimeUs, actualCodec.wireId)
                                     onFrame(info.presentationTimeUs, payload.size, now)
                                 }
                             }
@@ -249,6 +288,7 @@ class SpikeCaster(
         }
 
         override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
+            if (codec !== this@SpikeCaster.codec) return
             SpikeReport.add(tag, "outputFormat: $format")
             synchronized(lock) { csdFromFormat.reset(); csdFromConfig.reset() }
             for (name in listOf("csd-0", "csd-1")) {
@@ -263,6 +303,7 @@ class SpikeCaster(
         }
 
         override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
+            if (codec !== this@SpikeCaster.codec) return
             SpikeReport.add(tag, "编码器错误: ${e.diagnosticInfo}（recoverable=${e.isRecoverable}）")
         }
     }

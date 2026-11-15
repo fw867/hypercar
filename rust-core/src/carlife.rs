@@ -575,18 +575,20 @@ async fn handle_media_client(
                     VIDEO_DATA => {
                         if !payload.is_empty() {
                             if encryption.is_some() {
-                                let units = match parser.push(&payload) {
+                                let units = match parser.push_tagged(&payload) {
                                     Ok(units) => units,
                                     Err(error) => { emit_log(&format!("CARWITH-VIDEO: {error}")); return; }
                                 };
-                                for data in units {
+                                for unit in units {
+                                    let video::AccessUnit { data, codec } = unit;
                                     access_units += 1;
-                                    let types: Vec<_> = crate::screen::annexb_nals(&data).iter().map(|n| n[0] & 31).collect();
-                                    if access_units == 1 || types.contains(&5) {
-                                        emit_log(&format!("CARWITH-VIDEO: AU#{access_units} bytes={} nals={types:?} sourceUnixSeconds={ts_ms}; AirPlay PTS=monotonic",data.len()));
+                                    let types: Vec<_> = crate::screen::annexb_nals(&data).iter().map(|n|
+                                        if codec == crate::video_format::VideoCodec::Hevc { (n[0]>>1)&63 } else { n[0]&31 }).collect();
+                                    if access_units == 1 || types.iter().any(|kind| if codec == crate::video_format::VideoCodec::Hevc { matches!(kind,19..=21) } else { *kind==5 }) {
+                                        emit_log(&format!("CARWITH-VIDEO: AU#{access_units} codec={} bytes={} nals={types:?} sourceUnixSeconds={ts_ms}; AirPlay PTS=monotonic",codec.as_str(),data.len()));
                                     }
-                                    let _ = events.send(CarLifeEvent::VideoFrame {
-                                        pts_us: crate::timing::monotonic_nanos() / 1000, data,
+                                    let _ = events.send(CarLifeEvent::VideoFrameTagged {
+                                        pts_us: crate::timing::monotonic_nanos() / 1000, data, codec,
                                     });
                                 }
                             } else {

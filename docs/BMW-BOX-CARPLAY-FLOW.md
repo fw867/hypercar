@@ -1,5 +1,21 @@
 # 宝马盒子流程证据
 
+## BMW标记调用链与ID9参数对照（2026-11-15）
+
+本节继续使用下文同一固件哈希，静态地址仅适用于该样本。逐文件扫描rootfs的1993文件/611个ELF，只有xiap2包含`vehicleCfgIsBMW`符号；xiap2可执行节ARM B/BL、重定位、函数地址取用模式均未找到该导出函数的静态调用者。0x55f28虽然字面值为0x8cac0，实际由0x55ef8与PC相加得到全局地址0xe29c0，不是函数指针。不能因导出函数存在便认定它控制BMW认证/SETUP；动态/其它版本行为未被这次扫描排除。
+
+| 实际路径 | 确定行为 | ID9处理结论 |
+|---|---|---|
+| vehicleCfgSave：0x8d614/0x8d774→0x8d650 | 根据Mini/BMW名称分别写0x8200/0x8100至记录+134；vehicleCfgIsBMW的算式只接受这两个值并比较12位蓝牙地址 | 是品牌记录，不区分ID9/IDC23代际 |
+| 0x63730→vehicleCfgIsAccConnectOnly(0x8cba8)→bt_succ(0x4f0f0) | 按匹配地址检查记录+134的符号位；true时先AT-LP再AT-NL | 是连接策略分支，未查到它调度认证或SETUP |
+| 蓝牙模块fscsdkbw123：NL handler 0x35720→app_disallow_rec(0x3bc3c) | 配对记录+0x1d置1；自动linker的0x3bebe及扫描完成0x3c7cc读取，禁止该设备进入自动重连候选；显式地址btAPI_IAP_Connect仍可调用lib_serial_port_connect | 不等价于Android从启动起关闭所有出站iAP2。当前ID9的allowOutboundIap2不能仅据此改false；更精确对应是已成功连接后的按设备自动重连抑制 |
+| pair-verify成功→0x2c8c4 SAP→0x257a0会话SETUP | 已确认配对成功后继续auth-setup；SAP入口看会话状态，未见此路径按BMW或ID9分流 | 与ID9不发SAP有差异，但ID9通用BMW档案已有SAP成功后仍媒体400的反证，不能宣称补SAP即修复 |
+| 0x25b38–0x25bcc能力构造 | 固定uiContext/viewAreas/cornerMasks/focusTransfer/altScreen/enhancedSiri/hevc七项；enabledFeatures/hevc在0x2d830驱动会话标记，再于0x39e28传入视频对象 | 与本项目能力列表不同；不因此恢复ID9 HEVC或同时删能力 |
+| /info完成回调0x33490→RECORD 0x2a9e4 | RECORD无正文；屏幕由独立资源回调carplay_video_start→0x3ad34→0x3a998触发 | 不能由主链静态调度认定所有会话屏幕必晚于RECORD，也不足以推翻ID9已有独立顺序 |
+| 屏幕SETUP 0x3ab7c–0x3abb8 | type110、显示UUID、连接ID与latencyMs四字段；0x3abac明确mov r2,#75后写latencyMs | 当前仅ID9将25ms对齐75ms作单变量参数对照；默认25ms及旧MBUX实验100ms保持，URI/认证/HEVC/资源与RECORD顺序不变。尚未证明能消除IDC23的400 |
+
+此次实际修改是ID9屏幕延迟单变量，非“恢复盒子ID9专用分支”。原生实际请求测试先观察25!=75失败，修改后验证75及四字段、type110、正连接ID，保留其它档案25/100和失败清理回归。准备安装时检测到既有571已由其它工作提交为f7f574c，本轮延迟改动仍未提交，故按项目约定升级572/10668；本轮不提交、不推送。
+
 ## 方向盘与Now Playing固件复核（2026-11-15）
 
 对照原固件SHA-256 `4b7dc91d4ee353a9f1f1acc6ae2c0e69b94b598355379545362856e6a27dff8e`中的xiap2，结合已留存成功日志。以下地址为该固件虚拟地址，不能套用其它版本；原日志每包只保留前16字节，未恢复完整描述符/订阅正文。
@@ -95,3 +111,16 @@ CarDeck与mcarplay也先应答事件，再分发命令；未处理changeUIContex
 requestUI可能由用户点击或车机重试产生；后续借屏拒绝不能解释此前已出现的入口失败。两项旧恢复实验测试无效已删除，当前画面资源联动及诊断见[视频](VIDEO-STREAM-REVIEW.md)，不保留旧实验操作指引。
 
 按同一轮比较：首次车机激活/邀请、资源声明、屏幕SETUP、真实源配置与IDR、后续业务和断开。盒子成功不代表本项目已经复现实车全部行为。
+
+## 572：以 ID8.5 为主线的档案与 HEVC 校准
+
+商家声称适配 ID6–ID9.5，用户实测盒子在 ID8.5 较稳定；本轮以 MGU/ID8.5 成功日志和固件为依据，ID9 仅兼容支持，不把全系销售声明当作各代流程一致的证据。
+
+- MGU 启用已有屏幕资源生命周期：收屏暂停并释放旧发送器，允许的 requestUI 按资源代次重建，保留认证和单次 RECORD 顺序。远端档案 schema 升12，旧缓存不能覆盖新默认；NBT/ID9 的启动顺序保持。
+- MGU 屏幕 SETUP 的四字段不变，latencyMs 从25校准为固件明确的75（xiap2 `0x3abac`）；NBT与通用路径仍25，MBUX仍100。ID9沿用本批已有75ms对照。
+- BMW 移除无处理器的 sessionManagement/logTransfer/vehicleStateProtocol；MGU/NBT 不再把现有 type100/type102 UDP 音频声明成 type103 MainBuffered。ID9原有缓冲音频独立开关保留。PCM节拍修复不依赖 AAC。
+- HEVC 默认关闭，设置可选“HEVC优先”。只有本轮 SETUP 明确接受 hevc 才允许 HEVC 帧；ID9继续关闭该声明。自绘以手机硬件 Main/Surface 编码为前提，启动失败重建 H.264；首页与地图逐帧带实际 codec，跨会话能力失效，编码偏好改变重建显示编码器。
+- 固件 `0x3bb80`、`0x3bca0..0x3bd88` 支持 VPS/SPS/PPS→hvcC→94字节 hvc1 前缀；HEVC config 标志 `header[6]=0x1e,[7]=1`，frame `[5]=0x10`。复用既有帧加密和持续 nonce。hvcC时间层字段依据真实 SPS，不照抄盒子的固定0x0b；H.264既有线上格式保持。
+- CarWith 只透传真正的 HEVC：通过完整参数序列确认格式、按 HEVC 图片边界组帧、同步19..21补齐当前参数。没有找到请求 CarWith 产 HEVC 的协议字段，因此未添加猜测字段，也不做实时转码。接收端未允许HEVC却收到该源时明确结束并提示选择支持的源/会话，避免静默黑屏。
+
+真实手机探针已用2732×794 Surface硬编产出 Main HEVC，并将同份参数/关键帧交硬件解码器得到一帧。脱敏的纯色测试输出保存在 `rust-core/tests/fixtures/hevc-phone/`，用于参数解析、hvc1、真实AAD/nonce和IDR实包回归。该验证是短片编码/解码，不证明持续60fps吞吐或车机显示成功。运行期 MediaCodec onError 仍为诊断，不宣称已有动态 Surface 重建恢复。

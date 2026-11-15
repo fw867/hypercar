@@ -104,6 +104,8 @@ useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关�
 
 ID9当前路径：配对 → 会话SETUP → /info主屏UUID → 初始资源声明 → 按约束申请主屏 → HID mode0 → 主屏SETUP/TCP → RECORD → 资源版本仍有效才送帧。只对bmw_id9启用；不支持的PCM媒体档不尝试；声明AAC-LC48媒体输出时可使用AAC，ID9实车仍待验证。
 
+572固件对照以ID8.5为主线：MGU启用已实现的屏幕资源生命周期，屏幕latencyMs校准为75；远端schema12保护新默认。BMW能力声明移除未实现的处理能力，MGU/NBT移除MainBuffered声明；HEVC为可选的自绘硬编与真实输入透传，默认H.264。ID9仅保留已有75ms对照和关闭HEVC策略，认证/URI/启动顺序保持。不从固件BMW自动重连AT命令推导全局禁用ID9出站。尚未实车证明稳定性或400修复，详见[盒子调用链](BMW-BOX-CARPLAY-FLOW.md)。
+
 2026-11-14 ID9单变量验证：仅当 `id9_screen_bootstrap` 启用时从会话 features 移除 `hevc`，完整能力列表由14项变为13项；日志增加 `hevc_proposed=false`。保留 `mainBuffered` 等其余能力、屏幕四字段与25ms延迟、会话 `/setup` / 屏幕 `/` / 音频绝对URI及启动顺序。ID8.5和其它档案保留原能力列表，原MBUX最小能力路径仍只提议viewAreas。此变更用于验证HEVC声明是否参与400，尚未证明根因或实车修复。
 
 本地验证：Android arm64原生测试184通过、0失败、1忽略，包含ID9只移除HEVC及其余会话字段/其它能力列表保持的回归；正式APK构建通过。0.1.0.567（10663）已通过adb install -r覆盖安装到已连接M154FF，安装后核实版本一致，保留应用数据。尚未获得本版ID9实车连接日志。

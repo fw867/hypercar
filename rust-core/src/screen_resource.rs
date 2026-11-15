@@ -255,7 +255,7 @@ mod tests {
             pipeline.lock().audio_ready=true;
             let params=AirplayParams {
                 car_ip:"127.0.0.1".into(),airplay_port:7000,device_id:"test".into(),device_name:"Test phone".into(),identity_path:"unused".into(),
-                receiver_id:None,receiver_previously_connected:true,enable_audio:true,audio_codec:String::new(),microphone_probe:None,keep_alive_stats:false,
+                receiver_id:None,receiver_previously_connected:true,enable_audio:true,audio_codec:String::new(),video_codec:String::new(),bmw_capabilities:true,microphone_probe:None,keep_alive_stats:false,
                 bmw_box_bootstrap:!mbux,mbux_screen_bootstrap:mbux,id9_screen_bootstrap:false,id9_disable_buffered_audio:false,nbt_audio_first:false,mbux_media_compat:false,desktop_receiver:false,width:1920,height:720,touch_display:None,touch_rect:None,
                 encoder_size:Arc::new(Mutex::new((1920,720))),touch_size:Arc::new(Mutex::new((1920,720))),
                 carwith_display:None,carwith_stretch:false,screen_resource_lifecycle:true,pipeline:pipeline.clone(),
@@ -264,7 +264,7 @@ mod tests {
             let pump=tokio::spawn(video_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(PumpStat::default())),true,pipeline,rx,video_rx));
             let owned=Arc::new(AtomicBool::new(modes.screen_owned()));
             let session=Arc::new(ScreenSession {control,factory:Arc::new(Factory),params,shared:Some([9;32]),uuid:"screen-test".into(),
-                keep_stats:false,software_receiver:false,display:(1920,720),owned,commands,bootstrap_event:None,bootstrap_hids:Vec::new(),activated:AtomicBool::new(!mbux),resource_state:tokio::sync::Mutex::new(Default::default())});
+                hevc_allowed:false,keep_stats:false,software_receiver:false,display:(1920,720),owned,commands,bootstrap_event:None,bootstrap_hids:Vec::new(),activated:AtomicBool::new(!mbux),resource_state:tokio::sync::Mutex::new(Default::default())});
             Self {session,modes:Arc::new(Mutex::new(modes)),car,video,source,pump}
         }
         fn reconcile(&self)->tokio::task::JoinHandle<Result<(),String>> {
@@ -373,7 +373,10 @@ mod tests {
             let body=bplist::parse(&setup.body).unwrap();
             let stream=&body.get("streams").unwrap().as_array().unwrap()[0];
             assert_eq!(stream.get("uuid").and_then(Value::as_str),Some("screen-test"));
-            assert_eq!(stream.get("latencyMs").and_then(Value::as_int),Some(25));
+            assert_eq!(stream.get("latencyMs").and_then(Value::as_int),Some(75));
+            assert_eq!(stream.as_dict().unwrap().len(),4);
+            assert_eq!(stream.get("type").and_then(Value::as_int),Some(110));
+            assert!(stream.get("streamConnectionID").and_then(Value::as_int).unwrap()>0);
             let (mut video,id)=f.setup_reply(&setup).await;
             let record=read(&mut f.car).await;assert_eq!(record.first_line,"RECORD / RTSP/1.0");
             assert!(!f.session.activated.load(Ordering::Acquire));
@@ -419,6 +422,24 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn mgu_box_latency_is_75_while_generic_and_nbt_remain_25() {
+        for (bmw,nbt,expected) in [(true,false,75),(false,false,25),(true,true,25)] {
+            let mut f=Fixture::new(Modes::initial()).await;
+            let session=Arc::get_mut(&mut f.session).unwrap();
+            session.params.bmw_capabilities=bmw;
+            session.params.bmw_box_bootstrap=bmw;
+            session.params.nbt_audio_first=nbt;
+            let session=f.session.clone();
+            let task=tokio::spawn(async move {session.open().await.err().unwrap()});
+            let request=read(&mut f.car).await;
+            let proposal=bplist::parse(&request.body).unwrap();
+            assert_eq!(proposal.get("streams").unwrap().as_array().unwrap()[0]
+                .get("latencyMs").and_then(Value::as_int),Some(expected));
+            reply(&mut f.car,&request,400,&[]).await;
+            assert!(task.await.unwrap().contains("400"));
+        }
+    }
+    #[tokio::test]
     async fn screen_business_rejection_or_missing_port_never_opens_data_socket_or_marks_setup() {
         for reject_business in [true, false] {
             let mut f=Fixture::new(Modes::initial()).await;
@@ -426,6 +447,9 @@ mod tests {
             let task=tokio::spawn(async move { session.open().await.err().unwrap() });
             let setup=read(&mut f.car).await;
             assert_eq!(setup.first_line,"SETUP / RTSP/1.0");
+            let proposal=bplist::parse(&setup.body).unwrap();
+            assert_eq!(proposal.get("streams").unwrap().as_array().unwrap()[0]
+                .get("latencyMs").and_then(Value::as_int),Some(75));
             let body=if reject_business {
                 // A transport 200 and a plausible port must not override a business rejection.
                 Value::dict(vec![("status",Value::int(-1)),("streams",Value::array(vec![Value::dict(vec![

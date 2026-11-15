@@ -57,6 +57,11 @@ object CarUiCaster {
     }
 
     private suspend fun startLocked(context: Context, current: () -> Boolean): String {
+        val desiredCodec = SettingsStore.preferredVideoCodec
+        if (running && caster?.preferredCodec != desiredCodec) {
+            HyperCarRepo.log("CARUI: video codec preference changed; rebuilding home/map encoders")
+            stopLocked()
+        }
         if (running) {
             // A new native engine needs the touch callback and source dimensions again.
             installTouchListener()
@@ -77,7 +82,7 @@ object CarUiCaster {
         width = plan.width
         height = plan.height
         HyperCarRepo.log("CARUI: viewport=${SettingsStore.receiverViewport ?: (SettingsStore.videoWidth to SettingsStore.videoHeight)} stream=${width}x${height}@${plan.fps} dpi=$DPI")
-        val c = SpikeCaster(width = width, height = height, fps = plan.fps, bitrate = plan.bitrate, tag = TAG)
+        val c = SpikeCaster(width = width, height = height, fps = plan.fps, bitrate = plan.bitrate, tag = TAG, preferredCodec = desiredCodec)
         caster = c
         val encoder = runCatching { c.startEncoder() }.getOrElse { t ->
             caster = null

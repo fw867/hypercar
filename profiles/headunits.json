@@ -1,8 +1,8 @@
 {
-  "version": 11,
-  "_schema": 11,
+  "version": 12,
+  "_schema": 12,
   "updated": "2026-11-15",
-  "_comment": "HyperCar 车机档案下发文件。新增车型改这里 + push 即可，App 端「从 GitHub 更新车型列表」后立即出现。字段含义见 docs/HEADUNIT-PROFILES.md；除 id/label 外都可省略（省略 = 用同 id 内置档案的值）。覆盖内置档案须达到各自要求的 schema：ID6 为11，奔驰为10，ID9 为9，其余内置档案为8（旧缓存不能把内置修复顶回去）。",
+  "_comment": "HyperCar 车机档案下发文件。新增车型改这里 + push 即可，App 端「从 GitHub 更新车型列表」后立即出现。字段含义见 docs/HEADUNIT-PROFILES.md；除 id/label 外都可省略（省略 = 用同 id 内置档案的值）。覆盖内置档案须达到各自要求的 schema：MGU 为12，ID6 为11，奔驰为10，ID9 为9，其余内置档案为8（旧缓存不能把内置修复顶回去）。",
   "profiles": [
     {
       "id": "bmw_id85",
@@ -20,6 +20,7 @@
       "abortWhenCarPlayWindowClosed": false,
       "preferMdnsAirplay": true,
       "requireAirplayActivation": true,
+      "useScreenResourceLifecycle": true,
       "fallbackAirplayPorts": [
         7000,
         7001,

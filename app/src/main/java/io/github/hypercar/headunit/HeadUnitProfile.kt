@@ -136,6 +136,8 @@ object HeadUnitProfiles {
         abortWhenCarPlayWindowClosed = false,
         preferMdnsAirplay = true,
         requireAirplayActivation = true,
+        // Box video callbacks follow resource ownership independently of RECORD.
+        useScreenResourceLifecycle = true,
         fallbackAirplayPorts = listOf(7000, 7001, 7100, 17000),
         touchDisplay = null,
         pairingHint = "首次要在 iDrive 里把这个设备选成 CarPlay 手机（车机会弹确认）",

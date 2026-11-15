@@ -1150,6 +1150,7 @@ private fun ResolutionSection() {
     var widthText by rememberSaveable { mutableStateOf(SettingsStore.videoWidth.toString()) }
     var heightText by rememberSaveable { mutableStateOf(SettingsStore.videoHeight.toString()) }
     var fps by rememberSaveable { mutableStateOf(SettingsStore.videoFps) }
+    var videoCodec by rememberSaveable { mutableStateOf(SettingsStore.videoCodec) }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionLabel(text = "分辨率与帧率")
         GlassPanel(
@@ -1205,6 +1206,21 @@ private fun ResolutionSection() {
                 fps = selected
                 SettingsStore.videoFps = selected
             }
+            Spacer(modifier = Modifier.height(12.dp))
+            Text("视频编码（下次连接生效）", style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                listOf("h264" to "H.264", "hevc" to "HEVC 优先").forEachIndexed { index, (value, label) ->
+                    SegmentedButton(
+                        selected = videoCodec == value,
+                        onClick = { videoCodec = value; SettingsStore.videoCodec = value },
+                        shape = SegmentedButtonDefaults.itemShape(index = index, count = 2),
+                        label = { Text(label) },
+                    )
+                }
+            }
+            Text("HEVC 需要车机支持；自绘使用手机硬件编码，不可用时回退 H.264。CarWith 保留源编码，不转码。",
+                style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+
         }
     }
 }

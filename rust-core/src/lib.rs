@@ -31,6 +31,8 @@ mod resource_trace;
 mod rtsp_uri;
 mod screen;
 mod h264;
+mod hevc;
+mod video_format;
 mod pipeline;
 mod tcp_diagnostics;
 mod screen_session;
@@ -242,6 +244,12 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSetWifi
     mut env: JNIEnv, _class: JClass, id: jlong, phase: JString,
 ) {
     if let Ok(phase)=env.get_string(&phase) { wifi_iap2::set_phase(id as u64,&phase.to_string_lossy()); }
+}
+
+pub(crate) fn emit_video_capabilities(hevc_allowed:bool) {
+    call_listener("onVideoCapabilities", |env,obj| {
+        env.call_method(obj,"onVideoCapabilities","(Z)V", &[(if hevc_allowed {JNI_TRUE} else {JNI_FALSE}).into()]).map(|_|())
+    });
 }
 
 pub(crate) fn emit_display_size(width: u32, height: u32) {
@@ -666,6 +674,19 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePushVid
             pts_us: pts_us.max(0) as u64,
             data: bytes,
         });
+    }
+}
+
+/// Codec-tagged Annex B: 0=H.264, 1=HEVC. Unknown tags are rejected.
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePushVideoFrameWithCodec(
+    env:JNIEnv, _class:JClass, data:JByteArray, pts_us:jlong, codec:jint,
+) {
+    let Some(codec)=video_format::VideoCodec::from_id(codec) else {return;};
+    let Ok(bytes)=env.convert_byte_array(&data) else {return;};
+    if bytes.is_empty() {return;}
+    if let Some(handle)=ENGINE.lock().as_ref() {
+        let _=handle.source_tx.send(engine::SourceEvent::VideoFrameTagged {pts_us:pts_us.max(0) as u64,data:bytes,codec});
     }
 }
 

@@ -6,6 +6,40 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class RemoteProfilesTest {
+    @Test fun mguUsesResourceLifecycleWithoutChangingBootstrapOrActivationPolicy() {
+        val mgu = HeadUnitProfiles.BMW_ID85
+        assertTrue(mgu.screenResourceLifecycleEnabled(false))
+        assertFalse(mgu.nbtAudioFirst)
+        assertFalse(mgu.id9ScreenBootstrap)
+        assertFalse(mgu.mbuxScreenBootstrap)
+        assertTrue(mgu.requireAirplayActivation)
+        assertTrue(mgu.openEaSessions)
+        assertTrue(mgu.sendTransportIdentifier)
+        assertFalse(mgu.allowOutboundIap2)
+        assertTrue(ReceiverCompatibility.useBmwBootstrap(mgu.id, "BMW MGU"))
+    }
+
+    @Test fun schemaTwelveProtectsMguLifecycleWhilePreservingOtherReceiverOverrides() {
+        val mgu = HeadUnitProfiles.BMW_ID85
+        val stale = mgu.copy(useScreenResourceLifecycle = false)
+        for (schema in 8..11) {
+            val merged = RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(stale), schema)
+            assertTrue("schema=$schema", merged.single { it.id == mgu.id }.useScreenResourceLifecycle)
+            assertFalse(RemoteProfiles.canOverrideBuiltin(mgu.id, schema))
+        }
+        assertEquals(12, RemoteProfiles.SCHEMA)
+        assertTrue(RemoteProfiles.canOverrideBuiltin(mgu.id, 12))
+        assertEquals(stale, RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(stale), 12)
+            .single { it.id == mgu.id })
+        for ((profile, schema) in listOf(HeadUnitProfiles.BMW_ID6 to 11,
+            HeadUnitProfiles.BMW_ID9 to 9, HeadUnitProfiles.MERCEDES_MBUX to 10,
+            HeadUnitProfiles.VOLKSWAGEN to 8)) {
+            val override = profile.copy(preferMdnsAirplay = !profile.preferMdnsAirplay)
+            assertEquals(override, RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(override), schema)
+                .single { it.id == profile.id })
+        }
+    }
+
     @Test fun schemaSevenCannotRestoreVolkswagenUnverifiedLabelOrChangeItsHandshake() {
         val old = RemoteProfiles.parse("""{"_schema":7,"profiles":[{
             "id":"volkswagen_mib","verified":false,"notes":"未实车验证"}]}""")
@@ -73,8 +107,7 @@ class RemoteProfilesTest {
     }
 
     @Test fun id9SchemaUpgradeDoesNotInvalidateExistingReceiversSchemaEightOverrides() {
-        val overrides = listOf(HeadUnitProfiles.BMW_ID85,
-            HeadUnitProfiles.AUDI_MIB3, HeadUnitProfiles.VOLKSWAGEN, HeadUnitProfiles.WINPLAY,
+        val overrides = listOf(HeadUnitProfiles.AUDI_MIB3, HeadUnitProfiles.VOLKSWAGEN, HeadUnitProfiles.WINPLAY,
             HeadUnitProfiles.GENERIC).map { it.copy(preferMdnsAirplay = !it.preferMdnsAirplay) }
         val oldId9 = HeadUnitProfiles.BMW_ID9.copy(id9ScreenBootstrap = false)
         val effective = RemoteProfiles.merge(HeadUnitProfiles.builtin, overrides + oldId9, 8)

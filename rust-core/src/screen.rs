@@ -3,7 +3,8 @@
 //! 线格式：每条消息 = 128 字节明文头 + body。头部布局（Little-Endian）：
 //!  - `[0..4)`  u32LE body 长度（VideoFrame 含 16B Poly1305 tag）
 //!  - `[4]`     u8 opcode：0=VideoFrame，1=VideoConfig，2=KeepAlive，5=KeepAliveWithBody
-//!  - `[6]`     u8 small_param[1]：VideoConfig 置 ScreenFlag::Encrypted(0x04)
+//!  - `[6]`     u8 small_param[1]：AVC config=0x04；HEVC config=0x1e且[7]=1
+//!  - `[5]`     HEVC VideoFrame=0x10；HEVC config body为hvc1 sample entry包含hvcC
 //!  - `[8..16)` params[0]：NTP 32.32 LE 时间戳（VideoFrame 用 pts 换算；config/keepAlive 归零）
 //!  - `[16..20)` params[1] 低 4 字节 = width f32 LE；`[20..24)` = height f32 LE
 //!    （两者同属 params[1]，对照 cardeck `CONFIG_WIDTH_HEIGHT_OFFSET = 16` + 偏移+4；
@@ -30,6 +31,7 @@
 
 use crate::crypto::{chacha_seal, nonce64, Aes128CtrStream};
 use crate::timing::ntp_be;
+use crate::video_format::VideoCodec;
 use std::time::Duration;
 use std::os::fd::AsRawFd;
 use tokio::io::AsyncWriteExt;
@@ -39,7 +41,7 @@ use tokio::net::tcp::OwnedWriteHalf;
 const HEADER_LEN: usize = 128;
 /** opcode：密封视频帧。 */
 const OP_FRAME: u8 = 0;
-/** opcode：明文 avcC 配置。 */
+/** opcode：明文 avcC / hvc1 配置。 */
 const OP_CONFIG: u8 = 1;
 /** opcode：keepAlive（空 body）。 */
 const OP_KEEP_ALIVE: u8 = 2;
@@ -96,13 +98,14 @@ pub struct ScreenSender {
     keep_alive_count: u64,
     /** 是否已发过 VideoConfig（未发前丢弃视频帧，对齐参考实现）。 */
     config_sent: bool,
-    /** 最近一次随 VideoConfig 发出的 SPS/PPS（变化检测用）。 */
+    /** 当前源参数集（配置变化和分包缓存；codec切换时清空）。 */
     last_sps: Option<Vec<u8>>,
     last_pps: Option<Vec<u8>>,
     /** 首帧 NAL 类型只打印一次（诊断 H.264/H.265）。 */
     logged_first_frame: bool,
-    /** HEVC 告警只打印一次。 */
-    logged_hevc: bool,
+    codec: VideoCodec,
+    hevc_allowed: bool,
+    last_vps: Option<Vec<u8>>,
     waiting_idr: bool,
     last_sync_request: Option<tokio::time::Instant>,
     ownership: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -148,7 +151,9 @@ impl ScreenSender {
             last_sps: None,
             last_pps: None,
             logged_first_frame: false,
-            logged_hevc: false,
+            codec: VideoCodec::H264,
+            hevc_allowed: false,
+            last_vps: None,
             waiting_idr: true,
             last_sync_request: None,
             ownership: None,
@@ -198,9 +203,25 @@ impl ScreenSender {
     pub fn reset_source(&mut self) {
         crate::emit_log(&format!("VIDEO: reset source {}", self.diagnostics()));
         self.config_sent = false;
-        self.last_sps = None; self.last_pps = None;
+        self.last_vps = None; self.last_sps = None; self.last_pps = None;
         self.waiting_idr = true; self.last_sync_request = None;
         self.logged_first_frame = false;
+    }
+
+    pub fn set_hevc_allowed(&mut self, allowed: bool) {
+        self.hevc_allowed = allowed;
+        if !allowed && self.codec == VideoCodec::Hevc {
+            self.codec = VideoCodec::H264;
+            self.reset_source();
+        }
+    }
+
+    pub fn set_video_codec(&mut self, codec: VideoCodec) -> std::io::Result<()> {
+        if codec == VideoCodec::Hevc && !self.hevc_allowed {
+            return Err(std::io::Error::new(std::io::ErrorKind::Unsupported,"HEVC was not enabled by the receiver"));
+        }
+        if self.codec != codec {self.codec=codec;self.reset_source();}
+        Ok(())
     }
 
     pub fn set_ownership(&mut self, owner: std::sync::Arc<std::sync::atomic::AtomicBool>) {
@@ -257,11 +278,17 @@ impl ScreenSender {
     /// 声明「后续视频帧是密封的」、params[1] = (width, height) 两个 f32 LE（车机据此
     /// 建立解码器画布）、params[0] 归零（config 不带 PTS）。缺任何一项 → 真车黑屏。
     pub async fn send_config(&mut self, avcc: &[u8]) -> std::io::Result<()> {
+        if self.codec!=VideoCodec::H264 {return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,"AVC configuration supplied for HEVC source"));}
+        let size=crate::h264::avcc_dimensions(avcc);
+        self.write_config(avcc,size).await
+    }
+
+    async fn write_config(&mut self, avcc: &[u8], sps_size: Option<(u32,u32)>) -> std::io::Result<()> {
         let mut header = build_header(OP_CONFIG, avcc.len(), &ZERO_TS);
         header[6] = SCREEN_FLAG_ENCRYPTED;
+        if self.codec == VideoCodec::Hevc {header[6]=0x1e;header[7]=1;}
         // params[1]（偏移 16）里是**两个** f32：width 在 16..20、height 在 20..24。
         // 曾把 height 写到 24..28（误当 params[2]），车机读到的画布高度成 0 → 黑屏/错缩放。
-        let sps_size = crate::h264::avcc_dimensions(avcc);
         let (display_w, display_h) = sps_size.unwrap_or_else(|| self.size());
         header[16..20].copy_from_slice(&(display_w as f32).to_le_bytes());
         header[20..24].copy_from_slice(&(display_h as f32).to_le_bytes());
@@ -271,8 +298,36 @@ impl ScreenSender {
         self.w.write_all(&wire).await?;
         self.config_sent = true;
         self.waiting_idr = true;
-        crate::emit_log(&format!("VIDEO: config TCP written {}B header={}x{} encoder_report={}x{} sps={sps_size:?} report_matches_sps={:?} flags=0x04 header_stretch=false requested_target={:?}; receiver decode/display unconfirmed",
-            avcc.len(), display_w, display_h, self.width, self.height, sps_size.map(|s| s == self.size()), self.display_target));
+        crate::emit_log(&format!("VIDEO: config TCP written {}B codec={} header={}x{} encoder_report={}x{} sps={sps_size:?} report_matches_sps={:?} flags=0x{:02x} header_stretch=false requested_target={:?}; receiver decode/display unconfirmed",
+            avcc.len(), self.codec.as_str(), display_w, display_h, self.width, self.height, sps_size.map(|s| s == self.size()), header[6], self.display_target));
+        Ok(())
+    }
+
+    fn source_nal_type(&self,nal:&[u8])->u8 {
+        match self.codec {VideoCodec::H264=>nal_type(nal),VideoCodec::Hevc=>crate::hevc::nal_type(nal).unwrap_or(255)}
+    }
+
+    async fn update_hevc_config(&mut self,nals:&[&[u8]])->std::io::Result<()> {
+        let get=|kind|nals.iter().copied().find(|n|crate::hevc::nal_type(n)==Some(kind));
+        let (v,s,p)=(get(32),get(33),get(34));
+        let changed=v.map(|n|self.last_vps.as_deref()!=Some(n)).unwrap_or(false)
+            || s.map(|n|self.last_sps.as_deref()!=Some(n)).unwrap_or(false)
+            || p.map(|n|self.last_pps.as_deref()!=Some(n)).unwrap_or(false);
+        if changed {
+            // Never combine a replacement VPS/SPS with stale dependent sets.
+            if v.map(|n|self.last_vps.as_deref()!=Some(n)).unwrap_or(false) {self.last_sps=None;self.last_pps=None;}
+            if s.map(|n|self.last_sps.as_deref()!=Some(n)).unwrap_or(false) {self.last_pps=None;}
+            if let Some(n)=v {self.last_vps=Some(n.to_vec());}
+            if let Some(n)=s {self.last_sps=Some(n.to_vec());}
+            if let Some(n)=p {self.last_pps=Some(n.to_vec());}
+            self.config_sent=false;self.waiting_idr=true;
+        }
+        if !self.config_sent {
+            if let (Some(v),Some(s),Some(p))=(&self.last_vps,&self.last_sps,&self.last_pps) {
+                let (config,size)=crate::hevc::build_config(v,s,p).ok_or_else(||std::io::Error::new(std::io::ErrorKind::InvalidData,"invalid or unsupported HEVC parameter sets"))?;
+                self.write_config(&config,Some(size)).await?;
+            }
+        }
         Ok(())
     }
 
@@ -295,25 +350,18 @@ impl ScreenSender {
         if nals.is_empty() {
             return Ok(());
         }
-        // 诊断：首次出帧打印 NAL 类型（H.264 应为 7=SPS/8=PPS/5=IDR/1=P）；
-        // 同时守卫 HEVC——编码器若改用 H.265，当前实现只做
-        // H.264（avcC+SPS/PPS）。不检测的话表现就是「握手全对、车机一直黑屏」。
         if !self.logged_first_frame {
             self.logged_first_frame = true;
-            let types: Vec<u8> = nals.iter().take(6).map(|n| nal_type(n)).collect();
-            crate::emit_log(&format!(
-                "VIDEO: 首帧 {} 个 NAL，类型={:?}（H.264 期望含 7/8/5）",
-                nals.len(),
-                types
-            ));
+            let types: Vec<_> = nals.iter().take(6).map(|n| self.source_nal_type(n)).collect();
+            crate::emit_log(&format!("VIDEO: codec={} first NAL types={types:?}",self.codec.as_str()));
         }
-        if !self.logged_hevc && nals.iter().any(|n| matches!(nal_type(n), 32 | 33 | 34 | 19 | 20 | 21)) {
-            self.logged_hevc = true;
-            crate::emit_log(
-                "VIDEO: ⚠ 检测到 H.265/HEVC NAL（32/33/34 或 19/20/21）——当前核心层只支持 H.264，\
-                 画面不会出。请在设置里改用 H.264 输出（当前只支持 avc）",
-            );
+        if self.codec == VideoCodec::Hevc {
+            if nals.iter().any(|n|crate::hevc::nal_type(n).is_none()) {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,"invalid HEVC NAL header"));
+            }
+            self.update_hevc_config(&nals).await?;
         }
+        if self.codec == VideoCodec::H264 {
         let mut sps: Option<&[u8]> = None;
         let mut pps: Option<&[u8]> = None;
         for &nal in &nals {
@@ -342,7 +390,8 @@ impl ScreenSender {
                 }
             }
         }
-        let is_idr = nals.iter().any(|nal| nal_type(nal) == 5);
+        }
+        let is_idr = nals.iter().any(|nal| match self.codec {VideoCodec::H264=>nal_type(nal)==5, VideoCodec::Hevc=>matches!(crate::hevc::nal_type(nal),Some(19..=21))});
         if !self.config_sent || (self.waiting_idr && !is_idr) {
             self.sync_skips += 1;
             if self.last_sync_request.map(|t| t.elapsed() >= Duration::from_secs(1)).unwrap_or(true) {
@@ -361,8 +410,8 @@ impl ScreenSender {
         // 打包「4 字节 BE 长度前缀 NAL 序列」（SPS/PPS 已经走 VideoConfig，不进帧体）
         let mut plain = Vec::with_capacity(annexb.len());
         for &nal in &nals {
-            let kind = nal_type(nal);
-            if kind == 7 || kind == 8 {
+            let kind = self.source_nal_type(nal);
+            if match self.codec {VideoCodec::H264=>matches!(kind,7|8),VideoCodec::Hevc=>matches!(kind,32..=34|39|40)} {
                 continue;
             }
             plain.extend_from_slice(&(nal.len() as u32).to_be_bytes());
@@ -376,13 +425,15 @@ impl ScreenSender {
         // 头只能构造一次：ChaCha 的 AAD 必须是最终写出的那 128 字节
         let (header, body) = match &mut self.cipher {
             ScreenCipher::ChaCha(key) => {
-                let header = build_header(OP_FRAME, plain.len() + TAG_SIZE, &ntp);
+                let mut header = build_header(OP_FRAME, plain.len() + TAG_SIZE, &ntp);
+                if self.codec==VideoCodec::Hevc {header[5]=0x10;}
                 let sealed = chacha_seal(&*key, &nonce64(self.frame_counter), &plain, &header);
                 (header, sealed)
             }
             ScreenCipher::AesCtr(stream) => {
                 // 无 tag、长度不变；密钥流状态跨帧连续（apply_keystream 推进内部计数器）
-                let header = build_header(OP_FRAME, plain.len(), &ntp);
+                let mut header = build_header(OP_FRAME, plain.len(), &ntp);
+                if self.codec==VideoCodec::Hevc {header[5]=0x10;}
                 let mut encrypted = plain.clone();
                 stream.apply_keystream(&mut encrypted);
                 (header, encrypted)
@@ -579,6 +630,67 @@ pub fn build_avcc(sps: &[u8], pps: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn real_encoder_hevc_fixture_has_cropped_hvc1_and_authenticated_idr() {
+        let csd=include_bytes!("../tests/fixtures/hevc-phone/csd0.annexb");
+        let frame=include_bytes!("../tests/fixtures/hevc-phone/keyframe.annexb");
+        let parameters=annexb_nals(csd);
+        let get=|kind|parameters.iter().copied().find(|n|crate::hevc::nal_type(n)==Some(kind)).unwrap();
+        let (expected_config,size)=crate::hevc::build_config(get(32),get(33),get(34)).unwrap();
+        assert_eq!(size,(2732,794));
+        assert_eq!(&expected_config[32..36],&[0x0a,0xac,0x03,0x1a]);
+        assert_eq!(&expected_config[90..94],b"hvcC");
+        assert_eq!(expected_config[95]&31,1); // Main profile from actual encoder SPS.
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client=tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut peer,_)=listener.accept().await.unwrap();let (_,w)=client.into_split();
+        let mut sender=ScreenSender::new(w,ScreenCipher::ChaCha([0x23;32]),size.0,size.1,false);
+        sender.set_hevc_allowed(true);sender.set_video_codec(VideoCodec::Hevc).unwrap();
+        sender.send_video_annexb(csd,10_000).await.unwrap();
+        let mut header=[0;128];peer.read_exact(&mut header).await.unwrap();
+        assert_eq!(&header[4..8],&[1,0,0x1e,1]);
+        assert_eq!(f32::from_le_bytes(header[16..20].try_into().unwrap()),2732.0);
+        assert_eq!(f32::from_le_bytes(header[20..24].try_into().unwrap()),794.0);
+        let mut config=vec![0;u32::from_le_bytes(header[..4].try_into().unwrap()) as usize];
+        peer.read_exact(&mut config).await.unwrap();assert_eq!(config,expected_config);
+        assert_eq!(sender.frames_sent(),0);assert_eq!(sender.frame_counter,0);
+        sender.send_video_annexb(frame,20_000).await.unwrap();
+        peer.read_exact(&mut header).await.unwrap();assert_eq!(&header[4..8],&[0,0x10,0,0]);
+        assert_eq!(&header[8..16],&ntp_le_from_us(20_000));
+        let mut encrypted=vec![0;u32::from_le_bytes(header[..4].try_into().unwrap()) as usize];peer.read_exact(&mut encrypted).await.unwrap();
+        let mut expected_frame=Vec::new();let mut has_idr=false;
+        for nal in annexb_nals(frame) {
+            let kind=crate::hevc::nal_type(nal).unwrap();has_idr|=kind==20;
+            if !matches!(kind,32..=34|39|40) {expected_frame.extend_from_slice(&(nal.len() as u32).to_be_bytes());expected_frame.extend_from_slice(nal);}
+        }
+        assert!(has_idr);assert_eq!(crate::crypto::chacha_open(&[0x23;32],&nonce64(0),&encrypted,&header).unwrap(),expected_frame);
+        assert_eq!(sender.frames_sent(),1);assert_eq!(sender.frame_counter,1);
+    }
+
+    #[tokio::test]
+    async fn hevc_requires_agreement_and_preserves_cipher_counter_through_codec_change() {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client=tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut peer,_)=listener.accept().await.unwrap();let (_,w)=client.into_split();
+        let mut sender=ScreenSender::new(w,ScreenCipher::ChaCha([7;32]),1920,1080,false);
+        assert_eq!(sender.set_video_codec(VideoCodec::Hevc).unwrap_err().kind(),std::io::ErrorKind::Unsupported);
+        sender.frame_counter=9;sender.set_hevc_allowed(true);sender.set_video_codec(VideoCodec::Hevc).unwrap();
+        let pack=|nals:Vec<Vec<u8>>|nals.into_iter().flat_map(|n|[vec![0,0,0,1],n].concat()).collect::<Vec<_>>();
+        let sps=crate::hevc::tests::fixture_sps();
+        let config=pack(vec![vec![0x40,1,12],sps,vec![0x44,1,0xc0]]);
+        sender.send_video_annexb(&config,1000).await.unwrap();
+        let mut h=[0;128];peer.read_exact(&mut h).await.unwrap();assert_eq!(&h[4..8],&[1,0,0x1e,1]);
+        let mut body=vec![0;u32::from_le_bytes(h[..4].try_into().unwrap()) as usize];peer.read_exact(&mut body).await.unwrap();assert_eq!(&body[4..8],b"hvc1");assert_eq!(sender.frame_counter,9);
+        sender.send_video_annexb(&pack(vec![vec![2,1,0x80]]),2000).await.unwrap();assert_eq!(sender.frames_sent(),0);
+        sender.send_video_annexb(&pack(vec![vec![0x26,1,0x80]]),3000).await.unwrap();
+        peer.read_exact(&mut h).await.unwrap();assert_eq!(h[5],0x10);
+        let mut encrypted=vec![0;u32::from_le_bytes(h[..4].try_into().unwrap()) as usize];peer.read_exact(&mut encrypted).await.unwrap();
+        assert_eq!(crate::crypto::chacha_open(&[7;32],&nonce64(9),&encrypted,&h).unwrap(),vec![0,0,0,3,0x26,1,0x80]);
+        sender.send_video_annexb(&pack(vec![vec![0x44,1,0xc1],vec![2,1,0x80]]),4000).await.unwrap();
+        assert_eq!(sender.frames_sent(),1);assert!(sender.waiting_idr);assert_eq!(sender.frame_counter,10);
+        sender.set_video_codec(VideoCodec::H264).unwrap();assert_eq!(sender.frame_counter,10);assert!(!sender.config_sent);
+    }
 
     #[tokio::test]
     async fn old_stretch_preference_never_overrides_encoded_size_even_after_source_reset() {

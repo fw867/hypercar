@@ -54,6 +54,8 @@ object RustCoreBridge {
         /** 车机 forceKeyFrame：请求编码器立刻产出 IDR。 */
         fun onForceKeyFrame() {}
 
+        fun onVideoCapabilities(hevcAllowed: Boolean) {}
+
         fun onDisplaySize(width: Int, height: Int) {}
         fun onDisplayLayout(width: Int, height: Int, viewX: Int, viewY: Int, viewWidth: Int, viewHeight: Int,
                             safeX: Int, safeY: Int, safeWidth: Int, safeHeight: Int, drawOutside: Boolean) {}
@@ -116,6 +118,9 @@ object RustCoreBridge {
 
     /** 投喂一帧 H.264（Annex B，本机 MediaCodec 编码输出）。[ptsUs] 为微秒时间戳。 */
     external fun nativePushVideoFrame(data: ByteArray, ptsUs: Long)
+
+    /** Explicit actual codec: 0=H.264, 1=HEVC; Annex B access unit. */
+    external fun nativePushVideoFrameWithCodec(data: ByteArray, ptsUs: Long, codec: Int)
 
     /** 投喂画面新尺寸（对齐 AirPlay VideoConfig）。 */
     external fun nativeSetVideoSize(width: Int, height: Int)

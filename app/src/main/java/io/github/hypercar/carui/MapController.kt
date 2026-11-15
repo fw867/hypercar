@@ -94,7 +94,7 @@ object MapController {
         val home = homeCaster ?: return "home caster 不在"
         val provider = MapApps.selected(ctx) ?: return "请在手机安装高德地图或百度地图"
 
-        val c = SpikeCaster(width = W, height = H, fps = CarUiCaster.plan.fps, bitrate = CarUiCaster.plan.bitrate, tag = "CARUI-MAP")
+        val c = SpikeCaster(width = W, height = H, fps = CarUiCaster.plan.fps, bitrate = CarUiCaster.plan.bitrate, tag = "CARUI-MAP", preferredCodec = home.actualCodec)
         mapCaster = c
         c.setPushing(false)
         try {

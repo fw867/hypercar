@@ -42,6 +42,8 @@ pub struct AirplayParams {
     pub receiver_previously_connected: bool,
     pub enable_audio: bool,
     pub audio_codec: String,
+    pub video_codec: String,
+    pub bmw_capabilities: bool,
     pub microphone_probe: Option<Arc<crate::mic_probe::ProbeControl>>,
     pub keep_alive_stats: bool,
     pub bmw_box_bootstrap: bool,
@@ -280,9 +282,13 @@ pub async fn negotiate(
     // CatPlay bootstrap: 会话 SETUP → /info → 事件通道/保活 → 资源声明 → 屏幕流。
     let timing = TimingServer::start_with_pipeline(p.pipeline.clone()).map_err(|e| format!("计时服务启动失败: {e}"))?;
     let (root, session_info) = setup_and_read_info(
-        &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap, p.id9_screen_bootstrap, mbux_media_compat, p.id9_disable_buffered_audio, Some(&mut cleanup),
+        &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap, p.id9_screen_bootstrap, mbux_media_compat, p.id9_disable_buffered_audio, p.bmw_capabilities, p.video_codec == "hevc", Some(&mut cleanup),
     ).await?;
     info = session_info;
+    let hevc_proposed=video_session_features(p.mbux_screen_bootstrap,p.id9_screen_bootstrap,mbux_media_compat,p.id9_disable_buffered_audio,p.bmw_capabilities,p.video_codec=="hevc").iter().any(|f|f.as_str()==Some("hevc"));
+    let hevc_allowed=negotiated_hevc(hevc_proposed,&root);
+    crate::emit_video_capabilities(hevc_allowed);
+    emit_log(&format!("VIDEO-CODEC: preferred={} hevc_proposed={hevc_proposed} hevc_accepted={hevc_allowed}",p.video_codec));
     for line in audio_capability_lines(&info) { emit_log(&line); }
     let nbt_mode = p.nbt_audio_first && !p.desktop_receiver && use_box_bootstrap(true, &info);
     if nbt_mode && !crate::nbt::matches(&info) {
@@ -398,7 +404,7 @@ pub async fn negotiate(
         control:channel.clone(), factory:factory.clone(), params:p.clone(), shared:shared_secret,
         software_receiver:p.desktop_receiver || !use_box_bootstrap(true, &info),
         uuid:display_uuid.clone().unwrap_or_else(|| "6E4E3B31-0E5B-4A8F-9F1B-2C5D7E9A0C11".into()),
-        keep_stats:keep_alive_stats, display:(disp_w,disp_h), owned:screen_owned.clone(),
+        hevc_allowed, keep_stats:keep_alive_stats, display:(disp_w,disp_h), owned:screen_owned.clone(),
         commands:screen_ready,
         bootstrap_event: if p.id9_screen_bootstrap { Some(event_for_bootstrap) } else { None },
         bootstrap_hids: if p.id9_screen_bootstrap { id9_hid_ids(&info, display_uuid.as_deref()) } else { Vec::new() },
@@ -679,7 +685,7 @@ mod shutdown_tests {
         let c=control.clone();
         let task=tokio::spawn(async move {
             let mut cleanup=crate::negotiation_cleanup::NegotiationCleanup::new(c.clone(),true);
-            let result=setup_and_read_info(&c,"phone","name",1234,true,Value::dict(vec![]),false,true,false,false,Some(&mut cleanup)).await;
+            let result=setup_and_read_info(&c,"phone","name",1234,true,Value::dict(vec![]),false,true,false,false,false,false,Some(&mut cleanup)).await;
             cleanup.finish().await;result
         });
         let setup=read_request(&mut peer).await;assert!(setup.first_line.starts_with("SETUP "));
@@ -1158,6 +1164,12 @@ mod display_size_tests {
                         }
                         1 => {
                             assert_eq!(request.first_line, "SETUP /setup RTSP/1.0");
+                            let body=bplist::parse(&request.body).unwrap();
+                            let features=body.get("features").unwrap().as_array().unwrap();
+                            for absent in ["hevc","mainBuffered","sessionManagement","logTransfer","vehicleStateProtocol"] {
+                                assert!(!features.iter().any(|f|f.as_str()==Some(absent)));
+                            }
+                            assert!(features.iter().any(|f|f.as_str()==Some("iAPChannel")));
                             bplist::encode(&Value::dict(vec![("eventPort", Value::int(5001))]))
                         }
                         2 => {
@@ -1190,7 +1202,7 @@ mod display_size_tests {
         let (read, write) = socket.into_split();
         let (channel, _) = RtspChannel::spawn(read, write, None);
         crate::auth_setup::run(&channel).await.unwrap();
-        let (_, info) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", "Test phone", 12345, true, Value::dict(vec![]), false, false, false, false, None).await.unwrap();
+        let (_, info) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", "Test phone", 12345, true, Value::dict(vec![]), false, false, false, false, true, false, None).await.unwrap();
         let display = &info.get("displays").unwrap().as_array().unwrap()[0];
         assert_eq!(uuid_text(display.get("uuid")).as_deref(), Some("actual-bmw-display"));
         assert_eq!(read_display_size(display), (2560, 744));
@@ -1377,6 +1389,38 @@ fn session_features(mbux: bool, id9: bool, media_compat: bool, id9_unbuffered: b
         .map(|f| Value::str(f)).collect()
 }
 
+// BMW ID8.5 is the calibration baseline. Preserve ID9's independent compatibility
+// switches; HEVC remains disabled there. UDP Main/MainHigh are not MainBuffered.
+fn video_session_features(mbux:bool,id9:bool,compat:bool,unbuffered:bool,bmw:bool,prefer_hevc:bool)->Vec<Value> {
+    session_features(mbux,id9,compat,unbuffered).into_iter().filter(|feature| {
+        let name=feature.as_str().unwrap_or("");
+        (name!="hevc" || prefer_hevc) &&
+        !(bmw && matches!(name,"sessionManagement"|"logTransfer"|"vehicleStateProtocol")) &&
+        !(bmw && !id9 && name=="mainBuffered")
+    }).collect()
+}
+fn negotiated_hevc(proposed:bool,setup:&Value)->bool {
+    proposed && setup.get("enabledFeatures").and_then(Value::as_array)
+        .map(|features|features.iter().any(|f|f.as_str()==Some("hevc"))).unwrap_or(false)
+}
+
+#[test]
+fn bmw_capabilities_match_implemented_paths_and_hevc_is_opt_in() {
+    let features = video_session_features(false, false, false, false, true, false);
+    for absent in ["hevc", "mainBuffered", "sessionManagement", "logTransfer", "vehicleStateProtocol"] {
+        assert!(!features.iter().any(|f| f.as_str() == Some(absent)));
+    }
+    for present in ["uiContext", "viewAreas", "focusTransfer", "iAPChannel"] {
+        assert!(features.iter().any(|f| f.as_str() == Some(present)));
+    }
+    assert!(video_session_features(false, false, false, false, true, true).iter().any(|f| f.as_str()==Some("hevc")));
+    assert!(!video_session_features(false, true, false, false, true, true).iter().any(|f| f.as_str()==Some("hevc")));
+    let accepted=Value::dict(vec![("enabledFeatures",Value::array(vec![Value::str("hevc")]))]);
+    assert!(negotiated_hevc(true,&accepted));
+    assert!(!negotiated_hevc(false,&accepted));
+    assert!(!negotiated_hevc(true,&Value::dict(vec![])));
+}
+
 fn build_session_setup(device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, mbux: bool, id9: bool, media_compat: bool, id9_unbuffered: bool) -> Vec<u8> {
     let session_uuid = box_session_uuid();
     let mut fields: Vec<(&str, Value)> = vec![
@@ -1437,10 +1481,16 @@ pub(crate) async fn record_session(channel: &Arc<RtspChannel>) -> Result<(), Str
 }
 
 async fn setup_and_read_info(
-    channel: &Arc<RtspChannel>, device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool, id9: bool, media_compat: bool, id9_unbuffered: bool, cleanup: Option<&mut crate::negotiation_cleanup::NegotiationCleanup>,
+    channel: &Arc<RtspChannel>, device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool, id9: bool, media_compat: bool, id9_unbuffered: bool, bmw: bool, prefer_hevc: bool, cleanup: Option<&mut crate::negotiation_cleanup::NegotiationCleanup>,
 ) -> Result<(Value, Value), String> {
     emit_log(&format!("AIRPLAY: session device name={device_name}"));
-    let body = build_session_setup(device_id, device_name, timing_port, encrypted, mbux, id9, media_compat, id9_unbuffered);
+    let mut request = bplist::parse(&build_session_setup(device_id, device_name, timing_port, encrypted, mbux, id9, media_compat, id9_unbuffered)).map_err(|e|e.to_string())?;
+    if let Value::Dict(fields) = &mut request {
+        if let Some((_,features))=fields.iter_mut().find(|(key,_)|key.as_str()==Some("features")) {
+            *features=Value::array(video_session_features(mbux,id9,media_compat,id9_unbuffered,bmw,prefer_hevc));
+        }
+    }
+    let body=bplist::encode(&request);
     if media_compat {
         emit_log("MBUX-MEDIA: HEVC/mainBuffered not proposed; H.264 + implemented UDP audio; RECORD order unchanged");
     }
