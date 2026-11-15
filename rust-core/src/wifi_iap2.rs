@@ -23,6 +23,28 @@ pub fn phase(id: u64) -> String {
     if id==0 { "WAIT_SESSION".into() } else if s.id!=id { "STOPPED".into() }
     else if s.ready { "READY_TRANSPORT".into() } else if s.phase.is_empty() { "WAIT_PEER".into() } else { s.phase.clone() }
 }
+pub fn transport_ready(id: u64) -> bool {
+    let s=HANDOFF.lock(); id!=0 && s.id==id && s.ready
+}
+/// Readiness is a local write barrier, not certificate/signature verification.
+pub async fn wait_transport_ready(id: u64, stop: Arc<Notify>, budget: Duration) -> bool {
+    wait_ready_barrier(||is_active(id), ||transport_ready(id), stop, budget).await
+}
+async fn wait_ready_barrier(current:impl Fn()->bool, ready:impl Fn()->bool, stop:Arc<Notify>, budget:Duration)->bool {
+    let deadline=tokio::time::sleep(budget);tokio::pin!(deadline);
+    let mut tick=tokio::time::interval(Duration::from_millis(25));
+    loop {
+        tokio::select! {
+            biased;
+            _=stop.notified()=>return false,
+            _=&mut deadline=>return false,
+            _=tick.tick()=>{
+                if !current() {return false;}
+                if ready() {return true;}
+            }
+        }
+    }
+}
 pub fn mark_ready(id: u64, ready: bool) {
     let token = {
         let mut state = HANDOFF.lock();
@@ -280,6 +302,19 @@ mod tests {
         assert!(!send(id, vec![7]));
     }
 
+    #[tokio::test]
+    async fn media_retry_barrier_is_bounded_cancelled_and_generation_scoped() {
+        use std::sync::atomic::AtomicBool;
+        let budget=Duration::from_millis(80);
+        let stop=Arc::new(Notify::new());
+        assert!(!wait_ready_barrier(||true,||false,stop.clone(),budget).await);
+        assert!(!wait_ready_barrier(||false,||true,stop.clone(),budget).await);
+        stop.notify_one();assert!(!wait_ready_barrier(||true,||true,stop.clone(),budget).await);
+        let flag=Arc::new(AtomicBool::new(false));let update=flag.clone();
+        let worker=tokio::spawn(async move {tokio::time::sleep(Duration::from_millis(30)).await;update.store(true,Ordering::Release);});
+        assert!(wait_ready_barrier(||true,||flag.load(Ordering::Acquire),stop,Duration::from_secs(1)).await);
+        worker.await.unwrap();
+    }
     #[test]
     fn bluetooth_retirement_requires_current_ready_and_fresh_health() {
         let (tx,mut rx)=mpsc::channel(4);

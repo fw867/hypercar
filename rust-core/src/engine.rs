@@ -74,6 +74,10 @@ pub struct EngineConfig {
     pub mbux_screen_bootstrap: bool,
     #[serde(default)]
     pub id9_screen_bootstrap: bool,
+    #[serde(default)]
+    pub nbt_audio_first: bool,
+    #[serde(default)]
+    pub mbux_media_compat: bool,
     /// CarWith 模式（2026-11-03）：视频/音频改由本机 CarLife（CarWith）的 H.264/PCM 提供，
     /// 不再使用自绘 UI 的编码器帧。
     #[serde(default)]
@@ -501,6 +505,8 @@ pub async fn run_engine(
         bmw_box_bootstrap: cfg.bmw_box_bootstrap,
         mbux_screen_bootstrap: cfg.mbux_screen_bootstrap,
         id9_screen_bootstrap: cfg.id9_screen_bootstrap,
+        nbt_audio_first: cfg.nbt_audio_first,
+        mbux_media_compat: cfg.mbux_media_compat,
         desktop_receiver: cfg.desktop_receiver,
         width: cfg.width,
         height: cfg.height,
@@ -541,7 +547,8 @@ pub async fn run_engine(
     let keepalive = outcome.keepalive;
     let mut teardown = outcome.teardown;
     let resource_session = outcome.resource_session;
-    let had_audio = outcome.audio.is_some();
+    let audio_stream_type = outcome.audio.as_ref().map(|audio| audio.stream_type());
+    let had_audio = audio_stream_type.is_some();
     let audio_resource = outcome.audio_resource;
     let stop_audio_claim = stop.clone();
     tasks.spawn(async move {
@@ -622,7 +629,7 @@ pub async fn run_engine(
     tasks.shutdown().await;
     drop(keepalive);
     if let Some(session) = resource_session {
-        if let Ok(current) = tokio::time::timeout(Duration::from_millis(250), session.resource_teardown(had_audio)).await {
+        if let Ok(current) = tokio::time::timeout(Duration::from_millis(250), session.resource_teardown(audio_stream_type)).await {
             teardown = current;
         }
     }
@@ -788,6 +795,7 @@ mod video_pump_tests {
         assert!(!config.screen_resource_lifecycle);assert!(config.enable_audio);
         assert!(!config.mbux_screen_bootstrap);
         assert!(!config.id9_screen_bootstrap);
+        assert!(!config.nbt_audio_first);assert!(!config.mbux_media_compat);
         assert!(!config.self_microphone_asr);
         json["screen_resource_lifecycle"]=serde_json::json!(true);
         let config:EngineConfig=serde_json::from_value(json).unwrap();

@@ -13,7 +13,7 @@ sealed interface LinkState {
     /** 协商进行中，[step] 为当前步骤的人话描述（秒连链路的可视化）。 */
     data class Negotiating(val step: String) : LinkState
 
-    /** 控制会话与视频通道已建立；不表示车机已显示或喇叭已出声。 */
+    /** 控制会话已激活；媒体通道需独立检查，不表示车机已显示或喇叭已出声。 */
     data class Connected(val carName: String, val sinceMillis: Long) : LinkState
 
     /** 失败：[reason] 人话原因，[recoverable] 是否可自动重试。 */

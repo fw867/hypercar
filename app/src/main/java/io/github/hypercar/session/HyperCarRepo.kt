@@ -2468,12 +2468,12 @@ object HyperCarRepo {
                                     "——本次不写「已配对」标记",
                             )
                         } else {
-                            val carName = bondedNameOf(mac)
-                                ?: io.github.hypercar.iap2.Iap2Peer.name.takeIf {
-                                    mac.equals(io.github.hypercar.iap2.Iap2Peer.address, true)
-                                }
-                                ?: SettingsStore.targetCarName
-                                ?: "车机"
+                            val carName = connectedReceiverName(
+                                headUnitProfile.label, mac,
+                                SettingsStore.targetCarMac, SettingsStore.targetCarName,
+                                io.github.hypercar.iap2.Iap2Peer.address, io.github.hypercar.iap2.Iap2Peer.name,
+                                bondedNameOf(mac),
+                            )
                             SettingsStore.markCarPaired(mac, carName)
                             val rememberedSsid = sessionWifiSsid ?: joinedSsid
                             if (!rememberedSsid.isNullOrBlank()) SettingsStore.rememberCarNetwork(rememberedSsid, mac)
@@ -2491,7 +2491,16 @@ object HyperCarRepo {
                     }
                     push(
                         link = LinkState.Connected(
-                            carName = SettingsStore.targetCarName ?: "BMW ID8.5",
+                            carName = (sessionReceiverMac ?: iap2?.activePeerAddress ?: aclCarMac ?: SettingsStore.targetCarMac).let { mac ->
+                                connectedReceiverName(
+                                    profileLabel = headUnitProfile.label,
+                                    receiverMac = mac,
+                                    targetMac = SettingsStore.targetCarMac, targetName = SettingsStore.targetCarName,
+                                    peerMac = io.github.hypercar.iap2.Iap2Peer.address,
+                                    peerName = io.github.hypercar.iap2.Iap2Peer.name,
+                                    bondedName = mac?.let(::bondedNameOf),
+                                )
+                            },
                             sinceMillis = System.currentTimeMillis(),
                         ),
                     )

@@ -84,6 +84,9 @@ data class HeadUnitProfile(
     /** IDC23 resource/HID/screen bootstrap before RECORD; separate from MGU and MBUX. */
     val id9ScreenBootstrap: Boolean = false,
 
+    /** NBT Evo only: negotiate audio before the single successful RECORD. */
+    val nbtAudioFirst: Boolean = false,
+
     /** mDNS 拿不到（或不用 mDNS）时的兜底端口，按顺序试连。 */
     val fallbackAirplayPorts: List<Int> = listOf(7000, 7001, 7100, 17000),
 
@@ -93,11 +96,18 @@ data class HeadUnitProfile(
     /** 首次连接引导里这个车机额外要提示的一句；null = 不提。 */
     val pairingHint: String? = null,
 ) {
-    /** All Mercedes receivers use the MB_D-PP reference policy, including MB_E-P models.
-     * Retired remote/cache switches must not restore the unsuccessful screen-first experiment. */
-    fun connectionPolicy(): HeadUnitProfile = if (id == "mercedes_mbux") {
-        copy(mbuxScreenBootstrap = false, id9ScreenBootstrap = false, useScreenResourceLifecycle = true)
-    } else this
+    /** Pin ID6 to its own audio-first bootstrap; stale caches cannot mix receiver strategies.
+     * Mercedes keeps the MB_D-PP reference policy, including MB_E-P models. */
+    fun connectionPolicy(): HeadUnitProfile = when (id) {
+        "bmw_id6" -> copy(nbtAudioFirst = true, mbuxScreenBootstrap = false,
+            id9ScreenBootstrap = false, useScreenResourceLifecycle = true)
+        "mercedes_mbux" -> copy(nbtAudioFirst = false, mbuxScreenBootstrap = false,
+            id9ScreenBootstrap = false, useScreenResourceLifecycle = true)
+        else -> if (nbtAudioFirst) copy(nbtAudioFirst = false) else this
+    }
+
+    /** Current Mercedes media proposals reflect the implemented H.264/UDP sender. */
+    val mbuxMediaCompat: Boolean get() = id == "mercedes_mbux"
 
     fun screenResourceLifecycleEnabled(userEnabled: Boolean): Boolean =
         id == "mercedes_mbux" || useScreenResourceLifecycle || userEnabled
@@ -129,6 +139,18 @@ object HeadUnitProfiles {
         fallbackAirplayPorts = listOf(7000, 7001, 7100, 17000),
         touchDisplay = null,
         pairingHint = "首次要在 iDrive 里把这个设备选成 CarPlay 手机（车机会弹确认）",
+    )
+
+    /** NBT Evo has its own stream order; never apply this to MGU or IDC23. */
+    val BMW_ID6 = HeadUnitProfile(
+        id = "bmw_id6", label = "BMW ID6", model = "NBT Evo",
+        notes = "NBT Evo 试验配置：按车机声明选择音频，音频先建立，再单次激活会话。保留系统蓝牙音频；尚未实车验证，旋钮输入仍待适配。",
+        verified = false, sendCarPlayAvailability = true,
+        openEaSessions = false, sendTransportIdentifier = false,
+        dropProfilesBeforeIap2 = false, allowOutboundIap2 = false,
+        requireAirplayActivation = true, allowProactiveWifiSession = false,
+        useScreenResourceLifecycle = true, nbtAudioFirst = true,
+        pairingHint = "适用于 NBT Evo，先在车机确认 Apple CarPlay 授权；MGU 和 IDC23 请使用各自配置。",
     )
 
     /** IDC23 is kept separate from the existing MGU policy; media compatibility remains experimental. */
@@ -287,7 +309,7 @@ object HeadUnitProfiles {
     )
 
     /** 内置档案（出厂就有的，断网也一定在）。宝马排第一：它是默认档案。 */
-    val builtin: List<HeadUnitProfile> = listOf(BMW_ID85, BMW_ID9, GENERIC, WINPLAY, AUDI_MIB3, VOLKSWAGEN, MERCEDES_MBUX)
+    val builtin: List<HeadUnitProfile> = listOf(BMW_ID85, BMW_ID6, BMW_ID9, GENERIC, WINPLAY, AUDI_MIB3, VOLKSWAGEN, MERCEDES_MBUX)
 
     /**
      * 全部可用档案 = 内置 + 远程（GitHub 下发的 `profiles/headunits.json`）。

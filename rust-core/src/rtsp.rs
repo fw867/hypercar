@@ -196,6 +196,7 @@ pub struct RtspChannel {
     pending: Arc<Mutex<HashMap<i32, oneshot::Sender<RtspMessage>>>>,
     reader: tokio::task::JoinHandle<()>,
     closed: AtomicBool,
+    pub(crate) nbt_recorded: tokio::sync::Mutex<bool>,
 }
 
 // Removal is also required when a request future is cancelled by its caller. A partially
@@ -249,6 +250,7 @@ impl RtspChannel {
             pending,
             reader,
             closed: AtomicBool::new(false),
+            nbt_recorded: tokio::sync::Mutex::new(false),
         });
         (this, inbound)
     }

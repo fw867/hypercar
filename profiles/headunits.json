@@ -1,8 +1,8 @@
 {
-  "version": 10,
-  "_schema": 10,
-  "updated": "2026-11-14",
-  "_comment": "HyperCar 车机档案下发文件。新增车型改这里 + push 即可，App 端「从 GitHub 更新车型列表」后立即出现。字段含义见 docs/HEADUNIT-PROFILES.md；除 id/label 外都可省略（省略 = 用同 id 内置档案的值）。覆盖内置档案须达到各自要求的 schema：奔驰为10，ID9 为9，其余内置档案为8（旧缓存不能把内置修复顶回去）。",
+  "version": 11,
+  "_schema": 11,
+  "updated": "2026-11-15",
+  "_comment": "HyperCar 车机档案下发文件。新增车型改这里 + push 即可，App 端「从 GitHub 更新车型列表」后立即出现。字段含义见 docs/HEADUNIT-PROFILES.md；除 id/label 外都可省略（省略 = 用同 id 内置档案的值）。覆盖内置档案须达到各自要求的 schema：ID6 为11，奔驰为10，ID9 为9，其余内置档案为8（旧缓存不能把内置修复顶回去）。",
   "profiles": [
     {
       "id": "bmw_id85",
@@ -30,6 +30,23 @@
       "allowProactiveWifiSession": true,
       "advertiseOnCurrentWifi": false,
       "requireFreshCtrlInvite": false
+    },
+    {
+      "id": "bmw_id6",
+      "label": "BMW ID6",
+      "model": "NBT Evo",
+      "notes": "NBT Evo 试验配置：按车机声明选择音频，音频先建立，再单次激活会话。保留系统蓝牙音频；尚未实车验证，旋钮输入仍待适配。",
+      "verified": false,
+      "sendCarPlayAvailability": true,
+      "openEaSessions": false,
+      "sendTransportIdentifier": false,
+      "dropProfilesBeforeIap2": false,
+      "allowOutboundIap2": false,
+      "requireAirplayActivation": true,
+      "allowProactiveWifiSession": false,
+      "useScreenResourceLifecycle": true,
+      "nbtAudioFirst": true,
+      "pairingHint": "适用于 NBT Evo，先在车机确认 Apple CarPlay 授权；MGU 和 IDC23 请使用各自配置。"
     },
     {
       "id": "bmw_id9",

@@ -67,6 +67,8 @@ pub struct AudioOut {
     blocked_samples: u64,
     aac: Option<crate::aac::AacEncoder>,
     aac_needs_reset: bool,
+    sample_rate: u32,
+    resampler: Option<crate::audio_resample::Stereo48To441>,
 }
 
 impl AudioOut {
@@ -93,14 +95,19 @@ impl AudioOut {
             blocked_samples: 0,
             aac: None,
             aac_needs_reset: false,
+            sample_rate: 48000,
+            resampler: None,
         }
     }
 
     pub fn new_aac(data: UdpSocket, sync: Option<UdpSocket>, key: [u8;32], encoder: crate::aac::AacEncoder) -> Self {
         let mut output = Self::new(data, sync, key, 102);
+        output.sample_rate = encoder.sample_rate();
+        if output.sample_rate == 44100 { output.resampler = Some(Default::default()); }
         output.aac = Some(encoder);
         output
     }
+    pub fn sample_rate(&self) -> u32 { self.sample_rate }
     pub fn stream_type(&self) -> i64 { self.pt as i64 }
     pub fn codec_name(&self) -> &'static str { match self.pt {100=>"PCM",102=>"AAC",_=>""} }
     pub fn payload_bytes_sent(&self) -> u64 { self.payload_bytes }
@@ -124,13 +131,16 @@ impl AudioOut {
             self.blocked_samples = self.blocked_samples.saturating_add(frames.len() as u64);
             self.marker_pending = true;
             if self.pt == 102 { self.aac.take(); self.aac_needs_reset = true; }
+            if let Some(converter) = self.resampler.as_mut() { converter.reset(); }
             return Ok(());
         }
         if self.pt == 102 {
             if self.aac_needs_reset {
                 self.aac_needs_reset = false;
-                self.aac = Some(crate::aac::AacEncoder::new()?);
+                self.aac = Some(crate::aac::AacEncoder::at_rate(self.sample_rate)?);
             }
+            let converted = self.resampler.as_mut().map(|converter| converter.convert(frames));
+            let frames = converted.as_deref().unwrap_or(frames);
             let encoded = self.aac.as_mut().ok_or_else(|| std::io::Error::other("AAC encoder stopped"))?.encode(frames);
             let encoded = match encoded { Ok(frames) => frames, Err(error) => { self.aac.take(); return Err(error); } };
             for payload in encoded { self.send_payload(&payload, crate::aac::FRAMES as u32).await?; }
@@ -149,6 +159,7 @@ impl AudioOut {
         if !self.owns_audio() {
             self.marker_pending = true;
             if self.pt == 102 { self.aac.take(); self.aac_needs_reset = true; }
+            if let Some(converter) = self.resampler.as_mut() { converter.reset(); }
             return Ok(());
         }
         let mut header = [0u8; RTP_HEADER_LEN];
@@ -250,12 +261,35 @@ mod ownership_tests {
     }
     #[cfg(target_os="android")]
     #[tokio::test]
+    async fn aac441_sender_converts_48k_input_and_keeps_rtp_sample_clock() {
+        let receiver=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(receiver.local_addr().unwrap()).await.unwrap();
+        let key=[7;32];
+        let mut sender=AudioOut::new_aac(socket,None,key,crate::aac::AacEncoder::at_rate(44100).unwrap());
+        let pcm=vec![500;960]; // 480 source frames / 10ms at 48kHz.
+        for _ in 0..100 {
+            sender.send_pcm(&pcm).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(sender.sample_rate(),44100);
+        assert!((39..=44).contains(&sender.packets_sent()),"{} packets for 1s of source audio",sender.packets_sent());
+        let mut packet=[0;2048];
+        for index in 0..sender.packets_sent() {
+            let n=tokio::time::timeout(std::time::Duration::from_secs(1),receiver.recv(&mut packet)).await.unwrap().unwrap();
+            assert_eq!(packet[1]&0x7f,102);
+            assert_eq!(u32::from_be_bytes(packet[4..8].try_into().unwrap()),index as u32*1024);
+            assert!(!crate::crypto::chacha_open(&key,&nonce64(index),&packet[12..n-8],&packet[4..12]).unwrap().is_empty());
+        }
+    }
+    #[cfg(target_os="android")]
+    #[tokio::test]
     async fn aac_owner_loss_discards_encoder_and_buffered_audio() {
         let receiver=UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let socket=UdpSocket::bind("127.0.0.1:0").await.unwrap();
         socket.connect(receiver.local_addr().unwrap()).await.unwrap();
         let owner=Arc::new(AtomicBool::new(true));
-        let mut sender=AudioOut::new_aac(socket,None,[0;32],crate::aac::AacEncoder::new().unwrap());
+        let mut sender=AudioOut::new_aac(socket,None,[0;32],crate::aac::AacEncoder::at_rate(44100).unwrap());
         sender.set_ownership(owner.clone());
         sender.send_pcm(&vec![500;704]).await.unwrap(); // Fractional AAC frame must not survive handover.
         owner.store(false,Ordering::Release);
@@ -264,6 +298,7 @@ mod ownership_tests {
         owner.store(true,Ordering::Release);
         sender.send_pcm(&vec![0;704]).await.unwrap();
         assert!(sender.aac.is_some()); assert_eq!(sender.packets_sent(),0);
+        assert_eq!(sender.aac.as_ref().unwrap().sample_rate(),44100);
         assert!(sender.marker_pending);
     }
     #[tokio::test]

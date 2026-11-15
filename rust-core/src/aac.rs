@@ -21,6 +21,8 @@ mod platform {
         fn AMediaCodec_getInputBuffer(codec: *mut c_void, index: usize, size: *mut usize) -> *mut u8;
         fn AMediaCodec_queueInputBuffer(codec: *mut c_void, index: usize, offset: libc::off_t, size: usize, pts: u64, flags: u32) -> i32;
         fn AMediaCodec_dequeueOutputBuffer(codec: *mut c_void, info: *mut BufferInfo, timeout_us: i64) -> isize;
+        fn AMediaCodec_getOutputFormat(codec: *mut c_void) -> *mut c_void;
+        fn AMediaFormat_getInt32(format: *mut c_void, key: *const c_char, value: *mut i32) -> bool;
         fn AMediaCodec_getOutputBuffer(codec: *mut c_void, index: usize, size: *mut usize) -> *mut u8;
         fn AMediaCodec_releaseOutputBuffer(codec: *mut c_void, index: usize, render: bool) -> i32;
         fn AMediaFormat_new() -> *mut c_void;
@@ -31,11 +33,13 @@ mod platform {
     fn status(code: i32, operation: &str) -> io::Result<()> {
         if code == 0 { Ok(()) } else { Err(io::Error::other(format!("AAC {operation}: status={code}"))) }
     }
-    pub struct AacEncoder { codec: *mut c_void, submitted: u64, pending: Vec<i16> }
+    pub struct AacEncoder { codec: *mut c_void, submitted: u64, pending: Vec<i16>, sample_rate: u32 }
     // Exclusive &mut access; NDK synchronous codec calls can move between Tokio worker threads.
     unsafe impl Send for AacEncoder {}
     impl AacEncoder {
-        pub fn new() -> io::Result<Self> {
+        pub fn sample_rate(&self) -> u32 { self.sample_rate }
+        pub fn at_rate(sample_rate: u32) -> io::Result<Self> {
+            if !matches!(sample_rate,44_100|48_000) { return Err(io::Error::other("unsupported AAC sample rate")); }
             // Standalone Android test binaries have no framework-started Binder pool.
             // Codec2 needs it for asynchronous buffer completion; app processes already have one.
             #[cfg(test)] {
@@ -52,11 +56,11 @@ mod platform {
             unsafe {
                 let codec = AMediaCodec_createEncoderByType(b"audio/mp4a-latm\0".as_ptr().cast());
                 if codec.is_null() { return Err(io::Error::other("AAC encoder unavailable")); }
-                let encoder = Self { codec, submitted: 0, pending: Vec::new() };
+                let encoder = Self { codec, submitted: 0, pending: Vec::new(), sample_rate };
                 let format = AMediaFormat_new();
                 if format.is_null() { return Err(io::Error::other("AAC format allocation failed")); }
                 AMediaFormat_setString(format, b"mime\0".as_ptr().cast(), b"audio/mp4a-latm\0".as_ptr().cast());
-                for (key, value) in [("sample-rate",48000), ("channel-count",2), ("aac-profile",2),
+                for (key, value) in [("sample-rate",sample_rate as i32), ("channel-count",2), ("aac-profile",2),
                     ("bitrate",256000), ("max-input-size",4096)] {
                     let key = std::ffi::CString::new(key).unwrap();
                     AMediaFormat_setInt32(format, key.as_ptr(), value);
@@ -71,7 +75,7 @@ mod platform {
         pub fn encode(&mut self, pcm: &[i16]) -> io::Result<Vec<Vec<u8>>> {
             if pcm.len() % 2 != 0 { return Err(io::Error::other("AAC requires complete stereo samples")); }
             self.pending.extend_from_slice(pcm);
-            if self.pending.len() > 48000 { return Err(io::Error::other("AAC input stalled >500ms")); }
+            if self.pending.len() > self.sample_rate as usize { return Err(io::Error::other("AAC input stalled >500ms")); }
             let mut frames = self.drain()?;
             while self.pending.len() >= FRAMES * 2 {
                 unsafe {
@@ -86,7 +90,7 @@ mod platform {
                         bytes.copy_from_slice(&sample.to_le_bytes());
                     }
                     status(AMediaCodec_queueInputBuffer(self.codec, index as usize, 0, FRAMES*4,
-                        self.submitted * 1_000_000 / 48000, 0), "queue")?;
+                        self.submitted * 1_000_000 / self.sample_rate as u64, 0), "queue")?;
                     self.pending.drain(..FRAMES*2);
                     self.submitted += FRAMES as u64;
                 }
@@ -101,7 +105,19 @@ mod platform {
                     let mut info = BufferInfo::default();
                     let index = AMediaCodec_dequeueOutputBuffer(self.codec, &mut info, 0);
                     if index == -1 { return Ok(frames); }
-                    if index == -2 || index == -3 { continue; }
+                    if index == -2 {
+                        let format=AMediaCodec_getOutputFormat(self.codec);
+                        if format.is_null() { return Err(io::Error::other("AAC output format unavailable")); }
+                        let mut rate=0; let mut channels=0;
+                        let valid=AMediaFormat_getInt32(format,b"sample-rate\0".as_ptr().cast(),&mut rate) &&
+                            AMediaFormat_getInt32(format,b"channel-count\0".as_ptr().cast(),&mut channels);
+                        AMediaFormat_delete(format);
+                        if !valid || rate != self.sample_rate as i32 || channels != 2 {
+                            return Err(io::Error::other("AAC codec output differs from negotiated rate/channels"));
+                        }
+                        continue;
+                    }
+                    if index == -3 { continue; }
                     if index < 0 { return Err(io::Error::other(format!("AAC output index={index}"))); }
                     let mut capacity = 0;
                     let buffer = AMediaCodec_getOutputBuffer(self.codec, index as usize, &mut capacity);
@@ -112,7 +128,7 @@ mod platform {
                     } else if info.size > 0 && info.flags & 2 == 0 {
                         // Codec config (AudioSpecificConfig) is not an audio access unit.
                         let bytes = std::slice::from_raw_parts(buffer.add(info.offset as usize), info.size as usize);
-                        raw_access_unit(bytes).map(|raw| frames.push(raw.to_vec()))
+                        raw_access_unit_at_rate(bytes, self.sample_rate).map(|raw| frames.push(raw.to_vec()))
                     } else { Ok(()) };
                     let released = AMediaCodec_releaseOutputBuffer(self.codec, index as usize, false);
                     result?; status(released, "release")?;
@@ -131,19 +147,22 @@ pub use platform::AacEncoder;
 pub struct AacEncoder;
 #[cfg(not(target_os = "android"))]
 impl AacEncoder {
-    pub fn new() -> io::Result<Self> { Err(io::Error::other("AAC encoder requires Android")) }
+    pub fn at_rate(_: u32) -> io::Result<Self> { Err(io::Error::other("AAC encoder requires Android")) }
+    pub fn sample_rate(&self) -> u32 { 48000 }
     pub fn encode(&mut self, _: &[i16]) -> io::Result<Vec<Vec<u8>>> { Err(io::Error::other("AAC encoder requires Android")) }
 }
 
-/// Accept raw output, or a complete, single AAC-LC48k stereo ADTS frame from a vendor codec.
-fn raw_access_unit(bytes: &[u8]) -> io::Result<&[u8]> {
+/// Accept raw output, or a complete, single AAC-LC 44.1/48 kHz stereo ADTS frame from a vendor codec.
+#[cfg(test)]
+fn raw_access_unit(bytes: &[u8]) -> io::Result<&[u8]> { raw_access_unit_at_rate(bytes,48000) }
+fn raw_access_unit_at_rate(bytes: &[u8], sample_rate: u32) -> io::Result<&[u8]> {
     if bytes.is_empty() { return Err(io::Error::other("empty AAC frame")); }
     if bytes.len() < 2 || bytes[0] != 0xff || bytes[1] & 0xf0 != 0xf0 { return Ok(bytes); }
     if bytes.len() < 7 { return Err(io::Error::other("truncated ADTS header")); }
     let header = if bytes[1] & 1 != 0 { 7 } else { 9 };
     let size = ((bytes[3] as usize & 3) << 11) | ((bytes[4] as usize) << 3) | (bytes[5] as usize >> 5);
     let channels = ((bytes[2] & 1) << 2) | (bytes[3] >> 6);
-    if bytes[1] & 6 != 0 || bytes[2] >> 6 != 1 || (bytes[2] >> 2) & 15 != 3 || channels != 2 ||
+    if bytes[1] & 6 != 0 || bytes[2] >> 6 != 1 || (bytes[2] >> 2) & 15 != if sample_rate == 44100 { 4 } else { 3 } || channels != 2 ||
         bytes[6] & 3 != 0 || size != bytes.len() || size <= header {
         return Err(io::Error::other("unsupported/malformed ADTS output"));
     }
@@ -160,15 +179,22 @@ mod tests {
         assert!(raw_access_unit(&frame[..8]).is_err());
         let mut invalid = frame; invalid[6] |= 1; assert!(raw_access_unit(&invalid).is_err());
     }
+    #[test] fn adts_rate_must_match_negotiated_stream() {
+        let frame=[0xff,0xf1,0x50,0x80,0x01,0x3f,0xfc,0x21,0x10];
+        assert_eq!(raw_access_unit_at_rate(&frame,44100).unwrap(), &[0x21,0x10]);
+        assert!(raw_access_unit_at_rate(&frame,48000).is_err());
+    }
     #[cfg(target_os="android")]
     #[test] fn device_encoder_emits_raw_aac_at_1024_frame_cadence() {
-        let mut encoder=AacEncoder::new().unwrap();
+        for rate in [44100,48000] {
+        let mut encoder=AacEncoder::at_rate(rate).unwrap();
         let pcm:Vec<i16>=(0..2048).map(|i| ((i as f32 * 0.0576).sin()*6000.) as i16).collect();
         let mut count=0;
         for _ in 0..24 {
             for frame in encoder.encode(&pcm).unwrap() { assert!(!frame.is_empty()); assert!(frame.len()<1400); count+=1; }
             std::thread::sleep(std::time::Duration::from_millis(22));
         }
-        assert!(count>=20, "encoded only {count} AAC access units");
+        assert!(count>=20, "rate={rate}: encoded only {count} AAC access units");
+        }
     }
 }

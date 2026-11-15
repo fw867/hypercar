@@ -412,6 +412,8 @@ object SettingsStore {
             append("\"carwith_stretch\":").append(if (carWithStretch) "true" else "false").append(",")
             append("\"mbux_screen_bootstrap\":").append(profile.mbuxScreenBootstrap).append(",")
             append("\"id9_screen_bootstrap\":").append(profile.id9ScreenBootstrap).append(",")
+            append("\"nbt_audio_first\":").append(profile.nbtAudioFirst).append(",")
+            append("\"mbux_media_compat\":").append(profile.mbuxMediaCompat).append(",")
             append("\"screen_resource_lifecycle\":").append(if (profile.screenResourceLifecycleEnabled(screenResourceLifecycle)) "true" else "false").append(",")
             append("\"width\":").append(plan.width).append(",")
             append("\"height\":").append(plan.height).append(",")

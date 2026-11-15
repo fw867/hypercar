@@ -16,8 +16,14 @@ impl ScreenSession {
     /// MBUX opens the screen TCP endpoint before RECORD, but never exposes it to the pump
     /// until RECORD succeeds. Event callbacks may arbitrate while this serialized bootstrap runs.
     pub async fn bootstrap_before_record(&self, modes: &Arc<Mutex<Modes>>) -> Result<(), String> {
+        self.bootstrap_before_record_with(modes, async { Ok(()) }).await
+    }
+
+    /// NBT Evo inserts audio SETUP after the screen TCP is open, before activation.
+    pub async fn bootstrap_before_record_with<T,F>(&self, modes: &Arc<Mutex<Modes>>, prepare: F) -> Result<T,String>
+        where F: std::future::Future<Output=Result<T,String>> {
         let mut state = self.resource_state.lock().await;
-        let label = if self.params.id9_screen_bootstrap { "ID9" } else { "MBUX" };
+        let label = if self.params.nbt_audio_first { "NBT" } else if self.params.id9_screen_bootstrap { "ID9" } else { "MBUX" };
         let (mut revision, mut owned, declaration) = {
             let m = modes.lock();
             (m.screen_generation(), m.screen_owned(), m.declaration())
@@ -59,7 +65,17 @@ impl ScreenSession {
                 }
             }
         } else { None };
-        if let Err(error) = crate::airplay::record_session(&self.control).await {
+        let prepared = match prepare.await {
+            Ok(value) => value,
+            Err(error) => {
+                drop(sender);
+                if state.negotiated { let _ = self.release_resource_stream(&mut state).await; }
+                return Err(error);
+            }
+        };
+        let activation = if self.params.nbt_audio_first { crate::nbt::record_once(&self.control).await }
+            else { crate::airplay::record_session(&self.control).await };
+        if let Err(error) = activation {
             drop(sender);
             if state.negotiated { let _ = self.release_resource_stream(&mut state).await; }
             return Err(error);
@@ -82,15 +98,15 @@ impl ScreenSession {
             }
         }
         // A concurrent resource event can now reconcile; never keep the bootstrap lock across it.
-        Ok(())
+        Ok(prepared)
     }
 
     /// Query after event workers are stopped: graceful exit includes only negotiated streams.
-    pub async fn resource_teardown(&self, audio: bool) -> Vec<u8> {
+    pub async fn resource_teardown(&self, audio: Option<i64>) -> Vec<u8> {
         let state = self.resource_state.lock().await;
         let mut streams = Vec::new();
         if state.negotiated { streams.push(Value::dict(vec![("type",Value::int(110)),("uuid",Value::str(&self.uuid))])); }
-        if audio { streams.push(Value::dict(vec![("type",Value::int(100))])); }
+        if let Some(kind) = audio { streams.push(Value::dict(vec![("type",Value::int(kind))])); }
         bplist::encode(&Value::dict(vec![("streams",Value::array(streams))]))
     }
 
@@ -240,7 +256,7 @@ mod tests {
             let params=AirplayParams {
                 car_ip:"127.0.0.1".into(),airplay_port:7000,device_id:"test".into(),device_name:"Test phone".into(),identity_path:"unused".into(),
                 receiver_id:None,receiver_previously_connected:true,enable_audio:true,audio_codec:String::new(),microphone_probe:None,keep_alive_stats:false,
-                bmw_box_bootstrap:!mbux,mbux_screen_bootstrap:mbux,id9_screen_bootstrap:false,desktop_receiver:false,width:1920,height:720,touch_display:None,touch_rect:None,
+                bmw_box_bootstrap:!mbux,mbux_screen_bootstrap:mbux,id9_screen_bootstrap:false,nbt_audio_first:false,mbux_media_compat:false,desktop_receiver:false,width:1920,height:720,touch_display:None,touch_rect:None,
                 encoder_size:Arc::new(Mutex::new((1920,720))),touch_size:Arc::new(Mutex::new((1920,720))),
                 carwith_display:None,carwith_stretch:false,screen_resource_lifecycle:true,pipeline:pipeline.clone(),
             };
@@ -299,6 +315,42 @@ mod tests {
                     }
                 }
             }).await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn nbt_screen_then_audio_then_record_with_failure_cleanup() {
+        for fail in [false,true] {
+            let mut f=Fixture::with_bootstrap(Modes::initial(),true).await;
+            {let session=Arc::get_mut(&mut f.session).unwrap();
+                session.params.mbux_screen_bootstrap=false;session.params.nbt_audio_first=true;}
+            let session=f.session.clone();let modes=f.modes.clone();
+            let task=tokio::spawn(async move {
+                let control=session.control.clone();
+                session.bootstrap_before_record_with(&modes,async move {
+                    let r=control.request("SETUP","/",b"test audio","application/octet-stream",&[],Duration::from_secs(2)).await?;
+                    if r.status()!=200 {return Err("audio rejected".into());} Ok(42)
+                }).await
+            });
+            f.modes_reply(1).await;
+            let setup=read(&mut f.car).await;let(mut video,id)=f.setup_reply(&setup).await;
+            let audio=read(&mut f.car).await;assert_eq!(audio.body,b"test audio");
+            assert!(!f.session.activated.load(Ordering::Acquire));
+            reply(&mut f.car,&audio,if fail{400}else{200},&[]).await;
+            if fail {
+                f.teardown_reply().await; // No RECORD is allowed on failed audio preparation.
+                assert!(task.await.unwrap().is_err());
+                assert!(!f.session.activated.load(Ordering::Acquire));
+                assert!(!f.session.resource_state.lock().await.negotiated);
+            } else {
+                let record=read(&mut f.car).await;assert_eq!(record.first_line,"RECORD / RTSP/1.0");
+                reply(&mut f.car,&record,200,&[]).await;
+                assert_eq!(task.await.unwrap().unwrap(),42);
+                f.video_frame(&mut video,id).await;
+                crate::nbt::record_once(&f.session.control).await.unwrap();
+                let exit=bplist::parse(&f.session.resource_teardown(Some(102)).await).unwrap();
+                assert_eq!(exit.get("streams").unwrap().as_array().unwrap()[1].get("type").and_then(Value::as_int),Some(102));
+            }
+            let mut byte=[0];assert!(tokio::time::timeout(Duration::from_millis(30),f.car.read(&mut byte)).await.is_err());
         }
     }
     fn enable_id9(f: &mut Fixture) {
@@ -507,7 +559,7 @@ mod tests {
         f.teardown_reply().await;task.await.unwrap().unwrap();
         let mut byte=[0];assert_eq!(tokio::time::timeout(Duration::from_secs(1),peer.read(&mut byte)).await.unwrap().unwrap(),0);
         assert!(f.session.params.pipeline.lock().video_tcp.is_none());
-        let exit=bplist::parse(&f.session.resource_teardown(true).await).unwrap();
+        let exit=bplist::parse(&f.session.resource_teardown(Some(100)).await).unwrap();
         let streams=exit.get("streams").unwrap().as_array().unwrap();
         assert_eq!(streams.len(),1);assert_eq!(streams[0].get("type").and_then(Value::as_int),Some(100));
         assert!(f.session.params.pipeline.lock().audio_ready);
@@ -529,6 +581,27 @@ mod tests {
         let mut byte=[0];assert_eq!(peer.read(&mut byte).await.unwrap(),0);
         assert_eq!(f.session.params.pipeline.lock().video_stream,"WAIT_OWNERSHIP");
         assert!(f.session.params.pipeline.lock().audio_ready);
+    }
+    #[tokio::test]
+    async fn mercedes_rejected_screen_can_retry_without_repeating_record_or_reviving_lost_grant() {
+        for revoked in [false,true] {
+            let mut f=Fixture::new(Modes::initial()).await;
+            {let session=Arc::get_mut(&mut f.session).unwrap();session.params.mbux_media_compat=true;session.params.bmw_box_bootstrap=false;}
+            let control=f.session.control.clone();let record=tokio::spawn(async move {crate::airplay::record_session(&control).await});
+            let request=read(&mut f.car).await;assert_eq!(request.first_line,"RECORD / RTSP/1.0");
+            reply(&mut f.car,&request,200,&[]).await;record.await.unwrap().unwrap();
+            let task=f.reconcile();f.modes_reply(1).await;let setup=read(&mut f.car).await;
+            reply(&mut f.car,&setup,400,&[]).await;f.teardown_reply().await;assert!(task.await.unwrap().is_err());
+            if revoked {f.update(|m|borrow(m,100));}
+            // Same reconciliation path used by the one pre-ready retry.
+            let task=f.reconcile();f.modes_reply(if revoked {2}else{1}).await;
+            if !revoked {
+                let setup=read(&mut f.car).await;let(mut peer,id)=f.setup_reply(&setup).await;
+                task.await.unwrap().unwrap();f.video_frame(&mut peer,id).await;
+            } else {task.await.unwrap().unwrap();assert_eq!(f.session.params.pipeline.lock().video_stream,"WAIT_OWNERSHIP");}
+            assert!(f.session.params.pipeline.lock().audio_ready);
+            assert!(tokio::time::timeout(Duration::from_millis(30),f.car.read(&mut [0])).await.is_err());
+        }
     }
     #[tokio::test]
     async fn rejected_setup_cleans_video_only_and_next_ui_can_retry() {

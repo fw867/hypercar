@@ -47,6 +47,8 @@ pub struct AirplayParams {
     pub bmw_box_bootstrap: bool,
     pub mbux_screen_bootstrap: bool,
     pub id9_screen_bootstrap: bool,
+    pub nbt_audio_first: bool,
+    pub mbux_media_compat: bool,
     pub desktop_receiver: bool,
     /// 设置里的编码分辨率（仅作 `/info` 无显示器信息时的兜底）。
     pub width: u32,
@@ -100,6 +102,7 @@ pub async fn negotiate(
     stop: Arc<Notify>,
     screen_ready: tokio::sync::mpsc::Sender<crate::screen_session::ScreenCommand>,
 ) -> Result<AirplayOutcome, String> {
+    let mbux_media_compat = p.mbux_media_compat && !p.desktop_receiver;
     let (mut channel, mut control_inbound) = RtspChannel::spawn(read, write, None);
     emit_log(&format!("AIRPLAY: 控制连接 RTSP#{} 开始", channel.trace_id()));
 
@@ -257,7 +260,7 @@ pub async fn negotiate(
         }
     }
 
-    let mut box_bootstrap = !p.id9_screen_bootstrap && use_box_bootstrap(p.bmw_box_bootstrap, &info);
+    let mut box_bootstrap = !p.nbt_audio_first && !p.id9_screen_bootstrap && use_box_bootstrap(p.bmw_box_bootstrap, &info);
     if box_bootstrap { crate::auth_setup::run(&channel).await?; }
     else if p.mbux_screen_bootstrap {
         emit_log("MBUX: screen-before-RECORD bootstrap; auth-setup=true minimal_features=true latencyMs=100 deferred_audio=true");
@@ -274,10 +277,17 @@ pub async fn negotiate(
     // CatPlay bootstrap: 会话 SETUP → /info → 事件通道/保活 → 资源声明 → 屏幕流。
     let timing = TimingServer::start_with_pipeline(p.pipeline.clone()).map_err(|e| format!("计时服务启动失败: {e}"))?;
     let (root, session_info) = setup_and_read_info(
-        &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap, p.id9_screen_bootstrap,
+        &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap, p.id9_screen_bootstrap, mbux_media_compat,
     ).await?;
     info = session_info;
     for line in audio_capability_lines(&info) { emit_log(&line); }
+    let nbt_mode = p.nbt_audio_first && !p.desktop_receiver && use_box_bootstrap(true, &info);
+    if nbt_mode && !crate::nbt::matches(&info) {
+        return Err("ID6 profile requires NBT Evo receiver identity; select the MGU/IDC23 profile for those platforms".into());
+    }
+    if nbt_mode && p.enable_audio && shared_secret.is_none() {
+        return Err("ID6 audio path requires pair-verify; no plaintext audio fallback".into());
+    }
     // SETUP may be the first point at which /info reveals the real receiver identity.
     box_bootstrap = use_box_bootstrap(box_bootstrap, &info);
     emit_log(&format!("AIRPLAY: effective BMW box bootstrap={box_bootstrap} requested={}", p.bmw_box_bootstrap));
@@ -431,7 +441,21 @@ pub async fn negotiate(
     // BMW box activates the session before resource negotiation and video SETUP.
     let declaration = modes.lock().declaration();
     emit_log(&format!("TIMING: before RECORD {}",p.pipeline.lock().timing.summary()));
-    if p.mbux_screen_bootstrap || p.id9_screen_bootstrap {
+    let plan = if nbt_mode { nbt_audio_candidates(&info, &p.audio_codec) }
+        else { audio_candidates(&info, &p.audio_codec, p.id9_screen_bootstrap || mbux_media_compat) };
+    let mut audio = None;
+    if nbt_mode {
+        emit_log("NBT: screen TCP -> audio SETUP -> single RECORD; media waits for activation");
+        audio = screen_session.bootstrap_before_record_with(&modes, async {
+            if !p.enable_audio { return Ok(None); }
+            for codec in &plan {
+                if let Some(audio) = negotiate_audio(&channel,&factory,shared_secret.as_ref(),p,false,*codec).await {
+                    return Ok(Some(audio));
+                }
+            }
+            Err("NBT: no declared media format could be opened; RECORD not sent".into())
+        }).await?;
+    } else if p.mbux_screen_bootstrap || p.id9_screen_bootstrap {
         screen_session.bootstrap_before_record(&modes).await?;
     } else {
         activate_session(&channel, &declaration, &p.pipeline).await?;
@@ -458,11 +482,14 @@ pub async fn negotiate(
         }
     }
 
+    let media_started_before_ready = mbux_media_compat && !crate::wifi_iap2::transport_ready(wifi_iap_id);
+    let mut screen_failed = false;
     // ---- 6. 屏幕流 SETUP ----
     screen_session.activated.store(true, std::sync::atomic::Ordering::Release);
     emit_log(&format!("SCREEN-LIFECYCLE: session enabled={} initial={}", p.screen_resource_lifecycle,modes.lock().diagnostics()));
     if p.screen_resource_lifecycle {
         if let Err(error) = screen_session.reconcile_resource(&modes).await {
+            screen_failed = true;
             p.pipeline.lock().video_stream="FAILED".into();
             emit_log(&format!("SCREEN-LIFECYCLE: initial video failed: {error}; preserve audio/control"));
         }
@@ -476,24 +503,46 @@ pub async fn negotiate(
     // The phone is the resource arbiter. CatPlay marks changeModes FromAccessory;
     // sending it to BMW returned 422. Initial local ownership was already published via
     // modesChanged before stream SETUP. Receiver borrow/take requests still gate packets.
-    let plan = audio_candidates(&info, &p.audio_codec, p.id9_screen_bootstrap);
     audio_owned.store(modes.lock().audio_owned(), std::sync::atomic::Ordering::Release);
     emit_log(&format!("AUDIO: enabled={} preference={} candidates={plan:?} owner_controller={}", p.enable_audio, p.audio_codec, modes.lock().audio_owned()));
-    let mut audio = None;
-    if p.enable_audio {
+    if p.enable_audio && !nbt_mode {
         let desktop = p.desktop_receiver || !use_box_bootstrap(true, &info);
-        for codec in plan {
+        for codec in plan.iter().copied() {
             audio = negotiate_audio(&channel, &factory, shared_secret.as_ref(), p, desktop, codec).await;
             if audio.is_some() { break; }
         }
         if audio.is_none() { emit_log("AUDIO: no usable media stream; retain video/control"); }
     }
 
+    // One transition-triggered retry only: no timers looping on a READY receiver's 400.
+    // Historical MBUX also rejected streams after READY; this is not proof of authentication.
+    if media_started_before_ready && (screen_failed || (p.enable_audio && audio.is_none())) {
+        let ready=crate::wifi_iap2::wait_transport_ready(wifi_iap_id, stop.clone(), Duration::from_secs(3)).await;
+        emit_log(&format!("MBUX-MEDIA: pre-ready failure; retry_barrier={ready} screen_failed={screen_failed} audio_missing={}; no extra RECORD",audio.is_none()));
+        if ready {
+            if screen_failed && p.screen_resource_lifecycle {
+                if let Err(error)=screen_session.reconcile_resource(&modes).await {
+                    p.pipeline.lock().video_stream="FAILED".into();
+                    emit_log(&format!("MBUX-MEDIA: one screen retry rejected: {error}; await real resource/UI event"));
+                }
+            }
+            if p.enable_audio && audio.is_none() {
+                for codec in plan.iter().copied() {
+                    audio=negotiate_audio(&channel,&factory,shared_secret.as_ref(),p,false,codec).await;
+                    if audio.is_some() {break;}
+                }
+            }
+        }
+    }
+
     if let Some(task) = crate::mic_probe::spawn(channel.clone(), factory.clone(), shared_secret, p, &info, stop.clone()) {
         keepalive.0.push(task);
     }
     p.pipeline.lock().audio_ready=audio.is_some();
-    if let Some(audio) = audio.as_mut() { audio.set_ownership(audio_owned.clone()); }
+    if let Some(audio) = audio.as_mut() {
+        audio.set_ownership(audio_owned.clone());
+        emit_log(&format!("AUDIO: actual sender rate={}Hz timestamp clock; SPF={}",audio.sample_rate(),audio.samples_per_packet()));
+    }
 
     let mut streams = vec![Value::dict(vec![("type", Value::int(110)), ("uuid", Value::str(&screen_session.uuid))])];
     if let Some(audio) = audio.as_ref() { streams.push(Value::dict(vec![("type", Value::int(audio.stream_type()))])); }
@@ -902,6 +951,30 @@ mod display_size_tests {
         }
     }
     #[test]
+    fn nbt_selects_only_declared_output_and_setup_matches_encoder_rate() {
+        let info=Value::dict(vec![("audioFormats",Value::array(vec![
+            Value::dict(vec![("type",Value::int(102)),("audioType",Value::str("media")),
+                ("audioOutputFormats",Value::int((1<<22)|(1<<23)))]),
+            Value::dict(vec![("type",Value::int(100)),("audioType",Value::str("media")),
+                ("audioOutputFormats",Value::int(1<<15))]),
+        ]))]);
+        assert_eq!(nbt_audio_candidates(&info,"auto"),vec![AudioCodec::Aac441,AudioCodec::Aac,AudioCodec::Pcm]);
+        assert_eq!(nbt_audio_candidates(&info,"pcm"),vec![AudioCodec::Pcm]);
+        assert!(nbt_audio_candidates(&Value::dict(vec![]),"auto").is_empty());
+        let input=Value::dict(vec![("audioFormats",Value::array(vec![Value::dict(vec![
+            ("type",Value::int(102)),("audioType",Value::str("media")),("audioInputFormats",Value::int(1<<22))])]))]);
+        assert!(nbt_audio_candidates(&input,"auto").is_empty());
+        for codec in [AudioCodec::Aac441,AudioCodec::Aac] {
+            let setup=bplist::parse(&build_audio_setup_for_codec(42,false,codec)).unwrap();
+            let stream=&setup.get("streams").unwrap().as_array().unwrap()[0];
+            for (key,value) in [("type",102),("sr",codec.rate() as i64),("audioFormat",codec.format()),("spf",1024),("ct",4)] {
+                assert_eq!(stream.get(key).and_then(Value::as_int),Some(value));
+            }
+        }
+        // Enabling 44.1 kHz for ID6 must not change the old MGU/default candidates.
+        assert_eq!(audio_candidates(&info,"auto",false),vec![AudioCodec::Pcm,AudioCodec::Aac]);
+    }
+    #[test]
     fn aac_setup_and_candidates_keep_pcm_default_and_respect_receiver_direction() {
         let format=|kind,audio_type,bits| Value::dict(vec![("type",Value::int(kind)),
             ("audioType",Value::str(audio_type)),("audioOutputFormats",Value::int(bits))]);
@@ -1093,7 +1166,7 @@ mod display_size_tests {
         let (read, write) = socket.into_split();
         let (channel, _) = RtspChannel::spawn(read, write, None);
         crate::auth_setup::run(&channel).await.unwrap();
-        let (_, info) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", "Test phone", 12345, true, Value::dict(vec![]), false, false).await.unwrap();
+        let (_, info) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", "Test phone", 12345, true, Value::dict(vec![]), false, false, false).await.unwrap();
         let display = &info.get("displays").unwrap().as_array().unwrap()[0];
         assert_eq!(uuid_text(display.get("uuid")).as_deref(), Some("actual-bmw-display"));
         assert_eq!(read_display_size(display), (2560, 744));
@@ -1273,14 +1346,14 @@ const CONTROLLER_FEATURES: &[&str] = &[
     "videoPlayback",
 ];
 
-fn session_features(mbux: bool, id9: bool) -> Vec<Value> {
+fn session_features(mbux: bool, id9: bool, media_compat: bool) -> Vec<Value> {
     if mbux { return vec![Value::str("viewAreas")]; }
     // ID9 single-variable experiment: keep every other feature and stream parameter.
-    CONTROLLER_FEATURES.iter().filter(|f| !(id9 && **f == "hevc"))
+    CONTROLLER_FEATURES.iter().filter(|f| !((id9 || media_compat) && **f == "hevc") && !(media_compat && **f == "mainBuffered"))
         .map(|f| Value::str(f)).collect()
 }
 
-fn build_session_setup(device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, mbux: bool, id9: bool) -> Vec<u8> {
+fn build_session_setup(device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, mbux: bool, id9: bool, media_compat: bool) -> Vec<u8> {
     let session_uuid = box_session_uuid();
     let mut fields: Vec<(&str, Value)> = vec![
         ("deviceID", Value::str(device_id)),
@@ -1300,7 +1373,7 @@ fn build_session_setup(device_id: &str, device_name: &str, timing_port: u16, enc
         ("keepAliveLowPower", Value::bool(true)),
         (
             "features",
-            Value::array(session_features(mbux, id9)),
+            Value::array(session_features(mbux, id9, media_compat)),
         ),
     ];
     if !encrypted {
@@ -1340,14 +1413,17 @@ pub(crate) async fn record_session(channel: &Arc<RtspChannel>) -> Result<(), Str
 }
 
 async fn setup_and_read_info(
-    channel: &Arc<RtspChannel>, device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool, id9: bool,
+    channel: &Arc<RtspChannel>, device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool, id9: bool, media_compat: bool,
 ) -> Result<(Value, Value), String> {
     emit_log(&format!("AIRPLAY: session device name={device_name}"));
-    let body = build_session_setup(device_id, device_name, timing_port, encrypted, mbux, id9);
+    let body = build_session_setup(device_id, device_name, timing_port, encrypted, mbux, id9, media_compat);
+    if media_compat {
+        emit_log("MBUX-MEDIA: HEVC/mainBuffered not proposed; H.264 + implemented UDP audio; RECORD order unchanged");
+    }
     if id9 {
         // Only booleans/counts: session SETUP carries identity, so never dump its raw bytes.
         emit_log(&format!("ID9: session SETUP identity_consistent=true features={} hevc_proposed=false timing_port_valid={}",
-            session_features(mbux, id9).len(), timing_port != 0));
+            session_features(mbux, id9, media_compat).len(), timing_port != 0));
     }
     let reply = channel.request(
         "SETUP", "/setup", &body, "application/x-apple-binary-plist", &[], Duration::from_secs(10),
@@ -1396,11 +1472,21 @@ pub(crate) fn build_screen_setup_with_latency(conn_id: i64, uuid: &str, latency_
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 // type100 = Main; type102 = MainHigh (UDP). MainBuffered is type103 (TCP),
 // which this sender does not implement. The session feature is a separate capability.
-enum AudioCodec { Pcm, Aac }
+enum AudioCodec { Pcm, Aac, Aac441 }
 impl AudioCodec {
-    fn stream_type(self) -> i64 { if self == Self::Aac { 102 } else { 100 } }
-    fn format(self) -> i64 { if self == Self::Aac { 1 << 23 } else { 1 << 15 } }
-    fn spf(self) -> i64 { if self == Self::Aac { 1024 } else { 352 } }
+    fn stream_type(self) -> i64 { if self == Self::Pcm {100} else {102} }
+    fn format(self) -> i64 { match self {Self::Pcm=>1<<15,Self::Aac=>1<<23,Self::Aac441=>1<<22} }
+    fn rate(self) -> u32 { if self == Self::Aac441 {44100} else {48000} }
+    fn spf(self) -> i64 { if self == Self::Pcm {352} else {1024} }
+}
+fn nbt_audio_candidates(info: &Value, preference: &str) -> Vec<AudioCodec> {
+    let supports = |codec: AudioCodec| info.get("audioFormats").and_then(Value::as_array).into_iter().flatten().any(|f|
+        f.get("type").and_then(Value::as_int)==Some(codec.stream_type()) &&
+        f.get("audioType").and_then(Value::as_str)==Some("media") &&
+        f.get("audioOutputFormats").and_then(Value::as_int).is_some_and(|bits|bits & codec.format()!=0));
+    let candidates = if preference=="pcm" { vec![AudioCodec::Pcm] }
+        else {vec![AudioCodec::Aac441,AudioCodec::Aac,AudioCodec::Pcm]};
+    candidates.into_iter().filter(|codec|supports(*codec)).collect()
 }
 fn audio_candidates(info: &Value, preference: &str, strict: bool) -> Vec<AudioCodec> {
     let aac = info.get("audioFormats").and_then(Value::as_array).into_iter().flatten().any(|f|
@@ -1428,7 +1514,7 @@ fn build_audio_setup_for_codec(conn_id: i64, desktop: bool, codec: AudioCodec) -
         ("spf", Value::int(codec.spf())),
     ];
     // Leave the validated PCM proposal unchanged. AAC explicitly describes compression/rate.
-    if codec == AudioCodec::Aac { stream.extend([("ct",Value::int(4)),("sr",Value::int(48000))]); }
+    if codec != AudioCodec::Pcm { stream.extend([("ct",Value::int(4)),("sr",Value::int(codec.rate() as i64))]); }
     bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(stream)]))]))
 }
 
@@ -1440,15 +1526,15 @@ async fn negotiate_audio(
     desktop: bool,
     codec: AudioCodec,
 ) -> Option<AudioOut> {
-    let encoder = if codec == AudioCodec::Aac {
-        match crate::aac::AacEncoder::new() {
-            Ok(encoder) => { emit_log("AUDIO: AAC-LC encoder ready 48000Hz stereo 256kbps raw/SPF1024"); Some(encoder) }
+    let encoder = if codec != AudioCodec::Pcm {
+        match crate::aac::AacEncoder::at_rate(codec.rate()) {
+            Ok(encoder) => { emit_log(&format!("AUDIO: AAC-LC encoder ready {}Hz stereo 256kbps raw/SPF1024",codec.rate())); Some(encoder) }
             Err(error) => { emit_log(&format!("AUDIO: AAC encoder unavailable: {error}")); return None; }
         }
     } else { None };
     let conn_id = random_positive_i64();
     let body = build_audio_setup_for_codec(conn_id, desktop, codec);
-    emit_log(&format!("AUDIO: SETUP {codec:?}48k stereo SPF{} desktop={desktop} latencyMs={}", codec.spf(), if desktop {250} else {0}));
+    emit_log(&format!("AUDIO: SETUP {codec:?} {}Hz stereo SPF{} desktop={desktop} latencyMs={}", codec.rate(), codec.spf(), if desktop {250} else {0}));
     // 音频 SETUP 必须用**绝对 URI**（cardeck runAudioStream 同款：`rtsp://host:port/`）；
     // 屏幕流与初始 SETUP 才用相对路径。URI 用反会 400/404。
     let audio_uri = crate::rtsp_uri::audio_uri(&p.car_ip, p.airplay_port);
@@ -1500,7 +1586,7 @@ async fn negotiate_audio(
             None
         };
         emit_log(&format!(
-            "AIRPLAY: ✓ 音频流就绪 data={data_port} control={control_port}（{codec:?}48k/SPF{}）", codec.spf()
+            "AIRPLAY: ✓ 音频流就绪 data={data_port} control={control_port}（{codec:?} {}Hz/SPF{}）", codec.rate(), codec.spf()
         ));
         Some(match encoder { Some(encoder) => AudioOut::new_aac(udp, sync, key, encoder), None => AudioOut::new(udp, sync, key, 100) })
     }.await;
@@ -2108,7 +2194,7 @@ mod mbux_profile_tests {
     fn box_session_uuid_changes_per_attempt_without_replacing_phone_identity() {
         let mut sessions=std::collections::HashSet::new();
         for _ in 0..16 {
-            let body=bplist::parse(&build_session_setup("phone-device","phone",1234,true,false,false)).unwrap();
+            let body=bplist::parse(&build_session_setup("phone-device","phone",1234,true,false,false,false)).unwrap();
             assert_eq!(body.get("deviceID").and_then(Value::as_str),Some("phone-device"));
             let id=body.get("sessionUUID").and_then(Value::as_str).unwrap();
             assert_eq!(id.len(),36);
@@ -2125,7 +2211,7 @@ mod mbux_profile_tests {
         for encrypted in [true,false] {
             for mbux in [false,true] {
                 for device_id in ["02:11:22:33:44:55", "02:66:77:88:99:00"] {
-                    let body=bplist::parse(&build_session_setup(device_id,"test phone",1234,encrypted,mbux,false)).unwrap();
+                    let body=bplist::parse(&build_session_setup(device_id,"test phone",1234,encrypted,mbux,false,false)).unwrap();
                     assert_eq!(body.get("macAddress").and_then(Value::as_str),Some(device_id));
                     assert_eq!(body.get("deviceID"),body.get("macAddress"));
                     assert_eq!(body.get("name").and_then(Value::as_str),Some("test phone"));
@@ -2145,11 +2231,36 @@ mod mbux_profile_tests {
     }
 
     #[test]
+    fn mercedes_udp_audio_never_uses_buffered_type103_capabilities() {
+        let formats=|kind,bits|Value::dict(vec![("audioFormats",Value::array(vec![Value::dict(vec![
+            ("type",Value::int(kind)),("audioType",Value::str("media")),("audioOutputFormats",Value::int(bits))])]))]);
+        assert!(audio_candidates(&formats(103,(1<<22)|(1<<23)),"auto",true).is_empty());
+        assert_eq!(audio_candidates(&formats(102,1<<23),"auto",true),vec![AudioCodec::Aac]);
+        assert_eq!(audio_candidates(&formats(100,1<<15),"auto",true),vec![AudioCodec::Pcm]);
+        // Non-strict MGU/default behavior stays unchanged.
+        assert_eq!(audio_candidates(&formats(103,1<<22),"auto",false),vec![AudioCodec::Pcm]);
+    }
+    #[test]
+    fn mercedes_features_match_implemented_media_without_changing_other_fields() {
+        let baseline=bplist::parse(&build_session_setup("phone","name",1234,true,false,false,false)).unwrap();
+        let compat=bplist::parse(&build_session_setup("phone","name",1234,true,false,false,true)).unwrap();
+        let features=compat.get("features").unwrap().as_array().unwrap();
+        assert_eq!(features,&baseline.get("features").unwrap().as_array().unwrap().iter()
+            .filter(|f| !matches!(f.as_str(),Some("hevc"|"mainBuffered"))).cloned().collect::<Vec<_>>());
+        assert!(features.iter().any(|f|f.as_str()==Some("h.264Level5.1")));
+        let stable=|v:&Value|v.as_dict().unwrap().iter().filter(|(k,_)|
+            !matches!(k.as_str(),Some("features"|"sessionUUID"|"sessionCorrelationUUID"))).cloned().collect::<Vec<_>>();
+        assert_eq!(stable(&baseline),stable(&compat));
+        assert_eq!(session_features(false,false,false).len(),14);
+        assert_eq!(session_features(false,true,false).len(),13);
+        assert_eq!(features.len(),12);
+    }
+    #[test]
     fn id9_session_removes_only_hevc_and_preserves_other_profiles() {
         for encrypted in [false, true] {
             for mbux in [false, true] {
-                let baseline = bplist::parse(&build_session_setup("phone", "name", 1234, encrypted, mbux, false)).unwrap();
-                let id9 = bplist::parse(&build_session_setup("phone", "name", 1234, encrypted, mbux, true)).unwrap();
+                let baseline = bplist::parse(&build_session_setup("phone", "name", 1234, encrypted, mbux, false,false)).unwrap();
+                let id9 = bplist::parse(&build_session_setup("phone", "name", 1234, encrypted, mbux, true,false)).unwrap();
                 let expected: Vec<_> = baseline.get("features").unwrap().as_array().unwrap().iter()
                     .filter(|f| f.as_str() != Some("hevc")).cloned().collect();
                 assert_eq!(id9.get("features").unwrap().as_array().unwrap(), &expected);
@@ -2159,9 +2270,9 @@ mod mbux_profile_tests {
                     .filter(|(k, _)| !matches!(k.as_str(), Some("features" | "sessionUUID" | "sessionCorrelationUUID")))
                     .cloned().collect::<Vec<_>>();
                 assert_eq!(stable_fields(&baseline), stable_fields(&id9));
-                assert_eq!(baseline.get("features").unwrap().as_array().unwrap(), &session_features(mbux, false));
+                assert_eq!(baseline.get("features").unwrap().as_array().unwrap(), &session_features(mbux, false, false));
                 if !mbux {
-                    assert_eq!(session_features(false, false), CONTROLLER_FEATURES.iter().map(|f| Value::str(f)).collect::<Vec<_>>());
+                    assert_eq!(session_features(false, false, false), CONTROLLER_FEATURES.iter().map(|f| Value::str(f)).collect::<Vec<_>>());
                 }
             }
         }
@@ -2170,7 +2281,7 @@ mod mbux_profile_tests {
     #[test]
     fn minimal_features_and_100ms_latency_are_explicit_profile_choices() {
         for mbux in [false,true] {
-            let body=bplist::parse(&build_session_setup("real-mac","测试手机 \"BT\"",1234,true,mbux,false)).unwrap();
+            let body=bplist::parse(&build_session_setup("real-mac","测试手机 \"BT\"",1234,true,mbux,false,false)).unwrap();
             assert_eq!(body.get("name").and_then(Value::as_str),Some("测试手机 \"BT\""));
             let features=body.get("features").unwrap().as_array().unwrap();
             assert_eq!(features.len(),if mbux {1} else {CONTROLLER_FEATURES.len()});

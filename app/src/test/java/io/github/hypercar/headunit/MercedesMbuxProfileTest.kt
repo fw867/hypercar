@@ -6,6 +6,12 @@ import org.junit.Test
 class MercedesMbuxProfileTest {
     private val profile = HeadUnitProfiles.MERCEDES_MBUX
 
+    @Test fun mediaProposalCompatibilityIsPinnedToMercedesOnly() {
+        assertTrue(profile.mbuxMediaCompat)
+        for (other in HeadUnitProfiles.builtin.filter { it.id != profile.id }) {
+            assertFalse(other.id, other.mbuxMediaCompat)
+        }
+    }
     @Test fun replacementKeepsSavedIdAndRejectsOldBootstrapCaches() {
         assertEquals("mercedes_mbux", profile.id)
         assertFalse(profile.mbuxScreenBootstrap)
@@ -44,7 +50,7 @@ class MercedesMbuxProfileTest {
 
     @Test fun mbuxKeepsControlOnScreenRejectionWithoutChangingOtherProfilesOrUserSetting() {
         assertTrue(profile.screenResourceLifecycleEnabled(false))
-        for (other in HeadUnitProfiles.builtin.filter { it.id != profile.id && it.id != HeadUnitProfiles.BMW_ID9.id }) {
+        for (other in HeadUnitProfiles.builtin.filter { it.id != profile.id && it.id != HeadUnitProfiles.BMW_ID9.id && it.id != HeadUnitProfiles.BMW_ID6.id }) {
             assertFalse(other.id, other.screenResourceLifecycleEnabled(false))
             assertTrue(other.id, other.screenResourceLifecycleEnabled(true))
         }
@@ -67,7 +73,7 @@ class MercedesMbuxProfileTest {
 
     @Test fun unificationOnlyAppliesToMercedesAndRetainsNegotiatedModelIndependence() {
         for (other in HeadUnitProfiles.builtin.filter { it.id != profile.id }) {
-            assertSame(other.id, other, other.connectionPolicy())
+            assertEquals(other.id, other, other.connectionPolicy())
         }
         for (model in listOf("MB_D-PP-3", "MB_D-PP-4", "MB_E-P-4")) {
             val selected = profile.copy(model = model, mbuxScreenBootstrap = true).connectionPolicy()

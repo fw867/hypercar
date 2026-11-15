@@ -37,7 +37,7 @@ object RemoteProfiles {
      * 规则：**`_schema` 低于本档案要求版本的条目，只能新增车型，不能覆盖该内置档案**
      * ——这样"修内置档案"必须显式升 schema 才会生效，旧缓存不会把修复顶回去。
      */
-    const val SCHEMA = 10
+    const val SCHEMA = 11
 
     /** 档案列表地址（raw.githubusercontent.com，改 `main` 为其它分支即可灰度）。 */
     const val DEFAULT_URL =
@@ -89,6 +89,7 @@ object RemoteProfiles {
     /** Mercedes changed in schema 10; preserve the existing cache contracts for other profiles. */
     internal fun canOverrideBuiltin(id: String, schema: Int): Boolean =
         schema >= when (id) {
+            "bmw_id6" -> 11
             "mercedes_mbux" -> 10
             "bmw_id9" -> 9
             else -> 8
@@ -208,6 +209,7 @@ object RemoteProfiles {
             useScreenResourceLifecycle = o.optBoolean("useScreenResourceLifecycle", defaults.useScreenResourceLifecycle),
             mbuxScreenBootstrap = o.optBoolean("mbuxScreenBootstrap", defaults.mbuxScreenBootstrap),
             id9ScreenBootstrap = o.optBoolean("id9ScreenBootstrap", defaults.id9ScreenBootstrap),
+            nbtAudioFirst = o.optBoolean("nbtAudioFirst", defaults.nbtAudioFirst),
             fallbackAirplayPorts = readPorts(o, defaults.fallbackAirplayPorts),
             touchDisplay = if (o.has("touchDisplay")) {
                 o.optString("touchDisplay", "").ifBlank { null }
@@ -251,6 +253,7 @@ object RemoteProfiles {
                     put("useScreenResourceLifecycle", p.useScreenResourceLifecycle)
                     put("mbuxScreenBootstrap", p.mbuxScreenBootstrap)
                     put("id9ScreenBootstrap", p.id9ScreenBootstrap)
+                    put("nbtAudioFirst", p.nbtAudioFirst)
                     put("fallbackAirplayPorts", JSONArray(p.fallbackAirplayPorts))
                     put("touchDisplay", p.touchDisplay ?: "")
                     put("pairingHint", p.pairingHint ?: "")

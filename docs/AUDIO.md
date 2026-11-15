@@ -19,6 +19,12 @@
 
 AirPlay PCM 使用 SPF352，约 136.36 包/秒，16-bit 大端样本。TTS 参与闪避混音；持续全零样本不会一直保持“播放中”。PC 联调的 audioLatencyMs=250 不应自动套给真实车机。
 
+## ID6 / NBT Evo 实验路径
+
+独立 ID6 档案只接受 NBT Evo 身份，并按本轮 `/info` 的 media 输出能力选择 AAC-LC 44.1 kHz、48 kHz 或 PCM 48 kHz；缺失声明不猜测格式。手动 PCM 选择仍受输出能力限制。顺序为屏幕 TCP、音频 SETUP、单次成功 RECORD，失败不能伪装激活。
+
+采集/混音保持 48 kHz；仅 AAC 44.1 kHz 发送端做保留相位的流式重采样。MediaCodec、SETUP 与 RTP 样本时钟采用实际协商采样率，AAC 每包 1024 帧；资源接管丢弃旧缓存，归还时保留采样率重建编码器。该分支不改变 MGU/ID9 的默认格式和激活顺序；实车音画仍待验证。
+
 ## 资源归属与恢复
 
 音频 SETUP 成功仅表示流存在。车机通过 changeModes 接管音频后，本端停止 RTP，保留控制及视频。屏幕归还、requestUI 或持续 PCM 不等于音频已归还。

@@ -9,7 +9,9 @@
 //!
 
 mod airplay;
+mod nbt;
 mod audio_out;
+mod audio_resample;
 mod aac;
 mod opus;
 mod mic_probe;

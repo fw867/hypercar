@@ -1,12 +1,13 @@
 # 车机档案与验证范围
 
-更新：2026-11-13。所有车型统一在 [profiles/headunits.json](../profiles/headunits.json) 下发，App 按 ID 选择，不维护独立车型 JSON。
+更新：2026-11-15。所有车型统一在 [profiles/headunits.json](../profiles/headunits.json) 下发，App 按 ID 选择，不维护独立车型 JSON。
 
 ## 内置策略
 
 | ID | 断 HFP/A2DP | 出站 iAP2 | 要求本轮激活 | 特殊门槛 | 验证范围 |
 |---|---|---|---|---|---|
 | bmw_id85 | false | false | true | 允许用户开启已配对 Wi-Fi 主动恢复 | MGU-55 实车基准；不能代表所有 iDrive |
+| bmw_id6 | false | false | true | NBT Evo 身份校验；屏幕 TCP、声明内音频先就绪，再单次成功 RECORD | 实验档案；AAC 44.1/48 kHz，实车待验证 |
 | bmw_id9 | false | true | true | 新鲜0x4301；主屏/HID/视频TCP在RECORD前就绪；不继承MGU的SAP | ID9实车待验证；AAC48已接通并通过DiPlay出声测试 |
 | generic | true | true | false | 通用模板 | verified 不代表所有车型经过测试 |
 | winplay | false | true | false | deviceID 校验；7000端口 | PC 联调，不等于真实车机 |
@@ -14,13 +15,13 @@
 | volkswagen_mib | false | true | true | 当前目标 Wi-Fi 广播；必须新鲜 ctrl 邀请；禁用无邀请捷径 | 用户转述连接正常，未逐项验证功能 |
 | mercedes_mbux | false | true | true | 本轮 iAP2 端点；单次 RECORD 后协商屏幕/音频；关闭旧屏幕前置实验 | MB_D-PP 与 MB_E-P 统一使用 MB_D-PP 参考策略，未实车验证 |
 
-BMW/generic/Audi 启用0x4300、EA及0x4E0E；大众/奔驰启用0x4300、0x4E0E但不主动打开EA；WinPlay关闭三项。全部回复电源更新，不因CarPlay窗口关闭就主动中止。音频配置保护只涉及HFP/A2DP，不能因此提前断掉RFCOMM控制链。
+MGU BMW/generic/Audi 启用0x4300、EA及0x4E0E；大众/奔驰启用0x4300、0x4E0E但不主动打开EA；WinPlay关闭三项。ID6 仅启用0x4300，不套用MGU的EA、传输标识及SAP引导；nbtAudioFirst只允许ID6启用，禁止与ID9/MBUX前置策略混用。全部回复电源更新，不因CarPlay窗口关闭就主动中止。音频配置保护只涉及HFP/A2DP，不能因此提前断掉RFCOMM控制链。
 
 默认及未知ID回退BMW，新增档案不自动切换用户选择。档案ID不同，连接参数不能因同名Wi-Fi混用。真实接收端身份与UI所选档案需同时记录。
 
 ## 配置字段与覆盖
 
-当前发布schema=10。覆盖门槛按档案区分：mercedes_mbux需要schema10，bmw_id9需要schema9，其余内置档案继续接受schema8，避免旧奔驰缓存恢复已移除的屏幕前置策略，同时保留其它档案已有有效覆盖；低于该档案门槛的缓存仅能追加新ID。缺省字段继承同ID内置值，新ID继承BMW模板；显式false通常是有效覆盖；奔驰例外：mbuxScreenBootstrap/id9ScreenBootstrap固定false，useScreenResourceLifecycle固定true，解析、合并和引擎配置均按统一策略处理。touchDisplay/pairingHint空字符串可清除。导出保留策略及schema，刷新失败保留缓存并继续执行schema隔离。
+当前发布schema=11。覆盖门槛按档案区分：bmw_id6需要schema11，mercedes_mbux需要schema10，bmw_id9需要schema9，其余内置档案继续接受schema8，避免旧奔驰缓存恢复已移除的屏幕前置策略，同时保留其它档案已有有效覆盖；低于该档案门槛的缓存仅能追加新ID。缺省字段继承同ID内置值，新ID继承BMW模板；显式false通常是有效覆盖；奔驰例外：mbuxScreenBootstrap/id9ScreenBootstrap固定false，useScreenResourceLifecycle固定true，解析、合并和引擎配置均按统一策略处理。touchDisplay/pairingHint空字符串可清除。导出保留策略及schema，刷新失败保留缓存并继续执行schema隔离。
 
 | 字段组 | 内容 |
 |---|---|
@@ -50,6 +51,12 @@ useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关�
 直接替换原奔驰档案内容，保留 `mercedes_mbux` ID，已保存的奔驰选择自动使用新策略，列表只保留一个奔驰条目。使用现有全局单次 RECORD 路径：初始激活 → 资源声明 → 屏幕 SETUP/TCP → 音频 SETUP；音频加入、屏幕借出归还均不补发 RECORD。HyperCar 原有音频路径已满足这一点，无需新增无实际行为差异的布尔开关。MB_E-P-4 的配对后 SAP、最小能力集、屏幕在 RECORD 前建立等实验不由 MB_D-PP 继承。
 
 保留蓝牙、本轮端点门槛和屏幕资源生命周期；尺寸及 UUID 使用协商结果，不固定为报告的 2570×1080。不引入奇瑞专用 MFi 或 disableBluetooth 行为。未引入字段，发布内容 version 与 schema 均升10；仅奔驰提高覆盖门槛，schema8/9 旧缓存不能恢复旧 bootstrap。以上是替换未跑通的奔驰实验并复用既有单次激活行为，尚无本项目 MB_D-PP 音画实测，也不能解释 MB_E-P-4 既有 SETUP 400。
+
+### 当前奔驰媒体提议校准
+
+`mbux_media_compat` 由奔驰档案 ID 派生，不作为任意远端档案开关。关闭当前发送端未实现的 hevc/mainBuffered 会话声明，保留 H.264 和实际实现的 type100/102 UDP 音频；仅使用车机明确声明的媒体输出格式。RECORD、屏幕参数和资源规则保持原有单次激活路径，未恢复旧屏幕前置实验。
+
+仅“初始媒体失败且发送时尚未READY”允许等待最多3秒，本轮传输就绪后对失败流重试一次；成功流不重建，不重复RECORD，不对初始已READY的拒绝循环重试。真实车机音画仍待验证。
 
 ## 旧奔驰 MBUX 实验记录
 
