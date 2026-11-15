@@ -14,6 +14,7 @@ class Id9BluetoothBootstrapTest {
         val serialOverride: ByteArray? = null,
         val legacy: Boolean = false,
         val subscribeEarly: Boolean = false,
+        val replyWithWifi: Boolean = true,
     ) : Iap2LinkChannel {
         val sent = mutableListOf<Iap2Csm.Frame>()
         val queue = ArrayDeque<ByteArray>()
@@ -43,7 +44,7 @@ class Id9BluetoothBootstrapTest {
                         else Iap2Csm.encode(0xaa01,certificate)
                     0xaa02 -> if(signature!=null) queue += Iap2Csm.encode(0xaa03,signature) +
                         (if(subscribeEarly) Iap2Csm.encode(0xae00,Iap2Csm.param(6,byteArrayOf())) else byteArrayOf())
-                    0x5702 -> queue += Iap2Csm.encode(0x5703,Iap2Csm.string(1,"fixture-ap")+Iap2Csm.string(2,"fixture-pass"))
+                    0x5702 -> if (replyWithWifi) queue += Iap2Csm.encode(0x5703,Iap2Csm.string(1,"fixture-ap")+Iap2Csm.string(2,"fixture-pass"))
                     0x4300 -> queue += Iap2Csm.encode(0x4301,Iap2Csm.group(1,
                         Iap2Csm.string(0,"fixture-ap") + Iap2Csm.string(1,"fixture-pass") + Iap2Csm.u8(2,1)))
                 }
@@ -59,12 +60,44 @@ class Id9BluetoothBootstrapTest {
         assertEquals(1,ids.count { it==0x4300 })
         assertTrue(ids.none { it in 0x4e09..0x4e0e || it==0xea00 || it==0x5702 })
     }
-    @Test fun mguKeepsExistingGreetingsBeforeAvailability() {
+    @Test fun id85NewWifiAlsoUsesTheBoxGreetingsBeforeAvailability() {
         val channel = Channel()
         Iap2SenderSession(channel,{},onEndpoint={},profile=HeadUnitProfiles.BMW_ID85,nanoTime={channel.time}).run(10_000)
         val ids = channel.sent.map { it.messageId }
-        assertTrue(ids.indexOf(0x4e09)>ids.indexOf(0xaa05))
+        assertEquals(listOf(0x4e0c,0x4e0d,0x4e0a,0x4e09,0x4e0b),
+            ids.drop(ids.indexOf(0xaa05)+1).take(5))
         assertTrue(ids.indexOf(0x4300)>ids.indexOf(0x4e09))
+        assertEquals(1,ids.count { it==0x4e0d })
+        assertFalse(0x5702 in ids)
+    }
+    @Test fun id85LegacyWifiStartsWithTheBoxGreetingSequenceAndDoesNotRepeatWirelessUpdate() {
+        val channel = Channel(legacy = true)
+        Iap2SenderSession(channel,{},deviceName="fixture-phone",onEndpoint={},
+            profile=HeadUnitProfiles.BMW_ID85,nanoTime={channel.time}).run(10_000)
+        val ids = channel.sent.map { it.messageId }
+        assertEquals(listOf(0x4e0c,0x4e0d,0x4e0a,0x4e09,0x4e0b),
+            ids.drop(ids.indexOf(0xaa05)+1).take(5))
+        assertTrue(ids.indexOf(0x5702)>ids.indexOf(0x4e0b))
+        assertEquals(1,ids.count { it==0x4e0d })
+        assertArrayEquals(Iap2Csm.u8(0,1),channel.sent.single { it.messageId==0x4e0d }.body)
+        assertArrayEquals(Iap2Csm.string(0,"fixture-phone"),channel.sent.single { it.messageId==0x4e09 }.body)
+    }
+    @Test fun onlyId85MovesWirelessUpdateIntoLegacyGreetings() {
+        for (profile in HeadUnitProfiles.builtin.filter { it.id!="bmw_id85" }) {
+            val channel = Channel(legacy = true)
+            Iap2SenderSession(channel,{},onEndpoint={},profile=profile,nanoTime={channel.time}).run(10_000)
+            val ids = channel.sent.map { it.messageId }
+            assertEquals(profile.id,listOf(0x4e0c,0x4e0a,0x4e0b,0x4e09),
+                ids.drop(ids.indexOf(0xaa05)+1).take(4))
+            assertEquals(profile.id,0x4e0d,ids[ids.indexOf(0x5702)+1])
+        }
+    }
+    @Test fun id85CanRepeatTheCompleteGreetingSequenceForTheExistingWifiRescue() {
+        val channel = Channel(legacy = true, replyWithWifi = false)
+        Iap2SenderSession(channel,{},onEndpoint={},profile=HeadUnitProfiles.BMW_ID85,nanoTime={channel.time}).run(10_000)
+        val greetings = channel.sent.map { it.messageId }.filter { it in 0x4e09..0x4e0d }
+        assertEquals(listOf(0x4e0c,0x4e0d,0x4e0a,0x4e09,0x4e0b,
+            0x4e0c,0x4e0d,0x4e0a,0x4e09,0x4e0b),greetings)
     }
     private fun run(channel: Channel, peer: String? = "00:11:22:33:44:55", id9: Boolean = true) {
         Iap2SenderSession(channel,{},onEndpoint={},receiverAddress=peer,

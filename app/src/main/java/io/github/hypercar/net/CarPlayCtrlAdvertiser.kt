@@ -30,7 +30,7 @@ import java.net.Socket
  *     （02:00:…）会导致永不邀请。
  *  3. Android 13+ 通过 NsdServiceInfo.network 限定本轮车机网络；较旧系统保留进程绑定。
  *
- * 服务名沿用 cardeck 验证过的 `sender`（改 `iPhone` 与 srcvers 同时变更时无法单次归因）。
+ * ID8.5 以本轮手机名称发布实例，其它档案保留 `sender`；TXT 与端口不随名称变化。
  */
 class CarPlayCtrlAdvertiser(
     context: Context,
@@ -38,11 +38,11 @@ class CarPlayCtrlAdvertiser(
     private val bluetoothMacProvider: () -> String,
     private val log: (String) -> Unit,
     private val onDiagnostic: (Event) -> Unit = {},
+    private val serviceNameProvider: () -> String = { "sender" },
 ) {
     enum class Event { REGISTERED, INVITED }
     companion object {
         const val SERVICE_TYPE = "_carplay-ctrl._tcp"
-        private const val SERVICE_NAME = "sender"
         private const val SRCVERS = "770.8.1"
         private const val TAG = "CTRL"
         private const val MAX_HEAD_BYTES = 16 * 1024
@@ -64,6 +64,7 @@ class CarPlayCtrlAdvertiser(
     private var registeredNetwork: Network? = null
     private var registeredAtMillis = 0L
     private var registeredMac: String? = null
+    private var registeredName: String? = null
 
     /** 车机 ctrl 邀请计数（每收到一次 `GET /ctrl-int/1/connect` 加一）。 */
     @Volatile
@@ -92,8 +93,9 @@ class CarPlayCtrlAdvertiser(
     fun ensureForNetwork(ssid: String, network: Network? = null): Boolean {
         val effectiveNetwork = network ?: registeredNetwork
         val currentMac = bluetoothMacProvider()
+        val currentName = serviceNameProvider()
         val same = registeredSsid == ssid && registeredNetwork == effectiveNetwork &&
-            registeredMac.equals(currentMac, ignoreCase = true)
+            registeredMac.equals(currentMac, ignoreCase = true) && registeredName == currentName
         val age = SystemClock.uptimeMillis() - registeredAtMillis
         val socket = serverSocket?.takeUnless { it.isClosed }
         if (socket != null && registration.canReuse(same, age, REGISTRATION_TIMEOUT_MILLIS)) {
@@ -150,9 +152,10 @@ class CarPlayCtrlAdvertiser(
         val token = registration.begin()
         return try {
             val mac = bluetoothMacProvider()
+            val name = serviceNameProvider()
             val info =
                 NsdServiceInfo().apply {
-                    serviceName = SERVICE_NAME
+                    serviceName = name
                     serviceType = SERVICE_TYPE
                     setPort(socket.localPort)
                     // 车机在 WiFi 上唯一能看到的手机身份就是这两个 TXT 字段
@@ -202,9 +205,10 @@ class CarPlayCtrlAdvertiser(
             nsdManager.registerService(info, NsdManager.PROTOCOL_DNS_SD, listener)
             registeredAtMillis = SystemClock.uptimeMillis()
             registeredMac = mac
+            registeredName = name
             log(
                 "$TAG: 已监听 :${socket.localPort}，提交广播 $SERVICE_TYPE network=$registeredNetwork " +
-                    "name=$SERVICE_NAME id=$mac srcvers=$SRCVERS" +
+                    "name=$name id=$mac srcvers=$SRCVERS" +
                     if (mac == PLACEHOLDER_MAC) "（⚠ 占位 MAC：车机不会邀请）" else "",
             )
             true
@@ -222,6 +226,7 @@ class CarPlayCtrlAdvertiser(
         val previous = registrationListener
         registrationListener = null
         registeredMac = null
+        registeredName = null
         previous?.let { runCatching { nsdManager.unregisterService(it) } }
     }
 

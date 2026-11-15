@@ -54,7 +54,7 @@ class NoCarPlayWindowException(message: String) : IOException(message)
  * 序列（BMW iD8.5/MGU-86 实测次序，见 §9j）：
  *   0x1D00 → 0x1D01 → 0x1D02（识别）
  *   0xAA00 → 0xAA01 → 0xAA02 → 0xAA03 → 0xAA05（MFi，跳过证书/签名校验）
- *   **0xAA05 之后立即突发设备状态问候** 0x4E0C/0x4E0A/0x4E0B/0x4E09（§9j 核心修复：
+ *   **0xAA05 之后立即突发设备状态问候**；ID8.5 对齐盒子为 0x4E0C/0x4E0D/0x4E0A/0x4E09/0x4E0B（§9j 核心修复：
  *   真 iPhone 就是这个次序；旧实现把问候排在 0x5703 等待之后，BMW 等问候、我们等
  *   0x5703，5.4s 后车机判 accessory 未就绪拆链）
  *   0xEA00（EA 会话：param1 为 u16 会话号；车机声明的
@@ -272,16 +272,17 @@ class Iap2SenderSession(
         nowPlaying.authenticated()
         subscriptions.authenticated()
 
-        // 0x5702 与 0x4E0D 的先后只在这条链上调整：会发 0x5702 的车先发请求，再发可用性。
-        // 不发 0x5702 的车仍在问候里带上 0x4E0D。两条的正文都不改。
+        // ID8.5 按盒子在设备问候中声明无线可用性；其它档案保留原有 0x5702/0x4E0D 顺序。
         val wifiGen = ReceiverProfile.classifyWifiGen(ident.sendIds, ident.receiveIds)
         val legacyWifiExchange = wifiGen != ReceiverProfile.WifiGen.NEW
+        val boxOrderedGreetings = profile.id == "bmw_id85"
 
         // ---- MGU／旧路径设备问候；IDC23新式路径已直接发送4300并跳过问候 ----
-        // 早期MGU样本在 0xAA05 之后发 0x4E0C/0x4E0A/0x4E0B/0x4E09，然后才轮到
+        // 设备问候必须在 0xAA05 后、订阅/凭据请求前；ID8.5 的完整次序另按盒子抓包校准。
+        // 早期MGU样本在 0xAA05 之后发设备问候，然后才轮到
         // 订阅/请求。旧实现排在 0x5703 等待之后：BMW 等问候、我们等 0x5703，
         // 两轮实测稳定 5.37~5.45s 后车机拆 RFCOMM（另一台 MGU-86 五轮全败同签名）。
-        sendDeviceStateGreetings(includeWirelessUpdate = !legacyWifiExchange)
+        sendDeviceStateGreetings(includeWirelessUpdate = boxOrderedGreetings || !legacyWifiExchange)
         enterPhase("EA_AND_HID")
 
         // ---- EA 会话（MFi 完成后发；认证前发会噎死 DiPlay）----
@@ -360,7 +361,7 @@ class Iap2SenderSession(
                 null
             } else {
                 send(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION)
-                sendWirelessCarPlayUpdate()
+                if (!boxOrderedGreetings) sendWirelessCarPlayUpdate()
                 // 只占用本阶段预算，为 0x4300/0x4301 留出时间；4301 早到也立即结束等待。
                 val wifiDeadline = rescueDeadline(deadline, WIFI_EXCHANGE_BUDGET_MILLIS)
                 val credentialMessages = setOf(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION, Iap2MessageIds.CARPLAY_START_SESSION)
@@ -954,8 +955,8 @@ class Iap2SenderSession(
     // ---- 设备状态问候 ----
 
     /**
-     * 设备状态问候：0x4E0D 无线可用性 / 0x4E0C 无线会话标识（UUID 大写）/ 0x4E0A 语言 /
-     * 0x4E0B 设备时间 / 0x4E09 设备名。一轮一次（[force]=true 才重发，§9j 处置 3）。
+     * 设备状态问候：无线可用性、无线会话标识、语言、设备时间、设备名。
+     * 一轮一次（[force]=true 才重发，§9j 处置 3）；仅 ID8.5 按盒子次序发送。
      *
      * **0x4E0D（WirelessCarPlayUpdate，u8=1）不能省**（2026-10-24 对照 cardeck 定谳）：
      * 真 iPhone 在 0xAA05 之后会发这条「本机支持无线 CarPlay」的可用性通知；
@@ -977,25 +978,31 @@ class Iap2SenderSession(
         greetingsSent = true
         val timezoneMinutes = TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 60_000
         val daylightSaving = if (TimeZone.getDefault().inDaylightTime(Date())) 1 else 0
-        if (includeWirelessUpdate) sendWirelessCarPlayUpdate()
-        send(
-            Iap2MessageIds.DEVICE_UUID_UPDATE,
-            Iap2Csm.string(0, Iap2DeviceUuid.value),
-        )
-        send(
-            Iap2MessageIds.DEVICE_LANGUAGE_UPDATE,
-            Iap2Csm.string(0, "zh"),
-        )
-        send(
-            Iap2MessageIds.DEVICE_TIME_UPDATE,
-            Iap2Messages.deviceTime(System.currentTimeMillis() / 1_000L, timezoneMinutes, daylightSaving),
-        )
-        send(
-            Iap2MessageIds.DEVICE_INFORMATION_UPDATE,
-            Iap2Csm.string(0, deviceName),
-        )
+        // 盒子 MGU-55 抓包：AA05 -> 4E0C/4E0D/4E0A/4E09/4E0B -> 5702。
+        // ID9 最小引导仍在上面直接返回；其它档案的问候及正文保持原样。
+        val ids = if (profile.id == "bmw_id85") {
+            listOf(Iap2MessageIds.DEVICE_UUID_UPDATE, Iap2MessageIds.WIRELESS_CARPLAY_UPDATE,
+                Iap2MessageIds.DEVICE_LANGUAGE_UPDATE, Iap2MessageIds.DEVICE_INFORMATION_UPDATE,
+                Iap2MessageIds.DEVICE_TIME_UPDATE)
+        } else {
+            buildList {
+                if (includeWirelessUpdate) add(Iap2MessageIds.WIRELESS_CARPLAY_UPDATE)
+                add(Iap2MessageIds.DEVICE_UUID_UPDATE)
+                add(Iap2MessageIds.DEVICE_LANGUAGE_UPDATE)
+                add(Iap2MessageIds.DEVICE_TIME_UPDATE)
+                add(Iap2MessageIds.DEVICE_INFORMATION_UPDATE)
+            }
+        }
+        for (id in ids) when (id) {
+            Iap2MessageIds.WIRELESS_CARPLAY_UPDATE -> sendWirelessCarPlayUpdate()
+            Iap2MessageIds.DEVICE_UUID_UPDATE -> send(id, Iap2Csm.string(0, Iap2DeviceUuid.value))
+            Iap2MessageIds.DEVICE_LANGUAGE_UPDATE -> send(id, Iap2Csm.string(0, "zh"))
+            Iap2MessageIds.DEVICE_INFORMATION_UPDATE -> send(id, Iap2Csm.string(0, deviceName))
+            Iap2MessageIds.DEVICE_TIME_UPDATE -> send(id,
+                Iap2Messages.deviceTime(System.currentTimeMillis() / 1_000L, timezoneMinutes, daylightSaving))
+        }
         log(
-            "iap2 tx=${if (includeWirelessUpdate) "0x4e0d/" else ""}0x4e0c/0x4e0a/0x4e0b/0x4e09 " +
+            "iap2 tx=${ids.joinToString("/") { "0x${it.toString(16)}" }} " +
                 "设备状态问候（name=$deviceName mac=$bluetoothMac）",
         )
     }

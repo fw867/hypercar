@@ -1286,16 +1286,19 @@ object HyperCarRepo {
             // 绑 WiFi + 广播 `_carplay-ctrl._tcp`——车机是在 WiFi 上发现该服务后
             // `GET /ctrl-int/1/connect` 邀请手机，**邀请成功才下发 0x4301**。
             // 若等 0x4301 才去入网，双方互等（旧实现就是这样，真车上永远拿不到端点）。
+            val controlServiceName = io.github.hypercar.net.ControlServiceName.forProfile(
+                p.id, io.github.hypercar.bluetooth.LocalDeviceName.snapshot())
             val advertiser = CarPlayCtrlAdvertiser(context, { deviceMac }, ::log, onDiagnostic = { event ->
                 connectionDiagnostics.mark(diagnosticId, when (event) {
                     CarPlayCtrlAdvertiser.Event.REGISTERED -> ConnectionDiagnostics.Stage.CTRL_REGISTERED
                     CarPlayCtrlAdvertiser.Event.INVITED -> ConnectionDiagnostics.Stage.CTRL_INVITED
                 })
-            })
+            }, serviceNameProvider = { controlServiceName })
             ctrlAdvertiser = advertiser
             val lastSeen = AtomicReference<CarPlayEndpoint?>(null)
             val baselineSessions = coordinator.sessionStartCount
             roundSessionBaseline = baselineSessions
+            val discoveryAttempt = connectionAttemptId
             discoveryJob = CoroutineScope(kotlinx.coroutines.currentCoroutineContext()).launch {
                 try { io.github.hypercar.bluetooth.ReconnectDiscoverability.watch(context,
                     networkKey = {
@@ -1309,6 +1312,16 @@ object HyperCarRepo {
                     servicesReady = { coordinator.isListening && advertiser.isAdvertising },
                     sessionStarted = { coordinator.isSessionActive || coordinator.sessionStartCount > baselineSessions ||
                         advertiser.lastInvitePeerIp != null || streaming },
+                    preparationKey = {
+                        val target = SettingsStore.targetCarMac
+                        val bonded = runCatching {
+                            android.bluetooth.BluetoothAdapter.getDefaultAdapter()?.bondedDevices
+                                ?.any { it.address.equals(target, ignoreCase = true) } == true
+                        }.getOrDefault(false)
+                        io.github.hypercar.bluetooth.ReconnectDiscoverability.bmwPreparationKey(
+                            p.id, target, bonded, coordinator.isListening,
+                            sessionLive.get() && connectionAttemptId == discoveryAttempt && !userDisconnectRequested)
+                    },
                     log = ::log,
                 ) } catch (cancelled: CancellationException) {
                     throw cancelled
@@ -1514,7 +1527,12 @@ object HyperCarRepo {
                 }
                 push(link = LinkState.Negotiating("连接车机 AirPlay 端口"))
                 val carNetworkSsid = currentWifiSsid(context)
-                val connected = connectAirplayEndpoint(context, sockets, candidatePorts.map { AirplayTarget(apHost, it) })
+                val candidateHosts = mdnsEndpoint?.addresses ?: endpoint.ipAddresses.takeIf { it.isNotEmpty() }
+                    ?: listOf(apHost)
+                val connected = connectAirplayEndpoint(context, sockets,
+                    (listOf(apHost) + candidateHosts).distinct().flatMap { address ->
+                        candidatePorts.map { AirplayTarget(address, it) }
+                    })
                 if (connected == null) {
                     if (endpoint.proactive) {
                         waitForInvitation("主动控制端口不可用；候选地址已失效", null)
@@ -2222,7 +2240,7 @@ object HyperCarRepo {
                 val fresh = AirplayServiceProbe(context, ::log).browse(sockets.network, 1500, strictNetwork = true, accept = ::matchesAirplayService)
                 if (fresh != null) {
                     log("ENDPOINT: 重新发现 → ${fresh.host}:${fresh.port}（${fresh.instance}）")
-                    listOf(hints.advertised(AirplayTarget(fresh.host, fresh.port)))
+                    fresh.addresses.map { hints.advertised(AirplayTarget(it, fresh.port)) }
                 } else {
                     log("ENDPOINT: 无新服务，保留 ctrl 广播与 iAP2，限时等待新端点/服务启动")
                     emptyList()
@@ -2925,7 +2943,7 @@ object HyperCarRepo {
                                         deviceIdentifier = null,
                                         publicKeyHex = null,
                                         sourceVersion = null,
-                                        ipAddresses = listOf(mdnsHere.host),
+                                        ipAddresses = mdnsHere.addresses,
                                         gateway = mdnsHere.host,
                                         proactive = profileRequiresActivation,
                                     )

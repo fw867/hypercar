@@ -18,7 +18,9 @@ internal class ReconnectDiscoverabilityPolicy {
     /** Session already started — no further discoverable windows this watch. */
     private var sessionClaimed = false
 
-    fun shouldAttempt(enabled: Boolean, networkKey: String?, servicesReady: Boolean, sessionStarted: Boolean, now: Long): Boolean {
+    @Synchronized
+    fun shouldAttempt(enabled: Boolean, networkKey: String?, servicesReady: Boolean, sessionStarted: Boolean, now: Long,
+                      preparationKey: String? = null): Boolean {
         if (sessionStarted) {
             attempted = true
             wakeArmed = false
@@ -26,22 +28,24 @@ internal class ReconnectDiscoverabilityPolicy {
             return false
         }
         if (sessionClaimed) return false
-        if (!enabled || networkKey == null || !servicesReady) { key = null; return false }
+        val readyKey = preparationKey ?: networkKey?.takeIf { servicesReady }
+        if (!enabled || readyKey == null) { key = null; return false }
         if (wakeArmed) {
             wakeArmed = false
             attempted = true
-            key = networkKey
+            key = readyKey
             readyAt = now
             return true
         }
         if (attempted) return false
-        if (key != networkKey) { key = networkKey; readyAt = now; return false }
+        if (key != readyKey) { key = readyKey; readyAt = now; return false }
         if (now - readyAt < 5_000) return false
         attempted = true
         return true
     }
 
     /** Car ACL while still waiting for invite/iAP2: allow one extra discoverable window. */
+    @Synchronized
     fun armForWake(): Boolean {
         if (sessionClaimed || !attempted || wakeArmed) return false
         wakeArmed = true
@@ -49,7 +53,32 @@ internal class ReconnectDiscoverabilityPolicy {
     }
 }
 
+/** Token cleanup runs even when cancellation arrives during the synchronous Binder start. */
+internal suspend fun runDiscoverableWindow(
+    start: () -> Boolean,
+    keepOpen: () -> Boolean,
+    stop: suspend () -> Unit,
+) {
+    try {
+        if (!start()) return
+        withTimeoutOrNull(30_000) {
+            while (keepOpen()) delay(250)
+        }
+    } finally {
+        withContext(NonCancellable) { stop() }
+    }
+}
+
 internal object ReconnectDiscoverability {
+    /** 仅准备被动接受蓝牙连接；不授权主动拨号、Wi-Fi 入网或 RTSP 建链。 */
+    fun bmwPreparationKey(profileId: String, targetMac: String?, isBonded: Boolean,
+                          listening: Boolean, connectionAllowed: Boolean): String? {
+        if (profileId != "bmw_id85" || !isBonded || !listening || !connectionAllowed) return null
+        val mac = targetMac?.trim()?.uppercase(java.util.Locale.ROOT) ?: return null
+        if (!Regex("(?:[0-9A-F]{2}:){5}[0-9A-F]{2}").matches(mac)) return null
+        return "bt:$mac"
+    }
+
     @Volatile private var activePolicy: ReconnectDiscoverabilityPolicy? = null
     /** 首扇窗已结束，或这轮不会再开窗。不在这里再武装第二扇。 */
     @Volatile private var firstWindowFinished = false
@@ -64,6 +93,7 @@ internal object ReconnectDiscoverability {
         servicesReady: () -> Boolean,
         sessionStarted: () -> Boolean,
         log: (String) -> Unit,
+        preparationKey: () -> String? = { null },
     ) {
         firstWindowFinished = false
         val policy = ReconnectDiscoverabilityPolicy()
@@ -73,31 +103,38 @@ internal object ReconnectDiscoverability {
                 if (sessionStarted()) return
                 if (!SettingsStore.bluetoothDiscoverableFallback) firstWindowFinished = true
                 val network = networkKey()
+                val preparation = preparationKey()
+                fun readyForWindow(): Boolean = if (preparation != null) {
+                    preparationKey() == preparation
+                } else preparationKey() == null && servicesReady() && networkKey() == network
                 if (policy.shouldAttempt(SettingsStore.bluetoothDiscoverableFallback, network, servicesReady(), false,
-                        SystemClock.elapsedRealtime())) {
+                        SystemClock.elapsedRealtime(), preparation)) {
                     try {
                         if (!ShizukuTools.isReady) { log("BT-DISCOVERY: 跳过短暂可发现，Shizuku 未就绪"); return }
                         val bind = SpikeShell.connect(context)
                         // 绑定 shell 可能花数秒，期间车机可能已建立会话、换网或用户关闭开关。
-                        if (sessionStarted() || !servicesReady() || networkKey() != network || !SettingsStore.bluetoothDiscoverableFallback) return
+                        if (sessionStarted() || !readyForWindow() || !SettingsStore.bluetoothDiscoverableFallback) return
                         if (!SpikeShell.isConnected()) { log("BT-DISCOVERY: shell 绑定未完成：$bind"); return }
                         val token = UUID.randomUUID().toString()
                         val owner = Binder()
-                        try {
-                            val result = SpikeShell.startBluetoothDiscoverable(owner, token, 30)
-                            log("BT-DISCOVERY: 已配对车机 Wi-Fi/广播/监听就绪 5s 后：$result")
-                            if (!result.startsWith("OK")) return
-                            withTimeoutOrNull(30_000) {
-                                while (!sessionStarted() && networkKey() == network && SettingsStore.bluetoothDiscoverableFallback) {
-                                    delay(250)
+                        var started = false
+                        runDiscoverableWindow(
+                            start = {
+                                val result = SpikeShell.startBluetoothDiscoverable(owner, token, 30)
+                                log("BT-DISCOVERY: ${if (preparation != null) "ID8.5 已配对目标/蓝牙监听" else "已配对车机 Wi-Fi/广播/监听"}就绪 5s 后：$result")
+                                result.startsWith("OK").also { started = it }
+                            },
+                            keepOpen = {
+                                !sessionStarted() && readyForWindow() && SettingsStore.bluetoothDiscoverableFallback
+                            },
+                            stop = {
+                                // 旧轮次只清理本轮 token，不能关闭新窗口。
+                                withContext(Dispatchers.IO) {
+                                    log("BT-DISCOVERY: ${SpikeShell.stopBluetoothDiscoverable(token)}")
                                 }
-                            }
-                        } finally {
-                            // 即使启动 binder 返回时取消，也用本轮 token 清理；旧轮次不会关闭新窗口。
-                            withContext(NonCancellable + Dispatchers.IO) {
-                                log("BT-DISCOVERY: ${SpikeShell.stopBluetoothDiscoverable(token)}")
-                            }
-                        }
+                            },
+                        )
+                        if (!started) return
                     } finally {
                         // 窗已关，或这轮没能开成。进度据此停止把空窗写成交棒完成。
                         firstWindowFinished = true

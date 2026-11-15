@@ -50,8 +50,8 @@ class AirplayDnsRecordsTest {
         records.feed(packet(extra = listOf(address()))); assertNull(records.first())
         records.feed(packet(listOf(srv(7000, 1)))); assertEquals(7000, records.first()!!.port)
         records.feed(packet(listOf(srv(17000, 1)))); assertEquals(17000, records.first()!!.port)
-        records.feed(packet(listOf(srv(17000, 0)))); assertNull(records.first())
-        records.feed(packet(listOf(srv(17000, 1)))); time = 1000; assertNull(records.first())
+        records.feed(packet(listOf(srv(17000, 0)))); time = 1000; assertNull(records.first())
+        records.feed(packet(listOf(srv(17000, 1)))); time = 2000; assertNull(records.first())
     }
 
     @Test fun compressedNamesResolveAndMalformedPacketsDoNotPublishPartialState() {
@@ -66,5 +66,73 @@ class AirplayDnsRecordsTest {
         // Self-referencing compressed owner is bounded and discarded.
         broken.feed(byteArrayOf(0,0,0x84.toByte(),0,0,0,0,1,0,0,0,0,0xc0.toByte(),12) + ByteArray(12))
         assertNull(broken.first())
+    }
+    @Test fun everyAddressOfOneInstanceGetsAChanceAndGoodbyeRemovesOnlyItsAddress() {
+        var time = 0L; val records = AirplayDnsRecords { time }
+        val second = rr("car.local", 1, 120, byteArrayOf(10,0,0,3))
+        records.feed(packet(listOf(srv(7000)), listOf(address(), second)))
+        assertEquals("192.168.1.2", records.first { it.host == "192.168.1.2" }?.host)
+        assertEquals("10.0.0.3", records.first { it.host == "10.0.0.3" }?.host)
+        assertEquals(listOf("10.0.0.3", "192.168.1.2"), records.first { it.host == "10.0.0.3" }?.addresses)
+        records.feed(packet(listOf(rr("car.local",1,0,byteArrayOf(10,0,0,3)))))
+        time = 1000
+        assertEquals("192.168.1.2", records.first()?.host)
+    }
+
+    @Test fun aaaaOnlyReceiverResolvesWithoutInternetDns() {
+        val records = AirplayDnsRecords()
+        val ipv6 = byteArrayOf(0x20,1,0xd.toByte(),0xb8.toByte(),0,0,0,0,0,0,0,0,0,0,0,1)
+        records.feed(packet(listOf(srv(7000)), listOf(rr("car.local",28,120,ipv6))))
+        assertEquals("2001:db8:0:0:0:0:0:1", records.first()?.host)
+    }
+
+    @Test fun cacheFlushReplacesPreviousAddressSetButKeepsAllSiblingsInPacket() {
+        var time = 0L; val records = AirplayDnsRecords { time }
+        records.feed(packet(listOf(srv(7000)), listOf(address())))
+        time = 1001
+        records.feed(packet(listOf(rr("car.local",1,120,byteArrayOf(10,0,0,2)),
+            rr("car.local",1,120,byteArrayOf(10,0,0,3)))))
+        time = 2001
+        assertNull(records.first { it.host == "192.168.1.2" })
+        assertNotNull(records.first { it.host == "10.0.0.2" })
+        assertNotNull(records.first { it.host == "10.0.0.3" })
+    }
+
+    @Test fun ptrDiscoveryActivelyResolvesServiceTxtAndThenBothHostFamilies() {
+        val records = AirplayDnsRecords()
+        records.feed(packet(listOf(rr("_airplay._tcp.local",12,120,name(instance)))))
+        assertTrue(records.pendingQuestions().contains(AirplayDnsRecords.Question(instance.lowercase(),33)))
+        assertTrue(records.pendingQuestions().contains(AirplayDnsRecords.Question(instance.lowercase(),16)))
+        records.feed(packet(listOf(srv(7000))))
+        assertTrue(records.pendingQuestions().contains(AirplayDnsRecords.Question("car.local",1)))
+        assertTrue(records.pendingQuestions().contains(AirplayDnsRecords.Question("car.local",28)))
+        records.feed(packet(listOf(rr("_airplay._tcp.local",12,0,name(instance)))))
+        assertTrue(records.pendingQuestions().contains(AirplayDnsRecords.Question("car.local", 1)))
+    }
+
+    @Test fun linkLocalIpv6UsesReceivingInterfaceScope() {
+        val records = AirplayDnsRecords()
+        val ipv6 = ByteArray(16).apply { this[0]=0xfe.toByte(); this[1]=0x80.toByte(); this[15]=1 }
+        val bytes = packet(listOf(srv(7000)),listOf(rr("car.local",28,120,ipv6)))
+        records.accept(bytes, bytes.size, 7)
+        assertEquals("fe80:0:0:0:0:0:0:1%7", records.first()?.host)
+    }    @Test fun splitCacheFlushRepliesKeepAddressesReceivedWithinOneSecond() {
+        var time = 0L; val records = AirplayDnsRecords { time }
+        records.feed(packet(listOf(srv(7000)), listOf(address())))
+        time = 100
+        records.feed(packet(listOf(rr("car.local",1,120,byteArrayOf(10,0,0,3)))))
+        assertEquals(listOf("192.168.1.2", "10.0.0.3"), records.first()?.addresses)
+    }
+
+    @Test fun goodbyeKeepsRecordForOneSecondAndAnnouncementCanRescueIt() {
+        var time = 0L; val records = AirplayDnsRecords { time }
+        records.feed(packet(listOf(srv(7000)),listOf(address())))
+        records.feed(packet(listOf(address(0))))
+        assertNotNull(records.first())
+        time = 999; assertNotNull(records.first())
+        records.feed(packet(listOf(address())))
+        time = 1000; assertNotNull(records.first())
+        records.feed(packet(listOf(address(0))))
+        time = 2000; assertNull(records.first())
     }
 }

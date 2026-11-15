@@ -1,5 +1,37 @@
 # 宝马盒子流程证据
 
+## 连接前初始化、蓝牙与mDNS对照（2026-11-16）
+
+574 实施范围：所有档案使用绑定当前 Network/接口的 IPv4 与 IPv6 mDNS，主动补查 PTR→SRV/TXT→A/AAAA，并将同实例地址交给原 TCP 重试器；组播锁只覆盖查询期间。ID8.5 单独采用盒子 4E0C/4E0D/4E0A/4E09/4E0B 问候顺序、手机名称作为控制服务实例名，以及已配对目标/被动监听就绪后的短时可发现准备。按用户追加要求，BMW 的设置控制主动建链、邀请门禁和已保存 Wi-Fi 重连策略保持不变。
+
+可发现准备继续受原开关、Shizuku、当前连接授权限制，5 秒稳定后最多 30 秒，开始会话/停止/取消即清理。此处没有将盒子的 AT-LK 指令宣称为 Android 某个精确扫描模式，也没有新增认证验签或在屏幕资源授权前启动实际视频推流；这些不同平台行为还缺等价实现依据。
+
+本轮仅查证当前源码、同一固件样本和既有MGU成功日志，没有修改连接代码、编译或安装。盒子成功记录不是当前手机黑屏轮次，初始化差异不能直接等同根因；ID8.5仍为主线，旧协议问候顺序不能自动套用ID9/奔驰。
+
+### 启动与已对齐部分
+
+S37CarPlay先启动hct_mdnsd，再后台启动xiap2/zlink_server；S42HCTBluetooth按CarPlay模式设置blueware的pair/serial/iap属性，启动独立模块进程。成功记录显示xiap2先准备Wi-Fi驱动和wpa_supplicant，再由车机发起蓝牙连接；盒子实际作为STA连接车机AP。提取固件脚本使用SDIO aic3581bs、wlan0/ap0，成功日志却是USB aic3581bu、air0，不能把脚本逐条当成成功样本真实执行步骤，也不能因wifi_ap.sh的名字认定盒子给车机开AP。
+
+App复用Android蓝牙/Wi-Fi系统栈，已有CarPlay SDP marker和iAP2来向监听；BMW ID8.5配置保留HFP/A2DP并禁用主动出站，与成功记录的Connected from方向一致。已有0x5703→验证IP/绑定车机Network→ctrl ServerSocket/mDNS→邀请/端点→AirPlay流程，Wi-Fi iAP2 worker也已实现，并非缺少连接前listener。MAC由PhoneIdentitySnapshot共享；真实MAC获取失败仍有稳定伪标识回退，现场要核对它与空口蓝牙身份是否一致。
+
+### 明确差异与边界
+
+| 项目 | 固件/成功样本 | 当前App源码 | 结论 |
+|---|---|---|---|
+| mDNS完整发现 | xiap2 0x34cfc DNSServiceBrowse；0x256d8 Resolve；0x27dc0协议掩码3、0x27dc4 GetAddrInfo，IPv4/IPv6均查询 | net/AirplayServiceProbe.kt:35、45、63–64只向224.0.0.251做单轮PTR查询；AirplayDnsRecords.kt:55–79处理SRV/A/model TXT，无AAAA | 高确定性的功能差异。仅PTR或SRV、地址分开发送且需后续解析，或只有AAAA的接收端，App可能错过；已有0x4301/ctrl IPv6端点仍可直连，不能说App不支持IPv6 |
+| 持续性与接口 | 盒子保留Bonjour connection/dispatch source，用if_nametoindex限定接口，Browse→Resolve→地址回调持续处理 | 每次browse默认3秒，发送一次查询，窗口内累积记录；外层可再次调用，窗口之间无该query状态。NSD发布在SDK33+显式setNetwork | App不是完全没有mDNS重试，而是缺少完整持续DNS-SD会话；应把接收端晚发布、拆分应答、TTL变化分别抓包核对 |
+| mDNS发布 | 0x343ec–0x344f4注册_carplay-ctrl._tcp，TXT仅id和srcvers=770.8.1，使用本轮接口/HTTP端口；实例名取设备身份结构+0x44 | CarPlayCtrlAdvertiser.kt:45–46、155–161：实例名固定sender，TXT id/srcvers=770.8.1相同；先建ServerSocket(0)，健康注册复用 | TXT与端口准备已对齐，服务实例名有差异；没有证据证明sender名称导致400/黑屏，不连同srcvers一起盲改 |
+| 可发现窗口前置 | 成功记录34.541s发送AT-LK1，48.709s车机连入，均早于Wi-Fi入网；Detect后发送AT-LK0。0x4ed30–0x4ed70存在对应发送路径 | HyperCarRepo.kt:1299–1311要求已绑定Wi-Fi+目标MAC/SSID，并要求SDP监听和ctrl广播就绪；ReconnectDiscoverability.kt:21–41、75–90再等5秒开30秒窗口 | 冷启动/尚未入网阶段不被App自动兜底覆盖。未完整解码LK处理器，不把LK1精确命名为某个inquiry/page scan组合；已配对设备不一定需要可发现状态 |
+| iAP2前段消息顺序 | 从原始发送帧独立解码：AA05→4E0C→4E0D→4E0A→4E09→4E0B，约100ms后5702 | Iap2SenderSession.kt:275–284、362–363、974–999：旧Wi-Fi路径先4E0C→4E0A→4E0B→4E09，再5702→4E0D | 是可精确单变量对照的MGU差异，尤其卡5703时；当前代码有先请求再声明的既有设计，不能仅据一个成功盒子记录直接全车型翻转。ID9是AA05→4300独立路径 |
+| 保存热点重入 | 0x5d3dc requestWifiConnect及wpa_cli存在主动配置和选择网络路径，但尚未证明待机时一定无蓝牙主动重入保存SSID | HyperCarRepo.kt:1163–1190 monitor在系统已经连入已配对车网后恢复会话；从5703得到凭据时才主动joinAndBind | 若二次上车没有新5703且Android未重入local-only热点，仅监听已连接网络不能完成重新入网。应先区分WIFI_BOUND缺失与已绑定后的AirPlay窗口缺失 |
+| 邀请与主动RTSP | 成功记录49.470s收到5703，49.772s IP ready，51.598s收到本轮ctrl connect后连接7000 | HeadUnitActivationPolicy.kt:14–17仅requireFreshCtrlInvite=true强制同网络/20秒；BMW默认未设该项，允许配置下的已知车网主动尝试 | 有Wi-Fi、RTSP200与视频写帧，不等于车机本轮CarPlay窗口已授权显示。不能从该成功盒子推导所有接收端都须禁用主动模式；需要和无画面轮次的新邀请、屏幕归属一起核对 |
+| 可见身份与握手门禁 | 成功入口从来向连接继续Detect、识别和认证 | HyperCarRepo.kt:953–973冷却/休眠keepIdentityOnly；Iap2Bluetooth.kt:398–401会以sessions-disabled或wifi-handoff拒绝来向 | App“SDP可见”不一定“允许新iAP2”。这是授权暂停/交接策略，先对照BT-REJECT原因，不直接删门禁 |
+| 视频预热 | 成功记录入网前Preheat/Record已启动，实际资源/端口就绪后再启动正式录制 | 自绘/CarWith各有源与资源生命周期，正式自绘编码在连接/票据许可后启动 | 时序不同，但当前已有每轮modes和资源状态及旧代清理，不能笼统认定二次连接沿用了上轮状态，亦不能证明缺预热就是黑屏根因 |
+
+协议常量按[Apple DNS-SD头文件](https://github.com/apple-oss-distributions/mDNSResponder/blob/main/mDNSShared/dns_sd.h)核对，GetAddrInfo协议3为IPv4|IPv6。App未发现显式MulticastLock及对应权限，但Android NSD与手工UDP发现是不同通路，不能据此直接断言mDNS被系统过滤；如做丢包实验，应结合空口/手机抓包和系统状态验证，[Android MulticastLock说明](https://developer.android.com/reference/android/net/wifi/WifiManager.MulticastLock)仅说明一般过滤行为，不是本次丢包证据。
+
+建议优先级：补齐mDNS双栈、分阶段Resolve及持续发现的可重复测试；在BMW旧协议单独比较4E0D/5702顺序；现场同步记录冷启动可发现前置、身份MAC、BT会话门禁和本轮ctrl邀请。已通过RECORD且只有声音的轮次，再查看changeModes/requestUI、screen owned、视频SETUP/config/IDR和接收端统计，不能把发现阶段缺口当作已经推流后的必然解释。App的MFi ready仍是兼容交换结果，未完成证书/签名校验；本轮也未逆向证明盒子的完整验签算法。
+
 2026-11-16最新URI状态：按用户追加要求，已将绝对会话URI扩大到所有车机档案，删除BMW专用门控和配置字段，统一从配对后的公共会话路径安装。下文BMW单变量对照是此前实施阶段记录；最新测试见[验证记录](VALIDATION.md)。
 
 2026-11-16编码策略更新：所有档案现在默认能力门控的HEVC优先，ID9不再无条件禁止声明；保留显式H.264选择，要求手机硬件编码能力与本轮会话确认，详见[视频策略](VIDEO-STREAM-REVIEW.md)。下文的默认关闭和ID9关闭记录反映早期固件对照阶段；随后CarWith硬件转码已实现并经DiPlay验证。

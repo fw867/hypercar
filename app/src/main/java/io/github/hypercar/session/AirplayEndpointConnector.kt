@@ -11,7 +11,7 @@ internal data class AirplayTarget(val host: String, val port: Int) {
 
 /** Invitations identify a host, not a port. Preserve a recent explicit SRV/iAP2 port. */
 internal class AirplayEndpointHints(private val defaultPort: Int = 7000) {
-    private var advertised: AirplayTarget? = null
+    private val advertised = mutableMapOf<String, AirplayTarget>()
     private var lastInvitation: Any? = null
     /** The first existing invitation must supersede a cached/scanned endpoint too. */
     fun invitation(identity: Any, host: String): AirplayTarget? {
@@ -19,8 +19,8 @@ internal class AirplayEndpointHints(private val defaultPort: Int = 7000) {
         lastInvitation = identity
         return invited(host)
     }
-    fun advertised(target: AirplayTarget): AirplayTarget { advertised = target; return target }
-    fun invited(host: String): AirplayTarget = advertised?.takeIf { it.host == host } ?: AirplayTarget(host, defaultPort)
+    fun advertised(target: AirplayTarget): AirplayTarget { advertised[target.host] = target; return target }
+    fun invited(host: String): AirplayTarget = advertised[host] ?: AirplayTarget(host, defaultPort)
 }
 
 /** Transport-only recovery. Does not pair, stop iAP2, or treat discovery as activation. */

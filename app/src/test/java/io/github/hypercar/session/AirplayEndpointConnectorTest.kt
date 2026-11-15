@@ -9,6 +9,16 @@ import org.junit.Test
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class AirplayEndpointConnectorTest {
+    @Test fun eachAddressRetainsItsExplicitSrvPortWhenInvited() {
+        val hints = AirplayEndpointHints(7000)
+        val ipv4 = AirplayTarget("192.0.2.4", 7001)
+        val ipv6 = AirplayTarget("2001:db8::4", 7001)
+        hints.advertised(ipv4)
+        hints.advertised(ipv6)
+        assertEquals(ipv4, hints.invitation(Any(), ipv4.host))
+        assertEquals(ipv6, hints.invitation(Any(), ipv6.host))
+    }
+
     private val old = AirplayTarget("192.168.1.1", 7000)
     private val fresh = AirplayTarget("192.168.1.2", 17000)
 
