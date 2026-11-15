@@ -44,34 +44,21 @@ impl Microphone {
 struct CaptureLease(Arc<crate::mic_probe::ProbeControl>);
 impl Drop for CaptureLease {fn drop(&mut self){self.0.request(false);}}
 
-// Observe framing and cryptographic success only. Incoming VR semantics and
-// reply format are deliberately left uninterpreted; nothing reaches playback.
-pub(super) fn observe_incoming(observer:&mut channel_diagnostics::Observer,stats:&mut channel_diagnostics::Stats,state:&session::Shared,input:&[u8]) {
-    observer.push(input,stats,|_service,payload,stats| {
-        stats.observed_only+=1;
-        if payload.is_empty() {stats.empty+=1;return;}
-        match state.lock().decrypt(payload) {
-            Ok(_)=>stats.decrypt_ok+=1,
-            Err(_)=>stats.decrypt_fail+=1,
-        }
-    });
-}
-
-pub(super) async fn run(stream:TcpStream,state:session::Shared,control:Arc<crate::mic_probe::ProbeControl>,stop:Arc<Notify>) {
+pub(super) async fn run(stream:TcpStream,state:session::Shared,control:Arc<crate::mic_probe::ProbeControl>,stop:Arc<Notify>,events:mpsc::UnboundedSender<CarLifeEvent>) {
     let _lease=CaptureLease(control.clone());
     let (mut rd,mut wr)=stream.into_split();let mut discard=[0;4096];
     let mut tick=tokio::time::interval(Duration::from_millis(8));
     let mut previous=0;let mut packets=0u64;
-    let mut observer=channel_diagnostics::Observer::default();
+    let mut receiver=voice_audio::Receiver::default();
     let mut stats=channel_diagnostics::Stats::default();
     let mut diagnostics=tokio::time::interval(Duration::from_secs(5));
     diagnostics.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {tokio::select! {biased;
-        _=stop.notified()=>{emit_log(&stats.report("VR","stopped",observer.pending()));control.request(false);return;},
-        _=diagnostics.tick()=>emit_log(&stats.report("VR","periodic",observer.pending())),
+        _=stop.notified()=>{emit_log(&stats.report("VR","stopped",receiver.pending()));control.request(false);return;},
+        _=diagnostics.tick()=>emit_log(&stats.report("VR","periodic",receiver.pending())),
         received=rd.read(&mut discard)=>{match received {
-            Ok(n) if n>0=>observe_incoming(&mut observer,&mut stats,&state,&discard[..n]),
-            result=>{emit_log(&stats.report("VR",if matches!(result,Ok(0)){"eof"}else{"ioError"},observer.pending()));control.request(false);return;}
+            Ok(n) if n>0=>receiver.push(&discard[..n],&mut stats,&state,&events),
+            result=>{emit_log(&stats.report("VR",if matches!(result,Ok(0)){"eof"}else{"ioError"},receiver.pending()));control.request(false);return;}
         }},
         _=tick.tick()=>{
             let generation=control.generation();
@@ -125,7 +112,7 @@ mod wire_tests {
         let client=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();let(mut peer,_)=listener.accept().await.unwrap();
         let control=Arc::new(crate::mic_probe::ProbeControl::for_carwith());control.arm_test();control.request(true);
         let generation=control.generation();let state=session::microphone_test_session();let stop=Arc::new(Notify::new());
-        let worker=tokio::spawn(run(client,state.clone(),control.clone(),stop.clone()));
+        let worker=tokio::spawn(run(client,state.clone(),control.clone(),stop.clone(),mpsc::unbounded_channel().0));
         control.carwith.as_ref().unwrap().push(generation,&[1234;512],16000).unwrap();
         let mut header=[0;12];tokio::time::timeout(Duration::from_secs(2),peer.read_exact(&mut header)).await.unwrap().unwrap();
         assert_eq!(u32::from_be_bytes(header[8..].try_into().unwrap()),0x58001);
@@ -147,7 +134,7 @@ mod cancellation_tests {
         let client=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();let(_peer,_)=listener.accept().await.unwrap();
         let control=Arc::new(crate::mic_probe::ProbeControl::for_carwith());control.arm_test();control.request(true);
         let generation=control.generation();control.carwith.as_ref().unwrap().push(generation,&[1;512],16000).unwrap();
-        let task=tokio::spawn(run(client,session::microphone_test_session(),control.clone(),Arc::new(Notify::new())));
+        let task=tokio::spawn(run(client,session::microphone_test_session(),control.clone(),Arc::new(Notify::new()),mpsc::unbounded_channel().0));
         tokio::task::yield_now().await;task.abort();assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(control.generation()&1,0);assert_eq!(control.carwith.as_ref().unwrap().queued_bytes(),0);
     }

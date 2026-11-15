@@ -197,6 +197,7 @@ pub struct RtspChannel {
     reader: tokio::task::JoinHandle<()>,
     closed: AtomicBool,
     pub(crate) nbt_recorded: tokio::sync::Mutex<bool>,
+    session_uri: std::sync::OnceLock<crate::rtsp_uri::SessionUri>,
 }
 
 // Removal is also required when a request future is cancelled by its caller. A partially
@@ -251,6 +252,7 @@ impl RtspChannel {
             reader,
             closed: AtomicBool::new(false),
             nbt_recorded: tokio::sync::Mutex::new(false),
+            session_uri: std::sync::OnceLock::new(),
         });
         (this, inbound)
     }
@@ -262,6 +264,9 @@ impl RtspChannel {
     }
 
     pub fn trace_id(&self) -> u64 { self.trace_id }
+    pub(crate) fn set_session_uri(&self,uri:crate::rtsp_uri::SessionUri)->Result<(),String> {
+        self.session_uri.set(uri).map_err(|_|"session URI already belongs to this control channel".into())
+    }
 
 
     pub fn next_cseq(&self) -> i32 {
@@ -281,6 +286,9 @@ impl RtspChannel {
         timeout: Duration,
     ) -> Result<RtspMessage, String> {
         if self.is_closed() { return Err("控制通道已关闭".into()); }
+        // Resolve before diagnostics, formatting, and encryption so both wire and trace
+        // use the same immutable target. Incoming responses and audio SETUP are untouched.
+        let path=self.session_uri.get().map(|uri|uri.resolve(method,path)).unwrap_or(path);
         let deadline = tokio::time::Instant::now() + timeout;
         let cseq = self.next_cseq();
         let started = std::time::Instant::now();
@@ -617,6 +625,45 @@ async fn respond(write: &SharedWrite, cipher: &SharedCipher, cseq: Option<i32>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn absolute_session_uri_is_immutable_reused_and_preserves_encrypted_transactions() {
+        use crate::bplist::{self,Value};
+        for session_id in [None,Some(7u64),Some(8u64)] {
+            let session=bplist::encode(&Value::dict(vec![("features",Value::array(vec![Value::str("hevc")])),("timingPort",Value::int(12345))]));
+            let screen=crate::airplay::build_screen_setup_with_latency(987,"display",75);
+            let teardown=bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![("type",Value::int(110))])]))]));
+            let cases=vec![("SETUP","/setup",session),("SETUP","/",screen),("RECORD","/",vec![]),
+                ("TEARDOWN","/",teardown),("TEARDOWN","/",bplist::encode(&Value::dict(vec![("streams",Value::Array(vec![]))]))),
+                ("SETUP","rtsp://[fe80::1]:7000/",b"audio unchanged".to_vec()),("POST","/command",b"command unchanged".to_vec()),("GET","/info",vec![])];
+            let expected=cases.clone();
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client=tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let(mut peer,_)=listener.accept().await.unwrap();let(r,w)=client.into_split();
+            let(channel,_)=RtspChannel::spawn(r,w,Some(ControlCipher::new([1;32],[2;32])));
+            if let Some(id)=session_id {
+                channel.set_session_uri(crate::rtsp_uri::SessionUri::new("fe80::1%wlan0",id).unwrap()).unwrap();
+                assert!(channel.set_session_uri(crate::rtsp_uri::SessionUri::new("192.0.2.2",999).unwrap()).is_err());
+            }
+            let server=tokio::spawn(async move {
+                let mut cipher=ControlCipher::new([2;32],[1;32]);let mut wire=vec![];let mut plain=vec![];
+                for (index,(method,path,body)) in expected.into_iter().enumerate() {
+                    let request=loop {
+                        let mut buf=[0;4096];let n=peer.read(&mut buf).await.unwrap();assert!(n>0);wire.extend_from_slice(&buf[..n]);
+                        let(decoded,used)=cipher.decrypt(&wire).unwrap();wire.drain(..used);plain.extend(decoded);
+                        if let Some(msg)=parse_rtsp_messages(&mut plain).unwrap().pop(){break msg;}
+                    };
+                    let target=match session_id {Some(id) if index<5=>format!("rtsp://[fe80::1%25wlan0]/{id}"),_=>path.to_string()};
+                    assert_eq!(request.first_line,format!("{method} {target} RTSP/1.0"));
+                    assert_eq!(request.body,body);assert_eq!(request.cseq(),Some(index as i32+1));
+                    assert_eq!(request.headers.get("user-agent").map(String::as_str),Some("AirPlay/770.8.1"));
+                    peer.write_all(&cipher.encrypt(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",request.cseq().unwrap()).as_bytes())).await.unwrap();
+                }
+            });
+            for (method,path,body) in cases {assert_eq!(channel.request(method,path,&body,"application/x-apple-binary-plist",&[],Duration::from_secs(2)).await.unwrap().status(),200);}
+            server.await.unwrap();
+        }
+    }
 
     #[test]
     fn framing_rejects_invalid_and_oversized_lengths_without_consuming_input() {

@@ -4,6 +4,18 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class VideoCodecPolicyTest {
+    @Test fun missingPreferenceDefaultsToHevcButExplicitAvcAndInvalidValuesArePreservedSafely() {
+        assertEquals("hevc", VideoCodecPolicy.storedPreference(null))
+        assertEquals("h264", VideoCodecPolicy.storedPreference("h264"))
+        assertEquals("hevc", VideoCodecPolicy.storedPreference("hevc"))
+        assertEquals("h264", VideoCodecPolicy.storedPreference("invalid"))
+    }
+    @Test fun hardwarePreflightCannotUpgradeExplicitAvcOrProposeUnsupportedHevc() {
+        assertEquals("hevc", VideoCodecPolicy.forHardware("hevc", true))
+        assertEquals("h264", VideoCodecPolicy.forHardware("hevc", false))
+        assertEquals("h264", VideoCodecPolicy.forHardware("h264", true))
+        assertEquals("h264", VideoCodecPolicy.forHardware("h264", false))
+    }
     @Test fun hevcRequiresPreferenceAndCurrentReceiverPermission() {
         assertEquals(VideoCodec.H264, VideoCodecPolicy.preferred("h264", true))
         assertEquals(VideoCodec.H264, VideoCodecPolicy.preferred("hevc", false))

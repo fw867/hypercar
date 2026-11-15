@@ -5,6 +5,9 @@ enum class VideoCodec(val wireId: Int, val mime: String) {
 }
 
 object VideoCodecPolicy {
+    fun storedPreference(value: String?): String = if (value == null || value == "hevc") "hevc" else "h264"
+    fun forHardware(preference: String, hardwareHevc: Boolean): String =
+        if (preference == "hevc" && hardwareHevc) "hevc" else "h264"
     fun preferred(preference: String, receiverHevcAllowed: Boolean): VideoCodec =
         if (preference == "hevc" && receiverHevcAllowed) VideoCodec.HEVC else VideoCodec.H264
 

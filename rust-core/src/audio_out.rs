@@ -66,6 +66,7 @@ pub struct AudioOut {
     ownership: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     blocked_samples: u64,
     aac: Option<crate::aac::AacEncoder>,
+    opus: Option<crate::opus_encode::OpusEncoder>,
     aac_needs_reset: bool,
     sample_rate: u32,
     resampler: Option<crate::audio_resample::Stereo48To441>,
@@ -95,6 +96,7 @@ impl AudioOut {
             ownership: None,
             blocked_samples: 0,
             aac: None,
+            opus: None,
             aac_needs_reset: false,
             sample_rate: 48000,
             resampler: None,
@@ -109,11 +111,16 @@ impl AudioOut {
         output.aac = Some(encoder);
         output
     }
+    pub fn new_opus(data: UdpSocket, sync: Option<UdpSocket>, key: [u8;32], sample_rate:u32, samples_per_packet:usize, stream_type:u8) -> std::io::Result<Self> {
+        let encoder=crate::opus_encode::OpusEncoder::new(sample_rate,samples_per_packet)?;
+        let mut output=Self::new(data,sync,key,stream_type);
+        output.sample_rate=encoder.sample_rate();output.opus=Some(encoder);Ok(output)
+    }
     pub fn sample_rate(&self) -> u32 { self.sample_rate }
     pub fn stream_type(&self) -> i64 { self.pt as i64 }
-    pub fn codec_name(&self) -> &'static str { match self.pt {100=>"PCM",102=>"AAC",_=>""} }
+    pub fn codec_name(&self) -> &'static str { if self.opus.is_some() { "OPUS" } else { match self.pt {100=>"PCM",102=>"AAC",_=>""} } }
     pub fn payload_bytes_sent(&self) -> u64 { self.payload_bytes }
-    pub fn samples_per_packet(&self) -> usize { if self.pt == 102 { crate::aac::FRAMES } else { SAMPLES_PER_PACKET } }
+    pub fn samples_per_packet(&self) -> usize { if let Some(opus)=self.opus.as_ref() {opus.samples_per_packet()} else if self.pt == 102 { crate::aac::FRAMES } else { SAMPLES_PER_PACKET } }
 
     /// 发送交错 PCM（48kHz 立体声 i16）。内部按 352 帧切包逐包发送，
     /// **尾部不足一包的余数不发**（由调用方留存到下一批）。
@@ -146,10 +153,15 @@ impl AudioOut {
             self.blocked_samples = self.blocked_samples.saturating_add(frames.len() as u64);
             self.marker_pending = true;
             if self.pt == 102 { self.aac.take(); self.aac_needs_reset = true; }
+            if let Some(encoder)=self.opus.as_mut() { encoder.reset()?; }
             if let Some(converter) = self.resampler.as_mut() { converter.reset(); }
             return Ok(());
         }
-        if self.pt == 102 {
+        if let Some(encoder)=self.opus.as_mut() {
+            let sample_frames=encoder.samples_per_packet() as u32;
+            let encoded=encoder.encode(frames)?;
+            for payload in encoded { self.send_payload(&payload,sample_frames).await?; }
+        } else if self.pt == 102 {
             if self.aac_needs_reset {
                 self.aac_needs_reset = false;
                 self.aac = Some(crate::aac::AacEncoder::at_rate(self.sample_rate)?);
@@ -174,6 +186,7 @@ impl AudioOut {
         if !self.owns_audio() {
             self.marker_pending = true;
             if self.pt == 102 { self.aac.take(); self.aac_needs_reset = true; }
+            if let Some(encoder)=self.opus.as_mut() { encoder.reset()?; }
             if let Some(converter) = self.resampler.as_mut() { converter.reset(); }
             return Ok(());
         }
@@ -224,6 +237,59 @@ impl AudioOut {
     /// 已发送音频包数（对外统计）。
     pub fn packets_sent(&self) -> u64 {
         self.packets
+    }
+}
+
+#[cfg(test)]
+mod opus_output_tests {
+    use super::*;
+    use std::sync::{Arc,atomic::{AtomicBool,Ordering}};
+    #[tokio::test]
+    async fn opus_rtp_uses_negotiated_rate_spf_payload_type_aead_and_sync() {
+        for (rate,frames,pt) in [(24000,480,100),(48000,960,101)] {
+            let receiver=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let data=UdpSocket::bind("127.0.0.1:0").await.unwrap();data.connect(receiver.local_addr().unwrap()).await.unwrap();
+            let sync_receiver=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let sync=UdpSocket::bind("127.0.0.1:0").await.unwrap();sync.connect(sync_receiver.local_addr().unwrap()).await.unwrap();
+            let key=[9;32];let mut out=AudioOut::new_opus(data,Some(sync),key,rate,frames,pt).unwrap();
+            assert_eq!(out.codec_name(),"OPUS");assert_eq!(out.sample_rate(),rate);assert_eq!(out.samples_per_packet(),frames);
+            out.send_pcm(&[1000,1000].repeat(1920)).await.unwrap();
+            let mut packet=[0;4096];
+            for index in 0..2 {
+                let n=tokio::time::timeout(std::time::Duration::from_secs(1),receiver.recv(&mut packet)).await.unwrap().unwrap();
+                assert_eq!(packet[1]&127,pt);assert_eq!(packet[1]&128,if index==0 {128}else{0});
+                assert_eq!(u16::from_be_bytes(packet[2..4].try_into().unwrap()),index as u16);
+                assert_eq!(u32::from_be_bytes(packet[4..8].try_into().unwrap()),index*frames as u32);
+                assert_eq!(&packet[8..12],&[0;4]);assert_eq!(&packet[n-8..n],&u64::from(index).to_le_bytes());
+                let plain=crate::crypto::chacha_open(&key,&nonce64(u64::from(index)),&packet[12..n-8],&packet[4..12]).unwrap();
+                assert_eq!(unsafe{audiopus_sys::opus_packet_get_nb_samples(plain.as_ptr(),plain.len() as i32,rate as i32)},frames as i32);
+                assert_eq!(unsafe{audiopus_sys::opus_packet_get_nb_channels(plain.as_ptr())},1);
+            }
+            assert_eq!(out.packets_sent(),2);
+            out.send_sync_now(1_000_000_000).await.unwrap();
+            let n=sync_receiver.recv(&mut packet).await.unwrap();assert_eq!(n,20);
+            assert_eq!(u32::from_be_bytes(packet[4..8].try_into().unwrap()),frames as u32*2);
+            assert_eq!(u32::from_be_bytes(packet[16..20].try_into().unwrap()),frames as u32*3);
+        }
+    }
+    #[tokio::test]
+    async fn opus_resource_loss_discards_buffered_audio_without_reusing_nonce() {
+        let receiver=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let data=UdpSocket::bind("127.0.0.1:0").await.unwrap();data.connect(receiver.local_addr().unwrap()).await.unwrap();
+        let mut out=AudioOut::new_opus(data,None,[3;32],24000,480,100).unwrap();
+        let owned=Arc::new(AtomicBool::new(true));out.set_ownership(owned.clone());
+        out.send_pcm(&[10000,10000].repeat(960)).await.unwrap();
+        let mut packet=[0;4096];receiver.recv(&mut packet).await.unwrap();
+        out.send_pcm(&[10000,10000].repeat(600)).await.unwrap();
+        owned.store(false,Ordering::Release);out.send_pcm(&[10000,10000].repeat(352)).await.unwrap();
+        owned.store(true,Ordering::Release);out.skip_source_frames(960);
+        out.send_pcm(&[0;1920]).await.unwrap();
+        let n=receiver.recv(&mut packet).await.unwrap();
+        assert_eq!(&packet[n-8..n],&1u64.to_le_bytes());assert_eq!(packet[1]&128,128);
+        assert_eq!(u32::from_be_bytes(packet[4..8].try_into().unwrap()),960);
+        let actual=crate::crypto::chacha_open(&[3;32],&nonce64(1),&packet[12..n-8],&packet[4..12]).unwrap();
+        let expected=crate::opus_encode::OpusEncoder::new(24000,480).unwrap().encode(&[0;1920]).unwrap();
+        assert_eq!(actual,expected[0]);assert_eq!(out.packets_sent(),2);
     }
 }
 

@@ -82,6 +82,10 @@ object RustCoreBridge {
 
     external fun nativeInitLogger()
 
+    /** JNI factory belongs to the stable bridge, independent of delegated session listeners. */
+    fun createCarWithTranscoder(width: Int, height: Int, targetWidth: Int, targetHeight: Int, fps: Int, csd: ByteArray): CarWithHevcTranscoder =
+        CarWithHevcTranscoder.open(width, height, targetWidth, targetHeight, fps, csd)
+
     external fun nativeSetListener(listener: EventListener?)
 
     external fun nativeSetTouchListener(listener: TouchListener?)
@@ -127,6 +131,11 @@ object RustCoreBridge {
 
     /** 投喂一包 PCM（16-bit 小端交错；本机采集的音频）。 */
     external fun nativePushAudioPcm(pcm: ShortArray, rate: Int, channels: Int)
+
+    /** UID-isolated navigation utterances, independent from continuous media PCM. */
+    external fun nativeStartNavigationAudio(rate: Int, channels: Int)
+    external fun nativePushNavigationAudioPcm(pcm: ShortArray, rate: Int, channels: Int)
+    external fun nativeStopNavigationAudio()
 
     /** Rust 侧是否在运行（诊断）。 */
     external fun nativeIsRunning(): Boolean

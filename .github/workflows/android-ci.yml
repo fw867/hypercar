@@ -122,8 +122,13 @@ jobs:
       - name: 编译 Rust 核心层 → jniLibs
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          CMAKE_GENERATOR: Ninja
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
         run: |
           set -eu
+          command -v cmake
+          command -v ninja
           cd rust-core
           cargo ndk -t arm64-v8a -o ../app/src/main/jniLibs build --release
           ls -la ../app/src/main/jniLibs/arm64-v8a/

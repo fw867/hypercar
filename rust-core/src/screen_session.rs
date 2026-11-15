@@ -63,6 +63,7 @@ impl ScreenSession {
         let (_,write)=socket.into_split();
         let (w,h)=*self.params.encoder_size.lock();
         let mut sender=ScreenSender::new(write,cipher,w,h,self.keep_stats);
+        sender.set_receiver_size(self.display);
         sender.set_hevc_allowed(self.hevc_allowed);
         sender.attach_diagnostics(self.params.pipeline.clone(),conn_id as u64);
         if self.params.carwith_stretch { sender.set_display_target(self.display.0,self.display.1); }

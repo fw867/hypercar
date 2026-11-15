@@ -269,7 +269,7 @@ object SettingsStore {
         set(v) = p().edit().putInt(KEY_HEIGHT, v.coerceAtLeast(2)).apply()
 
     var videoCodec: String
-        get() = p().getString("video_codec", "h264").let { if (it == "hevc") "hevc" else "h264" }
+        get() = VideoCodecPolicy.storedPreference(p().getString("video_codec", null))
         set(v) = p().edit().putString("video_codec", if (v == "hevc") "hevc" else "h264").apply()
 
     val videoCapabilities = VideoSessionCapabilities()
@@ -434,7 +434,7 @@ object SettingsStore {
             append("\"touch_display_h\":").append(tdH).append(",")
             append("\"fps\":").append(plan.fps).append(",")
             append("\"enable_audio\":").append(enableAudio).append(",")
-            append("\"video_codec\":\"").append(videoCodec).append("\",")
+            append("\"video_codec\":\"").append(VideoCodecPolicy.forHardware(videoCodec, VideoHardwareCapabilities.hevcEncoderAvailable)).append("\",")
             append("\"bmw_capabilities\":").append(profile.id.startsWith("bmw_")).append(",")
             append("\"audio_codec\":\"").append(audioCodec).append("\",")
             append("\"microphone_probe\":").append(microphoneProbe && !carWithMode).append(",")

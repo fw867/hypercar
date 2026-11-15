@@ -9,7 +9,7 @@
 | CMD | 7240 | 版本、身份、挑战、功能、加密及编码控制 |
 | VIDEO | 8240 | H.264 |
 | MEDIA / TTS | 9240 / 9241 | 音乐、提示音PCM |
-| VR | 9242 | 默认排空；车机麦克风实验开启时加密上行 PCM |
+| VR | 9242 | 独立语音回复PCM下行；车机麦克风实验开启时同时加密上行PCM |
 | CTRL | 9340 | 触摸与硬键 |
 | DATA | 9440 | CarWith附加数据 |
 
@@ -34,6 +34,16 @@ CarWith入口可能使用手机蓝牙名称显示设备；该显示名不是AirP
 参考：[mcarplay固定版本](https://github.com/wangxso/mcarplay/tree/a3a4117ed60b864324d681e45086be594ed7233a) 的状态机、挑战绑定、七路连接、视频分片和入流门控；后续大众策略另参考 `f1ec3ffaa1f9c11b548ec1a8d8f7afff087d8627`。第三方成功不替代本项目验证。
 
 实现：`carlife.rs`、`carlife/session.rs`、`carlife/video.rs`。不再维护重复的通用回环监听/发现旧方案。
+
+## 573：补齐 VR 回复音频
+
+本机CarWith/CarLife源码确认：RemoteVRAudioProcessor→CarLifeAudioManager→TTSPCMUtil→VRAudioManager将助手回复写到9242。0x50002的初始化正文是CarlifeTTSInit（字段1采样率、2声道数、3样本位数），0x50003是PCM16数据，两者按现有AES会话解密；0x50004是空明文STOP。外层PCMPackageHead只有一层12字节头。它与送入麦克风的0x58001不同，不能因通道叫VR就丢弃所有下行。
+
+接收器在认证、准入、加密及源开始条件满足后处理消息，要求先有效INIT再接DATA，拒绝不支持的格式、坏加密和未对齐PCM。默认手机麦克风路径和车机麦克风实验共用回复接收器；麦克风仍由原有单writer写入，不因回复开始而启用录音。未知FEED_END/INTERRUPT仅统计；未找到当前发送端必须接收新DONE回执的依据，因此不新增回执。
+
+MEDIA、导航TTS、助手VR各自保留输入队列，VR正常STOP关闭输入并排完已有尾音，新INIT清旧参数与队列；最终仍混到当前48k立体声媒体输出，沿用音频所有权门禁、RTP计时和防突发补包策略。盒子固件还有独立speechRecognition/AltAudio实现，但不能把这些名字直接套到本项目；本轮未新增SIRI/OPUS或绕过车机资源限制。
+
+同批后续已按用户要求补独立AirPlay输出：MGU/ID8.5在对应能力可用时，将VR回复送往OPUS24k主speechRecognition流、TTS送往OPUS48k AltAudio/default流；MEDIA仍保留原PCM/AAC。缺能力或已确认清理的SETUP拒绝才回退媒体混音，资源拒绝不绕过授权。新源重置会结束两路旧辅助输入；回复接收本身不启用录音。详见[独立音频生命周期](AUDIO.md)。
 
 
 ## 2026-11-13 645：车机麦克风接入（实验）

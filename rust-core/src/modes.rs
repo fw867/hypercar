@@ -84,9 +84,76 @@ pub struct Modes {
     revision: u64,
     audio_epoch: u64,
     audio_change_epoch: u64,
+    speech_epoch: u64,
+    audio_borrow_epoch: u64,
+    navigation_epoch: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct SpeechLease { generation:u64, borrow_generation:u64, borrowed:bool }
+impl SpeechLease { pub fn valid(&self,modes:&Modes)->bool { modes.speech_epoch==self.generation && modes.audio_borrow_epoch==self.borrow_generation && modes.apps[0]==1 && modes.speech==1 && modes.audio_owned() } }
+#[derive(Clone, Debug)]
+pub struct NavigationLease { generation:u64 }
+impl NavigationLease { pub fn valid(&self,modes:&Modes)->bool { modes.navigation_epoch==self.generation && modes.apps[2]==1 } }
+#[derive(Clone)]
+pub(crate) struct AuxTransition { base:(u64,u64,u64), next:Modes, speech:bool }
+impl AuxTransition { pub fn declaration(&self)->Vec<u8> { self.next.declaration() } }
+
 impl Modes {
+    pub(crate) fn speech_begin(&self,user:bool)->Option<(AuxTransition,SpeechLease)> {
+        if self.apps[0]!=0 || self.speech!=-1 { return None; }
+        let mut next=self.clone(); let borrowed=!self.audio_owned();
+        if borrowed {
+            // A temporary reply never takes permanent media ownership or interrupts
+            // an accessory borrowing our permanent resource.
+            if self.resources[1].permanent!=2 {return None;}
+            let request=Value::dict(vec![("transferType",Value::int(3)),
+                ("transferPriority",Value::int(if user {USER_INITIATED} else {ANYTIME})),
+                ("unborrowConstraint",Value::int(ANYTIME))]);
+            if !next.resources[1].request(&request,1) {return None;}
+        }
+        next.apps[0]=1; next.speech=1; next.speech_epoch=self.speech_epoch.wrapping_add(1);
+        next.audio_borrow_epoch=self.audio_borrow_epoch.wrapping_add(1);
+        let lease=SpeechLease{generation:next.speech_epoch,borrow_generation:next.audio_borrow_epoch,borrowed};
+        Some((AuxTransition{base:self.aux_generations(),next,speech:true},lease))
+    }
+    pub(crate) fn speech_end(&self,lease:&SpeechLease)->Option<AuxTransition> {
+        // Receiver audio arbitration revokes the playback gate, but does not take
+        // ownership of our speech app. Clear only that app if it is still ours.
+        if self.speech_epoch!=lease.generation || self.apps[0]!=1 || self.speech!=1 {return None;}
+        let mut next=self.clone();
+        if lease.borrowed && self.audio_borrow_epoch==lease.borrow_generation &&
+            !next.resources[1].request(&Value::dict(vec![("transferType",Value::int(4))]),1) {return None;}
+        next.apps[0]=0; next.speech=-1; next.speech_epoch=self.speech_epoch.wrapping_add(1);
+        next.audio_borrow_epoch=self.audio_borrow_epoch.wrapping_add(1);
+        Some(AuxTransition{base:self.aux_generations(),next,speech:true})
+    }
+    pub(crate) fn navigation_begin(&self)->Option<(AuxTransition,NavigationLease)> {
+        if self.apps[2]!=0 {return None;}
+        let mut next=self.clone(); next.apps[2]=1; next.navigation_epoch=self.navigation_epoch.wrapping_add(1);
+        let lease=NavigationLease{generation:next.navigation_epoch};
+        Some((AuxTransition{base:self.aux_generations(),next,speech:false},lease))
+    }
+    pub(crate) fn navigation_end(&self,lease:&NavigationLease)->Option<AuxTransition> {
+        if !lease.valid(self) {return None;}
+        let mut next=self.clone(); next.apps[2]=0; next.navigation_epoch=self.navigation_epoch.wrapping_add(1);
+        Some(AuxTransition{base:self.aux_generations(),next,speech:false})
+    }
+    fn aux_generations(&self)->(u64,u64,u64) {(self.speech_epoch,self.audio_borrow_epoch,self.navigation_epoch)}
+    pub(crate) fn commit_aux(&mut self,proposal:&AuxTransition)->bool {
+        // Only changed domains invalidate an acknowledged proposal. Merge the
+        // touched fields so a receiver screen/other-app update is never reverted.
+        let base=self.aux_generations();
+        if if proposal.speech {base.0!=proposal.base.0 || base.1!=proposal.base.1}else{base.2!=proposal.base.2} {return false;}
+        if proposal.speech {
+            self.resources[1]=proposal.next.resources[1]; self.apps[0]=proposal.next.apps[0];
+            self.speech=proposal.next.speech; self.speech_epoch=proposal.next.speech_epoch;
+            self.audio_borrow_epoch=proposal.next.audio_borrow_epoch;
+        } else {self.apps[2]=proposal.next.apps[2];self.navigation_epoch=proposal.next.navigation_epoch;}
+        self.audio_epoch=self.audio_epoch.wrapping_add(1);
+        self.audio_change_epoch=self.audio_change_epoch.wrapping_add(1);
+        true
+    }
     pub fn initial() -> Self { Self { speech: -1, playback_enabled: true, ..Self::default() } }
     pub fn box_initial() -> Self {
         let mut value = Self::initial();
@@ -106,6 +173,7 @@ impl Modes {
         if self.audio_epoch != epoch { return false; }
         self.resources[1] = claim.resources[1];
         self.audio_epoch = self.audio_epoch.wrapping_add(1);
+        self.audio_borrow_epoch = self.audio_borrow_epoch.wrapping_add(1);
         true
     }
     pub fn screen_owned(&self) -> bool { self.resources[0].current == 1 }
@@ -222,6 +290,11 @@ impl Modes {
             }
         }
         if !next.apply_apps(params) { return false; }
+        let requested_app = |id| params.get("appStates").and_then(Value::as_array)
+            .map(|values| values.iter().any(|v| integer(v,"appStateID")==Some(id))).unwrap_or(false);
+        if audio_request {next.audio_borrow_epoch=self.audio_borrow_epoch.wrapping_add(1);}
+        if requested_app(1) {next.speech_epoch=self.speech_epoch.wrapping_add(1);}
+        if requested_app(3) {next.navigation_epoch=self.navigation_epoch.wrapping_add(1);}
         // Only screen changes invalidate a pending video stream grant; audio/app changes
         // must not cancel screen setup.
         if next.resources[0] != self.resources[0] {
@@ -465,6 +538,71 @@ mod id9_bootstrap_tests {
             let mut modes=Modes::id9_initial(&info,true);
             assert!(!modes.screen_owned()); assert!(modes.audio_owned());
             modes.request_ui(); assert_eq!(modes.screen_owned(),constraint==100);
+        }
+    }
+}
+
+#[cfg(test)]
+mod speech_resource_tests {
+    use super::*;
+    fn take(borrow:i64)->Value { Value::dict(vec![("resources",Value::array(vec![Value::dict(vec![
+        ("resourceID",Value::int(2)),("transferType",Value::int(1)),("transferPriority",Value::int(500)),
+        ("takeConstraint",Value::int(1000)),("borrowConstraint",Value::int(borrow)),
+    ])]))]) }
+    #[test] fn temporary_speech_borrows_and_returns_without_taking_permanent_audio() {
+        let mut m=Modes::box_initial();
+        let before=m.snapshot();
+        let (proposal,lease)=m.speech_begin(false).unwrap();
+        assert_eq!(m.snapshot(),before,"proposal cannot open gate before ACK");
+        assert!(m.commit_aux(&proposal)); assert!(lease.valid(&m)); assert!(m.audio_owned());
+        assert_eq!(m.resources[1].permanent,2); assert_eq!(m.speech,1); assert_eq!(m.apps[0],1);
+        let end=m.speech_end(&lease).unwrap(); assert!(m.commit_aux(&end));
+        assert!(!m.audio_owned()); assert_eq!(m.resources[1].permanent,2); assert_eq!(m.speech,-1);
+        assert!(!lease.valid(&m)); assert!(m.speech_end(&lease).is_none());
+    }
+    #[test] fn normal_reply_respects_user_and_never_borrow_constraints() {
+        for (constraint,user,allowed) in [(100,false,true),(500,false,false),(500,true,true),(1000,true,false)] {
+            let mut m=Modes::initial(); assert!(m.change(&take(constraint)));
+            assert_eq!(m.speech_begin(user).is_some(),allowed);
+        }
+    }
+    #[test] fn receiver_take_invalidates_inflight_and_active_speech_without_restoring_old_owner() {
+        let mut m=Modes::box_initial(); let (proposal,_)=m.speech_begin(false).unwrap();
+        assert!(m.change(&take(100))); assert!(!m.commit_aux(&proposal));
+        let (proposal,lease)=m.speech_begin(false).unwrap(); assert!(m.commit_aux(&proposal));
+        assert!(m.change(&take(100))); assert!(!lease.valid(&m));
+        let end=m.speech_end(&lease).expect("receiver audio take must still allow ending our own Speaking app");
+        assert!(m.commit_aux(&end));assert_eq!(m.apps[0],0);assert_eq!(m.speech,-1);
+        assert!(!m.audio_owned());
+        let(next,_)=m.speech_begin(false).expect("next reply must use current receiver constraints");assert!(m.commit_aux(&next));
+    }
+    #[test] fn receiver_speech_update_prevents_old_end_from_clearing_its_app() {
+        let mut m=Modes::box_initial();let(proposal,lease)=m.speech_begin(false).unwrap();assert!(m.commit_aux(&proposal));
+        assert!(m.change(&Value::dict(vec![("appStates",Value::array(vec![Value::dict(vec![
+            ("appStateID",Value::int(1)),("speechMode",Value::int(2)),
+        ])]))])));
+        assert!(!lease.valid(&m));assert!(m.speech_end(&lease).is_none());assert_eq!(m.apps[0],2);assert_eq!(m.speech,2);
+    }
+    #[test] fn navigation_changes_only_its_app_state_and_does_not_invalidate_speech() {
+        let mut m=Modes::initial(); let (speech,lease)=m.speech_begin(false).unwrap(); assert!(m.commit_aux(&speech));
+        let resource=m.resources; let (nav,nav_lease)=m.navigation_begin().unwrap(); assert!(m.commit_aux(&nav));
+        assert_eq!(m.resources,resource); assert!(lease.valid(&m)); assert!(nav_lease.valid(&m)); assert_eq!(m.apps[2],1);
+        let end=m.navigation_end(&nav_lease).unwrap(); assert!(m.commit_aux(&end));
+        assert_eq!(m.resources,resource); assert!(lease.valid(&m)); assert_eq!(m.apps[2],0);
+        let end=m.speech_end(&lease).unwrap(); assert!(m.commit_aux(&end)); assert!(m.audio_owned());
+    }
+    #[test] fn acknowledged_aux_transition_merges_over_unrelated_screen_change() {
+        for speech in [false,true] {
+            let mut m=Modes::box_initial();
+            let proposal=if speech {m.speech_begin(false).unwrap().0}else{m.navigation_begin().unwrap().0};
+            assert!(m.change(&Value::dict(vec![("resources",Value::array(vec![Value::dict(vec![
+                ("resourceID",Value::int(1)),("transferType",Value::int(1)),("transferPriority",Value::int(500)),
+                ("takeConstraint",Value::int(1000)),("borrowConstraint",Value::int(1000)),
+            ])]))])));
+            let screen=m.resources[0];
+            assert!(m.commit_aux(&proposal),"ACK must not orphan an accepted app because only screen changed");
+            assert_eq!(m.resources[0],screen);
+            assert_eq!(m.apps[if speech{0}else{2}],1);
         }
     }
 }

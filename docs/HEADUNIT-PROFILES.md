@@ -1,6 +1,10 @@
 # 车机档案与验证范围
 
-更新：2026-11-15。所有车型统一在 [profiles/headunits.json](../profiles/headunits.json) 下发，App 按 ID 选择，不维护独立车型 JSON。
+更新：2026-11-16。所有车型统一在 [profiles/headunits.json](../profiles/headunits.json) 下发，App 按 ID 选择，不维护独立车型 JSON。
+
+当前编码策略：所有档案默认HEVC优先，保留显式H.264选择；手机缺少硬件HEVC Main/Surface编码器，或本轮会话未明确启用HEVC时使用H.264。ID9、MBUX兼容档案不再按车型强制移除HEVC，其余认证、启动顺序、音频和缓冲能力策略保持。旧章节的“ID9关闭HEVC/默认H.264”为当时验证阶段记录，当前规则见[视频策略](VIDEO-STREAM-REVIEW.md)。这不构成所有车型HEVC实车通过的结论。
+
+当前URI策略：所有车机档案在配对后的最终控制会话中创建一次绝对URI，统一会话SETUP、屏幕SETUP、RECORD、TEARDOWN目标；保留音频SETUP原URI。已删除原BMW专用JSON字段和车型门控，内置、远端或未知档案均走公共会话初始化；旧字段不参与运行。请求正文及其它车型的认证、能力、超时、启动顺序不变。详情见[验证记录](VALIDATION.md)及[盒子URI证据](BMW-BOX-CARPLAY-FLOW.md)。
 
 ## 内置策略
 
@@ -105,6 +109,10 @@ useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关�
 ID9当前路径：配对 → 会话SETUP → /info主屏UUID → 初始资源声明 → 按约束申请主屏 → HID mode0 → 主屏SETUP/TCP → RECORD → 资源版本仍有效才送帧。只对bmw_id9启用；不支持的PCM媒体档不尝试；声明AAC-LC48媒体输出时可使用AAC，ID9实车仍待验证。
 
 572固件对照以ID8.5为主线：MGU启用已实现的屏幕资源生命周期，屏幕latencyMs校准为75；远端schema12保护新默认。BMW能力声明移除未实现的处理能力，MGU/NBT移除MainBuffered声明；HEVC为可选的自绘硬编与真实输入透传，默认H.264。ID9仅保留已有75ms对照和关闭HEVC策略，认证/URI/启动顺序保持。不从固件BMW自动重连AT命令推导全局禁用ID9出站。尚未实车证明稳定性或400修复，详见[盒子调用链](BMW-BOX-CARPLAY-FLOW.md)。
+
+573同批补充MGU能力：按`/info`明确输出声明，为VR助手回复建立type100/speechRecognition/OPUS24k主流，为导航TTS建立type101/default/OPUS48k辅助流，并实现对应资源/appState、duck/unduck及媒体切换恢复。无对应能力或已确认清理的SETUP拒绝可回退原媒体混音；资源拒绝不能绕过。不是所有车型统一套用，ID9/NBT/桌面保留原策略；本地RTSP/UDP及编解码回归通过，实车听感和互操作待验证，详见[音频](AUDIO.md)。
+
+同批后续为明确识别的DiPlay开放能力受控辅助音频验证（WinPlay及其它桌面接收端仍不开放），并补自绘高德按UID双sink采集。DiPlay已实测两段导航独立type101，用户确认音乐降低后恢复，媒体仍PCM；该结果不更新BMW实车verified结论。
 
 2026-11-14 ID9单变量验证：仅当 `id9_screen_bootstrap` 启用时从会话 features 移除 `hevc`，完整能力列表由14项变为13项；日志增加 `hevc_proposed=false`。保留 `mainBuffered` 等其余能力、屏幕四字段与25ms延迟、会话 `/setup` / 屏幕 `/` / 音频绝对URI及启动顺序。ID8.5和其它档案保留原能力列表，原MBUX最小能力路径仍只提议viewAreas。此变更用于验证HEVC声明是否参与400，尚未证明根因或实车修复。
 

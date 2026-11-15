@@ -4,6 +4,40 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class Iap2NowPlayingTest {
+    @Test fun explicitPlaybackCapabilitiesAndBundleUseOnlyRequestedRealFields() {
+        val logs = mutableListOf<String>()
+        var state = Iap2NowPlaying(title="private-title", appBundleId="com.example.player")
+        val session = Iap2NowPlayingSession({ state }, logs::add)
+        session.authenticated()
+        session.handle(Iap2Csm.Frame(0x5000, Iap2Csm.param(1,
+            Iap2Csm.param(13, byteArrayOf()) + Iap2Csm.param(14, byteArrayOf()) +
+                Iap2Csm.param(16, byteArrayOf()) + Iap2Csm.param(99, byteArrayOf()))))
+        fun playback(now: Long) = Iap2Csm.parseParams(Iap2Csm.parseParams(
+            controls(session.poll(now,2048,true)).single().body).single().value).associateBy { it.id }
+        val fields = playback(0)
+        assertEquals(setOf(13,14,16), fields.keys)
+        assertArrayEquals(byteArrayOf(0), fields.getValue(13).value)
+        assertArrayEquals(byteArrayOf(0), fields.getValue(14).value)
+        assertEquals("com.example.player", fields.getValue(16).asStringOrNull())
+        assertTrue(logs.any { "unsupported" in it && "99" in it })
+        assertFalse(logs.any { "private-title" in it || "com.example.player" in it })
+        state = state.copy(appBundleId="com.example.other")
+        assertEquals("com.example.other", playback(1500).getValue(16).asStringOrNull())
+    }
+
+    @Test fun newPlaybackFieldsStayAbsentFromLegacyAndUnrequestedSubscriptions() {
+        val state = Iap2NowPlaying(appBundleId="com.example.player")
+        fun fields(session: Iap2NowPlayingSession) = Iap2Csm.parseParams(Iap2Csm.parseParams(
+            controls(session.poll(0,2048,true)).single().body).first { it.id == 1 }.value).map { it.id }
+        assertEquals(listOf(0,1,7), fields(subscribed { state }))
+        val explicit = Iap2NowPlayingSession({ state }).also { it.authenticated() }
+        explicit.handle(Iap2Csm.Frame(0x5000, Iap2Csm.param(1, Iap2Csm.param(0,byteArrayOf()))))
+        assertEquals(listOf(0), fields(explicit))
+        val unknown = Iap2NowPlayingSession({ state }).also { it.authenticated() }
+        unknown.handle(Iap2Csm.Frame(0x5000, Iap2Csm.param(1, Iap2Csm.param(99,byteArrayOf()))))
+        assertTrue(unknown.poll(0,2048,true).isEmpty())
+    }
+
     @Test fun explicitSubscriptionEmitsOnlyRequestedSupportedFields() {
         val session = Iap2NowPlayingSession({ Iap2NowPlaying(title="track", artist="artist", status=1) })
         session.authenticated()

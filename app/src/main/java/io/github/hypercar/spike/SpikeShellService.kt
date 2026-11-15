@@ -29,6 +29,8 @@ import java.lang.reflect.Method
 class SpikeShellService : ISpikeShell.Stub {
 
     private val playbackAudio = ShellPlaybackAudio()
+    private val splitPlaybackAudio = SplitPlaybackAudio()
+    @Volatile private var splitCaptureRequested = false
     private val bluetoothDiscovery = ShellBluetoothDiscovery()
     private val wifiSelection = ShellWifiSelection()
     override fun startWifiSelection(owner: IBinder, token: String, ssid: String, bssid: String, uid: Int): String {
@@ -55,19 +57,37 @@ class SpikeShellService : ISpikeShell.Stub {
         finally { android.os.Binder.restoreCallingIdentity(identity) }
     }
 
-    override fun startAudioCapture(owner: IBinder): android.os.ParcelFileDescriptor? {
+    @Synchronized override fun startAudioCapture(owner: IBinder): android.os.ParcelFileDescriptor? {
         val identity = android.os.Binder.clearCallingIdentity()
-        return try { appContext?.let { playbackAudio.start(it, owner) } }
+        return try {
+            splitPlaybackAudio.stop()
+            splitCaptureRequested = false
+            appContext?.let { playbackAudio.start(it, owner) }
+        }
         finally { android.os.Binder.restoreCallingIdentity(identity) }
     }
 
-    override fun stopAudioCapture() {
+    @Synchronized override fun startSplitAudioCapture(owner: IBinder, navigationUid: Int): Array<android.os.ParcelFileDescriptor>? {
         val identity = android.os.Binder.clearCallingIdentity()
-        try { playbackAudio.stop() }
+        return try {
+            playbackAudio.stop()
+            splitPlaybackAudio.stop()
+            splitCaptureRequested = true
+            appContext?.let { splitPlaybackAudio.start(it, owner, navigationUid) }
+        } finally { android.os.Binder.restoreCallingIdentity(identity) }
+    }
+
+    @Synchronized override fun stopAudioCapture() {
+        val identity = android.os.Binder.clearCallingIdentity()
+        try {
+            splitPlaybackAudio.stop()
+            playbackAudio.stop()
+            splitCaptureRequested = false
+        }
         finally { android.os.Binder.restoreCallingIdentity(identity) }
     }
 
-    override fun audioCaptureStatus(): String = playbackAudio.status
+    override fun audioCaptureStatus(): String = if (splitCaptureRequested) splitPlaybackAudio.status else playbackAudio.status
 
     constructor() : super() {
         bindContext(null)

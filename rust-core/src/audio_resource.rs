@@ -7,10 +7,12 @@ pub struct AudioResource {
     pub control: Arc<RtspChannel>,
     pub modes: Arc<Mutex<Modes>>,
     pub owned: Arc<AtomicBool>,
+    pub serial: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AudioResource {
     pub async fn request(&self, user_initiated: bool) {
+        let _serial=self.serial.lock().await;
         let audio_epoch = self.modes.lock().audio_change_epoch();
         for attempt in 0..2 {
             let proposal = {
@@ -80,7 +82,7 @@ mod tests {
             let modes = Arc::new(Mutex::new(Modes::initial()));
             assert!(modes.lock().change(&receiver_take()));
             let owned = Arc::new(AtomicBool::new(false));
-            let resource = AudioResource { control, modes: modes.clone(), owned: owned.clone() };
+            let resource = AudioResource { control, modes: modes.clone(), owned: owned.clone(), serial:Arc::new(tokio::sync::Mutex::new(())) };
             let task = tokio::spawn(async move { resource.request(true).await });
             let mut buffer = Vec::new();
             let request = tokio::time::timeout(std::time::Duration::from_secs(1), async {

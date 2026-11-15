@@ -109,6 +109,11 @@ if (-not $SkipRust) {
   $env:CARGO_HOME = $cargoHome
   $env:RUSTUP_HOME = $rustupHome
   $env:PATH = "$(Join-Path $cargoHome 'bin');$env:PATH"
+  # audiopus_sys builds its bundled libopus with CMake; never load a private Android .so.
+  $nativeBuildTools = Join-Path $devtools 'mingw64\mingw64\bin'
+  if (Test-Path $nativeBuildTools) { $env:PATH = "$nativeBuildTools;$env:PATH" }
+  if (-not $env:CMAKE_GENERATOR) { $env:CMAKE_GENERATOR = 'Ninja' }
+  if (-not $env:CMAKE_POLICY_VERSION_MINIMUM) { $env:CMAKE_POLICY_VERSION_MINIMUM = '3.5' }
   $env:RUSTUP_NO_UPDATE_CHECK = '1'
   if ($needAsciiBuildDir) {
     # target 目录也放纯 ASCII 路径：GNU ld 会从 cargo 的元数据里拿到 .rlib 的绝对路径，

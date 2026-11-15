@@ -16,6 +16,10 @@ mod audio_pacing;
 mod audio_resample;
 mod aac;
 mod opus;
+mod opus_encode;
+mod speech_resource;
+mod aux_audio;
+mod aux_setup;
 mod mic_probe;
 mod audio_resource;
 mod bplist;
@@ -31,6 +35,7 @@ mod resource_trace;
 mod rtsp_uri;
 mod screen;
 mod h264;
+mod video_transcode;
 mod hevc;
 mod video_format;
 mod pipeline;
@@ -72,6 +77,7 @@ static TOKIO_RT: Lazy<Runtime> = Lazy::new(|| {
 
 static JAVA_VM: RwLock<Option<jni::JavaVM>> = RwLock::new(None);
 static LISTENER: RwLock<Option<GlobalRef>> = RwLock::new(None);
+static TRANSCODER_BRIDGE: RwLock<Option<GlobalRef>> = RwLock::new(None);
 /// 车机 HID 触摸回调（Rust → Kotlin）。
 ///
 /// 与 [LISTENER] 分开持有 GlobalRef：触摸是高频事件（车机滑一下就是几十条），
@@ -400,9 +406,10 @@ impl SocketProvider for JniSocketProvider {
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeInitLogger(
     env: JNIEnv,
-    _class: JClass,
+    bridge: JObject,
 ) {
     *JAVA_VM.write() = Some(env.get_java_vm().expect("JavaVM 获取失败"));
+    *TRANSCODER_BRIDGE.write()=env.new_global_ref(bridge).ok();
     android_logger::init_once(
         android_logger::Config::default()
             .with_max_level(log::LevelFilter::Info)
@@ -734,6 +741,62 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePushAud
             channels: channels.clamp(1, 2) as u8,
             data: bytes,
         });
+    }
+}
+
+fn navigation_audio_format(rate:jint,channels:jint,samples:Option<usize>)->Option<(u32,u8)> {
+    if !(4000..=96000).contains(&rate) || !(1..=2).contains(&channels) {return None;}
+    if samples.is_some_and(|count|count==0 || count%channels as usize!=0) {return None;}
+    Some((rate as u32,channels as u8))
+}
+fn navigation_audio_event(rate:jint,channels:jint,pcm:Option<&[i16]>)->Option<engine::SourceEvent> {
+    let (rate,channels)=navigation_audio_format(rate,channels,pcm.map(<[i16]>::len))?;
+    Some(match pcm {
+        None=>engine::SourceEvent::AudioInit{tts:true,rate,channels},
+        Some(pcm)=>engine::SourceEvent::AudioData{tts:true,rate,channels,data:pcm.iter().flat_map(|s|s.to_le_bytes()).collect()},
+    })
+}
+fn send_navigation_audio(event:engine::SourceEvent) {
+    if let Some(handle)=ENGINE.lock().as_ref().filter(|h|!h.shutdown.requested()) {let _=handle.source_tx.send(event);}
+}
+/// UID-isolated self-rendered navigation; media capture keeps its existing lane.
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStartNavigationAudio(
+    _env:JNIEnv,_class:JClass,rate:jint,channels:jint,
+) {
+    if let Some(event)=navigation_audio_event(rate,channels,None) {send_navigation_audio(event);}
+}
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePushNavigationAudioPcm(
+    env:JNIEnv,_class:JClass,pcm:JShortArray,rate:jint,channels:jint,
+) {
+    let Ok(len)=env.get_array_length(&pcm) else {return;};
+    if navigation_audio_format(rate,channels,Some(len as usize)).is_none() {return;}
+    let mut samples=vec![0i16;len as usize];
+    if env.get_short_array_region(&pcm,0,&mut samples).is_err() {return;}
+    if let Some(event)=navigation_audio_event(rate,channels,Some(&samples)) {send_navigation_audio(event);}
+}
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStopNavigationAudio(
+    _env:JNIEnv,_class:JClass,
+) {send_navigation_audio(engine::SourceEvent::AudioStop{tts:true});}
+
+#[cfg(test)]
+mod navigation_audio_jni_tests {
+    use super::*;
+    #[test] fn navigation_pcm_rejects_invalid_format_and_incomplete_interleaved_frames() {
+        for rate in [4000,16000,48000,96000] {
+            for channels in [1,2] {assert_eq!(navigation_audio_format(rate,channels,Some(8)),Some((rate as u32,channels as u8)));}
+        }
+        for (rate,channels,samples) in [(3999,1,8),(96001,1,8),(48000,0,8),(48000,3,8),(48000,2,3),(48000,1,0)] {
+            assert_eq!(navigation_audio_format(rate,channels,Some(samples)),None);
+        }
+        assert_eq!(navigation_audio_format(48000,2,None),Some((48000,2)));
+    }
+    #[test] fn navigation_events_preserve_pcm_and_use_only_the_tts_lane() {
+        assert!(matches!(navigation_audio_event(48000,2,None),Some(engine::SourceEvent::AudioInit{tts:true,rate:48000,channels:2})));
+        assert!(matches!(navigation_audio_event(16000,1,Some(&[1,-2])),Some(engine::SourceEvent::AudioData{tts:true,rate:16000,channels:1,data}) if data==[1,0,254,255]));
+        assert!(navigation_audio_event(48000,2,Some(&[1])).is_none());
     }
 }
 

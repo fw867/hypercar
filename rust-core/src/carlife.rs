@@ -9,6 +9,7 @@ mod session;
 mod video;
 pub(crate) mod microphone;
 pub(super) mod channel_diagnostics;
+mod voice_audio;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -222,8 +223,8 @@ impl CarLifeHub {
                 let vr = sockets.next().unwrap();
                 if let Some(mic) = config.microphone.clone() {
                     mic.request(false);
-                    children.spawn(microphone::run(vr, state.clone(), mic, stop.clone()));
-                } else { children.spawn(drain_stream(vr, state.clone())); }
+                    children.spawn(microphone::run(vr, state.clone(), mic, stop.clone(), events_task.clone()));
+                } else { children.spawn(drain_stream(vr, state.clone(), events_task.clone())); }
                 let ctrl=sockets.next().unwrap(); let q=queue.clone(); let cipher=state.clone(); let stop_ctrl=stop.clone();
                 children.spawn(async move { session::control(ctrl,q,cipher,stop_ctrl).await; });
                 children.spawn(session::data(sockets.next().unwrap(),state.clone(),events_task.clone()));
@@ -788,22 +789,100 @@ async fn dial(host: &str, port: u16) -> Result<TcpStream, std::io::Error> {
     }
 }
 
-/// 只读消费一个连接（VR 通道：保活即可，不消费语义）。
-async fn drain_stream(mut stream: TcpStream, state:session::Shared) {
+/// VR playback remains available when car microphone capture is disabled.
+async fn drain_stream(mut stream: TcpStream, state:session::Shared, events:mpsc::UnboundedSender<CarLifeEvent>) {
     let mut buf = [0u8; 2048];
-    let mut observer=channel_diagnostics::Observer::default();
+    let mut receiver=voice_audio::Receiver::default();
     let mut stats=channel_diagnostics::Stats::default();
     let mut diagnostics=tokio::time::interval(Duration::from_secs(5));
     diagnostics.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            _=diagnostics.tick()=>emit_log(&stats.report("VR/noCapture","periodic",observer.pending())),
+            _=diagnostics.tick()=>emit_log(&stats.report("VR/noCapture","periodic",receiver.pending())),
             received=stream.read(&mut buf)=>match received {
-                Ok(0)=>{emit_log(&stats.report("VR/noCapture","eof",observer.pending()));return;},
-                Ok(n)=>microphone::observe_incoming(&mut observer,&mut stats,&state,&buf[..n]),
-                Err(_)=>{emit_log(&stats.report("VR/noCapture","ioError",observer.pending()));return;},
+                Ok(0)=>{emit_log(&stats.report("VR/noCapture","eof",receiver.pending()));return;},
+                Ok(n)=>receiver.push(&buf[..n],&mut stats,&state,&events),
+                Err(_)=>{emit_log(&stats.report("VR/noCapture","ioError",receiver.pending()));return;},
             }
         }
     }
 }
 
+
+#[cfg(test)]
+mod voice_downlink_tests {
+    use super::*;
+    #[tokio::test]
+    async fn vr_without_microphone_forwards_encrypted_init_pcm_and_stop() { exercise_downlink(false).await; }
+    #[tokio::test]
+    async fn vr_with_microphone_forwards_reply_without_changing_capture() { exercise_downlink(true).await; }
+    async fn exercise_downlink(capture:bool) {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let(mut peer,_)=listener.accept().await.unwrap();
+        let state=session::microphone_test_session();let(tx,mut rx)=mpsc::unbounded_channel();
+        let control=Arc::new(crate::mic_probe::ProbeControl::for_carwith());
+        if capture { control.arm_test(); control.request(true); }
+        let generation=control.generation();
+        let worker=if capture { tokio::spawn(microphone::run(client,state.clone(),control.clone(),Arc::new(Notify::new()),tx)) }
+            else {tokio::spawn(drain_stream(client,state.clone(),tx))};
+        let init=state.lock().encrypt(&[8,128,125,16,1,24,16]).unwrap();
+        let pcm=state.lock().encrypt(&[1,0,254,255]).unwrap();
+        let wire=[build_media_frame(0x50002,0,&init),build_media_frame(0x50003,0,&pcm),build_media_frame(0x50004,0,&[])].concat();
+        for bytes in wire.chunks(7) {peer.write_all(bytes).await.unwrap();}
+        let first=tokio::time::timeout(Duration::from_millis(250),rx.recv()).await;
+        assert!(matches!(first,Ok(Some(CarLifeEvent::VoiceAudioInit{rate:16000,channels:1}))),"assistant INIT must reach independent voice output: {first:?}");
+        assert!(matches!(rx.recv().await,Some(CarLifeEvent::VoiceAudioData{rate:16000,channels:1,data}) if data==[1,0,254,255]));
+        assert!(matches!(rx.recv().await,Some(CarLifeEvent::VoiceAudioStop)));
+        assert_eq!(control.generation(),generation,"downstream audio cannot change microphone capture");
+        worker.abort();let _=worker.await;
+    }
+}
+
+#[cfg(test)]
+mod media_tts_downlink_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn media_decrypts_init_but_preserves_raw_pcm_after_exactly_one_outer_header() {
+        exercise_audio(MediaKind::Media, false, 48000, 2,
+            &[8,128,247,2,16,2,24,16], 0x30001, 0x30006, 0x30002).await;
+    }
+
+    #[tokio::test]
+    async fn tts_decrypts_init_and_pcm_preserves_format_and_accepts_empty_stop() {
+        exercise_audio(MediaKind::Tts, true, 16000, 1,
+            &[8,128,125,16,1,24,16], 0x40001, 0x40003, 0x40002).await;
+    }
+
+    async fn exercise_audio(kind:MediaKind, tts:bool, rate:u32, channels:u8,
+        init:&[u8], init_service:u32, data_service:u32, stop_service:u32) {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let(mut peer,_)=listener.accept().await.unwrap();peer.set_nodelay(true).unwrap();
+        let state=session::microphone_test_session();let(tx,mut rx)=mpsc::unbounded_channel();
+        let worker=tokio::spawn(handle_media_client(client,tx,kind,if tts {"TTS"}else{"MEDIA"},Some(state.clone())));
+        let encrypted_init=state.lock().encrypt(init).unwrap();
+        // The first twelve PCM bytes resemble an outer header. They remain samples;
+        // a second header strip or incorrect MEDIA decryption must fail this assertion.
+        let pcm=vec![0,0,0,4,0,0,0,7,0,4,0,3,1,0,254,255,2,0,253,255];
+        let body=if tts {state.lock().encrypt(&pcm).unwrap()} else {pcm.clone()};
+        let first=build_media_frame(init_service,0,&encrypted_init);
+        peer.write_all(&first[..5]).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(20),rx.recv()).await.is_err(),"partial header cannot yield an audio event");
+        // Finish a fragmented INIT and coalesce two DATA frames plus empty STOP.
+        let rest=[first[5..].to_vec(),build_media_frame(data_service,1,&body),
+            build_media_frame(data_service,2,&body),build_media_frame(stop_service,3,&[])].concat();
+        for bytes in rest.chunks(17) {peer.write_all(bytes).await.unwrap();tokio::task::yield_now().await;}
+        let event=tokio::time::timeout(Duration::from_secs(1),rx.recv()).await.unwrap();
+        assert!(matches!(event,Some(CarLifeEvent::AudioInit{tts:t,rate:r,channels:c}) if (t,r,c)==(tts,rate,channels)),"INIT must preserve stream and source format: {event:?}");
+        for _ in 0..2 {
+            let event=tokio::time::timeout(Duration::from_secs(1),rx.recv()).await.unwrap();
+            assert!(matches!(event,Some(CarLifeEvent::AudioData{tts:t,rate:r,channels:c,data}) if (t,r,c)==(tts,rate,channels) && data==pcm),"PCM must stay byte-exact and on its own stream");
+        }
+        let event=tokio::time::timeout(Duration::from_secs(1),rx.recv()).await.unwrap();
+        assert!(matches!(event,Some(CarLifeEvent::AudioStop{tts:t}) if t==tts),"STOP cannot affect another stream: {event:?}");
+        assert!(rx.try_recv().is_err(),"headers must not become extra audio events");
+        worker.abort();let _=worker.await;
+    }
+}

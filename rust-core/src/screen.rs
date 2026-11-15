@@ -82,6 +82,7 @@ pub struct ScreenSender {
     height: f32,
     /// Diagnostic only: the old header-only stretch request is never applied to the wire.
     display_target: Option<(u32, u32)>,
+    receiver_size: Option<(u32,u32)>,
     /** 车机 /info 声明 keepAliveSendStatsAsBody 时为 true → opcode=5 + 统计体。 */
     keep_alive_with_stats: bool,
     /** 上一次屏幕流 keepAlive 的时刻（1s 节流）。 */
@@ -140,6 +141,7 @@ impl ScreenSender {
             width: even_width as f32,
             height: even_height as f32,
             display_target: None,
+            receiver_size: None,
             keep_alive_with_stats,
             last_keep_alive: tokio::time::Instant::now(),
             frames: 0,
@@ -189,6 +191,8 @@ impl ScreenSender {
     pub fn size(&self) -> (u32, u32) {
         (self.width as u32, self.height as u32)
     }
+    pub fn set_receiver_size(&mut self,size:(u32,u32)) {self.receiver_size=Some(size);}
+    pub fn receiver_size(&self)->(u32,u32) {self.receiver_size.unwrap_or_else(||self.size())}
 
     /// Preserve old configuration for diagnostics, but never falsify encoded dimensions.
     pub fn set_display_target(&mut self, width: u32, height: u32) {
@@ -208,6 +212,7 @@ impl ScreenSender {
         self.logged_first_frame = false;
     }
 
+    pub fn hevc_allowed(&self)->bool {self.hevc_allowed}
     pub fn set_hevc_allowed(&mut self, allowed: bool) {
         self.hevc_allowed = allowed;
         if !allowed && self.codec == VideoCodec::Hevc {

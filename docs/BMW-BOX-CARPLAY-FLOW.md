@@ -1,5 +1,21 @@
 # 宝马盒子流程证据
 
+2026-11-16最新URI状态：按用户追加要求，已将绝对会话URI扩大到所有车机档案，删除BMW专用门控和配置字段，统一从配对后的公共会话路径安装。下文BMW单变量对照是此前实施阶段记录；最新测试见[验证记录](VALIDATION.md)。
+
+2026-11-16编码策略更新：所有档案现在默认能力门控的HEVC优先，ID9不再无条件禁止声明；保留显式H.264选择，要求手机硬件编码能力与本轮会话确认，详见[视频策略](VIDEO-STREAM-REVIEW.md)。下文的默认关闭和ID9关闭记录反映早期固件对照阶段；随后CarWith硬件转码已实现并经DiPlay验证。
+
+## 屏幕SETUP参数与绝对URI复核（2026-11-16）
+
+后续实现状态：按用户指示，已仅为BMW ID8.5/ID9接入一次生成、按控制通道归属的绝对URI，覆盖会话/屏幕SETUP、RECORD及TEARDOWN，IPv6使用方括号和原始scope编码；音频SETUP地址不改。DiPlay两轮接受新URI，正常停止的TEARDOWN复用原URI但连接关闭未收到200，重连分配新ID并恢复HEVC。以下“当前HyperCar”描述为改动前的静态对照，最新测试边界见[验证记录](VALIDATION.md)。
+
+依据同一固件xiap2，屏幕构造入口0x3a998。0x3ab70–0x3abd4创建单元素streams数组，每个stream仅四项：type=110（Int64）、streamConnectionID（UUIDGet新随机值前8字节组成的64位整数）、uuid（当前选中显示器的字符串）、latencyMs=75（Int64，0x3abac固定立即数）。uuid从/info的display字典读取（0x2f2d4）并复制到屏幕状态+34（0x2f4b8–0x2f4f8），不与随机连接ID混淆。该构造区间没有HEVC/H.264分支或width/height、fps、bitrate、codec、VPS/SPS/PPS等额外字段。
+
+请求头0x3aa68–0x3aac4：SETUP、RTSP/1.0、User-Agent AirPlay/770.8.1、动态CSeq。0x3abe4通过CFBinaryPlistV0Create序列化，Content-Type为application/x-apple-binary-plist。屏幕成功样本52.310发起、52.327完成，随后读取main screen data port并连接视频TCP；日志不是完整请求抓包，字典与URI结论来自静态调用链。
+
+**本轮新确认的URI差异：盒子不是SETUP /。** 0x2c4ac UUIDGet产生会话随机ID，0x2c4c8–0x2c4f4以`%s%s%s%llu`拼接`rtsp://`、车机IP字符串、`/`、随机64位会话ID，asprintf写到会话对象+0x1c8。格式没有显式端口；这是URI文本，实际控制连接端口由其它逻辑建立。IPv6路径0x2c7d0使用inet_ntop后返回同一拼接区，本区未看到添加方括号，不照搬为本项目IPv6格式规则。URI尾部ID与屏幕streamConnectionID来自两次不同UUIDGet。
+
+0x2587c会话SETUP、0x2aaa8 RECORD、0x3aa6c屏幕SETUP、0x38ccc屏幕TEARDOWN均读取同一会话URI。当前HyperCar会话SETUP使用/setup、屏幕SETUP和RECORD使用/；BMW-MGU与ID9屏幕字典均四项、latencyMs75已一致，MBUX100、通用/NBT/DiPlay25保留。绝对URI是有明确依据的差异，但尚无同车单变量对照证明它导致或解决400；本次仅查证并记录，没有修改请求行、版本、APK或提交推送。
+
 ## BMW标记调用链与ID9参数对照（2026-11-15）
 
 本节继续使用下文同一固件哈希，静态地址仅适用于该样本。逐文件扫描rootfs的1993文件/611个ELF，只有xiap2包含`vehicleCfgIsBMW`符号；xiap2可执行节ARM B/BL、重定位、函数地址取用模式均未找到该导出函数的静态调用者。0x55f28虽然字面值为0x8cac0，实际由0x55ef8与PC相加得到全局地址0xe29c0，不是函数指针。不能因导出函数存在便认定它控制BMW认证/SETUP；动态/其它版本行为未被这次扫描排除。
@@ -124,3 +140,15 @@ requestUI可能由用户点击或车机重试产生；后续借屏拒绝不能�
 - CarWith 只透传真正的 HEVC：通过完整参数序列确认格式、按 HEVC 图片边界组帧、同步19..21补齐当前参数。没有找到请求 CarWith 产 HEVC 的协议字段，因此未添加猜测字段，也不做实时转码。接收端未允许HEVC却收到该源时明确结束并提示选择支持的源/会话，避免静默黑屏。
 
 真实手机探针已用2732×794 Surface硬编产出 Main HEVC，并将同份参数/关键帧交硬件解码器得到一帧。脱敏的纯色测试输出保存在 `rust-core/tests/fixtures/hevc-phone/`，用于参数解析、hvc1、真实AAD/nonce和IDR实包回归。该验证是短片编码/解码，不证明持续60fps吞吐或车机显示成功。运行期 MediaCodec onError 仍为诊断，不宣称已有动态 Surface 重建恢复。
+
+## 573：Now Playing 与语音回复补充对照
+
+NowPlaying的0x5000处理位于`0x62924`起；`0x62c90..0x62f18`对所订阅的队列、播放能力和应用bundle字段有回复，`0x5c610..0x5c644`后续更新elapsed设置能力。HyperCar仅补有据可答的13/14=false、16真实包名，不照抄盒子elapsed可设置=true，也不伪造queueCount。6800参数0/4、6802参数0/1和B5/B6边沿路由未见确定差异，当前实车仍缺实际切歌报告证据。
+
+音频方面，`audio_start@0x1ea34`及`0x1ed20`跳表区分MEDIA/TEL/SIRI/NAVI/REC/RING；main AudioDef不同类型互斥切换，导航使用独立alt AudioDef。`0x41998`把对应audioType写入SETUP，type101另有duckAudio/unduckAudio及资源操作。这是静态实现；成功文本只有能力枚举与listener启动，没有实际SIRI/NAVI播放，不能声称已捕获盒子的完整语音闭环。
+
+当前项目先修复源侧明确遗漏的VR回复接收，保留MEDIA/TTS/VR类别直到混音，沿用可用的PCM媒体输出。独立AirPlay语音/导航流需要对应OPUS、资源与app state一起实现和车测，不只替换audioType字符串。此次不把盒子AAC媒体选择套到用户实际使用的PCM卡顿问题，也不宣称VR下行补齐已被实车证明解决小爱无声。
+
+用户随后明确盒子成功日志未测试这两项，并要求独立SIRI/导航也实现。573同批继续补齐：libAirPlay `AirPlayAudioFormatToASBD@0x1dc64`的24k分支`0x1df3a`明确bit29/480帧，48k分支`0x1df4e`明确bit30/960帧，均20ms；`_AirPlay_SendAudio@0x40bc8`按实际ASBD帧数推进RTP时钟。SIRI用type100/speechRecognition，导航用type101/default；OPUS不填AAC专用spf/sr/ct。
+
+当前实现已连通静态OPUS编码、独立流SETUP、每流加密/同步、mainAudio借还与Speaking、导航appState和duck/unduck。主媒体PCM保留；SIRI切换前确认旧媒体停止，结束清理并重新建立媒体，导航并行。按接收端明确能力选择、失败清理后回退，receiver接管时不以旧lease恢复。详细生命周期与验证边界见[音频](AUDIO.md)。成功日志缺项不再作为暂缓实现的依据，实车是否成功仍须分别测试。

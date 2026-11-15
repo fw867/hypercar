@@ -9,6 +9,8 @@
 -keep interface io.github.hypercar.core.RustCoreBridge$TouchListener { *; }
 # 回调实现类（匿名 object）：方法名与接口一致，接口 keep 后即可，但显式保一下更稳
 -keep class * implements io.github.hypercar.core.RustCoreBridge$EventListener { *; }
+-keep class io.github.hypercar.core.CarWithHevcTranscoder { *; }
+-keep class io.github.hypercar.core.CarWithHevcTranscoder$Companion { *; }
 -keep class * implements io.github.hypercar.core.RustCoreBridge$SocketProvider { *; }
 -keep class * implements io.github.hypercar.core.RustCoreBridge$TouchListener { *; }
 

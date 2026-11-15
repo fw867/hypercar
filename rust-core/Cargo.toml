@@ -17,6 +17,7 @@ rand = "0.8"
 libc = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 bytes = "1"
+audiopus_sys = { version = "0.2.2", features = ["static"] }
 jni = "0.21"
 log = "0.4"
 android_logger = "0.14"

@@ -43,11 +43,14 @@ mod tests {
         }).await.expect("accepted session must receive one global TEARDOWN")
     }
     #[tokio::test] async fn accepted_failure_sends_one_global_teardown_then_closes() {
+        for absolute in [false,true] {
         let(c,mut car)=pair().await;let mut guard=NegotiationCleanup::new(c.clone(),true);guard.accepted();
+        if absolute {c.set_session_uri(crate::rtsp_uri::SessionUri::new("fe80::1%wlan0",77).unwrap()).unwrap();}
         let task=tokio::spawn(async move{guard.finish().await;guard.finish().await;});
-        let m=read(&mut car).await;assert_eq!(m.first_line,"TEARDOWN / RTSP/1.0");assert_eq!(crate::bplist::parse(&m.body).unwrap().get("streams"), Some(&crate::bplist::Value::Array(vec![])));
+        let m=read(&mut car).await;assert_eq!(m.first_line,if absolute {"TEARDOWN rtsp://[fe80::1%25wlan0]/77 RTSP/1.0"}else{"TEARDOWN / RTSP/1.0"});assert_eq!(crate::bplist::parse(&m.body).unwrap().get("streams"), Some(&crate::bplist::Value::Array(vec![])));
         car.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",m.cseq().unwrap()).as_bytes()).await.unwrap();
         task.await.unwrap();assert!(c.is_closed());
+        }
     }
     #[tokio::test] async fn caller_cancel_during_cleanup_does_not_abandon_the_old_socket() {
         let(c,mut car)=pair().await;let mut guard=NegotiationCleanup::new(c.clone(),true);guard.accepted();

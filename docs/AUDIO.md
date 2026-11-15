@@ -6,8 +6,8 @@
 
 | 来源 | PCM 输入 | 边界 |
 |---|---|---|
-| 自绘 UI | Shizuku shell AudioRecord / REMOTE_SUBMIX，PCM16、48kHz、双声道 | 采集系统播放，不是麦克风或电话桥接 |
-| CarWith | 本机 CarLife MEDIA / TTS 通道，重采样与混音后进入公共 AirPlay 音频泵 | 不启动自绘系统播放采集 |
+| 自绘 UI | Shizuku shell AudioPolicy双sink，MEDIA排除高德UID、导航仅含该UID，PCM16/48k/双声道 | policy不可用时完整退回单一系统混音；不采麦克风 |
+| CarWith | 本机 CarLife MEDIA / TTS / VR：媒体、导航提示与助手回复 | 不启动自绘系统播放采集；MGU按能力分配独立流 |
 
 首页音频卡单行显示实际协商的 PCM / AAC 和约每秒更新的发送负载码率，不再添加播放状态文字前缀。统计仅包含成功交给 UDP 的音频有效负载，不含 RTP 头、加密开销或同步包；发送失败、资源被接管后未发出的数据不计入。未协商时不显示编码/码率，停止后不沿用旧会话数值。静音保活也可能有发送码率，不能据此判断车机已出声。
 
@@ -21,7 +21,33 @@ AirPlay PCM 使用 SPF352，约 136.36 包/秒，16-bit 大端样本。TTS 参�
 
 571音频节拍：绝对周期不变，漏拍时跳过已过期的352帧时段，丢弃混音队列中对应旧样本并推进RTP时间戳；不再Burst集中追发。恢复首包置marker并重新发送时间同步，包序号及AEAD nonce不重置。AAC保留编码器半帧和重采样相位，避免每次漏拍同步重建编码器导致持续饥饿；音频资源被接管时仍按原策略清理编码器。`AUDIO-PACING`每5秒累计报告恢复次数、跳过源帧数、丢弃队列帧数和最大延迟。该策略修复本地突发补拍，不表示已消除车机端网络抖动或UDP丢包。
 
-CarWith新增`CARWITH-CHANNEL`诊断：MEDIA、TTS及VR每5秒输出接收字节、服务类型分布、解密API结果、PCM字节/非零样本、转发或丢弃计数；空闲也输出零计数，EOF/错误补终止摘要。VR仅按有界帧观察，不假定其下行格式是小爱回复，也不接入播放。未建立密钥时现有decrypt API会原样返回，因此decryptOk不能单独作为加密验证证据。日志不记录音频内容或识别文字。
+CarWith新增`CARWITH-CHANNEL`诊断：MEDIA、TTS及VR每5秒输出接收字节、服务类型分布、解密API结果、PCM字节/非零样本、转发或丢弃计数；空闲也输出零计数，EOF/错误补终止摘要。573已按本机VRAudioManager实现独立VR回复接收，要求认证、准入、加密及有效PCM16初始化；未知VR服务只统计。日志不记录音频内容或识别文字。
+
+## 573：BMW ID8.5 独立 SIRI / 导航输出
+
+盒子成功日志当时未测试SIRI和导航，缺少相关记录不代表未实现。以下按xiap2及libAirPlay固件静态路径实现，接收端必须在本轮`/info`明确声明对应输出；对MGU/BMW ID8.5及明确识别的DiPlay验证接收端启用，NBT、ID9、WinPlay及其它桌面接收端保持既有策略。
+
+| 输入类别 | AirPlay流 | 编码与时钟 | 生命周期 |
+|---|---|---|---|
+| 媒体MEDIA | 原media type100/102 | 保留用户选定PCM/AAC；当前PCM不改成AAC | 仍受主音频资源门禁 |
+| 助手VR回复 | type100 / speechRecognition，audioFormat bit29 | OPUS24k、mono、SPF480、20ms；RTP每包+480 | Speaking及临时mainAudio借用；暂停/退掉旧媒体，结束后重新SETUP原媒体 |
+| 导航TTS | type101 / default，audioFormat bit30 | OPUS48k、mono、SPF960、20ms；RTP每包+960 | 仅导航appState；duck→SETUP；停UDP→unduck→TEARDOWN |
+
+OPUS使用随APK静态链接的libopus，输入仍为48k立体声，编码前下混为单声道，24k路径保留跨调用转换相位；不依赖Android私有`libopus.so`。每条流独立连接ID、流密钥、nonce、序号、采样时钟及同步socket。SETUP不虚构AAC的sr/ct/spf字段，延迟从对应`audioLatencies.outputLatencyMicros`读取。导航命令沿固件`durationMs=100.0`，duck volume=-12.0、unduck volume=0.2。
+
+资源变化共用串行发布锁，ACK和业务成功后才提交。普通回复使用Nice优先级，实际语音按键触发的短期会话意图可使用UserInitiated；不因收到PCM而抢永久音频归属，也不为回复主动抢主屏。receiver重新接管会撤销旧lease；结束仅归还本次借用、清理仍由本段持有的appState，保留途中屏幕、导航和receiver所有权变化。
+
+媒体泵确认暂停并关闭旧socket后才切SIRI。退出先停止独立发送，TEARDOWN和资源归还确认后再恢复原PCM/AAC媒体，使用新连接ID/密钥；恢复被拒有界重试，仍失败则保留待恢复状态，由新媒体开始/新源触发。清理失败保留lease和阶段，避免永远卡Speaking或重复开启冲突type100；结束中的SETUP在关闭预算后进入最终会话TEARDOWN列表。导航不暂停媒体泵，两个辅助worker的RTSP等待不会阻塞媒体节拍。
+
+未声明对应能力或独立SETUP被拒且已确认清理时，可回退原媒体混音；资源拒绝/无法确认清理则不绕过授权播放。新INIT清旧队列，正常STOP排尾，过期tick只淘汰同一源代次样本，避免旧流丢弃新回复。`AUX-AUDIO`记录每类流建立、清理/恢复、发包和队列计数；本地发送与测试通过仍需实车确认听感和互操作。
+
+### 自绘高德分流与DiPlay验证
+
+实机高德导航使用USAGE_MEDIA，不能仅按USAGE_ASSISTANCE_NAVIGATION_GUIDANCE抓取。573同批新增shell AudioPolicy双LOOP_BACK mix：导航匹配现查的高德UID，MEDIA排除同一UID，分别使用createAudioRecordSink生成的独立地址，禁止同时保留旧address0全局submix。UID隔离的是高德应用的播放，不能宣称识别了它内部所有音频的业务语义。
+
+导航PCM经有界50ms预缓存与400ms尾静音门控，首个非零段发送独立START/DATA，静音结束只发一次STOP，避免零PCM永久duck。两个reader受同一代次约束，单路失效或owner死亡会回收两路与policy，再由父端一次性退回legacy系统混音。split不能建立时不单独抓导航，避免双播；type101被拒且已清理时，已有互斥捕获的导航才混回MEDIA一次。重连复用采集时重发新段INIT，退出地图全屏不停止导航捕获。
+
+2026-11-15 DiPlay实际验证：系统policy已显示互补UID规则和两条不同mix地址；一轮导航播报时NAV非零PCM增加、MEDIA计数不随之增加。修复DiPlay被desktop标记整体禁用辅助流后，23:13:56和23:14:05两次建立type101/OPUS48k/mono/SPF960，分别发送165/450包后排空关闭，主媒体始终PCM48k双声道/SPF352。用户确认导航正常、音乐降低后恢复，未见该轮辅助SETUP/清理异常。这是DiPlay验证，不替代ID8.5上车测试。
 
 ## ID6 / NBT Evo 实验路径
 

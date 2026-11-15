@@ -27,3 +27,44 @@
 后续：按用户要求追踪固件BMW分支，确认vehicleCfgIsBMW未找到静态调用者、实际品牌位影响蓝牙模块自动重连候选。SAP、固定七项features及资源回调另行记录，不误当ID9专用路径。唯一新增协议对照为ID9屏幕latencyMs 25→75（固件0x3abac明确常量），实际请求测试先红后绿，MBUX100/默认25保持。安装前发现571已被其它工作提交为f7f574c，此延迟改动作为新未提交批次升572/10668；本轮不提交推送，实车400是否变化待验证。
 
 用户随后明确ID8.5为主线、ID9仅附带支持，并选择“自绘HEVC＋真实HEVC输入透传，保留H.264回退”。复用本批572，不再加号。实施范围：MGU资源生命周期及75ms、BMW已实现能力声明、显式codec贯穿编码器/JNI/视频泵、HEVC hvc1/hvcC和加密标志、真实源参数确认与AU解析。未找到CarWith编码选择协议，因此不添加猜测字段/实时转码。自绘默认H264、HEVC硬件启动失败回退；车机未协商HEVC的真实HEVC源明确提示不兼容。验证包括JVM策略、Android真实socket、实际手机Surface编码/解码素材与独立审查；编译通过后覆盖安装，保留数据，不提交推送。
+
+## 573：方向盘与小爱回复链路
+
+当前HEAD已由其它工作推进至80da947（572），本轮再次授权证据差异修复、构建和覆盖安装，不提交推送；版本按新未提交批次升573/10669一次。
+
+证据与实施范围：
+
+- [x] 复核盒子6800/6802及B5/B6到Android MediaSession路由：未发现确定的按键映射差异；570日志有注册无实际报告，不猜测按键值或改CarWith音乐控制。
+- [x] NowPlaying：盒子回显式订阅的playback13/14能力和16应用bundle；当前无5003设置能力，回复13/14=false，16由真实packageName提供。保持legacy空订阅wire及字段过滤，未知项只记录ID。新增失败测试后实现，iAP2整包回归。
+- [x] CarWith源码追踪证明独立VR下行：VRAudioManager经9242发0x50002 INIT、0x50003 DATA（AES），0x50004 STOP空明文。当前receiver只观察丢弃，确定需要补齐；不把上行0x58001认作下行。
+- [x] 在carlife/voice_audio.rs实现受认证、格式和大小约束的VR输入；capture/noCapture共用，保留现有单writer上行。未知FEED_END/INTERRUPT只统计，无证据不新增DONE回执。
+- [x] engine.rs增加独立VoiceAudio事件和PCM队列，STOP排尾，下次INIT清旧源；三路混音/闪避保留PCM RTP、nonce和Skip节拍，不新建未经车测的SIRI/OPUS流，不冒充用户操作抢音频资源。
+- [x] 设备失败复现→修复回归，独立审查；完整Release JVM/Android原生/Lint/构建，核对APK并adb install -r、版本与启动验证。
+
+复测重点：CARWITH-CHANNEL VR的INIT/DATA/STOP、decryptOk/pcmBytes/nonzeroSamples/forwarded，VOICE-AUDIO及音频队列vr、owner_phone/blocked_samples；IAP2-NOWPLAYING订阅字段和IAP2-MEDIA reports/edges，再到MEDIA-KEY派发。不记录语音内容或播放器元数据，软件闭环不宣称实车已恢复。
+
+573最终验证：Release JVM532、Android原生244通过/1既有现场依赖忽略，包含MEDIA/TTS/VR真实socket路径；完整Lint0错误/69警告，Release构建通过，包内原生库匹配。已adb install -r成功并核实573/10669、主Activity启动及进程，无本进程致命崩溃；保持未提交未推送。
+
+### 同批继续：独立SIRI与导航
+
+用户明确盒子成功日志未测试SIRI/导航，授权继续对照固件实现，复用573/10669。按已证实的type100/speechRecognition/OPUS24k480与type101/default/OPUS48k960设计，分别保留main借还/Speaking与导航appState/duck/unduck；不改媒体PCM或主线到ID9。
+
+- [x] 静态libopus工厂及48k立体声输入转换、20ms mono编码、实际采样时钟RTP/同步/nonce回归；本地/CI CMake构建与许可材料。
+- [x] 严格能力过滤、独立SETUP字段和响应校验、duck/unduck及结构化失败清理结果，RTSP实包测试。
+- [x] 资源按相关代次合并，串行ACK提交、精确借还；end失败保留lease可重试，receiver接管不抢回。
+- [x] 独立worker和有界源队列；主泵Pause物理关闭/取消迟到Pause/恢复媒体，fallback不重播；新代次不被旧tick淘汰。
+- [x] 控制器RTSP+UDP验证正常SIRI/导航、重复清理防护、清理拒绝重试、恢复耗尽后fresh start、SETUP中shutdown。
+- [x] 最终完整构建与覆盖安装；保持未提交未推送。车机分别验证SIRI回复、导航提示、音乐恢复与原有媒体稳定性。
+
+同批最终：Android281通过/1现场依赖忽略，Release JVM532，完整Lint0错误69警告；静态Opus正式APK构建通过、许可与库校验通过，再次覆盖安装573/10669及启动核实完成。未提交推送。
+
+### 同批继续：自绘高德UID音频分流
+
+用户授权补齐自绘导航type101、PCM MEDIA、duck/unduck及失败回退，先DiPlay验证，不提交推送。
+
+- [x] 只读确认当前高德播放为USAGE_MEDIA；选现查UID包含/排除，避免usage-only漏采。
+- [x] shell双AudioPolicy LOOP_BACK sink/owner与故障回收，legacy全局采集互斥回退；AIDL末尾追加保持旧事务号。
+- [x] 双reader代次隔离、导航400ms静音门控、有界预缓存、JNI tts START/DATA/STOP；旧reader不能停止新capture。
+- [x] 设备确认两policy地址与UID互斥，修复DiPlay desktop禁用辅助流的限制；接收端选择红绿回归。
+- [x] DiPlay两段导航建立type101/OPUS48k/SPF960并排空关闭，媒体PCM保持；用户确认导航有声、音乐降低后恢复。
+- [x] Release JVM542、Android顺序284通过/1现场依赖忽略，Lint0错误76警告；同批573再次覆盖安装及进程核实，不提交推送。ID8.5实车仍待复测。

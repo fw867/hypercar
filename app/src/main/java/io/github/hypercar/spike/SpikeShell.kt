@@ -35,6 +35,8 @@ object SpikeShell {
     fun isConnected(): Boolean = service?.asBinder()?.isBinderAlive == true
 
     fun startAudioCapture(owner: IBinder): android.os.ParcelFileDescriptor? = service?.startAudioCapture(owner)
+    fun startSplitAudioCapture(owner: IBinder, navigationUid: Int): Array<android.os.ParcelFileDescriptor>? =
+        service?.startSplitAudioCapture(owner, navigationUid)
     fun stopAudioCapture() { service?.stopAudioCapture() }
     fun audioCaptureStatus(): String = service?.audioCaptureStatus() ?: "shell disconnected"
     fun startBluetoothDiscoverable(owner: IBinder, token: String, seconds: Int): String =

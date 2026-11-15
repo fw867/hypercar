@@ -57,4 +57,7 @@ interface ISpikeShell {
     /** Preserve the complete card gesture, including cancellation and any available pointers. */
     String touchEvent(int displayId, in MotionEvent event);
 
+    /** [0]=MEDIA excluding navigation UID, [1]=navigation UID only; one policy, two PCM sinks. */
+    ParcelFileDescriptor[] startSplitAudioCapture(IBinder owner, int navigationUid);
+
 }

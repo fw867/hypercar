@@ -5,8 +5,9 @@ data class Iap2NowPlaying(
     val title: String = "", val artist: String = "", val album: String = "",
     val appName: String = "", val durationMs: Long = 0, val elapsedMs: Long = 0,
     val status: Int = 0, val artwork: ByteArray? = null,
+    val appBundleId: String = "",
 ) {
-    fun body(artworkId: Int?): ByteArray {
+    fun body(artworkId: Int?, explicitPlayback: Boolean = false): ByteArray {
         // Bound UTF-8 fields as well as numeric values; a bad player must not exhaust CSM u16.
         fun text(id: Int, value: String) = Iap2Csm.string(id, value.replace("\u0000", "").take(192))
         fun millis(value: Long) = value.coerceIn(0, 0xffff_ffffL)
@@ -14,7 +15,10 @@ data class Iap2NowPlaying(
             text(6, album) + text(12, artist) +
             (artworkId?.takeIf { it in 1..255 }?.let { Iap2Csm.u8(26, it) } ?: byteArrayOf())
         val playback = Iap2Csm.u8(0, status.coerceIn(0, 2)) + Iap2Csm.u32(1, millis(elapsedMs)) +
-            text(7, appName)
+            text(7, appName) + if (explicitPlayback) {
+                // SetNowPlayingInformation is not implemented: do not advertise remote seek or queue lists.
+                Iap2Csm.u8(13, 0) + Iap2Csm.u8(14, 0) + text(16, appBundleId)
+            } else byteArrayOf()
         return Iap2Csm.param(0, item) + Iap2Csm.param(1, playback)
     }
 }
@@ -64,6 +68,10 @@ internal class Iap2NowPlayingSession(
             } else {
                 requested = if (frame.body.isEmpty()) null else fields.mapValues { (_, values) -> values.map { it.id }.toSet() }
                 note("Start body_bytes=${frame.body.size} fields=${requested?.entries?.take(8)?.associate { it.key to it.value.sorted().take(32) } ?: "legacy-default"}; values omitted")
+                val unsupported = requested?.mapValues { (group, ids) ->
+                    ids - supportedFields[group].orEmpty()
+                }?.filterValues { it.isNotEmpty() }
+                if (!unsupported.isNullOrEmpty()) note("requested unsupported fields=${unsupported.entries.take(8).associate { it.key to it.value.sorted().take(32) }}; values omitted")
                 subscribed = true; force = true; nextPoll = 0
             }
             true
@@ -112,9 +120,9 @@ internal class Iap2NowPlayingSession(
                     } + byteArrayOf(0, 2)
                 }
             }
-            val body = select(np.body(artworkId))
+            val body = select(np.body(artworkId, explicitPlayback = requested != null))
             // Elapsed changes are useful but do not flood the link every polling interval.
-            val content = select(np.copy(elapsedMs = 0).body(artworkId))
+            val content = select(np.copy(elapsedMs = 0).body(artworkId, explicitPlayback = requested != null))
             if (force || !content.contentEquals(lastBody) || (wants(1,1) && np.status == 1 && now - lastProgressAt >= 5_000)) {
                 if (body.isNotEmpty()) out += Output.Control(body)
                 lastBody = content
@@ -153,5 +161,8 @@ internal class Iap2NowPlayingSession(
         }
     }
     private fun note(message: String) { if (diagnostics++ < 64) log("IAP2-NOWPLAYING: $message") }
-    companion object { const val MAX_ARTWORK = 256 * 1024 }
+    companion object {
+        const val MAX_ARTWORK = 256 * 1024
+        private val supportedFields = mapOf(0 to setOf(1,4,6,12,26), 1 to setOf(0,1,7,13,14,16))
+    }
 }

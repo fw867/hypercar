@@ -6,7 +6,7 @@ pub fn avcc_dimensions(avcc: &[u8]) -> Option<(u32, u32)> {
     sps_dimensions(avcc.get(8..8usize.checked_add(len)?)?)
 }
 
-fn sps_dimensions(nal: &[u8]) -> Option<(u32, u32)> {
+pub(crate) fn sps_dimensions(nal: &[u8]) -> Option<(u32, u32)> {
     if nal.first()? & 31 != 7 || nal.len() > 65535 { return None; }
     let mut rbsp = Vec::with_capacity(nal.len());
     let mut zeros = 0;

@@ -4,7 +4,7 @@ pub(super) struct Stats {
     pub rx_bytes: u64, pub frames: u64, pub decrypt_ok: u64, pub decrypt_fail: u64,
     pub plain: u64, pub pcm_bytes: u64, pub nonzero_samples: u64, pub odd_bytes: u64,
     pub forwarded: u64, pub event_closed: u64, pub empty: u64, pub unknown: u64,
-    pub parse_fail: u64, pub observed_only: u64,
+    pub parse_fail: u64, pub observed_only: u64, pub not_ready: u64,
     services: Vec<(u32,u64)>, other_services: u64,
 }
 impl Stats {
@@ -21,7 +21,7 @@ impl Stats {
     }
     pub fn report(&self,label:&str,reason:&str,pending:usize)->String {
         let services=self.services.iter().map(|(s,n)|format!("0x{s:x}:{n}")).collect::<Vec<_>>().join(",");
-        format!("CARWITH-CHANNEL: {label} reason={reason} rxBytes={} frames={} services=[{services}] otherServices={} decryptOk={} decryptFail={} plain={} pcmBytes={} nonzeroSamples={} oddBytes={} forwarded={} eventClosed={} empty={} unknown={} parseFail={} observedOnly={} pending={pending}; cumulative, no content",self.rx_bytes,self.frames,self.other_services,self.decrypt_ok,self.decrypt_fail,self.plain,self.pcm_bytes,self.nonzero_samples,self.odd_bytes,self.forwarded,self.event_closed,self.empty,self.unknown,self.parse_fail,self.observed_only)
+        format!("CARWITH-CHANNEL: {label} reason={reason} rxBytes={} frames={} services=[{services}] otherServices={} decryptOk={} decryptFail={} plain={} pcmBytes={} nonzeroSamples={} oddBytes={} forwarded={} eventClosed={} empty={} unknown={} parseFail={} observedOnly={} notReady={} pending={pending}; cumulative, no content",self.rx_bytes,self.frames,self.other_services,self.decrypt_ok,self.decrypt_fail,self.plain,self.pcm_bytes,self.nonzero_samples,self.odd_bytes,self.forwarded,self.event_closed,self.empty,self.unknown,self.parse_fail,self.observed_only,self.not_ready)
     }
 }
 const MAX_PAYLOAD:usize=256*1024;

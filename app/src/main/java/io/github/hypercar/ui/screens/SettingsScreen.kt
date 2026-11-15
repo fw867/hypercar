@@ -1218,7 +1218,7 @@ private fun ResolutionSection() {
                     )
                 }
             }
-            Text("HEVC 需要车机支持；自绘使用手机硬件编码，不可用时回退 H.264。CarWith 保留源编码，不转码。",
+            Text("HEVC 需要车机和手机支持；CarWith 可硬件转码并铺满车机主屏，不可用时回退 H.264。",
                 style = MaterialTheme.typography.bodySmall, color = TextSecondary)
 
         }

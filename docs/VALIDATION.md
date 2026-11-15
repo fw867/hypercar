@@ -2,6 +2,74 @@
 
 本页集中记录各车机当日日志的关键结论、修复状态和待验证项，不再为单次日志分析新建车型文档。只保留定位问题所需的脱敏摘要，不收录原始日志、抓包、设备标识、网络地址、配对凭据或本地采集路径。实现细节见[会话控制](SESSION-CONTROL.md)、[音频](AUDIO.md)和[输入与语音](INPUT-AND-VOICE.md)。
 
+## 2026-11-16 所有档案统一绝对会话URI（573，同批续编）
+
+用户要求把BMW对照扩大到所有车机档案。移除Kotlin车型URI判断、专用JSON字段及Rust配置门控，公共negotiate在配对重连选定最终控制连接后无条件安装一次绝对URI。URI格式、IPv6/原始scope处理、OnceLock控制通道归属、请求映射及音频SETUP原地址保持。其它请求参数和时序不变。新增真实socket回归先观察旧路径失败，再验证公共初始化的三条独立连接均在会话/屏幕SETUP、RECORD、TEARDOWN复用单一URI且新连接ID不同；保留加密实包、失败清理及HEVC重试回归。旧BMW字段仅保留于兼容测试JSON，不再影响运行。
+
+Release JVM544项、Android原生302项通过，1项既有现场依赖忽略；Lint0错误/76警告，独立静态复核无P1/P2。编译后保留数据覆盖安装573/10669，同批未重复升号，未提交/推送。
+
+DiPlay第一轮00:35:18、第二轮00:36:22均记录SESSION-URI全档案策略生效。各轮会话SETUP(CSeq4)、RECORD(CSeq6)、屏幕SETUP(CSeq9)同URI且200；音频SETUP(CSeq10)保持原地址且200。通过App断开/启动入口完成重连，第一轮TEARDOWN(CSeq61)复用原URI、未收到200 ACK即控制连接关闭；第二轮使用不同URI，恢复HEVC2400×1080输出。不是每款车机均已实测，也尚不能确认ID9/奔驰400或ID8.5二次上车只有声音的唯一根因。
+
+## 2026-11-16 BMW绝对会话URI单变量对照（573，同批续编）
+
+仅BMW ID8.5与ID9档案启用bmw_absolute_session_uri，DiPlay身份不覆盖该档案选择，其余档案保持旧URI。配对可能重建控制连接，因此在最终配对连接上生成一次UUID前8字节组成的无符号64位会话ID，URI采用盒子的无显式端口形式。IPv6加方括号，原始socket scope的百分号转义为%25；socket连接地址不变。URI用OnceLock归属于当前控制通道，不能由其它源或重连覆盖。
+
+只替换会话SETUP /setup、屏幕SETUP /、RECORD /及TEARDOWN /的请求目标，包含清理、屏幕回收、辅助流和最终退出；音频SETUP既有带端口绝对URI、认证/info/command/feedback路径、正文/头部、时序和超时不变。HEVC拒绝重试沿用同一URI。测试先红后绿验证精确档案范围、IPv4/IPv6/数字与接口scope、非法authority、加密实包的正文/UA/CSeq一致、URI不可替换、重连隔离，以及已接受协商失败的全局TEARDOWN复用。
+
+Release545项JVM、301项Android原生测试通过，1项既有现场依赖忽略；Lint0错误/76警告，独立静态审查未发现P1/P2。构建后保留数据覆盖安装573/10669，同批不再次加号，未提交/推送。
+
+DiPlay以BMW档案和真实IPv6地址测试：00:26:55本轮CSeq4会话SETUP、CSeq6 RECORD、CSeq9屏幕SETUP使用同一绝对URI且均200；音频SETUP仍为原地址且200，输出HEVC2400×1080@30。用户确认完成停止/重连且画面正常，但初次采集未看到退出事务；随后从App实际“断开”入口补验，00:28:56 CSeq130 TEARDOWN复用该URI，发出后控制连接关闭、没有200 ACK，清理完成。00:29:25重连生成不同的会话ID，会话SETUP/RECORD/屏幕SETUP再次同URI且200，音频200，00:29:26恢复HEVC输出。不能把无ACK的退出写成200成功，也不能把DiPlay通过等同于ID8.5/ID9实车400已解决。
+
+## 2026-11-16 所有档案默认能力门控HEVC（573，同批续编）
+
+按用户最新要求，未保存编码偏好时默认HEVC，保留已明确选择的H.264；手机无硬件HEVC Main/Surface编码器时在引擎配置中先降级。移除ID9和MBUX兼容路径的HEVC硬禁用，实际发送仍需本轮SETUP明确返回enabledFeatures/hevc。明确不支持类SETUP拒绝时仅移除HEVC重试一次；授权拒绝、超时、已接受但响应损坏不走该重试，实际提议状态随结果返回。没有猜测/info位定义，不因车型名称强制HEVC。
+
+先红后绿验证默认值、显式偏好、手机门控，以及全部档案布尔组合只有HEVC项变化；真实RTSP回归确认400后第二次SETUP仅删除HEVC，且未提议时即使应答回显HEVC也不会启用，401/403不重试。Release JVM544项、Android原生297项通过，1项既有现场依赖忽略，Lint0错误/76警告。构建后保留数据覆盖安装573/10669，未重复升号，未提交/推送。
+
+DiPlay在00:13:13确认hevc_proposed=true/hevc_accepted=true；00:13:15使用硬件AVC1920×1080→全屏HEVC2400×1080@30，至00:13:41已编码732帧、队列基本为空，未见该轮转码回退。其它档案覆盖是本地协议组合与模拟接收端验证，不是每款实车均已通过，BMW ID8.5实车仍待验证。
+
+## 2026-11-15–16 CarWith硬件HEVC转码与DiPlay全屏验证（573，同批续编）
+
+HEVC优先和会话接受HEVC共同门控硬件AVC解码→GPU缩放/轻锐化→HEVC Main编码，实际输出使用/info主屏尺寸。手机硬件不支持、配置/运行失败或持续无输出时，本源轮锁定H.264透传并重新等待源参数集和IDR；已有真实HEVC源不重编码。保持现有屏幕加密和nonce、PCM MEDIA及车型协商策略，ID9继续不声明HEVC，BMW ID8.5为主线。
+
+最初DiPlay轮因Kotlin增量编译的会话委托接口未生成新工厂转发，出现AbstractMethodError，日志确认成功回退H.264；未将该轮“画面正常”误记为HEVC通过。工厂改到稳定JNI桥后实际发出HEVC，后续定位到CarWith突发视频包引起短队列积压，增加有界突发队列、完整IDR安全淘汰/关键帧请求和解码后帧率控制。后台初始化和独立编解码线程避免阻塞视频泵；生命周期信号量避免重连与旧资源清理竞争。回归覆盖回退锁定、暂停/源重建、参数变化、初始化无输出及静止页恢复。
+
+手机生产类实测将合成AVC1280×720、约60fps输入转为HEVC1280×720、2400×1080、2732×794，三个输出均通过解码尺寸及PTS验证，输出约30fps。初版保持比例时用户报告黑边，按最新要求改为实际像素拉伸铺满，保留全屏归一化触摸映射。最终DiPlay在00:03:14明确使用c2.qti.avc.decoder 1920×1080→GPU full-screen stretch/sharpen→c2.qti.hevc.encoder 2400×1080@30；VideoConfig SPS/头部均2400×1080、flags0x1e。至00:03:55编码1175帧，队列基本为空，未见本轮转码回退或IDR淘汰。用户确认“已铺满全屏，滑动点击正常”。这不是BMW实车稳定性证明。
+
+最终Release JVM542项通过；Android原生顺序294项通过、1项既有现场依赖忽略；Lint0错误/76警告，diff检查通过。Release编译后保留数据覆盖安装573/10669，多次续编未再升级版本；未提交、未推送。BMW ID8.5实车、持续高负载/热降频及所有硬件故障注入仍未在DiPlay这轮全部覆盖。
+
+## 2026-11-15 自绘高德分流与DiPlay实测（573，同批续编）
+
+高德实际导航AudioTrack使用USAGE_MEDIA，原全局REMOTE_SUBMIX会把导航与音乐混在一起。本批按现查的应用UID注册两个互斥LOOP_BACK policy sink：导航包含、MEDIA排除，分别绑定独立mix地址。真机dumpsys确认规则和两路录音存在，旧全局采集已退出；非零PCM计数证明导航与MEDIA可分开。使用只包含计数的诊断，不记录导航语音、路线或音频文件。
+
+新导航JNI通路使用tts=true；首声START/PCM、尾静音400ms后STOP，有界预缓存，重连/旧reader/单路故障清理受代次约束。split建立或运行失败先完整释放两sink/policy再回退单系统混音，独立type101拒绝且确认清理后可把导航PCM混回排除导航UID的MEDIA，避免丢声和双播。测试覆盖门控、UID互斥规则与逆序回滚；失败回退协议已有真实RTSP/UDP模拟回归，未在DiPlay人为破坏policy验证所有故障场景。
+
+第一轮真机发现DiPlay被desktop_receiver整体禁止辅助音频，导航虽独立采到仍回MEDIA；新增接收端选择失败测试先红后绿，只为明确DiPlay放行能力受控的辅助流，保留WinPlay/NBT/ID9策略。重装后23:13:56和23:14:05实际建立type101/OPUS48k/mono/SPF960并发送165、450包，播报后unduck/TEARDOWN及导航app归还顺序完成、队列排空。主音频保持PCM48k双声道/SPF352，控制会话和HEVC继续存活；用户确认“导航正常，音乐降低后恢复”。未见该轮辅助流建立/清理错误。
+
+最终Release JVM542项通过，完整Lint0错误/76警告；Android原生顺序运行284项通过、1项既有现场依赖忽略。并行初轮有1个既有Opus NDK解码测试因input busy失败，定向和顺序完整回归通过，未改解码器以掩盖该条件。Release构建通过，APK原生库匹配，再次保留数据覆盖安装573/10669并核实启动和进程。仍是同一未提交批次，不再加号；未提交、未推送。BMW ID8.5实车验证尚待进行。
+
+## 2026-11-15 ID8.5独立SIRI回复与导航流（573，同批续编）
+
+用户明确盒子成功日志当时没有测试SIRI/导航，要求继续按固件实现，未把日志缺项当作不实现的依据。本批补齐type100/speechRecognition/OPUS24k480和type101/default/OPUS48k960，每包20ms，独立密钥、nonce、RTP样本时钟与同步；对应`/info`能力存在时用于MGU/ID8.5的VR回复和TTS导航。媒体保留原PCM/AAC，ID9/NBT/桌面路径不启用该MGU策略。
+
+SIRI按Speaking与临时主音频借用执行，主泵确认暂停、关闭旧媒体后切流，结束时确认清理及归还再重新SETUP原媒体；导航只更新导航appState，按固件duck→SETUP、停止UDP→unduck→TEARDOWN执行。ACK拒绝、receiver接管、途中screen变更、新INIT、迟到Pause和旧流迟到tick均有代次/清理保护。恢复失败有界重试并保留待恢复阶段，fresh媒体开始可再恢复；shutdown将未收尾流并入最终TEARDOWN。
+
+最终Android原生281项通过、1项既有现场依赖忽略；Release JVM532项通过，完整Lint0错误/69警告，Release构建通过。控制器7项真实RTSP/UDP回归包括正常SIRI/导航、失败SETUP仅清理一次、归还403后重试、媒体恢复失败及fresh start、SETUP中关闭；Opus测试实际编码/解码并验证20msmono、PT100/101、480/960时间戳、AAD/nonce与同步。独立审查发现的恢复及世代缺口已修复。CI构建配置已更新，尚未运行远端CI。
+
+同一未提交批次沿用573/10669，未再加号。已再次adb install -r覆盖安装，保留数据/配对，核实版本、启动和新进程存活；APK内原生库匹配本次产物，含Opus许可且无私有libopus.so依赖。未提交、未推送。当前证明本地协议与编解码闭环，待ID8.5实车分别验证回复音、导航提示、媒体恢复和借还/抢占行为；不能仅凭RTSP200或UDP写出宣称车机实际出声。
+
+## 2026-11-15 ID8.5方向盘与小爱回复（573，第一阶段）
+
+继续对照盒子及本机CarWith/CarLife源码，确认一个源侧遗漏：VR下行原先只统计丢弃，实际VRAudioManager通过9242发送加密INIT(0x50002)、PCM DATA(0x50003)和空明文STOP(0x50004)。现补独立VoiceAudio事件与接收器，两种麦克风模式共用；要求本轮认证/准入/加密/开始条件以及有效PCM16初始化，格式、加密或畸形超大INIT不能沿用旧参数。未知FEED_END/INTERRUPT仅统计，不猜回执、不启用录音。
+
+MEDIA、导航TTS和VR回复保留独立队列，VR停止排完尾音，新初始化清旧格式；最终沿用现有PCM媒体输出、音频归属门禁、Skip节拍及RTP时钟。不把盒子独立SIRI/AltAudio的静态实现直接套成未经车测的新SETUP或OPUS路径。明确修复了接收缺口，尚不能证明该实车轮次已发送VR回复或车机最终出声。
+
+NowPlaying补显式订阅playback13/14=false、16真实播放器包名，保留legacy字段过滤和封面行为；未知请求只记录ID。盒子的HID注册、B5/B6映射与当前通路一致，未发现可据以修改的键值差异。570日志中六次component1注册成功，但无实际6802切歌报告；不能把NowPlaying补齐称作方向盘故障已修复。
+
+设备失败复现覆盖VR原观察丢弃、独立混音静音、坏/超大INIT及同次读取后的格式遗留，修复后回归通过。Release JVM 532项通过；Android原生244项通过、1项现场依赖忽略；完整Lint为0错误、69警告，正式构建通过。MEDIA/TTS另有真实socket回归，验证分片、加密、PCM原样转发与单层12字节头，未发现新缺陷。独立复审发现的格式遗留问题已闭环。573/10669只升级一次，包内原生库与本轮产物匹配，已adb install -r保留数据覆盖安装，并核实版本、主Activity启动和进程存活，未见该进程致命崩溃。本轮未提交、未推送。
+
+实车复测重点：按一次上一曲/下一曲后检查IAP2-MEDIA reports/edges→MEDIA-KEY；小爱出现识别文字后检查CARWITH-CHANNEL VR services/decryptOk/nonzeroSamples/forwarded→VOICE-AUDIO→队列vr及owner_phone/blocked_samples。不录音、不记录语音内容；需新日志才能判断剩余故障所在层。
+
 ## 2026-11-15 ID8.5流程校准与HEVC（572，同批续编）
 
 以BMW ID8.5为主线，ID9仅兼容支持。MGU启用已有屏幕资源生命周期，屏幕latencyMs按盒子75ms校准，远端schema12保护新默认；保留认证和RECORD顺序。BMW去除未实现的会话管理/日志/车辆状态能力，MGU/NBT不声明未实现的type103 MainBuffered，PCM发送策略保持。详细证据和能力边界见[盒子流程](BMW-BOX-CARPLAY-FLOW.md)。

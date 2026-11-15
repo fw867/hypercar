@@ -35,7 +35,7 @@ internal object Iap2NowPlayingSource {
         }
         if (!state.available) return Iap2NowPlaying()
         return Iap2NowPlaying(state.title, state.artist, state.album, state.appLabel,
-            state.durationMs, state.positionMs, state.playbackStatus, bytes)
+            state.durationMs, state.positionMs, state.playbackStatus, bytes, appBundleId = state.packageName)
     }
     private fun encode(image: Bitmap): ByteArray? {
         val scale = minOf(1.0, 320.0 / maxOf(image.width, image.height))
