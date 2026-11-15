@@ -342,7 +342,7 @@ class WifiIap2ProtocolTest {
         val car = Car()
         car.ready()
         val power = car.message(0xae00)
-        assertEquals(listOf(0xae01, 0xae01, 0xae01), power.map { it.messageId })
+        assertEquals(listOf(0xae01), power.map { it.messageId })
         power.forEach { frame ->
             val parsed = Iap2Csm.parseParams(frame.body)
             assertEquals(frame.body.size, parsed.sumOf { it.value.size + 4 })
@@ -380,7 +380,7 @@ class WifiIap2ProtocolTest {
             car.message(0xaa01, Iap2Csm.param(0, byteArrayOf(1)))
             val result = car.message(0xaa03, Iap2Csm.param(0, ByteArray(64) { 1 }))
             assertTrue(car.protocol.ready)
-            assertEquals(if (cancel) 0 else 3, result.count { it.messageId == 0xae01 })
+            assertEquals(if (cancel) 0 else 1, result.count { it.messageId == 0xae01 })
             assertEquals(1, result.count { it.messageId == 0x4155 })
             assertTrue(car.logs.any { it.startsWith("DEFER") })
             car.message(0x1234)

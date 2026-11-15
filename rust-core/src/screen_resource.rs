@@ -264,7 +264,7 @@ mod tests {
             let pump=tokio::spawn(video_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(PumpStat::default())),true,pipeline,rx,video_rx));
             let owned=Arc::new(AtomicBool::new(modes.screen_owned()));
             let session=Arc::new(ScreenSession {control,factory:Arc::new(Factory),params,shared:Some([9;32]),uuid:"screen-test".into(),
-                keep_stats:false,display:(1920,720),owned,commands,bootstrap_event:None,bootstrap_hids:Vec::new(),activated:AtomicBool::new(!mbux),resource_state:tokio::sync::Mutex::new(Default::default())});
+                keep_stats:false,software_receiver:false,display:(1920,720),owned,commands,bootstrap_event:None,bootstrap_hids:Vec::new(),activated:AtomicBool::new(!mbux),resource_state:tokio::sync::Mutex::new(Default::default())});
             Self {session,modes:Arc::new(Mutex::new(modes)),car,video,source,pump}
         }
         fn reconcile(&self)->tokio::task::JoinHandle<Result<(),String>> {
@@ -289,7 +289,7 @@ mod tests {
             assert_eq!(streams.len(),1);assert_eq!(streams[0].get("type").and_then(Value::as_int),Some(110));
             let id=streams[0].get("streamConnectionID").and_then(Value::as_int).unwrap() as u64;
             let response=bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![
-                ("dataPort",Value::int(self.video.local_addr().unwrap().port() as i64)),
+                ("type",Value::int(110)),("dataPort",Value::int(self.video.local_addr().unwrap().port() as i64)),
             ])]))]));
             reply(&mut self.car,request,200,&response).await;
             let (peer,_)=tokio::time::timeout(Duration::from_secs(2),self.video.accept()).await.unwrap().unwrap();
@@ -431,7 +431,7 @@ mod tests {
                 Value::dict(vec![("status",Value::int(-1)),("streams",Value::array(vec![Value::dict(vec![
                     ("type",Value::int(110)),("dataPort",Value::int(f.video.local_addr().unwrap().port() as i64)),
                 ])]))])
-            } else { Value::dict(vec![("streams",Value::array(vec![]))]) };
+            } else { Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![("type",Value::int(110))])]))]) };
             reply(&mut f.car,&setup,200,&bplist::encode(&body)).await;
             let error=task.await.unwrap();
             assert!(error.contains(if reject_business { "business rejection" } else { "dataPort" }));
@@ -657,7 +657,7 @@ mod tests {
         let mut f=Fixture::new(Modes::initial()).await;
         let task=f.reconcile();f.modes_reply(1).await;let setup=read(&mut f.car).await;
         task.abort();assert!(task.await.unwrap_err().is_cancelled());
-        let body=bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![("dataPort",Value::int(f.video.local_addr().unwrap().port() as i64))])]))]));
+        let body=bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![("type",Value::int(110)),("dataPort",Value::int(f.video.local_addr().unwrap().port() as i64))])]))]));
         reply(&mut f.car,&setup,200,&body).await;
         assert!(tokio::time::timeout(Duration::from_millis(50),f.video.accept()).await.is_err());
     }

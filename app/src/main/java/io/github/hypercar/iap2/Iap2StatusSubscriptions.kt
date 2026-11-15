@@ -2,7 +2,7 @@ package io.github.hypercar.iap2
 
 /** Bounded, transport-local subscription replies; Start/Stop ordering survives early auth. */
 internal class Iap2StatusSubscriptions(
-    private val power: () -> List<ByteArray> = Iap2Messages::powerUpdates,
+    private val power: () -> Iap2Power = Iap2PowerSource::snapshot,
     private val log: (String) -> Unit = {},
 ) {
     private var diagnostics = 0
@@ -55,7 +55,11 @@ internal class Iap2StatusSubscriptions(
                 if (diagnostics++ < 64) log("IAP2-LIST: 0x4170 fields=${requested.take(32)} -> 0x4171 fields=${Iap2Csm.parseParams(body).map { it.id }} body_bytes=${body.size}; box-compatible, no list records")
                 listOf(Iap2Csm.Frame(0x4171, body)) // Box also returns an empty frame if neither field was requested.
             }
-            0xae00 -> power().map { Iap2Csm.Frame(0xae01, it) }
+            0xae00 -> {
+                val fields = Iap2Csm.parseParams(frame.body)
+                if (fields.sumOf { it.value.size + 4 } != frame.body.size || fields.any { it.value.isNotEmpty() }) return true
+                listOf(Iap2Csm.Frame(0xae01, power().response(fields.map { it.id }.toSet())))
+            }
             // Existing box-compatible AppDiscoveryUpdate response, not an app-launch command.
             0xad00 -> listOf(Iap2Csm.Frame(0xad01, Iap2Csm.u8(0,1)))
             else -> return false

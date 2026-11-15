@@ -7,7 +7,7 @@
 //!    len > 1422 直接判协议违规）；读方向保持宽松（车机的分片长度由它决定）。
 //!  - 应答必须按 CSeq 异步派发：车机的音频 SETUP 实测可耗时 ~2.7s，
 //!    同步读会把 /feedback 心跳饿死，3s 看门狗即拆会话（cardeck 2026-10-17 实测）。
-//!  - 事件通道是双向 RTSP：车机的每个来向请求必须立即回 200 OK（echo CSeq），
+//!  - 事件通道是双向 RTSP：车机的每个来向请求必须及时应答（echo CSeq），
 //!    不应答 → 车机塞 3 条就断通道（§9c「触摸无报文（三）」）。
 
 use std::collections::HashMap;
@@ -184,7 +184,7 @@ fn find_head_separator(buf: &[u8]) -> Option<usize> {
 /// 控制通道：一条 RTSP 连接 + 可选密文帧 + CSeq 派发 + 入向请求应答。
 ///
 /// - `request()`：串行化写、按 CSeq 登记 oneshot、读线程派发（心跳不会被慢应答饿死）。
-/// - 入向请求（车机发来的 POST /command 等）：一律立即回 200 OK，
+/// - 入向请求（车机发来的 POST /command 等）：及时应答，非法 `/command` 回 400、未知命令回 501，
 ///   `/command` 的 body 经 [RtspChannel::inbound] 交给上层分发。
 pub struct RtspChannel {
     trace_id: u64,
@@ -211,7 +211,7 @@ impl Drop for TransactionGuard<'_> {
 
 impl RtspChannel {
     /// 建立通道：返回共享句柄 + 入向请求接收器（车机 POST 来的 /command 等；
-    /// reader 已对每个入向请求自动回 200 OK，上层只需消费消息体）。
+    /// reader 自动应答并仅分发合法命令，上层只需消费消息体）。
     pub fn spawn(
         read: OwnedReadHalf,
         write: OwnedWriteHalf,
@@ -512,6 +512,12 @@ async fn reader_loop(
                 }
             } else {
                 let cseq = msg.cseq();
+                if let Err((status, reason)) = validate_inbound_command(&msg) {
+                    if let Err(error) = respond(&write, &cipher, cseq, status, reason, &[]).await {
+                        crate::emit_log(&format!("RTSP#{trace_id}: rejection write failed CSeq={cseq:?} status={status}: {error}"));
+                    }
+                    continue;
+                }
                 let body = reply.as_ref().and_then(|f| f(&msg)).unwrap_or_default();
                 let ui_type = if msg.first_line.contains("/command") {
                     crate::bplist::parse(&msg.body).ok().and_then(|v| match v.get("type").and_then(crate::bplist::Value::as_str) {
@@ -552,8 +558,45 @@ async fn reader_loop(
     pending.lock().clear();
 }
 
+// Validate only the command endpoint; other RTSP methods retain their existing behavior.
+// Known no-op notifications remain accepted. Parameter rules follow our actual consumers,
+// including both HID layouts and optional device UUID, rather than a stricter peer schema.
+fn validate_inbound_command(message: &RtspMessage) -> Result<(), (u16, &'static str)> {
+    use crate::bplist::Value;
+    let mut line = message.first_line.split_whitespace();
+    if line.next() != Some("POST") || line.next() != Some("/command") { return Ok(()); }
+    let bad = (400, "Bad Request");
+    let command = crate::bplist::parse(&message.body).map_err(|_| bad)?;
+    let kind = command.get("type").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or(bad)?;
+    let field = |name: &str| command.get(name).or_else(|| command.get("params").and_then(|p| p.get(name)));
+    let valid = match kind {
+        "iAPSendMessage" => crate::wifi_iap2::command_bytes(&command).is_some(),
+        "hidSendReport" => {
+            let report = command.get("hidReport").and_then(Value::as_bytes)
+                .or_else(|| command.get("params").and_then(|p| p.get("report")).and_then(Value::as_bytes));
+            report.is_some_and(|r| !r.is_empty()) && field("uuid").is_none_or(|id| id.as_str().is_some() || id.as_int().is_some_and(|n| n >= 0))
+        }
+        "requestSiri" => matches!(command.get("params").and_then(|p| p.get("siriAction")).or_else(|| command.get("siriAction")).and_then(Value::as_int), Some(1..=3)),
+        "setNightMode" => {
+            // The consumer tries the decoded top-level value, then params; an invalid
+            // top-level type must not mask a valid nested night mode.
+            let boolean = |v: &Value| v.as_bool().or_else(|| v.as_int().map(|n| n != 0));
+            command.get("nightMode").and_then(boolean)
+                .or_else(|| command.get("params").and_then(|p| p.get("nightMode")).and_then(boolean)).is_some()
+        }
+        "requestUI" | "changeUIContext" | "changeModes" | "forceKeyFrame" |
+        "hidSetInputMode" | "ping" | "fps" => true,
+        _ => return Err((501, "Not Implemented")),
+    };
+    if valid { Ok(()) } else { Err(bad) }
+}
+
 async fn respond_ok(write: &SharedWrite, cipher: &SharedCipher, cseq: Option<i32>, body: &[u8]) -> std::io::Result<()> {
-    let mut head = format!("RTSP/1.0 200 OK\r\nContent-Length: {}\r\n", body.len());
+    respond(write, cipher, cseq, 200, "OK", body).await
+}
+
+async fn respond(write: &SharedWrite, cipher: &SharedCipher, cseq: Option<i32>, status: u16, reason: &str, body: &[u8]) -> std::io::Result<()> {
+    let mut head = format!("RTSP/1.0 {status} {reason}\r\nContent-Length: {}\r\n", body.len());
     if let Some(c) = cseq { head.push_str(&format!("CSeq: {c}\r\n")); }
     if !body.is_empty() { head.push_str("Content-Type: application/x-apple-binary-plist\r\n"); }
     head.push_str("\r\n");
@@ -626,6 +669,79 @@ mod tests {
 
 
     #[tokio::test]
+    async fn inbound_commands_reject_malformed_and_unknown_without_dispatch() {
+        use crate::bplist::{encode, Value};
+        let mut cases = vec![
+            ("POST /command RTSP/1.0", b"broken".to_vec(), 400),
+            ("POST /command RTSP/1.0", encode(&Value::array(vec![])), 400),
+            ("POST /command RTSP/1.0", encode(&Value::dict(vec![])), 400),
+            ("POST /command RTSP/1.0", encode(&Value::dict(vec![("type", Value::int(3))])), 400),
+            ("POST /command RTSP/1.0", encode(&Value::dict(vec![("type", Value::str("futureCommand"))])), 501),
+            ("OPTIONS * RTSP/1.0", vec![], 200),
+            ("POST /command-extra RTSP/1.0", b"opaque".to_vec(), 200),
+        ];
+        for kind in ["iAPSendMessage", "hidSendReport", "requestUI", "changeUIContext", "changeModes",
+            "requestSiri", "setNightMode", "forceKeyFrame", "hidSetInputMode", "ping", "fps"] {
+            let params = match kind {
+                "iAPSendMessage" => Value::dict(vec![("data",Value::Data(vec![1]))]),
+                "hidSendReport" => Value::dict(vec![("report",Value::Data(vec![1]))]),
+                "requestSiri" => Value::dict(vec![("siriAction",Value::int(2))]),
+                "setNightMode" => Value::dict(vec![("nightMode",Value::bool(true))]),
+                _ => Value::dict(vec![]),
+            };
+            cases.push(("POST /command RTSP/1.0", encode(&Value::dict(vec![("type",Value::str(kind)),("params",params)])), 200));
+        }
+        for (kind, params) in [
+            ("iAPSendMessage", Value::dict(vec![])),
+            ("iAPSendMessage", Value::dict(vec![("data",Value::str("invalid"))])),
+            ("iAPSendMessage", Value::dict(vec![("data",Value::Data(vec![]))])),
+            ("hidSendReport", Value::dict(vec![])),
+            ("hidSendReport", Value::dict(vec![("report",Value::str("invalid"))])),
+            ("requestSiri", Value::dict(vec![("siriAction",Value::int(99))])),
+            ("setNightMode", Value::dict(vec![])),
+        ] {
+            cases.push(("POST /command RTSP/1.0",encode(&Value::dict(vec![("type",Value::str(kind)),("params",params)])),400));
+        }
+        for (fields, status) in [
+            (vec![("type",Value::str("hidSendReport")),("hidReport",Value::Data(vec![1])),("uuid",Value::str("touch"))],200),
+            (vec![("type",Value::str("hidSendReport")),("hidReport",Value::Data(vec![1])),("uuid",Value::int(1))],200),
+            (vec![("type",Value::str("requestSiri")),("siriAction",Value::int(3))],200),
+            (vec![("type",Value::str("setNightMode")),("nightMode",Value::int(0))],200),
+        ] { cases.push(("POST /command RTSP/1.0",encode(&Value::dict(fields)),status)); }
+        for (id, status) in [(Value::str("touch"),200),(Value::int(0),200),(Value::int(1),200),
+            (Value::int(-1),400),(Value::Data(vec![1]),400),(Value::bool(true),400)] {
+            for nested in [false,true] {
+                let mut fields = vec![("type",Value::str("hidSendReport"))];
+                if nested { fields.push(("params",Value::dict(vec![("report",Value::Data(vec![1])),("uuid",id.clone())]))); }
+                else { fields.extend([("hidReport",Value::Data(vec![1])),("uuid",id.clone())]); }
+                cases.push(("POST /command RTSP/1.0",encode(&Value::dict(fields)),status));
+            }
+        }
+        cases.push(("POST /command RTSP/1.0",encode(&Value::dict(vec![("type",Value::str("setNightMode")),
+            ("nightMode",Value::str("invalid")),("params",Value::dict(vec![("nightMode",Value::bool(true))]))])),200));
+        for (line, body, status) in cases {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut car = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (phone, _) = listener.accept().await.unwrap();
+            let (r,w) = phone.into_split();
+            let (_channel, mut inbound) = RtspChannel::spawn(r,w,None);
+            car.write_all(format!("{line}\r\nCSeq: 23\r\nContent-Length: {}\r\n\r\n",body.len()).as_bytes()).await.unwrap();
+            car.write_all(&body).await.unwrap();
+            let mut buffer = Vec::new(); let mut chunk = [0;1024];
+            let response = loop {
+                let n = tokio::time::timeout(Duration::from_secs(1),car.read(&mut chunk)).await.unwrap().unwrap();
+                assert!(n>0); buffer.extend_from_slice(&chunk[..n]);
+                if let Some(message) = parse_rtsp_messages(&mut buffer).unwrap().pop() { break message; }
+            };
+            assert_eq!(response.status(),status,"{line} body={body:?}");
+            assert_eq!(response.cseq(),Some(23));
+            assert!(response.body.is_empty());
+            if status == 200 { assert_eq!(inbound.recv().await.unwrap().body,body); }
+            else { assert!(inbound.try_recv().is_err(),"rejected command was dispatched"); }
+        }
+    }
+
+    #[tokio::test]
     async fn ui_commands_receive_empty_200_with_optional_cseq_before_dispatch() {
         for (kind,cseq) in [("requestUI",Some(19)),("changeUIContext",None)] {
             let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -692,7 +808,9 @@ mod tests {
         let body = crate::bplist::encode(&crate::bplist::Value::dict(vec![("status", crate::bplist::Value::int(0))]));
         let expected = body.clone();
         let (_channel, mut inbound) = RtspChannel::spawn_with_reply(r,w,None,Some(Arc::new(move |_| Some(body.clone()))));
-        car.write_all(b"POST /command RTSP/1.0\r\nCSeq: 19\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+        let command = crate::bplist::encode(&crate::bplist::Value::dict(vec![("type",crate::bplist::Value::str("changeModes"))]));
+        car.write_all(format!("POST /command RTSP/1.0\r\nCSeq: 19\r\nContent-Length: {}\r\n\r\n",command.len()).as_bytes()).await.unwrap();
+        car.write_all(&command).await.unwrap();
         assert!(inbound.recv().await.is_some());
         let mut buffer = Vec::new(); let mut chunk = [0;1024];
         let response = loop {

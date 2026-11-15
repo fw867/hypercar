@@ -5,6 +5,9 @@ use parking_lot::Mutex;
 use tokio::sync::{mpsc,oneshot};
 use crate::{airplay::{self,AirplayParams,SocketProvider},bplist::{self,Value},rtsp::RtspChannel,screen::{ScreenSender,ScreenCipher}};
 
+#[path = "setup_stream.rs"]
+pub(crate) mod setup_stream;
+
 pub enum ScreenCommand {
     Install(ScreenSender),
     Pause(oneshot::Sender<()>),
@@ -15,6 +18,7 @@ pub struct ScreenSession {
     pub control: Arc<RtspChannel>,
     pub factory: Arc<dyn SocketProvider>,
     pub params: AirplayParams,
+    pub software_receiver: bool,
     pub shared: Option<[u8;32]>,
     pub uuid: String,
     pub keep_stats: bool,
@@ -37,8 +41,9 @@ impl ScreenSession {
         if response.status()!=200 { return Err(format!("屏幕 SETUP 被拒 {}",response.first_line)); }
         crate::resource_trace::validate_ack("SCREEN_SETUP", &response)?;
         let root=bplist::parse(&response.body).map_err(|e|format!("屏幕 SETUP 解析失败 {e}"))?;
-        let port=root.get("streams").and_then(Value::as_array).and_then(|s|s.first())
-            .map(|s|airplay::port_of(s.get("dataPort"))).unwrap_or(0);
+        let stream=setup_stream::select(&root,110,self.software_receiver)
+            .map_err(|error|format!("屏幕 {error}"))?;
+        let port=airplay::port_of(stream.get("dataPort"));
         if port==0 { return Err("屏幕 SETUP 没有 dataPort".into()); }
         crate::pipeline::activation(&self.params.pipeline, "SCREEN_SETUP");
         let cipher=match &self.shared {

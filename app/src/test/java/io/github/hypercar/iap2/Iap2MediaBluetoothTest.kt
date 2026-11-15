@@ -95,7 +95,7 @@ class Iap2MediaBluetoothTest {
         assertEquals(1,channel.sent.count{it==0x4155})
         assertEquals(1,channel.sent.count{it==0x4158})
         assertEquals(1,channel.sent.count{it==0x4171})
-        assertEquals(3,channel.sent.count{it==0xae01})
+        assertEquals(1,channel.sent.count{it==0xae01})
         assertTrue(channel.sent.indexOf(0x4e09)<channel.sent.indexOf(0x4155))
     }
     @Test fun malformedCertificateOrSignatureNeverProducesAuthenticationSuccess() {

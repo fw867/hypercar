@@ -396,6 +396,7 @@ pub async fn negotiate(
     p.pipeline.lock().screen_owned=Some(initially_owned);
     let screen_session=Arc::new(crate::screen_session::ScreenSession {
         control:channel.clone(), factory:factory.clone(), params:p.clone(), shared:shared_secret,
+        software_receiver:p.desktop_receiver || !use_box_bootstrap(true, &info),
         uuid:display_uuid.clone().unwrap_or_else(|| "6E4E3B31-0E5B-4A8F-9F1B-2C5D7E9A0C11".into()),
         keep_stats:keep_alive_stats, display:(disp_w,disp_h), owned:screen_owned.clone(),
         commands:screen_ready,
@@ -683,7 +684,7 @@ mod shutdown_tests {
         });
         let setup=read_request(&mut peer).await;assert!(setup.first_line.starts_with("SETUP "));
         peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 3\r\n\r\nbad",setup.cseq().unwrap()).as_bytes()).await.unwrap();
-        let exit=read_request(&mut peer).await;assert_eq!(exit.first_line,"TEARDOWN / RTSP/1.0");assert!(exit.body.is_empty());
+        let exit=read_request(&mut peer).await;assert_eq!(exit.first_line,"TEARDOWN / RTSP/1.0");assert_eq!(bplist::parse(&exit.body).unwrap().get("streams"), Some(&Value::Array(vec![])));
         peer.write_all(format!("RTSP/1.0 500 Failed\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",exit.cseq().unwrap()).as_bytes()).await.unwrap();
         let error=task.await.unwrap().unwrap_err();assert!(error.contains("SETUP 应答解析失败"));assert!(control.is_closed());
     }
@@ -1589,7 +1590,10 @@ async fn negotiate_audio(
     }
     let result = async {
         let root = bplist::parse(&resp.body).ok()?;
-        let stream = root.get("streams").and_then(Value::as_array)?.first()?;
+        let stream = match crate::screen_session::setup_stream::select(&root, codec.stream_type(), desktop) {
+            Ok(stream) => stream,
+            Err(error) => { emit_log(&format!("AUDIO: {error}")); return None; }
+        };
         let data_port = port_of(stream.get("dataPort"));
         let control_port = port_of(stream.get("controlPort"));
         if data_port == 0 {

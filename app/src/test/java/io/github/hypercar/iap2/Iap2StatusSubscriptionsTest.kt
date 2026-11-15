@@ -18,7 +18,7 @@ class Iap2StatusSubscriptionsTest {
         repeat(100) { for(id in listOf(0x4154,0x4157,0x4170,0xae00,0xad00)) s.handle(frame(id)) }
         s.authenticated()
         val replies=s.drain()
-        assertEquals(listOf(0x4155,0x4158,0x4171,0xae01,0xae01,0xae01,0xad01),replies.map{it.messageId})
+        assertEquals(listOf(0x4155,0x4158,0x4171,0xae01,0xad01),replies.map{it.messageId})
         replies.forEach { assertEquals(it.body.size,Iap2Csm.parseParams(it.body).sumOf{p->p.value.size+4}) }
         assertTrue(s.drain().isEmpty())
         val communications=Iap2Csm.parseParams(replies.first{it.messageId==0x4158}.body)

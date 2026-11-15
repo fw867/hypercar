@@ -14,8 +14,9 @@ impl NegotiationCleanup {
         match tokio::runtime::Handle::try_current() {
             Ok(runtime)=>Some(runtime.spawn(async move {
                 crate::emit_log(&format!("NEGOTIATION-CLOSE: accepted={accepted}; bounded session cleanup; no fabricated media streams"));
-                // Empty-body TEARDOWN addresses the session, including a SETUP accepted before parse failure.
-                crate::airplay::finish_session(&channel,&[],accepted).await;
+                // A parseable empty stream list tears down the session, including a SETUP accepted before parse failure.
+                let body=crate::bplist::encode(&crate::bplist::Value::dict(vec![("streams",crate::bplist::Value::Array(vec![]))]));
+                crate::airplay::finish_session(&channel,&body,accepted).await;
             })),
             Err(_)=>{channel.close();None}
         }
@@ -44,7 +45,7 @@ mod tests {
     #[tokio::test] async fn accepted_failure_sends_one_global_teardown_then_closes() {
         let(c,mut car)=pair().await;let mut guard=NegotiationCleanup::new(c.clone(),true);guard.accepted();
         let task=tokio::spawn(async move{guard.finish().await;guard.finish().await;});
-        let m=read(&mut car).await;assert_eq!(m.first_line,"TEARDOWN / RTSP/1.0");assert!(m.body.is_empty());
+        let m=read(&mut car).await;assert_eq!(m.first_line,"TEARDOWN / RTSP/1.0");assert_eq!(crate::bplist::parse(&m.body).unwrap().get("streams"), Some(&crate::bplist::Value::Array(vec![])));
         car.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",m.cseq().unwrap()).as_bytes()).await.unwrap();
         task.await.unwrap();assert!(c.is_closed());
     }

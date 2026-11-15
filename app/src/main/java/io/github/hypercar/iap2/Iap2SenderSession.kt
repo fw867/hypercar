@@ -57,7 +57,7 @@ class NoCarPlayWindowException(message: String) : IOException(message)
  *   **0xAA05 之后立即突发设备状态问候** 0x4E0C/0x4E0A/0x4E0B/0x4E09（§9j 核心修复：
  *   真 iPhone 就是这个次序；旧实现把问候排在 0x5703 等待之后，BMW 等问候、我们等
  *   0x5703，5.4s 后车机判 accessory 未就绪拆链）
- *   0xEA00（EA 会话：param1 必须是**协议名字符串**——§9j 第三证据；车机声明的
+ *   0xEA00（EA 会话：param1 为 u16 会话号；车机声明的
  *   每一条 EA 协议都要各开一次，BMW MGU-55 一次声明 7 条）
  *   0x5702 → 0x5703（按能力清单，拿热点 SSID/密码/信道）
  *   0x4300 → 0x4301（按能力清单，拿 AirPlay 端口/公钥/地址）
@@ -74,7 +74,7 @@ class Iap2SenderSession(
     private val deviceName: String = "HyperCar",
     /** 每次拿到/更新端点即回调（0x5703 与 0x4301 各触发一次，保活期 0x4301 重发也触发）。 */
     private val onEndpoint: (CarPlayEndpoint) -> Unit,
-    /** 仅用于 MFi 挑战长度的按车机持久化记忆；null = 只用进程内内存表（纯 JVM 单测）。 */
+    /** 用于 MFi 挑战长度与真实证书的按车机持久化记忆；null = 只用进程内内存表（纯 JVM 单测）。 */
     private val context: android.content.Context? = null,
     /** 车机档案：品牌特有的行为差异都从这里读（见 `headunit/HeadUnitProfile.kt`）。 */
     private val profile: io.github.hypercar.headunit.HeadUnitProfile =
@@ -146,7 +146,7 @@ class Iap2SenderSession(
     private var eaProtocols: List<Iap2Messages.EaProtocol> = emptyList()
 
     /** 车机是否回过 0xEA03（EA 会话确认）；没回过才有必要重发 0xEA00。 */
-    private var eaSessionConfirmed = false
+    private val eaSessions = Iap2EaSessions()
 
     /** 保活期「等不到热点凭据」时的重探节奏（见 [pokeWhileWaiting]）。 */
     private var lastPokeNanos = 0L
@@ -244,11 +244,30 @@ class Iap2SenderSession(
         enterPhase("MFI_EXCHANGE")
         val identityText = listOfNotNull(ident.name, ident.model, ident.manufacturer).joinToString(" ").lowercase()
         val certificate = requestCertificate(ident, deadline)
-        log("iap2 rx=0xaa01 certificate bytes=${certificate.body.size}（跳过校验）")
-        val mfiResult = runMfiChallenge(deadline, receiverKey = MfiLengthMemory.receiverKey(identityText, receiverAddress))
+        log("iap2 certificate source=${if(certificate.cached) "cache" else "rx-AA01"} bytes=${certificate.frame.body.size}; trust unverified")
+        val mfiResult = try {
+            runMfiChallenge(deadline, receiverKey = MfiLengthMemory.receiverKey(identityText, receiverAddress))
+        } catch (error: IOException) {
+            if (usesId9MinimalBootstrap() && error !is InterruptedIOException) MfiCertificateCache.forget(context,receiverAddress)
+            throw error
+        }
         ensureActive("MFi 结果发送前")
+        if (usesId9MinimalBootstrap()) {
+            if (mfiResult == MfiResult.RESPONSE_RECEIVED_UNVERIFIED) {
+                if (!certificate.cached) certificate.serial?.let { serial ->
+                    val saved=MfiCertificateCache.remember(context,receiverAddress,serial,certificate.frame.body)
+                    log("iap2 certificate-cache stored=$saved; certificate reuse only, authentication remains unverified")
+                }
+            } else MfiCertificateCache.forget(context,receiverAddress)
+        }
         send(Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED)
         log("iap2 tx=0xaa05 compatibility-result=$mfiResult（未做证书/签名验证，不代表标准认证通过）")
+        // IDC23 capture: AA05 -> 4300, before greetings, EA, HID or queued subscriptions.
+        val earlyAvailability = usesId9MinimalBootstrap() && profile.sendCarPlayAvailability
+        if (earlyAvailability) {
+            sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY,Iap2Messages.carPlayAvailability(bluetoothMac))
+            log("iap2 ID9 minimal bootstrap: AA05 -> 4300; no unsolicited state greetings")
+        }
         media.authenticated()
         nowPlaying.authenticated()
         subscriptions.authenticated()
@@ -258,8 +277,8 @@ class Iap2SenderSession(
         val wifiGen = ReceiverProfile.classifyWifiGen(ident.sendIds, ident.receiveIds)
         val legacyWifiExchange = wifiGen != ReceiverProfile.WifiGen.NEW
 
-        // ---- 设备状态问候：必须**紧贴** 0xAA05 突发（§9j 核心修复）----
-        // 真 iPhone 在 0xAA05 之后立刻发 0x4E0C/0x4E0A/0x4E0B/0x4E09，然后才轮到
+        // ---- MGU／旧路径设备问候；IDC23新式路径已直接发送4300并跳过问候 ----
+        // 早期MGU样本在 0xAA05 之后发 0x4E0C/0x4E0A/0x4E0B/0x4E09，然后才轮到
         // 订阅/请求。旧实现排在 0x5703 等待之后：BMW 等问候、我们等 0x5703，
         // 两轮实测稳定 5.37~5.45s 后车机拆 RFCOMM（另一台 MGU-86 五轮全败同签名）。
         sendDeviceStateGreetings(includeWirelessUpdate = !legacyWifiExchange)
@@ -267,13 +286,7 @@ class Iap2SenderSession(
 
         // ---- EA 会话（MFi 完成后发；认证前发会噎死 DiPlay）----
         // BMW iD8.5 档案 B 声明 com.bmw.carplay protocol=8；档案 A 声明 de.bmw.a4a.bt。
-        // param1 必须是**协议名字符串**：旧代码发成 u16 协议号，车机不回 0xEA03、
-        // CarPlay 数据通道不打开（§9j 第三证据，对所有车机都存在的错误）。
-        //
-        // BMW MGU-55 实测（2026-10-24）声明了 7 条 EA 协议（id 全部是 10）——
-        // 旧解析把重复 id 压成一条、只开最后那条（de.bmw.a4a.bt）；de.bmw.a4a.pairing
-        // 这条「配对通道」从未被打开过。解析已修（[Iap2Messages.parseIdentification]），
-        // 这里逐条开、逐条记，日志里能直接看到车机回过哪条 0xEA03。
+        // EA sessions use local u16 identifiers, independent of protocol names.
         eaProtocols = ident.eaProtocols
         if (eaProtocols.isNotEmpty()) {
             log("iap2 车机声明 EA 协议(${eaProtocols.size})=" + eaProtocols.joinToString { "${it.protocolId}:${it.name}" })
@@ -286,7 +299,7 @@ class Iap2SenderSession(
             if (eaProtocols.isNotEmpty()) log("iap2 跳过 0xea00 EA 会话（档案 ${profile.id} 不要求，对齐真 iPhone 行为）")
         } else {
             for (protocol in eaProtocols) {
-                sendFireAndForget(Iap2MessageIds.EA_OPEN_SESSION, Iap2Messages.eaOpenSession(protocol.protocolId, protocol.name))
+                sendFireAndForget(Iap2MessageIds.EA_OPEN_SESSION, eaSessions.open(protocol.protocolId, protocol.name))
                 log("iap2 tx=0xea00 startEASession protocol=${protocol.protocolId} name=${protocol.name}")
             }
         }
@@ -396,13 +409,13 @@ class Iap2SenderSession(
         // **不再看可收清单**——清单只能证明「有」，不能证明「没有」（cardeck 0.1.14 定谳）。
         // 0x4300 里带的是本机蓝牙传输标识：车机靠它把 CarPlay 设备与已配对手机对上，
         // 这也是必须用真实 MAC 的原因（伪 MAC 会对不上任何已配对设备）。
-        if (profile.sendCarPlayAvailability) {
+        if (profile.sendCarPlayAvailability && !earlyAvailability) {
             if (ident.declaresReceive(Iap2MessageIds.CARPLAY_AVAILABILITY) == false) {
                 log("iap2 车机清单未声明可收 0x4300，但档案 ${profile.id} 要求发——照发（清单可能不完整）")
             }
             sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY, Iap2Messages.carPlayAvailability(bluetoothMac))
             log("iap2 tx=0x4300 CarPlayAvailability（档案 ${profile.id}；mac=$bluetoothMac）")
-        } else {
+        } else if (!earlyAvailability) {
             log("iap2 跳过 0x4300（CarPlayAvailability）——档案 ${profile.id} 不要求")
         }
         val declaresStartSession = ident.declaresSend(Iap2MessageIds.CARPLAY_START_SESSION)
@@ -632,9 +645,9 @@ class Iap2SenderSession(
             if (peer?.declaresReceive(Iap2MessageIds.CARPLAY_AVAILABILITY) == true) {
                 sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY, Iap2Messages.carPlayAvailability(bluetoothMac))
             }
-            if (!eaSessionConfirmed && pokeCount <= EA_REOPEN_ATTEMPTS) {
+            if (profile.openEaSessions && !eaSessions.allConfirmed && pokeCount <= EA_REOPEN_ATTEMPTS) {
                 for (protocol in eaProtocols) {
-                    sendFireAndForget(Iap2MessageIds.EA_OPEN_SESSION, Iap2Messages.eaOpenSession(protocol.protocolId, protocol.name))
+                    sendFireAndForget(Iap2MessageIds.EA_OPEN_SESSION, eaSessions.open(protocol.protocolId, protocol.name))
                 }
                 log("iap2 重发 0xea00（EA 会话未确认，第 $pokeCount 次，共 $EA_REOPEN_ATTEMPTS 次）")
             }
@@ -648,25 +661,10 @@ class Iap2SenderSession(
     private fun hasAccessoryEndpoint(): Boolean =
         !wifi?.ssid.isNullOrEmpty() || lastStartSession?.ipAddresses?.isNotEmpty() == true
 
-    /** 车机 0xEA03：EA 会话状态。文档未公开字段，只记原始体 + 尽力解析协议号/状态。 */
-    private fun handleEaSessionStatus(
-        frame: Iap2Csm.Frame,
-        phase1: Boolean,
-    ) {
-        eaSessionConfirmed = true
-        val subs = Iap2Csm.parseParams(frame.body)
-        val protocolId = subs.firstOrNull { it.id == 0 }?.asU8()
-        val status = subs.firstOrNull { it.id == 1 }?.asU8()
-        val parsed =
-            if (protocolId != null || status != null) {
-                " protocol=${protocolId ?: "?"} status=${status ?: "?"}"
-            } else {
-                ""
-            }
-        log(
-            "iap2 rx=0xea03 EA 会话${if (phase1) "" else "（保活期）"}已确认$parsed" +
-                " bytes=${frame.body.size}=" + frame.body.take(BODY_DUMP_BYTES).joinToString("") { "%02x".format(it) },
-        )
+    /** EA03 confirms only an actually requested u16 session with status OK. */
+    private fun handleEaSessionStatus(frame: Iap2Csm.Frame, phase1: Boolean) {
+        val accepted = eaSessions.status(frame.body)
+        log("iap2 rx=0xea03 accepted=$accepted allConfirmed=${eaSessions.allConfirmed} bytes=${frame.body.size}")
     }
 
     /**
@@ -813,12 +811,19 @@ class Iap2SenderSession(
 
     // ---- MFi 挑战 ----
 
-    /** AA06 may precede AA01. One follow-up request, with the original deadline unchanged. */
-    private fun requestCertificate(ident: Iap2Messages.Identification, deadline: Long): Iap2Csm.Frame {
+    private fun usesId9MinimalBootstrap(): Boolean = profile.id=="bmw_id9" && peerIdentification?.let {
+        ReceiverProfile.classifyWifiGen(it.sendIds,it.receiveIds)==ReceiverProfile.WifiGen.NEW
+    }==true
+
+    private data class CertificateExchange(val frame: Iap2Csm.Frame, val serial: ByteArray?, val cached: Boolean = false)
+
+    /** A serial cache hit reuses a real certificate; a miss still fetches AA01 within the original deadline. */
+    private fun requestCertificate(ident: Iap2Messages.Identification, deadline: Long): CertificateExchange {
         if (ident.declaresSend(Iap2MessageIds.ACCESSORY_AUTHENTICATION_SERIAL_NUMBER) == true)
             send(Iap2MessageIds.MFI_REQUEST_CERTIFICATE, Iap2Csm.param(0, byteArrayOf()))
         else send(Iap2MessageIds.MFI_REQUEST_CERTIFICATE)
         var followedSerial = false
+        var serial: ByteArray? = null
         while (true) {
             val frame = expectAnyOrNull(setOf(Iap2MessageIds.MFI_CERTIFICATE,
                 Iap2MessageIds.ACCESSORY_AUTHENTICATION_SERIAL_NUMBER,
@@ -827,12 +832,22 @@ class Iap2SenderSession(
             when (frame.messageId) {
                 Iap2MessageIds.MFI_CERTIFICATE -> {
                     if (!Iap2Csm.hasNonEmptyParameter(frame.body, 0)) throw IOException("MFi 证书缺少完整参数")
-                    return frame
+                    return CertificateExchange(frame,serial)
                 }
-                Iap2MessageIds.ACCESSORY_AUTHENTICATION_SERIAL_NUMBER -> if (!followedSerial) {
-                    followedSerial = true
-                    send(Iap2MessageIds.MFI_REQUEST_CERTIFICATE)
-                    log("iap2 rx=0xaa06 → 请求完整证书（不延长认证预算）")
+                Iap2MessageIds.ACCESSORY_AUTHENTICATION_SERIAL_NUMBER -> {
+                    val received=MfiCertificateCache.serial(frame.body) ?: throw IOException("MFi 序列号缺少完整参数")
+                    if (serial!=null && !serial.contentEquals(received)) throw IOException("MFi 证书交换期间序列号改变")
+                    serial=received
+                    if (!followedSerial) {
+                        followedSerial=true
+                        val cached=if (usesId9MinimalBootstrap()) MfiCertificateCache.load(context,receiverAddress,received) else null
+                        if (cached!=null) {
+                            log("iap2 rx=0xaa06 certificate-cache hit -> challenge; authentication remains unverified")
+                            return CertificateExchange(Iap2Csm.Frame(Iap2MessageIds.MFI_CERTIFICATE,cached),received,true)
+                        }
+                        send(Iap2MessageIds.MFI_REQUEST_CERTIFICATE)
+                        log("iap2 rx=0xaa06 -> request full certificate; cache miss/disabled, original deadline unchanged")
+                    }
                 }
                 else -> throw IOException("MFi 证书阶段被拒 id=0x${frame.messageId.toString(16)}")
             }
@@ -957,6 +972,7 @@ class Iap2SenderSession(
     }
 
     private fun sendDeviceStateGreetings(force: Boolean = false, includeWirelessUpdate: Boolean = true) {
+        if (usesId9MinimalBootstrap()) return
         if (greetingsSent && !force) return
         greetingsSent = true
         val timezoneMinutes = TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 60_000

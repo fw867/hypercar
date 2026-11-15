@@ -9,12 +9,14 @@ object PairingReset {
         PairingIdentityFiles.resetAll(context.filesDir)
         SettingsStore.forgetAllCarPairings()
         io.github.hypercar.iap2.MfiLengthMemory.clearAll(context)
+        io.github.hypercar.iap2.MfiCertificateCache.clearAll(context)
         log("PAIR-RESET: 用户明确清除全部身份、备份、配对标记、Wi-Fi 关联与 MFi 记忆")
         return "已清除全部配对身份与记录，目标车机已设为未指定"
     }
 
     fun run(context: Context, mac: String, log: (String) -> Unit): String {
         PairingIdentityFiles.resetReceiver(context.filesDir, mac)
+        io.github.hypercar.iap2.MfiCertificateCache.forget(context,mac)
         SettingsStore.forgetCarPairing(mac)
         val summary = "已清除该车机的配对身份与记录"
         log("PAIR-RESET: receiver=$mac；仅清理本车，保留共享身份与其它车机记录")

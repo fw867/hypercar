@@ -1,13 +1,13 @@
 # 参考实现与证据边界
 
-更新：2026-11-09。仅记录已查看的源码/样本；接收端和手机发送端的角色不能互换，第三方成功不代表 HyperCar 已实车通过。
+更新：2026-11-15。仅记录已查看的源码/样本；接收端和手机发送端的角色不能互换，第三方成功不代表 HyperCar 已实车通过。
 
 | 来源 | 可借鉴内容 | 边界 |
 |---|---|---|
 | [CarDeck](https://github.com/shaonialife/cardeck/tree/503ed3730d5a9365272294b79306cea5fcce115b) | iAP2 问候、EA、可变Session ID及奥迪记录 | 历史实验解释需按后续修正理解，不能当宝马规范 |
 | [mcarplay](https://github.com/wangxso/mcarplay/tree/a3a4117ed60b864324d681e45086be594ed7233a) | CarWith七路连接、认证、加密、视频重组与IDR门控 | VW后续对照版本f1ec3ffaa1f9c11b548ec1a8d8f7afff087d8627；不照搬所有品牌特例 |
 | [CarPToCarL](https://github.com/jjuugk/CarPToCarL/tree/6346bf7b63b052b2764eb19f1495891bc833c152) | requestSiri、HID语音入口及CarLife硬键 | 参考的1.5秒PTT经验未用于当前默认结束逻辑 |
-| [CatPlay](https://github.com/catplay-labs/catplay/tree/fc52bac7910a07ff3b6d94712175db6013528aa9) | 资源仲裁、流生命周期、关闭顺序、附加蓝牙UUID | Linux HCI及USB包装器公告不能直接搬到Android |
+| [CatPlay](https://github.com/catplay-labs/catplay/tree/4e7846e5d0ed2c12da5bee91787e77ceb7eb5cb3) | 资源仲裁、流生命周期、关闭顺序、附加蓝牙UUID | 双角色、USB模拟与实际无线路径须分开；本轮字段/清理审计见VALIDATION |
 | [Showcase](https://github.com/amineross/showcase/tree/34980e930a0b3245ffb6b49f22187630dac525ab) | 多流资源、媒体加密及计时/TCP诊断 | 越狱iOS接收端；不能证明宝马需同样重建时序 |
 | [LIVI](https://github.com/f-io/LIVI/tree/739c889c92929babd0cce4e697672a440291e4bf) | 接收端邀请、IPv6、多屏及车辆协议 | 其主动拨号/拆ACL不应复制为手机“无画面就断蓝牙” |
 | [headunit-carplay](https://github.com/riazosama/headunit-carplay/tree/ec76e30a164cbfb9734be11b0383a9780500e6d2) | Android车机栈桥接、依赖就绪及清理 | 依赖Autochips预装栈、MFi及root，不是独立手机发送端 |

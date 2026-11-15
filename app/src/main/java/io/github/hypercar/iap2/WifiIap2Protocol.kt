@@ -19,10 +19,7 @@ internal class WifiIap2Protocol(
     private val media = Iap2MediaSession(log, onMediaKey)
     private val nowPlaying = Iap2NowPlayingSession(nowPlayingProvider, log)
     private var navigation = RouteGuidanceSession(log)
-    private val subscriptions = Iap2StatusSubscriptions(power = {
-        // Preserve the existing Wi-Fi bridge's power compatibility values.
-        listOf(Iap2Csm.u8(4,1), Iap2Csm.u8(5,1), Iap2Csm.u16(6,100))
-    }, log = log)
+    private val subscriptions = Iap2StatusSubscriptions(log = log)
     private var started = false
     private var phase = "LINK"
     private var deadline = 0L

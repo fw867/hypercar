@@ -14,7 +14,7 @@
  *  4. MFi 认证（0xAA00 段，配件证明自己；手机侧可跳过校验）
  *  5. 手机 → 配件: 设备状态问候 0x4E0C/0x4E0A/0x4E0B/0x4E09（**必须紧跟 0xAA05**，
  *     BMW iD8.5/MGU-86 实测：发晚了车机 5.4s 拆链，见 §9j）
- *  6. EA 会话 0xEA00（param0=u8 协议号、param1=**协议名字符串**——BMW §9j 第三证据）
+ *  6. EA 会话 0xEA00（param0=u8 协议号、param1=u16 会话号）
  *  7. 手机 → 配件: RequestAccessoryWiFiConfiguration(0x5702)
  *     配件 → 手机: AccessoryWiFiConfiguration(0x5703)   // 明文 TLV：SSID/密码/信道
  *  8. 手机 → 配件: CarPlayAvailability(0x4300) → 配件回 CarPlayStartSession(0x4301)
@@ -360,18 +360,10 @@ object Iap2Messages {
 
     // ---- 出向消息构建 ----
 
-    /** 0xEA00：param0=u8 协议号、param1=**协议名字符串**（BMW §9j 第三证据：发成 u16 协议号时车机不回 0xEA03）。 */
-    fun eaOpenSession(protocolId: Int, protocolName: String): ByteArray =
-        Iap2Csm.u8(0, protocolId) + Iap2Csm.string(1, protocolName)
+    /** EA00: protocol u8, session identifier u16. */
+    fun eaOpenSession(protocolId: Int, sessionId: Int): ByteArray =
+        Iap2Csm.u8(0, protocolId) + Iap2Csm.u16(1, sessionId)
 
-
-    /** Existing Bluetooth compatibility values, NOT a live Android battery reading.
-     * Respect each captured TLV length; old constants also included 6a40/bd40 tail bytes. */
-    fun powerUpdates(): List<ByteArray> = listOf(
-        Iap2Csm.u16(6, 0x4f),
-        Iap2Csm.u8(4, 0),
-        Iap2Csm.u16(6, 0x4f),
-    )
     /** 0x4300：无线组件（transport=1 蓝牙）+ 传输标识（本机蓝牙 MAC）。 */
     fun carPlayAvailability(bluetoothMac: String): ByteArray =
         Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac))
