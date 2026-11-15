@@ -1476,6 +1476,7 @@ private fun agoText(atMillis: Long): String {
 private fun HeadUnitSection(connected: Boolean = false) {
     val context = androidx.compose.ui.platform.LocalContext.current
     var selectedId by rememberSaveable { mutableStateOf(SettingsStore.headUnitProfileId) }
+    var id9WithoutBuffered by rememberSaveable { mutableStateOf(SettingsStore.id9DisableBufferedAudio) }
     var expanded by rememberSaveable { mutableStateOf(false) }
     // 远程档案（GitHub 下发）：新增车型不用发版，点一下就能拉到
     val scope = androidx.compose.runtime.rememberCoroutineScope()
@@ -1648,6 +1649,19 @@ private fun HeadUnitSection(connected: Boolean = false) {
                         },
                     )
                 }
+            }
+            if (current.id == "bmw_id9") {
+                SwitchRow(
+                    title = "ID9 不声明缓冲音频（对照实验）",
+                    subtitle = "仅移除 mainBuffered，HEVC 继续关闭；下次连接生效",
+                    checked = id9WithoutBuffered,
+                    enabled = !connected,
+                    onCheckedChange = {
+                        SettingsStore.id9DisableBufferedAudio = it
+                        id9WithoutBuffered = it
+                        io.github.hypercar.settings.SettingsRevision.bump()
+                    },
+                )
             }
             Spacer(modifier = Modifier.height(8.dp))
             Text(

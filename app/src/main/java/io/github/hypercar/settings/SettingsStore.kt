@@ -136,6 +136,10 @@ object SettingsStore {
         set(v) = p().edit().putBoolean(KEY_STANDBY_NOTIFICATION, v).apply()
 
     /** 选中的车机档案 id（见 `headunit/HeadUnitProfile.kt`）；默认宝马 iD8.5。 */
+    var id9DisableBufferedAudio: Boolean
+        get() = p().getBoolean("id9_disable_buffered_audio", false)
+        set(v) = p().edit().putBoolean("id9_disable_buffered_audio", v).apply()
+
     var headUnitProfileId: String
         get() = p().getString(KEY_HEAD_UNIT, "bmw_id85") ?: "bmw_id85"
         set(v) = p().edit().putString(KEY_HEAD_UNIT, v).apply()
@@ -412,6 +416,7 @@ object SettingsStore {
             append("\"carwith_stretch\":").append(if (carWithStretch) "true" else "false").append(",")
             append("\"mbux_screen_bootstrap\":").append(profile.mbuxScreenBootstrap).append(",")
             append("\"id9_screen_bootstrap\":").append(profile.id9ScreenBootstrap).append(",")
+            append("\"id9_disable_buffered_audio\":").append(profile.id == "bmw_id9" && id9DisableBufferedAudio).append(",")
             append("\"nbt_audio_first\":").append(profile.nbtAudioFirst).append(",")
             append("\"mbux_media_compat\":").append(profile.mbuxMediaCompat).append(",")
             append("\"screen_resource_lifecycle\":").append(if (profile.screenResourceLifecycleEnabled(screenResourceLifecycle)) "true" else "false").append(",")

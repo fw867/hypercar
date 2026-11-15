@@ -133,6 +133,12 @@ object HyperCarRepo {
     }
 
     private fun retryAirplayOrFail(detail: String) {
+        if (AirplayFailurePolicy.waitsForNewInvitation(headUnitProfile.id, detail)) {
+            reconnectJob?.cancel()
+            log("SESSION: ID9协议明确拒绝，本轮不重建相同参数/端点；等待新的车机连接或手动重试：$detail")
+            fail(detail, allowReconnect = false)
+            return
+        }
         // 车机主动关掉控制通道时**不要重试同一个端点**：它紧接着会把 7000 的监听也关掉，
         // 之后每次重试都是 ECONNREFUSED（2026-10-25 22:32 现场：6 轮 × 2.5s 全是拒连，
         // 既没意义，还占着「等车机重新发起 iAP2」的时间窗）。
@@ -3011,14 +3017,14 @@ object HyperCarRepo {
         )
     }
 
-    private fun fail(reason: String, expectedAttempt: Long = connectionAttemptId) {
+    private fun fail(reason: String, expectedAttempt: Long = connectionAttemptId, allowReconnect: Boolean = true) {
         scope.launch {
             autoConnectChanges.lock()
             try {
                 if (expectedAttempt != connectionAttemptId || !sessionLive.compareAndSet(true, false)) return@launch
                 val receiver = retryReceiver()
                 val hadLink = sessionHadLink
-                if (wifiSessionRecovery.interrupted(receiver, sessionWifiSsid, SystemClock.elapsedRealtime()))
+                if (allowReconnect && wifiSessionRecovery.interrupted(receiver, sessionWifiSsid, SystemClock.elapsedRealtime()))
                     log("WIFI-RECOVERY: 本次受邀媒体会话意外失败，开启120s/最多5次恢复窗口；不代表车机已显示")
                 sessionSockets?.invalidate()
                 val pending = connectJob
@@ -3031,7 +3037,7 @@ object HyperCarRepo {
                 log("SESSION 失败: $reason")
                 releaseSessionResources(AutomaticConnectionPolicy.keepListeningAfterStop(SettingsStore.autoConnect, automaticPauseRemaining > 0))
                 _snapshots.update { it.copy(link = LinkState.Failed(reason)) }
-                scheduleAutoReconnect("失败: $reason", hadLink, receiver)
+                if (allowReconnect) scheduleAutoReconnect("失败: $reason", hadLink, receiver)
                 if (SettingsStore.autoConnect) scheduleStandbyAfterCleanup()
             } finally { autoConnectChanges.unlock() }
         }

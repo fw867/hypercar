@@ -10,6 +10,7 @@
 
 mod airplay;
 mod nbt;
+mod negotiation_cleanup;
 mod audio_out;
 mod audio_resample;
 mod aac;

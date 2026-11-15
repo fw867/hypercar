@@ -75,6 +75,8 @@ pub struct EngineConfig {
     #[serde(default)]
     pub id9_screen_bootstrap: bool,
     #[serde(default)]
+    pub id9_disable_buffered_audio: bool,
+    #[serde(default)]
     pub nbt_audio_first: bool,
     #[serde(default)]
     pub mbux_media_compat: bool,
@@ -505,6 +507,7 @@ pub async fn run_engine(
         bmw_box_bootstrap: cfg.bmw_box_bootstrap,
         mbux_screen_bootstrap: cfg.mbux_screen_bootstrap,
         id9_screen_bootstrap: cfg.id9_screen_bootstrap,
+        id9_disable_buffered_audio: cfg.id9_disable_buffered_audio,
         nbt_audio_first: cfg.nbt_audio_first,
         mbux_media_compat: cfg.mbux_media_compat,
         desktop_receiver: cfg.desktop_receiver,
@@ -794,7 +797,7 @@ mod video_pump_tests {
         let config:EngineConfig=serde_json::from_value(json.clone()).unwrap();
         assert!(!config.screen_resource_lifecycle);assert!(config.enable_audio);
         assert!(!config.mbux_screen_bootstrap);
-        assert!(!config.id9_screen_bootstrap);
+        assert!(!config.id9_screen_bootstrap);assert!(!config.id9_disable_buffered_audio);
         assert!(!config.nbt_audio_first);assert!(!config.mbux_media_compat);
         assert!(!config.self_microphone_asr);
         json["screen_resource_lifecycle"]=serde_json::json!(true);
