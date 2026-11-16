@@ -7,7 +7,9 @@ import java.util.concurrent.Executors
 
 /** Bitmap conversion stays off both iAP2 receive loops and the main thread. */
 internal object Iap2NowPlayingSource {
+    private data class Track(val app: String, val item: Long?, val title: String, val artist: String, val album: String)
     private val lock = Any()
+    private var track: Track? = null
     private var bitmap = java.lang.ref.WeakReference<Bitmap>(null)
     private var bitmapGeneration = 0
     private var generation = 0L
@@ -16,26 +18,32 @@ internal object Iap2NowPlayingSource {
         Thread(task, "iap2-artwork").apply { isDaemon = true }
     } }
 
-    fun snapshot(): Iap2NowPlaying {
+    fun snapshot(): Iap2NowPlaying = synchronized(lock) {
         val state = MusicBridge.state.value
-        val image = state.albumArt.takeIf { state.available }
-        val bytes = synchronized(lock) {
-            val imageGeneration = runCatching { image?.generationId ?: 0 }.getOrDefault(0)
-            if (bitmap.get() !== image || bitmapGeneration != imageGeneration) {
-                bitmap = java.lang.ref.WeakReference(image); bitmapGeneration = imageGeneration; encoded = null
-                val ticket = ++generation
-                if (image != null) worker.execute {
-                    // Superseded work must not retain or publish another player's cover.
-                    if (synchronized(lock) { generation != ticket }) return@execute
-                    val result = runCatching { encode(image) }.getOrNull()
-                    synchronized(lock) { if (generation == ticket) encoded = result }
+        val image = state.albumArt?.takeIf { state.available && !it.isRecycled }
+        val nextTrack = if (state.available) Track(state.packageName, state.mediaDetails.itemId,
+            state.title, state.artist, state.album) else null
+        val imageGeneration = runCatching { image?.generationId ?: 0 }.getOrDefault(0)
+        if (track != nextTrack || bitmap.get() !== image || bitmapGeneration != imageGeneration) {
+            // QQ republishes identical artwork in fresh Bitmap instances. Keep the last
+            // verified JPEG for this track while checking the replacement off-thread.
+            if (track != nextTrack || image == null) encoded = null
+            track = nextTrack
+            bitmap = java.lang.ref.WeakReference(image)
+            bitmapGeneration = imageGeneration
+            val ticket = ++generation
+            if (image != null) worker.execute {
+                if (synchronized(lock) { generation != ticket }) return@execute
+                val result = runCatching { encode(image) }.getOrNull()
+                synchronized(lock) {
+                    if (generation == ticket && !encoded.contentEquals(result)) encoded = result
                 }
             }
-            encoded
         }
-        if (!state.available) return Iap2NowPlaying()
-        return Iap2NowPlaying(state.title, state.artist, state.album, state.appLabel,
-            state.durationMs, state.positionMs, state.playbackStatus, bytes, appBundleId = state.packageName)
+        if (!state.available) return@synchronized Iap2NowPlaying()
+        Iap2NowPlaying(state.title, state.artist, state.album, state.appLabel,
+            state.durationMs, state.positionMs, state.playbackStatus, encoded, appBundleId = state.packageName,
+            details = state.mediaDetails)
     }
     private fun encode(image: Bitmap): ByteArray? {
         val scale = minOf(1.0, 320.0 / maxOf(image.width, image.height))

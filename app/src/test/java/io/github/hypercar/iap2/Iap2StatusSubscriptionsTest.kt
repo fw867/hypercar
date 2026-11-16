@@ -5,6 +5,33 @@ import org.junit.Test
 
 class Iap2StatusSubscriptionsTest {
     private fun frame(id:Int)=Iap2Csm.Frame(id,byteArrayOf())
+    @Test fun libraryInfoAndUpdatesMatchTheAdvertisedLibraryAndBoxOrder() {
+        val session = Iap2StatusSubscriptions()
+        assertTrue(session.handle(frame(0x4c00)))
+        assertTrue(session.drain().isEmpty())
+        session.authenticated()
+        val info = session.drain().single()
+        assertEquals(0x4c01, info.messageId)
+        val fields = Iap2Csm.parseParams(Iap2Csm.parseParams(info.body).single().value)
+        assertEquals(listOf(0, 1, 2), fields.map { it.id })
+        assertArrayEquals(byteArrayOf(0), fields.last().value)
+        val identifier = Iap2Csm.param(0, fields[1].value)
+        val flags = hex("000400040004000600040005")
+        fun request(body: ByteArray) = session.handle(Iap2Csm.Frame(0x4c03, body))
+        request(identifier + flags)
+        val replies = session.drain()
+        assertEquals(listOf(0x4c04, 0x4c04, 0x4c04), replies.map { it.messageId })
+        listOf("0005000800", "0005000900", "000400060006000131000005000764")
+            .zip(replies).forEach { (tail, reply) -> assertArrayEquals(identifier + hex(tail), reply.body) }
+        request(Iap2Csm.string(0, "another-library") + flags)
+        request(identifier + flags + byteArrayOf(0))
+        assertTrue(session.drain().isEmpty())
+        request(identifier + hex("00040006"))
+        assertArrayEquals(identifier + hex("0005000900"), session.drain().single().body)
+        request(identifier + flags)
+        session.handle(Iap2Csm.Frame(0x4c05, identifier))
+        assertTrue(session.drain().isEmpty())
+    }
     @Test fun earlyRequestsWaitForAuthAndStopCancelsEveryPendingFamily() {
         for((start,stop) in listOf(0x4154 to 0x4156,0x4157 to 0x4159,0x4170 to 0x4172,0xae00 to 0xae02,0xad00 to 0xad02)) {
             val s=Iap2StatusSubscriptions();assertTrue(s.handle(frame(start)))
@@ -32,6 +59,32 @@ class Iap2StatusSubscriptionsTest {
         assertFalse(s.handle(frame(0xea02))) // No speculative application launch.
     }
     private fun hex(value: String) = value.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+
+    @Test fun bmwMguCommunicationsReplyMatchesRequestedFirmwareFields() {
+        val session = Iap2StatusSubscriptions()
+        session.identify("MGU-55-BMW", "BMW Group")
+        session.authenticated()
+        fun reply(vararg ids: Int): ByteArray {
+            val body = ids.fold(byteArrayOf()) { bytes, id -> bytes + Iap2Csm.param(id, byteArrayOf()) }
+            session.handle(Iap2Csm.Frame(0x4157, body))
+            val response = session.drain().single()
+            assertEquals(0x4158, response.messageId)
+            return response.body
+        }
+        assertArrayEquals(hex("0005000005000500010400050009000005001100"), reply(0, 1, 9, 17))
+        assertArrayEquals(hex("0005000104"), reply(1, 3, 1, 0xffff))
+        assertArrayEquals(byteArrayOf(), reply(3, 18))
+        assertArrayEquals(hex("0005000200000b00044d6f62696c650000050005010005000601" +
+            "000500070000050008000005000a000005000b000005000c000005000d000005000e000005000f000005001000"),
+            reply(16, 15, 14, 13, 12, 11, 10, 8, 7, 6, 5, 4, 2))
+        session.reset()
+        session.authenticated()
+        assertArrayEquals(hex("0005001100"), reply(0, 1, 9, 17))
+        for ((model, manufacturer) in listOf("MGU-55-BMW" to "Other", "NBT" to "BMW Group")) {
+            session.identify(model, manufacturer)
+            assertArrayEquals(hex("0005001100"), reply(0, 1, 9, 17))
+        }
+    }
 
     @Test fun communicationsReplyContainsOnlyRequestedKnownFlagsInBoxOrder() {
         val s = Iap2StatusSubscriptions(); s.authenticated()

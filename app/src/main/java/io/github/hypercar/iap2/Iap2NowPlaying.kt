@@ -1,25 +1,59 @@
 package io.github.hypercar.iap2
 
+import io.github.hypercar.carui.MediaPlaybackDetails
+import java.io.ByteArrayOutputStream
+import kotlin.math.roundToInt
+
 /** Immutable snapshot; providers must return cached data without Binder or bitmap work. */
 data class Iap2NowPlaying(
     val title: String = "", val artist: String = "", val album: String = "",
     val appName: String = "", val durationMs: Long = 0, val elapsedMs: Long = 0,
     val status: Int = 0, val artwork: ByteArray? = null,
     val appBundleId: String = "",
+    val details: MediaPlaybackDetails = MediaPlaybackDetails(),
 ) {
     fun body(artworkId: Int?, explicitPlayback: Boolean = false): ByteArray {
         // Bound UTF-8 fields as well as numeric values; a bad player must not exhaust CSM u16.
         fun text(id: Int, value: String) = Iap2Csm.string(id, value.replace("\u0000", "").take(192))
         fun millis(value: Long) = value.coerceIn(0, 0xffff_ffffL)
-        val item = text(1, title) + Iap2Csm.u32(4, millis(durationMs)) +
-            text(6, album) + text(12, artist) +
-            (artworkId?.takeIf { it in 1..255 }?.let { Iap2Csm.u8(26, it) } ?: byteArrayOf())
-        val playback = Iap2Csm.u8(0, status.coerceIn(0, 2)) + Iap2Csm.u32(1, millis(elapsedMs)) +
-            text(7, appName) + if (explicitPlayback) {
-                // SetNowPlayingInformation is not implemented: do not advertise remote seek or queue lists.
-                Iap2Csm.u8(13, 0) + Iap2Csm.u8(14, 0) + text(16, appBundleId)
-            } else byteArrayOf()
-        return Iap2Csm.param(0, item) + Iap2Csm.param(1, playback)
+        val item = ByteArrayOutputStream().apply {
+            if (explicitPlayback) details.itemId?.let { write(Iap2Csm.u64(0, it)) }
+            write(text(1, title))
+            write(Iap2Csm.u32(4, millis(durationMs)))
+            write(text(6, album))
+            if (explicitPlayback) {
+                details.trackNumber?.let { write(Iap2Csm.u16(7, it)) }
+                details.trackCount?.let { write(Iap2Csm.u16(8, it)) }
+                details.discNumber?.let { write(Iap2Csm.u16(9, it)) }
+            }
+            write(text(12, artist))
+            if (explicitPlayback) {
+                if (details.genre.isNotBlank()) write(text(16, details.genre))
+                if (details.composer.isNotBlank()) write(text(18, details.composer))
+                // No remote like/ban command handler. The player may still publish its current rating.
+                write(Iap2Csm.u8(21, 0))
+                write(Iap2Csm.u8(22, 0))
+                details.liked?.let { write(Iap2Csm.u8(23, if (it) 1 else 0)) }
+            }
+            artworkId?.takeIf { it in 1..255 }?.let { write(Iap2Csm.u8(26, it)) }
+        }
+        val playback = ByteArrayOutputStream().apply {
+            write(Iap2Csm.u8(0, status.coerceIn(0, 2)))
+            write(Iap2Csm.u32(1, millis(elapsedMs)))
+            if (explicitPlayback) {
+                details.queueIndex?.let { write(Iap2Csm.u32(2, it.toLong())) }
+                write(Iap2Csm.u32(3, details.queueCount?.toLong() ?: 0))
+            }
+            write(text(7, appName))
+            if (explicitPlayback) {
+                val speed = details.speed?.takeIf { it.isFinite() && it in 0f..655.35f }
+                write(Iap2Csm.u16(12, speed?.let { (it * 100).roundToInt() } ?: 0))
+                write(Iap2Csm.u8(13, 0))
+                write(Iap2Csm.u8(14, 0))
+                write(text(16, appBundleId))
+            }
+        }
+        return Iap2Csm.param(0, item.toByteArray()) + Iap2Csm.param(1, playback.toByteArray())
     }
 }
 
@@ -38,6 +72,7 @@ internal class Iap2NowPlayingSession(
     private var requested: Map<Int, Set<Int>>? = null
     private var force = false
     private var nextPoll = 0L
+    private var lastSample: Iap2NowPlaying? = null
     private var lastBody: ByteArray? = null
     private var lastProgressAt = 0L
     private var nextArtworkId = 1
@@ -55,7 +90,7 @@ internal class Iap2NowPlayingSession(
     fun restartLink() { val wasAuthenticated = authenticated; reset(); authenticated = wasAuthenticated }
     fun reset() {
         authenticated = false; subscribed = false; requested = null; force = false; nextPoll = 0
-        lastBody = null; pending = null; cancelId = null; artwork = null; artworkId = null
+        lastBody = null; lastSample = null; pending = null; cancelId = null; artwork = null; artworkId = null
         // Do not recycle transfer IDs across link resynchronization on the same transport.
     }
     fun handle(frame: Iap2Csm.Frame): Boolean = when (frame.messageId) {
@@ -77,7 +112,7 @@ internal class Iap2NowPlayingSession(
             true
         }
         Iap2MessageIds.STOP_NOW_PLAYING_UPDATES -> {
-            subscribed = false; lastBody = null; cancelPending(); artwork = null; artworkId = null; true
+            subscribed = false; lastBody = null; lastSample = null; cancelPending(); artwork = null; artworkId = null; true
         }
         else -> false
     }
@@ -100,13 +135,16 @@ internal class Iap2NowPlayingSession(
             cancelPending(); artworkId = null; force = subscribed
         }
         if (subscribed && (force || now >= nextPoll)) {
-            nextPoll = now + 1_500
+            // Observe track changes and completed JPEG work promptly. Elapsed-only
+            // updates retain their independent five-second wire cadence below.
+            nextPoll = now + 100
             val np = try { snapshot() } catch (error: Exception) {
                 note("snapshot unavailable: ${error.javaClass.simpleName}"); return out
             }
             val nextArt = np.artwork?.takeIf { wants(0,26) && filesSupported && maxPayload >= 12 && it.isNotEmpty() && it.size <= MAX_ARTWORK }
             var setup: ByteArray? = null
-            if (nextArt !== artwork) {
+            val artworkChanged = nextArt !== artwork
+            if (artworkChanged) {
                 cancelPending()
                 artwork = nextArt
                 artworkId = null
@@ -120,15 +158,18 @@ internal class Iap2NowPlayingSession(
                     } + byteArrayOf(0, 2)
                 }
             }
-            val body = select(np.body(artworkId, explicitPlayback = requested != null))
-            // Elapsed changes are useful but do not flood the link every polling interval.
-            val content = select(np.copy(elapsedMs = 0).body(artworkId, explicitPlayback = requested != null))
-            if (force || !content.contentEquals(lastBody) || (wants(1,1) && np.status == 1 && now - lastProgressAt >= 5_000)) {
-                if (body.isNotEmpty()) out += Output.Control(body)
-                lastBody = content
-                lastProgressAt = now
-                force = false
-                note("update status=${np.status} artwork=${artworkId != null}; text omitted")
+            val progressDue = wants(1,1) && np.status == 1 && now - lastProgressAt >= 5_000
+            if (force || progressDue || artworkChanged || np != lastSample) {
+                lastSample = np
+                val content = select(np.copy(elapsedMs = 0).body(artworkId, explicitPlayback = requested != null))
+                if (force || progressDue || !content.contentEquals(lastBody)) {
+                    val body = select(np.body(artworkId, explicitPlayback = requested != null))
+                    if (body.isNotEmpty()) out += Output.Control(body)
+                    lastBody = content
+                    lastProgressAt = now
+                    force = false
+                    note("update status=${np.status} artwork=${artworkId != null}; text omitted")
+                }
             }
             cancelId?.let { out += Output.File(byteArrayOf(it.toByte(), 2)); cancelId = null }
             setup?.let { out += Output.File(it) }
@@ -163,6 +204,7 @@ internal class Iap2NowPlayingSession(
     private fun note(message: String) { if (diagnostics++ < 64) log("IAP2-NOWPLAYING: $message") }
     companion object {
         const val MAX_ARTWORK = 256 * 1024
-        private val supportedFields = mapOf(0 to setOf(1,4,6,12,26), 1 to setOf(0,1,7,13,14,16))
+        private val supportedFields = mapOf(0 to setOf(0,1,4,6,7,8,9,12,16,18,21,22,23,26),
+            1 to setOf(0,1,2,3,7,12,13,14,16))
     }
 }

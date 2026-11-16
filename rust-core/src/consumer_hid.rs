@@ -1,12 +1,30 @@
-//! Consumer Control HID: device/report-specific layouts and key-down edges, never touch coordinates.
+//! AirPlay HID controls, scoped to the device, application collection and report ID.
 use std::collections::{BTreeSet, HashMap};
 use crate::bplist::Value;
 
 #[derive(Clone, Default)]
 struct Globals { page: u32, size: usize, count: usize, id: u8, min: i32 }
-struct Field { id: u8, offset: usize, size: usize, count: usize, variable: bool, min: i32, usages: Vec<u32> }
+struct Field { id: u8, offset: usize, size: usize, count: usize, variable: bool, relative: bool, controller: bool, min: i32, usages: Vec<u32> }
 #[derive(Default)]
-struct Device { fields: Vec<Field>, has_ids: bool, pressed: HashMap<u8, BTreeSet<u32>> }
+struct Device {
+    fields: Vec<Field>,
+    has_ids: bool,
+    touch_reports: BTreeSet<u8>,
+    report_bits: HashMap<u8, usize>,
+    pressed: HashMap<u8, BTreeSet<u32>>,
+}
+
+pub const CONSOLE_BACK: u32 = 0x30001;
+pub const CONSOLE_SELECT: u32 = 0x30002;
+pub const CONSOLE_LEFT: u32 = 0x30003;
+pub const CONSOLE_RIGHT: u32 = 0x30004;
+pub const CONSOLE_UP: u32 = 0x30005;
+pub const CONSOLE_DOWN: u32 = 0x30006;
+pub const CONSOLE_PREV: u32 = 0x30007;
+pub const CONSOLE_NEXT: u32 = 0x30008;
+
+const MULTI_AXIS_CONTROLLER: u32 = 0x0001_0008;
+const MAX_ROTATION_STEPS: usize = 16;
 
 fn supported(u: u32) -> bool { matches!(u, 0xb0|0xb1|0xb3|0xb4|0xb5|0xb6|0xb7|0xb9|0xcd|0xcf) }
 fn identity(v: &Value) -> Option<String> {
@@ -17,6 +35,113 @@ fn identity(v: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // MGU-81 /info hard keys and touchscreen, and G38 NBT Evo hard keys.
+    const MGU_KNOB: &[u8] = &[
+        0x05,1,0x09,8,0xa1,1,0x05,9,0x09,1,0x15,0,0x25,1,0x75,1,0x95,1,0x81,2,
+        0x05,0x0c,0x75,1,0x95,1,0x81,1,0x0a,0x24,2,0x15,0,0x25,1,0x75,1,0x95,1,
+        0x81,2,0x75,5,0x95,1,0x81,1,0x05,1,0x09,0x30,0x09,0x31,0x15,0x81,0x25,
+        0x7f,0x75,8,0x95,2,0x81,2,0x05,1,0x09,0x38,0x15,0x81,0x25,0x7f,0x75,8,
+        0x95,1,0x81,6,0xc0,
+    ];
+    const G38_KNOB: &[u8] = &[
+        0x05,1,0x09,8,0xa1,1,0x05,9,0x09,1,0x15,0,0x25,1,0x75,1,0x95,1,0x81,2,
+        0x05,0x0c,0x0a,0x24,2,0x95,1,0x81,2,0x95,6,0x81,1,0x05,1,0x09,0x38,
+        0x15,0x81,0x25,0x7f,0x75,8,0x95,1,0x81,6,0xc0,
+    ];
+    const MGU_TOUCH: &[u8] = &[
+        0x05,0x0d,0x09,4,0xa1,1,0x05,0x0d,0x09,0x22,0xa1,2,0x05,0x0d,0x09,0x33,
+        0x15,0,0x25,1,0x75,1,0x95,1,0x81,2,0x75,7,0x95,1,0x81,1,0x05,1,0x09,
+        0x30,0x15,0,0x26,0x66,0x0a,0x75,0x10,0x95,1,0x81,2,0x09,0x31,0x15,0,0x26,
+        0x2c,3,0x75,0x10,0x95,1,0x81,2,0xc0,0xc0,
+    ];
+    #[test]
+    fn bmw_absolute_buttons_and_axes_emit_once_until_release_or_reversal() {
+        let mut d = Device::parse(MGU_KNOB).unwrap();
+        assert_eq!(d.report(&[0,0,0,2]), vec![0x30008; 2]);
+        assert_eq!(d.report(&[0,0,0,0xff]), vec![0x30007]);
+        assert_eq!(d.report(&[1,0,0,0]), vec![0x30002]);
+        assert!(d.report(&[1,0,0,0]).is_empty());
+        assert_eq!(d.report(&[4,0,0,0]), vec![0x30001]);
+        assert!(d.report(&[0,0,0,0]).is_empty());
+        assert_eq!(d.report(&[4,0,0,0]), vec![0x30001]);
+        assert_eq!(d.report(&[0,0xff,0,0]), vec![0x30003]);
+        assert!(d.report(&[0,0x81,0,0]).is_empty());
+        assert_eq!(d.report(&[0,0x7f,0,0]), vec![0x30004]);
+        assert_eq!(d.report(&[0,0,0xff,0]), vec![0x30005]);
+        assert_eq!(d.report(&[0,0,1,0]), vec![0x30006]);
+    }
+    #[test]
+    fn bmw_relative_wheel_counts_signed_detents_on_each_report_with_a_burst_limit() {
+        let mut d = Device::parse(G38_KNOB).unwrap();
+        assert_eq!(d.report(&[2,0]), vec![0x30001]);
+        assert_eq!(d.report(&[0,2]), vec![0x30008; 2]);
+        assert_eq!(d.report(&[0,2]), vec![0x30008; 2]);
+        assert_eq!(d.report(&[0,0xfd]), vec![0x30007; 3]);
+        assert_eq!(d.report(&[0,0x7f]), vec![0x30008; 16]);
+        assert_eq!(d.report(&[0,0x81]), vec![0x30007; 16]);
+        assert!(d.report(&[0,0]).is_empty());
+        assert!(d.report(&[0xb5]).is_empty());
+    }
+    #[test]
+    fn bmw_composite_report_ids_keep_touch_media_and_console_independent() {
+        let mut all = Vec::new();
+        for (id, desc) in [(1, MGU_TOUCH), (2, MGU_KNOB), (3, &bitmap(false)[..])] {
+            all.extend_from_slice(&desc[..6]);
+            all.extend([0x85,id]);
+            all.extend_from_slice(&desc[6..]);
+        }
+        let id = Value::int(7);
+        let mut h = ConsumerHid::from_info(&Value::dict(vec![("hidDevices",Value::array(vec![
+            Value::dict(vec![("uuid",id.clone()),("hidDescriptor",Value::Data(all))]),
+        ]))]));
+        assert_eq!(h.report(Some(&id), &[1,1,0xb5,0,0xb6,0]), None);
+        assert_eq!(h.touch_payload(Some(&id), &[1,1,0xb5,0,0xb6,0]), &[1,0xb5,0,0xb6,0]);
+        assert_eq!(h.report(Some(&id), &[2,4,0,0,0]), Some(vec![0x30001]));
+        assert_eq!(h.report(Some(&id), &[3,4]), Some(vec![0xb5]));
+        assert_eq!(h.report(Some(&id), &[2,4,0,0,0]), Some(vec![]));
+        assert_eq!(h.report(Some(&id), &[8,0xb6]), Some(vec![]));
+    }
+    #[test]
+    fn bmw_declared_touch_uuid_cannot_fall_back_to_raw_media_or_knob() {
+        let touch = Value::int(0);
+        let knob = Value::int(1);
+        let mut h = ConsumerHid::from_info(&Value::dict(vec![("hidDevices",Value::array(vec![
+            Value::dict(vec![("uuid",touch.clone()),("hidDescriptor",Value::Data(MGU_TOUCH.to_vec()))]),
+            Value::dict(vec![("uuid",knob.clone()),("hidDescriptor",Value::Data(G38_KNOB.to_vec()))]),
+        ]))]));
+        assert_eq!(h.report(Some(&touch), &[0xb5]), None);
+        assert_eq!(h.report(Some(&touch), &[1,0xb6,0,0xb5,0]), None);
+        assert_eq!(h.touch_payload(Some(&touch), &[1,0xb6,0,0xb5,0]), &[1,0xb6,0,0xb5,0]);
+        assert_eq!(h.report(Some(&knob), &[1,0]), Some(vec![0x30002]));
+        assert_eq!(h.report(None, &[2,0]), Some(vec![]));
+        assert_eq!(h.report(None, &[0xb5]), Some(vec![]));
+        assert_eq!(h.report(Some(&Value::int(9)), &[0xb6]), Some(vec![]));
+    }
+    #[test]
+    fn ambiguous_and_unknown_devices_cannot_inject_media_or_touch_from_a_control_report() {
+        let mut desc = MGU_KNOB.to_vec();
+        desc.splice(6..6, [0x85,7]);
+        let mut h = ConsumerHid::from_info(&Value::dict(vec![("hidDevices",Value::array(vec![
+            Value::dict(vec![("uuid",Value::int(1)),("hidDescriptor",Value::Data(desc))]),
+            Value::dict(vec![("uuid",Value::int(2))]),
+        ]))]));
+        let unknown = Value::int(3);
+        for uuid in [None, Some(&unknown)] {
+            assert_eq!(h.report(uuid, &[0xb5]), Some(vec![]));
+            assert_eq!(h.report(uuid, &[7,1,0,0,0]), Some(vec![]));
+        }
+        assert_eq!(h.report(Some(&Value::int(2)), &[1,1,0,2,0]), None);
+        assert_eq!(h.report(Some(&Value::int(1)), &[7,1,0,0,0]), Some(vec![0x30002]));
+    }
+    #[test]
+    fn one_declared_long_control_layout_can_resolve_a_missing_uuid() {
+        let mut desc = MGU_KNOB.to_vec();
+        desc.splice(desc.len()-1..desc.len()-1, [0x75,8,0x95,2,0x81,1]);
+        let mut h = ConsumerHid::from_info(&Value::dict(vec![("hidDevices",Value::array(vec![
+            Value::dict(vec![("uuid",Value::int(1)),("hidDescriptor",Value::Data(desc))]),
+        ]))]));
+        assert_eq!(h.report(None, &[1,0,0,0,0,0]), Some(vec![0x30002]));
+    }
     #[test] fn voice_hid_has_down_and_up_edges_and_does_not_repeat() {
         let mut h=ConsumerHid::default();
         assert_eq!(h.report(None,&[0xcf]),Some(vec![0xcf]));
@@ -119,8 +244,9 @@ impl Device {
         if bytes.len()>4096 { return None; }
         let (mut at, mut g, mut stack) = (0, Globals::default(), Vec::new());
         let (mut usages, mut range) = (Vec::new(), None);
-        let mut offsets = HashMap::<u8, usize>::new();
         let mut device = Self::default();
+        let mut application = 0;
+        let mut collections = Vec::new();
         while at<bytes.len() {
             let prefix=bytes[at]; at+=1;
             if prefix==0xfe { let len=*bytes.get(at)? as usize; at=at.checked_add(2+len)?; if at>bytes.len(){return None;} continue; }
@@ -141,13 +267,27 @@ impl Device {
                     let start=range.take()?; let end=qualified(value,g.page);
                     if end<start || end-start>512{return None;} usages.extend(start..=end);
                 },
+                (0,10)=>{
+                    collections.push(application);
+                    if value == 1 { application = usages.first().copied().unwrap_or(0); }
+                    usages.clear();range=None;
+                },
+                (0,12)=>{
+                    application = collections.pop()?;
+                    usages.clear();range=None;
+                },
                 (0,8)=>{
                     if g.size==0||g.size>32||g.count>256{return None;}
-                    let offset=*offsets.get(&g.id).unwrap_or(&0);
+                    let offset=*device.report_bits.get(&g.id).unwrap_or(&0);
                     let end=offset.checked_add(g.size.checked_mul(g.count)?)?;
-                    if end>32768{return None;} offsets.insert(g.id,end);
-                    if value&1==0 && usages.iter().any(|u|u>>16==0x0c) {
-                        device.fields.push(Field{id:g.id,offset,size:g.size,count:g.count,variable:value&2!=0,min:g.min,usages:usages.clone()});
+                    if end>32768{return None;} device.report_bits.insert(g.id,end);
+                    let controller = application == MULTI_AXIS_CONTROLLER;
+                    if application >> 16 == 0x0d {
+                        device.touch_reports.insert(g.id);
+                    } else if value&1==0 && usages.iter().any(|u|u>>16==0x0c ||
+                        controller && matches!(u,0x90001|0x10030|0x10031|0x10038)) {
+                        device.fields.push(Field{id:g.id,offset,size:g.size,count:g.count,
+                            variable:value&2!=0,relative:value&4!=0,controller,min:g.min,usages:usages.clone()});
                     }
                     usages.clear();range=None;
                 },
@@ -155,30 +295,46 @@ impl Device {
                 _=>{},
             }
         }
-        (!device.fields.is_empty()).then_some(device)
+        (collections.is_empty() && (!device.fields.is_empty() || !device.touch_reports.is_empty())).then_some(device)
     }
 
     fn diagnostic_layout(&self) -> String {
         self.fields.iter().take(8).map(|f| format!(
-            "id={} offset={} size={} count={} variable={} min={} usages={:x?}",
-            f.id,f.offset,f.size,f.count,f.variable,f.min,
+            "id={} offset={} size={} count={} variable={} relative={} min={} usages={:x?}",
+            f.id,f.offset,f.size,f.count,f.variable,f.relative,f.min,
             f.usages.iter().take(24).collect::<Vec<_>>()
         )).collect::<Vec<_>>().join("; ")
+    }
+
+    fn is_touch_report(&self, bytes: &[u8]) -> bool {
+        let id = if self.has_ids { bytes.first().copied() } else { Some(0) };
+        id.is_some_and(|id| self.touch_reports.contains(&id))
+    }
+
+    fn matches_report_length(&self, bytes: &[u8]) -> bool {
+        let (id, body) = if self.has_ids {
+            let Some((&id, body)) = bytes.split_first() else { return false; };
+            (id, body)
+        } else {
+            (0, bytes)
+        };
+        self.report_bits.get(&id).is_some_and(|bits| bits.div_ceil(8) == body.len())
     }
 
     fn diagnostic_report(&self, bytes: &[u8]) -> String {
         let (id,len)=if self.has_ids { (bytes.first().copied().unwrap_or(0),bytes.len().saturating_sub(1)) } else { (0,bytes.len()) };
         let fields:Vec<_>=self.fields.iter().filter(|f| f.id==id).collect();
-        let required=fields.iter().map(|f|f.offset+f.size*f.count).max().unwrap_or(0);
+        let required=self.report_bits.get(&id).copied().unwrap_or(0);
         format!("report_id={id} fields={} bits={} required_bits={required} short={}", fields.len(),len*8,len*8<required)
     }
 
     fn report(&mut self, bytes: &[u8]) -> Vec<u32> {
         let (id,body)=if self.has_ids {match bytes.split_first(){Some((id,b))=>(*id,b),None=>return vec![]}} else {(0,bytes)};
-        let fields:Vec<_>=self.fields.iter().filter(|f|f.id==id).collect();
-        if fields.is_empty()||fields.iter().any(|f|f.offset+f.size*f.count>body.len()*8){return vec![];}
+        let Some(&required) = self.report_bits.get(&id) else { return vec![]; };
+        if required > body.len()*8 { return vec![]; }
         let mut down=BTreeSet::new();
-        for f in fields {
+        let mut rotation = Vec::new();
+        for f in self.fields.iter().filter(|f|f.id==id) {
             for i in 0..f.count {
                 let value=(0..f.size).fold(0u32,|v,b|{let bit=f.offset+i*f.size+b;v|((((body[bit/8]>>(bit%8))&1) as u32)<<b)});
                 let usage=if f.variable {
@@ -187,27 +343,62 @@ impl Device {
                     let index=value as i64-f.min as i64;
                     if index<0 {continue;} f.usages.get(index as usize).copied()
                 };
-                if let Some(u)=usage.filter(|u|u>>16==0x0c && supported(u&0xffff)) {down.insert(u&0xffff);}
+                let Some(u) = usage else { continue; };
+                if u >> 16 == 0x0c && supported(u & 0xffff) {
+                    down.insert(u & 0xffff);
+                } else if u == 0xc0224 {
+                    down.insert(CONSOLE_BACK);
+                } else if f.controller && f.variable {
+                    // BMW describes its push axes as signed, absolute and centered at zero.
+                    // Wheel is a signed relative delta, including successive identical samples.
+                    let shift = 32 - f.size;
+                    let signed = ((value << shift) as i32) >> shift;
+                    match (u, f.relative) {
+                        (0x90001, false) => { down.insert(CONSOLE_SELECT); }
+                        (0x10030, false) if f.min < 0 => {
+                            down.insert(if signed < 0 { CONSOLE_LEFT } else { CONSOLE_RIGHT });
+                        }
+                        (0x10031, false) if f.min < 0 => {
+                            down.insert(if signed < 0 { CONSOLE_UP } else { CONSOLE_DOWN });
+                        }
+                        (0x10038, true) if f.min < 0 => {
+                            let count = (signed.unsigned_abs() as usize).min(MAX_ROTATION_STEPS - rotation.len());
+                            let direction = if signed < 0 { CONSOLE_PREV } else { CONSOLE_NEXT };
+                            rotation.resize(rotation.len() + count, direction);
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         let previous=self.pressed.entry(id).or_default();
         let mut edges:Vec<u32>=down.difference(previous).copied().collect();
         if previous.contains(&0xcf)&&!down.contains(&0xcf){edges.push(crate::voice_key::HID_UP);}
+        edges.extend(rotation);
         *previous=down; edges
     }
 }
 
 #[derive(Default)]
-pub struct ConsumerHid { devices: HashMap<String,Device>, raw: HashMap<String,BTreeSet<u32>>, unknown: usize, short_logs: usize, long_logs: usize }
+pub struct ConsumerHid {
+    devices: HashMap<String, Device>,
+    advertised: BTreeSet<Option<String>>,
+    raw: HashMap<String, BTreeSet<u32>>,
+    unknown: usize,
+    short_logs: usize,
+    long_logs: usize,
+}
 impl ConsumerHid {
     pub fn from_info(info:&Value)->Self {
         let mut result=Self::default();
         for key in ["hidDevices","hids","hid"] {
             for entry in info.get(key).and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]).iter().take(32) {
-                let Some(id)=entry.get("uuid").and_then(identity) else {continue;};
+                let id = entry.get("uuid").and_then(identity);
+                result.advertised.insert(id.clone());
+                let Some(id) = id else { continue; };
                 let descriptor=entry.get("hidDescriptor").or_else(||entry.get("reportDescriptor")).and_then(Value::as_bytes);
                 if let Some(device)=descriptor.and_then(Device::parse) {
-                    crate::emit_log(&format!("HID-KEY: device={id} descriptor={}B consumer_fields={} report_ids={}",descriptor.unwrap().len(),device.fields.len(),device.has_ids));
+                    crate::emit_log(&format!("HID-KEY: device={id} descriptor={}B control_fields={} report_ids={} touch_reports={:?}",descriptor.unwrap().len(),device.fields.len(),device.has_ids,device.touch_reports));
                     crate::emit_log(&format!("HID-LAYOUT: device={id} {}",device.diagnostic_layout()));
                     result.devices.insert(id,device);
                 } else {
@@ -215,12 +406,25 @@ impl ConsumerHid {
                 }
             }
         }
-        crate::emit_log(&format!("HID-KEY: registered media devices={}",result.devices.len()));
+        crate::emit_log(&format!("HID-KEY: registered input devices={}",result.devices.len()));
         result
     }
-    /// Some = media/short report consumed (including releases). None = preserve existing touch path.
+    fn layout_id(&self, uuid: Option<&Value>, bytes: &[u8]) -> Option<String> {
+        if let Some(uuid) = uuid { return identity(uuid); }
+        if self.advertised.len() != 1 { return None; }
+        let (id, device) = self.devices.iter().next()?;
+        (bytes.len() < 5 || device.matches_report_length(bytes)).then(|| id.clone())
+    }
+
+    /// The existing touch decoder expects coordinates to start after any HID report ID.
+    pub fn touch_payload<'a>(&self, uuid: Option<&Value>, bytes: &'a [u8]) -> &'a [u8] {
+        let device = self.layout_id(uuid, bytes).and_then(|id| self.devices.get(&id));
+        if device.is_some_and(|d| d.has_ids && d.is_touch_report(bytes)) { &bytes[1..] } else { bytes }
+    }
+
+    /// Some = control report consumed (including releases). None = forward to the touch decoder.
     pub fn report(&mut self,uuid:Option<&Value>,bytes:&[u8])->Option<Vec<u32>> {
-        let id=uuid.and_then(identity);
+        let id=self.layout_id(uuid,bytes);
         let budget=if bytes.len()<5 { &mut self.short_logs } else { &mut self.long_logs };
         let limit=if bytes.len()<5 {64} else {8};
         if *budget<limit {
@@ -228,12 +432,22 @@ impl ConsumerHid {
             let device=id.as_ref().and_then(|id|self.devices.get(id));
             let layout=device.map(|d|d.diagnostic_report(bytes)).unwrap_or_else(||"layout=unmatched".into());
             // Never dump touch coordinates; short control reports alone get a hex sample.
-            let sample=if bytes.len()<5 {format!("{:02x?}",bytes)} else {"omitted-touch-or-long-report".into()};
+            let sample=if bytes.len()<5 && !device.is_some_and(|d|d.is_touch_report(bytes)) {format!("{:02x?}",bytes)} else {"omitted-touch-or-long-report".into()};
             crate::emit_log(&format!("HID-INPUT: device={id:?} bytes={} {layout} sample={sample} short_budget={}/64 long_budget={}/8",bytes.len(),self.short_logs,self.long_logs));
         }
-        if let Some(device)=id.as_ref().and_then(|id|self.devices.get_mut(id)) {return Some(device.report(bytes));}
-        if id.is_none() && bytes.len()<5 && self.devices.len()==1 {return Some(self.devices.values_mut().next().unwrap().report(bytes));}
-        if bytes.len()>=5 {return None;}
+        if let Some(device)=id.as_ref().and_then(|id|self.devices.get_mut(id)) {
+            if device.is_touch_report(bytes) { return None; }
+            return Some(device.report(bytes));
+        }
+        if bytes.len()>=5 {
+            // A declared device lacking a usable descriptor keeps legacy touch decoding.
+            // Otherwise an unresolved report matching a control layout must not become a tap.
+            let declared = id.is_some() && self.advertised.contains(&id);
+            let possible_control = !declared && self.devices.values().any(|d|
+                d.matches_report_length(bytes) && !d.is_touch_report(bytes));
+            return possible_control.then(Vec::new);
+        }
+        if !self.devices.is_empty() { return Some(vec![]); }
         // Without a descriptor only unambiguous direct Usage IDs are supported. 0x04 is not hardcoded.
         let value=match bytes { [v]=>*v as u32,[lo,hi]=>u16::from_le_bytes([*lo,*hi]) as u32,_=>u32::MAX };
         if value==0||supported(value) {

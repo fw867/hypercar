@@ -2,12 +2,16 @@ package io.github.hypercar.iap2
 
 import io.github.hypercar.core.RustCoreBridge
 import io.github.hypercar.session.HyperCarRepo
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
 
 /** JNI callbacks never block the RTSP reader; a bounded worker owns each protocol engine. */
 object WifiIap2Bridge {
     private var active: Worker? = null
+    private val liveVehicleStatus = MutableStateFlow(Iap2VehicleStatus())
+    val vehicleStatus = liveVehicleStatus.asStateFlow()
 
     @Synchronized fun start(id: Long, deviceId: String, deviceName: String) {
         active?.close()
@@ -29,6 +33,16 @@ object WifiIap2Bridge {
 
     @Synchronized private fun isCurrent(id: Long): Boolean = active?.let { it.id == id && !it.closed } == true
 
+    @Synchronized private fun publishVehicle(worker: Worker, status: Iap2VehicleStatus) {
+        if (active === worker && !worker.closed) {
+            liveVehicleStatus.value = status
+        }
+    }
+
+    @Synchronized private fun clearVehicle(worker: Worker) {
+        if (active === worker) liveVehicleStatus.value = Iap2VehicleStatus()
+    }
+
     private class Worker(val id: Long, deviceId: String, deviceName: String) {
         val input = ArrayBlockingQueue<ByteArray>(64)
         @Volatile var closed = false
@@ -37,6 +51,7 @@ object WifiIap2Bridge {
             navigationCue = { io.github.hypercar.navigation.NavigationSources.snapshot() },
             deviceName = deviceName,
             nowPlayingProvider = Iap2NowPlayingSource::snapshot,
+            onVehicleStatus = { publishVehicle(this, it) },
             onMediaKey = { usage -> HyperCarRepo.onIap2MediaKey(usage) { isCurrent(id) } })
         val thread = Thread({
             var readyReported = false
@@ -76,6 +91,7 @@ object WifiIap2Bridge {
                 HyperCarRepo.log("WIFI-IAP#$id: ${error.javaClass.simpleName}: ${error.message}")
             } finally {
                 closed = true
+                clearVehicle(this)
                 HyperCarRepo.log("WIFI-IAP#$id: END ${protocol.diagnosticSummary} native_queued_frames=$queuedFrames native_queued_bytes=$queuedBytes input_pending=${input.size}")
                 RustCoreBridge.nativeMarkWifiIap2Ready(id, false)
                 RustCoreBridge.nativeSetWifiIap2Phase(id, if (protocol.failed) "FAILED" else "STOPPED")
@@ -83,6 +99,6 @@ object WifiIap2Bridge {
             }
         }, "wifi-iap2-$id").apply { isDaemon = true }
 
-        fun close() { closed = true; thread.interrupt(); input.clear() }
+        fun close() { closed = true; clearVehicle(this); thread.interrupt(); input.clear() }
     }
 }

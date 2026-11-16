@@ -69,6 +69,19 @@ class Iap2MediaBluetoothTest {
         assertEquals(4,java.util.UUID.fromString(channel.deviceUuids.first()).version())
     }
 
+    @Test fun bluetoothKeepAliveServicesTheBmwMediaLibraryExchange() {
+        val channel = Channel()
+        val session = Iap2SenderSession(channel, {}, onEndpoint = {}, profile = HeadUnitProfiles.WINPLAY,
+            nanoTime = { channel.time })
+        session.run(10_000)
+        val flags = intArrayOf(4, 5, 6).map { Iap2Csm.param(it, byteArrayOf()) }
+        channel.queue += Iap2Csm.encode(0x4c00) + Iap2Csm.encode(0x4c03,
+            Iap2Csm.string(0, Iap2MediaLibrary.identifier) + flags.reduce { body, flag -> body + flag })
+        channel.endWhenEmpty = true
+        session.pumpIncomingForever()
+        assertEquals(listOf(0x4c01, 0x4c04, 0x4c04, 0x4c04), channel.sent.filter { it in 0x4c00..0x4c05 })
+    }
+
     @Test fun bluetoothEarlyCommunicationsSubscriptionUsesTheSharedFilteredReply() {
         val channel = Channel(statusEarly=true, communicationsBody=byteArrayOf(0,4,0,17,0,4,0,6))
         Iap2SenderSession(channel,{},onEndpoint={},profile=HeadUnitProfiles.WINPLAY,

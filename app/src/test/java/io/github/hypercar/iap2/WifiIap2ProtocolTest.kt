@@ -72,10 +72,12 @@ class WifiIap2ProtocolTest {
         val mediaKeys = mutableListOf<Int>()
         var authenticationOutput = emptyList<Iap2Csm.Frame>()
         var nowPlaying = Iap2NowPlaying()
+        val vehicleUpdates = mutableListOf<Iap2VehicleStatus>()
         var navigationAllowed = false
         var navigationCue: io.github.hypercar.navigation.NavigationCue? = null
         val protocol = WifiIap2Protocol("test-device", { logs += it }, { ByteArray(32) { 7 } },
-            navigationEnabled = { navigationAllowed }, navigationCue = { navigationCue }, deviceName = deviceName, onMediaKey = mediaKeys::add, nowPlayingProvider = { nowPlaying })
+            navigationEnabled = { navigationAllowed }, navigationCue = { navigationCue }, deviceName = deviceName, onMediaKey = mediaKeys::add,
+            nowPlayingProvider = { nowPlaying }, onVehicleStatus = vehicleUpdates::add)
         var sequence = 86
         var ack = 0
         var time = 1L
@@ -110,12 +112,59 @@ class WifiIap2ProtocolTest {
             assertEquals(32, Iap2Csm.parseParams(challenge.body).single().value.size)
             val greetings = message(0xaa03, Iap2Csm.param(0, ByteArray(64) { 9 }))
             authenticationOutput = greetings
-            assertTrue(greetings.none { it.messageId in listOf(0xa100,0xfffa,0xfff0) })
-            assertEquals(listOf(0xaa05, 0x4e0c, 0x4e0a, 0x4e09, 0x4e0b), greetings.filterNot { it.messageId == 0x5201 }.map { it.messageId })
+            assertEquals(listOf(0xaa05, 0x4e0c, 0x4e0a, 0x4e09, 0x4e0b),
+                greetings.filterNot { it.messageId == 0x5201 || it.messageId == 0xa100 }.map { it.messageId })
             val name = Iap2Csm.parseParams(greetings.single { it.messageId == 0x4e09 }.body).single()
             assertEquals(deviceName, name.asStringOrNull())
             assertFalse(protocol.failed)
         }
+    }
+
+    private val vehicleMessages = Iap2Csm.u16(6, 0xa101) + Iap2Csm.u16(7, 0xa100)
+    private fun vehicleComponent(vararg flags: Int) = Iap2Csm.group(21,
+        Iap2Csm.u16(0, 1), Iap2Csm.string(1, "VehicleStatus"),
+        *flags.map { Iap2Csm.param(it, byteArrayOf()) }.toTypedArray())
+
+    @Test fun vehicleSubscriptionFollowsUuidAndRequestsDeclaredBoxFieldsOnce() {
+        val car = Car()
+        car.ready(vehicleMessages + vehicleComponent(15, 18, 6, 4, 9, 3))
+        val frames = car.authenticationOutput
+        assertEquals(listOf(0xaa05, 0x4e0c, 0xa100, 0x4e0a, 0x4e09, 0x4e0b), frames.map { it.messageId })
+        assertArrayEquals(byteArrayOf(0,4,0,3, 0,4,0,4, 0,4,0,6, 0,4,0,9, 0,4,0,15), frames[2].body)
+        assertEquals(listOf(0x1d02), car.message(0x1d01, vehicleMessages + vehicleComponent(3,4,6,9,15)).map { it.messageId })
+    }
+
+    @Test fun vehicleSubscriptionNeedsBothMessageDirectionsAndSupportedComponentFlags() {
+        for (identity in listOf(byteArrayOf(), vehicleMessages, vehicleComponent(3),
+            Iap2Csm.u16(6, 0xa101) + vehicleComponent(3), Iap2Csm.u16(7, 0xa100) + vehicleComponent(3),
+            vehicleMessages + vehicleComponent(5, 21), vehicleMessages + Iap2Csm.group(21, Iap2Csm.u8(3, 1)))) {
+            val car = Car()
+            car.ready(identity)
+            assertTrue(car.authenticationOutput.none { it.messageId == 0xa100 })
+        }
+    }
+
+    @Test fun vehicleUpdatesMergeValidSubscribedValuesAndResetOnLinkRestart() {
+        val car = Car()
+        val identity = vehicleMessages + vehicleComponent(3, 4, 6, 11, 15)
+        car.ready(identity) { car.message(0xa101, Iap2Csm.u16(3, 123)) }
+        assertTrue(car.vehicleUpdates.isEmpty())
+        car.message(0xa101) // First A101 of the BMW capture is empty.
+        car.message(0xa101, byteArrayOf(0,5,0,6,0))
+        car.message(0xa101, byteArrayOf(0,6,0,4,0xff.toByte(),0xf9.toByte()))
+        car.message(0xa101, byteArrayOf(0,6,0,3,2,0x49))
+        car.message(0xa101, byteArrayOf(0,6,0,11,0,42, 0,5,0,15,1))
+        assertEquals(Iap2VehicleStatus(585, -7, false, mapOf(VehicleFuel.ELECTRIC to 42),
+            mapOf(VehicleFuel.ELECTRIC to true)), car.vehicleUpdates.last())
+        car.message(0xa101, byteArrayOf(0,5,0,6,2, 0,5,0,4,22, 0,6,0,9,0,64))
+        car.message(0xa101, byteArrayOf(0,6,0,3,0,1, 0,6,0))
+        assertEquals(4, car.vehicleUpdates.size)
+        car.message(0x1d01, identity)
+        assertEquals(4, car.vehicleUpdates.size)
+        car.ready()
+        assertEquals(Iap2VehicleStatus(), car.vehicleUpdates.last())
+        car.message(0xa101, Iap2Csm.u16(3, 0))
+        assertEquals(5, car.vehicleUpdates.size)
     }
 
     @Test fun everyWifiCsmUsesNegotiatedFragmentSizeIncludingGreetingsAndStatus() {

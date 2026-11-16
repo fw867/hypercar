@@ -4,6 +4,27 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class Iap2NowPlayingTest {
+    @Test fun bmwExplicitSubscriptionUsesPlayerMetadataAndFixedPointSpeed() {
+        val details = io.github.hypercar.carui.MediaPlaybackDetails(itemId = 0x0102030405060708,
+            trackNumber = 4, trackCount = 15, discNumber = 2, genre = "Jazz", composer = "A",
+            liked = true, queueIndex = 3, queueCount = 8, speed = 1.25f)
+        val session = Iap2NowPlayingSession({ Iap2NowPlaying(details = details) })
+        session.authenticated()
+        fun group(id: Int, vararg ids: Int) = Iap2Csm.group(id, *ids.map { Iap2Csm.param(it, byteArrayOf()) }.toTypedArray())
+        session.handle(Iap2Csm.Frame(0x5000, group(0, 0, 7, 8, 9, 10, 16, 18, 21, 22, 23, 24, 27) +
+            group(1, 2, 3, 12) + group(2, 0, 1, 6)))
+        val expected = Iap2Csm.group(0, Iap2Csm.u64(0, 0x0102030405060708), Iap2Csm.u16(7, 4),
+            Iap2Csm.u16(8, 15), Iap2Csm.u16(9, 2), Iap2Csm.string(16, "Jazz"), Iap2Csm.string(18, "A"),
+            Iap2Csm.u8(21, 0), Iap2Csm.u8(22, 0), Iap2Csm.u8(23, 1)) +
+            Iap2Csm.group(1, Iap2Csm.u32(2, 3), Iap2Csm.u32(3, 8), Iap2Csm.u16(12, 125))
+        assertArrayEquals(expected, controls(session.poll(0, 2048, true)).single().body)
+    }
+    @Test fun explicitSpeedReportsUnknownWhenPlayerProvidesNoSpeed() {
+        val session = Iap2NowPlayingSession({ Iap2NowPlaying(status = 2) })
+        session.authenticated()
+        session.handle(Iap2Csm.Frame(0x5000, Iap2Csm.group(1, Iap2Csm.param(12, byteArrayOf()))))
+        assertArrayEquals(Iap2Csm.group(1, Iap2Csm.u16(12, 0)), controls(session.poll(0, 2048, false)).single().body)
+    }
     @Test fun explicitPlaybackCapabilitiesAndBundleUseOnlyRequestedRealFields() {
         val logs = mutableListOf<String>()
         var state = Iap2NowPlaying(title="private-title", appBundleId="com.example.player")
@@ -125,6 +146,22 @@ class Iap2NowPlayingTest {
         assertEquals(1, controls(session.poll(2, 2048, true)).size)
         assertFalse(session.handle(frame(0x5001))) // An incoming update is never a Stop.
     }
+    @Test fun quickTrackChangeAndLateCoverReachAnExistingSubscriber() {
+        var state = Iap2NowPlaying(title = "first", artwork = byteArrayOf(1))
+        val session = subscribed { state }
+        val first = artId(controls(session.poll(0, 2048, true)).single().body)!!
+        state = state.copy(title = "second", artwork = null)
+        val update = controls(session.poll(100, 2048, true)).single()
+        assertNull(artId(update.body))
+        val item = Iap2Csm.parseParams(update.body).first { it.id == 0 }
+        assertEquals("second", Iap2Csm.parseParams(item.value).first { it.id == 1 }.asStringOrNull())
+        state = state.copy(artwork = byteArrayOf(2))
+        val second = artId(controls(session.poll(200, 2048, true)).single().body)!!
+        assertNotEquals(first, second)
+        session.fileResponse(byteArrayOf(first.toByte(), 1), 201)
+        assertTrue(session.poll(201, 2048, true).isEmpty())
+    }
+
     @Test fun lateMetadataChangesAndPlaybackProgressUpdateOnlyAfterSubscription() {
         var state = Iap2NowPlaying()
         val session = subscribed { state }

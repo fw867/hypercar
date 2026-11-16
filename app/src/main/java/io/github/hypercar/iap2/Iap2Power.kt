@@ -2,12 +2,10 @@ package io.github.hypercar.iap2
 
 /** Null fields are unavailable; connection transport cannot imply charging. */
 internal data class Iap2Power(val externalCharger: Boolean? = null, val chargingState: Int? = null, val level: Int? = null) {
-    fun response(requested: Set<Int>): ByteArray {
-        var body = byteArrayOf()
-        if (4 in requested) externalCharger?.let { body += Iap2Csm.u8(4, if (it) 1 else 0) }
-        if (5 in requested) chargingState?.takeIf { it in 0..2 }?.let { body += Iap2Csm.u8(5,it) }
-        if (6 in requested) level?.takeIf { it in 0..100 }?.let { body += Iap2Csm.u16(6,it) }
-        return body
+    fun fields(requested: Set<Int>): List<ByteArray> = buildList {
+        if (4 in requested) externalCharger?.let { add(Iap2Csm.u8(4, if (it) 1 else 0)) }
+        if (5 in requested) chargingState?.takeIf { it in 0..2 }?.let { add(Iap2Csm.u8(5, it)) }
+        if (6 in requested) level?.takeIf { it in 0..100 }?.let { add(Iap2Csm.u16(6, it)) }
     }
 }
 

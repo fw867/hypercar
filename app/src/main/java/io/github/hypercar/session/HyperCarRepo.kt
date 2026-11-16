@@ -2785,6 +2785,11 @@ object HyperCarRepo {
 
         override fun onMediaKey(usage: Int) {
             if (!sessionLive.get()) return
+            val consoleKey = io.github.hypercar.carui.CarConsoleKey.fromInput(usage)
+            if (consoleKey != null) {
+                if (!sessionCarWithMode) io.github.hypercar.carui.CarUiCaster.onConsoleKey(consoleKey)
+                return
+            }
             appContext()?.let { MusicBridge.onCarMediaKey(it, usage) }
         }
 

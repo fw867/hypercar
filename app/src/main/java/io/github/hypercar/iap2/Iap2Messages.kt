@@ -64,6 +64,8 @@ object Iap2MessageIds {
     const val NOW_PLAYING_UPDATE = 0x5001
     const val STOP_NOW_PLAYING_UPDATES = 0x5002
     const val START_ROUTE_GUIDANCE_UPDATES = 0x5200
+    const val START_VEHICLE_STATUS_UPDATES = 0xA100
+    const val VEHICLE_STATUS_UPDATE = 0xA101
     const val START_POWER_UPDATES = 0xAE00
 
     /** 0xAE01 电源状态上报（车机发 0xAE00 后手机回）。 */
@@ -78,6 +80,12 @@ object Iap2MessageIds {
 
     fun nameOf(messageId: Int): String =
         when (messageId) {
+            0x4c00 -> "StartMediaLibraryInformation"
+            0x4c01 -> "MediaLibraryInformation"
+            0x4c02 -> "StopMediaLibraryInformation"
+            0x4c03 -> "StartMediaLibraryUpdates"
+            0x4c04 -> "MediaLibraryUpdate"
+            0x4c05 -> "StopMediaLibraryUpdates"
             START_IDENTIFICATION -> "StartIdentification"
             IDENTIFICATION_INFORMATION -> "IdentificationInformation"
             IDENTIFICATION_ACCEPTED -> "IdentificationAccepted"
@@ -110,6 +118,8 @@ object Iap2MessageIds {
             NOW_PLAYING_UPDATE -> "NowPlayingUpdate"
             STOP_NOW_PLAYING_UPDATES -> "StopNowPlayingUpdates"
             START_ROUTE_GUIDANCE_UPDATES -> "StartRouteGuidanceUpdates"
+            START_VEHICLE_STATUS_UPDATES -> "StartVehicleStatusUpdates"
+            VEHICLE_STATUS_UPDATE -> "VehicleStatusUpdate"
             START_POWER_UPDATES -> "StartPowerUpdates"
             START_COMMUNICATIONS_UPDATES -> "StartCommunicationsUpdates"
             START_CALL_STATE_UPDATES -> "StartCallStateUpdates"
@@ -175,6 +185,7 @@ object Iap2Messages {
          */
         val hasWirelessCarPlayComponent: Boolean,
         val hidComponents: List<HidComponent> = emptyList(),
+        val vehicleStatusFields: Set<Int> = emptySet(),
     ) {
         /** 车机是否声明会发某消息；null = 未提供清单（未知）。 */
         fun declaresSend(messageId: Int): Boolean? = sendIds?.contains(messageId)
@@ -250,6 +261,11 @@ object Iap2Messages {
                 val function = fields.singleOrNull { it.id == 2 }?.takeIf { it.value.size == 1 }?.asU8() ?: return@mapNotNull null
                 HidComponent(id, function)
             }.groupBy { it.identifier }.values.filter { it.size == 1 }.map { it.single() },
+            vehicleStatusFields = params.singleOrNull { it.id == 21 }?.let { component ->
+                val fields = Iap2Csm.parseParams(component.value)
+                if (fields.sumOf { it.value.size + 4 } != component.value.size) emptySet()
+                else fields.filter { it.value.isEmpty() }.mapTo(mutableSetOf()) { it.id }
+            }.orEmpty(),
         )
     }
 

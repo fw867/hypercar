@@ -142,6 +142,20 @@ object CarUiCaster {
         }
     }
 
+    internal fun onConsoleKey(key: CarConsoleKey) {
+        if (!running) return
+        val target = if (MapController.mapActive) {
+            if (key == CarConsoleKey.BACK) {
+                MapController.requestExit()
+                return
+            }
+            MapController.fullscreenDisplayId
+        } else displayId
+        if (target <= 0) return
+        val result = SpikeShell.consoleKey(target, key.keyCode, key.metaState)
+        if (result != "OK") HyperCarRepo.log("CARUI: console input $key display=$target $result")
+    }
+
     /**
      * Install the input callback for the currently owned display. Lifecycle changes
      * serialize listener installation with old-display teardown.

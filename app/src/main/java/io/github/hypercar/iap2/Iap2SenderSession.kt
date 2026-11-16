@@ -62,8 +62,7 @@ class NoCarPlayWindowException(message: String) : IOException(message)
  *   0x5702 → 0x5703（按能力清单，拿热点 SSID/密码/信道）
  *   0x4300 → 0x4301（按能力清单，拿 AirPlay 端口/公钥/地址）
  *   进入保活泵：0x4301 是生命周期事件，重复到达都回调 onEndpoint；
- *   车机没下发凭据时**不拆链**，按节奏重探并 dump 未知消息体（BMW MGU-55 实测：
- *   清单里根本没有 0x57xx/0x43xx，只有私有 0x4C00..0x4C07——凭据若存在只会在那里）
+ *   没下发凭据时继续保活。MGU-55 的早期蓝牙会话还可能通过 0x4C00/0x4C03 查询媒体库。
  */
 class Iap2SenderSession(
     private val channel: Iap2LinkChannel,
@@ -93,7 +92,7 @@ class Iap2SenderSession(
     private val media = Iap2MediaSession(log, onMediaKey)
     private val nowPlaying = Iap2NowPlayingSession(nowPlayingProvider, log)
     private val navigation = RouteGuidanceSession(log)
-    private val subscriptions = Iap2StatusSubscriptions(log = log)
+    private val subscriptions = Iap2StatusSubscriptions(log = log, deviceName = deviceName)
     private var phaseName = "IDLE"
     private var phaseStarted = nanoTime()
     private var tracedReceivedFrames = 0
@@ -233,6 +232,7 @@ class Iap2SenderSession(
         val identFrame = expect(Iap2MessageIds.IDENTIFICATION_INFORMATION, deadline)
         val ident = Iap2Messages.parseIdentification(identFrame.body)
         peerIdentification = ident
+        subscriptions.identify(ident.model, ident.manufacturer)
         media.identify(ident.hidComponents)
         onIdentification(listOfNotNull(ident.name, ident.model, ident.manufacturer).joinToString(" "))
         logIdentification(ident, identFrame)
@@ -547,9 +547,7 @@ class Iap2SenderSession(
      *    上层再把整个会话拆掉，形成 3s 一轮的连-断循环；
      *  - **重探**：车机迟迟不下发凭据时，按 [POKE_INTERVAL_NANOS] 重发 0x5702/0x4300
      *    （仅当车机声明可收），EA 会话没确认时补发 0xEA00；
-     *  - **未知消息体 dump**：BMW 只声明 0x4C00..0x4C07 这一套私有消息、不下发
-     *    0x5703/0x4301 时，无线凭据只可能藏在这些报文里——每个消息 id 的原始体
-     *    必须落进日志，下一轮现场才有得解。
+     *  - 媒体库请求在取帧时处理，未知消息按 ID 限流记录。
      */
     fun pumpIncomingForever() {
         enterPhase("MAINTAIN_LINK")
@@ -605,16 +603,9 @@ class Iap2SenderSession(
         if (frame.body.isEmpty()) return
         val shown = if (frame.body.size <= BODY_DUMP_BYTES) frame.body else frame.body.copyOf(BODY_DUMP_BYTES)
         val truncated = if (frame.body.size > shown.size) "（前 ${shown.size}/${frame.body.size} 字节）" else ""
-        val hint =
-            when (frame.messageId) {
-                in 0x4C00..0x4CFF ->
-                    "——BMW 私有 0x4Cxx：清单里唯一没被本实现消费的就这一组，" +
-                        "无线 CarPlay 凭据若不走 0x5703/0x4301 就只可能在这里"
-                else -> ""
-            }
         log(
             "iap2 0x${frame.messageId.toString(16).padStart(4, '0')} 原始体$truncated=" +
-                shown.joinToString("") { "%02x".format(it) } + hint,
+                shown.joinToString("") { "%02x".format(it) },
         )
     }
 
@@ -677,6 +668,7 @@ class Iap2SenderSession(
     private fun handleReidentification(frame: Iap2Csm.Frame) {
         val ident = Iap2Messages.parseIdentification(frame.body)
         peerIdentification = ident
+        subscriptions.identify(ident.model, ident.manufacturer)
         media.identify(ident.hidComponents)
         onIdentification(listOfNotNull(ident.name, ident.model, ident.manufacturer).joinToString(" "))
         log(
@@ -1159,7 +1151,9 @@ class Iap2SenderSession(
                 if (frame.messageId == Iap2MessageIds.IDENTIFICATION_INFORMATION && peerIdentification != null) {
                     // Late identity can be queued by a Wi-Fi/credential wait. Its capability
                     // boundary must precede the following StartHID, not wait for the keepalive pump.
-                    media.identify(Iap2Messages.parseIdentification(frame.body).hidComponents)
+                    val ident = Iap2Messages.parseIdentification(frame.body)
+                    subscriptions.identify(ident.model, ident.manufacturer)
+                    media.identify(ident.hidComponents)
                 }
                 // Consume in wire order: Identification must configure the component before
                 // the following StartHID in the SAME read is registered.

@@ -60,4 +60,6 @@ interface ISpikeShell {
     /** [0]=MEDIA excluding navigation UID, [1]=navigation UID only; one policy, two PCM sinks. */
     ParcelFileDescriptor[] startSplitAudioCapture(IBinder owner, int navigationUid);
 
+    String consoleKey(int displayId, int keyCode, int metaState);
+
 }

@@ -163,7 +163,7 @@ pub(crate) fn emit_stats(
     });
 }
 
-/// 车机日夜信号（AirPlay `setNightMode`）→ Kotlin，用于自动主题。
+/// Media usage or self-rendered console input, dispatched by the active Kotlin source.
 pub(crate) fn emit_media_key(usage: u32) {
     call_listener("onMediaKey", |env, obj| {
         env.call_method(obj, "onMediaKey", "(I)V", &[(usage as jint).into()]).map(|_| ())

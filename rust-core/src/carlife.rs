@@ -120,6 +120,9 @@ const TTS_STOP: u32 = 0x0004_0002;
 const TTS_DATA: u32 = 0x0004_0003;
 
 // CTRL 通道（8 字节头）
+const CTRL_CAR_HARD_KEY_CODE: u32 = 0x68008;
+const SELECTOR_NEXT: u64 = 6;
+const SELECTOR_PREVIOUS: u64 = 7;
 
 /// 触摸动作（CarLife 语义：0=DOWN / 1=UP / 2=MOVE，**不是** Android 的 1/2/3）。
 pub const TOUCH_DOWN: u32 = 0;
@@ -264,13 +267,40 @@ impl CarLifeHub {
         }
     }
 
-    pub fn voice_start(&self) {
-        let code=0x21;
-        let mut body=Vec::new();proto::varint(&mut body,1,code);
-        let packet=QueuedControl{bytes:build_cmd_frame(0x68008,&body),expires:Some(std::time::Instant::now()+Duration::from_secs(2))};
-        emit_log(&format!("VOICE-KEY: CarWith key=0x{code:x} queued={} (not recognition confirmation)",self.touch_tx.send(packet).is_ok()));
+    fn queue_hard_key(&self, code: u64, lifetime: Duration) -> bool {
+        let mut body = Vec::new();
+        proto::varint(&mut body, 1, code);
+        self.touch_tx.send(QueuedControl {
+            bytes: build_cmd_frame(CTRL_CAR_HARD_KEY_CODE, &body),
+            expires: Some(std::time::Instant::now() + lifetime),
+        }).is_ok()
     }
 
+    pub fn voice_start(&self) {
+        let queued = self.queue_hard_key(0x21, Duration::from_secs(2));
+        emit_log(&format!("VOICE-KEY: CarWith key=0x21 queued={queued} (not recognition confirmation)"));
+    }
+
+    pub fn handle_console_key(&self, key: u32) -> bool {
+        use crate::consumer_hid::*;
+        // CarLife CommonParams.KEYCODE_* on the phone's CTRL channel.
+        let code = match key {
+            CONSOLE_BACK => 14,
+            CONSOLE_SELECT => 20,
+            CONSOLE_LEFT => 21,
+            CONSOLE_RIGHT => 22,
+            CONSOLE_UP => 23,
+            CONSOLE_DOWN => 24,
+            CONSOLE_PREV => SELECTOR_PREVIOUS,
+            CONSOLE_NEXT => SELECTOR_NEXT,
+            _ => return false,
+        };
+        if !self.queue_hard_key(code, Duration::from_secs(1)) {
+            emit_log("CARWITH-KEY: CTRL queue closed");
+        }
+        // The input belongs to this source even when its CTRL writer has closed.
+        true
+    }
 }
 
 impl Drop for CarLifeHub {

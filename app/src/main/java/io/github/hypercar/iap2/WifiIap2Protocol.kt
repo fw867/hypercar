@@ -13,13 +13,16 @@ internal class WifiIap2Protocol(
     private val deviceName: String = "HyperCar",
     private val onMediaKey: (Int) -> Unit = {},
     private val nowPlayingProvider: () -> Iap2NowPlaying = { Iap2NowPlaying() },
+    onVehicleStatus: (Iap2VehicleStatus) -> Unit = {},
 ) {
     private val engine = Iap2LinkEngine(reliableTransport = true, declaredWindow = 32)
     private var parser = Iap2Csm.Parser()
     private val media = Iap2MediaSession(log, onMediaKey)
     private val nowPlaying = Iap2NowPlayingSession(nowPlayingProvider, log)
+    private val vehicle = Iap2VehicleStatusSession(onVehicleStatus, log)
+    private var identification: Iap2Messages.Identification? = null
     private var navigation = RouteGuidanceSession(log)
-    private val subscriptions = Iap2StatusSubscriptions(log = log)
+    private val subscriptions = Iap2StatusSubscriptions(log = log, deviceName = deviceName)
     private var started = false
     private var phase = "LINK"
     private var deadline = 0L
@@ -58,6 +61,8 @@ internal class WifiIap2Protocol(
             parser = Iap2Csm.Parser()
             media.reset()
             nowPlaying.reset()
+            vehicle.reset()
+            identification = null
             subscriptions.reset()
             navigation = RouteGuidanceSession(log)
             phase = "LINK"
@@ -138,14 +143,21 @@ internal class WifiIap2Protocol(
         if (failed) return
         val id = frame.messageId
         lastReceivedMessage = id
+        if (id == Iap2MessageIds.VEHICLE_STATUS_UPDATE) {
+            if (phase == "READY") vehicle.receive(frame.body)
+            return
+        }
         if (media.handle(frame) || nowPlaying.handle(frame)) return
         if (subscriptions.handle(frame)) {
             if (phase != "READY") log("DEFER phase=$phase id=0x${id.toString(16)} until authentication completes")
             return
         }
         if (id == 0x1d01 && phase == "READY") {
-            media.identify(Iap2Messages.parseIdentification(frame.body).hidComponents)
+            val ident = Iap2Messages.parseIdentification(frame.body)
+            subscriptions.identify(ident.model, ident.manufacturer)
+            media.identify(ident.hidComponents)
             send(0x1d02)
+            subscribeVehicle(ident)
             return
         }
         if (phase != "READY" || seen.add(id)) log("RX phase=$phase id=0x${id.toString(16)} body=${frame.body.size}B")
@@ -158,6 +170,8 @@ internal class WifiIap2Protocol(
         when (id) {
             0x1d01 -> if (phase == "IDENTIFICATION") {
                 val identification = Iap2Messages.parseIdentification(frame.body)
+                this.identification = identification
+                subscriptions.identify(identification.model, identification.manufacturer)
                 media.identify(identification.hidComponents)
                 val serialSupported = identification.declaresSend(0xaa06) == true
                 send(0x1d02)
@@ -200,7 +214,7 @@ internal class WifiIap2Protocol(
 
             }
             0xaa04, 0x1d03 -> fail("peer rejected id=0x${id.toString(16)}")
-            // Vehicle/location/HID subscriptions still receive link ACK. Unknown payloads are not guessed.
+            // Unknown payloads still receive the link ACK.
             else -> if (unknown.add(id)) log("ACK-only id=0x${id.toString(16)} body=${frame.body.size}B")
         }
     }
@@ -208,10 +222,15 @@ internal class WifiIap2Protocol(
     private fun greetings() {
         val zone = TimeZone.getDefault()
         send(0x4e0c, Iap2Csm.string(0, Iap2DeviceUuid.value))
+        identification?.let(::subscribeVehicle)
         send(0x4e0a, Iap2Csm.string(0, "zh"))
         send(0x4e09, Iap2Csm.string(0, deviceName))
         log("device name=$deviceName")
         send(0x4e0b, Iap2Messages.deviceTime(System.currentTimeMillis() / 1000, zone.getOffset(System.currentTimeMillis()) / 60_000, 0))
+    }
+
+    private fun subscribeVehicle(peer: Iap2Messages.Identification) {
+        vehicle.subscribe(peer)?.let { send(Iap2MessageIds.START_VEHICLE_STATUS_UPDATES, it) }
     }
 
     private fun send(id: Int, vararg parts: ByteArray) {

@@ -48,6 +48,20 @@ data class NowPlaying(
     val canLike: Boolean = false,
     val album: String = "",
     val playbackStatus: Int = 0,
+    val mediaDetails: MediaPlaybackDetails = MediaPlaybackDetails(),
+)
+
+data class MediaPlaybackDetails(
+    val itemId: Long? = null,
+    val trackNumber: Int? = null,
+    val trackCount: Int? = null,
+    val discNumber: Int? = null,
+    val genre: String = "",
+    val composer: String = "",
+    val liked: Boolean? = null,
+    val queueIndex: Int? = null,
+    val queueCount: Int? = null,
+    val speed: Float? = null,
 )
 
 class MusicNotificationListener : NotificationListenerService() {
@@ -168,9 +182,11 @@ object MusicBridge {
         val ratingType: Int,
         val count: Int,
         val denied: Boolean = false,
+        val queueIds: List<Long>? = null,
     )
     private var metadata: MediaMetadata? = null
     private var playback: PlaybackState? = null
+    private var queueIds: List<Long>? = null
     private var ratingType = Rating.RATING_NONE
     private var sessionGeneration = 0L
     private val snapshotEpoch = MusicSnapshotEpoch()
@@ -538,6 +554,12 @@ object MusicBridge {
             publish()
             choose()
         }
+        override fun onQueueChanged(queue: MutableList<android.media.session.MediaSession.QueueItem>?) {
+            if (generation != sessionGeneration) return
+            snapshotEpoch.queueChanged()
+            queueIds = queue?.map { it.queueId }
+            publish()
+        }
     }
 
     private fun clearController() {
@@ -548,6 +570,7 @@ object MusicBridge {
         controller = null
         metadata = null
         playback = null
+        queueIds = null
         ratingType = Rating.RATING_NONE
     }
 
@@ -700,7 +723,8 @@ object MusicBridge {
                 ?: sessions.firstOrNull { !it.metadata?.getString(MediaMetadata.METADATA_KEY_TITLE).isNullOrBlank() }
                 ?: sessions.firstOrNull()
             SessionSnapshot(target, target?.metadata, target?.playbackState,
-                target?.ratingType ?: Rating.RATING_NONE, sessions.size, denied)
+                target?.ratingType ?: Rating.RATING_NONE, sessions.size, denied,
+                runCatching { target?.queue?.map { it.queueId } }.getOrNull())
         }, { snapshot ->
             if (service !== s) return@submit
             permissionDenied = snapshot.denied
@@ -712,6 +736,7 @@ object MusicBridge {
                 controller = target
                 metadata = snapshot.metadata
                 playback = snapshot.playback
+                queueIds = snapshot.queueIds
                 ratingType = snapshot.ratingType
                 if (target != null) {
                     val generation = sessionGeneration
@@ -729,6 +754,7 @@ object MusicBridge {
                 // discovery snapshot must not replace newer metadata or playback callbacks.
                 if (snapshotEpoch.acceptsMetadata(epoch)) metadata = snapshot.metadata
                 if (snapshotEpoch.acceptsPlayback(epoch)) playback = snapshot.playback
+                if (snapshotEpoch.acceptsQueue(epoch)) queueIds = snapshot.queueIds
                 ratingType = snapshot.ratingType
             }
             publish()
@@ -777,6 +803,16 @@ object MusicBridge {
         val title = md?.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty()
         val artist = md?.getString(MediaMetadata.METADATA_KEY_ARTIST)
             ?: md?.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST).orEmpty()
+        val itemId = md?.getString(MediaMetadata.METADATA_KEY_MEDIA_ID)?.takeIf { it.isNotBlank() }?.let {
+            java.util.UUID.nameUUIDFromBytes("$pkg\u0000$it".encodeToByteArray()).mostSignificantBits
+        }
+        fun trackValue(key: String) = md?.getLong(key)?.takeIf { it in 1..65535 }?.toInt()
+        val liked = when (rating?.ratingStyle) {
+            Rating.RATING_HEART -> rating.hasHeart()
+            Rating.RATING_THUMB_UP_DOWN -> rating.isThumbUp
+            else -> likeAction?.name?.toString()?.let(FavoriteActionLabels::liked)
+        }
+        val activeQueueId = ps?.activeQueueItemId?.takeUnless { it == android.media.session.MediaSession.QueueItem.UNKNOWN_ID.toLong() }
         _state.value = NowPlaying(
             available = true,
             packageName = pkg,
@@ -794,11 +830,15 @@ object MusicBridge {
             playing = ps?.state == PlaybackState.STATE_PLAYING,
             positionMs = positionOf(ps),
             durationMs = md?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L,
-            liked = when (rating?.ratingStyle) {
-                Rating.RATING_HEART -> rating.hasHeart()
-                Rating.RATING_THUMB_UP_DOWN -> rating.isThumbUp
-                else -> likeAction?.name?.toString()?.let(FavoriteActionLabels::liked) ?: false
-            },
+            liked = liked ?: false,
+            mediaDetails = MediaPlaybackDetails(itemId = itemId,
+                trackNumber = trackValue(MediaMetadata.METADATA_KEY_TRACK_NUMBER),
+                trackCount = trackValue(MediaMetadata.METADATA_KEY_NUM_TRACKS),
+                discNumber = trackValue(MediaMetadata.METADATA_KEY_DISC_NUMBER),
+                genre = md?.getString(MediaMetadata.METADATA_KEY_GENRE).orEmpty(),
+                composer = md?.getString(MediaMetadata.METADATA_KEY_COMPOSER).orEmpty(),
+                liked = liked, speed = ps?.playbackSpeed, queueCount = queueIds?.size,
+                queueIndex = activeQueueId?.let { queueIds?.indexOf(it) }?.takeIf { it >= 0 }),
             canLike = likeAction != null || (actions and PlaybackState.ACTION_SET_RATING != 0L &&
                 ratingType in listOf(Rating.RATING_HEART, Rating.RATING_THUMB_UP_DOWN)),
         )

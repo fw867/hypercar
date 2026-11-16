@@ -215,6 +215,62 @@ mod tests {
         while let Ok(CarLifeEvent::VideoFrame{data,..}) = rx.try_recv() {kinds.push(data[4]);}
         assert_eq!(kinds,vec![0x67,0x68,0x65,0x41]);
     }
+
+    #[tokio::test]
+    async fn screen_replay_writes_cached_avc_idr_without_a_new_source_frame() {
+        use crate::screen::{build_avcc, ScreenCipher, ScreenSender};
+        use tokio::{io::AsyncReadExt, net::{TcpListener, TcpStream}};
+
+        let mut feed = Feed::default();
+        let mut events = feed.attach();
+        let sps = [0x67, 0x42, 0, 0x1f];
+        let pps = [0x68, 1];
+        // Match the size and NAL layout of the 18:11 access unit without retaining its image.
+        let mut idr = vec![0x55; 14_686 - 3 * 4 - sps.len() - pps.len()];
+        idr[0] = 0x65;
+        let mut au = Vec::new();
+        for nal in [&sps[..], &pps, idr.as_slice()] {
+            au.extend_from_slice(&[0, 0, 0, 1]);
+            au.extend_from_slice(nal);
+        }
+        feed.receive(CarLifeEvent::VideoFrame { pts_us: 1000, data: au });
+        // The live copy arrived before screen installation and was consumed.
+        while events.try_recv().is_ok() {}
+        tokio::time::sleep(Duration::from_millis(125)).await;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let key = [7; 32];
+        let mut sender = ScreenSender::new(client.into_split().1, ScreenCipher::ChaCha(key), 2736, 800, false);
+        let ready = Instant::now();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            feed.replay();
+            while let Ok(event) = events.try_recv() {
+                match event {
+                    CarLifeEvent::VideoReplay => sender.reset_source(),
+                    CarLifeEvent::VideoFrame { pts_us, data } => sender.send_video_annexb(&data, pts_us).await.unwrap(),
+                    other => panic!("unexpected replay event {other:?}"),
+                }
+            }
+            for opcode in [1, 0] {
+                let mut header = [0; 128];
+                peer.read_exact(&mut header).await.unwrap();
+                assert_eq!(header[4], opcode);
+                let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+                let mut body = vec![0; len];
+                peer.read_exact(&mut body).await.unwrap();
+                if opcode == 1 {
+                    assert_eq!(body, build_avcc(&sps, &pps));
+                } else {
+                    let plain = crate::crypto::chacha_open(&key, &crate::crypto::nonce64(0), &body, &header).unwrap();
+                    assert_eq!(plain[..4], (idr.len() as u32).to_be_bytes());
+                    assert_eq!(plain[4..], idr[..]);
+                }
+            }
+        }).await.expect("peer did not receive cached configuration and IDR");
+        println!("screen ready to loopback IDR read: {} us", ready.elapsed().as_micros());
+    }
     #[test] fn reset_and_overflow_never_replay_delta_without_idr() {
         let mut feed = Feed::default(); feed.receive(video(0x65));
         for _ in 0..300 {feed.receive(video(0x41));}

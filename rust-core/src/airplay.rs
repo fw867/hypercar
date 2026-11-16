@@ -2058,20 +2058,19 @@ fn spawn_event_dispatcher(
                         hid_reports += 1;
                         if hid_reports <= 3 || hid_reports % 20 == 0 {
                             emit_log(&format!(
-                                "EVENT: HID 报告 #{hid_reports} {}B {}",
-                                report.len(),
-                                report.iter().take(6).map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
+                                "EVENT: HID 报告 #{hid_reports} device={uuid:?} {}B",
+                                report.len()
                             ));
                         }
                         if let Some(keys) = consumer_hid.report(uuid, report) {
                             for usage in keys {
-                                emit_log(&format!("HID-KEY: device={uuid:?} usage=0x{:02x} pressed={}",usage&0xffff,usage!=crate::voice_key::HID_UP));
+                                emit_log(&format!("HID-KEY: device={uuid:?} input=0x{usage:x} pressed={}",usage!=crate::voice_key::HID_UP));
                                 let _ = key_tx.send(usage);
                             }
                             continue;
                         }
                         handle_hid_report(
-                            report,
+                            consumer_hid.touch_payload(uuid, report),
                             &touch_tx,
                             &key_tx,
                             display_size,

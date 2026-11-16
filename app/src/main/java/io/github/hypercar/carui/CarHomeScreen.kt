@@ -22,6 +22,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.InputMode
+import androidx.compose.ui.platform.LocalInputModeManager
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -79,6 +84,17 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
     var apps by remember { mutableStateOf(false) }
     var settings by remember { mutableStateOf(false) }
     var about by remember { mutableStateOf(false) }
+    androidx.activity.compose.BackHandler {
+        when {
+            settings -> settings = false
+            about -> about = false
+            apps -> apps = false
+            MusicUiState.appView -> {
+                MusicBridge.hideFromView()
+                MusicUiState.appView = false
+            }
+        }
+    }
     val enterMap: () -> Unit = {
         apps = false
         settings = false
@@ -441,11 +457,20 @@ private fun mapLaneSymbol(action: Int): String = when (action) {
     else -> "·"
 }
 
+@OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
 private fun MusicCard(music: NowPlaying, modifier: Modifier) {
     val context = LocalContext.current
     val installed = remember(context) { MusicApps.installed(context) }
     var picker by remember { mutableStateOf(false) }
+    val pickerButton = remember { FocusRequester() }
+    val inputMode = LocalInputModeManager.current
+    val closePicker = {
+        picker = false
+        if (inputMode.inputMode == InputMode.Keyboard) pickerButton.requestFocus()
+        Unit
+    }
+    androidx.activity.compose.BackHandler(enabled = picker, onBack = closePicker)
     val currentIcon = remember(music.packageName) { MusicApps.iconFor(context, music.packageName) }
     val dark = CarThemeState.dark
     val ink = if (dark) White else Color(0xFF1B1730)
@@ -494,6 +519,7 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
                     .clip(RoundedCornerShape(12.dp))
                     // 只让"图标 + 应用名"这一小段可点（原来整行/整条顶部都能点，容易误触）
                     .widthIn(max = 150.dp)
+                    .focusRequester(pickerButton)
                     .clickable(enabled = installed.isNotEmpty()) { picker = true }
                     .padding(horizontal = 4.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -556,13 +582,20 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
             }
         }
         if (picker) {
+            val choices = remember(installed) { installed.map { FocusRequester() } }
+            LaunchedEffect(inputMode.inputMode) {
+                if (inputMode.inputMode == InputMode.Keyboard) {
+                    val selected = installed.indexOfFirst { it.packageName == music.packageName }
+                    choices.getOrNull(selected.coerceAtLeast(0))?.requestFocus()
+                }
+            }
             // 直接画在卡片内，不用 Popup：D1 虚拟屏上 Popup 可能落在别的窗口，
             // 编码器只采到 Activity 这一层，切换列表就看不到。
             Box(
                 Modifier
                     .fillMaxSize()
                     .background(Color.Black.copy(alpha = .45f))
-                    .clickable { picker = false },
+                    .clickable(onClick = closePicker),
             )
             Column(
                 Modifier
@@ -575,12 +608,21 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
             ) {
                 Text("切换音乐应用", color = sub, fontSize = 12.sp,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
-                installed.forEach { app ->
+                installed.forEachIndexed { index, app ->
                     Row(
                         Modifier
                             .fillMaxWidth()
+                            .focusRequester(choices[index])
+                            .focusProperties {
+                                previous = choices[(index + choices.size - 1) % choices.size]
+                                next = choices[(index + 1) % choices.size]
+                                up = previous
+                                down = next
+                                left = FocusRequester.Cancel
+                                right = FocusRequester.Cancel
+                            }
                             .clickable {
-                                picker = false
+                                closePicker()
                                 MusicBridge.selectPackage(context, app.packageName)
                             }
                             .padding(horizontal = 16.dp, vertical = 10.dp),

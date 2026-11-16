@@ -5,6 +5,17 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CarMediaKeysTest {
+    @Test fun consoleControlsMoveFocusWithoutDispatchingPlayerCommands() {
+        assertEquals(KeyEvent.KEYCODE_BACK, CarConsoleKey.fromInput(0x30001)?.keyCode)
+        assertEquals(KeyEvent.KEYCODE_DPAD_CENTER, CarConsoleKey.fromInput(0x30002)?.keyCode)
+        assertEquals(KeyEvent.KEYCODE_DPAD_LEFT, CarConsoleKey.fromInput(0x30003)?.keyCode)
+        assertEquals(KeyEvent.KEYCODE_TAB, CarConsoleKey.fromInput(0x30008)?.keyCode)
+        assertEquals(KeyEvent.META_SHIFT_ON, CarConsoleKey.fromInput(0x30007)?.metaState)
+        assertEquals(0, CarConsoleKey.fromInput(0x30008)?.metaState)
+        assertNull(CarConsoleKey.fromInput(0xb5))
+        assertNull(CarConsoleKey.fromInput(0xb6))
+        for (input in 0x30001..0x30008) assertEquals(0, CarMediaKeys.keyCode(input))
+    }
     @Test fun consumerUsagesMapToAndroidMediaControls() {
         assertEquals(KeyEvent.KEYCODE_MEDIA_NEXT, CarMediaKeys.keyCode(0xB5))
         assertEquals(KeyEvent.KEYCODE_MEDIA_PREVIOUS, CarMediaKeys.keyCode(0xB6))

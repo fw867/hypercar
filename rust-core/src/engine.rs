@@ -135,6 +135,16 @@ fn default_true() -> bool {
     true
 }
 
+pub(crate) fn route_display_key(
+    hub: Option<&crate::carlife::CarLifeHub>,
+    key: u32,
+    local_key: impl FnOnce(u32),
+) {
+    if !hub.is_some_and(|hub| hub.handle_console_key(key)) {
+        local_key(key);
+    }
+}
+
 const TARGET_RATE: u32 = 48_000;
 const SPF: usize = 352; // AirPlay 每包样本帧（512 在真车无声）
 
@@ -241,7 +251,7 @@ pub async fn run_engine(
     }
     let voice_probe = if cfg.carlife_source { None } else { microphone_probe.clone() };
     let key_stop=stop.clone();
-    let voice_hub=carwith_hub.clone();
+    let input_hub=carwith_hub.clone();
     let carwith_voice=cfg.carlife_source;
     let voice_auxiliary_input=auxiliary_input.clone();
     tasks.spawn(async move {
@@ -260,10 +270,12 @@ pub async fn run_engine(
                                 if let Some(probe) = voice_probe.as_ref() {
                                     probe.toggle();
                                 } else if carwith_voice {
-                                    if let Some(hub)=voice_hub.as_ref(){voice_auxiliary_input.mark_user_intent();hub.voice_start();}
+                                    if let Some(hub)=input_hub.as_ref(){voice_auxiliary_input.mark_user_intent();hub.voice_start();}
                                 } else {crate::emit_voice_assistant();}
                             }
-                        } else {crate::emit_media_key(key);}
+                        } else {
+                            route_display_key(input_hub.as_deref(), key, crate::emit_media_key);
+                        }
                     },
                     None=>return,
                 }

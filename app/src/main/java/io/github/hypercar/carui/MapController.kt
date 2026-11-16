@@ -27,6 +27,7 @@ object MapController {
     private var homeCaster: SpikeCaster? = null
     private var mapCaster: SpikeCaster? = null
     private var mapDisplayId = -1
+    internal val fullscreenDisplayId: Int get() = if (mapActive) mapDisplayId else -1
     private var entering = false
 
     @Volatile

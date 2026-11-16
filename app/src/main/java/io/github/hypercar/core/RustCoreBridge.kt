@@ -44,7 +44,7 @@ object RustCoreBridge {
 
         /** 车机日夜模式（AirPlay setNightMode）：true = 夜间。 */
         fun onNightMode(night: Boolean)
-        /** Consumer-page HID Usage ID, one callback per key-down edge. */
+        /** Consumer media usage, or a CarConsoleKey event when the projected source is the local UI. */
         fun onMediaKey(usage: Int) {}
         /** Voice button routed to the phone assistant only for the self-rendered source. */
         fun onVoiceAssistant() {}

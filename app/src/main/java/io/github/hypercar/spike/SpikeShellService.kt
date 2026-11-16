@@ -410,6 +410,22 @@ class SpikeShellService : ISpikeShell.Stub {
         if (sendAsync(displayId, event)) "OK" else "ERR $inputError"
     }
 
+    override fun consoleKey(displayId: Int, keyCode: Int, metaState: Int): String = synchronized(lock) {
+        if (displayId <= 0 || !displays.containsKey(displayId)) return@synchronized "ERR display missing"
+        if (!ensureInput()) return@synchronized "ERR $inputError"
+        val downTime = SystemClock.uptimeMillis()
+        fun inject(action: Int): Boolean {
+            val event = android.view.KeyEvent(downTime, SystemClock.uptimeMillis(), action, keyCode, 0,
+                metaState, android.view.KeyCharacterMap.VIRTUAL_KEYBOARD, 0, 0, InputDevice.SOURCE_KEYBOARD)
+            setDisplayIdMethod!!.invoke(event, displayId)
+            return injectMethod!!.invoke(inputManager, event, 0) != false
+        }
+        runCatching {
+            if (inject(android.view.KeyEvent.ACTION_DOWN) && inject(android.view.KeyEvent.ACTION_UP)) "OK"
+            else "ERR key injection"
+        }.getOrElse { "ERR ${it.javaClass.simpleName}" }
+    }
+
     private fun sendAsync(displayId: Int, event: MotionEvent): Boolean {
         if (!ensureInput()) return false
         return try {

@@ -289,20 +289,39 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
 
 pub(super) async fn control(mut stream: TcpStream, queue: Arc<Mutex<Vec<QueuedControl>>>, state: Shared, stop: Arc<Notify>) {
     let mut sent=0u64;
+    let mut last_selector: Option<(u64, std::time::Instant)> = None;
     loop {
         let frame={let mut q=queue.lock(); if q.is_empty(){None}else{Some(q.remove(0))}};
         if let Some(packet)=frame {
-            if packet.expires.is_some_and(|at|std::time::Instant::now()>=at) {emit_log("VOICE-KEY: expired CarWith command dropped");continue;}
+            let Some((kind, body, _)) = read_cmd_frame(&packet.bytes) else {continue};
+            let hard_key = if kind == CTRL_CAR_HARD_KEY_CODE { first_int(&body, 1) } else { None };
+            let selector = hard_key.filter(|&code| matches!(code, SELECTOR_PREVIOUS | SELECTOR_NEXT));
+            // CarlifeTouchManager drops an identical hard key within 50ms of the previous one.
+            if let (Some(code), Some((previous, sent_at))) = (selector, last_selector) {
+                let due = sent_at + Duration::from_millis(55);
+                if code == previous && due > std::time::Instant::now() {
+                    if packet.expires.is_some_and(|expires| due >= expires) { continue; }
+                    tokio::select! {
+                        _ = stop.notified() => return,
+                        _ = tokio::time::sleep_until(due.into()) => {}
+                    }
+                }
+            }
+            if packet.expires.is_some_and(|at|std::time::Instant::now()>=at) {continue;}
             let wire={
                 let s=state.lock();
-                if !s.started { if packet.expires.is_some(){emit_log("VOICE-KEY: CarWith is not ready; command dropped");} continue; }
-                let Some((kind,body,_))=read_cmd_frame(&packet.bytes) else {continue};
-                if kind==0x68008 {emit_log(&format!("VOICE-KEY: CarWith CTRL write key={:?}",first_int(&body,1)));}
+                if !s.started { if packet.expires.is_some(){emit_log("CARWITH-CTRL: source not ready; command dropped");} continue; }
                 let Ok(body)=s.encrypt(&body) else {return};
                 build_cmd_frame(kind,&body)
             };
             if stream.write_all(&wire).await.is_err(){return;}
             sent+=1;
+            if let Some(code) = hard_key {
+                last_selector = selector.map(|key| (key, std::time::Instant::now()));
+                if code == 0x21 || sent <= 8 || sent % 60 == 0 {
+                    emit_log(&format!("CARWITH-KEY: encrypted CTRL write key={code}"));
+                }
+            }
             if sent<=8 || sent%60==0 {emit_log(&format!("CARWITH-TOUCH: encrypted CTRL packet #{sent} wire={}B",wire.len()));}
         } else {tokio::select!{_=stop.notified()=>return,_=tokio::time::sleep(Duration::from_millis(8))=>{}}}
     }
@@ -344,6 +363,62 @@ pub(super) async fn data(mut stream:TcpStream,state:Shared,events:mpsc::Unbounde
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn repeated_rotary_steps_arrive_after_the_carwith_debounce_interval() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let state = microphone_test_session();
+        let queue = Arc::new(Mutex::new(vec![]));
+        for code in [6, 6, 7] {
+            queue.lock().push(QueuedControl {
+                bytes: build_cmd_frame(0x68008, &[8, code]),
+                expires: None,
+            });
+        }
+        let started = tokio::time::Instant::now();
+        let writer = tokio::spawn(control(client, queue, state.clone(), Arc::new(Notify::new())));
+        for expected in [6, 6, 7] {
+            let mut frame = [0; 24];
+            tokio::time::timeout(Duration::from_secs(2), peer.read_exact(&mut frame))
+                .await.unwrap().unwrap();
+            let (kind, body, _) = read_cmd_frame(&frame).unwrap();
+            assert_eq!(kind, 0x68008);
+            assert_eq!(state.lock().decrypt(&body).unwrap(), [8, expected]);
+        }
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        writer.abort();
+    }
+
+    #[test]
+    fn console_keys_use_only_the_active_source_and_never_seek_tracks() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let hub = CarLifeHub {
+            owned_tasks: vec![],
+            touch_state: Arc::new(Mutex::new(TouchGesture::default())),
+            touch_tx: tx,
+            encoder_size: Arc::new(Mutex::new((1920, 720))),
+            keyframe_request: Arc::new(Notify::new()),
+        };
+        let mut local_keys = Vec::new();
+        for (key, wire_code) in [
+            (0x30001, 14), (0x30002, 20), (0x30003, 21), (0x30004, 22),
+            (0x30005, 23), (0x30006, 24), (0x30007, 7), (0x30008, 6),
+        ] {
+            assert_eq!(crate::voice_key::action(key), None);
+            crate::engine::route_display_key(None, key, |k| local_keys.push(k));
+            assert_eq!(local_keys.pop(), Some(key));
+            crate::engine::route_display_key(Some(&hub), key, |k| local_keys.push(k));
+            assert!(local_keys.is_empty(), "CarWith console key leaked to the local display");
+            let packet = rx.try_recv().expect("CarWith CTRL packet");
+            assert!(packet.expires.is_some());
+            assert_eq!(packet.bytes, [0, 2, 0, 0, 0, 6, 128, 8, 8, wire_code]);
+        }
+        crate::engine::route_display_key(Some(&hub), 0xb5, |k| local_keys.push(k));
+        assert_eq!(local_keys, [0xb5]);
+        assert!(rx.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn voice_start_uses_ctrl_protobuf_and_has_an_expiry() {
         let (tx,mut rx)=mpsc::unbounded_channel();
