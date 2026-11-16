@@ -364,9 +364,18 @@ object Iap2Messages {
     fun eaOpenSession(protocolId: Int, sessionId: Int): ByteArray =
         Iap2Csm.u8(0, protocolId) + Iap2Csm.u16(1, sessionId)
 
-    /** 0x4300：无线组件（transport=1 蓝牙）+ 传输标识（本机蓝牙 MAC）。 */
-    fun carPlayAvailability(bluetoothMac: String): ByteArray =
-        Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac))
+    /** 0x4300: nested field 0 is availability, not a transport type. */
+    fun carPlayAvailability(bluetoothMac: String, includeWiredGroup: Boolean = false): ByteArray {
+        val wireless = Iap2Csm.group(1, Iap2Csm.u8(0, 1), Iap2Csm.string(1, bluetoothMac))
+        if (!includeWiredGroup) return wireless
+        // ID9 A/B experiment only: reproduce the observed 24-character group-0 shape
+        // with this phone's stable local identity. This is not an Apple USB identifier.
+        val source = "HyperCar:iAP2:4300:group0:" + bluetoothMac.trim().uppercase(java.util.Locale.ROOT)
+        val identifier = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(source.toByteArray(Charsets.US_ASCII)).take(12)
+            .joinToString("") { "%02X".format(java.util.Locale.ROOT, it.toInt() and 0xff) }
+        return Iap2Csm.group(0, Iap2Csm.u8(0, 1), Iap2Csm.string(1, identifier)) + wireless
+    }
 
     /** 0x4E0B 设备时间：u64 epoch 秒 + s16 时区分钟 + u8 夏令时。 */
     fun deviceTime(epochSeconds: Long, timezoneOffsetMinutes: Int, daylightSaving: Int): ByteArray =

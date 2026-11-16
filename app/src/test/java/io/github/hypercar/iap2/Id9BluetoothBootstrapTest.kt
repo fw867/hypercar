@@ -6,6 +6,63 @@ import org.junit.Test
 import org.junit.Before
 
 class Id9BluetoothBootstrapTest {
+    @Test fun id9AvailabilityAddsStableGroupZeroAndKeepsWirelessBytes() {
+        val mac = "02:13:24:35:46:57"
+        fun availability() = Channel().let { channel ->
+            Iap2SenderSession(channel, {}, bluetoothMac = mac, onEndpoint = {},
+                profile = HeadUnitProfiles.BMW_ID9, nanoTime = { channel.time }).run(10_000)
+            channel.sent.single { it.messageId == 0x4300 }
+        }
+        val first = availability()
+        val second = availability()
+        assertArrayEquals(first.body, second.body)
+        val wire = Iap2Csm.encode(first.messageId, first.body)
+        assertEquals(75, wire.size)
+        val groups = Iap2Csm.parseParams(first.body)
+        assertEquals(listOf(0, 1), groups.map { it.id })
+        val local = Iap2Csm.parseParams(groups[0].value)
+        assertEquals(listOf(0, 1), local.map { it.id })
+        assertArrayEquals(byteArrayOf(1), local[0].value)
+        assertEquals(25, local[1].value.size)
+        assertEquals(0.toByte(), local[1].value.last())
+        val identifier = local[1].value.dropLast(1).toByteArray().toString(Charsets.US_ASCII)
+        assertTrue(Regex("[0-9A-F]{24}").matches(identifier))
+        assertArrayEquals(Iap2Messages.carPlayAvailability(mac),
+            Iap2Csm.group(groups[1].id, groups[1].value))
+    }
+
+    @Test fun otherProfilesKeepTheOriginalWirelessOnlyAvailabilityBytes() {
+        val mac = "02:13:24:35:46:57"
+        for (profile in HeadUnitProfiles.builtin.filter { it.id != "bmw_id9" }) {
+            val channel = Channel()
+            Iap2SenderSession(channel, {}, bluetoothMac = mac, onEndpoint = {},
+                profile = profile, nanoTime = { channel.time }).run(10_000)
+            val frames = channel.sent.filter { it.messageId == 0x4300 }
+            if (profile.sendCarPlayAvailability) assertTrue(profile.id, frames.isNotEmpty())
+            for (frame in frames) {
+                assertEquals(profile.id, 37, Iap2Csm.encode(frame.messageId, frame.body).size)
+                assertArrayEquals(profile.id, Iap2Messages.carPlayAvailability(mac), frame.body)
+            }
+        }
+    }
+
+    @Test fun id9LegacyAndNewWifiRetriesKeepTheIdenticalTwoGroups() {
+        for (legacy in listOf(false, true)) {
+            val channel = Channel(legacy = legacy, replyWithWifi = false, replyWithEndpoint = false)
+            val session = Iap2SenderSession(channel, {}, bluetoothMac = "02:13:24:35:46:57",
+                onEndpoint = {}, profile = HeadUnitProfiles.BMW_ID9, nanoTime = { channel.time })
+            session.run(10_000)
+            channel.closeAtNanos = channel.time + 12_000_000_000L
+            session.pumpIncomingForever()
+            val frames = channel.sent.filter { it.messageId == 0x4300 }
+            assertTrue("legacy=$legacy must exercise idle retries", frames.size > 1)
+            for (frame in frames) {
+                assertEquals(75, Iap2Csm.encode(frame.messageId, frame.body).size)
+                assertArrayEquals(frames.first().body, frame.body)
+            }
+        }
+    }
+
     @Before fun resetCache() { MfiCertificateCache.clearAll(null) }
     private class Channel(
         val serial: ByteArray? = null,
@@ -15,11 +72,13 @@ class Id9BluetoothBootstrapTest {
         val legacy: Boolean = false,
         val subscribeEarly: Boolean = false,
         val replyWithWifi: Boolean = true,
+        val replyWithEndpoint: Boolean = true,
     ) : Iap2LinkChannel {
         val sent = mutableListOf<Iap2Csm.Frame>()
         val queue = ArrayDeque<ByteArray>()
         var time = 1_000_000L
-        override val isAlive get() = true
+        var closeAtNanos = Long.MAX_VALUE
+        override val isAlive get() = time < closeAtNanos
         override fun awaitReady(timeoutMillis: Long) = true
         override fun peerMaxControlPayload() = 65525
         override fun close() {}
@@ -45,7 +104,7 @@ class Id9BluetoothBootstrapTest {
                     0xaa02 -> if(signature!=null) queue += Iap2Csm.encode(0xaa03,signature) +
                         (if(subscribeEarly) Iap2Csm.encode(0xae00,Iap2Csm.param(6,byteArrayOf())) else byteArrayOf())
                     0x5702 -> if (replyWithWifi) queue += Iap2Csm.encode(0x5703,Iap2Csm.string(1,"fixture-ap")+Iap2Csm.string(2,"fixture-pass"))
-                    0x4300 -> queue += Iap2Csm.encode(0x4301,Iap2Csm.group(1,
+                    0x4300 -> if (replyWithEndpoint) queue += Iap2Csm.encode(0x4301,Iap2Csm.group(1,
                         Iap2Csm.string(0,"fixture-ap") + Iap2Csm.string(1,"fixture-pass") + Iap2Csm.u8(2,1)))
                 }
             }

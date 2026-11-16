@@ -265,7 +265,7 @@ class Iap2SenderSession(
         // IDC23 capture: AA05 -> 4300, before greetings, EA, HID or queued subscriptions.
         val earlyAvailability = usesId9MinimalBootstrap() && profile.sendCarPlayAvailability
         if (earlyAvailability) {
-            sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY,Iap2Messages.carPlayAvailability(bluetoothMac))
+            sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY,carPlayAvailabilityBody())
             log("iap2 ID9 minimal bootstrap: AA05 -> 4300; no unsolicited state greetings")
         }
         media.authenticated()
@@ -414,7 +414,7 @@ class Iap2SenderSession(
             if (ident.declaresReceive(Iap2MessageIds.CARPLAY_AVAILABILITY) == false) {
                 log("iap2 车机清单未声明可收 0x4300，但档案 ${profile.id} 要求发——照发（清单可能不完整）")
             }
-            sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY, Iap2Messages.carPlayAvailability(bluetoothMac))
+            sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY, carPlayAvailabilityBody())
             log("iap2 tx=0x4300 CarPlayAvailability（档案 ${profile.id}；mac=$bluetoothMac）")
         } else if (!earlyAvailability) {
             log("iap2 跳过 0x4300（CarPlayAvailability）——档案 ${profile.id} 不要求")
@@ -644,7 +644,7 @@ class Iap2SenderSession(
                 sendFireAndForget(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION, ByteArray(0))
             }
             if (peer?.declaresReceive(Iap2MessageIds.CARPLAY_AVAILABILITY) == true) {
-                sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY, Iap2Messages.carPlayAvailability(bluetoothMac))
+                sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY, carPlayAvailabilityBody())
             }
             if (profile.openEaSessions && !eaSessions.allConfirmed && pokeCount <= EA_REOPEN_ATTEMPTS) {
                 for (protocol in eaProtocols) {
@@ -965,6 +965,15 @@ class Iap2SenderSession(
      * 而 BMW MGU-55 的 iAP2 可收清单里恰恰有 0x4E0D——车机可能就是靠它判断
      * 「这台设备是不是 CarPlay 设备」，没有就只给 iPod/BMW Apps 档案（不放 0x5703）。
      */
+    private fun carPlayAvailabilityBody(): ByteArray {
+        val withGroupZero = profile.id == "bmw_id9"
+        val body = Iap2Messages.carPlayAvailability(bluetoothMac, includeWiredGroup = withGroupZero)
+        if (withGroupZero) log("ID9-4300: groups=0,1 csmBytes=${body.size + Iap2Csm.HEADER_BYTES} " +
+            "group0Available=true identifierChars=24 identifierSource=local-bt-sha256; " +
+            "single-variable experiment, not confirmed SETUP-400 fix")
+        return body
+    }
+
     private fun sendWirelessCarPlayUpdate() {
         send(
             Iap2MessageIds.WIRELESS_CARPLAY_UPDATE,
