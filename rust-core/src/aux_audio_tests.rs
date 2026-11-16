@@ -27,6 +27,7 @@ impl Fixture {
         let modes=Arc::new(Mutex::new(Modes::initial()));
         let resource=Arc::new(SpeechResource::new(control.clone(),modes,Arc::new(AtomicBool::new(true))));
         let params=AirplayParams {
+                wifi_mac_address:None,
             car_ip:"127.0.0.1".into(),airplay_port:7000,device_id:"test".into(),device_name:"Test phone".into(),identity_path:"unused".into(),
             receiver_id:None,receiver_previously_connected:true,enable_audio:true,audio_codec:"pcm".into(),video_codec:String::new(),bmw_capabilities:true,microphone_probe:None,keep_alive_stats:false,
             bmw_box_bootstrap:true,mbux_screen_bootstrap:false,id9_screen_bootstrap:false,id9_disable_buffered_audio:false,nbt_audio_first:false,mbux_media_compat:false,desktop_receiver:false,

@@ -128,6 +128,81 @@ App复用Android蓝牙/Wi-Fi系统栈，已有CarPlay SDP marker和iAP2来向监
 
 此次实际修改是ID9屏幕延迟单变量，非“恢复盒子ID9专用分支”。原生实际请求测试先观察25!=75失败，修改后验证75及四字段、type110、正连接ID，保留其它档案25/100和失败清理回归。准备安装时检测到既有571已由其它工作提交为f7f574c，本轮延迟改动仍未提交，故按项目约定升级572/10668；本轮不提交、不推送。
 
+## 首包前命令的400/501逐项核对（2026-11-16，578同批）
+
+对照零基址eventCommand 0x45df4完整分支及WLAN接收线程0x6adb4，确认以下两类是App可确定修正的兼容差异；这仍不证明下午实车当时实际发过这些命令。
+
+| 命令 | 该版盒子的实际处理与应答 | App原行为及本轮处理 |
+|---|---|---|
+| showUI / stopUI | 读取可选url/uuid并记录，随后走普通空体200；没有请求资源或停止媒体的调用 | 原501；现正常应答并观察，不启动URL、不停止视频/网络、不转移资源 |
+| setLimitedUI | 读取limitedUI并记录，随后空体200；该分支未发现写入限用状态或通知源端调用 | 原501；现按该固件观察，不宣称实现了限用UI行为 |
+| updateDisplayPanels | 仅日志，随后空体200 | 原501；现观察并正常应答 |
+| accessoryGiveFocus | 读取尺寸、原点、focusHeading并记录，随后空体200，未改变资源归属 | 原501；现观察并正常应答 |
+| iAPSendMessage，params.data为合法空Data | 0x45df4显式创建并push空vector；0x6adb4看到begin=end直接丢弃，不进入链路解析，仍普通200 | 原command_bytes将空Data与缺字段一起判错，RTSP层回400；现接受运输封装但不投递到链接/认证，不计入非空iAP入站 |
+| requestUI / changeModes | 前者调用ResourceManager_RequestUi等，后者应用模式并构造带status/params的业务回复 | 不是观察通知；保持App既有资源与业务应答处理 |
+| updateViewArea | 根据显示uuid/viewAreaIndex等更新显示状态，并通知视区、按手机模式设置视区 | 不是无操作通知，本轮不简单回200。当前未实现路径仍可501，需区分实车是否命中及视区业务实现 |
+| 其它未知type / 畸形iAP封装 | 不据盒子的宽松普通回复推导App应接受任意业务 | 未知501、缺字段/非Data/超过65535B仍400；五类观察通知的params可省略，提供时须为Dictionary |
+
+实现将合法运输数据与非空链路字节分开：command_data用于RTSP校验及event/control入口，command_bytes保留只返回非空字节的用途。event与control两处都显式跳过空数据，故不触发JNI、识别认证、媒体订阅或就绪标志。RTSP诊断对合法空Data记iap_bytes=Some(0)，与缺失/错误类型区别。五类通知使用同一精确名称集合；没有改成未知类型一律200。
+
+两个真实socket回归先分别复现400与501，再验证通知/空封装序列→真实Detect：明文RTSP与加密HTTP均空体200、CSeq正确、后续Detect字节不变，观察通知及空封装不改变模式。既有缺字段、错误Data、65536B、非Dictionary params及未知命令拒绝保持，control入口测试也确认只有非空字节被投递。完整原生319项通过/2项现场依赖忽略，独立审查无待修问题；正式构建并保留数据覆盖安装同批578/10674通过，未重复升号、未提交推送。仍需新版实车日志把“存在可误拒分支”与“这次交接被该分支挡住”建立因果；不能据合成请求证明车机一定发送这些步骤。
+
+## 首包前置状态、HTTP应答与接收诊断（2026-11-16，578同批）
+
+进一步导出WLAN runloop初始化0xa74cc、运行0xa7bd0/0xa7e34、收包0xa563c及计时创建0xaac1c。RunOnce在附着事件位1时调用LinkAttached；TimeCreate初始无活动计时，未发现附着后立即启动Detect发送计时。HandleReadyPacket将已收到的Detect包（packet+0x1e=12）转为FSM事件17，之后才调用SendDetect并启动重发计时。新证据补足了此前只看状态表的局限，仍不支持用主动SYN或强制断蓝牙解释/修复零入站。
+
+接收证据需要收窄：下午WIFI-IAP计数为零表示没有成功路由到工作器，并非完整证明车机未向事件/控制TCP发送iAP命令。App原RTSP校验对未知type回501、格式不符回400，成功写出拒绝回复时没有日志，也不会分发到后续EVENT或iAP层。因而历史日志无法排除“首包之前的命令被拒”或“封装不符在前层被拒”。盒子0x45df4还处理showUI、stopUI、setLimitedUI、updateDisplayPanels、accessoryGiveFocus等类型；这些类型在当前App会被501拒绝，但没有本轮实际收包证据，未盲目放开或伪造业务处理。
+
+**明确兼容差异及本轮修正：**盒子eventCommand普通应答分支读取输入HTTPMessage的协议片段，以原始字符串0xb3d48="HTTP"识别HTTP请求，选择HTTP/1.1或RTSP/1.0状态行。App原respond始终写RTSP/1.0，is_response也只识别RTSP。实际socket回归先确认合法HTTP/1.1 iAPSendMessage Detect请求被回RTSP/1.0 200；现改为按收到的HTTP/1.0、HTTP/1.1或RTSP协议回复，同时将HTTP状态行识别为应答并走既有CSeq匹配。RTSP请求的回复、未知类型501、非法命令400、负载分发、加密和排队顺序保留。HTTP/1.0按其请求版本回复属于协议匹配扩展；固件可直接确认的HTTP分支是HTTP/1.1。旧车载日志未记录请求协议，不能据此宣称已定位此次首包缺失的实车根因。
+
+新增RTSP校验前元数据记录：每通道前32条接受样本及前32条拒绝样本，记录method/目标类别、协议、受限命令type、CSeq、body长度、可提取的iap字节数及validation_status。只表示解析和校验结果，不表示应答写出或业务认可。正常读循环退出时记录requests/rejected总数；主动close/Drop取消读任务时该尾部汇总可能不执行，初始样本仍已输出。不记录正文、参数值、触控位置、URL、凭据或认证载荷。
+
+明文/加密socket回归覆盖三种协议、可选CSeq、Detect字节不变、400/501不分发，另验证HTTP应答完成等待事务及日志元数据不包含私有内容。完整原生317项通过/2项现场依赖忽略，独立审查无阻断问题。本批保持578/10674，正式构建并保留数据覆盖安装通过；没有新车日志，尚未验证WLAN首包、识别认证和媒体订阅恢复。合法iAP消息原本先分发再写空体应答，所以若首个iAP已通过校验，单纯该消息的HTTP/RTSP应答差异不能解释工作器零字节；只能继续用校验前日志核对更早的命令与拒绝，不能偷换为实车已确定因果。
+
+## 蓝牙到WLAN入口与SETUP接口身份（2026-11-16，578）
+
+继续从零基址固件还原交接条件，而非将无媒体订阅等同于NowPlaying实现缺失：
+
+| 阶段 | 固件条件/调用 | App核对及结论 |
+|---|---|---|
+| 无线入口标记 | 共享CSM处理0x5e22c/0x65e14在蓝牙无线模式3处理AA01并发出AA02后，将miAP2SimComm+0x29置为1，调用CarplayStart；有线模式2清除此标志 | 此标志决定盒子是否启动WLAN工作器，是盒子内部模式状态，不是需要额外发给车机的启用消息 |
+| 事件客户端启动 | 0x25094在无线标志非零时调用0x6c0dc→0x6b69c，创建WLAN runloop并Attached | App也已在事件连接建立后、RECORD之前创建WifiIap2及双入口路由，没有发现缺少worker创建调用；WAIT_PEER表示worker正在等待，不等同于未创建 |
+| WLAN识别认证入口 | 已建立链路回调0x6b394记录协商会话；协议版本2先发1d00，版本1先请求证书。模式4处理AA03→AA05后置独立认证标志+0x44及WLAN就绪+0x3c | 下午两轮无WLAN入站帧，尚未进入这些分支，不能由后置认证/订阅gate解释零入站字节 |
+| 状态与媒体前置 | 0x5ce68要求有线状态0x85，或无线状态0x96且+0x3c非零，才置状态更新标志0xf31de；0x5c3d4另要求5000订阅标志和车机支持5001 | App保持认证后服务及订阅gate。没有依据跳过认证或主动伪造订阅 |
+| 本地蓝牙退场 | 0x47a48分别调度disableBluetooth和0x42dc8；0x50598设置mBt[7]预期退场，取消旧计时、清状态，0x4c7ec安排800ms动作3；0x4eb98→0x4d574及后续回调。0x507f8据预期标志区分只收束BT和异常重启 | App目前仅在ACL已离开且WLAN ready/控制健康时retireForWifi，存在流程差异。但上午首轮WLAN认证早于RFCOMM结束，否定“必须先关RFCOMM才可能收到WLAN”的必要条件。本轮不为此关闭手机蓝牙或提前丢弃可用BT媒体链路 |
+
+**本轮有据修正：SETUP的macAddress不应始终等于蓝牙deviceID。** 0x2cbb0在无线分支调用getInterfaceMacAddress(mCarPlaySim_t+0x18所指网络接口)，写入mCarPlaySim_t+0x38；获取失败才回退设备身份。0x257a0分别将设备身份写入deviceID、将+0x38写入macAddress；disableBluetooth 0x434a0仍用getDeviceId 0x26428。App原实现无条件将deviceID同时写入两个字段，与固件可核实的接口身份来源不符。该差异可能影响车机对蓝牙与WLAN端点的关联，但尚未取得车机内部判定或修正后的同车日志，不能定为零入站/不订阅的唯一原因。
+
+578仅对真实ID8.5路径，在取得本轮车机Network的可信站点MAC时，使用它填SETUP.macAddress，deviceID、蓝牙问候、配对身份及disableBluetooth.deviceID保持原值。优先读该Network的WifiInfo；占位/无法取得时，使用有shell子进程超时的wifi status，仅从IP匹配本Network地址的唯一WifiInfo行读取MAC标签，排除BSSID、引号内伪标签、歧义、组播及隐私占位地址。查询在打开控制TCP之前进行，结果按attempt/Network保存，取消/换网丢弃，失败回退原设备身份；不要求额外权限、不影响正常连接。ID9、MBUX、其它车型和桌面接收端排除该覆盖。不增加主动SYN、媒体报文或Wi-Fi清理动作。
+
+真实RTSP封包回归先复现仍写入蓝牙地址的失败，再验证deviceID不变、macAddress使用站点地址；额外socket回归覆盖档案排除及无效/缺失地址回退。完整原生313项通过/2项现场依赖忽略，JVM588项通过；Lint0错误/77警告，其中新增HardwareIds警告对应协议必须使用的当前接口地址读取。独立审查修正可选shell查询stdout阻塞风险：使用timeout子命令，实机超时测试约1.14s以124退出；复审无待修问题。正式构建、包内原生库一致性及保留数据安装578/10674通过。未提交、未推送；WLAN认证、媒体订阅及切歌仍待实车验证。
+
+## 媒体订阅与按键通道继续追踪（2026-11-16下午，577）
+
+以下使用原始ELF零基址Ghidra工程与PT_LOAD原始数据，不复用旧加载偏移工程。新增导出WLAN链路FSM、HID输入及桥接函数，重点区分车机侧CarPlay与盒子手机侧USB gadget；`iap2_sim_hid_start`走`/dev/hidg0`，不能据其名称照搬成车机媒体启用步骤。
+
+**订阅成立之前的差异：**留存盒子成功摘要在WLAN上先完成iAP2识别/认证，再在52.894收到6800、52.896收到5000，52.897发5001。下午App两轮视频均已建立，Wi-Fi iAP2最终统计rx_frames=0/tx_frames=0、event/control入口无字节，分别到约44s/94s清理；并非5000正文解析后被拒。蓝牙媒体HID摘要starts/reports=0、未见NowPlaying Start，也不能拿车机1d01的“支持发送5000/6800”清单当作已收到请求。现有证据把缺口定位到WLAN iAP2进入媒体订阅之前，尚未还原车机内部为何没有启动该链路，不能宣称唯一根因或已修复。
+
+**不能用主动5001代替订阅：**0x5e22c共享CSM处理路径接收5000时置0xf31e0的首字节，按请求组/字段构造5001；5002清除此字节。持续源信息更新0x66218→0x5c3d4仍同时要求5001被车机声明支持、状态更新开启0xf31de、订阅字节非零。源就绪与订阅是两个条件，音乐播放不会自动制造订阅。当前App的同运输认证及订阅gate与此一致。
+
+**WLAN启动状态表已核对：**0x6b69c创建Device runloop并Attached；0xa7d88设置附着事件，0xa40d0送FSM事件1。原始表`iAP2LinkDeviceStates=0xc7198`中state1/event1调用0xa339c ActionNone进入state2；ActionNone只把后续事件设为22（结束），没有发送Detect或SYN。state2/event17调用0xa6718 SendDetect，state2/event20为其超时重发；SendDetect才调用link+0x1c保存的0x6a9f4回调，后者经AirPlaySendiAPMessage发送6字节Detect并设1s重发计时。该检查否定“看到SendDetect函数就应在RECORD后主动发SYN”的推断，不据下午无入站字节改成主动探测。它不等同于穷尽固件所有外部事件来源。
+
+**按键传递链：**AirPlay eventCommand 0x45df4的hidSendReport读取uuid/hidReport→HidSim_Input 0x36c50；iAP2处理6800读取参数0组件、4描述符建HID，6802读取参数0/1后也进入HidSim_Input。0x36cf8→描述符解析0x35e70→Usage映射0x35de0→input_virtual_Input 0x8a1e0；按手机侧运行分支输出Linux虚拟输入或zlk_cmd_key 0x8fec0。后者发`XZ_KEY=键码,按下状态`；zlink_server 0x2ac40解析后按源模式进入libzlink_key_event或另一桥接分支，不能把所有源类型都说成同一个CarLife写包。
+
+原始Usage表0xb1a68与桥接键表0xbcf94相互印证：
+
+| HID page/Usage | Linux键值 | XZ_KEY映射 | 解释 |
+|---|---|---|---|
+| 0x0c/B5 | 0xa3 | 4 | 下一曲 |
+| 0x0c/B6 | 0xa5 | 5 | 上一曲 |
+| 0x0c/CD | 0xa4 | 3 | 播放/暂停 |
+| 0x0c/0224 | 0x9e | 独立返回路径 | 返回，不是切歌 |
+| 0x01/30、35、37、38 | 0x69及相应方向处理 | 7及方向键组 | 轴/旋钮/方向，不能仅凭数值当B5/B6 |
+
+盒子成功摘要的WLAN 6800描述符解析出B0/B5/B6，支持媒体按键走WLAN iAP2 HID这一条路径；摘要没有实际6802按键边沿，不能据此断言每个实体方向盘键都只走这条通道。下午App /info的设备0只解析出c0224、设备1为触摸；15:59:47起设备0四字节报告虽然收到，未出现媒体Usage边沿或MEDIA-KEY派发。用户确认当时混合操作方向盘和中控，无法把这些报告归给某个实体切歌键。未发现本轮ctrl日志有nextitem/previtem类HTTP请求，也没有依据添加DACP或AVRCP猜测分支。
+
+重新运行现有Wi-Fi iAP2模拟会话、媒体HID、NowPlaying和Android媒体键路由共75项，全部通过，包含真实封包的6800→6802→B5/B6边沿、重复抑制、停止/重同步、显式订阅筛选。只能证明本地已收到对应协议事件时的实现，不代表实车发起订阅或播放器已执行。本阶段仅分析和文档，没有新行为修改、重编译或安装；保留此前Wi-Fi修正，未提交、未推送。
+
 ## 方向盘与Now Playing固件复核（2026-11-15）
 
 对照原固件SHA-256 `4b7dc91d4ee353a9f1f1acc6ae2c0e69b94b598355379545362856e6a27dff8e`中的xiap2，结合已留存成功日志。以下地址为该固件虚拟地址，不能套用其它版本；原日志每包只保留前16字节，未恢复完整描述符/订阅正文。

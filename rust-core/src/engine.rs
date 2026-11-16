@@ -53,6 +53,8 @@ pub enum SourceEvent {
 pub struct EngineConfig {
     pub device_id: String,
     #[serde(default)]
+    pub wifi_mac_address: Option<String>,
+    #[serde(default)]
     pub device_name: String,
     pub car_ip: String,
     pub airplay_port: u16,
@@ -374,6 +376,7 @@ pub async fn run_engine(
         car_ip: cfg.car_ip.clone(),
         airplay_port: cfg.airplay_port,
         device_id: cfg.device_id.clone(),
+        wifi_mac_address: cfg.wifi_mac_address.clone(),
         device_name: if cfg.device_name.trim().is_empty() { "HyperCar".into() } else { cfg.device_name.clone() },
         identity_path: cfg.identity_path.clone(),
         receiver_id: cfg.receiver_id.clone(),

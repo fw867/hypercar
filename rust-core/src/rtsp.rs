@@ -103,7 +103,15 @@ pub struct RtspMessage {
 
 impl RtspMessage {
     pub fn is_response(&self) -> bool {
-        self.first_line.starts_with("RTSP/")
+        self.first_line.starts_with("RTSP/") || self.first_line.starts_with("HTTP/1.0 ") || self.first_line.starts_with("HTTP/1.1 ")
+    }
+
+    fn response_protocol(&self) -> &'static str {
+        match self.first_line.split_whitespace().nth(2) {
+            Some("HTTP/1.1") => "HTTP/1.1",
+            Some("HTTP/1.0") => "HTTP/1.0",
+            _ => "RTSP/1.0",
+        }
     }
 
     pub fn status(&self) -> u16 {
@@ -458,6 +466,10 @@ async fn reader_loop(
     let mut plain: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 4096];
     let mut unsolicited_responses = 0u64;
+    let mut inbound_requests = 0u64;
+    let mut rejected_requests = 0u64;
+    let mut accepted_trace = 0u64;
+    let mut rejected_trace = 0u64;
     loop {
         let n = match read.read(&mut chunk).await {
             Ok(0) => {
@@ -522,8 +534,18 @@ async fn reader_loop(
                 }
             } else {
                 let cseq = msg.cseq();
-                if let Err((status, reason)) = validate_inbound_command(&msg) {
-                    if let Err(error) = respond(&write, &cipher, cseq, status, reason, &[]).await {
+                let protocol = msg.response_protocol();
+                let validation = validate_inbound_command(&msg);
+                inbound_requests += 1;
+                if validation.is_err() { rejected_requests += 1; }
+                let trace_count=if validation.is_err() { &mut rejected_trace } else { &mut accepted_trace };
+                if *trace_count < 32 {
+                    *trace_count += 1;
+                    let status=validation.as_ref().err().map(|v|v.0).unwrap_or(200);
+                    crate::emit_log(&format!("RTSP#{trace_id} IN request={inbound_requests} {} CSeq={cseq:?} validation_status={status}; pre-dispatch, response write separate",inbound_command_metadata(&msg)));
+                }
+                if let Err((status, reason)) = validation {
+                    if let Err(error) = respond(&write, &cipher, protocol, cseq, status, reason, &[]).await {
                         crate::emit_log(&format!("RTSP#{trace_id}: rejection write failed CSeq={cseq:?} status={status}: {error}"));
                     }
                     continue;
@@ -539,7 +561,7 @@ async fn reader_loop(
                 if let Some(ui_type) = ui_type {
                     // Finish the UI command's acknowledgement before feedback can be scheduled.
                     // iAP and touch keep their existing immediate dispatch path below.
-                    match respond_ok(&write, &cipher, cseq, &body).await {
+                    match respond_ok(&write, &cipher, protocol, cseq, &body).await {
                         Ok(()) => {
                             crate::emit_log(&format!("RTSP#{trace_id}: UI response TCP written type={ui_type} CSeq={cseq:?} status=200 body={}B",body.len()));
                             let _ = inbound_tx.send(msg);
@@ -549,13 +571,13 @@ async fn reader_loop(
                 } else if body.is_empty() {
                     // Touch/iAP delivery remains immediate; it must not wait for a socket write.
                     let _ = inbound_tx.send(msg);
-                    if let Err(error)=respond_ok(&write, &cipher, cseq, &body).await {
+                    if let Err(error)=respond_ok(&write, &cipher, protocol, cseq, &body).await {
                         crate::emit_log(&format!("RTSP#{trace_id}: response write failed CSeq={cseq:?}: {error}"));
                     }
                 } else {
                     // Complete changeModes' business reply before dispatch can schedule the next
                     // modesChanged. CSeq/status are metadata; never dump private command bodies.
-                    match respond_ok(&write, &cipher, cseq, &body).await {
+                    match respond_ok(&write, &cipher, protocol, cseq, &body).await {
                         Ok(()) => crate::emit_log(&format!("RTSP#{trace_id}: business response written CSeq={cseq:?} body={}B",body.len())),
                         Err(error) => crate::emit_log(&format!("RTSP#{trace_id}: business response failed CSeq={cseq:?}: {error}")),
                     }
@@ -565,7 +587,54 @@ async fn reader_loop(
         }
     }
     // 读循环退出：唤醒所有等待者
+    crate::emit_log(&format!("RTSP#{trace_id} IN summary requests={inbound_requests} rejected={rejected_requests} accepted_samples={accepted_trace}/32 rejected_samples={rejected_trace}/32; iAP delivery counted separately"));
     pending.lock().clear();
+}
+
+fn inbound_command_metadata(message: &RtspMessage) -> String {
+    let mut line=message.first_line.split_whitespace();
+    let method=match line.next() {Some("POST")=>"POST",Some("GET")=>"GET",Some("OPTIONS")=>"OPTIONS",_=>"other"};
+    let target=if line.next()==Some("/command") {"command"}else{"other"};
+    let value=crate::bplist::parse(&message.body).ok();
+    let kind=value.as_ref().and_then(|v|v.get("type")).and_then(crate::bplist::Value::as_str)
+        .filter(|s|!s.is_empty() && s.len()<=48 && s.bytes().all(|b|b.is_ascii_alphanumeric() || b==b'_' || b==b'-')).unwrap_or("unparsed_or_nonstandard");
+    let iap_bytes=value.as_ref().and_then(crate::wifi_iap2::command_data).map(|data|data.len());
+    format!("method={method} target={target} protocol={} type={kind} body={}B iap_bytes={iap_bytes:?}",message.response_protocol(),message.body.len())
+}
+
+#[cfg(test)]
+mod ingress_metadata_tests {
+    use super::*;
+    use crate::bplist::{encode,Value};
+
+    #[test]
+    fn rejected_and_accepted_commands_have_metadata_without_private_bodies_or_urls() {
+        for (kind,expected) in [("futureCommand",501),("iAPSendMessage",200)] {
+            let message=RtspMessage {
+                first_line:"POST /command RTSP/1.0".into(),headers:HashMap::new(),
+                body:encode(&Value::dict(vec![("type",Value::str(kind)),("params",Value::dict(vec![
+                    ("data",Value::Data(b"PRIVATE_PAYLOAD".to_vec())),("url",Value::str("scheme:PRIVATE_URL")),
+                ]))])),
+            };
+            let validation=validate_inbound_command(&message);
+            assert_eq!(validation.err().map(|v|v.0).unwrap_or(200),expected);
+            let note=inbound_command_metadata(&message);
+            assert!(note.contains(&format!("type={kind}")));
+            assert!(note.contains("target=command"));
+            assert!(!note.contains("PRIVATE"));
+            assert!(!note.contains("scheme:"));
+        }
+        let message=RtspMessage {first_line:"POST /PRIVATE_URL?secret=PRIVATE RTSP/1.0".into(),headers:HashMap::new(),body:b"PRIVATE_BODY".to_vec()};
+        let note=inbound_command_metadata(&message);
+        assert!(note.contains("target=other"));
+        assert!(!note.contains("PRIVATE"));
+    }
+}
+
+// These branches in the reference firmware only observe parameters and return empty 200.
+// They do not grant screen/audio resources, start authentication or launch an arbitrary URL.
+pub(crate) fn is_box_observation_command(kind: &str) -> bool {
+    matches!(kind,"showUI"|"stopUI"|"setLimitedUI"|"updateDisplayPanels"|"accessoryGiveFocus")
 }
 
 // Validate only the command endpoint; other RTSP methods retain their existing behavior.
@@ -580,7 +649,8 @@ fn validate_inbound_command(message: &RtspMessage) -> Result<(), (u16, &'static 
     let kind = command.get("type").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or(bad)?;
     let field = |name: &str| command.get(name).or_else(|| command.get("params").and_then(|p| p.get(name)));
     let valid = match kind {
-        "iAPSendMessage" => crate::wifi_iap2::command_bytes(&command).is_some(),
+        "iAPSendMessage" => crate::wifi_iap2::command_data(&command).is_some(),
+        kind if is_box_observation_command(kind) => command.get("params").is_none_or(|p|matches!(p,Value::Dict(_))),
         "hidSendReport" => {
             let report = command.get("hidReport").and_then(Value::as_bytes)
                 .or_else(|| command.get("params").and_then(|p| p.get("report")).and_then(Value::as_bytes));
@@ -601,12 +671,12 @@ fn validate_inbound_command(message: &RtspMessage) -> Result<(), (u16, &'static 
     if valid { Ok(()) } else { Err(bad) }
 }
 
-async fn respond_ok(write: &SharedWrite, cipher: &SharedCipher, cseq: Option<i32>, body: &[u8]) -> std::io::Result<()> {
-    respond(write, cipher, cseq, 200, "OK", body).await
+async fn respond_ok(write: &SharedWrite, cipher: &SharedCipher, protocol: &str, cseq: Option<i32>, body: &[u8]) -> std::io::Result<()> {
+    respond(write, cipher, protocol, cseq, 200, "OK", body).await
 }
 
-async fn respond(write: &SharedWrite, cipher: &SharedCipher, cseq: Option<i32>, status: u16, reason: &str, body: &[u8]) -> std::io::Result<()> {
-    let mut head = format!("RTSP/1.0 {status} {reason}\r\nContent-Length: {}\r\n", body.len());
+async fn respond(write: &SharedWrite, cipher: &SharedCipher, protocol: &str, cseq: Option<i32>, status: u16, reason: &str, body: &[u8]) -> std::io::Result<()> {
+    let mut head = format!("{protocol} {status} {reason}\r\nContent-Length: {}\r\n", body.len());
     if let Some(c) = cseq { head.push_str(&format!("CSeq: {c}\r\n")); }
     if !body.is_empty() { head.push_str("Content-Type: application/x-apple-binary-plist\r\n"); }
     head.push_str("\r\n");
@@ -627,6 +697,124 @@ async fn respond(write: &SharedWrite, cipher: &SharedCipher, cseq: Option<i32>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn box_startup_sequence(kinds: &[&str]) {
+        use crate::bplist::{encode,Value};
+        for (protocol,encrypted) in [("RTSP/1.0",false),("HTTP/1.1",true)] {
+            let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut car=tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (phone,_)=listener.accept().await.unwrap();let(r,w)=phone.into_split();
+            let modes=Arc::new(Mutex::new(crate::modes::Modes::from_info(&Value::dict(vec![]),true,true)));
+            let before=modes.lock().diagnostics();
+            let reply_modes=modes.clone();
+            let reply=Arc::new(move |request: &RtspMessage| {
+                let command=crate::bplist::parse(&request.body).ok()?;
+                reply_modes.lock().response(&command)
+            });
+            let (_channel,mut inbound)=RtspChannel::spawn_with_reply(r,w,encrypted.then(||ControlCipher::new([1;32],[2;32])),Some(reply));
+            let mut peer_cipher=ControlCipher::new([2;32],[1;32]);
+            for (index,kind) in kinds.iter().chain(std::iter::once(&"iAPSendMessage")).enumerate() {
+                let last=index==kinds.len();
+                let data=if last {vec![0xff,0x55,2,0,0xee,0x10]}else{vec![]};
+                let params=if *kind=="iAPSendMessage" {Value::dict(vec![("data",Value::Data(data.clone()))])}else{Value::dict(vec![])};
+                let body=encode(&Value::dict(vec![("type",Value::str(kind)),("params",params)]));
+                let mut request=format!("POST /command {protocol}\r\nCSeq: {index}\r\nContent-Length: {}\r\n\r\n",body.len()).into_bytes();request.extend_from_slice(&body);
+                car.write_all(&if encrypted {peer_cipher.encrypt(&request)}else{request}).await.unwrap();
+                let mut wire=Vec::new();let mut plain=Vec::new();let mut chunk=[0;2048];
+                let response=loop {
+                    let n=tokio::time::timeout(Duration::from_secs(1),car.read(&mut chunk)).await.unwrap().unwrap();assert!(n>0);wire.extend_from_slice(&chunk[..n]);
+                    if encrypted {let (bytes,used)=peer_cipher.decrypt(&wire).unwrap();wire.drain(..used);plain.extend(bytes);}else{plain.append(&mut wire);}
+                    if let Some(response)=parse_rtsp_messages(&mut plain).unwrap().pop(){break response;}
+                };
+                assert_eq!(response.first_line,format!("{protocol} 200 OK"),"kind={kind}");
+                assert_eq!(response.cseq(),Some(index as i32));assert!(response.body.is_empty());
+                let received=tokio::time::timeout(Duration::from_secs(1),inbound.recv()).await.unwrap().unwrap();
+                assert_eq!(received.body,body);
+                let command=crate::bplist::parse(&received.body).unwrap();
+                if last {assert_eq!(crate::wifi_iap2::command_bytes(&command),Some(data.as_slice()));}
+                else {assert!(crate::wifi_iap2::command_bytes(&command).is_none(),"notification/empty command must not enter link authentication");}
+                assert_eq!(modes.lock().diagnostics(),before,"observation/empty command must not transfer screen or audio");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn box_empty_iap_envelope_is_acknowledged_before_real_detection() {
+        box_startup_sequence(&["iAPSendMessage"]).await;
+    }
+
+    #[tokio::test]
+    async fn box_observation_notifications_do_not_block_following_detection() {
+        box_startup_sequence(&["showUI","stopUI","setLimitedUI","updateDisplayPanels","accessoryGiveFocus"]).await;
+    }
+
+    #[test]
+    fn http_status_lines_are_responses_rather_than_commands() {
+        for protocol in ["HTTP/1.0","HTTP/1.1","RTSP/1.0"] {
+            let mut wire=format!("{protocol} 200 OK\r\nCSeq: 7\r\nContent-Length: 0\r\n\r\n").into_bytes();
+            let response=parse_rtsp_messages(&mut wire).unwrap().pop().unwrap();
+            assert!(response.is_response(),"{}",response.first_line);
+            assert_eq!(response.status(),200);
+            assert_eq!(response.cseq(),Some(7));
+        }
+    }
+
+    #[tokio::test]
+    async fn http_reply_resolves_pending_request_without_dispatch_as_a_command() {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client=tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut peer,_)=listener.accept().await.unwrap();let(r,w)=client.into_split();
+        let (channel,mut inbound)=RtspChannel::spawn(r,w,None);
+        let server=tokio::spawn(async move {
+            let mut buffer=Vec::new();let mut chunk=[0;1024];
+            let request=loop {
+                let n=peer.read(&mut chunk).await.unwrap();assert!(n>0);buffer.extend_from_slice(&chunk[..n]);
+                if let Some(request)=parse_rtsp_messages(&mut buffer).unwrap().pop(){break request;}
+            };
+            peer.write_all(format!("HTTP/1.1 200 OK\r\nCSeq: {}\r\nContent-Length: 2\r\n\r\nok",request.cseq().unwrap()).as_bytes()).await.unwrap();
+        });
+        let reply=channel.request("POST","/feedback",&[],"application/octet-stream",&[],Duration::from_secs(1)).await.unwrap();
+        assert_eq!(reply.status(),200);assert_eq!(reply.body,b"ok");
+        assert!(inbound.try_recv().is_err());server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn iap_command_ack_matches_request_protocol_without_changing_payload_or_validation() {
+        use crate::bplist::{encode,Value};
+        for protocol in ["RTSP/1.0","HTTP/1.1","HTTP/1.0"] {
+            for encrypted in [false,true] {
+                for (kind,valid,status) in [("iAPSendMessage",true,200),("iAPSendMessage",false,400),("futureCommand",true,501)] {
+                    let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let mut car=tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+                    let (phone,_)=listener.accept().await.unwrap();let(r,w)=phone.into_split();
+                    let cipher=encrypted.then(||ControlCipher::new([1;32],[2;32]));
+                    let (_channel,mut inbound)=RtspChannel::spawn(r,w,cipher);
+                    let marker=vec![0xff,0x55,2,0,0xee,0x10];
+                    let params=if valid {Value::dict(vec![("data",Value::Data(marker.clone()))])}else{Value::dict(vec![])};
+                    let body=encode(&Value::dict(vec![("type",Value::str(kind)),("params",params)]));
+                    let sequence=if encrypted {"CSeq: 7\r\n"}else{""};
+                    let mut request=format!("POST /command {protocol}\r\n{sequence}Content-Length: {}\r\n\r\n",body.len()).into_bytes();request.extend_from_slice(&body);
+                    let mut peer_cipher=ControlCipher::new([2;32],[1;32]);
+                    let wire=if encrypted {peer_cipher.encrypt(&request)}else{request};
+                    car.write_all(&wire).await.unwrap();
+                    let mut buffer=Vec::new();let mut chunk=[0;2048];
+                    let response=loop {
+                        let n=tokio::time::timeout(Duration::from_secs(1),car.read(&mut chunk)).await.unwrap().unwrap();assert!(n>0);
+                        buffer.extend_from_slice(&chunk[..n]);
+                        let parsed=if encrypted {peer_cipher.decrypt(&buffer).unwrap().0}else{buffer.clone()};
+                        if let Some(response)=parse_rtsp_messages(&mut parsed.clone()).unwrap().pop() {break response;}
+                    };
+                    assert_eq!(response.first_line,format!("{protocol} {status} {}",match status{200=>"OK",400=>"Bad Request",_=>"Not Implemented"}));
+                    assert_eq!(response.cseq(),encrypted.then_some(7));
+                    if status==200 {
+                        let delivered=tokio::time::timeout(Duration::from_secs(1),inbound.recv()).await.unwrap().unwrap();
+                        assert_eq!(delivered.body,body);
+                        assert_eq!(crate::wifi_iap2::command_bytes(&crate::bplist::parse(&delivered.body).unwrap()),Some(marker.as_slice()));
+                    }else{assert!(inbound.try_recv().is_err());}
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn absolute_session_uri_is_immutable_reused_and_preserves_encrypted_transactions() {
@@ -743,13 +931,16 @@ mod tests {
         for (kind, params) in [
             ("iAPSendMessage", Value::dict(vec![])),
             ("iAPSendMessage", Value::dict(vec![("data",Value::str("invalid"))])),
-            ("iAPSendMessage", Value::dict(vec![("data",Value::Data(vec![]))])),
+            ("iAPSendMessage", Value::dict(vec![("data",Value::Data(vec![0;65536]))])),
             ("hidSendReport", Value::dict(vec![])),
             ("hidSendReport", Value::dict(vec![("report",Value::str("invalid"))])),
             ("requestSiri", Value::dict(vec![("siriAction",Value::int(99))])),
             ("setNightMode", Value::dict(vec![])),
         ] {
             cases.push(("POST /command RTSP/1.0",encode(&Value::dict(vec![("type",Value::str(kind)),("params",params)])),400));
+        }
+        for kind in ["showUI","stopUI","setLimitedUI","updateDisplayPanels","accessoryGiveFocus"] {
+            cases.push(("POST /command RTSP/1.0",encode(&Value::dict(vec![("type",Value::str(kind)),("params",Value::str("not-a-dictionary"))])),400));
         }
         for (fields, status) in [
             (vec![("type",Value::str("hidSendReport")),("hidReport",Value::Data(vec![1])),("uuid",Value::str("touch"))],200),

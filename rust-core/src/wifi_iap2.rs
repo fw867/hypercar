@@ -82,10 +82,16 @@ pub fn ingress_summary(id: u64) -> String {
     format!("ingress_event={}/{}B ingress_control={}/{}B",s.event_packets,s.event_bytes,s.control_packets,s.control_bytes)
 }
 
-pub fn command_bytes(command: &Value) -> Option<&[u8]> {
+/// A valid transport command may carry empty Data; the box acknowledges it as a no-op.
+pub fn command_data(command: &Value) -> Option<&[u8]> {
     if command.get("type").and_then(Value::as_str)!=Some("iAPSendMessage") { return None; }
     command.get("params").and_then(|p|p.get("data")).and_then(Value::as_bytes)
-        .filter(|b| !b.is_empty() && b.len()<=65535)
+        .filter(|b| b.len()<=65535)
+}
+
+/// Only nonempty bytes can enter the link parser; empty commands do not start authentication.
+pub fn command_bytes(command: &Value) -> Option<&[u8]> {
+    command_data(command).filter(|b| !b.is_empty())
 }
 
 pub fn receive_bytes(id: u64, data: &[u8], source: &str) -> bool {
@@ -123,7 +129,7 @@ async fn run_control_ingress(
             Ok(v)=>v,
             Err(_)=>{ if invalid<3 {crate::emit_log(&format!("WIFI-IAP#{id}: control command malformed; payload omitted"));} invalid+=1; continue; },
         };
-        if let Some(data)=command_bytes(&command) { deliver(data); }
+        if let Some(data)=command_data(&command) { if !data.is_empty() { deliver(data); } }
         else if command.get("type").and_then(Value::as_str)==Some("iAPSendMessage") {
             if invalid<3 {crate::emit_log(&format!("WIFI-IAP#{id}: control iAP data missing/oversized"));} invalid+=1;
         } else {

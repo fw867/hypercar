@@ -36,6 +36,7 @@ pub struct AirplayParams {
     pub airplay_port: u16,
     /// 本机真实蓝牙 MAC（WinPlay 等接收端按 SETUP deviceID 过滤，占位值必 403）。
     pub device_id: String,
+    pub wifi_mac_address: Option<String>,
     pub device_name: String,
     pub identity_path: String,
     pub receiver_id: Option<String>,
@@ -295,7 +296,7 @@ pub async fn negotiate(
     // CatPlay bootstrap: 会话 SETUP → /info → 事件通道/保活 → 资源声明 → 屏幕流。
     let timing = TimingServer::start_with_pipeline(p.pipeline.clone()).map_err(|e| format!("计时服务启动失败: {e}"))?;
     let (root, session_info, hevc_proposed) = setup_and_read_info(
-        &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap, p.id9_screen_bootstrap, mbux_media_compat, p.id9_disable_buffered_audio, p.bmw_capabilities, p.video_codec == "hevc", Some(&mut cleanup),
+        &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap, p.id9_screen_bootstrap, mbux_media_compat, p.id9_disable_buffered_audio, p.bmw_capabilities, p.video_codec == "hevc", Some(&mut cleanup), p.wifi_mac_address.as_deref(),
     ).await?;
     info = session_info;
     let hevc_allowed=negotiated_hevc(hevc_proposed,&root);
@@ -658,6 +659,38 @@ mod shutdown_tests {
         (RtspChannel::spawn(r, w, None).0, peer)
     }
     #[tokio::test]
+    async fn wifi_station_mac_is_scoped_to_real_bmw_and_invalid_addresses_fall_back() {
+        for (bmw,mbux,id9,model,mac,expected) in [
+            (true,false,false,"MGU",Some("06:12:34:56:78:90"),"06:12:34:56:78:90"),
+            (false,false,false,"MGU",Some("06:12:34:56:78:90"),"phone"),
+            (true,true,false,"MGU",Some("06:12:34:56:78:90"),"phone"),
+            (true,false,true,"MGU",Some("06:12:34:56:78:90"),"phone"),
+            (true,false,false,"DiPlay",Some("06:12:34:56:78:90"),"phone"),
+            (true,false,false,"MGU",Some("02:00:00:00:00:00"),"phone"),
+            (true,false,false,"MGU",Some("ff:ff:ff:ff:ff:ff"),"phone"),
+            (true,false,false,"MGU",Some("not-a-mac"),"phone"),
+            (true,false,false,"MGU",None,"phone"),
+        ] {
+            let (control,mut peer)=pair().await;
+            let server=tokio::spawn(async move {
+                let setup=read_request(&mut peer).await;
+                assert!(setup.first_line.starts_with("SETUP "));
+                let value=bplist::parse(&setup.body).unwrap();
+                assert_eq!(value.get("deviceID").and_then(Value::as_str),Some("phone"));
+                assert_eq!(value.get("macAddress").and_then(Value::as_str),Some(expected));
+                for request in [Some(setup),None] {
+                    let request=match request {Some(v)=>v,None=>read_request(&mut peer).await};
+                    let body=bplist::encode(&Value::dict(vec![]));
+                    peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: {}\r\n\r\n",request.cseq().unwrap(),body.len()).as_bytes()).await.unwrap();
+                    peer.write_all(&body).await.unwrap();
+                }
+            });
+            setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![("model",Value::str(model))]),mbux,id9,false,false,bmw,false,None,mac).await.unwrap();
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn common_session_uri_initialization_is_profile_independent_and_fresh_per_connection() {
         let mut targets=std::collections::HashSet::new();
         for _ in 0..3 {
@@ -712,7 +745,7 @@ mod shutdown_tests {
             let body=bplist::encode(&Value::dict(vec![("model",Value::str("test"))]));
             peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: {}\r\n\r\n",info.cseq().unwrap(),body.len()).as_bytes()).await.unwrap();peer.write_all(&body).await.unwrap();
         });
-        let result=setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,false,true,true,None).await;
+        let result=setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,false,true,true,None,None).await;
         assert!(result.is_ok(),"{result:?}");assert!(!result.unwrap().2);server.await.unwrap();
     }
     #[tokio::test]
@@ -724,7 +757,7 @@ mod shutdown_tests {
                 peer.write_all(format!("RTSP/1.0 {status} Denied\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",request.cseq().unwrap()).as_bytes()).await.unwrap();
                 assert!(tokio::time::timeout(Duration::from_millis(50),peer.read(&mut [0u8;1])).await.is_err());
             });
-            assert!(setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,false,true,true,None).await.is_err());
+            assert!(setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,false,true,true,None,None).await.is_err());
             server.await.unwrap();
         }
     }
@@ -788,7 +821,7 @@ mod shutdown_tests {
         let c=control.clone();
         let task=tokio::spawn(async move {
             let mut cleanup=crate::negotiation_cleanup::NegotiationCleanup::new(c.clone(),true);
-            let result=setup_and_read_info(&c,"phone","name",1234,true,Value::dict(vec![]),false,true,false,false,false,false,Some(&mut cleanup)).await;
+            let result=setup_and_read_info(&c,"phone","name",1234,true,Value::dict(vec![]),false,true,false,false,false,false,Some(&mut cleanup),None).await;
             cleanup.finish().await;result
         });
         let setup=read_request(&mut peer).await;assert!(setup.first_line.starts_with("SETUP "));
@@ -1268,6 +1301,8 @@ mod display_size_tests {
                         1 => {
                             assert_eq!(request.first_line, "SETUP /setup RTSP/1.0");
                             let body=bplist::parse(&request.body).unwrap();
+                            assert_eq!(body.get("deviceID").and_then(Value::as_str), Some("84:AE:DE:56:D3:76"));
+                            assert_eq!(body.get("macAddress").and_then(Value::as_str), Some("06:12:34:56:78:90"));
                             let features=body.get("features").unwrap().as_array().unwrap();
                             for absent in ["hevc","mainBuffered","sessionManagement","logTransfer","vehicleStateProtocol"] {
                                 assert!(!features.iter().any(|f|f.as_str()==Some(absent)));
@@ -1305,7 +1340,7 @@ mod display_size_tests {
         let (read, write) = socket.into_split();
         let (channel, _) = RtspChannel::spawn(read, write, None);
         crate::auth_setup::run(&channel).await.unwrap();
-        let (_, info, _) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", "Test phone", 12345, true, Value::dict(vec![]), false, false, false, false, true, false, None).await.unwrap();
+        let (_, info, _) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", "Test phone", 12345, true, Value::dict(vec![]), false, false, false, false, true, false, None, Some("06:12:34:56:78:90")).await.unwrap();
         let display = &info.get("displays").unwrap().as_array().unwrap()[0];
         assert_eq!(uuid_text(display.get("uuid")).as_deref(), Some("actual-bmw-display"));
         assert_eq!(read_display_size(display), (2560, 744));
@@ -1596,12 +1631,29 @@ pub(crate) async fn record_session(channel: &Arc<RtspChannel>) -> Result<(), Str
     Ok(())
 }
 
+fn valid_station_mac(value: &str) -> Option<String> {
+    let parts=value.split(':').collect::<Vec<_>>();
+    if parts.len()!=6 || parts.iter().any(|part|part.len()!=2 || !part.bytes().all(|b|b.is_ascii_hexdigit())) { return None; }
+    let first=u8::from_str_radix(parts[0],16).ok()?;
+    let normalized=value.to_ascii_lowercase();
+    if first&1!=0 || normalized=="00:00:00:00:00:00" || normalized=="02:00:00:00:00:00" { return None; }
+    Some(normalized)
+}
+
 async fn setup_and_read_info(
-    channel: &Arc<RtspChannel>, device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool, id9: bool, media_compat: bool, id9_unbuffered: bool, bmw: bool, prefer_hevc: bool, cleanup: Option<&mut crate::negotiation_cleanup::NegotiationCleanup>,
+    channel: &Arc<RtspChannel>, device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool, id9: bool, media_compat: bool, id9_unbuffered: bool, bmw: bool, prefer_hevc: bool, cleanup: Option<&mut crate::negotiation_cleanup::NegotiationCleanup>, network_mac: Option<&str>,
 ) -> Result<(Value, Value, bool), String> {
     emit_log(&format!("AIRPLAY: session device name={device_name}"));
     let mut request = bplist::parse(&build_session_setup(device_id, device_name, timing_port, encrypted, mbux, id9, media_compat, id9_unbuffered)).map_err(|e|e.to_string())?;
     if let Value::Dict(fields) = &mut request {
+        if bmw && !id9 && !mbux && use_box_bootstrap(true, &previous_info) {
+            if let Some(mac) = network_mac.and_then(valid_station_mac) {
+                if let Some((_,value)) = fields.iter_mut().find(|(key,_)|key.as_str()==Some("macAddress")) {
+                    *value = Value::str(&mac);
+                }
+                emit_log("SESSION-IDENTITY: SETUP macAddress uses verified Wi-Fi station; deviceID unchanged");
+            }
+        }
         if let Some((_,features))=fields.iter_mut().find(|(key,_)|key.as_str()==Some("features")) {
             *features=Value::array(video_session_features(mbux,id9,media_compat,id9_unbuffered,bmw,prefer_hevc));
         }
@@ -1964,7 +2016,13 @@ fn spawn_event_dispatcher(
                 "iAPSendMessage" => {
                     if let Some(data)=crate::wifi_iap2::command_bytes(&command) {
                         crate::wifi_iap2::receive_bytes(wifi_iap_id, data, "event");
-                    } else { emit_log("WIFI-IAP: missing/oversized params.data"); }
+                    } else if crate::wifi_iap2::command_data(&command).is_none() {
+                        emit_log("WIFI-IAP: missing/oversized params.data");
+                    }
+                }
+                kind if crate::rtsp::is_box_observation_command(kind) => {
+                    // Match the box's observation-only branches. In particular stopUI
+                    // is not a request to tear down video/Wi-Fi or change resource ownership.
                 }
                 "changeModes" => {
                     // Already applied synchronously while building the request's status+params reply.

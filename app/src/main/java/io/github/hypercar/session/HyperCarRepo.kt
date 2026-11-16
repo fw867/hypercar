@@ -152,7 +152,11 @@ object HyperCarRepo {
                 kotlinx.coroutines.currentCoroutineContext().ensureActive()
                 if (!sessionLive.get() || connectionAttemptId != attempt || sessionSockets !== sockets)
                     throw CancellationException("旧核心启动结果已失效")
-                val json = io.github.hypercar.navigation.CarWithNavigation.prepareConfig(configure())
+                val config = org.json.JSONObject(configure())
+                val stationMac = wifiStationSnapshot?.takeIf { it.first == attempt && it.second == sockets.network }?.third
+                if (stationMac != null) config.put("wifi_mac_address", stationMac)
+                log("SESSION-IDENTITY: wifi_station_mac=${stationMac != null} device_identity_preserved=true")
+                val json = io.github.hypercar.navigation.CarWithNavigation.prepareConfig(config.toString())
                 val videoGeneration = videoCapabilityGeneration.incrementAndGet()
                 SettingsStore.videoCapabilities.begin(videoGeneration)
                 RustCoreBridge.setListener(object : RustCoreBridge.EventListener by rustListener {
@@ -300,6 +304,7 @@ object HyperCarRepo {
     @Volatile private var wifiReceiverMac: String? = null
     @Volatile private var sessionReceiverMac: String? = null
     @Volatile private var sessionWifiSsid: String? = null
+    @Volatile private var wifiStationSnapshot: Triple<Long, Network, String>? = null
     private var wifiReconnectMonitor: ConnectivityManager.NetworkCallback? = null
     private var wifiReconnectCheck: Job? = null
     private var sessionNetworkMonitor: ConnectivityManager.NetworkCallback? = null
@@ -1862,10 +1867,28 @@ object HyperCarRepo {
         sessionReceiverMac = null
         sessionIdentity = null
         sessionWifiSsid = null
+        wifiStationSnapshot = null
         appContext()?.let { io.github.hypercar.carui.MusicNotificationListener.sync(it) }
     }
 
     // ---------------------------------------------------------------- WiFi
+
+    private suspend fun wifiStationMac(context: Context, network: Network): String? {
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return null
+        val caps = cm.getNetworkCapabilities(network) ?: return null
+        if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return null
+        val info = caps.transportInfo as? android.net.wifi.WifiInfo
+        io.github.hypercar.net.WifiStationIdentity.normalize(info?.macAddress)?.let { return it }
+        if (!ShizukuTools.isReady) return null
+        val addresses = cm.getLinkProperties(network)?.linkAddresses?.mapNotNull { it.address.hostAddress }?.toSet().orEmpty()
+        if (addresses.isEmpty()) return null
+        // exec drains stdout before its process wait, so bound the child itself as well.
+        val result = ShizukuTools.exec("timeout 2 cmd wifi status", 3_000)
+        kotlinx.coroutines.currentCoroutineContext().ensureActive()
+        if (cm.getNetworkCapabilities(network)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) != true ||
+            cm.getLinkProperties(network)?.linkAddresses?.mapNotNull { it.address.hostAddress }?.toSet() != addresses) return null
+        return io.github.hypercar.net.WifiStationIdentity.fromStatus(result.out, addresses)
+    }
 
     /** Match this paired Bluetooth peer's fresh AP information before asking Wi-Fi to act. */
     private suspend fun matchingPairedCarNetwork(context: Context, endpoint: CarPlayEndpoint): Network? {
@@ -1979,8 +2002,27 @@ object HyperCarRepo {
         latestDeviceIdentifier: () -> String? = { endpoint.deviceIdentifier }): Network? {
         val attempt = connectionAttemptId
         carWifiRequests.lock()
-        try { return joinAndBindLocked(context, endpoint, latestDeviceIdentifier, attempt) }
+        val network = try { joinAndBindLocked(context, endpoint, latestDeviceIdentifier, attempt) }
         finally { carWifiRequests.unlock() }
+        // Resolve before opening the control TCP socket; optional shell metadata must not
+        // delay the first SETUP on an already accepted receiver connection.
+        if (network != null && headUnitProfile.id == "bmw_id85" &&
+            wifiStationSnapshot?.let { it.first == attempt && it.second == network } != true) {
+            val mac = try { wifiStationMac(context, network) }
+            catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) {
+                log("SESSION-IDENTITY: Wi-Fi 地址未取得，沿用设备身份：${error.javaClass.simpleName}")
+                null
+            }
+            autoConnectChanges.lock()
+            try {
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                if (!sessionLive.get() || connectionAttemptId != attempt || boundNetwork != network)
+                    throw CancellationException("旧网络身份结果已失效")
+                wifiStationSnapshot = mac?.let { Triple(attempt, network, it) }
+            } finally { autoConnectChanges.unlock() }
+        }
+        return network
     }
 
     private suspend fun joinAndBindLocked(context: Context, endpoint: CarPlayEndpoint,
