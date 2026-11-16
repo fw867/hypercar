@@ -526,6 +526,63 @@ mod tests {
         assert!(authenticated && frames>=60);
         println!("CarWith verified: {frames} decrypted frames across {:?}",began.elapsed());
     }
+
+    /// Source-only timing probe: no car connection, saved video, or injected user input.
+    #[tokio::test]
+    #[ignore = "requires a real Xiaomi phone; launch CarWith after probe start"]
+    async fn live_carwith_startup_timing() {
+        struct Timeline(std::time::Instant);
+        impl log::Log for Timeline {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool { true }
+            fn log(&self, record: &log::Record<'_>) {
+                let line=record.args().to_string();
+                if line.starts_with("CARWITH-HS:") || line.starts_with("CARWITH-SIZE:") {
+                    println!("SOURCE-PROBE +{}ms {line}",self.0.elapsed().as_millis());
+                }
+            }
+            fn flush(&self) {}
+        }
+        let began=std::time::Instant::now();
+        let logger=Box::leak(Box::new(Timeline(began)));
+        if log::set_logger(logger).is_ok() {log::set_max_level(log::LevelFilter::Info);}
+        let epoch=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        println!("SOURCE-PROBE start_epoch_ms={epoch}");
+        let stop=Arc::new(Notify::new());
+        let mut config=cfg();config.width=2736;config.height=800;
+        let (_hub,mut events)=CarLifeHub::connect(config,"127.0.0.1".into(),stop.clone(),None).unwrap();
+        let mut authenticated=false;
+        let mut frames=0;
+        let mut first_idr=None;
+        let result=tokio::time::timeout(Duration::from_secs(25),async {
+            while let Some(event)=events.recv().await {
+                let (data,codec)=match event {
+                    CarLifeEvent::SourceReset=>{println!("SOURCE-PROBE +{}ms all_channels_event",began.elapsed().as_millis());continue;},
+                    CarLifeEvent::EncoderResolution{width,height}=>{println!("SOURCE-PROBE +{}ms encoder={width}x{height}",began.elapsed().as_millis());continue;},
+                    CarLifeEvent::Handshake=>{authenticated=true;println!("SOURCE-PROBE +{}ms proof_admission_encryption_complete_video_START_written",began.elapsed().as_millis());continue;},
+                    CarLifeEvent::VideoFrame{data,..}=>(data,crate::video_format::VideoCodec::H264),
+                    CarLifeEvent::VideoFrameTagged{data,codec,..}=>(data,codec),
+                    _=>continue,
+                };
+                frames+=1;
+                let types:Vec<_>=crate::screen::annexb_nals(&data).iter().map(|nal|match codec {
+                    crate::video_format::VideoCodec::H264=>nal[0]&31,
+                    crate::video_format::VideoCodec::Hevc=>crate::hevc::nal_type(nal).unwrap_or(255),
+                }).collect();
+                if frames==1 {println!("SOURCE-PROBE +{}ms first_AU codec={codec:?} bytes={} types={types:?}",began.elapsed().as_millis(),data.len());}
+                if first_idr.is_none() && types.iter().any(|&kind|match codec {
+                    crate::video_format::VideoCodec::H264=>kind==5,
+                    crate::video_format::VideoCodec::Hevc=>matches!(kind,19..=21),
+                }) {
+                    first_idr=Some(began.elapsed().as_millis());
+                    println!("SOURCE-PROBE +{}ms first_IDR codec={codec:?}",first_idr.unwrap());
+                }
+                if authenticated && first_idr.is_some() && frames>=20 && began.elapsed()>=Duration::from_secs(3) {break;}
+            }
+        }).await;
+        stop.notify_waiters();
+        println!("SOURCE-PROBE finished elapsed_ms={} authenticated={authenticated} frames={frames} first_idr_ms={first_idr:?}",began.elapsed().as_millis());
+        assert!(result.is_ok() && authenticated && first_idr.is_some() && frames>=20,"CarWith source did not become ready within probe budget");
+    }
 }
 
 #[cfg(test)]

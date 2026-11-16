@@ -13,6 +13,30 @@ pub(crate) struct ResourceStream {
 }
 
 impl ScreenSession {
+    /// Match the MGU box's post-handoff initial Take, without replaying a receiver decision.
+    /// The caller has completed RECORD/resources but has not activated screen reconciliation.
+    pub async fn claim_box_startup_screen(&self, modes: &Arc<Mutex<Modes>>, revision: u64) -> Result<(), String> {
+        if !self.params.bmw_capabilities || !self.params.bmw_box_bootstrap || self.software_receiver ||
+            self.params.id9_screen_bootstrap || self.params.nbt_audio_first || self.params.mbux_screen_bootstrap ||
+            self.activated.load(Ordering::Acquire) { return Ok(()); }
+        let (previous, claim_revision, declaration) = {
+            let mut m = modes.lock();
+            let previous = m.clone();
+            if m.screen_generation() != revision || !m.claim_startup_screen() { return Ok(()); }
+            self.owned.store(false,Ordering::Release);
+            (previous,m.screen_generation(),m.declaration())
+        };
+        let result = self.control.request("POST","/command",&declaration,
+            "application/x-apple-binary-plist",&[],Duration::from_secs(5)).await
+            .and_then(|response|crate::resource_trace::validate_ack("BMW STARTUP_SCREEN_CLAIM",&response));
+        // Event commands may have changed ownership while the claim was in flight.
+        let mut m = modes.lock();
+        if result.is_err() { m.restore_startup_screen(&previous,claim_revision); }
+        self.owned.store(m.screen_owned(),Ordering::Release);
+        self.params.pipeline.lock().screen_owned = Some(m.screen_owned());
+        crate::emit_log(&format!("BMW-MGU: startup screen declaration accepted={} {}; latest receiver changes retained",result.is_ok(),m.diagnostics()));
+        result
+    }
     /// MBUX opens the screen TCP endpoint before RECORD, but never exposes it to the pump
     /// until RECORD succeeds. Event callbacks may arbitrate while this serialized bootstrap runs.
     pub async fn bootstrap_before_record(&self, modes: &Arc<Mutex<Modes>>) -> Result<(), String> {
@@ -351,6 +375,101 @@ mod tests {
                 assert_eq!(exit.get("streams").unwrap().as_array().unwrap()[1].get("type").and_then(Value::as_int),Some(102));
             }
             let mut byte=[0];assert!(tokio::time::timeout(Duration::from_millis(30),f.car.read(&mut byte)).await.is_err());
+        }
+    }
+    fn startup_screen_modes(constraint: i64) -> Modes {
+        let info=Value::dict(vec![("modes",Value::dict(vec![("initialPermanentEntity",Value::array(vec![
+            Value::dict(vec![("resourceID",Value::int(1)),("permanentEntity",Value::int(2)),
+                ("takeConstraint",Value::int(constraint)),("borrowConstraint",Value::int(100))]),
+        ]))]))]);
+        Modes::from_info(&info,true,true)
+    }
+    #[tokio::test]
+    async fn box_startup_claim_unblocks_500_only_after_its_ack_and_preserves_newer_owner() {
+        for receiver_changes in [false,true] {
+            let mut f=Fixture::new(startup_screen_modes(500)).await;
+            f.session.activated.store(false,Ordering::Release);
+            let revision=f.modes.lock().screen_generation();
+            let session=f.session.clone(); let modes=f.modes.clone();
+            let task=tokio::spawn(async move {session.claim_box_startup_screen(&modes,revision).await});
+            let request=tokio::time::timeout(Duration::from_millis(500),read(&mut f.car)).await
+                .expect("BMW startup must publish a constrained screen claim instead of waiting indefinitely");
+            assert!(request.first_line.starts_with("POST /command "));
+            let body=bplist::parse(&request.body).unwrap();
+            assert_eq!(body.get("type").and_then(Value::as_str),Some("modesChanged"));
+            let resources=body.get("params").unwrap().get("resources").unwrap().as_array().unwrap();
+            assert_eq!(resources[0].get("entity").and_then(Value::as_int),Some(1));
+            assert_eq!(resources[1].get("entity").and_then(Value::as_int),Some(1));
+            assert!(!f.session.activated.load(Ordering::Acquire));
+            assert!(!f.session.owned.load(Ordering::Acquire),"no screen gate before claim ACK");
+            assert!(tokio::time::timeout(Duration::from_millis(30),f.video.accept()).await.is_err());
+            if receiver_changes {f.update(|m|borrow(m,1000));}
+            reply(&mut f.car,&request,200,&bplist::encode(&Value::dict(vec![("status",Value::int(0))]))).await;
+            task.await.unwrap().unwrap();
+            assert_eq!(f.modes.lock().screen_owned(),!receiver_changes);
+            assert_eq!(f.session.owned.load(Ordering::Acquire),!receiver_changes);
+            let latest=f.modes.lock().screen_generation();
+            f.session.claim_box_startup_screen(&f.modes,latest).await.unwrap();
+            assert!(tokio::time::timeout(Duration::from_millis(30),read(&mut f.car)).await.is_err());
+        }
+    }
+    #[tokio::test]
+    async fn box_startup_claim_respects_never_borrows_revision_and_profile_exclusions() {
+        for case in 0..8 {
+            let mut f=Fixture::new(startup_screen_modes(if case==0 {1000}else{500})).await;
+            let mut revision=f.modes.lock().screen_generation();
+            if case==1 {f.update(|m|m.request_ui()); f.update(|m|borrow(m,1000)); revision=f.modes.lock().screen_generation();}
+            if case==2 {f.update(|m|m.request_ui()); f.update(|m|borrow(m,100));}
+            let session=Arc::get_mut(&mut f.session).unwrap();
+            session.activated.store(false,Ordering::Release);
+            if case==3 {session.params.id9_screen_bootstrap=true;}
+            if case==4 {session.params.nbt_audio_first=true;}
+            if case==5 {session.software_receiver=true;}
+            if case==6 {session.params.bmw_box_bootstrap=false;}
+            if case==7 {session.params.mbux_screen_bootstrap=true;}
+            let before=f.modes.lock().snapshot();
+            f.session.claim_box_startup_screen(&f.modes,revision).await.unwrap();
+            assert_eq!(f.modes.lock().snapshot(),before,"case {case}");
+            assert!(tokio::time::timeout(Duration::from_millis(30),read(&mut f.car)).await.is_err(),"case {case}");
+        }
+    }
+    #[tokio::test]
+    async fn box_startup_claim_rejection_cannot_open_a_video_socket() {
+        let mut f=Fixture::new(startup_screen_modes(500)).await;
+        f.session.activated.store(false,Ordering::Release);
+        let revision=f.modes.lock().screen_generation();
+        let session=f.session.clone();let modes=f.modes.clone();
+        let task=tokio::spawn(async move {session.claim_box_startup_screen(&modes,revision).await});
+        let request=tokio::time::timeout(Duration::from_millis(500),read(&mut f.car)).await.unwrap();
+        reply(&mut f.car,&request,200,&bplist::encode(&Value::dict(vec![("status",Value::int(1))]))).await;
+        assert!(task.await.unwrap().unwrap_err().contains("business rejection"));
+        assert!(!f.modes.lock().screen_owned(),"rejected startup claim restores earlier screen owner");
+        assert!(!f.session.owned.load(Ordering::Acquire));
+        assert!(!f.session.activated.load(Ordering::Acquire));
+        assert!(tokio::time::timeout(Duration::from_millis(30),f.video.accept()).await.is_err());
+    }
+    #[tokio::test]
+    async fn box_startup_claim_rejection_preserves_concurrent_screen_and_audio_changes() {
+        for screen_change in [false,true] {
+            let mut f=Fixture::new(startup_screen_modes(500)).await;
+            f.session.activated.store(false,Ordering::Release);
+            let revision=f.modes.lock().screen_generation();
+            let session=f.session.clone();let modes=f.modes.clone();
+            let task=tokio::spawn(async move {session.claim_box_startup_screen(&modes,revision).await});
+            let request=tokio::time::timeout(Duration::from_millis(500),read(&mut f.car)).await.unwrap();
+            if screen_change {f.update(|m|borrow(m,1000));}
+            else {f.update(|m|assert!(m.change(&Value::dict(vec![("resources",Value::array(vec![Value::dict(vec![
+                ("resourceID",Value::int(2)),("transferType",Value::int(1)),
+                ("transferPriority",Value::int(500)),("takeConstraint",Value::int(100)),("borrowConstraint",Value::int(100)),
+            ])]))]))));}
+            let after_receiver=f.modes.lock().snapshot();
+            reply(&mut f.car,&request,400,&[]).await;
+            assert!(task.await.unwrap().is_err());
+            let modes=f.modes.lock();
+            if screen_change {assert_eq!(modes.snapshot(),after_receiver);}
+            else {assert!(!modes.audio_owned());}
+            assert!(!modes.screen_owned());
+            assert!(!f.session.owned.load(Ordering::Acquire));
         }
     }
     fn enable_id9(f: &mut Fixture) {

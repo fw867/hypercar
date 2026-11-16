@@ -1274,6 +1274,28 @@ object HyperCarRepo {
         var discoveryJob: Job? = null
         try {
             if (!precheckDegradedMode(context)) return
+            // Prepare the CarLife listener while Bluetooth/Wi-Fi negotiation is still in
+            // progress. Waiting for RECORD/video TCP makes the first source dial fail;
+            // am start returning does not mean the seven source channels are ready.
+            if (sessionCarWithMode) {
+                sessionUiJob?.cancel()
+                sessionUiJob = scope.launch {
+                    fun current() = sessionLive.get() && connectionAttemptId == diagnosticId
+                    if (!current()) return@launch
+                    try {
+                        CarUiCaster.releaseForCarWith()
+                        kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                        if (!current()) return@launch
+                        log("CARWITH: 提前准备源端入口 attempt=$diagnosticId")
+                        val result = launchCarWith(context)
+                        if (current()) log("CARWITH: $result")
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        if (current()) log("CARWITH: 源端准备失败：${error.message}")
+                    }
+                }
+            }
             // Shizuku 从「必须」降级为「可选增强」：没有它照样能连，只是两条路径降级——
             //  WiFi 走 WifiNetworkSpecifier（热点首连弹一次系统确认框）+ deviceID 用稳定伪 MAC。
             if (!ShizukuTools.isReady) {
@@ -1647,8 +1669,12 @@ object HyperCarRepo {
                 // Stop only the failed media engine. Keep the same identity, Wi-Fi lease,
                 // RFCOMM session and ctrl listener/port alive for the receiver's next invite.
                 streaming = false
-                sessionUiJob?.cancel()
-                sessionUiJob = null
+                // CarWith preparation belongs to the connection attempt, not this
+                // activation. A new invitation in this attempt still needs that source.
+                if (!sessionCarWithMode) {
+                    sessionUiJob?.cancel()
+                    sessionUiJob = null
+                }
                 CarUiCaster.stopAsync()
                 MusicBridge.onCarDisconnected()
                 // A failed VW activation must wait for another invitation, not reuse the
@@ -1909,6 +1935,7 @@ object HyperCarRepo {
         val actualPeerIdentity = iap2?.activePeerAddress?.let { io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(it) }
             .orEmpty().lowercase()
         val desktopPeer = actualPeerIdentity.contains("winplay") || actualPeerIdentity.contains("diplay")
+        val invitation = if (endpoint.fromInvite) ctrlAdvertiser?.let(::usableCtrlInvitation) else null
         val eligible = networks.filter { network ->
             val caps = cm.getNetworkCapabilities(network)
             val lp = cm.getLinkProperties(network)
@@ -1920,7 +1947,15 @@ object HyperCarRepo {
             } == true
             val route = lp?.routes?.any { r -> r.destination.prefixLength > 0 && peers.any { r.destination.contains(it) } } == true
             val pinnedSame = network == joinedNetwork && !joinedSsid.isNullOrBlank() && joinedSsid == endpoint.ssid
-            val safe = io.github.hypercar.net.CarWifiPolicy.canReuse(caps, verifiedRequest = pinnedSame)
+            // A known car can invite us before Bluetooth sends 0x5703. INTERNET without
+            // VALIDATED is normal on that car AP; it is not evidence that Wi-Fi is absent.
+            val invitedSame = io.github.hypercar.net.CarWifiPolicy.canReuseInvitedCar(
+                knownCar = wifiReceiverMac != null && knownWifiReceiver(ssid).equals(wifiReceiverMac, true),
+                sameNetwork = network == boundNetwork && invitation?.network == network,
+                peerMatches = invitation != null && endpoint.ipAddresses.contains(invitation.host),
+                announcedSsid = endpoint.ssid, currentSsid = ssid,
+                hasAddress = hasAddress, routeToPeer = route)
+            val safe = io.github.hypercar.net.CarWifiPolicy.canReuse(caps, verifiedRequest = pinnedSame || invitedSame)
             val identity = io.github.hypercar.net.CarWifiPolicy.canReuseDesktop(desktopPeer, endpoint.ssid, ssid, hasAddress,
                     caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true) ||
                 io.github.hypercar.net.CarNetworkReuse.accepts(endpoint.ssid, null, endpoint.fromInvite,
@@ -1928,7 +1963,7 @@ object HyperCarRepo {
                         hasAddress, route, network == boundNetwork || network == joinedNetwork))
             if (explain) {
                 val actual = io.github.hypercar.net.CarNetworkReuse.mac(info?.bssid) ?: io.github.hypercar.net.CarNetworkReuse.mac(fallbackBssid)
-                log("WIFI-VERIFY: safe=$safe identity=$identity ssid_match=${!endpoint.ssid.isNullOrBlank() && endpoint.ssid == ssid} " +
+                log("WIFI-VERIFY: safe=$safe identity=$identity invited_car=$invitedSame ssid_match=${!endpoint.ssid.isNullOrBlank() && endpoint.ssid == ssid} " +
                     "receiver_id_is_ap=false bssid_known=${actual != null} " +
                     "address=$hasAddress route_to_peer=$route ipv6=${lp?.linkAddresses?.any { it.address is java.net.Inet6Address } == true} " +
                     "internet=${caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true} " +
@@ -2667,24 +2702,15 @@ object HyperCarRepo {
                             sinceMillis = System.currentTimeMillis(),
                         ),
                     )
-                    // P1：AirPlay RECORD 完成 → 接管屏幕流。
-                    // 两种来源（2026-11-03 设置里可切）：
-                    //  · car_ui  —— 我们自绘车机首页（默认）
-                    //  · carwith —— 拉起小米 CarWith 的 CarLife 入口，由它建显示/编码，
-                    //               我们只做 CarLife 通道 → AirPlay 的转发（Rust 引擎会主动拨 7240）
+                    // CarWith was prepared before Bluetooth/Wi-Fi negotiation. Do not
+                    // launch it again here: an existing CarLife handshake may be active.
+                    // The self-drawn source still starts when the receiver is connected.
                     val ctx = appContext()
-                    if (ctx != null) {
+                    if (ctx != null && !sessionCarWithMode) {
                         sessionUiJob?.cancel()
                         sessionUiJob = scope.launch {
                             fun current() = sessionLive.get() && streaming && connectionAttemptId == diagnosticId
                             if (!current()) return@launch
-                            if (sessionCarWithMode) {
-                                CarUiCaster.releaseForCarWith()
-                                if (!current()) return@launch
-                                val r = launchCarWith(ctx)
-                                log("CARWITH: $r")
-                                return@launch
-                            }
                             val result = runCatching { CarUiCaster.start(ctx, ::current) }
                                 .getOrElse { "启动失败: ${it.javaClass.simpleName}: ${it.message}" }
                             log("CARUI: $result")

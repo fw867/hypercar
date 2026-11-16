@@ -364,6 +364,25 @@ impl Modes {
             self.resources[0].current, self.resources[0].permanent, self.resources[1].current, self.resources[1].permanent));
     }
 
+    /// Box 0x28cb8 -> 0x7d034 requests screen Take at priority 500 after session start.
+    /// A 100-only bootstrap cannot acquire BMW's user-initiated initial screen constraint.
+    pub(crate) fn claim_startup_screen(&mut self) -> bool {
+        if self.screen_owned() { return false; }
+        let before = self.resources[0];
+        let accepted = self.resources[0].take_by(1, USER_INITIATED, USER_INITIATED, ANYTIME);
+        let changed = self.resources[0] != before;
+        if changed { self.revision = self.revision.wrapping_add(1); }
+        crate::emit_log(&format!("MODES: box startup screen claim accepted={accepted} changed={changed} {}; receiver display unconfirmed",self.diagnostics()));
+        changed
+    }
+
+    pub(crate) fn restore_startup_screen(&mut self, previous: &Self, revision: u64) {
+        if self.revision == revision {
+            self.resources[0] = previous.resources[0];
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
 
     pub fn can_restore_screen(&self,revision:u64) -> bool { self.revision==revision && self.screen_owned() }
 }

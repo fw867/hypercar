@@ -461,7 +461,10 @@ pub async fn negotiate(
     keepalive.1 = Some(wifi_iap);
     keepalive.2 = Some(timing);
     // BMW box activates the session before resource negotiation and video SETUP.
-    let declaration = modes.lock().declaration();
+    let (declaration, initial_screen_revision) = {
+        let m = modes.lock();
+        (m.declaration(),m.screen_generation())
+    };
     emit_log(&format!("TIMING: before RECORD {}",p.pipeline.lock().timing.summary()));
     let plan = if nbt_mode { nbt_audio_candidates(&info, &p.audio_codec) }
         else { audio_candidates(&info, &p.audio_codec, p.id9_screen_bootstrap || mbux_media_compat) };
@@ -501,6 +504,9 @@ pub async fn negotiate(
             }
             Some(Err(error)) => emit_log(&format!("HANDOFF: disableBluetooth failed: {error}; no automatic resend")),
             None => return Err("交接请求取消或会话代次已失效".into()),
+        }
+        if let Err(error) = screen_session.claim_box_startup_screen(&modes,initial_screen_revision).await {
+            emit_log(&format!("BMW-MGU: startup screen claim failed: {error}; preserve control/audio and wait for receiver UI"));
         }
     }
 

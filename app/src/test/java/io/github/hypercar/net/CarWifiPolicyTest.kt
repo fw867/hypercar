@@ -4,6 +4,22 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CarWifiPolicyTest {
+    @Test fun invitationBeforeBluetoothCredentialsReusesKnownCarWithoutInternetValidation() {
+        val verified = CarWifiPolicy.canReuseInvitedCar(true, true, true, null, "car", true, true)
+        assertTrue(verified)
+        assertTrue(CarWifiPolicy.safe(internet = true, validated = false, verifiedRequest = verified))
+        assertTrue(CarWifiPolicy.canReuseInvitedCar(true, true, true, "car", "car", true, true))
+    }
+
+    @Test fun invitationCannotAuthorizeOtherNetworksOrOverrideDifferentHotspotInformation() {
+        assertFalse(CarWifiPolicy.canReuseInvitedCar(false, true, true, null, "home", true, true))
+        assertFalse(CarWifiPolicy.canReuseInvitedCar(true, false, true, null, "car", true, true))
+        assertFalse(CarWifiPolicy.canReuseInvitedCar(true, true, false, null, "car", true, true))
+        assertFalse(CarWifiPolicy.canReuseInvitedCar(true, true, true, "other", "car", true, true))
+        assertFalse(CarWifiPolicy.canReuseInvitedCar(true, true, true, null, null, true, true))
+        assertFalse(CarWifiPolicy.canReuseInvitedCar(true, true, true, null, "car", false, true))
+        assertFalse(CarWifiPolicy.canReuseInvitedCar(true, true, true, null, "car", true, false))
+    }
     @Test fun pairedCarsFreshHotspotMatchesCurrentAssociationWithoutRejoining() {
         assertTrue(CarWifiPolicy.samePairedHotspot(true, true, "car", "car"))
         assertFalse(CarWifiPolicy.samePairedHotspot(true, true, "car", "home"))
