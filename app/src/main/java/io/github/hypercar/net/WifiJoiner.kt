@@ -10,7 +10,6 @@ import android.net.wifi.WifiNetworkSpecifier
 import android.os.SystemClock
 import android.util.Log
 import io.github.hypercar.shizuku.ShizukuTools
-import io.github.hypercar.shizuku.shellQuote
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -20,7 +19,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 /** Local-only Wi-Fi request owned by HyperCar. Never save/connect a system-wide internet network.
- * Shizuku may enable Wi-Fi, migrate an old system connection and select this app's matching request.
+ * Shizuku may enable Wi-Fi and select this app's matching request.
  * The NetworkCallback stays alive for the complete CarPlay session. */
 class WifiJoiner(
     private val context: Context,
@@ -50,12 +49,11 @@ class WifiJoiner(
         context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
     /** 当前持有的网络回调（join 时注册，供 onLost 使用）。 */
-    private val callback = AtomicReference<ConnectivityManager.NetworkCallback?>(null)
+    private val association = WifiRequestAssociation<ConnectivityManager.NetworkCallback, Network>()
 
     /** 当前已绑定的网络（bindProcess 记录，供快路径与 onLost 解绑）。 */
     private val boundNetwork = AtomicReference<Network?>(null)
     @Volatile private var requestIdentity: CarWifiRequestIdentity? = null
-    private val requestedNetwork = AtomicReference<Network?>(null)
     private val selectionOwner = android.os.Binder()
     private val selectionToken = AtomicReference<String?>(null)
 
@@ -63,7 +61,7 @@ class WifiJoiner(
     private val bindLock = Any()
 
     /** 当前绑定网络；未绑定返回 null。 */
-    val currentNetwork: Network? get() = boundNetwork.get()
+    val currentNetwork: Network? get() = association.network() ?: boundNetwork.get()
 
     /**
      * 最近一次静默入网失败的原因（人话，供会话层写进导出日志）。
@@ -101,22 +99,29 @@ class WifiJoiner(
             lastFailureReason = "热点密码不足 8 位，无法按 WPA2 入网"
             return JoinResult.Unsupported
         }
-        // 清掉旧回调/旧绑定，干净起步
-        release()
+        val existing = currentNetwork
+        if (existing != null && ownsLiveRequest(existing) && !requiresDifferentHotspot(ssid)) {
+            if (ready(existing)) return JoinResult.Joined(existing)
+            lastFailureReason = "已连接同一车机热点，等待网络属性或地址就绪；不重复入网"
+            return JoinResult.Failed
+        }
+        if (!canRequestHotspot(ssid, psk)) {
+            lastFailureReason = "热点名称或密码无法构造有效入网请求；保留现有连接"
+            return JoinResult.Unsupported
+        }
         val blocked = SpecifierPermissions.degradeBlockReason(context)
         if (blocked != null) {
             lastFailureReason = blocked
             return JoinResult.Failed
         }
+        // Only a deliberate different-SSID request can replace an available association.
+        release()
         if (ShizukuTools.isReady) withContext(Dispatchers.IO) {
             val shell = io.github.hypercar.spike.SpikeShell.connect(context)
             Log.i(TAG, "local-only shell: $shell")
             if (!isWifiEnabled()) ShizukuTools.exec("cmd wifi set-wifi-enabled enabled")
-            // Only the current matching car connection may be migrated. Never disconnect another AP.
-            val apk = shellQuote(context.applicationInfo.sourceDir)
-            val migration = ShizukuTools.exec("CLASSPATH=$apk /system/bin/app_process /system/bin " +
-                "io.github.hypercar.spike.ShellCarWifi ${shellQuote(ssid)}", 5_000)
-            Log.i(TAG, "local-only migration: ${migration.out.takeLast(400)} ${migration.err.takeLast(160)}")
+            // Never tear down a same-car system association or persistently disable its
+            // autojoin before a replacement request has even succeeded.
         }
         Log.i(TAG, "申请 HyperCar 专用局域网；不保存系统热点，不接管其它 App 默认网络")
         // Scan hints help ROMs that abandon SSID-only scans. They are optional evidence,
@@ -158,7 +163,7 @@ class WifiJoiner(
                 }
                 // 开放网络：Builder 没有 setOpenNetwork()，不设任何密码方法即为开放；
                 // WPA2 只有 setWpa2Passphrase 一条路径。
-                if (psk.isNotBlank()) setWpa2Passphrase(psk)
+                if (psk.isNotEmpty()) setWpa2Passphrase(psk)
             }.build()
 
             // app 专属网络：只能加 TRANSPORT_WIFI + specifier，
@@ -172,9 +177,9 @@ class WifiJoiner(
             val network = awaitSpecifierHandle(request, ssid, hint, SPECIFIER_WAIT_MS, verifiedFallback)
                 ?: return@withContext JoinResult.Failed
             val caps = connectivityManager.getNetworkCapabilities(network)
-            if (!CarWifiPolicy.canReuse(caps)) {
-                release()
-                lastFailureReason = "系统返回了未验证的互联网 Wi-Fi，拒绝作为车机局域网使用"
+            if (!CarWifiPolicy.canReuse(caps, ownsLiveRequest(network))) {
+                cancelPendingRegistration()
+                lastFailureReason = "系统网络属性尚未就绪，保留已建立的车机热点连接"
                 return@withContext JoinResult.Failed
             }
             Log.i(TAG, "LOCAL-ONLY network=$network internet=${caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)} " +
@@ -193,37 +198,34 @@ class WifiJoiner(
         val started = SystemClock.elapsedRealtime()
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                if (callback.get() !== this) return
+                if (!association.available(this, network)) return
                 result.set(network)
-                requestedNetwork.set(network)
                 diagnose("callback=available elapsed_ms=${SystemClock.elapsedRealtime() - started}; verifying capabilities/address")
                 latch.countDown()
             }
 
             override fun onUnavailable() {
-                if (callback.get() !== this) return
+                if (!association.unavailable(this)) return
                 unavailable.set(true)
-                requestedNetwork.set(null)
                 diagnose("callback=unavailable elapsed_ms=${SystemClock.elapsedRealtime() - started}; live network verification required")
                 latch.countDown()
             }
 
             override fun onLost(network: Network) {
-                if (callback.get() !== this) return
+                if (association.owner() !== this) return
                 result.compareAndSet(network, null)
-                requestedNetwork.compareAndSet(network, null)
                 diagnose("callback=lost bound=${boundNetwork.get() == network}")
                 handleNetworkLost(this, network)
             }
         }
-        callback.set(cb)
+        association.register(cb)
         diagnose("request timeout_ms=$timeoutMs exact_ap=${hint != null}; no SSID/password/address logged")
         try {
             // 系统确认框和关联/DHCP 共用这一个超时窗口，不是单独计时。
             // （该重载的 timeout 参数是 Int，需从 Long 转换）
             connectivityManager.requestNetwork(request, cb, timeoutMs.toInt())
         } catch (t: Throwable) {
-            callback.compareAndSet(cb, null)
+            cancelPendingRegistration(cb)
             lastFailureReason = "requestNetwork 抛异常：${t.javaClass.simpleName}: ${t.message}"
             Log.i(TAG, "specifier requestNetwork 失败：${t.message}")
             return null
@@ -236,7 +238,7 @@ class WifiJoiner(
                 val selected = io.github.hypercar.spike.SpikeShell.startWifiSelection(
                     selectionOwner, token, ssid, hint?.bssid.orEmpty(), android.os.Process.myUid())
                 Log.i(TAG, "local-only selection: $selected")
-                if (callback.get() !== cb || selectionToken.get() != token)
+                if (association.owner() !== cb || selectionToken.get() != token)
                     io.github.hypercar.spike.SpikeShell.stopWifiSelection(token)
             }
             while (SystemClock.uptimeMillis() < deadline) {
@@ -248,7 +250,7 @@ class WifiJoiner(
             // existing SSID/BSSID/address/route and local-only capability checks.
             val remaining = (timeoutMs - (SystemClock.elapsedRealtime() - started)).coerceIn(0L, 3_000L)
             val verified = VerifiedWifiWait.await(remaining, SystemClock::elapsedRealtime,
-                current = { callback.get() === cb }, probe = {
+                current = { association.owner() === cb }, probe = {
                     result.get()?.takeIf { ready(it) } ?: verifiedFallback()?.takeIf { ready(it) }
                 })
             if (verified != null) {
@@ -256,23 +258,24 @@ class WifiJoiner(
                 return verified
             }
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            if (callback.compareAndSet(cb, null)) {
-                runCatching { connectivityManager.unregisterNetworkCallback(cb) }
-            }
+            // Cancelling CarPlay must not withdraw a Wi-Fi association already supplied by
+            // the system. The session owner parks that request until actual network loss.
+            cancelPendingRegistration(cb)
             throw cancelled
         } catch (error: Exception) {
-            release()
+            cancelPendingRegistration(cb)
             lastFailureReason = "入网状态复核异常：${error.javaClass.simpleName}"
             diagnose("verification exception=${error.javaClass.simpleName}")
             return null
         } finally {
             stopSelection()
         }
-        val network = result.get()
+        val network = association.network() ?: result.get()
         if (network == null || !ready(network)) {
             diagnose("verified=false candidate=${network != null} ${readiness(network)}")
-            // 未拿到句柄（含用户拒绝/超时）：注销回调，别泄漏
-            release()
+            // No association: release a pending request. An associated AP without a ready
+            // address belongs to the Wi-Fi lifetime, rather than this failed CarPlay attempt.
+            cancelPendingRegistration(cb)
             lastFailureReason = if (network != null) "系统已返回 Wi-Fi 网络，但地址或局域网能力未就绪；请确认系统中的车机 Wi-Fi 连接状态" else SpecifierJoinFailure.describe(
                 elapsedMs = SystemClock.elapsedRealtime() - started,
                 timeoutMs = timeoutMs,
@@ -285,7 +288,7 @@ class WifiJoiner(
     }
 
     private fun ready(network: Network): Boolean =
-        CarWifiPolicy.canReuse(connectivityManager.getNetworkCapabilities(network)) &&
+        CarWifiPolicy.canReuse(connectivityManager.getNetworkCapabilities(network), ownsLiveRequest(network)) &&
             connectivityManager.getLinkProperties(network)?.linkAddresses?.any {
                 !it.address.isAnyLocalAddress && !it.address.isLoopbackAddress && !it.address.isMulticastAddress &&
                     (it.address is java.net.Inet6Address || !it.address.isLinkLocalAddress)
@@ -306,14 +309,33 @@ class WifiJoiner(
      */
     fun ownsBinding(network: Network): Boolean = boundNetwork.get() == network
 
+    fun ownsLiveRequest(network: Network): Boolean = association.owns(network)
+
+    fun requiresDifferentHotspot(ssid: String?): Boolean = requestIdentity?.requiresDifferentHotspot(ssid) == true
+
+    fun isReady(network: Network): Boolean = ready(network)
+
+    private fun cancelPendingRegistration(owner: ConnectivityManager.NetworkCallback? = association.owner()) {
+        owner ?: return
+        association.cancelPending(owner)?.let { runCatching { connectivityManager.unregisterNetworkCallback(it) } }
+    }
+
+    /** Drop only the process route; the request must survive a short protocol recovery. */
+    fun unbindProcess() = synchronized(bindLock) {
+        val network = boundNetwork.get()
+        if (network != null && connectivityManager.boundNetworkForProcess == network) {
+            connectivityManager.bindProcessToNetwork(null)
+        }
+    }
+
     /** An available callback for these exact credentials proves ownership even if SSID is redacted. */
     fun ownsHotspot(network: Network, ssid: String?, passphrase: String?): Boolean =
-        callback.get() != null && requestedNetwork.get() == network &&
+        association.owns(network) &&
             requestIdentity?.matches(ssid, passphrase) == true
 
     fun bindProcess(network: Network): Boolean = synchronized(bindLock) {
         if (boundNetwork.get() == network && connectivityManager.boundNetworkForProcess == network) return true // 快路径：已绑同一网络
-        if (!CarWifiPolicy.canReuse(connectivityManager.getNetworkCapabilities(network))) {
+        if (!CarWifiPolicy.canReuse(connectivityManager.getNetworkCapabilities(network), ownsLiveRequest(network))) {
             Log.w(TAG, "拒绝复用未验证的系统互联网 Wi-Fi；必须通过局域网请求连接")
             return false
         }
@@ -324,14 +346,12 @@ class WifiJoiner(
 
     private fun handleNetworkLost(owner: ConnectivityManager.NetworkCallback, network: Network) {
         val notify = synchronized(bindLock) {
-            if (callback.get() !== owner || boundNetwork.get() != network) false
-            else {
-                boundNetwork.set(null)
-                if (connectivityManager.boundNetworkForProcess == network) {
-                    connectivityManager.bindProcessToNetwork(null)
-                }
-                true
+            val lost = association.lost(owner, network, boundFallback = boundNetwork.get() == network)
+            boundNetwork.compareAndSet(network, null)
+            if (connectivityManager.boundNetworkForProcess == network) {
+                connectivityManager.bindProcessToNetwork(null)
             }
+            lost
         }
         if (notify) lostCallback()
     }
@@ -339,9 +359,9 @@ class WifiJoiner(
     /** Release only this instance's process binding and callback. */
     fun release() = synchronized(bindLock) {
         requestIdentity = null
-        requestedNetwork.set(null)
+        val previousCallback = association.release()
         stopSelection()
-        callback.getAndSet(null)?.let {
+        previousCallback?.let {
             runCatching { connectivityManager.unregisterNetworkCallback(it) }
         }
         val previous = boundNetwork.getAndSet(null)
@@ -357,6 +377,16 @@ class WifiJoiner(
     }
 
     internal companion object {
+        fun canRequestHotspot(ssid: String?, passphrase: String?): Boolean {
+            if (ssid.isNullOrBlank() || passphrase == null) return false
+            return try {
+                WifiNetworkSpecifier.Builder().apply {
+                    setSsid(ssid)
+                    if (passphrase.isNotEmpty()) setWpa2Passphrase(passphrase)
+                }.build()
+                true
+            } catch (_: IllegalArgumentException) { false }
+        }
         internal fun isUnsupportedPassphrase(psk: String): Boolean = psk.isNotEmpty() && psk.length < 8
         const val TAG = "WifiJoiner"
 

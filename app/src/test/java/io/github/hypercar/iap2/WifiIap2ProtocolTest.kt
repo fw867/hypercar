@@ -210,8 +210,7 @@ class WifiIap2ProtocolTest {
     @Test fun earlyHudSubscriptionWaitsForAuthenticationAndRealSource() {
         val car = Car()
         car.ready { assertTrue(car.message(0x5200, Iap2Csm.u16(0, 77)).isEmpty()) }
-        val idle = car.authenticationOutput.single { it.messageId == 0x5201 }
-        assertArrayEquals(byteArrayOf(0), Iap2Csm.parseParams(idle.body).first { it.id == 1 }.value)
+        assertTrue(car.authenticationOutput.none { it.messageId in listOf(0x5201, 0x5202) })
         car.time += 1000
         car.navigationAllowed = true
         car.navigationCue = io.github.hypercar.navigation.NavigationCue("右转", 2, 100)

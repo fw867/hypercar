@@ -513,8 +513,10 @@ async fn reader_loop(
                     } else {
                         // iAP output intentionally does not await RTSP replies; still expose rejection.
                         unsolicited_responses += 1;
-                        if msg.status() != 200 || unsolicited_responses <= 16 {
-                            crate::emit_log(&format!("RTSP#{trace_id} async RX CSeq={c} status={} body={}B", msg.status(), msg.body.len()));
+                        let business_status = crate::bplist::parse(&msg.body).ok()
+                            .and_then(|v| v.get("status").and_then(crate::bplist::Value::as_int));
+                        if msg.status() != 200 || business_status.is_some_and(|s|s != 0) || unsolicited_responses <= 128 {
+                            crate::emit_log(&format!("RTSP#{trace_id} async RX CSeq={c} status={} business_status={business_status:?} body={}B; link ACK separate", msg.status(), msg.body.len()));
                         }
                     }
                 }

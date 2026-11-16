@@ -23,9 +23,7 @@ class RouteGuidanceSessionTest {
         val s = RouteGuidanceSession {}
         assertTrue(s.updates(0, true, cue).isEmpty())
         s.handle(start(42))
-        val idle = s.updates(1, false, cue).single()
-        assertEquals(0x5201,idle.messageId)
-        assertArrayEquals(byteArrayOf(0),fields(idle)[1])
+        assertTrue(s.updates(1, false, cue).isEmpty())
         assertTrue(s.updates(2000,false,cue).isEmpty())
     }
     @Test fun realComponentAndManeuverBeforeReference() {
@@ -81,11 +79,30 @@ class RouteGuidanceSessionTest {
         assertFalse(fields(frames[1]).containsKey(7)) // segment total is NOT route remaining distance
     }
 
-    @Test fun idleSourceStillSupportsGuidanceInsteadOfAdvertisingItAsUnsupported() {
+    @Test fun subscriptionWithoutSourceWaitsWithoutInventingInitialGuidance() {
         val s = RouteGuidanceSession {}; s.handle(start(42))
-        val idle = fields(s.updates(0, true, null).single())
-        assertArrayEquals(byteArrayOf(0), idle[1])
-        assertArrayEquals(byteArrayOf(1), idle[0x14])
-        assertArrayEquals(byteArrayOf(0), fields(s.updates(1000, false, null).single())[0x14])
+        assertTrue(s.updates(0, true, null).isEmpty())
+        assertTrue(s.updates(1000, false, null).isEmpty())
+        assertTrue(s.updates(2000, false, cue).isEmpty())
+        val active = s.updates(2001, true, cue)
+        assertEquals(listOf(0x5202, 0x5201), active.map { it.messageId })
+        assertArrayEquals(byteArrayOf(1), fields(active.last())[0x14])
+        val clear = s.updates(4000, false, null).single()
+        assertArrayEquals(byteArrayOf(0), fields(clear)[1])
+        assertTrue(s.updates(6000, false, null).isEmpty())
+    }
+
+    @Test fun newComponentDoesNotInheritAnotherComponentsPendingClearOrClearedState() {
+        val s = RouteGuidanceSession {}; s.handle(start(42)); s.updates(0, true, cue)
+        s.handle(start(43))
+        val clear = s.updates(1000, true, null)
+        assertEquals(1, clear.size)
+        assertArrayEquals(byteArrayOf(0,42), fields(clear.single())[0])
+        s.handle(start(44))
+        assertTrue(s.updates(2000, true, null).isEmpty())
+        s.handle(Iap2Csm.Frame(0x5203,Iap2Csm.u16(0,42)))
+        s.handle(start(42))
+        assertTrue(s.updates(3000, true, null).isEmpty())
+        assertEquals(6, s.updates(4000, true, cue).size)
     }
 }

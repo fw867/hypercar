@@ -147,6 +147,15 @@ pub fn spawn_control_ingress(
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+// Link/CSM headers only: never expose certificate, challenge, media text or GPS payloads.
+fn frame_diagnostic(data: &[u8]) -> String {
+    if data.len() < 9 || data[..2] != [0xff, 0x5a] { return "link=detect_or_unparsed".into(); }
+    let csm = if data[4] & 0x80 == 0 && data[7] != 0 && data.len() >= 15 && data[9..11] == [0x40, 0x40] {
+        format!("0x{:04x}", u16::from_be_bytes([data[13],data[14]]))
+    } else { "none".into() };
+    format!("seq={} ack={} session={} csm={csm}",data[5],data[6],data[7])
+}
 enum Outbound { Frame(Vec<u8>), Ready(u64) }
 static OUTPUT: Lazy<Mutex<Option<(u64, mpsc::Sender<Outbound>)>>> = Lazy::new(|| Mutex::new(None));
 
@@ -170,6 +179,7 @@ impl WifiIap2 {
         *HANDOFF.lock() = Handoff { id, ..Handoff::default() };
         let task = tokio::spawn(async move {
             let mut sent = 0u64;
+            let mut last_written = String::from("none");
             loop {
                 let data = tokio::select! {
                     _ = stop.notified() => break,
@@ -180,6 +190,7 @@ impl WifiIap2 {
                     Outbound::Ready(token) => { ready_written(id,token); continue; }
                 };
                 let frame_bytes = data.len();
+                let metadata = frame_diagnostic(&data);
                 let body = bplist::encode(&Value::dict(vec![
                     ("type", Value::str("iAPSendMessage")),
                     ("params", Value::dict(vec![("data", Value::Data(data))])),
@@ -191,7 +202,8 @@ impl WifiIap2 {
                 )).await {
                     Ok(Ok(cseq)) => {
                         sent += 1;
-                        if sent <= 16 || sent % 50 == 0 { crate::emit_log(&format!("WIFI-IAP#{id}: control POST written CSeq={cseq} frameBytes={frame_bytes} count={sent}")); }
+                        last_written = format!("CSeq={cseq} {metadata}");
+                        if sent <= 128 || sent % 50 == 0 { crate::emit_log(&format!("WIFI-IAP#{id}: control POST written {last_written} frameBytes={frame_bytes} count={sent}; RTSP reply and link ACK separate")); }
                     }
                     other => {
                         crate::emit_log(&format!("WIFI-IAP#{id}: control transport failed {}", match other {
@@ -202,6 +214,7 @@ impl WifiIap2 {
                     }
                 }
             }
+            crate::emit_log(&format!("WIFI-IAP#{id}: writer ended written_frames={sent} output_pending={} last_written=[{last_written}]; queue acceptance is not socket write or peer acceptance",rx.len()));
             {
                 let mut current = OUTPUT.lock();
                 if current.as_ref().map(|(active, _)| *active) == Some(id) { *current = None; }
@@ -229,6 +242,15 @@ impl Drop for WifiIap2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn frame_diagnostics_include_only_link_and_message_headers() {
+        let mut frame = vec![0xff,0x5a,0,23,0x40,117,146,1,0,0x40,0x40,0,14,0x50,1];
+        frame.extend_from_slice(b"private!");
+        assert_eq!(frame_diagnostic(&frame),"seq=117 ack=146 session=1 csm=0x5001");
+        frame[9]=0;
+        assert_eq!(frame_diagnostic(&frame),"seq=117 ack=146 session=1 csm=none");
+        assert_eq!(frame_diagnostic(&[0xff,0x55,2,0,0xee,0x10]),"link=detect_or_unparsed");
+    }
     fn incoming(data: Vec<u8>) -> crate::rtsp::RtspMessage {
         crate::rtsp::RtspMessage { first_line:"POST /command RTSP/1.0".into(),headers:Default::default(),body:data }
     }

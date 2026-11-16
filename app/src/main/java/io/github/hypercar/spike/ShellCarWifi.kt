@@ -5,11 +5,10 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.AttributionSource
 import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
 import android.os.Looper
 
-/** Shell-only migration of the currently connected car AP. No credentials leave WifiService. */
+/** Shell-attributed managers used by the app-owned, reversible Wi-Fi selection lease. */
 object ShellCarWifi {
     internal fun managers(): Pair<WifiManager, ConnectivityManager> {
         if (Looper.myLooper() == null) Looper.prepare()
@@ -47,51 +46,4 @@ object ShellCarWifi {
         return wifi to cm
     }
 
-    @JvmStatic fun main(args: Array<String>) {
-        var phase = "context"
-        try {
-            check(android.os.Process.myUid() == 2000) { "shell UID required" }
-            val ssid = args.singleOrNull()?.takeIf { it.isNotBlank() } ?: error("SSID required")
-            val (wifi, cm) = managers()
-            val allowAutojoin = WifiManager::class.java.getMethod("allowAutojoin",
-                Int::class.javaPrimitiveType, Boolean::class.javaPrimitiveType)
-            if (ssid == "--probe") {
-                println("OK shell Wi-Fi context and per-network autojoin API available; read-only probe"); return
-            }
-            val info = wifi.connectionInfo
-            phase = "current-network"
-            if (info.ssid.trim('"') != ssid || info.networkId < 0) {
-                println("SKIP current Wi-Fi is not the requested car AP"); return
-            }
-            // A validated internet AP (e.g. WinPlay on home Wi-Fi) must remain untouched.
-            if (cm.allNetworks.any { network ->
-                val caps = cm.getNetworkCapabilities(network)
-                caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true &&
-                    caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
-            }) { println("SKIP validated internet Wi-Fi"); return }
-            val id = info.networkId
-            phase = "saved-config"
-            val config = wifi.configuredNetworks?.singleOrNull { it.networkId == id && it.SSID.trim('"') == ssid }
-            if (config == null) { println("SKIP not a saved system Wi-Fi connection"); return }
-            if (runCatching { config.javaClass.getField("fromWifiNetworkSpecifier").getBoolean(config) }.getOrDefault(false)) {
-                println("SKIP already a local-only specifier connection"); return
-            }
-            phase = "autojoin"
-            allowAutojoin.invoke(wifi, id, false)
-            val latest = wifi.connectionInfo
-            if (latest.networkId != id || latest.ssid.trim('"') != ssid) {
-                println("OK car autojoin disabled; current Wi-Fi changed, no disconnect"); return
-            }
-            phase = "disconnect"
-            check(wifi.disconnect()) { "disconnect request rejected" }
-            println("OK old car system Wi-Fi disconnected; autojoin disabled only for network=$id; use local-only request")
-        } catch (e: SecurityException) {
-            println("ERR migration phase=$phase SecurityException: ${e.message?.take(220)}")
-            kotlin.system.exitProcess(1)
-        } catch (e: Exception) {
-            val cause = e.cause ?: e
-            println("ERR migration phase=$phase ${cause.javaClass.simpleName}: ${cause.message?.take(220)}")
-            kotlin.system.exitProcess(1)
-        }
-    }
 }

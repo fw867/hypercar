@@ -187,6 +187,13 @@ impl ScreenSender {
         }
     }
 
+    pub fn transport_diagnostics(&self) -> String {
+        self.sample_tcp();
+        self.tcp_diagnostics.as_ref().and_then(|(pipeline,id)|
+            pipeline.lock().video_tcp.as_ref().filter(|s|s.connection_id==*id).map(|s|s.summary()))
+            .unwrap_or_else(||"TCP diagnostics unavailable".into())
+    }
+
     /// Actual source size (also used by engine to detect encoder changes).
     pub fn size(&self) -> (u32, u32) {
         (self.width as u32, self.height as u32)

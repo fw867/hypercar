@@ -914,14 +914,17 @@ pub(crate) async fn video_pump(
                             pts_us
                         };
                         let written=if resource_lifecycle {
-                            tokio::time::timeout(Duration::from_secs(2),s.send_video_annexb(&data,pts)).await
-                                .unwrap_or_else(|_|Err(std::io::Error::new(std::io::ErrorKind::TimedOut,"video TCP write timeout")))
+                            let connection = video_pipeline.lock().video_tcp.as_ref().map(|s|s.connection_id);
+                            crate::screen_write::with_progress(s.send_video_annexb(&data,pts), ||
+                                video_pipeline.lock().video_tcp.as_ref()
+                                    .filter(|s|Some(s.connection_id)==connection).and_then(|s|s.acked_bytes)).await
                         } else { s.send_video_annexb(&data,pts).await };
                         if let Err(error) = written {
-                            emit_log(&format!("VIDEO: write failed: {error}; {}", s.diagnostics()));
+                            emit_log(&format!("VIDEO: write failed: {error}; {}; tcp_at_failure=[{}]", s.diagnostics(),s.transport_diagnostics()));
                             video_pipeline.lock().video_stream="FAILED".into();
                             if resource_lifecycle {
                                 drop(sender.take());
+                                video_pipeline.lock().video_tcp=None;
                                 emit_log("SCREEN-LIFECYCLE: video write failed; keep audio/control, await next allowed requestUI");
                                 continue;
                             }
@@ -950,14 +953,17 @@ pub(crate) async fn video_pump(
                 // 屏幕流 keepAlive 帧（明文、1s 节流；缺它 Audi MMI 3315 10.2s 拆轮）
                 if let Some(s) = sender.as_mut() {
                     let written=if resource_lifecycle {
-                        tokio::time::timeout(Duration::from_secs(2),s.maybe_send_keep_alive()).await
-                            .unwrap_or_else(|_|Err(std::io::Error::new(std::io::ErrorKind::TimedOut,"video keepAlive write timeout")))
+                        let connection = video_pipeline.lock().video_tcp.as_ref().map(|s|s.connection_id);
+                        crate::screen_write::with_progress(s.maybe_send_keep_alive(), ||
+                            video_pipeline.lock().video_tcp.as_ref()
+                                .filter(|s|Some(s.connection_id)==connection).and_then(|s|s.acked_bytes)).await
                     } else { s.maybe_send_keep_alive().await };
                     if let Err(error) = written {
-                        emit_log(&format!("VIDEO: keepAlive failed: {error}; {}", s.diagnostics()));
+                        emit_log(&format!("VIDEO: keepAlive failed: {error}; {}; tcp_at_failure=[{}]", s.diagnostics(),s.transport_diagnostics()));
                         video_pipeline.lock().video_stream="FAILED".into();
                         if resource_lifecycle {
                             drop(sender.take());
+                            video_pipeline.lock().video_tcp=None;
                             emit_log("SCREEN-LIFECYCLE: video keepAlive failed; preserve other channels");
                             continue;
                         }

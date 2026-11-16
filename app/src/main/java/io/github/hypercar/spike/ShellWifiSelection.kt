@@ -84,13 +84,10 @@ internal class ShellWifiSelection {
                                 current = {
                                     val info = wifi.connectionInfo
                                     val name = info.ssid.trim('"')
-                                    val internet = connectivity.allNetworks.any { network ->
-                                        val caps = connectivity.getNetworkCapabilities(network)
-                                        caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) == true &&
-                                            caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-                                            caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-                                    }
-                                    if (!internet || name.contains("unknown", true)) null else
+                                    // The current AP's internet validation says nothing about
+                                    // whether a requested car hotspot needs a handoff. Never
+                                    // disconnect an already matching car AP, even if setup stalls.
+                                    if (name == ssid || name.contains("unknown", true)) null else
                                         WifiHandoffLease.currentSavedNetwork(info.networkId, name,
                                             savedNetworks().filter {
                                                 it.networkId == info.networkId && it.SSID?.trim('"') == name

@@ -4,6 +4,16 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CarWifiPolicyTest {
+    @Test fun pairedCarsFreshHotspotMatchesCurrentAssociationWithoutRejoining() {
+        assertTrue(CarWifiPolicy.samePairedHotspot(true, true, "car", "car"))
+        assertFalse(CarWifiPolicy.samePairedHotspot(true, true, "car", "home"))
+        assertFalse(CarWifiPolicy.samePairedHotspot(false, true, "car", "car"))
+        assertFalse(CarWifiPolicy.samePairedHotspot(true, false, "car", "car"))
+        assertFalse(CarWifiPolicy.samePairedHotspot(true, true, "car", null))
+        assertFalse(CarWifiPolicy.samePairedHotspot(true, true, "", ""))
+        assertTrue(CarWifiPolicy.safe(internet = true, validated = false, verifiedRequest = true))
+        assertFalse(CarWifiPolicy.safe(internet = true, validated = false, verifiedRequest = false))
+    }
     @Test fun unvalidatedSystemInternetApCannotBypassLocalOnlyJoin() {
         assertFalse(CarWifiPolicy.safe(internet = true, validated = false))
         assertTrue(CarWifiPolicy.safe(internet = false, validated = false))

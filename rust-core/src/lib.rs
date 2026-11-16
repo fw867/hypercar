@@ -34,6 +34,7 @@ mod rtsp;
 mod resource_trace;
 mod rtsp_uri;
 mod screen;
+mod screen_write;
 mod h264;
 mod video_transcode;
 mod hevc;

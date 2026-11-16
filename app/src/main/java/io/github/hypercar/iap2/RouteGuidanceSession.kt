@@ -8,6 +8,7 @@ internal class RouteGuidanceSession(private val log: (String) -> Unit) {
     private val subscribers = linkedMapOf<Int, Subscription>()
     private var previous: NavigationCue? = null
     private var published = false
+    private val publishedComponents = mutableSetOf<Int>()
     private var previousEnabled = false
     private var nextUpdate = 0L
     private var dirty = false
@@ -26,6 +27,7 @@ internal class RouteGuidanceSession(private val log: (String) -> Unit) {
         val component = params.first { it.id == 0 }.value.let { ((it[0].toInt() and 255) shl 8) or (it[1].toInt() and 255) }
         if (frame.messageId == 0x5203) {
             subscribers.remove(component)
+            publishedComponents.remove(component)
             log("HUD: unsubscribe component=$component")
         } else {
             if (component !in subscribers && subscribers.size >= 4) return true
@@ -51,12 +53,16 @@ internal class RouteGuidanceSession(private val log: (String) -> Unit) {
             diagnostic = status
             log("HUD: status=$status subscribers=${subscribers.size}; source readiness is separate from vehicle subscription and display")
         }
-        if (subscribers.isEmpty()) { published = false; previous = null; return emptyList() }
+        if (subscribers.isEmpty()) { published = false; previous = null; publishedComponents.clear(); return emptyList() }
         val current = cue.takeIf { enabled }
+        // Box 0x6317c..0x6323c stores the subscription without inventing an initial
+        // navigation state. Still clear a route once when a previously published source ends.
+        if (current == null && publishedComponents.isEmpty()) return emptyList()
         // When scope/source disappears send one no-route update to clear the old arrow.
         if (now < nextUpdate || (!dirty && published && current == previous && enabled == previousEnabled)) return emptyList()
         val frames = mutableListOf<Iap2Csm.Frame>()
         for ((component, subscription) in subscribers) {
+            if (current == null && component !in publishedComponents) continue
             val hasManeuver = current?.state == 1 && current.maneuver != null
             if (hasManeuver) {
                 frames += Iap2Csm.Frame(0x5202, concat(
@@ -72,11 +78,12 @@ internal class RouteGuidanceSession(private val log: (String) -> Unit) {
             if (subscription.source) fields += Iap2Csm.string(0x13, current?.sourceName ?: "HyperCar")
             if (subscription.support) fields += Iap2Csm.u8(0x14, if (enabled) 1 else 0)
             frames += Iap2Csm.Frame(0x5201, concat(*fields.toTypedArray()))
+            if (current == null) publishedComponents.remove(component) else publishedComponents.add(component)
         }
         log("HUD: QUEUED components=${subscribers.keys} state=${current?.state ?: 0} maneuver=${current?.maneuver} frames=${frames.size}; awaiting vehicle display validation")
         previous = current
         previousEnabled = enabled
-        published = true
+        published = current != null
         dirty = false
         nextUpdate = now + 1000
         return frames
