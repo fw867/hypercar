@@ -1,0 +1,249 @@
+//! Source lifetime and bounded pre-roll are independent of AirPlay engine lifetime.
+use std::{collections::VecDeque, sync::Arc, time::{Duration, Instant}};
+use parking_lot::Mutex;
+use once_cell::sync::Lazy;
+use tokio::sync::{mpsc, Notify};
+use crate::{engine::{CarLifeEvent, EngineConfig}, carlife::{CarLifeConfig, CarLifeHub}, video_format::VideoCodec};
+
+const MAX_GOP_BYTES: usize = 4 * 1024 * 1024;
+const MAX_GOP_FRAMES: usize = 180;
+const MAX_GOP_AGE: Duration = Duration::from_secs(2);
+
+#[derive(Default)]
+struct Feed {
+    target: Option<mpsc::UnboundedSender<CarLifeEvent>>,
+    parameters: Vec<(u8, CarLifeEvent)>,
+    gop: VecDeque<CarLifeEvent>, bytes: usize, since: Option<Instant>,
+    codec: Option<VideoCodec>, size: Option<(u32,u32)>,
+    formats: [Option<CarLifeEvent>;3], handshake: bool,
+    #[cfg(test)]
+    frames: u64,
+}
+impl Feed {
+    fn clear_video(&mut self) {self.gop.clear(); self.bytes=0; self.since=None;}
+    fn receive(&mut self, event: CarLifeEvent) {
+        match &event {
+            CarLifeEvent::SourceReset => {
+                self.clear_video(); self.parameters.clear(); self.codec=None;
+                self.size=None; self.formats=[None,None,None]; self.handshake=false;
+            }
+            CarLifeEvent::Handshake => self.handshake=true,
+            CarLifeEvent::EncoderResolution{width,height} => {
+                if self.size.is_some_and(|old|old!=(*width,*height)) {
+                    self.clear_video(); self.parameters.clear();
+                }
+                self.size=Some((*width,*height));
+            }
+            CarLifeEvent::AudioInit{tts,..} => self.formats[*tts as usize]=Some(event.clone()),
+            CarLifeEvent::VoiceAudioInit{..} => self.formats[2]=Some(event.clone()),
+            CarLifeEvent::AudioStop{tts} => self.formats[*tts as usize]=None,
+            CarLifeEvent::VoiceAudioStop => self.formats[2]=None,
+            CarLifeEvent::ClientLeft{video:true} => {self.clear_video(); self.handshake=false;}
+            _=>{}
+        }
+        let frame=match &event {
+            CarLifeEvent::VideoFrame{pts_us,data}=>Some((*pts_us,data,VideoCodec::H264)),
+            CarLifeEvent::VideoFrameTagged{pts_us,data,codec}=>Some((*pts_us,data,*codec)), _=>None,
+        };
+        if let Some((pts_us,data,codec))=frame {
+            #[cfg(test)] {self.frames+=1;}
+            if self.codec!=Some(codec) {self.clear_video();self.parameters.clear();self.codec=Some(codec);}
+            let mut idr=false;
+            for nal in crate::screen::annexb_nals(data) {
+                let kind=match codec {VideoCodec::H264=>nal[0]&31, VideoCodec::Hevc=>crate::hevc::nal_type(nal).unwrap_or(255)};
+                idr |= match codec {VideoCodec::H264=>kind==5, VideoCodec::Hevc=>matches!(kind,19..=21)};
+                let parameter=match codec {VideoCodec::H264=>matches!(kind,7|8), VideoCodec::Hevc=>matches!(kind,32..=34)};
+                if parameter && nal.len()<=16*1024 {
+                    let mut bytes=vec![0,0,0,1];bytes.extend_from_slice(nal);
+                    let config=match codec {VideoCodec::H264=>CarLifeEvent::VideoFrame{pts_us,data:bytes},
+                        VideoCodec::Hevc=>CarLifeEvent::VideoFrameTagged{pts_us,data:bytes,codec}};
+                    let data_of=|event:&CarLifeEvent| match event {
+                        CarLifeEvent::VideoFrame{data,..}|CarLifeEvent::VideoFrameTagged{data,..}=>data.clone(),_=>Vec::new()
+                    };
+                    if self.parameters.iter().any(|(old,event)|*old==kind && data_of(event)!=data_of(&config)) {self.clear_video();}
+                    self.parameters.retain(|(old,_)|*old!=kind); self.parameters.push((kind,config));
+                }
+            }
+            if idr {self.clear_video();self.since=Some(Instant::now());}
+            if self.since.is_some() {
+                self.bytes=self.bytes.saturating_add(data.len());
+                self.gop.push_back(event.clone());
+                if self.bytes>MAX_GOP_BYTES || self.gop.len()>MAX_GOP_FRAMES || self.since.unwrap().elapsed()>MAX_GOP_AGE {
+                    self.clear_video();
+                }
+            }
+        }
+        // Always drain the source. With no engine, PCM/video is never queued unboundedly.
+        if self.target.as_ref().is_some_and(|tx|tx.send(event).is_err()) {self.target=None;}
+    }
+    fn attach(&mut self)->mpsc::UnboundedReceiver<CarLifeEvent> {
+        let (tx,rx)=mpsc::unbounded_channel();
+        let _=tx.send(CarLifeEvent::SourceReset);
+        if self.handshake {let _=tx.send(CarLifeEvent::Handshake);}
+        for format in self.formats.iter().flatten() {let _=tx.send(format.clone());}
+        self.target=Some(tx); self.replay(); rx
+    }
+    fn replay(&mut self) {
+        if self.since.is_some_and(|at|at.elapsed()>MAX_GOP_AGE) {self.clear_video();}
+        let Some(tx)=&self.target else {return;};
+        let _=tx.send(CarLifeEvent::VideoReplay);
+        if let Some((width,height))=self.size {let _=tx.send(CarLifeEvent::EncoderResolution{width,height});}
+        for (_,parameter) in &self.parameters {let _=tx.send(parameter.clone());}
+        for frame in &self.gop {let _=tx.send(frame.clone());}
+    }
+}
+
+struct Prepared {
+    owner: u64, hub: Arc<CarLifeHub>, feed: Arc<Mutex<Feed>>,
+    display: Arc<Mutex<(u32,u32)>>, microphone: Option<Arc<crate::mic_probe::ProbeControl>>,
+    stop: Arc<Notify>, task: tokio::task::JoinHandle<()>,
+}
+impl Drop for Prepared {
+    fn drop(&mut self) {self.stop.notify_waiters(); self.task.abort(); if let Some(mic)=&self.microphone {mic.request(false);}}
+}
+#[derive(Default)]
+struct Slot {newest:u64, current:Option<Prepared>}
+static SOURCE: Lazy<Mutex<Slot>>=Lazy::new(||Mutex::new(Slot::default()));
+
+pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
+    let mut slot=SOURCE.lock();
+    if slot.current.as_ref().is_some_and(|s|s.owner==owner) {return Ok(());}
+    if owner==0 || owner<=slot.newest {return Err("stale CarWith source owner".into());}
+    slot.current=None;slot.newest=owner;
+    let stop=Arc::new(Notify::new()); let display=Arc::new(Mutex::new((cfg.width,cfg.height)));
+    let microphone=cfg.carwith_microphone.then(||Arc::new(crate::mic_probe::ProbeControl::for_carwith()));
+    let config=CarLifeConfig{width:cfg.width,height:cfg.height,fps:cfg.fps,bt_address:cfg.device_id.clone(),
+        bt_name:"HyperCar".into(),navigation_updates:cfg.carwith_navigation_enabled,microphone:microphone.clone()};
+    let (hub,mut events)=CarLifeHub::connect(config,"127.0.0.1".into(),stop.clone(),Some(display.clone()))?;
+    let feed=Arc::new(Mutex::new(Feed::default()));let sink=feed.clone();
+    let task=tokio::spawn(async move {while let Some(event)=events.recv().await {sink.lock().receive(event);}});
+    slot.current=Some(Prepared{owner,hub:Arc::new(hub),feed,display,microphone,stop,task});
+    crate::emit_log(&format!("CARWITH-SOURCE: owner={owner} seven-channel service prepared independently of AirPlay"));
+    Ok(())
+}
+pub(crate) struct Attachment {
+    pub hub:Arc<CarLifeHub>, pub events:mpsc::UnboundedReceiver<CarLifeEvent>,
+    pub display:Arc<Mutex<(u32,u32)>>, pub microphone:Option<Arc<crate::mic_probe::ProbeControl>>,
+}
+pub(crate) struct InputLease(pub Arc<CarLifeHub>);
+impl Drop for InputLease {fn drop(&mut self) {self.0.release_touch();}}
+pub(crate) fn attach(owner:u64)->Result<Attachment,String> {
+    let slot=SOURCE.lock();let source=slot.current.as_ref().filter(|s|s.owner==owner).ok_or("CarWith source not prepared for this attempt")?;
+    let events=source.feed.lock().attach(); source.hub.request_keyframe();
+    crate::emit_log(&format!("CARWITH-SOURCE: owner={owner} media attached; cached GOP then live events"));
+    Ok(Attachment{hub:source.hub.clone(),events,display:source.display.clone(),microphone:source.microphone.clone()})
+}
+pub(crate) fn stop(owner:u64) {
+    let mut slot=SOURCE.lock();
+    if slot.current.as_ref().is_some_and(|s|s.owner==owner) {slot.current=None;}
+}
+pub(crate) fn replay(owner:u64) {
+    let slot=SOURCE.lock();
+    if let Some(source)=slot.current.as_ref().filter(|s|s.owner==owner) {
+        source.feed.lock().replay(); source.hub.request_keyframe();
+        crate::emit_log(&format!("CARWITH-SOURCE: owner={owner} screen ready; replay current bounded GOP"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn video(kind: u8) -> CarLifeEvent {
+        CarLifeEvent::VideoFrame { pts_us: 1, data: vec![0,0,0,1,kind,8] }
+    }
+    #[tokio::test]
+    #[ignore = "requires Xiaomi phone; launch CarWith after READY; no car connection or input injection"]
+    async fn live_prewarm_survives_delayed_media_and_reattach() {
+        let config:EngineConfig=serde_json::from_value(serde_json::json!({
+            "device_id":"02:00:00:00:00:01","car_ip":"127.0.0.1","airplay_port":0,
+            "width":2736,"height":800,"fps":30,"identity_path":"","carlife_source":true
+        })).unwrap();
+        let owner=90001;
+        prepare(owner,&config).unwrap();
+        println!("SOURCE-PREWARM READY: launch CarWith now; wait 25s without AirPlay");
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        {
+            let slot=SOURCE.lock();let source=slot.current.as_ref().unwrap();let feed=source.feed.lock();
+            println!("SOURCE-PREWARM detached: authenticated={} frames={} cached_bytes={}",feed.handshake,feed.frames,feed.bytes);
+            assert!(feed.handshake && feed.frames>20);
+        }
+        for round in 1..=2 {
+            let mut source=attach(owner).unwrap();
+            let began=Instant::now();let mut frames=0;
+            tokio::time::timeout(Duration::from_secs(10),async {
+                while let Some(event)=source.events.recv().await {
+                    if matches!(event,CarLifeEvent::VideoFrame{..}|CarLifeEvent::VideoFrameTagged{..}) {frames+=1;}
+                    if began.elapsed()>=Duration::from_secs(3) && frames>=20 {break;}
+                }
+            }).await.unwrap();
+            assert!(frames>=20);println!("SOURCE-PREWARM media attach round={round} frames={frames}");
+            drop(source);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        stop(owner);
+        assert!(SOURCE.lock().current.is_none());
+    }
+
+    #[test] fn changed_parameter_set_invalidates_old_gop() {
+        let mut feed=Feed::default();feed.receive(video(0x67));feed.receive(video(0x65));
+        feed.receive(CarLifeEvent::VideoFrame{pts_us:2,data:vec![0,0,0,1,0x67,9]});
+        assert!(feed.gop.is_empty());
+    }
+    #[test] fn screen_replay_keeps_parameters_after_gop_expiry_without_replaying_audio() {
+        let mut feed=Feed::default();
+        feed.receive(CarLifeEvent::AudioInit{tts:true,rate:16000,channels:1});
+        feed.receive(video(0x67));feed.receive(video(0x68));feed.receive(video(0x65));
+        let mut rx=feed.attach();while rx.try_recv().is_ok() {}
+        feed.since=Some(Instant::now()-Duration::from_secs(3));feed.replay();
+        assert!(matches!(rx.try_recv(),Ok(CarLifeEvent::VideoReplay)));
+        for kind in [0x67,0x68] {
+            match rx.try_recv().unwrap() {CarLifeEvent::VideoFrame{data,..}=>assert_eq!(data[4],kind),other=>panic!("{other:?}")}
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(feed.formats[1].is_some());
+    }
+    #[test] fn attach_starts_with_configuration_and_current_complete_gop() {
+        let mut feed = Feed::default();
+        feed.receive(CarLifeEvent::EncoderResolution{width:1920,height:720});
+        feed.receive(video(0x67)); feed.receive(video(0x68));
+        feed.receive(video(0x65)); feed.receive(video(0x41));
+        let mut rx = feed.attach();
+        assert!(matches!(rx.try_recv(),Ok(CarLifeEvent::SourceReset)));
+        assert!(matches!(rx.try_recv(),Ok(CarLifeEvent::VideoReplay)));
+        assert!(matches!(rx.try_recv(),Ok(CarLifeEvent::EncoderResolution{width:1920,..})));
+        let mut kinds = Vec::new();
+        while let Ok(CarLifeEvent::VideoFrame{data,..}) = rx.try_recv() {kinds.push(data[4]);}
+        assert_eq!(kinds,vec![0x67,0x68,0x65,0x41]);
+    }
+    #[test] fn reset_and_overflow_never_replay_delta_without_idr() {
+        let mut feed = Feed::default(); feed.receive(video(0x65));
+        for _ in 0..300 {feed.receive(video(0x41));}
+        assert!(feed.gop.is_empty());
+        feed.receive(video(0x65)); feed.receive(CarLifeEvent::SourceReset);
+        feed.receive(video(0x41)); assert!(feed.gop.is_empty());
+        assert!(feed.parameters.is_empty());
+    }
+    #[test] fn reconnect_reuses_live_source_and_discards_historical_pcm() {
+        let mut feed = Feed::default();
+        feed.receive(CarLifeEvent::AudioInit{tts:false,rate:48000,channels:2});
+        feed.receive(CarLifeEvent::AudioData{tts:false,rate:48000,channels:2,data:vec![1;4096]});
+        feed.receive(video(0x65));
+        let first = feed.attach(); drop(first);
+        feed.receive(video(0x41));
+        let mut second = feed.attach(); let mut frames=0;
+        while let Ok(event) = second.try_recv() {
+            assert!(!matches!(event,CarLifeEvent::AudioData{..}));
+            if matches!(event,CarLifeEvent::VideoFrame{..}) {frames+=1;}
+        }
+        assert_eq!(frames,2);
+        feed.receive(video(0x41)); assert!(second.try_recv().is_ok());
+    }
+    #[test] fn new_idr_replaces_previous_gop_and_bytes_are_bounded() {
+        let mut feed = Feed::default();
+        feed.receive(video(0x65)); feed.receive(video(0x41)); feed.receive(video(0x65));
+        assert_eq!(feed.gop.len(),1);
+        feed.receive(CarLifeEvent::VideoFrame{pts_us:2,data:vec![0;MAX_GOP_BYTES+1]});
+        assert!(feed.gop.is_empty());
+        assert_eq!(feed.bytes,0);
+    }
+}

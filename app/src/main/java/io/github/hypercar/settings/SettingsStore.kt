@@ -278,6 +278,20 @@ object SettingsStore {
 
     @Volatile var receiverViewport: Pair<Int, Int>? = null
 
+    /** CarWith prewarm uses only this receiver's observed canvas, never custom UI size. */
+    fun carWithCanvas(receiver: String?): Pair<Int, Int>? {
+        if (receiver.isNullOrBlank()) return null
+        val width = p().getInt("carwith_canvas_width_$receiver", 0)
+        val height = p().getInt("carwith_canvas_height_$receiver", 0)
+        return (width to height).takeIf { width in 2..8192 && height in 2..8192 }
+    }
+
+    fun rememberCarWithCanvas(receiver: String?, width: Int, height: Int) {
+        if (receiver.isNullOrBlank() || width !in 2..8192 || height !in 2..8192) return
+        p().edit().putInt("carwith_canvas_width_$receiver", width)
+            .putInt("carwith_canvas_height_$receiver", height).apply()
+    }
+
     val encodingPlan: VideoEncodingPlan
         get() {
             // 有 /info 时用它；没有 /info 才回退设置。编码画布与引擎必须同源，

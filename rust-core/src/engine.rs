@@ -96,6 +96,8 @@ pub struct EngineConfig {
     #[serde(default)]
     pub carlife_source: bool,
     #[serde(default)]
+    pub carwith_source_owner: u64,
+    #[serde(default)]
     pub carwith_navigation_token: u64,
     #[serde(default)]
     pub carwith_navigation_enabled: bool,
@@ -170,28 +172,19 @@ pub async fn run_engine(
     // ---- CarWith 模式：把本机 CarLife（CarWith）的 H.264 / PCM 灌进同一条事件流 ----
     // 与自绘 UI 的区别只在"源"：视频帧来源换成 CarLife 的 8240 通道，音频换成 9240/9241/9242。
     // 引擎下游（screen/audio pump、触摸反向）完全复用，不需要第二套实现。
-    // EngineTasks owns the hub. Restarting creates a fresh source immediately;
-    // a time-based global guard also suppressed valid reconnects and mode switches.
-    let carwith_display = cfg.carlife_source.then(|| Arc::new(Mutex::new((cfg.width, cfg.height))));
+    // The connection attempt owns the source; a media retry only replaces its subscriber.
+    let prepared = if cfg.carlife_source {Some(crate::carwith_source::attach(cfg.carwith_source_owner)?)} else {None};
+    let carwith_display = prepared.as_ref().map(|source|source.display.clone());
     let microphone_probe = if cfg.carlife_source {
-        cfg.carwith_microphone.then(|| Arc::new(crate::mic_probe::ProbeControl::for_carwith()))
+        prepared.as_ref().and_then(|source|source.microphone.clone())
     } else if cfg.self_microphone_asr {
         Some(Arc::new(crate::mic_probe::ProbeControl::for_self_asr(cfg.input_generation)))
     } else { cfg.microphone_probe.then(|| Arc::new(crate::mic_probe::ProbeControl::new())) };
     let mut carwith_hub = None;
-    if cfg.carlife_source {
-        let life_cfg = crate::carlife::CarLifeConfig {
-            width: cfg.width,
-            height: cfg.height,
-            fps: cfg.fps,
-            bt_address: cfg.device_id.clone(),
-            bt_name: "HyperCar".to_string(),
-            navigation_updates: cfg.carwith_navigation_enabled,
-            microphone: microphone_probe.clone(),
-        };
-        match crate::carlife::CarLifeHub::connect(life_cfg, "127.0.0.1".to_string(), stop.clone(), carwith_display.clone()) {
-            Ok((hub, mut life_events)) => {
-                let hub = Arc::new(hub);
+    if let Some(source) = prepared {
+            {
+                let hub = source.hub;
+                let mut life_events = source.events;
                 carwith_hub = Some(hub.clone());
                 let carwith_touch_size = touch_size.clone();
                 let vtx = video_tx.clone();
@@ -200,7 +193,7 @@ pub async fn run_engine(
                 let navigation_token = cfg.carwith_navigation_token;
                 tasks.spawn(async move {
                     // Keep channel senders and the hub alive for the entire source task.
-                    let _hub = hub;
+                    let _input = crate::carwith_source::InputLease(hub);
                     while let Some(ev) = life_events.recv().await {
                         match ev {
                             CarLifeEvent::SourceReset => {
@@ -209,6 +202,7 @@ pub async fn run_engine(
                                 let _=atx.send(SourceEvent::AudioStop{tts:true});
                                 let _=atx.send(SourceEvent::VoiceAudioStop);
                             }
+                            CarLifeEvent::VideoReplay => {let _=vtx.send(SourceEvent::ResetVideoSource);}
                             CarLifeEvent::Navigation(update) => crate::emit_carwith_navigation(navigation_token,update.as_ref()),
                             CarLifeEvent::VideoFrame { pts_us, data } => {
                                 let _ = vtx.send(SourceEvent::VideoFrame { pts_us, data });
@@ -244,8 +238,6 @@ pub async fn run_engine(
                     }
                 });
             }
-            Err(error) => emit_log(&format!("CARLIFE: CarWith 模式连接失败：{error}")),
-        }
     }
     let voice_probe = if cfg.carlife_source { None } else { microphone_probe.clone() };
     let key_stop=stop.clone();
@@ -326,7 +318,8 @@ pub async fn run_engine(
     let (screen_ready_tx, screen_ready_rx) = mpsc::channel::<crate::screen_session::ScreenCommand>(2);
     let video_stats = Arc::new(Mutex::new(PumpStat::default()));
     tasks.spawn(video_pump(stop.clone(), video_stats.clone(), cfg.screen_resource_lifecycle,
-        pipeline.clone(), screen_ready_rx, video_rx, cfg.carlife_source && cfg.video_codec == "hevc", cfg.fps));
+        pipeline.clone(), screen_ready_rx, video_rx, cfg.carlife_source && cfg.video_codec == "hevc", cfg.fps,
+        cfg.carlife_source.then_some(cfg.carwith_source_owner)));
 
     // ---- 音频泵：重采样 + 闪避混音 + RTP ----
     let (audio_out_tx, audio_out_rx) = tokio::sync::oneshot::channel::<AudioOut>();
@@ -796,7 +789,7 @@ pub(crate) async fn video_pump(
     video_pipeline: Arc<Mutex<crate::pipeline::Pipeline>>,
     mut screen_ready_rx: mpsc::Receiver<crate::screen_session::ScreenCommand>,
     video_rx: mpsc::UnboundedReceiver<SourceEvent>,
-    transcode:bool, fps:u32,
+    transcode:bool, fps:u32, source_owner:Option<u64>,
 ) {
     let target=Arc::new(Mutex::new((1280,720)));
     let mut converter=crate::video_transcode::Router::new(transcode,fps.min(30).max(1),crate::video_transcode::hardware_factory(target.clone()));
@@ -823,6 +816,7 @@ pub(crate) async fn video_pump(
                     }
                     sender = Some(s);
                     crate::emit_force_keyframe();
+                    if let Some(owner)=source_owner {crate::carwith_source::replay(owner);}
                     emit_log(&format!("VIDEO: sender ready; discarded_before_ready_units={before_ready_units}; request fresh SPS/PPS/IDR"));
                 }
                 Some(crate::screen_session::ScreenCommand::InstallIfOwned { sender: mut next, modes, revision, reply }) => {
@@ -839,7 +833,10 @@ pub(crate) async fn video_pump(
                     };
                     let _ = reply.send(accepted);
                     emit_log(&format!("SCREEN-LIFECYCLE: video pump install revision={revision} accepted={accepted}"));
-                    if accepted { crate::emit_force_keyframe(); }
+                    if accepted {
+                        if let Some(owner)=source_owner {crate::carwith_source::replay(owner);}
+                        crate::emit_force_keyframe();
+                    }
                 }
                 Some(crate::screen_session::ScreenCommand::Pause(reply)) => {
                     converter.pause(); converted.clear();
@@ -1009,7 +1006,7 @@ mod video_pump_tests {
             let (commands,rx)=mpsc::channel(2);let (source,video_rx)=mpsc::unbounded_channel();
             let stats=Arc::new(Mutex::new(PumpStat::default()));let stop=Arc::new(Notify::new());
             let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
-            let pump=tokio::spawn(video_pump(stop.clone(),stats.clone(),recovery,pipeline,rx,video_rx,false,30));
+            let pump=tokio::spawn(video_pump(stop.clone(),stats.clone(),recovery,pipeline,rx,video_rx,false,30,None));
             commands.send(crate::screen_session::ScreenCommand::Install(ScreenSender::new(
                 write,crate::screen::ScreenCipher::ChaCha([7;32]),1920,720,false,
             ))).await.unwrap();
@@ -1233,6 +1230,8 @@ struct AudioPumpStat {
 pub enum CarLifeEvent {
     Navigation(Option<crate::carlife::navigation::NavigationUpdate>),
     SourceReset,
+    /// Replay for a new screen transport without resetting active audio/navigation.
+    VideoReplay,
     Handshake,
     VideoFrame { pts_us: u64, data: Vec<u8> },
     VideoFrameTagged { pts_us:u64, data:Vec<u8>, codec:crate::video_format::VideoCodec },

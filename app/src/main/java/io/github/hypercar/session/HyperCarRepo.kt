@@ -152,7 +152,7 @@ object HyperCarRepo {
                 kotlinx.coroutines.currentCoroutineContext().ensureActive()
                 if (!sessionLive.get() || connectionAttemptId != attempt || sessionSockets !== sockets)
                     throw CancellationException("旧核心启动结果已失效")
-                val config = org.json.JSONObject(configure())
+                val config = org.json.JSONObject(configure()).put("carwith_source_owner", attempt)
                 val stationMac = wifiStationSnapshot?.takeIf { it.first == attempt && it.second == sockets.network }?.third
                 if (stationMac != null) config.put("wifi_mac_address", stationMac)
                 log("SESSION-IDENTITY: wifi_station_mac=${stationMac != null} device_identity_preserved=true")
@@ -1279,28 +1279,6 @@ object HyperCarRepo {
         var discoveryJob: Job? = null
         try {
             if (!precheckDegradedMode(context)) return
-            // Prepare the CarLife listener while Bluetooth/Wi-Fi negotiation is still in
-            // progress. Waiting for RECORD/video TCP makes the first source dial fail;
-            // am start returning does not mean the seven source channels are ready.
-            if (sessionCarWithMode) {
-                sessionUiJob?.cancel()
-                sessionUiJob = scope.launch {
-                    fun current() = sessionLive.get() && connectionAttemptId == diagnosticId
-                    if (!current()) return@launch
-                    try {
-                        CarUiCaster.releaseForCarWith()
-                        kotlinx.coroutines.currentCoroutineContext().ensureActive()
-                        if (!current()) return@launch
-                        log("CARWITH: 提前准备源端入口 attempt=$diagnosticId")
-                        val result = launchCarWith(context)
-                        if (current()) log("CARWITH: $result")
-                    } catch (cancelled: CancellationException) {
-                        throw cancelled
-                    } catch (error: Exception) {
-                        if (current()) log("CARWITH: 源端准备失败：${error.message}")
-                    }
-                }
-            }
             // Shizuku 从「必须」降级为「可选增强」：没有它照样能连，只是两条路径降级——
             //  WiFi 走 WifiNetworkSpecifier（热点首连弹一次系统确认框）+ deviceID 用稳定伪 MAC。
             if (!ShizukuTools.isReady) {
@@ -1321,6 +1299,10 @@ object HyperCarRepo {
             sessionDeviceMac = ""
             val deviceMac = coordinatorFor(context).deviceMacForSession()
             sessionDeviceMac = deviceMac
+            if (sessionCarWithMode && !prepareCarWithSource(context, diagnosticId, deviceMac)) {
+                fail("CarWith 源端守候服务准备失败")
+                return
+            }
             log(when {
                 deviceMac == SettingsStore.stableDeviceId -> "BT: 使用已有稳定手机标识；真实蓝牙地址未取得，严格接收端仍可能拒绝"
                 SettingsStore.manualBtMac.equals(deviceMac, ignoreCase = true) -> "BT: 使用手动指定手机标识；iAP2、mDNS 与 AirPlay 共用"
@@ -1674,8 +1656,7 @@ object HyperCarRepo {
                 // Stop only the failed media engine. Keep the same identity, Wi-Fi lease,
                 // RFCOMM session and ctrl listener/port alive for the receiver's next invite.
                 streaming = false
-                // CarWith preparation belongs to the connection attempt, not this
-                // activation. A new invitation in this attempt still needs that source.
+                // Keep the source service and launch alive across media activations.
                 if (!sessionCarWithMode) {
                     sessionUiJob?.cancel()
                     sessionUiJob = null
@@ -1825,6 +1806,7 @@ object HyperCarRepo {
             if (graceful) log("SESSION-CLOSE: graceful completed=${RustCoreBridge.nativeStopGracefully()}")
             else RustCoreBridge.nativeStop()
         }
+        runCatching { RustCoreBridge.nativeStopCarWith(connectionAttemptId) }
         proactiveActivation.set(null)
         if (keepListening) {
             standbyEndpoint.set(null)
@@ -2744,9 +2726,7 @@ object HyperCarRepo {
                             sinceMillis = System.currentTimeMillis(),
                         ),
                     )
-                    // CarWith was prepared before Bluetooth/Wi-Fi negotiation. Do not
-                    // launch it again here: an existing CarLife handshake may be active.
-                    // The self-drawn source still starts when the receiver is connected.
+                    // The source service already receives and caches independently.
                     val ctx = appContext()
                     if (ctx != null && !sessionCarWithMode) {
                         sessionUiJob?.cancel()
@@ -2783,6 +2763,10 @@ object HyperCarRepo {
 
         override fun onDisplaySize(width: Int, height: Int) {
             SettingsStore.receiverViewport = (width to height).takeIf { width >= 320 && height >= 240 }
+            if (sessionLive.get() && sessionCarWithMode && width >= 320 && height >= 240) {
+                SettingsStore.rememberCarWithCanvas(retryReceiver(), width, height)
+                log("CARWITH: 已记住当前车机画布 ${width}x$height；用于下次源端初始化，不重启本轮编码器")
+            }
         }
 
         override fun onDisplayLayout(width: Int, height: Int, viewX: Int, viewY: Int, viewWidth: Int, viewHeight: Int,
@@ -3720,6 +3704,39 @@ object HyperCarRepo {
 
     /** 落盘日志超过这个大小就转存成 `.1`（只留一份上一代）。 */
     private const val DISK_LOG_MAX_BYTES = 1_500_000L
+
+    private fun prepareCarWithSource(context: Context, diagnosticId: Long, deviceMac: String): Boolean {
+        fun current() = sessionLive.get() && connectionAttemptId == diagnosticId
+        if (!current()) return false
+        val canvas = SettingsStore.carWithCanvas(retryReceiver()) ?: (1920 to 1080)
+        val config = org.json.JSONObject(SettingsStore.engineConfigJson("127.0.0.1", 0, deviceMac, "",
+            carWithSource = true)).put("width", canvas.first).put("height", canvas.second)
+            .put("carwith_navigation_enabled", carWithHudNavigationAllowed).toString()
+        log("CARWITH: 源端预热画布 ${canvas.first}x${canvas.second}；按车机身份缓存，与自绘分辨率独立")
+        if (!RustCoreBridge.nativePrepareCarWith(config, diagnosticId)) return false
+        if (!current()) {
+            RustCoreBridge.nativeStopCarWith(diagnosticId)
+            return false
+        }
+        sessionUiJob?.cancel()
+        sessionUiJob = scope.launch {
+            try {
+                CarUiCaster.releaseForCarWith()
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                if (!current()) return@launch
+                log("CARWITH: 七路守候与接收服务就绪；启动源端 attempt=$diagnosticId；独立保持至本轮连接结束")
+                val result = launchCarWith(context)
+                if (current()) log("CARWITH: $result")
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (current()) log("CARWITH: 源端准备失败：${error.message}")
+            } finally {
+                if (!current()) RustCoreBridge.nativeStopCarWith(diagnosticId)
+            }
+        }
+        return true
+    }
 
     /** 重启时从落盘日志带回环形缓冲的行数（够覆盖崩溃前的一段现场）。 */
     private const val DISK_LOG_TAIL_LINES = 400

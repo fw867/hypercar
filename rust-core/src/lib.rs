@@ -27,6 +27,7 @@ mod consumer_hid;
 mod voice_key;
 mod crypto;
 mod carlife;
+mod carwith_source;
 mod engine;
 mod modes;
 mod pairing;
@@ -456,6 +457,23 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSetTouc
 }
 
 /// 启动全链路网关：controlFd（已连车机 AirPlay 端口）+ socket 供给器 + 引擎配置 JSON。
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePrepareCarWith(
+    mut env:JNIEnv, _class:JClass, json:JString, owner:jlong,
+)->jboolean {
+    let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||->Result<(),String>{
+        let text:String=env.get_string(&json).map_err(|e|e.to_string())?.into();
+        let cfg:engine::EngineConfig=serde_json::from_str(&text).map_err(|e|e.to_string())?;
+        let _entered=TOKIO_RT.enter();
+        carwith_source::prepare(owner as u64,&cfg)
+    }));
+    match result {Ok(Ok(()))=>JNI_TRUE, error=>{emit_log(&format!("CARWITH-SOURCE: prepare failed: {error:?}"));JNI_FALSE}}
+}
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStopCarWith(
+    _env:JNIEnv,_class:JClass,owner:jlong,
+) {carwith_source::stop(owner as u64);}
+
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStart(
     env: JNIEnv,

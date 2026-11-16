@@ -256,6 +256,14 @@ impl CarLifeHub {
         }
     }
 
+    /// A media subscriber can disappear while a finger is down; the source survives it.
+    pub fn release_touch(&self) {
+        let size=*self.encoder_size.lock();
+        if let Some(bytes)=self.touch_state.lock().accept(TOUCH_UP,0,0,size) {
+            let _=self.touch_tx.send(QueuedControl{bytes,expires:Some(std::time::Instant::now()+Duration::from_secs(1))});
+        }
+    }
+
     pub fn voice_start(&self) {
         let code=0x21;
         let mut body=Vec::new();proto::varint(&mut body,1,code);
@@ -754,6 +762,23 @@ fn read_varint(bytes: &[u8]) -> (Option<u64>, usize) {
 }
 
 // ---------------------------------------------------------------- CTRL 通道
+
+#[cfg(test)]
+mod input_lease_tests {
+    use super::*;
+    #[test] fn detaching_media_releases_finger_once_without_destroying_source() {
+        let (tx,mut rx)=mpsc::unbounded_channel();
+        let hub=Arc::new(CarLifeHub{owned_tasks:vec![],touch_state:Arc::new(Mutex::new(session::TouchGesture::default())),
+            touch_tx:tx,encoder_size:Arc::new(Mutex::new((1920,720))),keyframe_request:Arc::new(Notify::new())});
+        hub.inject_touch(TOUCH_DOWN,33,44);
+        assert_eq!(read_cmd_frame(&rx.try_recv().unwrap().bytes).unwrap().0,0x68002);
+        drop(crate::carwith_source::InputLease(hub.clone()));
+        assert_eq!(read_cmd_frame(&rx.try_recv().unwrap().bytes).unwrap().0,0x68003);
+        hub.release_touch();assert!(rx.try_recv().is_err());
+        hub.inject_touch(TOUCH_DOWN,55,66);
+        assert_eq!(read_cmd_frame(&rx.try_recv().unwrap().bytes).unwrap().0,0x68002);
+    }
+}
 
 // Connection failures are throttled while CarWith has not opened its channels.
 struct DialLogThrottle(std::time::Instant);

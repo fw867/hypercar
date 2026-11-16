@@ -100,6 +100,9 @@ object RustCoreBridge {
      * @param socketProvider 后续新端口的 socket 供给
      */
     external fun nativeStart(configJson: String, controlFd: Int, socketProvider: SocketProvider): Boolean
+    /** Source service survives media engine retries; owner is the connection attempt. */
+    external fun nativePrepareCarWith(configJson: String, owner: Long): Boolean
+    external fun nativeStopCarWith(owner: Long)
 
     /** Capture the native engine generation; zero means no input receiver. */
     external fun nativeVoiceKeyToken(): Long
