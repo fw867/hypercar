@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, Notify};
 use crate::airplay::{self, AirplayParams, SocketProvider, TouchInput};
 use crate::audio_out::AudioOut;
 use crate::screen::ScreenSender;
+use crate::video_format::FrameOrigin;
 use crate::{emit_log, emit_stats, emit_state};
 
 /// 外部（Kotlin 侧）投喂给引擎的数据事件。
@@ -33,7 +34,7 @@ pub enum SourceEvent {
     RequestAudioOwnership,
     /// 视频编码器产出一帧（H.264 Annex B，可能含 SPS/PPS/IDR）。
     VideoFrame { pts_us: u64, data: Vec<u8> },
-    VideoFrameTagged { pts_us:u64, data:Vec<u8>, codec:crate::video_format::VideoCodec },
+    VideoFrameTagged { pts_us:u64, data:Vec<u8>, codec:crate::video_format::VideoCodec, origin:FrameOrigin },
     /// 编码器画布尺寸变化（对齐 AirPlay VideoConfig 宽高）。
     EncoderResolution { width: u32, height: u32 },
     /// 音频流开始（tts=true 表示提示音，参与闪避混音）。
@@ -85,8 +86,6 @@ pub struct EngineConfig {
     pub mbux_screen_bootstrap: bool,
     #[serde(default)]
     pub id9_screen_bootstrap: bool,
-    #[serde(default)]
-    pub id9_disable_buffered_audio: bool,
     #[serde(default)]
     pub nbt_audio_first: bool,
     #[serde(default)]
@@ -204,7 +203,7 @@ pub async fn run_engine(
                 tasks.spawn(async move {
                     // Keep channel senders and the hub alive for the entire source task.
                     let _input = crate::carwith_source::InputLease(hub);
-                    while let Some(ev) = life_events.recv().await {
+                    while let Some((ev, origin)) = life_events.recv().await {
                         match ev {
                             CarLifeEvent::SourceReset => {
                                 crate::emit_carwith_navigation(navigation_token,None);
@@ -215,10 +214,10 @@ pub async fn run_engine(
                             CarLifeEvent::VideoReplay => {let _=vtx.send(SourceEvent::ResetVideoSource);}
                             CarLifeEvent::Navigation(update) => crate::emit_carwith_navigation(navigation_token,update.as_ref()),
                             CarLifeEvent::VideoFrame { pts_us, data } => {
-                                let _ = vtx.send(SourceEvent::VideoFrame { pts_us, data });
+                                let _ = vtx.send(SourceEvent::VideoFrameTagged { pts_us, data, codec:crate::video_format::VideoCodec::H264, origin });
                             }
                             CarLifeEvent::VideoFrameTagged { pts_us, data, codec } => {
-                                let _=vtx.send(SourceEvent::VideoFrameTagged {pts_us,data,codec});
+                                let _=vtx.send(SourceEvent::VideoFrameTagged {pts_us,data,codec,origin});
                             }
                             CarLifeEvent::EncoderResolution { width, height } => {
                                 *carwith_touch_size.lock() = (width, height);
@@ -395,7 +394,6 @@ pub async fn run_engine(
         bmw_box_bootstrap: cfg.bmw_box_bootstrap,
         mbux_screen_bootstrap: cfg.mbux_screen_bootstrap,
         id9_screen_bootstrap: cfg.id9_screen_bootstrap,
-        id9_disable_buffered_audio: cfg.id9_disable_buffered_audio,
         nbt_audio_first: cfg.nbt_audio_first,
         mbux_media_compat: cfg.mbux_media_compat,
         desktop_receiver: cfg.desktop_receiver,
@@ -803,8 +801,7 @@ pub(crate) async fn video_pump(
     video_rx: mpsc::UnboundedReceiver<SourceEvent>,
     transcode:bool, fps:u32, source_owner:Option<u64>,
 ) {
-    let target=Arc::new(Mutex::new((1280,720)));
-    let mut converter=crate::video_transcode::Router::new(transcode,fps.min(30).max(1),crate::video_transcode::hardware_factory(target.clone()));
+    let mut converter=crate::video_transcode::Router::new(transcode,fps.min(30).max(1),crate::video_transcode::hardware_factory());
     let mut converted=std::collections::VecDeque::new();
     let mut sender: Option<ScreenSender> = None;
     let mut commands_open = true;
@@ -822,7 +819,8 @@ pub(crate) async fn video_pump(
             _ = stop_v.notified() => return,
             command = screen_ready_rx.recv(), if commands_open => match command {
                 Some(crate::screen_session::ScreenCommand::Install(mut s)) => {
-                    *target.lock()=s.receiver_size();
+                    converter.set_target(s.receiver_size());
+                    converted.clear();
                     if let Some((w, h)) = pending_size.take() {
                         s.set_size(w, h);
                     }
@@ -832,10 +830,11 @@ pub(crate) async fn video_pump(
                     emit_log(&format!("VIDEO: sender ready; discarded_before_ready_units={before_ready_units}; request fresh SPS/PPS/IDR"));
                 }
                 Some(crate::screen_session::ScreenCommand::InstallIfOwned { sender: mut next, modes, revision, reply }) => {
-                    *target.lock()=next.receiver_size();
                     let accepted = {
                         let state = modes.lock();
                         if state.can_restore_screen(revision) {
+                            converter.set_target(next.receiver_size());
+                            converted.clear();
                             next.set_resource_grant(modes.clone(),revision);
                             if let Some((w,h)) = pending_size.take() { next.set_size(w,h); }
                             video_pipeline.lock().video_stream="READY".into();
@@ -875,15 +874,17 @@ pub(crate) async fn video_pump(
                     // 必须在首帧引出 VideoConfig 之前生效，否则车机按旧画布解码。
                     encoder_size = Some((width, height));
                     if let Some(s) = sender.as_mut() {
-                        s.set_size(width, height);
+                        if !converter.encoding_to_display() {
+                            s.set_size(width, height);
+                        }
                     } else {
                         pending_size = Some((width, height));
                     }
                 }
                 Some(ev @ (SourceEvent::VideoFrame { .. } | SourceEvent::VideoFrameTagged { .. })) => {
-                    let (pts_us,data,codec)=match ev {
-                        SourceEvent::VideoFrame {pts_us,data}=>(pts_us,data,crate::video_format::VideoCodec::H264),
-                        SourceEvent::VideoFrameTagged {pts_us,data,codec}=>(pts_us,data,codec),
+                    let (pts_us,data,codec,origin)=match ev {
+                        SourceEvent::VideoFrame {pts_us,data}=>(pts_us,data,crate::video_format::VideoCodec::H264,FrameOrigin::Live),
+                        SourceEvent::VideoFrameTagged {pts_us,data,codec,origin}=>(pts_us,data,codec,origin),
                         _=>unreachable!(),
                     };
                     if !processed {
@@ -893,8 +894,8 @@ pub(crate) async fn video_pump(
                             // Do not initialize a codec until the current screen transport is installed.
                             if sender.is_none() {before_ready_units+=1;continue;}
                             let pts=if pts_us==0 {crate::timing::monotonic_nanos()/1000}else{pts_us};
-                            for unit in converter.input(allowed,pts,data,codec) {
-                                converted.push_back(SourceEvent::VideoFrameTagged {pts_us:unit.pts,data:unit.data,codec:unit.codec});
+                            for unit in converter.input(allowed,pts,data,codec,origin) {
+                                converted.push_back(SourceEvent::VideoFrameTagged {pts_us:unit.pts,data:unit.data,codec:unit.codec,origin:unit.origin});
                             }
                             continue;
                         }
@@ -910,8 +911,8 @@ pub(crate) async fn video_pump(
                         let before_frames = s.frames_sent();
                         let before_bytes = s.bytes_per_second();
                         // 编码尺寸变化时先切画布，保证随后 send_config 标注正确。
-                        let output_size=if transcode && processed && codec==crate::video_format::VideoCodec::Hevc {
-                            Some(*target.lock())
+                        let output_size=if processed && converter.encoding_to_display() {
+                            s.receiver_size().or(encoder_size)
                         }else{encoder_size};
                         if let Some((w, h)) = output_size {
                             if s.size() != (w, h) {
@@ -927,10 +928,10 @@ pub(crate) async fn video_pump(
                         };
                         let written=if resource_lifecycle {
                             let connection = video_pipeline.lock().video_tcp.as_ref().map(|s|s.connection_id);
-                            crate::screen_write::with_progress(s.send_video_annexb(&data,pts), ||
+                            crate::screen_write::with_progress(s.send_video_annexb_from(&data,pts,origin), ||
                                 video_pipeline.lock().video_tcp.as_ref()
                                     .filter(|s|Some(s.connection_id)==connection).and_then(|s|s.acked_bytes)).await
-                        } else { s.send_video_annexb(&data,pts).await };
+                        } else { s.send_video_annexb_from(&data,pts,origin).await };
                         if let Err(error) = written {
                             emit_log(&format!("VIDEO: write failed: {error}; {}; tcp_at_failure=[{}]", s.diagnostics(),s.transport_diagnostics()));
                             video_pipeline.lock().video_stream="FAILED".into();
@@ -959,7 +960,7 @@ pub(crate) async fn video_pump(
             _ = tick.tick() => {
                 if transcode && sender.is_some() {
                     for unit in converter.poll() {
-                        converted.push_back(SourceEvent::VideoFrameTagged {pts_us:unit.pts,data:unit.data,codec:unit.codec});
+                        converted.push_back(SourceEvent::VideoFrameTagged {pts_us:unit.pts,data:unit.data,codec:unit.codec,origin:unit.origin});
                     }
                 }
                 // 屏幕流 keepAlive 帧（明文、1s 节流；缺它 Audi MMI 3315 10.2s 拆轮）
@@ -1001,7 +1002,7 @@ mod video_pump_tests {
         let config:EngineConfig=serde_json::from_value(json.clone()).unwrap();
         assert!(!config.screen_resource_lifecycle);assert!(config.enable_audio);
         assert!(!config.mbux_screen_bootstrap);
-        assert!(!config.id9_screen_bootstrap);assert!(!config.id9_disable_buffered_audio);
+        assert!(!config.id9_screen_bootstrap);
         assert!(!config.nbt_audio_first);assert!(!config.mbux_media_compat);
         assert!(!config.self_microphone_asr);
         json["screen_resource_lifecycle"]=serde_json::json!(true);

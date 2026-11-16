@@ -242,7 +242,7 @@ internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
         }
         Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = "需要自动回连时，完成悬浮窗授权，再到设置开启「上车自动连接」。",
+            text = "上车自动连接默认开启，需完成悬浮窗授权。可在首页或设置中关闭。",
             style = MaterialTheme.typography.labelSmall,
             color = TextSecondary,
         )

@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.Semaphore
 
 /** One source round. Called serially by the native video pump, never from the UI thread. */
-class CarWithHevcTranscoder private constructor() : AutoCloseable {
+class CarWithHevcTranscoder private constructor(private val inputHevc: Boolean) : AutoCloseable {
     private var decoder: MediaCodec? = null
     private var encoder: MediaCodec? = null
     private var surface: Surface? = null
@@ -46,9 +46,10 @@ class CarWithHevcTranscoder private constructor() : AutoCloseable {
 
     companion object {
         private val lifecycle = Semaphore(1, true)
-        @JvmStatic fun open(width: Int, height: Int, targetWidth: Int, targetHeight: Int, fps: Int, csd: ByteArray): CarWithHevcTranscoder {
+        @JvmStatic fun open(inputHevc: Boolean, width: Int, height: Int, targetWidth: Int, targetHeight: Int, fps: Int, csd: ByteArray): CarWithHevcTranscoder {
             require(width in 16..8192 && height in 16..8192 && targetWidth in 16..8192 && targetHeight in 16..8192 && fps in 1..120)
-            val pair = CarWithHevcTranscoder()
+            val pair = CarWithHevcTranscoder(inputHevc)
+            val sourceMime = if (inputHevc) "video/hevc" else "video/avc"
             pair.framePeriodUs = 1_000_000L / fps
             pair.initThread = Thread({
               try {
@@ -65,7 +66,7 @@ class CarWithHevcTranscoder private constructor() : AutoCloseable {
                     setInteger(MediaFormat.KEY_PRIORITY, 0)
                     setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
                 }
-                val decoderFormat = MediaFormat.createVideoFormat("video/avc", width, height).apply {
+                val decoderFormat = MediaFormat.createVideoFormat(sourceMime, width, height).apply {
                     setByteBuffer("csd-0", ByteBuffer.wrap(csd))
                     setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 4 * 1024 * 1024)
                     setInteger(MediaFormat.KEY_PRIORITY, 0)
@@ -81,9 +82,9 @@ class CarWithHevcTranscoder private constructor() : AutoCloseable {
                                     (!encode || caps.colorFormats.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)) &&
                                     caps.isFormatSupported(f)
                             }.getOrDefault(false)
-                    } ?: error("No hardware $mime ${if (encode) "encoder" else "decoder"} for ${width}x$height@$fps")
+                    } ?: error("No hardware $mime ${if (encode) "encoder" else "decoder"} for ${f.getInteger(MediaFormat.KEY_WIDTH)}x${f.getInteger(MediaFormat.KEY_HEIGHT)}@$fps")
                 val enc = hardware("video/hevc", true, format)
-                val dec = hardware("video/avc", false, decoderFormat)
+                val dec = hardware(sourceMime, false, decoderFormat)
                 pair.encoder = MediaCodec.createByCodecName(enc.name)
                 pair.encoder!!.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 pair.surface = pair.encoder!!.createInputSurface()
@@ -134,7 +135,10 @@ class CarWithHevcTranscoder private constructor() : AutoCloseable {
         for (i in 0 until data.size - 4) {
             if (data[i] == 0.toByte() && data[i+1] == 0.toByte()) {
                 val n = if (data[i+2] == 1.toByte()) i+3 else if(data[i+2] == 0.toByte() && data[i+3] == 1.toByte()) i+4 else continue
-                if (n < data.size && data[n].toInt() and 31 == 5) return true
+                if (n < data.size) {
+                    val header = data[n].toInt() and 255
+                    if (if (inputHevc) (header ushr 1 and 63) in 16..21 else (header and 31) == 5) return true
+                }
             }
         }
         return false
@@ -223,7 +227,7 @@ class CarWithHevcTranscoder private constructor() : AutoCloseable {
             val (data, pts) = packet
             val index = inputIndex; inputIndex = -1
             val input = checkNotNull(codec.getInputBuffer(index))
-            check(input.capacity() >= data.size) { "AVC input exceeds codec buffer" }
+            check(input.capacity() >= data.size) { "Source frame exceeds codec buffer" }
             input.clear(); input.put(data)
             codec.queueInputBuffer(index, 0, data.size, pts, 0)
         }
@@ -235,8 +239,13 @@ class CarWithHevcTranscoder private constructor() : AutoCloseable {
             val index = enc.dequeueOutputBuffer(info, 0)
             when {
                 index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    val csd = enc.outputFormat.getByteBuffer("csd-0")?.duplicate()
-                    if (csd != null) configuration = ByteArray(csd.remaining()).also { csd.get(it) }
+                    val format = enc.outputFormat
+                    val headers = java.io.ByteArrayOutputStream()
+                    for (key in listOf("csd-0", "csd-1")) {
+                        val buffer = format.getByteBuffer(key)?.duplicate() ?: continue
+                        headers.write(ByteArray(buffer.remaining()).also { buffer.get(it) })
+                    }
+                    if (headers.size() > 0) configuration = headers.toByteArray()
                 }
                 index == MediaCodec.INFO_TRY_AGAIN_LATER -> return null
                 index >= 0 -> {

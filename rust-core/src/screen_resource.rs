@@ -281,7 +281,7 @@ mod tests {
                 wifi_mac_address:None,
                 car_ip:"127.0.0.1".into(),airplay_port:7000,device_id:"test".into(),device_name:"Test phone".into(),identity_path:"unused".into(),
                 receiver_id:None,receiver_previously_connected:true,enable_audio:true,audio_codec:String::new(),video_codec:String::new(),bmw_capabilities:true,microphone_probe:None,keep_alive_stats:false,
-                bmw_box_bootstrap:!mbux,mbux_screen_bootstrap:mbux,id9_screen_bootstrap:false,id9_disable_buffered_audio:false,nbt_audio_first:false,mbux_media_compat:false,desktop_receiver:false,width:1920,height:720,touch_display:None,touch_rect:None,
+                bmw_box_bootstrap:!mbux,mbux_screen_bootstrap:mbux,id9_screen_bootstrap:false,nbt_audio_first:false,mbux_media_compat:false,desktop_receiver:false,width:1920,height:720,touch_display:None,touch_rect:None,
                 encoder_size:Arc::new(Mutex::new((1920,720))),touch_size:Arc::new(Mutex::new((1920,720))),
                 carwith_display:None,carwith_stretch:false,screen_resource_lifecycle:true,pipeline:pipeline.clone(),
             };
@@ -385,6 +385,101 @@ mod tests {
         ]))]))]);
         Modes::from_info(&info,true,true)
     }
+    async fn streaming_mgu(start: std::time::Instant) -> (Fixture, RtspMessage, TcpStream, u64, tokio::task::JoinHandle<()>, u128, u128) {
+        let mut f = Fixture::new(startup_screen_modes(500)).await;
+        f.session.activated.store(false, Ordering::Release);
+        let mut tasks = Vec::new();
+        crate::airplay::start_mgu_handoff(&mut tasks, f.session.control.clone(), "phone".into(),
+            || true, Arc::new(Notify::new())).await.unwrap();
+        let handoff = read(&mut f.car).await;
+        assert_eq!(bplist::parse(&handoff.body).unwrap().get("type").and_then(Value::as_str), Some("disableBluetooth"));
+        let session = f.session.clone();
+        let modes = f.modes.clone();
+        let revision = modes.lock().screen_generation();
+        let claim = tokio::spawn(async move {session.claim_box_startup_screen(&modes, revision).await});
+        f.modes_reply(1).await;
+        claim.await.unwrap().unwrap();
+        f.session.activated.store(true, Ordering::Release);
+        let setup = f.reconcile();
+        f.modes_reply(1).await;
+        let request = read(&mut f.car).await;
+        let setup_ms = start.elapsed().as_millis();
+        let (mut video, id) = f.setup_reply(&request).await;
+        setup.await.unwrap().unwrap();
+        f.video_frame(&mut video, id).await;
+        let idr_ms = start.elapsed().as_millis();
+        (f, handoff, video, id, tasks.pop().unwrap(), setup_ms, idr_ms)
+    }
+
+    #[tokio::test]
+    async fn mgu_screen_and_idr_arrive_before_delayed_handoff_reply() {
+        let start = std::time::Instant::now();
+        let (mut f, handoff, _video, _id, task, setup_ms, idr_ms) = streaming_mgu(start).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!task.is_finished());
+        reply(&mut f.car, &handoff, 200, &[]).await;
+        task.await.unwrap();
+        println!("MGU loopback type110={setup_ms}ms decrypted_IDR={idr_ms}ms handoff_reply={}ms",start.elapsed().as_millis());
+    }
+
+    async fn verify_followup_frame(f: &Fixture, video: &mut TcpStream, id: u64, marker: u8) {
+        f.source.send(SourceEvent::VideoFrame { pts_us: 35_333, data: vec![0,0,0,1,0x41,marker] }).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let mut header = [0;128];
+                video.read_exact(&mut header).await.unwrap();
+                let mut body = vec![0;u32::from_le_bytes(header[..4].try_into().unwrap()) as usize];
+                video.read_exact(&mut body).await.unwrap();
+                if header[4] == 0 {
+                    let key = crate::airplay::stream_key(&[9;32], id);
+                    assert_eq!(crate::crypto::chacha_open(&key, &crate::crypto::nonce64(1), &body, &header).unwrap(),
+                        [0,0,0,2,0x41,marker]);
+                    break;
+                }
+            }
+        }).await.unwrap();
+    }
+
+    async fn verify_feedback(f: &mut Fixture) {
+        let control = f.session.control.clone();
+        let task = tokio::spawn(async move {
+            control.request("POST", "/feedback", &[], "application/octet-stream", &[], Duration::from_secs(1)).await
+        });
+        let msg = read(&mut f.car).await;
+        assert!(msg.first_line.starts_with("POST /feedback "));
+        reply(&mut f.car, &msg, 200, &[]).await;
+        assert_eq!(task.await.unwrap().unwrap().status(), 200);
+    }
+
+    #[tokio::test]
+    async fn mgu_handoff_timeout_and_late_rejection_preserve_video_and_isolate_reconnect() {
+        let start = std::time::Instant::now();
+        let (mut old, old_msg, mut old_video, old_id, old_task, _, idr) = streaming_mgu(start).await;
+        tokio::time::timeout(Duration::from_secs(4), old_task).await.unwrap().unwrap();
+        assert!(start.elapsed() >= Duration::from_secs(3));
+        verify_followup_frame(&old, &mut old_video, old_id, 0x11).await;
+        verify_feedback(&mut old).await;
+        println!("old CSeq={:?} IDR={idr}ms subsequent P frame and feedback OK at {}ms", old_msg.cseq(), start.elapsed().as_millis());
+        let next = std::time::Instant::now();
+        let (mut new, new_msg, mut new_video, new_id, new_task, _, idr) = streaming_mgu(next).await;
+        assert_eq!(old_msg.cseq(), new_msg.cseq());
+        // Keep the retiring control socket readable to exercise an actual late arrival.
+        reply(&mut old.car, &old_msg, 503, &[]).await;
+        verify_feedback(&mut old).await;
+        old.session.control.close();
+        drop(old_video);
+        drop(old);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!new_task.is_finished(), "old reply completed the new transaction");
+        let reject = next.elapsed().as_millis();
+        reply(&mut new.car, &new_msg, 500, &[]).await;
+        tokio::time::timeout(Duration::from_millis(500), new_task).await.unwrap().unwrap();
+        verify_followup_frame(&new, &mut new_video, new_id, 0x22).await;
+        verify_feedback(&mut new).await;
+        println!("new CSeq={:?} IDR={idr}ms delayed 500={reject}ms subsequent P frame and feedback OK at {}ms",
+            new_msg.cseq(), next.elapsed().as_millis());
+    }
+
     #[tokio::test]
     async fn box_startup_claim_unblocks_500_only_after_its_ack_and_preserves_newer_owner() {
         for receiver_changes in [false,true] {
@@ -482,7 +577,7 @@ mod tests {
     #[tokio::test]
     async fn id9_declares_requests_screen_sets_up_tcp_and_records_before_any_frame() {
         for (status,revoke) in [(200,false),(403,false),(200,true)] {
-            let mut f=Fixture::new(Modes::id9_initial(&Value::dict(vec![]),true)).await;
+            let mut f=Fixture::new(Modes::id9_initial(&Value::dict(vec![]),true,"ID9 test")).await;
             enable_id9(&mut f);
             let session=f.session.clone();let modes=f.modes.clone();
             let task=tokio::spawn(async move {session.bootstrap_before_record(&modes).await});
@@ -520,7 +615,7 @@ mod tests {
     #[tokio::test]
     async fn id9_screen_400_never_sends_record_and_business_rejection_never_sends_setup() {
         for business_reject in [false,true] {
-            let mut f=Fixture::new(Modes::id9_initial(&Value::dict(vec![]),true)).await;
+            let mut f=Fixture::new(Modes::id9_initial(&Value::dict(vec![]),true,"ID9 test")).await;
             enable_id9(&mut f);
             let session=f.session.clone();let modes=f.modes.clone();
             let task=tokio::spawn(async move {session.bootstrap_before_record(&modes).await});
@@ -586,7 +681,7 @@ mod tests {
 
     #[tokio::test]
     async fn id9_hid_initialization_uses_event_channel_before_screen_setup() {
-        let mut f=Fixture::new(Modes::id9_initial(&Value::dict(vec![]),true)).await;
+        let mut f=Fixture::new(Modes::id9_initial(&Value::dict(vec![]),true,"ID9 test")).await;
         enable_id9(&mut f);
         let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
         let socket=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();

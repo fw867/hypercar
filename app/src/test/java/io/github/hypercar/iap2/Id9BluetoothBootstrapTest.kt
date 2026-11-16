@@ -6,6 +6,17 @@ import org.junit.Test
 import org.junit.Before
 
 class Id9BluetoothBootstrapTest {
+    @Test fun mbuxDeclaredStartSessionCanArriveAfterTheInitialWait() {
+        val channel = Channel(replyWithWifi = false, replyWithEndpoint = false)
+        val lines = mutableListOf<String>()
+        Iap2SenderSession(channel, lines::add, onEndpoint = {},
+            profile = HeadUnitProfiles.builtin.single { it.id == "mercedes_mbux" },
+            nanoTime = { channel.time }).run(30_000)
+        assertTrue(lines.any { "车机声明会发" in it && "窗口内未到" in it })
+        assertFalse(lines.any { "也未声明 0x4301" in it })
+        assertTrue(channel.isAlive)
+    }
+
     @Test fun id9AvailabilityAddsStableGroupZeroAndKeepsWirelessBytes() {
         val mac = "02:13:24:35:46:57"
         fun availability() = Channel().let { channel ->

@@ -3,7 +3,6 @@ package io.github.hypercar.bluetooth
 import android.content.Context
 import android.os.Binder
 import android.os.SystemClock
-import io.github.hypercar.settings.SettingsStore
 import io.github.hypercar.shizuku.ShizukuTools
 import io.github.hypercar.spike.SpikeShell
 import java.util.UUID
@@ -101,19 +100,18 @@ internal object ReconnectDiscoverability {
         try {
             while (currentCoroutineContext().isActive) {
                 if (sessionStarted()) return
-                if (!SettingsStore.bluetoothDiscoverableFallback) firstWindowFinished = true
                 val network = networkKey()
                 val preparation = preparationKey()
                 fun readyForWindow(): Boolean = if (preparation != null) {
                     preparationKey() == preparation
                 } else preparationKey() == null && servicesReady() && networkKey() == network
-                if (policy.shouldAttempt(SettingsStore.bluetoothDiscoverableFallback, network, servicesReady(), false,
+                if (policy.shouldAttempt(true, network, servicesReady(), false,
                         SystemClock.elapsedRealtime(), preparation)) {
                     try {
                         if (!ShizukuTools.isReady) { log("BT-DISCOVERY: 跳过短暂可发现，Shizuku 未就绪"); return }
                         val bind = SpikeShell.connect(context)
-                        // 绑定 shell 可能花数秒，期间车机可能已建立会话、换网或用户关闭开关。
-                        if (sessionStarted() || !readyForWindow() || !SettingsStore.bluetoothDiscoverableFallback) return
+                        // 绑定 shell 可能花数秒，期间车机可能已建立会话或换网。
+                        if (sessionStarted() || !readyForWindow()) return
                         if (!SpikeShell.isConnected()) { log("BT-DISCOVERY: shell 绑定未完成：$bind"); return }
                         val token = UUID.randomUUID().toString()
                         val owner = Binder()
@@ -125,7 +123,7 @@ internal object ReconnectDiscoverability {
                                 result.startsWith("OK").also { started = it }
                             },
                             keepOpen = {
-                                !sessionStarted() && readyForWindow() && SettingsStore.bluetoothDiscoverableFallback
+                                !sessionStarted() && readyForWindow()
                             },
                             stop = {
                                 // 旧轮次只清理本轮 token，不能关闭新窗口。

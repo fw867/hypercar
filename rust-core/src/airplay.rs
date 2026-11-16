@@ -50,7 +50,6 @@ pub struct AirplayParams {
     pub bmw_box_bootstrap: bool,
     pub mbux_screen_bootstrap: bool,
     pub id9_screen_bootstrap: bool,
-    pub id9_disable_buffered_audio: bool,
     pub nbt_audio_first: bool,
     pub mbux_media_compat: bool,
     pub desktop_receiver: bool,
@@ -136,6 +135,16 @@ pub async fn negotiate(
         }
     }
     };
+    // CarWith prewarms before pairing. Give its encoder INIT this receiver's
+    // declaration as soon as we have it, even on the first uncached connection.
+    let early_carwith_display = p.carwith_display.as_ref().and_then(|requested| {
+        let display = select_display(&info)?;
+        let size = read_display_size(display);
+        if size.0 < 2 || size.1 < 2 { return None; }
+        *requested.lock() = size;
+        emit_log(&format!("CARWITH-SIZE: pre-SETUP /info display={}x{}", size.0, size.1));
+        Some(size)
+    });
     let receiver_pk = info
         .get("pk")
         .and_then(Value::as_bytes)
@@ -296,9 +305,13 @@ pub async fn negotiate(
     // CatPlay bootstrap: 会话 SETUP → /info → 事件通道/保活 → 资源声明 → 屏幕流。
     let timing = TimingServer::start_with_pipeline(p.pipeline.clone()).map_err(|e| format!("计时服务启动失败: {e}"))?;
     let (root, session_info, hevc_proposed) = setup_and_read_info(
-        &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap, p.id9_screen_bootstrap, mbux_media_compat, p.id9_disable_buffered_audio, p.bmw_capabilities, p.video_codec == "hevc", Some(&mut cleanup), p.wifi_mac_address.as_deref(),
+        &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap, p.id9_screen_bootstrap, mbux_media_compat, p.bmw_capabilities, p.video_codec == "hevc", Some(&mut cleanup), p.wifi_mac_address.as_deref(),
     ).await?;
     info = session_info;
+    let id9_modes = p.id9_screen_bootstrap.then(|| {
+        crate::modes::Modes::id9_initial(&info, p.enable_audio,
+            channel.id9_trace.get().map(String::as_str).unwrap_or("ID9"))
+    });
     let hevc_allowed=negotiated_hevc(hevc_proposed,&root);
     crate::emit_video_capabilities(hevc_allowed);
     emit_log(&format!("VIDEO-CODEC: preferred={} hevc_proposed={hevc_proposed} hevc_accepted={hevc_allowed}",p.video_codec));
@@ -331,7 +344,10 @@ pub async fn negotiate(
     if p.id9_screen_bootstrap && display_uuid.is_none() {
         return Err("ID9 /info lacks a valid main display UUID/size; refusing guessed screen SETUP".into());
     }
-    let (disp_w, disp_h) = display.map(read_display_size).unwrap_or((0, 0));
+    let (disp_w, disp_h) = display.map(read_display_size)
+        .or_else(|| early_carwith_display.filter(|_| info.get("displays").is_none()))
+        .unwrap_or((0, 0));
+    p.pipeline.lock().display_size = (disp_w >= 2 && disp_h >= 2).then_some((disp_w,disp_h));
     if let Some(requested) = &p.carwith_display {
         if disp_w >= 2 && disp_h >= 2 { *requested.lock() = (disp_w, disp_h); }
     }
@@ -358,8 +374,8 @@ pub async fn negotiate(
         .open_tcp(&p.car_ip, event_port, 5_000)
         .ok_or_else(|| format!("事件通道连接失败 {}:{event_port}", p.car_ip))?;
     let (ev_r, ev_w) = event_stream.into_split();
-    let initial_modes = if p.id9_screen_bootstrap {
-        crate::modes::Modes::id9_initial(&info, p.enable_audio)
+    let initial_modes = if let Some(initial) = id9_modes {
+        initial
     } else if p.mbux_screen_bootstrap {
         crate::modes::Modes::from_info_with_audio_policy(&info, p.enable_audio, false, true)
     } else { crate::modes::Modes::from_info(&info, p.enable_audio, box_bootstrap) };
@@ -370,6 +386,7 @@ pub async fn negotiate(
     let reply_modes = modes.clone();
     let reply_owner = screen_owned.clone();
     let reply_pipeline=p.pipeline.clone();
+    let event_trace = channel.id9_trace.get().cloned();
     let (event_channel, event_rx) = RtspChannel::spawn_with_reply(ev_r, ev_w, None, Some(Arc::new(move |message| {
         if !message.first_line.contains("/command") { return None; }
         let command = bplist::parse(&message.body).ok()?;
@@ -383,13 +400,17 @@ pub async fn negotiate(
         if command.get("type").and_then(Value::as_str)==Some("requestUI") { health.ui_requests+=1; }
         drop(health);
         if matches!(command.get("type").and_then(Value::as_str), Some("changeModes") | Some("requestUI")) {
-            emit_log(&format!("MODES: event applied type={} {}; reply_bytes={}",
+            let prefix = event_trace.as_deref().unwrap_or("MODES:");
+            emit_log(&format!("{prefix} event applied type={} {}; reply_bytes={}",
                 command.get("type").and_then(Value::as_str).unwrap_or("?"),modes.diagnostics(),response.as_ref().map(Vec::len).unwrap_or(0)));
         }
         response
     })));
 
     emit_log(&format!("AIRPLAY: 事件连接 RTSP#{} 建立，port={event_port}", event_channel.trace_id()));
+    if let Some(trace) = channel.id9_trace.get() {
+        emit_log(&format!("{trace} control=RTSP#{} event=RTSP#{}", channel.trace_id(), event_channel.trace_id()));
+    }
     if let Some(shared) = &shared_secret {
         let (read_key, write_key) = derive_event_keys(shared);
         event_channel.set_cipher(ControlCipher::new(read_key, write_key));
@@ -495,16 +516,23 @@ pub async fn negotiate(
     if box_bootstrap && !p.desktop_receiver {
         emit_log(&format!("HANDOFF: request after RECORD/resources, before video SETUP; wifi_phase={} {}; not waiting for Wi-Fi authentication",
             crate::wifi_iap2::phase(wifi_iap_id), crate::wifi_iap2::ingress_summary(wifi_iap_id)));
-        let result=request_bluetooth_handoff(&channel, &p.device_id,
-            || crate::wifi_iap2::is_active(wifi_iap_id), stop.clone()).await;
-        match result {
-            Some(Ok(reply)) => {
-                let business=bplist::parse(&reply.body).ok().and_then(|v|v.get("status").and_then(Value::as_int));
-                emit_log(&format!("HANDOFF: disableBluetooth rtsp_status={} business_status={business:?}; request only, keep_session_allowed={} wifi_phase={} {}",
-                    reply.status(),crate::wifi_iap2::can_keep_generation(wifi_iap_id),crate::wifi_iap2::phase(wifi_iap_id),crate::wifi_iap2::ingress_summary(wifi_iap_id)));
+        let model = info.get("model").and_then(Value::as_str).unwrap_or("");
+        if p.bmw_capabilities && (model == "MGU" || model.starts_with("MGU-")) {
+            start_mgu_handoff(&mut keepalive.0, channel.clone(), p.device_id.clone(),
+                move || crate::wifi_iap2::is_active(wifi_iap_id), stop.clone()).await?;
+            if !crate::wifi_iap2::is_active(wifi_iap_id) { return Err("MGU handoff session expired".into()); }
+        } else {
+            let result=request_bluetooth_handoff(&channel, &p.device_id,
+                || crate::wifi_iap2::is_active(wifi_iap_id), stop.clone()).await;
+            match result {
+                Some(Ok(reply)) => {
+                    let business=bplist::parse(&reply.body).ok().and_then(|v|v.get("status").and_then(Value::as_int));
+                    emit_log(&format!("HANDOFF: disableBluetooth rtsp_status={} business_status={business:?}; request only, keep_session_allowed={} wifi_phase={} {}",
+                        reply.status(),crate::wifi_iap2::can_keep_generation(wifi_iap_id),crate::wifi_iap2::phase(wifi_iap_id),crate::wifi_iap2::ingress_summary(wifi_iap_id)));
+                }
+                Some(Err(error)) => emit_log(&format!("HANDOFF: disableBluetooth failed: {error}; no automatic resend")),
+                None => return Err("交接请求取消或会话代次已失效".into()),
             }
-            Some(Err(error)) => emit_log(&format!("HANDOFF: disableBluetooth failed: {error}; no automatic resend")),
-            None => return Err("交接请求取消或会话代次已失效".into()),
         }
         if let Err(error) = screen_session.claim_box_startup_screen(&modes,initial_screen_revision).await {
             emit_log(&format!("BMW-MGU: startup screen claim failed: {error}; preserve control/audio and wait for receiver UI"));
@@ -619,6 +647,33 @@ fn diplay_can_validate_independent_audio_without_enabling_other_desktop_receiver
 async fn request_bluetooth_handoff(
     control: &RtspChannel, device: &str, current: impl Fn() -> bool, stop: Arc<Notify>,
 ) -> Option<Result<crate::rtsp::RtspMessage, String>> {
+    bluetooth_handoff_transaction(control, device, current, stop, None).await
+}
+
+pub(crate) async fn start_mgu_handoff(
+    tasks: &mut Vec<tokio::task::JoinHandle<()>>, control: Arc<RtspChannel>, device: String,
+    current: impl Fn() -> bool + Send + 'static, stop: Arc<Notify>,
+) -> Result<(), String> {
+    let (written, flushed) = tokio::sync::oneshot::channel();
+    tasks.push(tokio::spawn(async move {
+        match bluetooth_handoff_transaction(&control, &device, current, stop, Some(written)).await {
+            Some(Ok(reply)) => {
+                let status = bplist::parse(&reply.body).ok().and_then(|v| v.get("status").and_then(Value::as_int));
+                emit_log(&format!("HANDOFF: MGU disableBluetooth rtsp_status={} business_status={status:?}", reply.status()));
+            }
+            Some(Err(e)) => emit_log(&format!("HANDOFF: MGU disableBluetooth failed: {e}")),
+            None => {}
+        }
+    }));
+    flushed.await.map_err(|_| "MGU disableBluetooth cancelled or write failed".to_string())?;
+    emit_log("HANDOFF: MGU disableBluetooth written; proceeding to screen claim");
+    Ok(())
+}
+
+async fn bluetooth_handoff_transaction(
+    control: &RtspChannel, device: &str, current: impl Fn() -> bool, stop: Arc<Notify>,
+    written: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Option<Result<crate::rtsp::RtspMessage, String>> {
     if !current() || control.is_closed() { return None; }
     let body=bplist::encode(&Value::dict(vec![
         ("type",Value::str("disableBluetooth")),
@@ -627,7 +682,7 @@ async fn request_bluetooth_handoff(
     let reply=tokio::select! {
         biased;
         _=stop.notified()=>return None,
-        reply=control.request("POST","/command",&body,"application/x-apple-binary-plist",&[],Duration::from_secs(3))=>reply,
+        reply=control.request_with_write_signal("POST","/command",&body,"application/x-apple-binary-plist",&[],Duration::from_secs(3),written)=>reply,
     };
     if current() { Some(reply) } else { None }
 }
@@ -659,6 +714,90 @@ mod shutdown_tests {
         (RtspChannel::spawn(r, w, None).0, peer)
     }
     #[tokio::test]
+    async fn id9_diagnostics_match_wire_transactions_on_one_session() {
+        // This current-thread loopback records just this test's log messages.
+        struct Capture(std::thread::ThreadId, Mutex<Vec<String>>);
+        impl log::Log for Capture {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool { std::thread::current().id() == self.0 }
+            fn log(&self, r: &log::Record<'_>) {
+                if self.enabled(r.metadata()) { self.1.lock().push(r.args().to_string()); }
+            }
+            fn flush(&self) {}
+        }
+        let capture = Box::leak(Box::new(Capture(std::thread::current().id(), Mutex::new(Vec::new()))));
+        log::set_logger(capture).unwrap();
+        log::set_max_level(log::LevelFilter::Info);
+        let (control, mut peer) = pair().await;
+        install_session_uri(&control, "127.0.0.1").unwrap();
+        let server = tokio::spawn(async move {
+            let mut captures = Vec::new();
+            for seq in 1..=4 {
+                let mut wire = Vec::new();
+                let mut chunk = [0; 2048];
+                loop {
+                    let n = peer.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    wire.extend_from_slice(&chunk[..n]);
+                    if !crate::rtsp::parse_rtsp_messages(&mut wire.clone()).unwrap().is_empty() { break; }
+                }
+                let body = if seq == 4 { vec![] } else { bplist::encode(&Value::dict(vec![])) };
+                let status = if seq == 4 { "400 Bad Request" } else { "200 OK" };
+                let head = format!("RTSP/1.0 {status}\r\ncSeQ: {seq}\r\nX-Test: first\r\nX-Test: second\r\nContent-Length: {}\r\n\r\n", body.len());
+                peer.write_all(head.as_bytes()).await.unwrap();
+                peer.write_all(&body).await.unwrap();
+                captures.push((wire, head.into_bytes(), body));
+            }
+            captures
+        });
+        setup_and_read_info(&control, "phone", "test", 1234, true, Value::dict(vec![]),
+            false, true, false, true, false, None, None).await.unwrap();
+        for (method, path, body) in [
+            ("POST", "/command", crate::modes::Modes::initial().declaration()),
+            ("SETUP", "/", build_screen_setup(42, "display")),
+        ] {
+            control.request(method, path, &body, "application/x-apple-binary-plist", &[], Duration::from_secs(1)).await.unwrap();
+        }
+        let packets = server.await.unwrap();
+        let setup = crate::rtsp::parse_rtsp_messages(&mut packets[0].0.clone()).unwrap().remove(0);
+        let plist = bplist::parse(&setup.body).unwrap();
+        let sid = plist.get("sessionCorrelationUUID").unwrap().as_str().unwrap();
+        let trace = format!("ID9 sid={sid}");
+        assert_eq!(control.id9_trace.get(), Some(&trace));
+        let initial = |raw: Option<Value>| {
+            let info = Value::dict(raw.into_iter().map(|value| ("modes", value)).collect());
+            crate::modes::Modes::id9_initial(&info, true, &trace)
+        };
+        assert!(!initial(None).screen_owned());
+        assert!(!initial(Some(Value::str("bad-modes"))).screen_owned());
+        assert!(initial(Some(Value::dict(vec![]))).screen_owned());
+        let loan = Value::dict(vec![("resourceID",Value::int(1)),("transferType",Value::int(3)),
+            ("unborrowConstraint",Value::int(1000))]);
+        assert!(!initial(Some(Value::dict(vec![("resources",Value::array(vec![loan]))]))).screen_owned());
+        let logs = capture.1.lock();
+        for detail in ["INFO_MODES absent", "INFO_MODES part=1 text=String(\"bad-modes\")",
+            "INITIAL_MODES source=default_missing", "INITIAL_MODES source=default_invalid",
+            "INITIAL_MODES source=receiver screen_defaults=current,permanent,take,borrow,unborrow screen=1/1",
+            "INITIAL_MODES source=receiver screen_defaults=permanent,take,borrow screen=2/1 revision=0 take=100 borrow=100 unborrow=1000 borrows=1"] {
+            assert!(logs.iter().any(|line| line.starts_with(&format!("{trace} {detail}"))), "{detail}");
+        }
+        for (seq, kind) in [(1,"SESSION_SETUP"), (3,"RESOURCE"), (4,"FIRST_SCREEN_SETUP")] {
+            let prefix = format!("ID9 sid={sid} {kind} RTSP#{} CSeq={seq}", control.trace_id());
+            let (tx, rx_head, rx_body) = &packets[seq-1];
+            for (tag, expected) in [("TX_PREPARED_PLAINTEXT",tx), ("RX_HEAD",rx_head), ("RX_BODY",rx_body)] {
+                let tag = format!("{prefix} {tag}");
+                assert!(logs.iter().any(|s| s.starts_with(&format!("{tag} bytes={} ",expected.len()))), "{tag}");
+                let mut bytes = Vec::new();
+                for line in logs.iter().filter(|s|s.starts_with(&format!("{tag} offset="))) {
+                    assert!(line.contains(&format!("offset={} ",bytes.len())));
+                    let hex = line.split_once(" hex=").unwrap().1;
+                    bytes.extend((0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i+2],16).unwrap()));
+                }
+                assert_eq!(&bytes, expected, "{tag}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn wifi_station_mac_is_scoped_to_real_bmw_and_invalid_addresses_fall_back() {
         for (bmw,mbux,id9,model,mac,expected) in [
             (true,false,false,"MGU",Some("06:12:34:56:78:90"),"06:12:34:56:78:90"),
@@ -685,7 +824,7 @@ mod shutdown_tests {
                     peer.write_all(&body).await.unwrap();
                 }
             });
-            setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![("model",Value::str(model))]),mbux,id9,false,false,bmw,false,None,mac).await.unwrap();
+            setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![("model",Value::str(model))]),mbux,id9,false,bmw,false,None,mac).await.unwrap();
             server.await.unwrap();
         }
     }
@@ -732,6 +871,8 @@ mod shutdown_tests {
             let first=read_request(&mut peer).await;
             assert_eq!(first.first_line,"SETUP rtsp://[fe80::1%25wlan0]/66 RTSP/1.0");
             let first_body=bplist::parse(&first.body).unwrap();
+            assert!(!first_body.get("features").unwrap().as_array().unwrap().iter()
+                .any(|feature| feature.as_str() == Some("mainBuffered")), "ID9 proposed TCP buffered audio");
             assert!(first_body.get("features").unwrap().as_array().unwrap().iter().any(|f|f.as_str()==Some("hevc")));
             peer.write_all(format!("RTSP/1.0 400 Bad Request\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",first.cseq().unwrap()).as_bytes()).await.unwrap();
             let retry=read_request(&mut peer).await;
@@ -745,7 +886,7 @@ mod shutdown_tests {
             let body=bplist::encode(&Value::dict(vec![("model",Value::str("test"))]));
             peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: {}\r\n\r\n",info.cseq().unwrap(),body.len()).as_bytes()).await.unwrap();peer.write_all(&body).await.unwrap();
         });
-        let result=setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,false,true,true,None,None).await;
+        let result=setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,true,true,None,None).await;
         assert!(result.is_ok(),"{result:?}");assert!(!result.unwrap().2);server.await.unwrap();
     }
     #[tokio::test]
@@ -757,7 +898,7 @@ mod shutdown_tests {
                 peer.write_all(format!("RTSP/1.0 {status} Denied\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",request.cseq().unwrap()).as_bytes()).await.unwrap();
                 assert!(tokio::time::timeout(Duration::from_millis(50),peer.read(&mut [0u8;1])).await.is_err());
             });
-            assert!(setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,false,true,true,None,None).await.is_err());
+            assert!(setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,true,true,None,None).await.is_err());
             server.await.unwrap();
         }
     }
@@ -821,7 +962,7 @@ mod shutdown_tests {
         let c=control.clone();
         let task=tokio::spawn(async move {
             let mut cleanup=crate::negotiation_cleanup::NegotiationCleanup::new(c.clone(),true);
-            let result=setup_and_read_info(&c,"phone","name",1234,true,Value::dict(vec![]),false,true,false,false,false,false,Some(&mut cleanup),None).await;
+            let result=setup_and_read_info(&c,"phone","name",1234,true,Value::dict(vec![]),false,true,false,false,false,Some(&mut cleanup),None).await;
             cleanup.finish().await;result
         });
         let setup=read_request(&mut peer).await;assert!(setup.first_line.starts_with("SETUP "));
@@ -1340,7 +1481,7 @@ mod display_size_tests {
         let (read, write) = socket.into_split();
         let (channel, _) = RtspChannel::spawn(read, write, None);
         crate::auth_setup::run(&channel).await.unwrap();
-        let (_, info, _) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", "Test phone", 12345, true, Value::dict(vec![]), false, false, false, false, true, false, None, Some("06:12:34:56:78:90")).await.unwrap();
+        let (_, info, _) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", "Test phone", 12345, true, Value::dict(vec![]), false, false, false, true, false, None, Some("06:12:34:56:78:90")).await.unwrap();
         let display = &info.get("displays").unwrap().as_array().unwrap()[0];
         assert_eq!(uuid_text(display.get("uuid")).as_deref(), Some("actual-bmw-display"));
         assert_eq!(read_display_size(display), (2560, 744));
@@ -1509,7 +1650,6 @@ const CONTROLLER_FEATURES: &[&str] = &[
     "cornerMasks",
     "focusTransfer",
     "h.264Level5.1",
-    "mainBuffered",
     "altScreen",
     "enhancedSiri",
     "hevc",
@@ -1520,21 +1660,20 @@ const CONTROLLER_FEATURES: &[&str] = &[
     "videoPlayback",
 ];
 
-fn session_features(mbux: bool, id9: bool, media_compat: bool, id9_unbuffered: bool) -> Vec<Value> {
+fn session_features(mbux: bool, id9: bool, media_compat: bool) -> Vec<Value> {
     if mbux { return vec![Value::str("viewAreas")]; }
-    // ID9 keeps HEVC disabled; the opt-in buffered comparison changes only mainBuffered.
-    CONTROLLER_FEATURES.iter().filter(|f| !((id9 || media_compat) && **f == "hevc") && !((media_compat || (id9 && id9_unbuffered)) && **f == "mainBuffered"))
+    // Only type 100/102 UDP main audio is implemented.
+    CONTROLLER_FEATURES.iter().filter(|f| !((id9 || media_compat) && **f == "hevc"))
         .map(|f| Value::str(f)).collect()
 }
 
 // Codec preference is capability-gated across every profile. Keep all other profile
 // compatibility switches independent. UDP Main/MainHigh are not MainBuffered.
-fn video_session_features(mbux:bool,id9:bool,compat:bool,unbuffered:bool,bmw:bool,prefer_hevc:bool)->Vec<Value> {
-    let mut features:Vec<_>=session_features(mbux,id9,compat,unbuffered).into_iter().filter(|feature| {
+fn video_session_features(mbux:bool,id9:bool,compat:bool,bmw:bool,prefer_hevc:bool)->Vec<Value> {
+    let mut features:Vec<_>=session_features(mbux,id9,compat).into_iter().filter(|feature| {
         let name=feature.as_str().unwrap_or("");
         (name!="hevc" || prefer_hevc) &&
-        !(bmw && matches!(name,"sessionManagement"|"logTransfer"|"vehicleStateProtocol")) &&
-        !(bmw && !id9 && name=="mainBuffered")
+        !(bmw && matches!(name,"sessionManagement"|"logTransfer"|"vehicleStateProtocol"))
     }).collect();
     if prefer_hevc && !features.iter().any(|f|f.as_str()==Some("hevc")) {features.push(Value::str("hevc"));}
     features
@@ -1546,33 +1685,36 @@ fn negotiated_hevc(proposed:bool,setup:&Value)->bool {
 
 #[test]
 fn every_profile_proposes_hevc_only_when_effective_preference_allows_it() {
-    for mbux in [false,true] {for id9 in [false,true] {for compat in [false,true] {for unbuffered in [false,true] {for bmw in [false,true] {
-        let off=video_session_features(mbux,id9,compat,unbuffered,bmw,false);
-        let on=video_session_features(mbux,id9,compat,unbuffered,bmw,true);
+    for mbux in [false,true] {for id9 in [false,true] {for compat in [false,true] {for bmw in [false,true] {
+        let off=video_session_features(mbux,id9,compat,bmw,false);
+        let on=video_session_features(mbux,id9,compat,bmw,true);
         assert!(!off.iter().any(|f|f.as_str()==Some("hevc")));
-        assert_eq!(on.iter().filter(|f|f.as_str()==Some("hevc")).count(),1,"profile={mbux}/{id9}/{compat}/{unbuffered}/{bmw}");
+        assert_eq!(on.iter().filter(|f|f.as_str()==Some("hevc")).count(),1,"profile={mbux}/{id9}/{compat}/{bmw}");
+        for features in [&off, &on] {
+            assert!(!features.iter().any(|feature| feature.as_str() == Some("mainBuffered")));
+        }
         assert_eq!(on.into_iter().filter(|f|f.as_str()!=Some("hevc")).collect::<Vec<_>>(),off);
-    }}}}}
+    }}}}
 }
 
 #[test]
 fn bmw_capabilities_match_implemented_paths_and_hevc_is_opt_in() {
-    let features = video_session_features(false, false, false, false, true, false);
+    let features = video_session_features(false, false, false, true, false);
     for absent in ["hevc", "mainBuffered", "sessionManagement", "logTransfer", "vehicleStateProtocol"] {
         assert!(!features.iter().any(|f| f.as_str() == Some(absent)));
     }
     for present in ["uiContext", "viewAreas", "focusTransfer", "iAPChannel"] {
         assert!(features.iter().any(|f| f.as_str() == Some(present)));
     }
-    assert!(video_session_features(false, false, false, false, true, true).iter().any(|f| f.as_str()==Some("hevc")));
-    assert!(video_session_features(false, true, false, false, true, true).iter().any(|f| f.as_str()==Some("hevc")));
+    assert!(video_session_features(false, false, false, true, true).iter().any(|f| f.as_str()==Some("hevc")));
+    assert!(video_session_features(false, true, false, true, true).iter().any(|f| f.as_str()==Some("hevc")));
     let accepted=Value::dict(vec![("enabledFeatures",Value::array(vec![Value::str("hevc")]))]);
     assert!(negotiated_hevc(true,&accepted));
     assert!(!negotiated_hevc(false,&accepted));
     assert!(!negotiated_hevc(true,&Value::dict(vec![])));
 }
 
-fn build_session_setup(device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, mbux: bool, id9: bool, media_compat: bool, id9_unbuffered: bool) -> Vec<u8> {
+fn build_session_setup(device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, mbux: bool, id9: bool, media_compat: bool) -> Vec<u8> {
     let session_uuid = box_session_uuid();
     let mut fields: Vec<(&str, Value)> = vec![
         ("deviceID", Value::str(device_id)),
@@ -1592,7 +1734,7 @@ fn build_session_setup(device_id: &str, device_name: &str, timing_port: u16, enc
         ("keepAliveLowPower", Value::bool(true)),
         (
             "features",
-            Value::array(session_features(mbux, id9, media_compat, id9_unbuffered)),
+            Value::array(session_features(mbux, id9, media_compat)),
         ),
     ];
     if !encrypted {
@@ -1641,10 +1783,10 @@ fn valid_station_mac(value: &str) -> Option<String> {
 }
 
 async fn setup_and_read_info(
-    channel: &Arc<RtspChannel>, device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool, id9: bool, media_compat: bool, id9_unbuffered: bool, bmw: bool, prefer_hevc: bool, cleanup: Option<&mut crate::negotiation_cleanup::NegotiationCleanup>, network_mac: Option<&str>,
+    channel: &Arc<RtspChannel>, device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool, id9: bool, media_compat: bool, bmw: bool, prefer_hevc: bool, cleanup: Option<&mut crate::negotiation_cleanup::NegotiationCleanup>, network_mac: Option<&str>,
 ) -> Result<(Value, Value, bool), String> {
     emit_log(&format!("AIRPLAY: session device name={device_name}"));
-    let mut request = bplist::parse(&build_session_setup(device_id, device_name, timing_port, encrypted, mbux, id9, media_compat, id9_unbuffered)).map_err(|e|e.to_string())?;
+    let mut request = bplist::parse(&build_session_setup(device_id, device_name, timing_port, encrypted, mbux, id9, media_compat)).map_err(|e|e.to_string())?;
     if let Value::Dict(fields) = &mut request {
         if bmw && !id9 && !mbux && use_box_bootstrap(true, &previous_info) {
             if let Some(mac) = network_mac.and_then(valid_station_mac) {
@@ -1655,7 +1797,7 @@ async fn setup_and_read_info(
             }
         }
         if let Some((_,features))=fields.iter_mut().find(|(key,_)|key.as_str()==Some("features")) {
-            *features=Value::array(video_session_features(mbux,id9,media_compat,id9_unbuffered,bmw,prefer_hevc));
+            *features=Value::array(video_session_features(mbux,id9,media_compat,bmw,prefer_hevc));
         }
     }
     let body=bplist::encode(&request);
@@ -1663,8 +1805,10 @@ async fn setup_and_read_info(
         emit_log(&format!("MBUX-MEDIA: hevc_proposed={prefer_hevc} mainBuffered_proposed=false; implemented UDP audio; RECORD order unchanged"));
     }
     if id9 {
-        // Only booleans/counts: session SETUP carries identity, so never dump its raw bytes.
-        let features=video_session_features(mbux,id9,media_compat,id9_unbuffered,bmw,prefer_hevc);
+        if let Some(sid) = request.get("sessionCorrelationUUID").and_then(Value::as_str) {
+            channel.id9_trace.get_or_init(|| format!("ID9 sid={sid}"));
+        }
+        let features = request.get("features").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
         emit_log(&format!("ID9: session SETUP identity_consistent=true features={} hevc_proposed={prefer_hevc} mainBuffered_proposed={} timing_port_valid={}",
             features.len(), features.iter().any(|f|f.as_str()==Some("mainBuffered")), timing_port != 0));
     }
@@ -1678,7 +1822,7 @@ async fn setup_and_read_info(
         emit_log(&format!("VIDEO-CODEC: session HEVC proposal rejected status={}; retry once with H264 capability",reply.status()));
         if let Value::Dict(fields)=&mut request {
             if let Some((_,features))=fields.iter_mut().find(|(key,_)|key.as_str()==Some("features")) {
-                *features=Value::array(video_session_features(mbux,id9,media_compat,id9_unbuffered,bmw,false));
+                *features=Value::array(video_session_features(mbux,id9,media_compat,bmw,false));
             }
         }
         hevc_proposed=false;
@@ -1693,14 +1837,17 @@ async fn setup_and_read_info(
     emit_log("AIRPLAY: 会话 SETUP 已接受——读取会话内 /info");
     let info = match fetch_info(channel).await {
         Ok(value) if value.as_dict().map(|d| !d.is_empty()).unwrap_or(false) => {
+            if let Some(trace) = channel.id9_trace.get() { emit_log(&format!("{trace} INFO_RESULT source=session_info")); }
             emit_log("AIRPLAY: 会话内 /info 成功，采用本轮车机显示能力");
             value
         }
         Ok(_) => {
+            if let Some(trace) = channel.id9_trace.get() { emit_log(&format!("{trace} INFO_RESULT source=fallback_empty")); }
             emit_log("AIRPLAY: 会话内 /info 为空，保留先前能力或设置兜底");
             previous_info
         }
         Err(error) => {
+            if let Some(trace) = channel.id9_trace.get() { emit_log(&format!("{trace} INFO_RESULT source=fallback_error error={error:?}")); }
             emit_log(&format!("AIRPLAY: 会话内 /info 仍不可用（{error}），保留先前能力或设置兜底"));
             previous_info
         }
@@ -2459,7 +2606,7 @@ mod mbux_profile_tests {
     fn box_session_uuid_changes_per_attempt_without_replacing_phone_identity() {
         let mut sessions=std::collections::HashSet::new();
         for _ in 0..16 {
-            let body=bplist::parse(&build_session_setup("phone-device","phone",1234,true,false,false,false,false)).unwrap();
+            let body=bplist::parse(&build_session_setup("phone-device","phone",1234,true,false,false,false)).unwrap();
             assert_eq!(body.get("deviceID").and_then(Value::as_str),Some("phone-device"));
             let id=body.get("sessionUUID").and_then(Value::as_str).unwrap();
             assert_eq!(id.len(),36);
@@ -2476,7 +2623,7 @@ mod mbux_profile_tests {
         for encrypted in [true,false] {
             for mbux in [false,true] {
                 for device_id in ["02:11:22:33:44:55", "02:66:77:88:99:00"] {
-                    let body=bplist::parse(&build_session_setup(device_id,"test phone",1234,encrypted,mbux,false,false,false)).unwrap();
+                    let body=bplist::parse(&build_session_setup(device_id,"test phone",1234,encrypted,mbux,false,false)).unwrap();
                     assert_eq!(body.get("macAddress").and_then(Value::as_str),Some(device_id));
                     assert_eq!(body.get("deviceID"),body.get("macAddress"));
                     assert_eq!(body.get("name").and_then(Value::as_str),Some("test phone"));
@@ -2486,7 +2633,7 @@ mod mbux_profile_tests {
                     let features=body.get("features").unwrap().as_array().unwrap();
                     assert_eq!(features.len(),if mbux {1} else {CONTROLLER_FEATURES.len()});
                     if !mbux {
-                        for capability in ["viewAreas","uiContext","focusTransfer","mainBuffered","iAPChannel"] {
+                        for capability in ["viewAreas","uiContext","focusTransfer","iAPChannel"] {
                             assert!(features.iter().any(|v|v.as_str()==Some(capability)));
                         }
                     }
@@ -2495,16 +2642,6 @@ mod mbux_profile_tests {
         }
     }
 
-    #[test]
-    fn id9_buffered_experiment_changes_only_one_capability_and_is_profile_scoped() {
-        for id9 in [false,true] {
-            let base=session_features(false,id9,false,false);
-            let experiment=session_features(false,id9,false,true);
-            let expected:Vec<_>=base.iter().filter(|v|!id9 || v.as_str()!=Some("mainBuffered")).cloned().collect();
-            assert_eq!(experiment,expected);
-            assert_eq!(experiment.len(),if id9{12}else{14});
-        }
-    }
     #[test]
     fn mercedes_udp_audio_never_uses_buffered_type103_capabilities() {
         let formats=|kind,bits|Value::dict(vec![("audioFormats",Value::array(vec![Value::dict(vec![
@@ -2517,37 +2654,37 @@ mod mbux_profile_tests {
     }
     #[test]
     fn mercedes_features_match_implemented_media_without_changing_other_fields() {
-        let baseline=bplist::parse(&build_session_setup("phone","name",1234,true,false,false,false,false)).unwrap();
-        let compat=bplist::parse(&build_session_setup("phone","name",1234,true,false,false,true,false)).unwrap();
+        let baseline=bplist::parse(&build_session_setup("phone","name",1234,true,false,false,false)).unwrap();
+        let compat=bplist::parse(&build_session_setup("phone","name",1234,true,false,false,true)).unwrap();
         let features=compat.get("features").unwrap().as_array().unwrap();
         assert_eq!(features,&baseline.get("features").unwrap().as_array().unwrap().iter()
-            .filter(|f| !matches!(f.as_str(),Some("hevc"|"mainBuffered"))).cloned().collect::<Vec<_>>());
+            .filter(|f| f.as_str()!=Some("hevc")).cloned().collect::<Vec<_>>());
         assert!(features.iter().any(|f|f.as_str()==Some("h.264Level5.1")));
         let stable=|v:&Value|v.as_dict().unwrap().iter().filter(|(k,_)|
             !matches!(k.as_str(),Some("features"|"sessionUUID"|"sessionCorrelationUUID"))).cloned().collect::<Vec<_>>();
         assert_eq!(stable(&baseline),stable(&compat));
-        assert_eq!(session_features(false,false,false,false).len(),14);
-        assert_eq!(session_features(false,true,false,false).len(),13);
+        assert_eq!(session_features(false,false,false).len(),13);
+        assert_eq!(session_features(false,true,false).len(),12);
         assert_eq!(features.len(),12);
     }
     #[test]
     fn id9_session_removes_only_hevc_and_preserves_other_profiles() {
         for encrypted in [false, true] {
             for mbux in [false, true] {
-                let baseline = bplist::parse(&build_session_setup("phone", "name", 1234, encrypted, mbux, false,false,false)).unwrap();
-                let id9 = bplist::parse(&build_session_setup("phone", "name", 1234, encrypted, mbux, true,false,false)).unwrap();
+                let baseline = bplist::parse(&build_session_setup("phone", "name", 1234, encrypted, mbux, false,false)).unwrap();
+                let id9 = bplist::parse(&build_session_setup("phone", "name", 1234, encrypted, mbux, true,false)).unwrap();
                 let expected: Vec<_> = baseline.get("features").unwrap().as_array().unwrap().iter()
                     .filter(|f| f.as_str() != Some("hevc")).cloned().collect();
                 assert_eq!(id9.get("features").unwrap().as_array().unwrap(), &expected);
-                assert_eq!(expected.len(), if mbux { 1 } else { 13 });
+                assert_eq!(expected.len(), if mbux { 1 } else { 12 });
                 // These two UUIDs intentionally change on every build of a session body.
                 let stable_fields = |v: &Value| v.as_dict().unwrap().iter()
                     .filter(|(k, _)| !matches!(k.as_str(), Some("features" | "sessionUUID" | "sessionCorrelationUUID")))
                     .cloned().collect::<Vec<_>>();
                 assert_eq!(stable_fields(&baseline), stable_fields(&id9));
-                assert_eq!(baseline.get("features").unwrap().as_array().unwrap(), &session_features(mbux, false, false,false));
+                assert_eq!(baseline.get("features").unwrap().as_array().unwrap(), &session_features(mbux, false, false));
                 if !mbux {
-                    assert_eq!(session_features(false, false, false,false), CONTROLLER_FEATURES.iter().map(|f| Value::str(f)).collect::<Vec<_>>());
+                    assert_eq!(session_features(false, false, false), CONTROLLER_FEATURES.iter().map(|f| Value::str(f)).collect::<Vec<_>>());
                 }
             }
         }
@@ -2556,7 +2693,7 @@ mod mbux_profile_tests {
     #[test]
     fn minimal_features_and_100ms_latency_are_explicit_profile_choices() {
         for mbux in [false,true] {
-            let body=bplist::parse(&build_session_setup("real-mac","测试手机 \"BT\"",1234,true,mbux,false,false,false)).unwrap();
+            let body=bplist::parse(&build_session_setup("real-mac","测试手机 \"BT\"",1234,true,mbux,false,false)).unwrap();
             assert_eq!(body.get("name").and_then(Value::as_str),Some("测试手机 \"BT\""));
             let features=body.get("features").unwrap().as_array().unwrap();
             assert_eq!(features.len(),if mbux {1} else {CONTROLLER_FEATURES.len()});

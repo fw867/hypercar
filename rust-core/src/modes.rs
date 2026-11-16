@@ -14,6 +14,25 @@ struct Resource {
     borrow: i64,
     unborrow: i64,
 }
+
+// Track which effective screen fields came from /info. A valid dictionary can
+// omit the screen entirely or provide only some constraints.
+#[derive(Default)]
+struct ScreenFields {
+    current: bool, permanent: bool, take: bool, borrow: bool, unborrow: bool,
+}
+impl ScreenFields {
+    fn ownership(entry: &Value) -> Self {
+        Self { current: true, permanent: true, take: entry.get("takeConstraint").is_some(),
+            borrow: entry.get("borrowConstraint").is_some(), unborrow: false }
+    }
+    fn defaults(&self) -> String {
+        let fields = [("current",self.current), ("permanent",self.permanent), ("take",self.take),
+            ("borrow",self.borrow), ("unborrow",self.unborrow)];
+        let names = fields.iter().filter_map(|(name, present)| (!present).then_some(*name)).collect::<Vec<_>>();
+        if names.is_empty() { "none".into() } else { names.join(",") }
+    }
+}
 impl Default for Resource {
     fn default() -> Self { Self::owned(1, ANYTIME, ANYTIME) }
 }
@@ -192,11 +211,11 @@ impl Modes {
     }
 
     pub fn from_info_with_audio_policy(info: &Value, enable_audio: bool, box_bootstrap: bool, defer_audio: bool) -> Self {
-        crate::resource_trace::info_modes(info.get("modes"));
+        crate::resource_trace::info_modes("RESOURCE INFO_MODES", info.get("modes"));
         let fallback = if defer_audio || (box_bootstrap && !enable_audio) { Self::box_initial() } else { Self::initial() };
         let mut value = match info.get("modes") {
             Some(params) => match Self::read_initial(params) {
-                Some(value) => value,
+                Some((value, _)) => value,
                 None => { crate::emit_log("MODES: invalid /info.modes; using compatibility defaults"); fallback }
             },
             None => fallback,
@@ -216,21 +235,29 @@ impl Modes {
     }
 
     /// IDC23 publishes the receiver's initial screen ownership before requesting it.
-    pub fn id9_initial(info: &Value, enable_audio: bool) -> Self {
-        let mut value = info.get("modes").and_then(Self::read_initial).unwrap_or_else(|| {
-            let mut value = Self::initial();
-            value.resources[0] = Resource::owned(2, ANYTIME, ANYTIME);
-            value.resources[1] = Resource::owned(2, ANYTIME, ANYTIME);
-            value
-        });
+    pub fn id9_initial(info: &Value, enable_audio: bool, trace: &str) -> Self {
+        let raw = info.get("modes");
+        crate::resource_trace::info_modes(&format!("{trace} INFO_MODES"), raw);
+        let (mut value, fields, source) = match raw.and_then(Self::read_initial) {
+            Some((value, fields)) => (value, fields, "receiver"),
+            None => {
+                let mut value = Self::initial();
+                value.resources[0] = Resource::owned(2, ANYTIME, ANYTIME);
+                value.resources[1] = Resource::owned(2, ANYTIME, ANYTIME);
+                (value, ScreenFields::default(), if raw.is_none() { "default_missing" } else { "default_invalid" })
+            }
+        };
+        crate::emit_log(&format!("{trace} INITIAL_MODES source={source} screen_defaults={} {}",
+            fields.defaults(), value.diagnostics()));
         value.playback_enabled = enable_audio;
         if enable_audio { value.resources[1].take_by(1, USER_INITIATED, ANYTIME, ANYTIME); }
         value
     }
 
-    fn read_initial(params: &Value) -> Option<Self> {
+    fn read_initial(params: &Value) -> Option<(Self, ScreenFields)> {
         params.as_dict()?;
         let mut next = Self::initial();
+        let mut screen = ScreenFields::default();
         if let Some(values) = params.get("initialPermanentEntity") {
             for v in values.as_array()?.iter().take(3) {
                 let id = resource_id(v)?;
@@ -238,17 +265,23 @@ impl Modes {
                 if !(1..=2).contains(&entity) { return None; }
                 next.resources[id] = Resource::owned(entity,
                     optional_constraint(v, "takeConstraint")?, optional_constraint(v, "borrowConstraint")?);
+                if id == 0 { screen = ScreenFields::ownership(v); }
             }
             if values.as_array()?.len() > 2 { return None; }
         }
         if let Some(values) = params.get("resources") {
             if values.as_array()?.len() > 8 { return None; }
             for v in values.as_array()? {
-                let r = &mut next.resources[resource_id(v)?];
+                let id = resource_id(v)?;
+                let r = &mut next.resources[id];
                 match integer(v, "transferType")? {
-                    1 => *r = Resource::owned(2, optional_constraint(v, "takeConstraint")?, optional_constraint(v, "borrowConstraint")?),
+                    1 => {
+                        *r = Resource::owned(2, optional_constraint(v, "takeConstraint")?, optional_constraint(v, "borrowConstraint")?);
+                        if id == 0 { screen = ScreenFields::ownership(v); }
+                    }
                     3 => if r.permanent != 2 {
                         r.current = 2; r.borrows = 1; r.unborrow = optional_constraint(v, "unborrowConstraint")?;
+                        if id == 0 { screen.current = true; screen.unborrow = v.get("unborrowConstraint").is_some(); }
                     },
                     2 | 4 => {}, // Initial releases do not erase initialPermanentEntity.
                     _ => return None,
@@ -256,7 +289,7 @@ impl Modes {
             }
         }
         if !next.apply_apps(params) { return None; }
-        Some(next)
+        Some((next, screen))
     }
 
     pub fn snapshot(&self) -> Value {
@@ -554,7 +587,7 @@ mod id9_bootstrap_tests {
             let info=Value::dict(vec![("modes",Value::dict(vec![("resources",Value::array(vec![Value::dict(vec![
                 ("resourceID",Value::int(1)),("transferType",Value::int(1)),("takeConstraint",Value::int(constraint)),("borrowConstraint",Value::int(100)),
             ])]))]))]);
-            let mut modes=Modes::id9_initial(&info,true);
+            let mut modes=Modes::id9_initial(&info,true,"ID9 test");
             assert!(!modes.screen_owned()); assert!(modes.audio_owned());
             modes.request_ui(); assert_eq!(modes.screen_owned(),constraint==100);
         }

@@ -146,9 +146,9 @@ fun SettingsScreen(
                         GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)) {
                             SettingsMenuItem("我的车机", "车机型号、目标设备与增强发现") { open(SettingsPage.Car) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-                            SettingsMenuItem("连接与唤醒", "自动上车、待机通知与连接恢复") { open(SettingsPage.Connection) }
+                            SettingsMenuItem("连接与唤醒", "上车自动连接与连接恢复") { open(SettingsPage.Connection) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-                            SettingsMenuItem("画面与声音", "画面来源、音频转发与显示参数") { open(SettingsPage.Display) }
+                            SettingsMenuItem("画面与声音", "画面来源、音频格式与显示参数") { open(SettingsPage.Display) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
                             SettingsMenuItem("主题与外观", "跟随系统、HyperOS 风格浅色与深色") { open(SettingsPage.Appearance) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
@@ -165,7 +165,7 @@ fun SettingsScreen(
                     SettingsPage.Display -> {
                         CarSourceSection(startup, onRefreshSetup, connected = linkConnected,
                             title = "画面来源", compact = true)
-                        AudioSection(source = startup.source)
+                        AudioSection()
                         ResolutionSection()
                     }
                     SettingsPage.Permissions -> {
@@ -1257,11 +1257,6 @@ private fun FpsSegment(fps: Int, onFpsChanged: (Int) -> Unit) {
 private fun BehaviorSection(startup: io.github.hypercar.session.StartupReadiness) {
     val context = LocalContext.current
     var autoConnect by remember(io.github.hypercar.settings.SettingsRevision.value) { mutableStateOf(SettingsStore.autoConnect) }
-    var standbyNotification by remember(io.github.hypercar.settings.SettingsRevision.value) {
-        mutableStateOf(SettingsStore.standbyNotification)
-    }
-    var discoveryFallback by rememberSaveable { mutableStateOf(SettingsStore.bluetoothDiscoverableFallback) }
-    var carPlayMarker by rememberSaveable { mutableStateOf(SettingsStore.bluetoothCarPlayMarker) }
     var proactiveWifi by remember(io.github.hypercar.settings.SettingsRevision.value) { mutableStateOf(SettingsStore.proactiveWifiSession) }
     var proactiveWifiReconnect by remember(io.github.hypercar.settings.SettingsRevision.value) { mutableStateOf(SettingsStore.proactiveWifiReconnect) }
     val allowsProactiveWifi = remember(io.github.hypercar.settings.SettingsRevision.value) {
@@ -1290,41 +1285,6 @@ private fun BehaviorSection(startup: io.github.hypercar.session.StartupReadiness
             )
             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
             SwitchRow(
-                title = "待机通知",
-                subtitle = if (autoConnect) {
-                    "显示待机监听通知，降低后台被系统回收的概率"
-                } else {
-                    "开启上车自动连接后可设置"
-                },
-                checked = standbyNotification,
-                enabled = autoConnect,
-                onCheckedChange = {
-                    standbyNotification = it
-                    HyperCarRepo.setStandbyNotification(context, it)
-                },
-            )
-            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-            SwitchRow(
-                title = "蓝牙回连唤醒",
-                subtitle = "已配对车机 Wi-Fi 就绪 5 秒仍未会话时，短暂可发现 30 秒；需要 Shizuku",
-                checked = discoveryFallback,
-                onCheckedChange = {
-                    discoveryFallback = it
-                    SettingsStore.bluetoothDiscoverableFallback = it
-                },
-            )
-            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-            SwitchRow(
-                title = "CarPlay 蓝牙身份广播",
-                subtitle = "帮助车机识别本机，可单独开关对照连接效果",
-                checked = carPlayMarker,
-                onCheckedChange = {
-                    carPlayMarker = it
-                    HyperCarRepo.setBluetoothCarPlayMarker(it)
-                },
-            )
-            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-            SwitchRow(
                 title = "已配对车机 Wi-Fi 主动连接（实验）",
                 subtitle = if (allowsProactiveWifi) "接入已配对车机 Wi-Fi 并稳定 10 秒后尝试连接，不要求本次先连接成功；优先响应车机邀请"
                     else "当前车机配置要求车机发起连接，此开关不绕过该限制",
@@ -1349,68 +1309,33 @@ private fun BehaviorSection(startup: io.github.hypercar.session.StartupReadiness
                     HyperCarRepo.log("WIFI-ACTIVE: 中断恢复开关=${if (it) "开" else "关"}；已配对网络主动连接由独立开关控制")
                 },
             )
-            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-            SwitchRow(
-                title = "画面资源联动（实验）",
-                subtitle = if (profileLifecycle) "当前车机配置已启用；屏幕协商失败时保留控制连接，下次连接生效"
-                    else "取得主屏后建立视频通道，车机收回主屏时释放视频并保留音频，下次连接生效",
-                checked = profileLifecycle || resourceLifecycle,
-                enabled = !profileLifecycle,
-                onCheckedChange = {
-                    SettingsStore.screenResourceLifecycle = it
-                    resourceLifecycle = SettingsStore.screenResourceLifecycle
-                    HyperCarRepo.log("SCREEN-LIFECYCLE: 实验开关=${if (it) "开" else "关"}，下次连接生效")
-                },
-            )
+            if (!profileLifecycle) {
+                HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+                SwitchRow(
+                    title = "画面资源联动（实验）",
+                    subtitle = "取得主屏后建立视频通道，车机收回主屏时释放视频并保留音频，下次连接生效",
+                    checked = resourceLifecycle,
+                    onCheckedChange = {
+                        SettingsStore.screenResourceLifecycle = it
+                        resourceLifecycle = SettingsStore.screenResourceLifecycle
+                        HyperCarRepo.log("SCREEN-LIFECYCLE: 实验开关=${if (it) "开" else "关"}，下次连接生效")
+                    },
+                )
+            }
         }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AudioSection(source: String?) {
-    var enabled by rememberSaveable { mutableStateOf(SettingsStore.enableAudio) }
+private fun AudioSection() {
     var codec by rememberSaveable { mutableStateOf(SettingsStore.audioCodec) }
-    var voiceRecognition by rememberSaveable { mutableStateOf(SettingsStore.carVoiceRecognition) }
-    var microphoneProbe by rememberSaveable { mutableStateOf(SettingsStore.microphoneProbe) }
-    var carWithMicrophone by rememberSaveable { mutableStateOf(SettingsStore.carWithMicrophone) }
-    GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 2.dp)) {
-        SwitchRow(title = "音频转发", subtitle = "将声音传到车机，下次连接生效", checked = enabled,
-            onCheckedChange = { enabled = it; SettingsStore.enableAudio = it })
-        HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-        if (source == "carwith") {
-            SwitchRow(title = "CarWith 使用车机麦克风（实验）",
-                subtitle = "开启后由车机收音供 CarWith 小爱识别，单次最多 20 秒；关闭使用手机麦克风。需车机支持，下次连接生效",
-                checked = carWithMicrophone,
-                onCheckedChange = { carWithMicrophone = it; SettingsStore.carWithMicrophone = it })
-        } else if (source == "car_ui") {
-            SwitchRow(title = "车机麦克风收音测试（实验）",
-                subtitle = "长按语音键开始收音，最多 20 秒；再次长按停止。仅统计音量，不保存录音，也不唤醒手机助手。下次连接生效",
-                checked = microphoneProbe,
-                onCheckedChange = {
-                    microphoneProbe = it; SettingsStore.microphoneProbe = it
-                    if (it) { voiceRecognition = false; SettingsStore.carVoiceRecognition = false; io.github.hypercar.carui.CarSpeechValidation.cancel() }
-                })
-            SwitchRow(title = "车机语音字幕验证（实验）",
-                subtitle = "长按语音键使用车机收音，在顶部显示系统识别文字，不执行指令。结果需确认音频来源；下次连接生效",
-                checked = voiceRecognition,
-                onCheckedChange = {
-                    voiceRecognition = it; SettingsStore.carVoiceRecognition = it
-                    if (it) { microphoneProbe = false; SettingsStore.microphoneProbe = false }
-                    else io.github.hypercar.carui.CarSpeechValidation.cancel()
-                })
-            val speechContext = androidx.compose.ui.platform.LocalContext.current
-            TextButton(onClick = { io.github.hypercar.carui.CarSpeechValidation.inspect(speechContext) }) {
-                Text("检查系统识别服务")
-            }
-            io.github.hypercar.carui.CarSpeechPanel(Modifier.fillMaxWidth())
-        }
-        if (source == "carwith" || source == "car_ui") HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+    GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 10.dp)) {
         Text("音频格式", style = MaterialTheme.typography.bodySmall, color = TextSecondary)
         Spacer(Modifier.height(8.dp))
         SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
             listOf("auto" to "自动", "pcm" to "PCM", "aac" to "AAC 优先").forEachIndexed { index, (value, label) ->
-                SegmentedButton(selected = codec == value, enabled = enabled,
+                SegmentedButton(selected = codec == value,
                     onClick = { codec = value; SettingsStore.audioCodec = value },
                     shape = SegmentedButtonDefaults.itemShape(index, 3), label = { Text(label) })
             }
@@ -1492,7 +1417,6 @@ private fun agoText(atMillis: Long): String {
 private fun HeadUnitSection(connected: Boolean = false) {
     val context = androidx.compose.ui.platform.LocalContext.current
     var selectedId by rememberSaveable { mutableStateOf(SettingsStore.headUnitProfileId) }
-    var id9WithoutBuffered by rememberSaveable { mutableStateOf(SettingsStore.id9DisableBufferedAudio) }
     var expanded by rememberSaveable { mutableStateOf(false) }
     // 远程档案（GitHub 下发）：新增车型不用发版，点一下就能拉到
     val scope = androidx.compose.runtime.rememberCoroutineScope()
@@ -1666,19 +1590,6 @@ private fun HeadUnitSection(connected: Boolean = false) {
                     )
                 }
             }
-            if (current.id == "bmw_id9") {
-                SwitchRow(
-                    title = "ID9 不声明缓冲音频（对照实验）",
-                    subtitle = "仅移除 mainBuffered，HEVC 继续关闭；下次连接生效",
-                    checked = id9WithoutBuffered,
-                    enabled = !connected,
-                    onCheckedChange = {
-                        SettingsStore.id9DisableBufferedAudio = it
-                        id9WithoutBuffered = it
-                        io.github.hypercar.settings.SettingsRevision.bump()
-                    },
-                )
-            }
             Spacer(modifier = Modifier.height(8.dp))
             Text(
                 text = if (connected) {
@@ -1746,7 +1657,6 @@ fun CarSourceSection(
                 }, color = TextSecondary, style = MaterialTheme.typography.bodySmall)
                 if (current == "carwith" && startup.carWithInstalled) {
                     CarWithSettingsShortcut()
-                    CarWithStretchSetting()
                 }
                 if (!startup.carWithInstalled) {
                     Text("未安装系统 CarWith，此选项不可用。", color = AmberWarning,
@@ -1841,15 +1751,4 @@ private fun CarWithSettingsShortcut() {
     }) {
         Text("打开 CarWith 设置", color = ElectricCyan)
     }
-}
-
-@Composable
-private fun CarWithStretchSetting() {
-    SwitchRow(
-        title = "拉伸铺满车机屏幕",
-        subtitle = "暂时停用，视频按实际编码尺寸发送。",
-        checked = false,
-        onCheckedChange = {},
-        enabled = false,
-    )
 }

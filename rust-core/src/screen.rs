@@ -178,6 +178,17 @@ impl ScreenSender {
         pipeline.lock().video_tcp=Some(crate::tcp_diagnostics::TcpSnapshot::capture(self.w.as_ref().as_raw_fd(),connection_id));
         self.tcp_monitor=Some(crate::tcp_diagnostics::TcpMonitor::start(self.w.as_ref().as_raw_fd(),connection_id,pipeline.clone()));
         self.tcp_diagnostics=Some((pipeline,connection_id));
+        self.publish_format(None);
+    }
+    fn publish_format(&self, size: Option<(u32,u32)>) {
+        if let Some((pipeline,id)) = &self.tcp_diagnostics {
+            let mut p = pipeline.lock();
+            if p.video_tcp.as_ref().is_some_and(|tcp| tcp.connection_id == *id) {
+                p.video_format = size.map(|(width,height)| crate::pipeline::VideoFormat {
+                    width, height, codec: self.codec.as_str()
+                });
+            }
+        }
     }
     fn sample_tcp(&self) {
         if let Some((pipeline,id))=&self.tcp_diagnostics {
@@ -198,8 +209,8 @@ impl ScreenSender {
     pub fn size(&self) -> (u32, u32) {
         (self.width as u32, self.height as u32)
     }
-    pub fn set_receiver_size(&mut self,size:(u32,u32)) {self.receiver_size=Some(size);}
-    pub fn receiver_size(&self)->(u32,u32) {self.receiver_size.unwrap_or_else(||self.size())}
+    pub fn set_receiver_size(&mut self,size:(u32,u32)) {self.receiver_size=(size.0>=2 && size.1>=2).then_some(size);}
+    pub fn receiver_size(&self)->Option<(u32,u32)> {self.receiver_size}
 
     /// Preserve old configuration for diagnostics, but never falsify encoded dimensions.
     pub fn set_display_target(&mut self, width: u32, height: u32) {
@@ -213,6 +224,7 @@ impl ScreenSender {
 
     pub fn reset_source(&mut self) {
         crate::emit_log(&format!("VIDEO: reset source {}", self.diagnostics()));
+        self.publish_format(None);
         self.config_sent = false;
         self.last_vps = None; self.last_sps = None; self.last_pps = None;
         self.waiting_idr = true; self.last_sync_request = None;
@@ -308,6 +320,7 @@ impl ScreenSender {
         wire.extend_from_slice(&header);
         wire.extend_from_slice(avcc);
         self.w.write_all(&wire).await?;
+        self.publish_format(sps_size);
         self.config_sent = true;
         self.waiting_idr = true;
         crate::emit_log(&format!("VIDEO: config TCP written {}B codec={} header={}x{} encoder_report={}x{} sps={sps_size:?} report_matches_sps={:?} flags=0x{:02x} header_stretch=false requested_target={:?}; receiver decode/display unconfirmed",
@@ -349,7 +362,12 @@ impl ScreenSender {
     ///    作 VideoFrame；`pts_us` 为毫秒时间戳 * 1000，换算 NTP 32.32 写进 params[0]。
     ///
     /// config 尚未发出时丢帧（对齐参考实现：车机没有 avcC 就无从解码）。
+    #[cfg(test)]
     pub async fn send_video_annexb(&mut self, annexb: &[u8], pts_us: u64) -> std::io::Result<()> {
+        self.send_video_annexb_from(annexb, pts_us, crate::video_format::FrameOrigin::Live).await
+    }
+
+    pub async fn send_video_annexb_from(&mut self, annexb: &[u8], pts_us: u64, origin: crate::video_format::FrameOrigin) -> std::io::Result<()> {
         self.source_frames += 1;
         self.last_source = Some(tokio::time::Instant::now());
         if !self.observe_owner() {
@@ -464,7 +482,7 @@ impl ScreenSender {
         if is_idr {
             self.written_idrs += 1;
             if self.written_idrs == 1 || resuming {
-                crate::emit_log(&format!("VIDEO: IDR TCP written pts={pts_us}us frame={} wire={}B; receiver decode/display unconfirmed", self.frames, wire.len()));
+                crate::emit_log(&format!("VIDEO: IDR TCP written pts={pts_us}us frame={} wire={}B origin={}; receiver decode/display unconfirmed", self.frames, wire.len(), origin.as_str()));
             }
         }
         self.bytes = self.bytes.wrapping_add(plain.len() as u64);
@@ -542,6 +560,7 @@ impl Drop for ScreenSender {
     fn drop(&mut self) {
         crate::emit_log(&format!("VIDEO: sender released {}", self.diagnostics()));
         // Must stop descriptor sampling BEFORE Rust drops the write half and closes its fd.
+        self.publish_format(None);
         self.tcp_monitor.take();
     }
 }

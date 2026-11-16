@@ -712,7 +712,7 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePushVid
     let Ok(bytes)=env.convert_byte_array(&data) else {return;};
     if bytes.is_empty() {return;}
     if let Some(handle)=ENGINE.lock().as_ref() {
-        let _=handle.source_tx.send(engine::SourceEvent::VideoFrameTagged {pts_us:pts_us.max(0) as u64,data:bytes,codec});
+        let _=handle.source_tx.send(engine::SourceEvent::VideoFrameTagged {pts_us:pts_us.max(0) as u64,data:bytes,codec,origin:video_format::FrameOrigin::Live});
     }
 }
 

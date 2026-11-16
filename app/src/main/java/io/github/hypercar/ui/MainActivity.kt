@@ -159,7 +159,9 @@ private fun MainContent() {
     }
     LaunchedEffect(startup) {
         HyperCarRepo.refreshSystemState()
-        if (SettingsStore.autoConnect && !startup.automaticReady) {
+    }
+    LaunchedEffect(startup.automaticReady) {
+        if (SettingsStore.autoConnect) {
             HyperCarRepo.startAutomaticListening(context)
         }
     }

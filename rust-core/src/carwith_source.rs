@@ -3,7 +3,7 @@ use std::{collections::VecDeque, sync::Arc, time::{Duration, Instant}};
 use parking_lot::Mutex;
 use once_cell::sync::Lazy;
 use tokio::sync::{mpsc, Notify};
-use crate::{engine::{CarLifeEvent, EngineConfig}, carlife::{CarLifeConfig, CarLifeHub}, video_format::VideoCodec};
+use crate::{engine::{CarLifeEvent, EngineConfig}, carlife::{CarLifeConfig, CarLifeHub}, video_format::{FrameOrigin, VideoCodec}};
 
 const MAX_GOP_BYTES: usize = 4 * 1024 * 1024;
 const MAX_GOP_FRAMES: usize = 180;
@@ -11,7 +11,7 @@ const MAX_GOP_AGE: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 struct Feed {
-    target: Option<mpsc::UnboundedSender<CarLifeEvent>>,
+    target: Option<mpsc::UnboundedSender<(CarLifeEvent, FrameOrigin)>>,
     parameters: Vec<(u8, CarLifeEvent)>,
     gop: VecDeque<CarLifeEvent>, bytes: usize, since: Option<Instant>,
     codec: Option<VideoCodec>, size: Option<(u32,u32)>,
@@ -74,22 +74,22 @@ impl Feed {
             }
         }
         // Always drain the source. With no engine, PCM/video is never queued unboundedly.
-        if self.target.as_ref().is_some_and(|tx|tx.send(event).is_err()) {self.target=None;}
+        if self.target.as_ref().is_some_and(|tx|tx.send((event, FrameOrigin::Live)).is_err()) {self.target=None;}
     }
-    fn attach(&mut self)->mpsc::UnboundedReceiver<CarLifeEvent> {
+    fn attach(&mut self)->mpsc::UnboundedReceiver<(CarLifeEvent, FrameOrigin)> {
         let (tx,rx)=mpsc::unbounded_channel();
-        let _=tx.send(CarLifeEvent::SourceReset);
-        if self.handshake {let _=tx.send(CarLifeEvent::Handshake);}
-        for format in self.formats.iter().flatten() {let _=tx.send(format.clone());}
+        let _=tx.send((CarLifeEvent::SourceReset, FrameOrigin::Live));
+        if self.handshake {let _=tx.send((CarLifeEvent::Handshake, FrameOrigin::Live));}
+        for format in self.formats.iter().flatten() {let _=tx.send((format.clone(), FrameOrigin::Cached));}
         self.target=Some(tx); self.replay(); rx
     }
     fn replay(&mut self) {
         if self.since.is_some_and(|at|at.elapsed()>MAX_GOP_AGE) {self.clear_video();}
         let Some(tx)=&self.target else {return;};
-        let _=tx.send(CarLifeEvent::VideoReplay);
-        if let Some((width,height))=self.size {let _=tx.send(CarLifeEvent::EncoderResolution{width,height});}
-        for (_,parameter) in &self.parameters {let _=tx.send(parameter.clone());}
-        for frame in &self.gop {let _=tx.send(frame.clone());}
+        let _=tx.send((CarLifeEvent::VideoReplay, FrameOrigin::Cached));
+        if let Some((width,height))=self.size {let _=tx.send((CarLifeEvent::EncoderResolution{width,height}, FrameOrigin::Cached));}
+        for (_,parameter) in &self.parameters {let _=tx.send((parameter.clone(), FrameOrigin::Cached));}
+        for frame in &self.gop {let _=tx.send((frame.clone(), FrameOrigin::Cached));}
     }
 }
 
@@ -122,7 +122,7 @@ pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
     Ok(())
 }
 pub(crate) struct Attachment {
-    pub hub:Arc<CarLifeHub>, pub events:mpsc::UnboundedReceiver<CarLifeEvent>,
+    pub hub:Arc<CarLifeHub>, pub events:mpsc::UnboundedReceiver<(CarLifeEvent, FrameOrigin)>,
     pub display:Arc<Mutex<(u32,u32)>>, pub microphone:Option<Arc<crate::mic_probe::ProbeControl>>,
 }
 pub(crate) struct InputLease(pub Arc<CarLifeHub>);
@@ -171,7 +171,7 @@ mod tests {
             let mut source=attach(owner).unwrap();
             let began=Instant::now();let mut frames=0;
             tokio::time::timeout(Duration::from_secs(10),async {
-                while let Some(event)=source.events.recv().await {
+                while let Some((event,_))=source.events.recv().await {
                     if matches!(event,CarLifeEvent::VideoFrame{..}|CarLifeEvent::VideoFrameTagged{..}) {frames+=1;}
                     if began.elapsed()>=Duration::from_secs(3) && frames>=20 {break;}
                 }
@@ -195,9 +195,9 @@ mod tests {
         feed.receive(video(0x67));feed.receive(video(0x68));feed.receive(video(0x65));
         let mut rx=feed.attach();while rx.try_recv().is_ok() {}
         feed.since=Some(Instant::now()-Duration::from_secs(3));feed.replay();
-        assert!(matches!(rx.try_recv(),Ok(CarLifeEvent::VideoReplay)));
+        assert!(matches!(rx.try_recv(),Ok((CarLifeEvent::VideoReplay, _))));
         for kind in [0x67,0x68] {
-            match rx.try_recv().unwrap() {CarLifeEvent::VideoFrame{data,..}=>assert_eq!(data[4],kind),other=>panic!("{other:?}")}
+            match rx.try_recv().unwrap() {(CarLifeEvent::VideoFrame{data,..}, FrameOrigin::Cached)=>assert_eq!(data[4],kind),other=>panic!("{other:?}")}
         }
         assert!(rx.try_recv().is_err());
         assert!(feed.formats[1].is_some());
@@ -208,16 +208,27 @@ mod tests {
         feed.receive(video(0x67)); feed.receive(video(0x68));
         feed.receive(video(0x65)); feed.receive(video(0x41));
         let mut rx = feed.attach();
-        assert!(matches!(rx.try_recv(),Ok(CarLifeEvent::SourceReset)));
-        assert!(matches!(rx.try_recv(),Ok(CarLifeEvent::VideoReplay)));
-        assert!(matches!(rx.try_recv(),Ok(CarLifeEvent::EncoderResolution{width:1920,..})));
+        assert!(matches!(rx.try_recv(),Ok((CarLifeEvent::SourceReset, _))));
+        assert!(matches!(rx.try_recv(),Ok((CarLifeEvent::VideoReplay, _))));
+        assert!(matches!(rx.try_recv(),Ok((CarLifeEvent::EncoderResolution{width:1920,..}, _))));
         let mut kinds = Vec::new();
-        while let Ok(CarLifeEvent::VideoFrame{data,..}) = rx.try_recv() {kinds.push(data[4]);}
+        while let Ok((CarLifeEvent::VideoFrame{data,..}, FrameOrigin::Cached)) = rx.try_recv() {kinds.push(data[4]);}
         assert_eq!(kinds,vec![0x67,0x68,0x65,0x41]);
     }
 
     #[tokio::test]
     async fn screen_replay_writes_cached_avc_idr_without_a_new_source_frame() {
+        verify_first_idr(FrameOrigin::Cached).await;
+    }
+
+    #[tokio::test]
+    async fn screen_replay_with_only_parameters_writes_a_live_idr() {
+        verify_first_idr(FrameOrigin::Live).await;
+    }
+
+    async fn verify_first_idr(expected: FrameOrigin) {
+        android_logger::init_once(android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Info).with_tag("HyperCar-IDR-test"));
         use crate::screen::{build_avcc, ScreenCipher, ScreenSender};
         use tokio::{io::AsyncReadExt, net::{TcpListener, TcpStream}};
 
@@ -233,7 +244,9 @@ mod tests {
             au.extend_from_slice(&[0, 0, 0, 1]);
             au.extend_from_slice(nal);
         }
-        feed.receive(CarLifeEvent::VideoFrame { pts_us: 1000, data: au });
+        let pts = if expected == FrameOrigin::Cached { 1000 } else { 2000 };
+        let initial = if expected == FrameOrigin::Cached { au.clone() } else { au[..8].to_vec() };
+        feed.receive(CarLifeEvent::VideoFrame { pts_us: pts, data: initial });
         // The live copy arrived before screen installation and was consumed.
         while events.try_recv().is_ok() {}
         tokio::time::sleep(Duration::from_millis(125)).await;
@@ -242,16 +255,38 @@ mod tests {
         let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (mut peer, _) = listener.accept().await.unwrap();
         let key = [7; 32];
-        let mut sender = ScreenSender::new(client.into_split().1, ScreenCipher::ChaCha(key), 2736, 800, false);
+        let sender = ScreenSender::new(client.into_split().1, ScreenCipher::ChaCha(key), 2736, 800, false);
+        let (commands, installs) = mpsc::channel(1);
+        let (source, video) = mpsc::unbounded_channel();
+        let stop = Arc::new(Notify::new());
+        let pump = tokio::spawn(crate::engine::video_pump(
+            stop.clone(), Default::default(), true,
+            Arc::new(Mutex::new(crate::pipeline::Pipeline::new())), installs, video, false, 30, None,
+        ));
         let ready = Instant::now();
         tokio::time::timeout(Duration::from_secs(1), async {
+            let modes = crate::modes::Modes::initial();
+            let (reply, accepted) = tokio::sync::oneshot::channel();
+            commands.send(crate::screen_session::ScreenCommand::InstallIfOwned {
+                sender, revision: modes.screen_generation(), modes: Arc::new(Mutex::new(modes)), reply,
+            }).await.unwrap();
+            assert!(accepted.await.unwrap());
             feed.replay();
-            while let Ok(event) = events.try_recv() {
-                match event {
-                    CarLifeEvent::VideoReplay => sender.reset_source(),
-                    CarLifeEvent::VideoFrame { pts_us, data } => sender.send_video_annexb(&data, pts_us).await.unwrap(),
+            if expected == FrameOrigin::Live {
+                feed.receive(CarLifeEvent::VideoFrame { pts_us: pts, data: au });
+            }
+            while let Ok((event, origin)) = events.try_recv() {
+                let delivered = match event {
+                    CarLifeEvent::VideoReplay => crate::engine::SourceEvent::ResetVideoSource,
+                    CarLifeEvent::VideoFrame { pts_us, data } => {
+                        if crate::screen::annexb_nals(&data).iter().any(|n| n[0] & 31 == 5) {
+                            assert_eq!(origin, expected);
+                        }
+                        crate::engine::SourceEvent::VideoFrameTagged { pts_us, data, origin, codec: VideoCodec::H264 }
+                    }
                     other => panic!("unexpected replay event {other:?}"),
-                }
+                };
+                source.send(delivered).unwrap();
             }
             for opcode in [1, 0] {
                 let mut header = [0; 128];
@@ -269,7 +304,9 @@ mod tests {
                 }
             }
         }).await.expect("peer did not receive cached configuration and IDR");
-        println!("screen ready to loopback IDR read: {} us", ready.elapsed().as_micros());
+        println!("verified {} IDR, screen ready to loopback read: {} us", expected.as_str(), ready.elapsed().as_micros());
+        stop.notify_one();
+        pump.await.unwrap();
     }
     #[test] fn reset_and_overflow_never_replay_delta_without_idr() {
         let mut feed = Feed::default(); feed.receive(video(0x65));
@@ -287,7 +324,7 @@ mod tests {
         let first = feed.attach(); drop(first);
         feed.receive(video(0x41));
         let mut second = feed.attach(); let mut frames=0;
-        while let Ok(event) = second.try_recv() {
+        while let Ok((event,_)) = second.try_recv() {
             assert!(!matches!(event,CarLifeEvent::AudioData{..}));
             if matches!(event,CarLifeEvent::VideoFrame{..}) {frames+=1;}
         }

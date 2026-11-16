@@ -17,6 +17,8 @@ data class PipelineDiagnostics(
     val wifiIap2: String = "WAIT_SESSION",
     val screenOwned: Boolean? = null,
     val videoStream: String = "WAIT_SETUP",
+    val displaySize: String? = null,
+    val videoFormat: String? = null,
     val sourceUnits: Long = 0,
     val writtenFrames: Long = 0,
     val audioReady: Boolean = false,
@@ -98,6 +100,18 @@ data class PipelineDiagnostics(
             require(generation > 0)
             val timing = j.optJSONObject("timing")
             val tcp = j.optJSONObject("video_tcp")
+            fun resolution(width: Int, height: Int) =
+                if (width > 0 && height > 0) "${width}×${height}" else null
+            val display = j.optJSONArray("display_size")
+            val video = j.optJSONObject("video_format")
+            val format = video?.let {
+                val size = resolution(it.optInt("width"), it.optInt("height")) ?: return@let null
+                when (it.optString("codec")) {
+                    "hevc" -> "$size HEVC"
+                    "h264" -> "$size H.264"
+                    else -> null
+                }
+            }
             fun JSONObject?.number(key: String): Long? =
                 if (this == null || isNull(key)) null else optLong(key).takeIf { it >= 0 }
             PipelineDiagnostics(
@@ -109,6 +123,8 @@ data class PipelineDiagnostics(
                 controlReady = j.optBoolean("control_ready"), wifiIap2 = j.optString("wifi_iap2", "WAIT_SESSION"),
                 screenOwned = if (j.isNull("screen_owned")) null else j.getBoolean("screen_owned"),
                 videoStream = j.optString("video_stream", "WAIT_SETUP"),
+                displaySize = display?.let { resolution(it.optInt(0), it.optInt(1)) },
+                videoFormat = format,
                 sourceUnits = j.optLong("video_source_units").coerceAtLeast(0),
                 writtenFrames = j.optLong("video_frames_written").coerceAtLeast(0),
                 audioReady = j.optBoolean("audio_ready"), audioPackets = j.optLong("audio_packets_written").coerceAtLeast(0),

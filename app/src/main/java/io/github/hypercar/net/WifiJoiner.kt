@@ -2,10 +2,12 @@ package io.github.hypercar.net
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.wifi.WifiManager
+import android.net.wifi.WifiInfo
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.SystemClock
 import android.util.Log
@@ -159,7 +161,7 @@ class WifiJoiner(
                     setBssid(android.net.MacAddress.fromString(it.bssid))
                     if (android.os.Build.VERSION.SDK_INT >= 34 && it.ageSeconds <= 30 && it.frequency in 2400..7125)
                         setPreferredChannelsFrequenciesMhz(intArrayOf(it.frequency))
-                    Log.i(TAG, "local-only exact AP from invitation + scan bssid=${it.bssid} scan_age_s=${it.ageSeconds}")
+                    Log.i(TAG, "local-only exact AP from invitation + scan scan_age_s=${it.ageSeconds}")
                 }
                 // 开放网络：Builder 没有 setOpenNetwork()，不设任何密码方法即为开放；
                 // WPA2 只有 setWpa2Passphrase 一条路径。
@@ -174,7 +176,7 @@ class WifiJoiner(
                 .setNetworkSpecifier(specifier)
                 .build()
 
-            val network = awaitSpecifierHandle(request, ssid, hint, SPECIFIER_WAIT_MS, verifiedFallback)
+            val network = awaitSpecifierHandle(request, specifier, ssid, hint, SPECIFIER_WAIT_MS, verifiedFallback)
                 ?: return@withContext JoinResult.Failed
             val caps = connectivityManager.getNetworkCapabilities(network)
             if (!CarWifiPolicy.canReuse(caps, ownsLiveRequest(network))) {
@@ -189,61 +191,93 @@ class WifiJoiner(
         }
 
     /** 用 specifier 请求拿 Network 句柄；首连时系统确认框的等待时间也算在 [timeoutMs] 内。 */
-    private suspend fun awaitSpecifierHandle(request: NetworkRequest, ssid: String, hint: WifiApHint?, timeoutMs: Long,
+    private suspend fun awaitSpecifierHandle(request: NetworkRequest, specifier: WifiNetworkSpecifier, ssid: String, hint: WifiApHint?, timeoutMs: Long,
         verifiedFallback: suspend () -> Network?): Network? {
         val latch = CountDownLatch(1)
         val result = AtomicReference<Network?>(null)
         // 立刻 onUnavailable 与「等到超时」是完全不同的病因，必须分开记
         val unavailable = java.util.concurrent.atomic.AtomicBoolean(false)
         val started = SystemClock.elapsedRealtime()
+        val trace = WifiJoinDiagnostics(context, ssid, ::diagnose)
+        val waiting = java.util.concurrent.atomic.AtomicBoolean(true)
         val cb = object : ConnectivityManager.NetworkCallback() {
+            private var sawCapabilities = false
+            private var sawProperties = false
             override fun onAvailable(network: Network) {
                 if (!association.available(this, network)) return
                 result.set(network)
-                diagnose("callback=available elapsed_ms=${SystemClock.elapsedRealtime() - started}; verifying capabilities/address")
+                trace.log("callback=available handle=${network.networkHandle}")
                 latch.countDown()
             }
 
             override fun onUnavailable() {
                 if (!association.unavailable(this)) return
                 unavailable.set(true)
-                diagnose("callback=unavailable elapsed_ms=${SystemClock.elapsedRealtime() - started}; live network verification required")
+                trace.log("callback=unavailable handle_present=${result.get() != null}")
                 latch.countDown()
             }
 
             override fun onLost(network: Network) {
                 if (association.owner() !== this) return
                 result.compareAndSet(network, null)
-                diagnose("callback=lost bound=${boundNetwork.get() == network}")
+                trace.log("callback=lost handle=${network.networkHandle} bound=${boundNetwork.get() == network}")
                 handleNetworkLost(this, network)
+            }
+
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                if (association.owner() !== this || (sawCapabilities && !waiting.get())) return
+                sawCapabilities = true
+                trace.log("callback=capabilities handle=${network.networkHandle} wifi=${caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)} " +
+                    "ssid_match=${WifiJoinDiagnostics.ssidMatch((caps.transportInfo as? WifiInfo)?.ssid, ssid)} " +
+                    "validated=${caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)}")
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, props: LinkProperties) {
+                if (association.owner() !== this || (sawProperties && !waiting.get())) return
+                sawProperties = true
+                trace.log("callback=link_properties handle=${network.networkHandle} " +
+                    "v4_count=${props.linkAddresses.count { it.address is java.net.Inet4Address }} " +
+                    "v6_count=${props.linkAddresses.count { it.address is java.net.Inet6Address }} routes=${props.routes.size}")
             }
         }
         association.register(cb)
-        diagnose("request timeout_ms=$timeoutMs exact_ap=${hint != null}; no SSID/password/address logged")
+        trace.log("request timeout_ms=$timeoutMs exact_ap=${hint != null}")
+        trace.start(specifier) { waiting.get() && association.owner() === cb }
         try {
             // 系统确认框和关联/DHCP 共用这一个超时窗口，不是单独计时。
             // （该重载的 timeout 参数是 Int，需从 Long 转换）
             connectivityManager.requestNetwork(request, cb, timeoutMs.toInt())
+            trace.log("request_submitted")
         } catch (t: Throwable) {
             cancelPendingRegistration(cb)
+            waiting.set(false)
+            trace.log("request_exception=${t.javaClass.simpleName}")
+            trace.close()
             lastFailureReason = "requestNetwork 抛异常：${t.javaClass.simpleName}: ${t.message}"
             Log.i(TAG, "specifier requestNetwork 失败：${t.message}")
             return null
         }
         val deadline = SystemClock.uptimeMillis() + timeoutMs
         try {
-            if (ShizukuTools.isReady && io.github.hypercar.spike.SpikeShell.isConnected()) {
-                val token = java.util.UUID.randomUUID().toString()
+            val shizukuReady = ShizukuTools.isReady
+            val shellConnected = io.github.hypercar.spike.SpikeShell.isConnected()
+            if (shizukuReady && shellConnected) {
+                val token = trace.id
                 selectionToken.set(token)
                 val selected = io.github.hypercar.spike.SpikeShell.startWifiSelection(
                     selectionOwner, token, ssid, hint?.bssid.orEmpty(), android.os.Process.myUid())
-                Log.i(TAG, "local-only selection: $selected")
+                trace.log("selection=shell armed=${selected.startsWith("OK")}")
                 if (association.owner() !== cb || selectionToken.get() != token)
                     io.github.hypercar.spike.SpikeShell.stopWifiSelection(token)
-            }
+            } else trace.log("selection=system shizuku_ready=$shizukuReady shell_connected=$shellConnected approval_ui=unobservable")
+            var nextSample = SystemClock.elapsedRealtime() + 2_000
             while (SystemClock.uptimeMillis() < deadline) {
                 currentCoroutineContext().ensureActive()
                 if (latch.await(200, TimeUnit.MILLISECONDS)) break
+                if (SystemClock.elapsedRealtime() >= nextSample) {
+                    trace.station()
+                    nextSample = SystemClock.elapsedRealtime() + 2_000
+                }
             }
             // Do not unregister a potentially live request before checking the actual network.
             // A system Wi-Fi association alone is insufficient: fallback must pass the caller's
@@ -254,7 +288,7 @@ class WifiJoiner(
                     result.get()?.takeIf { ready(it) } ?: verifiedFallback()?.takeIf { ready(it) }
                 })
             if (verified != null) {
-                diagnose("verified=true callback_available=${result.get() != null} unavailable=${unavailable.get()}")
+                trace.log("verified=true handle=${verified.networkHandle} source=${if (result.get() == verified) "request_callback" else "existing_wifi"} unavailable=${unavailable.get()}")
                 return verified
             }
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
@@ -268,11 +302,13 @@ class WifiJoiner(
             diagnose("verification exception=${error.javaClass.simpleName}")
             return null
         } finally {
-            stopSelection()
+            waiting.set(false)
+            stopSelection(trace.id)
+            trace.close()
         }
         val network = association.network() ?: result.get()
         if (network == null || !ready(network)) {
-            diagnose("verified=false candidate=${network != null} ${readiness(network)}")
+            trace.log("verified=false candidate=${network != null} ${readiness(network)}")
             // No association: release a pending request. An associated AP without a ready
             // address belongs to the Wi-Fi lifetime, rather than this failed CarPlay attempt.
             cancelPendingRegistration(cb)
@@ -370,10 +406,10 @@ class WifiJoiner(
         }
     }
 
-    private fun stopSelection() {
-        selectionToken.getAndSet(null)?.let { token ->
-            runCatching { io.github.hypercar.spike.SpikeShell.stopWifiSelection(token) }
-        }
+    private fun stopSelection(token: String? = selectionToken.get()) {
+        if (token == null || !selectionToken.compareAndSet(token, null)) return
+        val summary = runCatching { io.github.hypercar.spike.SpikeShell.stopWifiSelection(token) }.getOrNull()
+        diagnose("request_id=$token selection_result=${summary?.takeIf { it.startsWith("OK Wi-Fi selector released") } ?: "unavailable"}")
     }
 
     internal companion object {

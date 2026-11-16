@@ -13,7 +13,7 @@
 
 新增 AAC-LC48k 双声道发送：Android NDK MediaCodec 编码，目标 256kbps；type102 / audioFormat0x800000 / spf1024 / ct4 / sr48000。一包一个裸 AAC 帧，不加 ADTS/AU 头、不换字节序；RTP 时间戳和同步包按1024采样推进。编码器配置输出不作音频发送；采集、重采样、TTS 混音仍共用48k PCM输入，CarWith和自绘均可使用。资源被车机接管时停止编码/发包并丢弃待编码数据，重新取得资源时重建编码器，保持密钥/nonce计数连续。
 
-音频类型：type100 为 Main，type102 为 MainHigh，均走 UDP；type103 才是 MainBuffered TCP，当前未实现。会话能力 `mainBuffered` 不代表 type102 使用缓冲 TCP。参考接收端的 `audioBufferSize` 位于 type103 的 SETUP 响应，不能据此认定 type102 请求缺少该字段而返回400。
+主音频使用 type100（Main）或 type102（MainHigh），均走 UDP。所有车机档案的初始会话 SETUP 均省略 `mainBuffered`，ID9 旧版实验开关的保存值也会被忽略。type103（MainBuffered）使用 TCP，当前未实现。参考接收端的 `audioBufferSize` 位于 type103 的 SETUP 响应。
 
 设置「画面与声音 → 音频格式」提供自动、PCM、AAC优先，下次连接生效。自动保持旧车型的PCM48k首选；ID9只尝试/info明确声明的媒体输出格式，PCM48不可用但声明AAC48时用AAC。AAC优先只在type102/media/output声明AAC48时尝试，否则保留可用PCM路径；仅AAC44的车机本次仍不支持。DiPlay已实测AAC协商成功、约47包/秒，用户确认出声；不等于ID9实车验证。参考[CarPToCarL](https://github.com/jjuugk/CarPToCarL)的AAC裸帧和RTP约定，编码/发送实现位于Rust核心。
 
@@ -90,7 +90,7 @@ peak=0、rms=0 表示输入为零；active=false 优先核实播放器是否真�
 
 ## 644 输入收音实验
 
-自绘UI可在设置开启默认关闭的车机麦克风测试，重连后长按语音键触发。只协商已声明的type107/speechRecognition/Opus16k单声道输入，通过车机网络绑定UDP接收、Input密钥认证解密、Android NDK Opus解码，仅统计PCM音量。最长20秒，不保存录音，不送往助手；独立connectionID和单流TEARDOWN隔离媒体输出。设置关闭时不创建收音任务。详见[输入和语音](INPUT-AND-VOICE.md)。
+当前两种画面来源均开启音频转发。CarWith 默认使用车机麦克风，在语音识别请求到达后协商车机输入。自绘 UI 的收音测试和语音字幕保持关闭。以下记录旧版实验行为。自绘 UI 当时可在重连后长按语音键测试收音。只协商已声明的type107/speechRecognition/Opus16k单声道输入，通过车机网络绑定UDP接收、Input密钥认证解密、Android NDK Opus解码，仅统计PCM音量。最长20秒，不保存录音，不送往助手；独立connectionID和单流TEARDOWN隔离媒体输出。设置关闭时不创建收音任务。详见[输入和语音](INPUT-AND-VOICE.md)。
 
 
 645新增独立的CarWith车机麦克风实验开关，默认关闭。启用后由CarWith识别开始/结束业务请求驱动车机type107收音，将Opus解码输出转换为16k单声道PCM16，经现有CarLife VR加密上行到内置小爱；不改变手机麦克风默认选项、自绘UI和媒体输出候选。详见[CarWith来源](CARWITH-SOURCE.md)。

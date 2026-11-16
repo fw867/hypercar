@@ -65,7 +65,7 @@ object CarUiCaster {
         if (running) {
             // A new native engine needs the touch callback and source dimensions again.
             installTouchListener()
-            if (SettingsStore.enableAudio) CarAudioCapture.start(context) else CarAudioCapture.stop()
+            CarAudioCapture.start(context)
             // 引擎重连会新建一个 encoder_size（初始值来自设置，可能是 2560x744）；
             // 画面尺寸必须重新上报，否则 Rust 触摸坐标按 2560x744 缩放，D1/D2 上点不动。
             runCatching { RustCoreBridge.nativeSetVideoSize(width, height) }
@@ -122,7 +122,7 @@ object CarUiCaster {
         }
 
         running = true
-        if (SettingsStore.enableAudio) CarAudioCapture.start(context)
+        CarAudioCapture.start(context)
         // 引擎刚起时 nativeSetVideoSize 可能落在 ENGINE 句柄安装之前；延迟补报一次
         scope.launch {
             kotlinx.coroutines.delay(900)

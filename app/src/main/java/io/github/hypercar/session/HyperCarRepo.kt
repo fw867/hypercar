@@ -867,26 +867,6 @@ object HyperCarRepo {
         }
     }
 
-    /**
-     * 待机通知开关：关掉后立刻撤掉「正在监听车机」的前台通知（会话占用前台时不动），
-     * 打开后若正在待机则补回前台保活。
-     */
-    fun setStandbyNotification(context: Context, enabled: Boolean) {
-        SettingsStore.standbyNotification = enabled
-        io.github.hypercar.settings.SettingsRevision.bump()
-        if (enabled) {
-            if (automaticConnectionAllowed && !hasCurrentSession) {
-                runCatching { context.startForegroundService(HyperCarService.listenIntent(context)) }
-                    .onFailure { log("SERVICE: 待机通知恢复失败：${it.message}") }
-            }
-        } else if (!hasCurrentSession) {
-            // 没有会话要保活：直接停前台服务，监听本身仍在进程内跑
-            runCatching { context.stopService(android.content.Intent(context, HyperCarService::class.java)) }
-                .onFailure { log("SERVICE: 待机通知取消失败：${it.message}") }
-        }
-        log("AUTO: 待机通知${if (enabled) "已开启" else "已关闭"}")
-    }
-
     /** 只处理待机监听；当前手动/自动会话不随开关切换被拆除。 */
     fun startAutomaticListening(context: Context): Job {
         init(context)
@@ -901,9 +881,9 @@ object HyperCarRepo {
                 if (SettingsStore.autoConnect) {
                     val issues = StartupRequirements.read(context).automaticIssues
                     if (issues.isNotEmpty()) {
-                        SettingsStore.autoConnect = false
-                        io.github.hypercar.settings.SettingsRevision.bump()
-                        log("STARTUP: 启动条件未满足，已关闭自动上车连接：${issues.joinToString("；")}")
+                        stopStandbyListening(standbyReady = false)
+                        log("STARTUP: 自动上车连接等待启动条件：${issues.joinToString("；")}")
+                        return@launch
                     }
                 }
                 if (SettingsStore.autoConnect) startWifiReconnectMonitor(context)
@@ -965,16 +945,8 @@ object HyperCarRepo {
             if (SettingsStore.autoConnect) connectAutomatically(context, "standby-iap2")
         }
         if (coordinator.isRunning) {
-            // 「待机通知」关掉时不进前台服务：通知栏干净，代价是进程更容易被回收
-            // （车机 ACL 广播仍会尝试拉起 App，见清单里的 CarBluetoothReceiver）。
-            if (SettingsStore.standbyNotification) {
-                runCatching { context.startForegroundService(HyperCarService.listenIntent(context)) }
-                    .onFailure { log("SERVICE: 后台监听保活启动失败：${it.message}") }
-            } else {
-                runCatching { context.startService(HyperCarService.listenIntent(context)) }
-                    .onFailure { log("SERVICE: 后台监听启动失败：${it.message}") }
-                log("AUTO: 待机通知已关闭——只做进程内监听，不发前台通知")
-            }
+            runCatching { context.startForegroundService(HyperCarService.listenIntent(context)) }
+                .onFailure { log("SERVICE: 后台监听保活启动失败：${it.message}") }
             log("AUTO: 待机监听已启用，等待车机；尚未发起 AirPlay 会话")
             updateCarProfileGuard(context)
         }
@@ -996,13 +968,8 @@ object HyperCarRepo {
         coordinator.keepIdentityOnly()
         io.github.hypercar.carui.MusicNotificationListener.sync(context)
         if (coordinator.isRunning) {
-            if (SettingsStore.standbyNotification) {
-                runCatching { context.startForegroundService(HyperCarService.identityIntent(context)) }
-                    .onFailure { log("SERVICE: 身份声明保活启动失败 ${it.message}") }
-            } else {
-                runCatching { context.startService(HyperCarService.identityIntent(context)) }
-                    .onFailure { log("SERVICE: 身份声明保活启动失败 ${it.message}") }
-            }
+            runCatching { context.startForegroundService(HyperCarService.identityIntent(context)) }
+                .onFailure { log("SERVICE: 身份声明保活启动失败 ${it.message}") }
             log("AUTO: 休眠中仅保留 iPhone/CarPlay 服务声明，不扫描、不拨号、不进行 iAP2 握手")
         }
     }
@@ -1014,14 +981,9 @@ object HyperCarRepo {
         else CarProfileGuard.stop()
     }
 
-    fun setBluetoothCarPlayMarker(enabled: Boolean) {
-        SettingsStore.bluetoothCarPlayMarker = enabled
-        iap2?.refreshCarPlayMarker()
-        log("BT-MARKER: 额外 CarPlay 身份广播=${if (enabled) "开" else "关"}，保留主 iAP2 服务")
-    }
-
-    private fun stopStandbyListening() {
-        appContext()?.let { updateCarProfileGuard(it) }
+    private fun stopStandbyListening(standbyReady: Boolean = true) {
+        if (standbyReady || hasCurrentSession) appContext()?.let { updateCarProfileGuard(it) }
+        else CarProfileGuard.stop()
         stopWifiReconnectMonitor()
         if (hasCurrentSession) return
         reconnectJob?.cancel()

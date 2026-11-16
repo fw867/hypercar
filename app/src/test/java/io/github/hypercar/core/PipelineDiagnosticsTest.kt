@@ -4,6 +4,15 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PipelineDiagnosticsTest {
+    @Test fun declared_screen_and_written_video_are_independent() {
+        val pending = PipelineDiagnostics.parse("""{"generation":1,"display_size":[2400,1080]}""")!!
+        assertEquals("2400×1080", pending.displaySize)
+        assertNull(pending.videoFormat)
+        for ((codec, label) in listOf("hevc" to "HEVC", "h264" to "H.264")) {
+            val video = PipelineDiagnostics.parse("""{"generation":1,"display_size":[2400,1080],"video_format":{"codec":"$codec","width":1920,"height":720}}""")!!
+            assertEquals("1920×720 $label", video.videoFormat)
+        }
+    }
     @Test fun audio_format_is_actual_negotiated_codec_and_rate_can_be_zero_or_unknown() {
         val pcm=PipelineDiagnostics.parse("""{"generation":1,"audio_ready":true,"audio_codec":"PCM","audio_kbps":1536}""")!!
         assertEquals("PCM",pcm.audioCodec);assertEquals(1536L,pcm.audioKbps)

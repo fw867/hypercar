@@ -1,4 +1,4 @@
-//! Resource and media-stream SETUP diagnostics. Excludes session SETUP and authentication.
+//! Resource and SETUP diagnostics. ID9 session SETUP is selected at the control connection.
 use crate::{bplist::{self, Value}, rtsp::RtspMessage};
 use sha2::{Digest, Sha256};
 
@@ -26,8 +26,7 @@ pub(crate) fn is_resource_request(method: &str, path: &str, body: &[u8]) -> bool
         .is_some_and(|kind| matches!(kind.as_str(), "modesChanged" | "changeModes"))
 }
 
-/// Only locally constructed resource commands and media SETUP are eligible.
-/// Session SETUP (/setup) can carry identity/encryption material and must never be dumped.
+/// General tracing covers resource commands and media streams on all profiles.
 pub(crate) fn trace_kind(method: &str, path: &str, body: &[u8]) -> Option<&'static str> {
     if is_resource_request(method, path, body) { return Some("RESOURCE"); }
     if method != "SETUP" || !(path == "/" || path.starts_with("rtsp://")) { return None; }
@@ -52,7 +51,7 @@ pub(crate) fn trace_kind(method: &str, path: &str, body: &[u8]) -> Option<&'stat
 
 // Small independently numbered lines survive logcat limits and interleaved heartbeat logs.
 // Every byte is retained; concatenate hex chunks in offset order to reconstruct the packet.
-fn bytes_lines(prefix: &str, bytes: &[u8]) -> Vec<String> {
+pub(crate) fn bytes_lines(prefix: &str, bytes: &[u8]) -> Vec<String> {
     let mut lines = vec![format!("{prefix} bytes={} sha256={:x}", bytes.len(), Sha256::digest(bytes))];
     for (i, chunk) in bytes.chunks(192).enumerate() {
         let hex = chunk.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -75,10 +74,16 @@ fn text_lines(prefix: &str, text: &str) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn info_modes(value: Option<&Value>) {
+/// Keep headers readable in the export without splitting one log record at CRLF.
+pub(crate) fn log_head(prefix: &str, head: &[u8]) {
+    let escaped = format!("{:?}", String::from_utf8_lossy(head));
+    for line in text_lines(prefix, &escaped) { crate::emit_log(&line); }
+}
+
+pub(crate) fn info_modes(prefix: &str, value: Option<&Value>) {
     if let Some(value) = value {
-        for line in text_lines("RESOURCE INFO_MODES", &format!("{value:?}")) { crate::emit_log(&line); }
-    } else { crate::emit_log("RESOURCE INFO_MODES absent"); }
+        for line in text_lines(prefix, &format!("{value:?}")) { crate::emit_log(&line); }
+    } else { crate::emit_log(&format!("{prefix} absent")); }
 }
 
 pub(crate) fn outbound(kind: &str, id: u64, cseq: i32, packet: &[u8], body: &[u8]) -> Vec<String> {

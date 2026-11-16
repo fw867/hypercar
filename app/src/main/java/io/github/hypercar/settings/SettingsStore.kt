@@ -31,7 +31,6 @@ object SettingsStore {
     private const val KEY_TARGET_MAC = "target_car_mac"
     private const val KEY_TARGET_NAME = "target_car_name"
     private const val KEY_AUTO_CONNECT = "auto_connect_on_bt"
-    private const val KEY_STANDBY_NOTIFICATION = "standby_notification"
     private const val KEY_MANUAL_BT_MAC = "manual_bt_mac"
     private const val KEY_HEAD_UNIT = "head_unit_profile"
     private const val KEY_REMOTE_PROFILES = "head_unit_remote_json"
@@ -41,7 +40,6 @@ object SettingsStore {
     private const val KEY_WIDTH = "video_width"
     private const val KEY_HEIGHT = "video_height"
     private const val KEY_FPS = "video_fps"
-    private const val KEY_ENABLE_AUDIO = "enable_audio"
     private const val KEY_KEEP_ALIVE_STATS = "keep_alive_stats"
     private const val KEY_DEBUG_LOG = "debug_log_enabled"
     private const val KEY_STABLE_DEVICE_ID = "stable_device_id"
@@ -90,25 +88,15 @@ object SettingsStore {
             SettingsRevision.bump()
         }
 
-    /** 上车自动连接（ACL 广播唤醒），新安装默认关，完成启动条件后由用户开启。 */
     /** Manual-stop cooldown; one atomic preference retains the deadline across process restarts. */
     var automaticPause: String
         get() = p().getString("automatic_connection_pause", "").orEmpty()
         set(value) = p().edit().putString("automatic_connection_pause", value).apply()
 
+    /** 默认开启，启动条件满足后开始监听。 */
     var autoConnect: Boolean
-        get() = p().getBoolean(KEY_AUTO_CONNECT, false)
+        get() = p().getBoolean(KEY_AUTO_CONNECT, true)
         set(v) = p().edit().putBoolean(KEY_AUTO_CONNECT, v).apply()
-
-    /** 已配对车机 Wi-Fi 上等待 iAP2 的一次短暂可发现兜底；需要 Shizuku。 */
-    var bluetoothDiscoverableFallback: Boolean
-        get() = p().getBoolean("bluetooth_discoverable_fallback", true)
-        set(v) = p().edit().putBoolean("bluetooth_discoverable_fallback", v).apply()
-
-    /** 可独立回退的经典蓝牙 CarPlay 手机身份标记。 */
-    var bluetoothCarPlayMarker: Boolean
-        get() = p().getBoolean("bluetooth_carplay_marker", true)
-        set(v) = p().edit().putBoolean("bluetooth_carplay_marker", v).apply()
 
     /** Restore the pre-recovery-only path as a separate opt-in, without changing existing installs. */
     var proactiveWifiReconnect: Boolean
@@ -125,21 +113,7 @@ object SettingsStore {
         get() = p().getBoolean("screen_resource_lifecycle", false)
         set(v) = p().edit().putBoolean("screen_resource_lifecycle", v).apply()
 
-    /**
-     * 待机监听是否常驻前台通知（「正在监听车机，等待自动连接」）。默认开。
-     *
-     * 关闭后待机不再进前台服务：通知栏干净，但进程更容易被系统回收——
-     * 车机 ACL 广播（清单里的接收器）仍会尝试把 App 拉起来，只是不保证。
-     */
-    var standbyNotification: Boolean
-        get() = p().getBoolean(KEY_STANDBY_NOTIFICATION, true)
-        set(v) = p().edit().putBoolean(KEY_STANDBY_NOTIFICATION, v).apply()
-
     /** 选中的车机档案 id（见 `headunit/HeadUnitProfile.kt`）；默认宝马 iD8.5。 */
-    var id9DisableBufferedAudio: Boolean
-        get() = p().getBoolean("id9_disable_buffered_audio", false)
-        set(v) = p().edit().putBoolean("id9_disable_buffered_audio", v).apply()
-
     var headUnitProfileId: String
         get() = p().getString(KEY_HEAD_UNIT, "bmw_id85") ?: "bmw_id85"
         set(v) = p().edit().putString(KEY_HEAD_UNIT, v).apply()
@@ -318,26 +292,9 @@ object SettingsStore {
 
     /** 是否 CarWith 模式。 */
     val carWithMode: Boolean get() = carSource == "carwith"
-    var carWithStretch: Boolean
-        get() = p().getBoolean("carwith_stretch", false)
-        set(v) = p().edit().putBoolean("carwith_stretch", v).apply()
-    var enableAudio: Boolean
-        get() = p().getBoolean(KEY_ENABLE_AUDIO, true)
-        set(v) = p().edit().putBoolean(KEY_ENABLE_AUDIO, v).apply()
 
-    /** Phase-one receive/statistics only; never records files or feeds an assistant. */
-    var microphoneProbe: Boolean
-        get() = p().getBoolean("microphone_probe", false)
-        set(v) = p().edit().putBoolean("microphone_probe", v).apply()
-
-    /** Self-rendered external-PCM recognition validation, opt-in and separate from CarWith. */
-    var carVoiceRecognition: Boolean
-        get() = p().getBoolean("car_voice_recognition", false)
-        set(v) = p().edit().putBoolean("car_voice_recognition", v).apply()
-
-    var carWithMicrophone: Boolean
-        get() = p().getBoolean("carwith_microphone", false)
-        set(v) = p().edit().putBoolean("carwith_microphone", v).apply()
+    // The retired self-rendered speech experiment also gates incoming native callbacks.
+    val carVoiceRecognition: Boolean get() = false
 
     var audioCodec: String
         get() = p().getString("audio_codec", "auto")?.takeIf { it in setOf("auto", "pcm", "aac") } ?: "auto"
@@ -435,10 +392,8 @@ object SettingsStore {
             append("\"airplay_port\":").append(airplayPort).append(",")
             // CarWith 模式：视频/音频源改由本机 CarLife（CarWith）提供（2026-11-03）
             append("\"carlife_source\":").append(if (carWithSource) "true" else "false").append(",")
-            append("\"carwith_stretch\":").append(if (carWithStretch) "true" else "false").append(",")
             append("\"mbux_screen_bootstrap\":").append(profile.mbuxScreenBootstrap).append(",")
             append("\"id9_screen_bootstrap\":").append(profile.id9ScreenBootstrap).append(",")
-            append("\"id9_disable_buffered_audio\":").append(profile.id == "bmw_id9" && id9DisableBufferedAudio).append(",")
             append("\"nbt_audio_first\":").append(profile.nbtAudioFirst).append(",")
             append("\"mbux_media_compat\":").append(profile.mbuxMediaCompat).append(",")
             append("\"screen_resource_lifecycle\":").append(if (profile.screenResourceLifecycleEnabled(screenResourceLifecycle)) "true" else "false").append(",")
@@ -447,13 +402,12 @@ object SettingsStore {
             append("\"touch_display_w\":").append(tdW).append(",")
             append("\"touch_display_h\":").append(tdH).append(",")
             append("\"fps\":").append(plan.fps).append(",")
-            append("\"enable_audio\":").append(enableAudio).append(",")
+            append("\"enable_audio\":true,")
+            append("\"carwith_microphone\":").append(carWithSource).append(",")
             append("\"video_codec\":\"").append(VideoCodecPolicy.forHardware(videoCodec, VideoHardwareCapabilities.hevcEncoderAvailable)).append("\",")
             append("\"bmw_capabilities\":").append(profile.id.startsWith("bmw_")).append(",")
             append("\"audio_codec\":\"").append(audioCodec).append("\",")
-            append("\"microphone_probe\":").append(microphoneProbe && !carWithMode).append(",")
             append("\"self_microphone_asr\":").append(carVoiceRecognition && !carWithMode).append(",")
-            append("\"carwith_microphone\":").append(carWithMicrophone && carWithMode).append(",")
             append("\"keep_alive_stats\":").append(keepAliveStats).append(",")
             append("\"bmw_box_bootstrap\":").append(io.github.hypercar.headunit.ReceiverCompatibility.useBmwBootstrap(
                 headUnitProfileId, io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(receiverBluetoothMac))).append(",")

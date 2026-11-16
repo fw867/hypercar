@@ -76,10 +76,6 @@ class Iap2Coordinator(
     /** 本次启动以来成功建过几轮 iAP2 会话（0 = 车机一次都没连进来）。 */
     val sessionStartCount: Int get() = bluetooth?.sessionStartCount ?: 0
 
-    fun refreshCarPlayMarker() = bluetooth?.setCarPlayMarkerEnabled(
-        io.github.hypercar.settings.SettingsStore.bluetoothCarPlayMarker,
-    )
-
     fun onTargetChanged() = bluetooth?.onTargetChanged()
 
     /**
@@ -103,7 +99,7 @@ class Iap2Coordinator(
                 if (existing.isRunning) {
                     existing.setSessionEnabled(allowSessions, "startTransport-existing")
                     if (allowSessions) existing.setWifiHandoff(false, "startTransport-resume")
-                    refreshCarPlayMarker()
+                    existing.setCarPlayMarkerEnabled(true)
                     log(if (allowSessions) "IAP2: 已在运行，允许会话且保留 SDP 注册" else "IAP2: 仅保留 iPhone 身份声明，暂停会话与出站；SDP 已注册=${existing.isListening}")
                     return
                 }
@@ -128,7 +124,7 @@ class Iap2Coordinator(
                 )
             bluetooth = bt
             bt.setSessionEnabled(allowSessions, "startTransport-new")
-            bt.setCarPlayMarkerEnabled(io.github.hypercar.settings.SettingsStore.bluetoothCarPlayMarker)
+            bt.setCarPlayMarkerEnabled(true)
             if (!bt.start()) {
                 log("IAP2: 蓝牙启动失败（权限/开关），请检查后重试")
                 bluetooth = null

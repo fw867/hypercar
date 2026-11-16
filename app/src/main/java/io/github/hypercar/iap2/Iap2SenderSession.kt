@@ -442,8 +442,10 @@ class Iap2SenderSession(
                     if (declaresStartSession == true) {
                         "iap2 0x4301 在 ${startSessionWindow / 1_000_000_000}s 窗口内未到" +
                             "（车机声明会发——可能稍后补发，保活期间收到会重新回调端点）"
-                    } else {
+                    } else if (declaresStartSession == false) {
                         "iap2 0x4301 未到（车机未声明会发）"
+                    } else {
+                        "iap2 0x4301 在本轮等待窗口内未到（车机发送清单未知）"
                     },
                 )
                 val wifiOnly = this.wifi ?: wifiFromExchange
@@ -463,8 +465,8 @@ class Iap2SenderSession(
                     // 热点凭据（0x5703 或 0x4301）。所以这里只记日志、返回空端点，
                     // 由 [pumpIncomingForever] 继续守着这条链路等凭据。
                     log(
-                        "iap2 ⚠ 车机既未声明 0x5702/0x5703，也未声明 0x4301" +
-                            "（iAP2 清单里没有无线 CarPlay 组件）——保持链路等待车机开放 CarPlay 窗口",
+                        "iap2 本轮尚无热点凭据或会话端点，保持链路等待车机下发" +
+                            "（车机声明：发送 0x4301=${declaresStartSession ?: "未知"}，发送 0x5703=${declaresSendWifi ?: "未知"}）",
                     )
                     log("iap2 提示：请在车机上进入「移动设备 → 选择本机 → Apple CarPlay」点一次；链路会一直保持")
                 }

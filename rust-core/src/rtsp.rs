@@ -133,7 +133,12 @@ impl RtspMessage {
 const MAX_RTSP_HEADER: usize = 64 * 1024;
 const MAX_RTSP_BODY: usize = 16 * 1024 * 1024;
 
+#[cfg(test)]
 pub fn parse_rtsp_messages(buf: &mut Vec<u8>) -> Result<Vec<RtspMessage>, String> {
+    parse_rtsp_messages_with(buf, |msg, _| msg)
+}
+
+fn parse_rtsp_messages_with<T>(buf: &mut Vec<u8>, mut collect: impl FnMut(RtspMessage, &[u8]) -> T) -> Result<Vec<T>, String> {
     let mut messages = Vec::new();
     loop {
         let head_end = match find_head_separator(buf) {
@@ -171,11 +176,12 @@ pub fn parse_rtsp_messages(buf: &mut Vec<u8>) -> Result<Vec<RtspMessage>, String
             break;
         }
         let body = buf[head_end + 4..total].to_vec();
-        messages.push(RtspMessage {
+        let message = RtspMessage {
             first_line,
             headers,
             body,
-        });
+        };
+        messages.push(collect(message, &buf[..head_end + 4]));
         buf.drain(..total);
     }
     Ok(messages)
@@ -201,11 +207,13 @@ pub struct RtspChannel {
     write: Arc<tokio::sync::Mutex<OwnedWriteHalf>>,
     cipher: Arc<Mutex<Option<ControlCipher>>>,
     cseq: Arc<Mutex<i32>>,
-    pending: Arc<Mutex<HashMap<i32, oneshot::Sender<RtspMessage>>>>,
+    pending: PendingMap,
     reader: tokio::task::JoinHandle<()>,
     closed: AtomicBool,
     pub(crate) nbt_recorded: tokio::sync::Mutex<bool>,
     session_uri: std::sync::OnceLock<crate::rtsp_uri::SessionUri>,
+    pub(crate) id9_trace: std::sync::OnceLock<String>,
+    first_screen_cseq: std::sync::OnceLock<i32>,
 }
 
 // Removal is also required when a request future is cancelled by its caller. A partially
@@ -236,8 +244,7 @@ impl RtspChannel {
         let write = Arc::new(tokio::sync::Mutex::new(write));
         let cipher = Arc::new(Mutex::new(cipher));
         let cseq = Arc::new(Mutex::new(0));
-        let pending: Arc<Mutex<HashMap<i32, oneshot::Sender<RtspMessage>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
         let (inbound_tx, inbound) = mpsc::unbounded_channel();
         let trace_id = CHANNEL_IDS.fetch_add(1, Ordering::Relaxed);
 
@@ -261,6 +268,8 @@ impl RtspChannel {
             closed: AtomicBool::new(false),
             nbt_recorded: tokio::sync::Mutex::new(false),
             session_uri: std::sync::OnceLock::new(),
+            id9_trace: std::sync::OnceLock::new(),
+            first_screen_cseq: std::sync::OnceLock::new(),
         });
         (this, inbound)
     }
@@ -293,21 +302,39 @@ impl RtspChannel {
         extra_headers: &[(&str, String)],
         timeout: Duration,
     ) -> Result<RtspMessage, String> {
+        self.request_with_write_signal(method, path, body, content_type, extra_headers, timeout, None).await
+    }
+
+    pub(crate) async fn request_with_write_signal(
+        &self, method: &str, path: &str, body: &[u8], content_type: &str,
+        extra_headers: &[(&str, String)], timeout: Duration, written: Option<oneshot::Sender<()>>,
+    ) -> Result<RtspMessage, String> {
         if self.is_closed() { return Err("控制通道已关闭".into()); }
         // Resolve before diagnostics, formatting, and encryption so both wire and trace
         // use the same immutable target. Incoming responses and audio SETUP are untouched.
+        let session_setup = method == "SETUP" && path == "/setup";
         let path=self.session_uri.get().map(|uri|uri.resolve(method,path)).unwrap_or(path);
         let deadline = tokio::time::Instant::now() + timeout;
         let cseq = self.next_cseq();
         let started = std::time::Instant::now();
         let trace = path != "/feedback";
-        let diagnostic_kind = crate::resource_trace::trace_kind(method, path, body);
+        let kind = crate::resource_trace::trace_kind(method, path, body);
+        let id9_kind = self.id9_trace.get().and_then(|session| {
+            let stage = match kind {
+                _ if session_setup => "SESSION_SETUP",
+                Some("RESOURCE") => "RESOURCE",
+                Some("SCREEN_SETUP") if *self.first_screen_cseq.get_or_init(|| cseq) == cseq => "FIRST_SCREEN_SETUP",
+                _ => return None,
+            };
+            Some(format!("{session} {stage}"))
+        });
+        let diagnostic_kind = id9_kind.as_deref().or(kind);
         if trace {
             let encrypted = self.cipher.lock().is_some();
             crate::emit_log(&format!("RTSP#{} TXQ CSeq={cseq} {method} {path} body={}B encrypted={} timeout={}ms", self.trace_id, body.len(), encrypted, timeout.as_millis()));
         }
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().insert(cseq, tx);
+        self.pending.lock().insert(cseq, PendingReply { tx, trace_head: id9_kind.is_some() });
         let mut transaction = TransactionGuard { channel: self, cseq, writing: false };
 
         let head = format!(
@@ -326,6 +353,9 @@ impl RtspChannel {
         let mut plaintext = Vec::with_capacity(head.len() + body.len());
         plaintext.extend_from_slice(head.as_bytes());
         plaintext.extend_from_slice(body);
+        if let Some(kind) = &id9_kind {
+            crate::resource_trace::log_head(&format!("{kind} RTSP#{} CSeq={cseq} TX_HEAD_TEXT", self.trace_id), head.as_bytes());
+        }
         if let Some(kind) = diagnostic_kind {
             for line in crate::resource_trace::outbound(kind, self.trace_id, cseq, &plaintext, body) {
                 crate::emit_log(&line);
@@ -356,13 +386,21 @@ impl RtspChannel {
             }
             transaction.writing = false;
         }
+        if let Some(written) = written { let _ = written.send(()); }
 
         if let Some(kind) = diagnostic_kind {
             crate::emit_log(&format!("{kind} RTSP#{} CSeq={cseq} TX_WRITTEN bytes={} elapsed={}ms; socket write is not receiver acceptance",
                 self.trace_id, head.len() + body.len(), started.elapsed().as_millis()));
         }
         let result = match tokio::time::timeout_at(deadline, rx).await {
-            Ok(Ok(msg)) => Ok(msg),
+            Ok(Ok((msg, raw_head))) => {
+                if let (Some(kind), Some(head)) = (&id9_kind, raw_head) {
+                    let prefix = format!("{kind} RTSP#{} CSeq={cseq} RX_HEAD", self.trace_id);
+                    crate::resource_trace::log_head(&format!("{prefix}_TEXT"), &head);
+                    for line in crate::resource_trace::bytes_lines(&prefix, &head) { crate::emit_log(&line); }
+                }
+                Ok(msg)
+            }
             Ok(Err(_)) => {
                 Err(format!("控制通道已关闭（等待 CSeq={cseq} {method} {path}）"))
             }
@@ -370,6 +408,15 @@ impl RtspChannel {
                 Err(format!("RTSP 超时（{timeout:?}，CSeq={cseq} {method} {path}）"))
             }
         };
+        if path == "/info" || method == "RECORD" {
+            if let Some(trace) = self.id9_trace.get() {
+                let outcome = match &result {
+                    Ok(message) => format!("status={}", message.status()),
+                    Err(error) => format!("error={error:?}"),
+                };
+                crate::emit_log(&format!("{trace} RTSP#{} CSeq={cseq} {method} {path} {outcome}", self.trace_id));
+            }
+        }
         match &result {
             Ok(message) if trace || message.status() != 200 => crate::emit_log(&format!("RTSP#{} RX CSeq={cseq} status={} body={}B elapsed={}ms", self.trace_id, message.status(), message.body.len(), started.elapsed().as_millis())),
             Err(error) => crate::emit_log(&format!("RTSP#{} ERROR CSeq={cseq} elapsed={}ms {error}", self.trace_id, started.elapsed().as_millis())),
@@ -451,7 +498,11 @@ pub type CommandReply = Arc<dyn Fn(&RtspMessage) -> Option<Vec<u8>> + Send + Syn
 
 type SharedWrite = Arc<tokio::sync::Mutex<OwnedWriteHalf>>;
 type SharedCipher = Arc<Mutex<Option<ControlCipher>>>;
-type PendingMap = Arc<Mutex<HashMap<i32, oneshot::Sender<RtspMessage>>>>;
+struct PendingReply {
+    tx: oneshot::Sender<(RtspMessage, Option<Vec<u8>>)>,
+    trace_head: bool,
+}
+type PendingMap = Arc<Mutex<HashMap<i32, PendingReply>>>;
 
 async fn reader_loop(
     mut read: OwnedReadHalf,
@@ -510,18 +561,22 @@ async fn reader_loop(
         };
 
         // 2) 切出完整 RTSP 消息并派发
-        let messages = match parse_rtsp_messages(stream) {
+        let messages = match parse_rtsp_messages_with(stream, |message, head| {
+            let capture = message.is_response() && message.cseq().is_some_and(|cseq|
+                pending.lock().get(&cseq).is_some_and(|p| p.trace_head));
+            (message, capture.then(|| head.to_vec()))
+        }) {
             Ok(messages) => messages,
             Err(error) => {
                 crate::emit_log(&format!("RTSP#{trace_id}: invalid framing: {error}; closing reader"));
                 break;
             }
         };
-        for msg in messages {
+        for (msg, raw_head) in messages {
             if msg.is_response() {
                 if let Some(c) = msg.cseq() {
-                    if let Some(tx) = pending.lock().remove(&c) {
-                        let _ = tx.send(msg);
+                    if let Some(reply) = pending.lock().remove(&c) {
+                        let _ = reply.tx.send((msg, raw_head));
                     } else {
                         // iAP output intentionally does not await RTSP replies; still expose rejection.
                         unsolicited_responses += 1;

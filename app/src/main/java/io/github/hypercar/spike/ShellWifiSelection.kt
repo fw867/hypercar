@@ -21,8 +21,17 @@ internal class ShellWifiSelection {
         Thread(r, "car-wifi-selection").apply { isDaemon = true }
     }
     private data class Lease(val token: String, val binder: IBinder, val death: IBinder.DeathRecipient,
-        val wifi: WifiManager, val callbackType: Class<*>, val callback: Any, val recovery: WifiHandoffLease)
+        val wifi: WifiManager, val callbackType: Class<*>, val callback: Any, val recovery: WifiHandoffLease,
+        val evidence: SelectionEvidence)
+    private class SelectionEvidence {
+        @Volatile var callbackReady = false
+        @Volatile var targetSeen = false
+        @Volatile var selected = false
+        @Volatile var result = "unreported"
+        fun summary() = "OK Wi-Fi selector released callback_ready=$callbackReady target_seen=$targetSeen select_called=$selected result=$result"
+    }
     private var lease: Lease? = null
+    private var lastClosed: Pair<String, String>? = null
 
     @Synchronized fun start(owner: IBinder, token: String, ssid: String, bssid: String, uid: Int): String {
         lease?.let { stop(it.token) }
@@ -30,6 +39,7 @@ internal class ShellWifiSelection {
         return try {
             val (wifi, connectivity) = ShellCarWifi.managers()
             val recovery = WifiHandoffLease()
+            val evidence = SelectionEvidence()
             val type = Class.forName("android.net.wifi.WifiManager\$NetworkRequestMatchCallback")
             fun savedNetworks(): List<WifiConfiguration> = try { wifi.configuredNetworks.orEmpty() }
             catch (denied: SecurityException) {
@@ -43,10 +53,12 @@ internal class ShellWifiSelection {
             lateinit var register: () -> Unit
             fun choose(candidates: List<ScanResult>, cached: Boolean, since: Long = 0) {
                 synchronized(this) {
-                    if (lease?.token != token || selected || selection == null) return
+                    if (lease?.token != token || selected) return
                     val matching = candidates.filter { it.SSID == ssid && (bssid.isBlank() || it.BSSID.equals(bssid, true)) &&
                         (!cached || (android.os.SystemClock.elapsedRealtime() - it.timestamp / 1000 in 0..30_000 &&
                             it.timestamp / 1000 >= since)) }
+                    if (matching.isNotEmpty()) evidence.targetSeen = true
+                    if (selection == null) return
                     // A polled cache without an AP hint must not choose between same-name APs.
                     if (cached && bssid.isBlank() && matching.map { it.BSSID.lowercase() }.distinct().size != 1) return
                     val ap = matching.maxByOrNull { it.level } ?: return
@@ -55,6 +67,7 @@ internal class ShellWifiSelection {
                     val selectionType = Class.forName("android.net.wifi.WifiManager\$NetworkRequestUserSelectionCallback")
                     selectionType.getMethod("select", WifiConfiguration::class.java).invoke(selection, config)
                     selected = true
+                    evidence.selected = true
                     Log.i("HyperCar", "WIFI-SELECT: selected own local-only request uid=$uid cached_exact_ap=$cached")
                 }
             }
@@ -127,6 +140,7 @@ internal class ShellWifiSelection {
                         "onUserSelectionCallbackRegistration" -> {
                             gate.acknowledge()
                             selection = args?.getOrNull(0)
+                            evidence.callbackReady = selection != null
                             Log.i("HyperCar", "WIFI-SELECT: own selection callback ready; bounded recovery armed")
                             armRecovery()
                             // A fresh iAP2 MAC corroborated by a matching scan can be selected
@@ -148,17 +162,20 @@ internal class ShellWifiSelection {
                                 Log.i("HyperCar", "WIFI-SELECT: factory not active yet; bounded registration retry")
                                 worker.schedule({ register() }, 150, TimeUnit.MILLISECONDS)
                             } else {
+                                evidence.result = "factory_abort"
                                 Log.i("HyperCar", "WIFI-SELECT: active request ended")
                                 stop(token)
                             }
                             null
                         }
                         "onUserSelectionConnectSuccess", "onUserSelectionConnectFailure" -> {
+                            evidence.result = if (method.name == "onUserSelectionConnectSuccess") "connect_success" else "connect_failure"
                             Log.i("HyperCar", "WIFI-SELECT: ${method.name}"); stop(token); null
                         }
                         else -> null
                     }
                 } catch (e: Exception) {
+                    evidence.result = "callback_error"
                     Log.w("HyperCar", "WIFI-SELECT: callback failed ${(e.cause ?: e).javaClass.simpleName}")
                     stop(token); null
                 }
@@ -184,7 +201,7 @@ internal class ShellWifiSelection {
                 }
             }
             val death = IBinder.DeathRecipient { stop(token) }
-            lease = Lease(token, owner, death, wifi, type, callback, recovery)
+            lease = Lease(token, owner, death, wifi, type, callback, recovery, evidence)
             owner.linkToDeath(death, 0)
             worker.execute { register() }
             worker.schedule({ stop(token) }, 60, TimeUnit.SECONDS)
@@ -196,7 +213,8 @@ internal class ShellWifiSelection {
     }
 
     @Synchronized fun stop(token: String): String {
-        val current = lease?.takeIf { it.token == token } ?: return "SKIP Wi-Fi selector inactive"
+        val current = lease?.takeIf { it.token == token }
+            ?: return lastClosed?.takeIf { it.first == token }?.second ?: "SKIP Wi-Fi selector inactive"
         lease = null
         runCatching { current.recovery.close() }.onFailure {
             Log.w("HyperCar", "WIFI-SELECT: previous autojoin restore failed ${it.javaClass.simpleName}")
@@ -204,7 +222,9 @@ internal class ShellWifiSelection {
         runCatching { current.binder.unlinkToDeath(current.death, 0) }
         runCatching { current.wifi.javaClass.getMethod("unregisterNetworkRequestMatchCallback", current.callbackType)
             .invoke(current.wifi, current.callback) }
-        return "OK Wi-Fi selector released"
+        val summary = current.evidence.summary()
+        lastClosed = token to summary
+        return summary
     }
 
     companion object {
