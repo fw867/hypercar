@@ -110,9 +110,11 @@ pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
     if slot.current.as_ref().is_some_and(|s|s.owner==owner) {return Ok(());}
     if owner==0 || owner<=slot.newest {return Err("stale CarWith source owner".into());}
     slot.current=None;slot.newest=owner;
-    let stop=Arc::new(Notify::new()); let display=Arc::new(Mutex::new((cfg.width,cfg.height)));
+    let stop=Arc::new(Notify::new());
+    // A missing declaration uses the prewarm fallback for INIT only.
+    let display=Arc::new(Mutex::new(if cfg.carwith_cached_canvas { (cfg.width,cfg.height) } else { (0,0) }));
     let microphone=cfg.carwith_microphone.then(||Arc::new(crate::mic_probe::ProbeControl::for_carwith()));
-    let config=CarLifeConfig{width:cfg.width,height:cfg.height,fps:cfg.fps,bt_address:cfg.device_id.clone(),
+    let config=CarLifeConfig{width:cfg.width,height:cfg.height,fps:cfg.carwith_fps(),bt_address:cfg.device_id.clone(),
         bt_name:"HyperCar".into(),navigation_updates:cfg.carwith_navigation_enabled,microphone:microphone.clone()};
     let (hub,mut events)=CarLifeHub::connect(config,"127.0.0.1".into(),stop.clone(),Some(display.clone()))?;
     let feed=Arc::new(Mutex::new(Feed::default()));let sink=feed.clone();

@@ -118,7 +118,7 @@ impl Router {
                             Ok(c) => {
                                 self.origins.clear(); self.active=Some(c); self.output_size=Some(target); self.submitted=0; self.produced=0;
                                 self.progress=std::time::Instant::now();
-                                crate::emit_log(&format!("CARWITH-TRANSCODE: {} {}x{} -> {} {}x{} initializing",codec.as_str(),source.0,source.1,output.as_str(),target.0,target.1));
+                                crate::emit_log(&format!("CARWITH-TRANSCODE: {} {}x{} -> {} {}x{} initializing target_fps={}",codec.as_str(),source.0,source.1,output.as_str(),target.0,target.1,self.fps));
                             },
                             Err(e) => self.fail(e),
                         }
@@ -240,15 +240,21 @@ pub fn hardware_factory()->Factory {Box::new(|codec,output,(w,h),(tw,th),fps,csd
         }
     }
     #[test]
-    fn avc_only_receiver_stretches_720p_source_to_ultrawide_display() {
-        let mut router = Router::new(true, 30, Box::new(|input, output, source, target, _, _| {
-            assert_eq!((input,output,source,target),(VideoCodec::H264,VideoCodec::H264,(1920,720),(2736,800)));
-            Ok(Box::new(Fake { output,fail:false, pending:vec![] }))
-        }));
-        router.set_target(Some((2736,800)));
-        let output = router.input(false, 90, avc_with_sps(SPS_720,true), VideoCodec::H264, FrameOrigin::Cached);
-        assert_eq!(router.output_size(), Some((2736,800)), "AVC-only receiver requires hardware stretch");
-        assert_eq!((output[0].pts,output[0].codec,output[0].origin),(90,VideoCodec::H264,FrameOrigin::Cached));
+    fn stretch_encoder_uses_requested_frame_rate_for_avc_and_hevc() {
+        for fps in [30, 60] {
+            for hevc_allowed in [false, true] {
+                let codec = if hevc_allowed { VideoCodec::Hevc } else { VideoCodec::H264 };
+                let mut router = Router::new(true, fps, Box::new(move |input, output, source, target, rate, _| {
+                    assert_eq!((input, output, rate), (VideoCodec::H264, codec, fps));
+                    assert_eq!((source, target), ((1920,720), (2736,800)));
+                    Ok(Box::new(Fake { output, fail:false, pending:vec![] }))
+                }));
+                router.set_target(Some((2736,800)));
+                let output = router.input(hevc_allowed, 90, avc_with_sps(SPS_720,true), VideoCodec::H264, FrameOrigin::Cached);
+                assert_eq!(router.output_size(), Some((2736,800)));
+                assert_eq!((output[0].pts, output[0].codec, output[0].origin), (90, codec, FrameOrigin::Cached));
+            }
+        }
     }
     #[test]
     fn stretch_threshold_is_strict_and_source_relative() {

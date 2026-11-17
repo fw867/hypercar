@@ -3791,6 +3791,7 @@ object HyperCarRepo {
         val canvas = cached ?: (1920 to 1080)
         val config = org.json.JSONObject(SettingsStore.engineConfigJson("127.0.0.1", 0, deviceMac, "",
             carWithSource = true)).put("width", canvas.first).put("height", canvas.second)
+            .put("carwith_cached_canvas", cached != null)
             .put("carwith_navigation_enabled", carWithHudNavigationAllowed).toString()
         log("CARWITH: 源端预热画布 ${canvas.first}x${canvas.second} canvas_cache=" +
             when { cached != null -> "hit"; key != null -> "miss"; else -> "no_identity" })

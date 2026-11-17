@@ -97,6 +97,8 @@ pub struct EngineConfig {
     #[serde(default)]
     pub carwith_source_owner: u64,
     #[serde(default)]
+    pub carwith_cached_canvas: bool,
+    #[serde(default)]
     pub carwith_navigation_token: u64,
     #[serde(default)]
     pub carwith_navigation_enabled: bool,
@@ -128,6 +130,12 @@ pub struct EngineConfig {
     pub touch_right: u32,
     #[serde(default)]
     pub touch_bottom: u32,
+}
+
+impl EngineConfig {
+    pub(crate) fn carwith_fps(&self) -> u32 {
+        self.fps.clamp(1, 60)
+    }
 }
 
 fn default_true() -> bool {
@@ -199,12 +207,17 @@ pub async fn run_engine(
                 let vtx = video_tx.clone();
                 let atx = audio_tx.clone();
                 let voice_keys = key_tx.clone();
+                let carwith_ui = host_ui_tx.clone();
                 let navigation_token = cfg.carwith_navigation_token;
                 tasks.spawn(async move {
                     // Keep channel senders and the hub alive for the entire source task.
                     let _input = crate::carwith_source::InputLease(hub);
                     while let Some((ev, origin)) = life_events.recv().await {
                         match ev {
+                            CarLifeEvent::GoToDesktop => {
+                                let queued = carwith_ui.try_send(()).is_ok();
+                                emit_log(&format!("CARWITH-UI: GO_TO_DESKTOP -> AirPlay requestUI queued={queued}"));
+                            }
                             CarLifeEvent::SourceReset => {
                                 crate::emit_carwith_navigation(navigation_token,None);
                                 let _ = voice_keys.send(crate::voice_key::RESET); let _ = vtx.send(SourceEvent::ResetVideoSource);
@@ -329,7 +342,7 @@ pub async fn run_engine(
     let (screen_ready_tx, screen_ready_rx) = mpsc::channel::<crate::screen_session::ScreenCommand>(2);
     let video_stats = Arc::new(Mutex::new(PumpStat::default()));
     tasks.spawn(video_pump(stop.clone(), video_stats.clone(), cfg.screen_resource_lifecycle,
-        pipeline.clone(), screen_ready_rx, video_rx, cfg.carlife_source, cfg.fps,
+        pipeline.clone(), screen_ready_rx, video_rx, cfg.carlife_source, cfg.carwith_fps(),
         cfg.carlife_source.then_some(cfg.carwith_source_owner)));
 
     // ---- 音频泵：重采样 + 闪避混音 + RTP ----
@@ -807,7 +820,7 @@ pub(crate) async fn video_pump(
     video_rx: mpsc::UnboundedReceiver<SourceEvent>,
     transcode:bool, fps:u32, source_owner:Option<u64>,
 ) {
-    let mut converter=crate::video_transcode::Router::new(transcode,fps.min(30).max(1),crate::video_transcode::hardware_factory());
+    let mut converter=crate::video_transcode::Router::new(transcode,fps,crate::video_transcode::hardware_factory());
     let mut converted=std::collections::VecDeque::new();
     let mut sender: Option<ScreenSender> = None;
     let mut commands_open = true;
@@ -1245,6 +1258,7 @@ struct AudioPumpStat {
 /// CarLife（HU 侧）向引擎上报的事件（2026-11-03 从 archive 分支取回，供 CarWith 模式使用）。
 #[derive(Debug, Clone)]
 pub enum CarLifeEvent {
+    GoToDesktop,
     Navigation(Option<crate::carlife::navigation::NavigationUpdate>),
     SourceReset,
     /// Replay for a new screen transport without resetting active audio/navigation.

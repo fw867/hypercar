@@ -51,6 +51,7 @@ const CMD_VIDEO_ENCODER_START: u32 = 0x0001_8009;
 const CMD_HU_GO_TO_FOREGROUND: u32 = 0x0001_8025;
 const CMD_SCREEN_ON: u32 = 0x0001_0018;
 const CMD_FOREGROUND: u32 = 0x0001_001B;
+const CMD_GO_TO_DESKTOP: u32 = 0x0001_0021;
 const CMD_HU_STATISTIC_INFO: u32 = 0x0001_8027;
 /// 模块级控制（文档 §10.2.2）：CarlifeModuleStatusList{cnt, moduleStatus{moduleID,statusID}}
 const CMD_HU_AUTHEN_REQUEST: u32 = 0x0001_8048;
@@ -175,7 +176,7 @@ impl CarLifeHub {
         let (events, event_rx) = mpsc::unbounded_channel();
         let (touch_tx, mut touch_rx) = mpsc::unbounded_channel::<QueuedControl>();
         let encoder_size = Arc::new(Mutex::new((cfg.width.max(2),cfg.height.max(2))));
-        let requested = requested.unwrap_or_else(|| encoder_size.clone());
+        let requested = requested.unwrap_or_else(|| Arc::new(Mutex::new((0,0))));
         let touch_state=Arc::new(Mutex::new(session::TouchGesture::default()));
         let round_touch=touch_state.clone();
         let queue = Arc::new(Mutex::new(Vec::<QueuedControl>::new()));

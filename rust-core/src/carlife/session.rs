@@ -46,6 +46,7 @@ pub(super) struct Session {
     seed: Option<Vec<u8>>,
     ready: bool,
     init_sent: bool,
+    declared_display: Option<(u32,u32)>,
     pub started: bool,
     matched: bool,
     navigation_requested: bool,
@@ -56,7 +57,7 @@ impl Default for Session {
     fn default() -> Self {
         Self { challenge: format!("2.0;{}", uuid::Uuid::new_v4().simple()), info: None,
             proof_ok: false, admitted: false, features_requested: false, features_sent: false,
-            rsa: None, seed: None, ready: false, init_sent: false, started: false, matched: false, navigation_requested: false, navigation_started: false }
+            rsa: None, seed: None, ready: false, init_sent: false, declared_display: None, started: false, matched: false, navigation_requested: false, navigation_started: false }
     }
 }
 
@@ -173,16 +174,25 @@ impl Session {
         }
         if self.proof_ok && self.features_requested && !self.features_sent {
             self.features_sent = true;
-            let mut entry = Vec::new(); proto::string(&mut entry, 1, "CONTENT_ENCRYPTION"); proto::varint(&mut entry, 2, 1);
-            let mut payload = Vec::new(); proto::varint(&mut payload, 1, 2); proto::bytes(&mut payload, 2, &entry);
-            let mut mic=Vec::new();proto::string(&mut mic,1,"VOICE_MIC");proto::varint(&mut mic,2,if cfg.microphone.is_some(){0}else{1});
-            proto::bytes(&mut payload,2,&mic);
+            let mut features = vec![("CONTENT_ENCRYPTION", 1), ("VOICE_MIC", u64::from(cfg.microphone.is_none()))];
+            if self.declared_display.is_some() {
+                features.push(("DISABLE_RESOLUTION_OPTION", 1));
+            }
+            let mut payload = Vec::new();
+            proto::varint(&mut payload, 1, features.len() as u64);
+            for (key, value) in features {
+                let mut entry = Vec::new();
+                proto::string(&mut entry, 1, key);
+                proto::varint(&mut entry, 2, value);
+                proto::bytes(&mut payload, 2, &entry);
+            }
             out.push((CMD_HU_FEATURE_CONFIG_RESPONSE, payload));
         }
         if self.proof_ok && self.admitted && self.ready && !self.init_sent {
             self.init_sent = true;
-            let (w,h) = canvas_for_receiver(cfg.width, cfg.height);
-            out.push((CMD_VIDEO_ENCODER_INIT, proto_encoder_info_payload(w,h,cfg.fps.min(30).max(1))));
+            let (width,height) = self.declared_display.unwrap_or((cfg.width,cfg.height));
+            let (w,h) = canvas_for_receiver(width, height);
+            out.push((CMD_VIDEO_ENCODER_INIT, proto_encoder_info_payload(w,h,cfg.fps)));
         }
         Ok(out)
     }
@@ -226,7 +236,7 @@ fn crypt(bytes: &[u8], key: Option<&[u8]>, encrypt: bool) -> Result<Vec<u8>,Stri
 }
 
 pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLifeEvent>,
-    size: Arc<Mutex<(u32,u32)>>, requested: Arc<Mutex<(u32,u32)>>, mut cfg: CarLifeConfig, state: Shared, reset_request: Arc<Notify>) -> Result<(),String> {
+    size: Arc<Mutex<(u32,u32)>>, requested: Arc<Mutex<(u32,u32)>>, cfg: CarLifeConfig, state: Shared, reset_request: Arc<Notify>) -> Result<(),String> {
     let (mut rd, mut wr) = stream.into_split();
     if !send_cmd(&mut wr, CMD_HU_PROTOCOL_VERSION, &proto_version_payload()).await { return Err("version write failed".into()); }
     let mut buf=Vec::new(); let mut chunk=[0;4096];
@@ -255,9 +265,14 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
         while let Some((kind, payload, consumed)) = read_cmd_frame(&buf) {
             buf.drain(..consumed);
             let payload=state.lock().decrypt(&payload)?;
-            let display=*requested.lock(); cfg.width=display.0; cfg.height=display.1;
+            let display=*requested.lock();
+            let declared = (display.0 >= 2 && display.1 >= 2).then_some(display);
             let cfg_copy=cfg.clone(); let session=state.clone(); let decoded=payload.clone();
-            let actions=tokio::task::spawn_blocking(move || session.lock().receive(kind,&decoded,&cfg_copy)).await.map_err(|e|e.to_string())??;
+            let actions=tokio::task::spawn_blocking(move || {
+                let mut session = session.lock();
+                session.declared_display = declared;
+                session.receive(kind,&decoded,&cfg_copy)
+            }).await.map_err(|e|e.to_string())??;
             let status={let s=state.lock(); (s.proof_ok,s.admitted,s.ready)};
             if matches!(kind, super::navigation::NEXT_TURN | super::navigation::ASSISTANT) {
                 let trace=navigation_diagnostics.observe("CMD",kind,consumed-8,Some(payload.len()));
@@ -270,12 +285,19 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
                 emit_log(&format!("CARWITH-SIZE: actual={w}x{h}; touch target uses actual source pixels"));
                 let _=events.send(CarLifeEvent::EncoderResolution { width:w,height:h });
             }
+            if kind == CMD_GO_TO_DESKTOP && payload.is_empty() && status == (true,true,true) && state.lock().started {
+                let _ = events.send(CarLifeEvent::GoToDesktop);
+            }
             for (id,body) in actions {
                 let encrypted=state.lock().encrypt(&body)?;
                 if !send_cmd(&mut wr,id,&encrypted).await { return Err(format!("CarWith write 0x{id:x} failed")); }
                 emit_log(&format!("CARWITH-HS: TX 0x{id:x} payload={}B wire={}B",body.len(),encrypted.len()));
+                if id == CMD_HU_FEATURE_CONFIG_RESPONSE {
+                    emit_log(&format!("CARWITH-SIZE: prefer_vehicle_resolution={}", declared.is_some()));
+                }
                 if id==CMD_VIDEO_ENCODER_INIT {
-                    emit_log(&format!("CARWITH-SIZE: receiver={}x{} request={}x{} cap=2560x2560",cfg.width,cfg.height,first_int(&body,1).unwrap_or(0),first_int(&body,2).unwrap_or(0)));
+                    let (width,height) = declared.unwrap_or((cfg.width,cfg.height));
+                    emit_log(&format!("CARWITH-SIZE: receiver={width}x{height} request={}x{} cap=2560x2560 requested_fps={}",first_int(&body,1).unwrap_or(0),first_int(&body,2).unwrap_or(0),cfg.fps));
                 }
                 if id==CMD_VIDEO_ENCODER_START {
                     emit_log("CARWITH-NAV: authenticated CMD/DATA monitoring 0x10030; dashboard card alone does not confirm HUD output");
@@ -483,6 +505,47 @@ mod tests {
         assert!(s.receive(CMD_MD_ENCRYPT_READY,&[],&cfg()).is_err());
     }
 
+    #[test]
+    fn receiver_canvas_is_advertised_and_latest_declaration_wins_at_init() {
+        let c = cfg();
+        let mut s = prepared();
+        s.proof_ok = true;
+        s.declared_display = Some((1920,1080)); // same receiver's cached size
+        let actions = s.receive(CMD_MD_FEATURE_CONFIG_REQUEST, &[], &c).unwrap();
+        let fields = &actions.iter().find(|a| a.0 == CMD_HU_FEATURE_CONFIG_RESPONSE).unwrap().1;
+        assert_eq!(first_int(fields, 1), Some(3));
+        assert!(fields.ends_with(b"\x12\x1d\x0a\x19DISABLE_RESOLUTION_OPTION\x10\x01"));
+        s.declared_display = Some((2760,800));
+        s.admitted = true;
+        s.ready = true;
+        let actions = s.receive(CMD_SCREEN_ON, &[], &c).unwrap();
+        let init = &actions.iter().find(|a| a.0 == CMD_VIDEO_ENCODER_INIT).unwrap().1;
+        assert_eq!((first_int(init,1), first_int(init,2), first_int(init,3)), (Some(2560), Some(742), Some(60)));
+    }
+
+    #[tokio::test]
+    async fn desktop_click_reaches_live_source_and_preserves_cmd_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut phone, _) = listener.accept().await.unwrap();
+        let state = microphone_test_session();
+        state.lock().started = false;
+        let (events, mut rx) = mpsc::unbounded_channel();
+        let size = Arc::new(Mutex::new((1280,720)));
+        let task = tokio::spawn(run(stream,events,size.clone(),size,cfg(),state.clone(),Arc::new(Notify::new())));
+        let click = build_cmd_frame(CMD_GO_TO_DESKTOP,&[]);
+        phone.write_all(&click).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(100),rx.recv()).await.is_err());
+        state.lock().started = true;
+        for _ in 0..2 {
+            phone.write_all(&click).await.unwrap();
+            let event = tokio::time::timeout(Duration::from_secs(2),rx.recv()).await.unwrap();
+            assert!(matches!(event,Some(CarLifeEvent::GoToDesktop)));
+        }
+        drop(phone);
+        assert!(task.await.unwrap().is_err());
+    }
+
     #[test] fn car_microphone_requires_explicit_option_authentication_and_recognition() {
         let mic=Arc::new(crate::mic_probe::ProbeControl::for_carwith());mic.arm_test();
         let mut cfg=cfg();cfg.microphone=Some(mic.clone());
@@ -525,7 +588,7 @@ mod tests {
         let wire=s.encrypt(&actions[0].1).unwrap();
         assert_ne!(wire,actions[0].1);
         assert_eq!(s.decrypt(&wire).unwrap(),actions[0].1);
-        assert_eq!(first_int(&actions[0].1,3),Some(30));
+        assert_eq!(first_int(&actions[0].1,3),Some(u64::from(cfg().fps)));
         assert!(s.receive(CMD_MD_AES_SEED,&body,&cfg()).is_err());
     }
 

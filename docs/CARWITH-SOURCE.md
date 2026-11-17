@@ -17,6 +17,8 @@ HyperCar 以车机角色主动拨本机端口，CMD/CTRL/DATA用8字节头，媒
 
 挑战认证、通道准入和加密准备是不同门槛；通过后才发送视频START。CONTENT_ENCRYPTION=1保留；默认VOICE_MIC=1使用手机麦克风，车机麦克风实验开启时声明0，仍需确认CarWith的实际录音源选择。触摸及语音硬键共用CTRL串行加密写入，不跨线程直接拼写socket。
 
+CarWith 菜单「返回车机」在已启动的 CMD 会话发 0x10021（GO_TO_DESKTOP），由本轮 AirPlay 控制通道发 POST /command（requestUI）。可按 CARWITH-UI 的入队结果和 AIRPLAY 的应答核对，屏幕是否切换仍需在车机上确认。
+
 ## 视频与触摸
 
 按源轮次重组分片及access unit，缓存有界，完整参数与IDR到位才输出。新轮次清除旧SPS/PPS和片段，不混用参数；reset输出配置不重置已有AirPlay加密帧计数，避免nonce复用。时间戳映射到单调时钟，不能直接把CarWith Unix秒当AirPlay PTS。
