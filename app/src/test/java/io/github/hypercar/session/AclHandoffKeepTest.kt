@@ -5,18 +5,10 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AclHandoffKeepTest {
-    @Test fun boundSessionStaysUp() {
-        assertTrue(AclHandoffKeep.keepInviteWait(true, false, true, false))
-        assertTrue(AclHandoffKeep.keepInviteWait(true, true, true, false))
-    }
-
-    @Test fun knownCarWifiKeepsUnboundNegotiate() {
-        assertTrue(AclHandoffKeep.keepInviteWait(true, false, false, true))
-    }
-
-    @Test fun missingCarWifiOrIdleOrStreamingUnboundDisconnects() {
-        assertFalse(AclHandoffKeep.keepInviteWait(true, false, false, false))
-        assertFalse(AclHandoffKeep.keepInviteWait(false, false, false, true))
-        assertFalse(AclHandoffKeep.keepInviteWait(true, true, false, true))
+    @Test fun refreshesOnlyWhileWaitingOnCarWifi() {
+        assertTrue(AclHandoffKeep.shouldRefreshInvitation(true, false, true))
+        assertFalse(AclHandoffKeep.shouldRefreshInvitation(true, true, true))
+        assertFalse(AclHandoffKeep.shouldRefreshInvitation(true, false, false))
+        assertFalse(AclHandoffKeep.shouldRefreshInvitation(false, false, true))
     }
 }

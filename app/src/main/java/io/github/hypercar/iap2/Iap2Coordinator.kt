@@ -107,7 +107,7 @@ class Iap2Coordinator(
             bluetooth?.let { existing ->
                 if (existing.isRunning) {
                     existing.setSessionEnabled(allowSessions, "startTransport-existing")
-                    if (allowSessions) existing.setWifiHandoff(false, "startTransport-resume")
+                    if (allowSessions) existing.setOutboundPausedForWifi(false)
                     existing.setCarPlayMarkerEnabled(true)
                     log(if (allowSessions) "IAP2: 已在运行，允许会话且保留 SDP 注册" else "IAP2: 仅保留 iPhone 身份声明，暂停会话与出站；SDP 已注册=${existing.isListening}")
                     return
@@ -158,12 +158,8 @@ class Iap2Coordinator(
         phoneIdentity.peek()?.takeIf { isSessionActive } ?: resolvePhoneIdentity()
     }
 
-    /**
-     * ACL 断开：结束当前会话但保留监听。
-     * 车机蓝牙断开后旧 RFCOMM socket 的读会卡在半开连接上不返回——必须主动关，
-     * 否则会话线程滞留、下一轮「秒连」被旧会话占位。
-     */
-    fun retireForWifi() { bluetooth?.setWifiHandoff(true, "wifi-ready-retirement") }
+    /** Wi-Fi is healthy. Suppress fresh outgoing dials while the car retires RFCOMM. */
+    fun pauseOutboundForWifi() { bluetooth?.setOutboundPausedForWifi(true) }
 
     fun endCurrentSession() { bluetooth?.dropCurrentSession() }
 

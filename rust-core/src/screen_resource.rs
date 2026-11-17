@@ -396,27 +396,31 @@ mod tests {
     async fn streaming_mgu(start: std::time::Instant) -> (Fixture, RtspMessage, TcpStream, u64, tokio::task::JoinHandle<()>, u128, u128) {
         let mut f = Fixture::new(startup_screen_modes(500)).await;
         f.session.activated.store(false, Ordering::Release);
-        let mut tasks = Vec::new();
-        crate::airplay::start_mgu_handoff(&mut tasks, f.session.control.clone(), "phone".into(),
-            || true, Arc::new(Notify::new())).await.unwrap();
-        let handoff = read(&mut f.car).await;
-        assert_eq!(bplist::parse(&handoff.body).unwrap().get("type").and_then(Value::as_str), Some("disableBluetooth"));
         let session = f.session.clone();
         let modes = f.modes.clone();
         let revision = modes.lock().screen_generation();
         let claim = tokio::spawn(async move {session.claim_box_startup_screen(&modes, revision).await});
         f.modes_reply(1).await;
         claim.await.unwrap().unwrap();
-        f.session.activated.store(true, Ordering::Release);
-        let setup = f.reconcile();
+        let session = f.session.clone();
+        let modes = f.modes.clone();
+        let setup = tokio::spawn(async move {
+            let mut tasks = Vec::new();
+            let handoff = crate::airplay::start_mgu_handoff(&mut tasks, session.control.clone(),
+                "phone".into(), || true, Arc::new(Notify::new()));
+            assert!(!crate::airplay::activate_screen_before_handoff(&session, &modes, Some(handoff)).await.unwrap());
+            tasks.pop().unwrap()
+        });
         f.modes_reply(1).await;
         let request = read(&mut f.car).await;
         let setup_ms = start.elapsed().as_millis();
         let (mut video, id) = f.setup_reply(&request).await;
-        setup.await.unwrap().unwrap();
+        let handoff = read(&mut f.car).await;
+        assert_eq!(bplist::parse(&handoff.body).unwrap().get("type").and_then(Value::as_str), Some("disableBluetooth"));
+        let task = setup.await.unwrap();
         f.video_frame(&mut video, id).await;
         let idr_ms = start.elapsed().as_millis();
-        (f, handoff, video, id, tasks.pop().unwrap(), setup_ms, idr_ms)
+        (f, handoff, video, id, task, setup_ms, idr_ms)
     }
 
     #[tokio::test]

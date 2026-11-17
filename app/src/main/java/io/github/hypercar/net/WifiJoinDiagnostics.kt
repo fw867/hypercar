@@ -12,6 +12,10 @@ import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
 import android.os.SystemClock
 import androidx.annotation.RequiresApi
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.util.UUID
 import java.util.concurrent.Executor
 
@@ -70,19 +74,32 @@ internal class WifiJoinDiagnostics(
         }
     }
 
-    @Suppress("DEPRECATION")
     fun lost(cm: ConnectivityManager, lost: Network) {
+        lossSnapshot(cm, lost, "callback")
+        // Let teardown proceed. Re-sample the original handle even after its request has ended.
+        CoroutineScope(Dispatchers.IO).launch {
+            delay(1000)
+            lossSnapshot(cm, lost, "after_1s")
+            delay(2000)
+            lossSnapshot(cm, lost, "after_3s")
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun lossSnapshot(cm: ConnectivityManager, lost: Network, phase: String) {
         val state = runCatching {
             val station = wifi?.connectionInfo
             val visible = cm.allNetworks.mapNotNull { network ->
                 val caps = cm.getNetworkCapabilities(network) ?: return@mapNotNull null
                 if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return@mapNotNull null
-                "${network.networkHandle}/ssid_match=${ssidMatch((caps.transportInfo as? WifiInfo)?.ssid, target)}"
+                val props = cm.getLinkProperties(network)
+                val ipv4 = props?.linkAddresses?.filter { it.address is java.net.Inet4Address }?.map { it.toString() }
+                "${network.networkHandle}/ssid_match=${ssidMatch((caps.transportInfo as? WifiInfo)?.ssid, target)}/ipv4=$ipv4/routes=${props?.routes?.size}"
             }
             "supplicant=${station?.supplicantState} sta_ssid_match=${ssidMatch(station?.ssid, target)} " +
                 "lost_handle_visible=${cm.getNetworkCapabilities(lost) != null} visible_wifi=$visible"
         }.getOrElse { "snapshot_error=${it.javaClass.simpleName}" }
-        log("loss_snapshot $state")
+        log("loss_snapshot phase=$phase handle=${lost.networkHandle} $state")
     }
 
     @SuppressLint("MissingPermission")

@@ -78,16 +78,29 @@ object CarUiCaster {
             }
             return "已经在跑（display=$displayId，已重新上报 ${width}x$height）"
         }
-        plan = SettingsStore.encodingPlan
-        width = plan.width
-        height = plan.height
-        HyperCarRepo.log("CARUI: viewport=${SettingsStore.receiverViewport ?: (SettingsStore.videoWidth to SettingsStore.videoHeight)} stream=${width}x${height}@${plan.fps} dpi=$DPI")
-        val c = SpikeCaster(width = width, height = height, fps = plan.fps, bitrate = plan.bitrate, tag = TAG, preferredCodec = desiredCodec)
-        caster = c
-        val encoder = runCatching { c.startEncoder() }.getOrElse { t ->
-            caster = null
-            return "编码器启动失败: ${t.javaClass.simpleName}: ${t.message}"
+        val requested = SettingsStore.encodingPlan
+        var lastError: Exception? = null
+        var encoder = ""
+        for (candidate in requested.encoderCandidates()) {
+            if (!current()) return "会话已停止，取消编码启动"
+            val next = SpikeCaster(width = candidate.width, height = candidate.height, fps = candidate.fps,
+                bitrate = candidate.bitrate, tag = TAG, preferredCodec = desiredCodec)
+            try {
+                encoder = next.startEncoder()
+            } catch (e: Exception) {
+                next.stop()
+                lastError = e
+                HyperCarRepo.log("CARUI: encoder rejected ${candidate.width}x${candidate.height}@${candidate.fps} codec=${next.actualCodec} error=${e.message}")
+                continue
+            }
+            caster = next
+            plan = candidate
+            width = candidate.width
+            height = candidate.height
+            break
         }
+        val c = caster ?: return "编码器启动失败: ${lastError?.message}"
+        HyperCarRepo.log("CARUI: requested=${requested.width}x${requested.height}@${requested.fps} stream=${width}x${height}@${plan.fps} dpi=$DPI $encoder")
         val surface = c.encoderSurface ?: run {
             c.stop()
             caster = null

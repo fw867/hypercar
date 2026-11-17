@@ -149,7 +149,7 @@ class Iap2Bluetooth(
         fun age(at: Long) = if (at == 0L) "none" else "${now - at}ms"
         return "generation=${generation.get()} running=$running registered=$isListening " +
             "acceptThread=${serverThread?.state} alive=${serverThread?.isAlive == true} ${sessions.diagnostics()} " +
-            "handoff=$wifiHandoff active=${sessionActive.get()} accepted=${acceptedSockets.get()} " +
+            "outboundPausedForWifi=${sessions.outboundPausedForWifi} active=${sessionActive.get()} accepted=${acceptedSockets.get()} " +
             "rejected=${rejectedSockets.get()} acceptAge=${age(lastAcceptAt)} workerAge=${age(lastWorkerAt)}"
     }
 
@@ -201,13 +201,10 @@ class Iap2Bluetooth(
     /** 「无 iAP2 服务→跳过」日志去重（每地址一次即可，重复轮询不刷屏）。 */
     private val skippedNoService: MutableSet<String> = java.util.Collections.synchronizedSet(HashSet())
 
-    @Volatile private var wifiHandoff = false
-    @Synchronized fun setWifiHandoff(active: Boolean, reason: String = "caller") {
-        val previous = wifiHandoff
-        wifiHandoff = active
-        if (active && !previous) sessions.retireTickets()
-        if (previous != active) log("BT-HANDOFF: reason=$reason from=$previous to=$active generation=${generation.get()}")
-        if (active) dropCurrentSession()
+    @Synchronized fun setOutboundPausedForWifi(paused: Boolean) {
+        if (sessions.outboundPausedForWifi == paused) return
+        sessions.outboundPausedForWifi = paused
+        log("BT-HANDOFF: outboundPausedForWifi=$paused generation=${generation.get()}")
     }
 
     val isRunning: Boolean get() = running
@@ -348,23 +345,17 @@ class Iap2Bluetooth(
         log("BT: 已停止（监听与出站均已关闭）")
     }
 
-    /**
-     * 只结束当前会话、保留监听/出站循环（ACL 断开时调用）。
-     * 车机蓝牙断开后，旧 RFCOMM socket 的读会卡在半开连接上不返回——必须主动关。
-     */
-    fun captureBluetoothLost(address: String): (() -> Unit)? {
-        fun matches(socket: BluetoothSocket) = runCatching {
-            socket.remoteDevice.address.equals(address, ignoreCase = true)
-        }.getOrDefault(false)
-        val cleanups = listOf(sessionSocket, pendingDial, currentSocket).mapNotNull { ref ->
-            PeerDisconnectCleanup.capture(ref, ::matches) { socket -> runCatching { socket.close() }; Unit }
+    // ACL broadcasts identify a device, not an RFCOMM generation. A pending dial also
+    // reports isConnected=false, so only inspect a socket published by runSession.
+    @SuppressLint("MissingPermission")
+    fun captureBluetoothLost(address: String): (() -> Unit)? =
+        PeerDisconnectCleanup.capture(sessionSocket,
+            matches = { socket -> runCatching { socket.remoteDevice.address.equals(address, true) }.getOrDefault(false) },
+            disconnected = { socket -> runCatching { !socket.isConnected }.getOrDefault(false) },
+        ) { socket ->
+            runCatching { socket.close() }
+            log("BT: ACL 断开，已清理 $address 的旧 RFCOMM")
         }
-        if (cleanups.isEmpty()) return null
-        return {
-            cleanups.forEach { it() }
-            log("BT: ACL 断开，仅清理 $address 捕获的旧 RFCOMM；保留 SDP 与 Wi-Fi 会话")
-        }
-    }
 
     fun dropCurrentSession() {
         sessionSocket.getAndSet(null)?.let { runCatching { it.close() } }
@@ -399,8 +390,8 @@ class Iap2Bluetooth(
             return
         }
         val ticket = sessions.ticket()
-        if (wifiHandoff || ticket == null) {
-            rejectSocket(socket, tag, if (wifiHandoff) "wifi-handoff" else "sessions-disabled")
+        if (ticket == null) {
+            rejectSocket(socket, tag, "sessions-disabled")
             return
         }
         val peerAddress = safeAddress(socket.remoteDevice)
@@ -423,6 +414,12 @@ class Iap2Bluetooth(
             // 车机只有在**新一轮** iAP2 里才会给档案 B 的能力清单，而我们又不肯为了
             // 换轮去主动拆链（拆链会让车机收起 CarPlay 图标，2026-10-25 现场定谳）。
             // 所以由车机发起的新连接来顶替旧会话——既不拆链，也不挡路。
+            // The invitation can arrive on Wi-Fi without fresh Bluetooth credentials.
+            // Once AirPlay owns a transport, let the car retire the active RFCOMM.
+            if (io.github.hypercar.session.HyperCarRepo.hasAirPlayTransport) {
+                rejectSocket(socket, tag, "active-session-during-airplay")
+                return
+            }
             if (sessionProductive) {
                 log("$tag: 已有 iAP2 会话在跑且已拿到凭据，忽略新的连入 addr=${peerAddress ?: "?"}")
                 rejectSocket(socket, tag, "productive-session")
@@ -457,7 +454,7 @@ class Iap2Bluetooth(
         while (running && generation.get() == myGeneration) {
             // 会话期间静默：两条 RFCOMM 会互相踩（见 sessionActive 注释）
             val ticket = sessions.ticket()
-            if (ticket == null || wifiHandoff || sessionActive.get()) {
+            if (ticket == null || sessions.outboundPausedForWifi || sessionActive.get()) {
                 sleepQuietly(2_000)
                 continue
             }
@@ -468,11 +465,11 @@ class Iap2Bluetooth(
                 inboundGraceDone = true
                 val deadline = SystemClock.uptimeMillis() + INBOUND_GRACE_MILLIS
                 while (running && generation.get() == myGeneration &&
-                    sessions.allows(ticket) && !sessionActive.get() && SystemClock.uptimeMillis() < deadline
+                    sessions.allowsOutbound(ticket) && !sessionActive.get() && SystemClock.uptimeMillis() < deadline
                 ) {
                     sleepQuietly(250)
                 }
-                if (!sessions.allows(ticket) || sessionActive.get() || !running || generation.get() != myGeneration) continue
+                if (!sessions.allowsOutbound(ticket) || sessionActive.get() || !running || generation.get() != myGeneration) continue
                 log("BT-C: ${INBOUND_GRACE_MILLIS / 1000}s 内车机未主动连入——改走出站（会先断开该车机的 HFP/A2DP）")
             }
             val explicitTarget = targetProvider()
@@ -491,7 +488,7 @@ class Iap2Bluetooth(
             var connected: BluetoothSocket? = null
             for (device in candidates) {
                 if (!running || generation.get() != myGeneration) return
-                if (!sessions.allows(ticket) || sessionActive.get()) break
+                if (!sessions.allowsOutbound(ticket) || sessionActive.get()) break
                 // SDP 等待期间目标可能由 ACL 广播锁定；旧候选不能继续拨号。
                 if (targetProvider() != explicitTarget || preferredProvider() != preferred) break
                 if (device.bondState != BluetoothDevice.BOND_BONDED) continue
@@ -505,7 +502,7 @@ class Iap2Bluetooth(
                 // 文件在线时不开放 iAP2 服务窗口（奥迪 MIB3 实测每 3s 连接失败）。
                 // **宝马档案不做这一步**：它的 HFP/A2DP 在线时照样主动连入 iAP2，而断开
                 // 会连带把 ACL 拽掉（车机反复重连），反而再也不发起 CarPlay。
-                if (!sessions.allows(ticket)) break
+                if (!sessions.allowsOutbound(ticket)) break
                 val evidence = io.github.hypercar.session.PairingEvidence.read(appContext.filesDir, device.address)
                 if (dropProfilesBeforeIap2 && evidence.mayDropProfiles) {
                     // 注意：BtProfiles.disconnect 内部会打「自己断开」归因标记——断开
@@ -645,7 +642,7 @@ class Iap2Bluetooth(
 
     @SuppressLint("MissingPermission")
     private fun tryConnect(device: BluetoothDevice, ticket: Long): BluetoothSocket? {
-        if (!sessions.allows(ticket)) return null
+        if (!sessions.allowsOutbound(ticket)) return null
         val socket =
             try {
                 device.createRfcommSocketToServiceRecord(ACCESSORY_IAP2_UUID)
@@ -655,7 +652,7 @@ class Iap2Bluetooth(
         // 连接前就登记：connect() 是阻塞调用（SDP 查询 + 建链最长可达数十秒），
         // stop()/dropCurrentSession() 只有拿到 socket 引用才能 close() 打断它。
         synchronized(this) {
-            if (!running || !sessions.allows(ticket)) {
+            if (!running || !sessions.allowsOutbound(ticket)) {
                 runCatching { socket.close() }
                 return null
             }
@@ -690,7 +687,6 @@ class Iap2Bluetooth(
             val rejected = when {
                 !running -> "not-running"
                 !sessions.allows(ticket) -> "stale-session-ticket"
-                wifiHandoff -> "wifi-handoff-before-worker"
                 !sessionActive.compareAndSet(false, true) -> "session-already-active"
                 else -> null
             }

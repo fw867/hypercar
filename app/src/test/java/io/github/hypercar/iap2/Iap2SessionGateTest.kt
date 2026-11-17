@@ -7,13 +7,15 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class Iap2SessionGateTest {
-    @Test fun wifiHandoffCannotReviveQueuedBluetoothWorkerAfterResume() {
+    @Test fun wifiHandoffLeavesCurrentAndIncomingSessionsUsableAndPausesNewDials() {
         val gate = Iap2SessionGate()
-        val queued = gate.ticket()!!
-        gate.retireTickets() // Wi-Fi handoff invalidates workers not yet published.
-        gate.setEnabled(true) // Resuming keeps SDP and may leave the enabled value unchanged.
-        assertFalse(gate.allows(queued))
+        val current = gate.ticket()!!
+        gate.outboundPausedForWifi = true
+        assertTrue(gate.allows(current))
         assertTrue(gate.allows(gate.ticket()!!))
+        assertFalse(gate.allowsOutbound(current))
+        gate.outboundPausedForWifi = false
+        assertTrue(gate.allowsOutbound(current))
     }
 
     @Test fun pausedTicketsNeverReviveWhenManualStartOrCooldownResumes() {

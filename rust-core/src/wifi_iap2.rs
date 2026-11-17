@@ -11,8 +11,26 @@ use crate::{bplist::{self, Value}, rtsp::RtspChannel};
 struct Handoff {
     id: u64, ready: bool, health: Option<std::time::Instant>, ready_token: u64, phase: String,
     event_packets: u64, event_bytes: u64, control_packets: u64, control_bytes: u64,
+    rtsp_owner: Option<u64>,
+}
+impl Handoff {
+    fn new_session(id: u64) -> Self {
+        Self { id, rtsp_owner: Some(id), ..Self::default() }
+    }
+    fn clear_writer(&mut self, id: u64) {
+        if self.id == id {
+            // The RTSP readers can observe EOF after the iAP writer has exited.
+            *self = Self { rtsp_owner: self.rtsp_owner, ..Self::default() };
+        }
+    }
+    fn take_rtsp_end(&mut self, id: u64) -> bool {
+        if self.rtsp_owner != Some(id) { return false; }
+        self.rtsp_owner = None;
+        true
+    }
 }
 static HANDOFF: Lazy<Mutex<Handoff>> = Lazy::new(|| Mutex::new(Handoff::default()));
+pub fn take_rtsp_end(id: u64) -> bool { HANDOFF.lock().take_rtsp_end(id) }
 pub fn is_active(id: u64) -> bool { HANDOFF.lock().id == id }
 pub fn set_phase(id: u64, phase: &str) {
     if !matches!(phase,"WAIT_PEER"|"WAIT_PEER_LONG"|"LINK"|"IDENTIFICATION"|"CERTIFICATE"|"CHALLENGE"|"READY_PENDING"|"FAILED"|"STOPPED") { return; }
@@ -74,7 +92,7 @@ pub fn can_keep_session() -> bool {
 pub fn can_keep_generation(id: u64) -> bool {
     let s = HANDOFF.lock(); s.id == id && s.ready && s.health.map(|t| t.elapsed() < Duration::from_secs(5)).unwrap_or(false)
 }
-fn clear_handoff(id: u64) { let mut s = HANDOFF.lock(); if s.id == id { *s = Handoff::default(); } }
+fn clear_handoff(id: u64) { HANDOFF.lock().clear_writer(id); }
 
 pub fn ingress_summary(id: u64) -> String {
     let s=HANDOFF.lock();
@@ -182,7 +200,7 @@ impl WifiIap2 {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::channel::<Outbound>(64);
         *OUTPUT.lock() = Some((id, tx));
-        *HANDOFF.lock() = Handoff { id, ..Handoff::default() };
+        *HANDOFF.lock() = Handoff::new_session(id);
         let task = tokio::spawn(async move {
             let mut sent = 0u64;
             let mut last_written = String::from("none");
@@ -235,6 +253,7 @@ impl WifiIap2 {
 
 impl Drop for WifiIap2 {
     fn drop(&mut self) {
+        take_rtsp_end(self.id);
         self.task.abort();
         clear_handoff(self.id);
         {
@@ -248,6 +267,20 @@ impl Drop for WifiIap2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn writer_failure_preserves_exactly_one_rtsp_end_for_the_current_session() {
+        let mut state = Handoff::new_session(17);
+        state.clear_writer(17);
+        assert_eq!(state.id, 0);
+        assert!(state.take_rtsp_end(17));
+        assert!(!state.take_rtsp_end(17));
+
+        let mut next = Handoff::new_session(18);
+        next.clear_writer(17);
+        assert_eq!(next.id, 18);
+        assert!(!next.take_rtsp_end(17));
+        assert!(next.take_rtsp_end(18));
+    }
     #[test]
     fn frame_diagnostics_include_only_link_and_message_headers() {
         let mut frame = vec![0xff,0x5a,0,23,0x40,117,146,1,0,0x40,0x40,0,14,0x50,1];

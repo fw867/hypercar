@@ -4,6 +4,27 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class VideoEncodingPlanTest {
+    @Test fun rejectedBmwNativeModeCanFallBackToAvcSizeAndRate() {
+        val requested = VideoEncodingPlan.fit(2736, 800, 60)
+        val candidates = requested.encoderCandidates()
+        assertEquals(requested, candidates.first())
+        assertEquals(requested.copy(fps = 30), candidates[1])
+        val accepted = candidates.first { it.width <= 1920 && it.fps <= 30 }
+        assertEquals(1920, accepted.width)
+        assertEquals(560, accepted.height)
+        assertEquals(30, accepted.fps)
+        assertTrue(accepted.densityDpi < requested.densityDpi)
+    }
+
+    @Test fun fallbackNeverUpscalesOrRaisesRequestedFps() {
+        for (plan in listOf(VideoEncodingPlan.fit(721, 1281, 24), VideoEncodingPlan.fit(1280, 720, 30))) {
+            val modes = plan.encoderCandidates()
+            assertEquals(modes.distinct(), modes)
+            assertTrue(modes.all { it.width <= plan.width && it.height <= plan.height && it.fps == plan.fps })
+            assertTrue(modes.any { it.width < plan.width && it.height < plan.height })
+        }
+    }
+
     @Test fun bmwUltrawideUsesNativePixelsAndDefaultsToSixtyFps() {
         val plan = VideoEncodingPlan.fit(2736, 800)
         assertEquals(2736, plan.width)

@@ -437,57 +437,25 @@ object HyperCarRepo {
                         connectAutomatically(app)
                     }
                 } else {
-                    // BMW retires Bluetooth after Wi-Fi takes over. Only keep a live, authenticated
-                    // Wi-Fi iAP2 session with a recent successful RTSP feedback response.
+                    // An ACL broadcast has no connection generation. The RFCOMM reader,
+                    // the bound network monitor and RTSP each own their transport's end.
+                    val attempt = connectionAttemptId
+                    val address = runCatching { device.address }.getOrNull()
                     if (sessionLive.get() && RustCoreBridge.nativeCanKeepWifiSession()) {
-                        iap2?.retireForWifi()
-                        log("HANDOFF: 蓝牙 ACL 已退场，Wi-Fi iAP2 就绪且控制保活正常，继续 CarPlay")
-                        logAclEvent(device, connected)
-                        return@handler
-                    }
-                    val processBound = hasCurrentSession && wifiReceiverMac != null && boundNetwork != null
-                    if (processBound) {
-                        // BMW secondary: phone is often already on car Wi-Fi; ACL closes after a
-                        // short window. Refresh ctrl on that handoff so the car can invite on Wi-Fi.
-                        log("WIFI-RESUME: 保留已知车机网络及监听；ACL 断开不撤销现有 mDNS，保留 ctrl 等 Wi-Fi 邀请")
-                        scope.launch { nudgeInvitationDiscovery(app, "ACL 退场交 Wi-Fi", handoffToWifi = true) }
-                        logAclEvent(device, connected)
-                        return@handler
-                    }
-                    if (hasCurrentSession && (!streaming || currentBluetoothHotspot(connectionAttemptId) != null)) {
-                        // Bind often finishes after this short ACL. Confirm the known car
-                        // network off the main thread before deciding to tear the wait down.
-                        val attempt = connectionAttemptId
-                        val address = runCatching { device.address }.getOrNull()
+                        iap2?.pauseOutboundForWifi()
+                        log("HANDOFF: ACL 退场，保留 RFCOMM 收发与当前 Wi-Fi CarPlay 会话")
+                    } else if (hasCurrentSession && !streaming && !hasAirPlayTransport) {
                         scope.launch {
                             val announced = currentBluetoothHotspot(attempt)
                             if (address != null && announced != null && !announced.peer.equals(address, true)) return@launch
-                            val association = announced?.let { hotspotAssociation(app, it) }
-                            val present = association?.associated == true || knownCarWifiAssociated(app)
-                            if (connectionAttemptId != attempt || !sessionLive.get()) return@launch
-                            val boundNow = boundNetwork?.let { wifiReceiverMac != null || it == association?.network } == true
-                            if (!AclHandoffKeep.keepInviteWait(hasCurrentSession, streaming, boundNow, present)) {
-                                userDisconnectRequested = false
-                                if (address != null && address == aclCarMac) aclCarMac = null
-                                disconnect(userInitiated = false, expectedAttempt = attempt)
-                                return@launch
-                            }
-                            log(if (boundNow) {
-                                "WIFI-RESUME: 保留已知车机网络及监听；ACL 断开不撤销现有 mDNS，保留 ctrl 等 Wi-Fi 邀请"
-                            } else {
-                                "WIFI-RESUME: ACL 退场时车机 Wi-Fi 已关联，等待完成绑定并接收邀请"
-                            })
-                            nudgeInvitationDiscovery(app, "ACL 退场交 Wi-Fi", handoffToWifi = true)
+                            val bound = boundNetwork != null
+                            val present = bound || announced?.let { hotspotAssociation(app, it).associated } == true ||
+                                knownCarWifiAssociated(app)
+                            if (connectionAttemptId != attempt || !AclHandoffKeep.shouldRefreshInvitation(
+                                    sessionLive.get(), streaming || hasAirPlayTransport, present)) return@launch
+                            nudgeInvitationDiscovery(app, "ACL 退场交 Wi-Fi", handoffToWifi = true, expectedAttempt = attempt)
                         }
-                        logAclEvent(device, connected)
-                        return@handler
                     }
-                    // 真正离开车机后允许下一轮 ACL 自动连接；服务停止不回灌 ACL 事件。
-                    userDisconnectRequested = false
-                    runCatching { device.address }.getOrNull()?.let { address ->
-                        if (address == aclCarMac) aclCarMac = null
-                    }
-                    disconnect(userInitiated = false)
                 }
                 logAclEvent(device, connected)
             }
@@ -523,6 +491,7 @@ object HyperCarRepo {
     // ---------------------------------------------------------------- 对 UI
 
     val hasCurrentSession: Boolean get() = sessionLive.get() || connecting || streaming
+    internal val hasAirPlayTransport: Boolean get() = sessionLive.get() && sessionSockets != null
 
     /** Only the filtered classic ACL broadcast calls this, never the foreground-service relay. */
     internal fun noteCarActivationWake(mac: String, connected: Boolean) {
@@ -565,6 +534,7 @@ object HyperCarRepo {
         context: Context,
         reason: String,
         handoffToWifi: Boolean = false,
+        expectedAttempt: Long = connectionAttemptId,
     ) {
         val advertiser = ctrlAdvertiser
         val now = SystemClock.elapsedRealtime()
@@ -574,6 +544,8 @@ object HyperCarRepo {
         if (!InviteWakeNudge.shouldNudge(sessionLive.get(), streaming, keepWifi, advertiser != null,
                 now, anchor, handoffToWifi)) return
         val ssid = sessionWifiSsid ?: currentWifiSsid(context)
+        if (expectedAttempt != connectionAttemptId || advertiser !== ctrlAdvertiser || !sessionLive.get() ||
+            streaming || hasAirPlayTransport) return
         val network = boundNetwork
         val ensured = advertiser?.nudgeWhileWaiting(reason, ssid, network) == true
         val stamped = InviteWakeNudge.rememberNudge(ensured, now, anchor)
@@ -783,7 +755,7 @@ object HyperCarRepo {
         log("TARGET: 用户目标=${target ?: "自动"}，已清除旧 ACL 候选；入站过滤立即生效，已建立会话保持")
     }
 
-    fun disconnect(expectedAttempt: Long) = disconnect(userInitiated = true, expectedAttempt = expectedAttempt)
+    fun disconnect(expectedAttempt: Long) = disconnect(userInitiated = true, expectedAttempt = expectedAttempt, reason = "用户断开当前会话")
 
     private fun clearAutomaticPause(context: Context, reason: String) {
         val hadPause = SettingsStore.automaticPause.isNotEmpty()
@@ -801,7 +773,7 @@ object HyperCarRepo {
     private fun disconnect(
         userInitiated: Boolean,
         expectedAttempt: Long = connectionAttemptId,
-        reason: String = if (userInitiated) "用户断开当前会话" else "车机 ACL 断开",
+        reason: String,
     ) {
         val attempt = expectedAttempt
         scope.launch {

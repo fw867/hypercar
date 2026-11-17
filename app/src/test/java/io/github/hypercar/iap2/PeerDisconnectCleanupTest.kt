@@ -6,12 +6,12 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PeerDisconnectCleanupTest {
-    private class Socket(val peer: String) { var closed = 0 }
+    private class Socket(val peer: String, val disconnected: Boolean = true) { var closed = 0 }
 
     @Test fun closesCapturedPeerOnce() {
         val socket = Socket("BMW")
         val ref = AtomicReference<Socket?>(socket)
-        val close = PeerDisconnectCleanup.capture(ref, { it.peer == "BMW" }, { it.closed++ })!!
+        val close = PeerDisconnectCleanup.capture(ref, { it.peer == "BMW" }, { it.disconnected }, { it.closed++ })!!
         close(); close()
         assertNull(ref.get())
         assertEquals(1, socket.closed)
@@ -20,16 +20,24 @@ class PeerDisconnectCleanupTest {
     @Test fun ignoresAnotherPeer() {
         val socket = Socket("DiPlay")
         val ref = AtomicReference<Socket?>(socket)
-        assertNull(PeerDisconnectCleanup.capture(ref, { it.peer == "BMW" }, { it.closed++ }))
+        assertNull(PeerDisconnectCleanup.capture(ref, { it.peer == "BMW" }, { it.disconnected }, { it.closed++ }))
         assertSame(socket, ref.get())
         assertEquals(0, socket.closed)
+    }
+
+    @Test fun broadcastDeliveredAfterReplacementPreservesConnectedSocketOfSamePeer() {
+        val next = Socket("BMW", disconnected = false)
+        val ref = AtomicReference<Socket?>(next)
+        assertNull(PeerDisconnectCleanup.capture(ref, { it.peer == "BMW" }, { it.disconnected }, { it.closed++ }))
+        assertSame(next, ref.get())
+        assertEquals(0, next.closed)
     }
 
     @Test fun delayedAclCleanupCannotCloseNewSessionEvenWithSameAddress() {
         val old = Socket("BMW")
         val next = Socket("BMW")
         val ref = AtomicReference<Socket?>(old)
-        val close = PeerDisconnectCleanup.capture(ref, { it.peer == "BMW" }, { it.closed++ })!!
+        val close = PeerDisconnectCleanup.capture(ref, { it.peer == "BMW" }, { it.disconnected }, { it.closed++ })!!
         val ready = CountDownLatch(1)
         val release = CountDownLatch(1)
         val worker = Thread { ready.countDown(); release.await(); close() }
@@ -43,6 +51,6 @@ class PeerDisconnectCleanupTest {
 
     @Test fun emptySessionDoesNotCreateDeferredWildcardCleanup() {
         val ref = AtomicReference<Socket?>(null)
-        assertNull(PeerDisconnectCleanup.capture(ref, { true }, { it.closed++ }))
+        assertNull(PeerDisconnectCleanup.capture(ref, { true }, { it.disconnected }, { it.closed++ }))
     }
 }

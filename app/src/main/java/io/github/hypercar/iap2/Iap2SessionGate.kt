@@ -9,7 +9,8 @@ internal class Iap2SessionGate {
         if (enabled != value) { enabled = value; revision++ }
     }
     @Synchronized fun diagnostics(): String = "enabled=$enabled revision=$revision"
-    @Synchronized fun retireTickets() { revision++ }
+    @Volatile var outboundPausedForWifi = false
+    @Synchronized fun allowsOutbound(ticket: Long): Boolean = allows(ticket) && !outboundPausedForWifi
     @Synchronized fun ticket(): Long? = revision.takeIf { enabled }
     @Synchronized fun allows(ticket: Long): Boolean = enabled && revision == ticket
 }

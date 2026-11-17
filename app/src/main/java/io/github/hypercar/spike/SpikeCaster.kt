@@ -124,12 +124,14 @@ class SpikeCaster(
             csdFromFormat.reset()
             awaitingKeyFrame = true
         }
-        val format = MediaFormat.createVideoFormat(selected.mime, width, height).apply {
+        fun surfaceFormat() = MediaFormat.createVideoFormat(selected.mime, width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, fps.toFloat())
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        }
+        val format = surfaceFormat().apply {
+            setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, fps.toFloat())
             setInteger(MediaFormat.KEY_PROFILE, if (selected == VideoCodec.HEVC) MediaCodecInfo.CodecProfileLevel.HEVCProfileMain else MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
             // Let MediaCodec choose the level required by the native size and frame rate.
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
@@ -143,30 +145,36 @@ class SpikeCaster(
                 runCatching { setInteger(MediaFormat.KEY_LATENCY, 0) }
             }
         }
-        val enc = if (selected == VideoCodec.HEVC) {
-            val candidate = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull { info ->
-                info.isEncoder && info.isHardwareAccelerated && info.supportedTypes.any { it.equals(selected.mime, true) } &&
-                    runCatching {
-                        val caps = info.getCapabilitiesForType(selected.mime)
-                        caps.colorFormats.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface) &&
-                            caps.profileLevels.any { it.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain } &&
-                            caps.videoCapabilities.areSizeAndRateSupported(width, height, fps.toDouble()) &&
-                            caps.isFormatSupported(format)
-                    }.getOrDefault(false)
-            } ?: error("no hardware HEVC Main Surface encoder for ${width}x${height}@$fps")
-            MediaCodec.createByCodecName(candidate.name)
-        } else MediaCodec.createEncoderByType(selected.mime)
+        val candidate = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull { info ->
+            if (!info.isEncoder || !info.isHardwareAccelerated ||
+                info.supportedTypes.none { it.equals(selected.mime, true) }) return@firstOrNull false
+            runCatching {
+                val caps = info.getCapabilitiesForType(selected.mime)
+                val supportsHevc = selected != VideoCodec.HEVC ||
+                    (caps.profileLevels.any { it.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain } &&
+                        caps.isFormatSupported(format))
+                supportsHevc && caps.colorFormats.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface) &&
+                    caps.videoCapabilities.areSizeAndRateSupported(width, height, fps.toDouble())
+            }.getOrDefault(false)
+        }
+        var enc = when {
+            candidate != null -> MediaCodec.createByCodecName(candidate.name)
+            selected == VideoCodec.HEVC -> error("no hardware HEVC Main Surface encoder for ${width}x${height}@$fps")
+            else -> MediaCodec.createEncoderByType(selected.mime)
+        }
         codec = enc
         try {
             try {
                 enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            } catch (t: Throwable) {
+            } catch (t: Exception) {
                 if (selected == VideoCodec.HEVC) throw t
-                SpikeReport.add(tag, "configure 带 profile/level/bitrateMode 失败（${t.message}），去掉后重试")
-                format.removeKey(MediaFormat.KEY_PROFILE)
-                format.removeKey(MediaFormat.KEY_LEVEL)
-                format.removeKey(MediaFormat.KEY_BITRATE_MODE)
-                enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                val name = enc.name
+                SpikeReport.add(tag, "$name ${width}x${height}@$fps rejected (${t.message}); retry fresh AVC encoder with basic Surface format")
+                enc.release()
+                codec = null
+                enc = MediaCodec.createByCodecName(name)
+                codec = enc
+                enc.configure(surfaceFormat(), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             }
             val surface = enc.createInputSurface()
             inputSurface = surface

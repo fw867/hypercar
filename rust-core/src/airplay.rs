@@ -508,18 +508,11 @@ pub async fn negotiate(
     emit_log(&format!("TIMING: after RECORD/resource response {}",p.pipeline.lock().timing.summary()));
     p.pipeline.lock().control_ready=true;
 
-    // The successful BMW box requests transport handoff BEFORE Wi-Fi iAP2 starts.
-    // This is a one-shot request, not proof of handoff completion. Keep-session policy
-    // still separately requires Wi-Fi iAP2 readiness and fresh feedback health.
+    let receiver_model = info.get("model").and_then(Value::as_str).unwrap_or("");
+    let mgu_handoff = box_bootstrap && !p.desktop_receiver && p.bmw_capabilities
+        && (receiver_model == "MGU" || receiver_model.starts_with("MGU-"));
     if box_bootstrap && !p.desktop_receiver {
-        emit_log(&format!("HANDOFF: request after RECORD/resources, before video SETUP; wifi_phase={} {}; not waiting for Wi-Fi authentication",
-            crate::wifi_iap2::phase(wifi_iap_id), crate::wifi_iap2::ingress_summary(wifi_iap_id)));
-        let model = info.get("model").and_then(Value::as_str).unwrap_or("");
-        if p.bmw_capabilities && (model == "MGU" || model.starts_with("MGU-")) {
-            start_mgu_handoff(&mut keepalive.0, channel.clone(), p.device_id.clone(),
-                move || crate::wifi_iap2::is_active(wifi_iap_id), stop.clone()).await?;
-            if !crate::wifi_iap2::is_active(wifi_iap_id) { return Err("MGU handoff session expired".into()); }
-        } else {
+        if !mgu_handoff {
             let result=request_bluetooth_handoff(&channel, &p.device_id,
                 || crate::wifi_iap2::is_active(wifi_iap_id), stop.clone()).await;
             match result {
@@ -538,22 +531,17 @@ pub async fn negotiate(
     }
 
     let media_started_before_ready = mbux_media_compat && !crate::wifi_iap2::transport_ready(wifi_iap_id);
-    let mut screen_failed = false;
-    // ---- 6. 屏幕流 SETUP ----
-    screen_session.activated.store(true, std::sync::atomic::Ordering::Release);
-    emit_log(&format!("SCREEN-LIFECYCLE: session enabled={} initial={}", p.screen_resource_lifecycle,modes.lock().diagnostics()));
-    if p.screen_resource_lifecycle {
-        if let Err(error) = screen_session.reconcile_resource(&modes).await {
-            screen_failed = true;
-            p.pipeline.lock().video_stream="FAILED".into();
-            emit_log(&format!("SCREEN-LIFECYCLE: initial video failed: {error}; preserve audio/control"));
-        }
-        emit_state("connected", "控制会话就绪；视频通道随主屏使用权建立");
-    } else {
-        let screen = screen_session.open().await?;
-        screen_session.install(screen).await?;
-        emit_state("connected", "控制会话与视频通道就绪；车机显示尚未确认");
-    }
+    // On MGU the iPhone publishes the initial screen owner before asking the receiver
+    // to retire Bluetooth. The receiver may retain the screen and may initiate iAP only later.
+    let handoff = mgu_handoff.then(|| async {
+        emit_log(&format!("HANDOFF: MGU initial screen decision complete; {}; wifi_phase={} {}",
+            modes.lock().diagnostics(), crate::wifi_iap2::phase(wifi_iap_id), crate::wifi_iap2::ingress_summary(wifi_iap_id)));
+        start_mgu_handoff(&mut keepalive.0, channel.clone(), p.device_id.clone(),
+            move || crate::wifi_iap2::is_active(wifi_iap_id), stop.clone()).await?;
+        if !crate::wifi_iap2::is_active(wifi_iap_id) { return Err("MGU handoff session expired".into()); }
+        Ok(())
+    });
+    let screen_failed = activate_screen_before_handoff(&screen_session, &modes, handoff).await?;
     // ---- 9. 音频流 SETUP（会话已激活后再试；失败只记录）----
     // The phone is the resource arbiter. CatPlay marks changeModes FromAccessory;
     // sending it to BMW returned 422. Initial local ownership was already published via
@@ -631,6 +619,31 @@ pub async fn negotiate(
     }
 }
 
+pub(crate) async fn activate_screen_before_handoff(
+    screen_session: &crate::screen_session::ScreenSession,
+    modes: &Arc<Mutex<crate::modes::Modes>>,
+    handoff: Option<impl std::future::Future<Output = Result<(), String>>>,
+) -> Result<bool, String> {
+    let mut screen_failed = false;
+    // ---- 6. 屏幕流 SETUP ----
+    screen_session.activated.store(true, std::sync::atomic::Ordering::Release);
+    emit_log(&format!("SCREEN-LIFECYCLE: session enabled={} initial={}", screen_session.params.screen_resource_lifecycle,modes.lock().diagnostics()));
+    if screen_session.params.screen_resource_lifecycle {
+        if let Err(error) = screen_session.reconcile_resource(modes).await {
+            screen_failed = true;
+            screen_session.params.pipeline.lock().video_stream="FAILED".into();
+            emit_log(&format!("SCREEN-LIFECYCLE: initial video failed: {error}; preserve audio/control"));
+        }
+        emit_state("connected", "控制会话就绪；视频通道随主屏使用权建立");
+    } else {
+        let screen = screen_session.open().await?;
+        screen_session.install(screen).await?;
+        emit_state("connected", "控制会话与视频通道就绪；车机显示尚未确认");
+    }
+    if let Some(request) = handoff { request.await?; }
+    Ok(screen_failed)
+}
+
 fn independent_audio_receiver(bmw:bool,nbt:bool,id9:bool,desktop:bool,info:&Value)->bool {
     let diplay=["name","model","manufacturer"].into_iter().any(|key|
         info.get(key).and_then(Value::as_str).is_some_and(|v|v.to_ascii_lowercase().contains("diplay")));
@@ -670,7 +683,7 @@ pub(crate) async fn start_mgu_handoff(
         }
     }));
     flushed.await.map_err(|_| "MGU disableBluetooth cancelled or write failed".to_string())?;
-    emit_log("HANDOFF: MGU disableBluetooth written; proceeding to screen claim");
+    emit_log("HANDOFF: MGU disableBluetooth written after initial screen decision");
     Ok(())
 }
 
@@ -2201,7 +2214,14 @@ fn spawn_keepalive_loops(
                         first_reply = false;
                     }
                 }
-                Err(error) => { if let Some(id) = wifi_iap_id { crate::wifi_iap2::feedback(id, false); } emit_log(&format!("AIRPLAY: feedback stopped: {error}")); if wifi_iap_id.map(crate::wifi_iap2::is_active).unwrap_or(false) { emit_state("ended", "控制保活失败"); } return; },
+                Err(error) => {
+                    emit_log(&format!("AIRPLAY: feedback stopped: {error}"));
+                    if let Some(id) = wifi_iap_id {
+                        crate::wifi_iap2::feedback(id, false);
+                        if crate::wifi_iap2::take_rtsp_end(id) { emit_state("ended", "控制保活失败"); }
+                    }
+                    return;
+                },
             }
         }
     }));
@@ -2239,7 +2259,8 @@ fn spawn_event_dispatcher(
                     Some(m) => m,
                     None => {
                         crate::wifi_iap2::mark_ready(wifi_iap_id, false);
-                        if crate::wifi_iap2::is_active(wifi_iap_id) { emit_state("ended", "事件通道关闭"); } return;
+                        if crate::wifi_iap2::take_rtsp_end(wifi_iap_id) { emit_state("ended", "事件通道关闭"); }
+                        return;
                     },
                 },
             };
