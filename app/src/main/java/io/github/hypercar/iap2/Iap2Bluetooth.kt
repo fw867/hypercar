@@ -227,9 +227,12 @@ class Iap2Bluetooth(
             carPlayMarker = null
             return
         }
-        if (carPlayMarker != null) return
+        startMarkerWhenListening(generation.get())
+    }
+
+    @Synchronized private fun startMarkerWhenListening(epoch: Long) {
+        if (generation.get() != epoch || !markerEnabled || !isListening || carPlayMarker != null) return
         val adapter = adapterOrNull() ?: return
-        val epoch = generation.get()
         carPlayMarker = CarPlayBluetoothMarker(
             adapter = adapter,
             ownerAlive = { running && markerEnabled && generation.get() == epoch },
@@ -296,6 +299,7 @@ class Iap2Bluetooth(
                 }
             },
             accept = { socket: BluetoothServerSocket -> socket.accept() },
+            onRegistered = { startMarkerWhenListening(myGeneration) },
             onFailure = { error ->
                 val now = SystemClock.elapsedRealtime()
                 if (lastRegistrationErrorAt == null || now - lastRegistrationErrorAt!! >= 30_000) {
@@ -311,7 +315,6 @@ class Iap2Bluetooth(
             serverThread = this
             start()
         }
-        setCarPlayMarkerEnabled(markerEnabled)
         if (allowOutboundIap2) {
             Thread({ connectLoop(myGeneration) }, "iap2-bt-client").apply {
                 isDaemon = true
@@ -736,6 +739,7 @@ class Iap2Bluetooth(
                     },
                     context = appContext,
                     receiverAddress = safeAddress(socket.remoteDevice),
+                    pairedReceiver = evidence.identityPresent && evidence.receiverCredentialPresent,
                     navigationEnabled = { sessions.allows(ticket) && io.github.hypercar.session.HyperCarRepo.hudNavigationAllowed },
                     navigationCue = { io.github.hypercar.navigation.NavigationSources.snapshot() },
                     onMediaKey = { usage -> io.github.hypercar.session.HyperCarRepo.onIap2MediaKey(usage) { sessions.allows(ticket) } },
@@ -912,6 +916,10 @@ private class RfcommLinkChannel(
         synchronized(lock) {
             engine.peerSynchronization?.maxLength?.minus(Iap2LinkEngine.HEADER_BYTES + 1)
         }
+
+    override val peerControlVersion: Int? get() = synchronized(lock) {
+        engine.peerSynchronization?.sessions?.firstOrNull { it.kind == 0 }?.version
+    }
 
     override val supportsFileTransfer: Boolean get() = synchronized(lock) { engine.fileTransferSession != null }
     override val canQueueMedia: Boolean get() = synchronized(lock) { !terminated && engine.queuedControlPackets < 4 && engine.outstandingPackets < 8 }

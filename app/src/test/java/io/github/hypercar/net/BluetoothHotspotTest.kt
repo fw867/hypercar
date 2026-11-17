@@ -4,6 +4,17 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class BluetoothHotspotTest {
+    @Test fun onlyFreshBluetoothParametersCanStartANewJoin() {
+        val hotspot = BluetoothHotspot.fromPeer(car, ssid)!!
+        val endpoint = io.github.hypercar.iap2.CarPlayEndpoint(ssid, "fixture-pass", 7000, null, null,
+            null, emptyList(), null, bluetoothHotspot = hotspot)
+        assertTrue(endpoint.canRequestHotspot(hotspot))
+        assertFalse(endpoint.copy(fromInvite = true).canRequestHotspot(hotspot))
+        assertFalse(endpoint.copy(proactive = true).canRequestHotspot(hotspot))
+        assertFalse(endpoint.copy(bluetoothHotspot = null).canRequestHotspot(hotspot))
+        assertFalse(endpoint.canRequestHotspot(BluetoothHotspot.fromPeer("another peer", ssid)))
+        assertFalse(endpoint.canRequestHotspot(BluetoothHotspot.fromPeer(car, "another SSID")))
+    }
     private val car = "12:34:56:78:9A:BC"
     private val ssid = "DIRECT-BMW test"
 

@@ -11,6 +11,7 @@ internal class RecoveringListener<S : Closeable, C : Closeable>(
     private val accept: (S) -> C,
     private val onFailure: (IOException) -> Unit,
     private val awaitRetry: () -> Unit,
+    private val onRegistered: () -> Unit = {},
 ) : Closeable {
     @Volatile private var stopped = false
     private val socket = AtomicReference<S?>(null)
@@ -22,7 +23,10 @@ internal class RecoveringListener<S : Closeable, C : Closeable>(
             try {
                 val listener = socket.get() ?: open().let { created ->
                     if (!active()) { runCatching { created.close() }; return null }
-                    if (!socket.compareAndSet(null, created)) runCatching { created.close() }
+                    if (socket.compareAndSet(null, created)) {
+                        if (!active()) { close(); return null }
+                        onRegistered()
+                    } else runCatching { created.close() }
                     socket.get()
                 } ?: continue
                 if (!active()) { close(); return null }

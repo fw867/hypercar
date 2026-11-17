@@ -249,6 +249,36 @@ Release JVM 530项通过；Android原生232项通过、1项现场依赖忽略；
 
 08:04 和 08:09 到第二次重探（seq 116）为止发送顺序和时刻几乎一致，车机两轮都已确认。08:09 在此后又确认了四次重探，却没有下发会话端点。手机侧可定位到车机已收包后未见业务启动消息，无法由 ACK 推断 MBUX 是否批准开启 CarPlay，也没有车机侧拒绝码。08:05 已下发过端点但随后手机首次入网失败，是后续会话状态的排查线索；日志不足以证明车机仍占用原会话。
 
+## MB_E-P-4 在 581 首次建流与 Wi-Fi iAP2 READY 后的对照
+
+样本为 `hypercar-log-20261116-232448.txt`，HyperCar 581/10677，MBUX 00081 / MB_E-P-4。下表取两轮有完整媒体请求的会话，数字为各自 RTSP 控制连接的 CSeq。按 offset 重组出站明文、按 total 核对长度，再解码二进制 plist。HyperCar 在该车型尚无屏幕 SETUP 成功记录。BOX-OFF 的奔驰出画、可触控反馈只能与其静态实现一起参考，缺少该成功会话的线上报文。
+
+| 事件，按各轮顺序 | attempt 2 / RTSP#1 | attempt 3 / RTSP#3 |
+|---|---|---|
+| 会话 SETUP、会话内 /info、RECORD | 6、7、8 均 200 | 6、7、8 均 200 |
+| 初始 modesChanged → 屏幕生命周期再发 modesChanged | 10、12 均 200 | 9、11 均 200 |
+| 首个屏幕 SETUP → 仅屏幕 TEARDOWN | 14 回 400，17 回 200 | 13 回 400，15 回 200 |
+| PCM、AAC 媒体 SETUP | 18、19 均 400 | 18、20 均 400 |
+| 本端 0x5001 写入，同轮 READY 发送屏障 | 06:44:45.900 | 06:45:31.159 |
+| 再发 modesChanged → 屏幕 SETUP | 40 回 200；41 于 .920 发出，.932 回 400 | 39 回 200；40 于 .180 发出，.188 回 400 |
+| 仅屏幕 TEARDOWN → PCM、AAC SETUP | 42 回 200，43、44 回 400 | 41 回 200，42、43 回 400 |
+
+六个资源正文逐字节相同。资源 1（屏幕）与 2（主音频）的 entity/permanentEntity 都为 1/1。appState 1、2、3 的 entity 都为 0，appState 1 的 speechMode 为 -1。六个 200 的 42 字节正文都解码为空字典。两轮均无 requestUI。车机首次明确拒绝媒体的回包是屏幕 SETUP 的空体 400，之后还有 iAP2 控制交互。
+
+| 媒体 SETUP | 581 实际请求 | BOX-OFF 8.1.1 静态实现 |
+|---|---|---|
+| 屏幕 | 绝对会话 URI，type 110，非零 streamConnectionID，/info 返回的显示 UUID，latencyMs 25 | 请求行目标为字面量 `/`，type 110，新连接 ID，显示 UUID 为字符串时带上，latencyMs 100 |
+| PCM | 绝对 IPv6 URI 带 7000 端口和根路径；type 100，audioFormat 0x8000，spf 352，audioLatencyMs 0，无 sr/ct | 输出 PCM 使用 `/`，48 kHz 时 spf 240、sr 48000、ct 1、audioLatencyMs 100 |
+| AAC-LC | 同一音频 URI；type 102，audioFormat 0x800000，spf 1024、sr 48000、ct 4、audioLatencyMs 0 | 缺少同车音频成功样本 |
+
+两种音频请求都带 audioType=media、input=false、supportsRTPPacketRedundancy=false；车机 /info 明确公布这两种 type/format 组合。屏幕与音频重试均更换 streamConnectionID，同轮对应媒体的其余正文及请求目标相同。BOX-OFF 静态主路径初始保留音频 2/2，先声明资源、建立屏幕 TCP，再 RECORD；581 在 RECORD 后连续两次声明屏幕和音频 1/1。BOX-OFF 的请求构造器直接写入调用方的 path，也会在收到 Session 头后保存并带回。581 的导出未给出会话 SETUP 的完整响应头，无法验证本车是否发过该头。旧奔驰档案也曾试验过屏幕前置和 100ms，参见[车型记录](HEADUNIT-PROFILES.md)。
+
+两轮重试分别在 READY 后 20、21ms 发出，四个屏幕和八个音频 SETUP 的 400 全部空体。READY 证明本端已写完所需消息，缺少车机对媒体授权的确认。更早的奔驰记录中，源端有帧、车机发来 requestUI 且 READY 已约 8 秒时，屏幕仍回 400。可单独核对接收端是否返回 Session 头、屏幕请求目标的形式，以及车机主动发出的资源变更；目前无法从空体锁定某个字段。
+
+**手机本地 7240。** 两轮均走 Shizuku 启动入口，分别于 06:44:30.186 和 06:45:26.774 记录请求已发送。第二轮到 06:46:52.226 仍在首个 CMD 端口收到 ECONNREFUSED，两轮都没有七路连通、挑战或源视频单元。581 的启动成功文案只检查 shell 退出码。本机留存的 CarWith 4.0.23-20261016 APK 中，CarlifeAdbActivity.onCreate 会检查连接开关、系统 CarWith 开关及已有连接状态，还可能转到用户同意或权限界面；启动 CarlinkService 也有独立失败分支。该实车导出没有 CarWith 包版本、Activity/Service 的系统日志或监听快照，无法判定走了哪一支。复测时可同步保存 CarlifeAdbActivity、ActivityTaskManager、CarlinkService 日志和被动监听快照，不额外拨 7240，以免占用真实命令连接。
+
+583（10679）实车对照入口：奔驰档案的 `MBUX-SESSION` 按控制连接和 CSeq 记录响应中的 Session；匹配本连接请求的 2xx 可更新标识，只带回分号前的值。换控制连接重新取值。仅当会话内 /info 的 model 精确为 MB_E-P-4、首次屏幕建流失败且进入原有 READY 重试时，查找 `MBUX-MEDIA: MB_E-P-4 READY retry screen SETUP target=/`，按随后实际请求行和响应码对照首次绝对 URI。屏幕连接 ID 每次按原逻辑重新生成。手机端按 attempt 查看 `CARWITH-START` 入口输出、启动约 6 秒后的 tcp/tcp6 7240 快照及本轮可见的系统事件。监听快照区分 no_entry、LISTEN、ESTABLISHED 和读取失败。以上为复测观测点，MB_E-P-4 的实车结果待回收。
+
 ## 2026-11-15 复核奔驰 MBUX 晚间日志
 
 同一导出混有上午旧 559 与晚间 566，不按导出版本统称全部会话。上午有入网超时、设备标识与 BSSID 混用导致有效网络被拒，以及 RECORD 附近对端关闭控制/事件连接；不能用这些旧故障解释晚间这轮。

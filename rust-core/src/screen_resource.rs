@@ -156,6 +156,14 @@ impl ScreenSession {
     }
 
     pub async fn reconcile_resource(&self, modes: &Arc<Mutex<Modes>>) -> Result<(), String> {
+        self.reconcile_screen(modes, false).await
+    }
+
+    pub async fn reconcile_after_mbux_ready(&self, modes: &Arc<Mutex<Modes>>, model: &str) -> Result<(), String> {
+        self.reconcile_screen(modes, self.params.mbux_media_compat && model == "MB_E-P-4").await
+    }
+
+    async fn reconcile_screen(&self, modes: &Arc<Mutex<Modes>>, mut literal_root: bool) -> Result<(), String> {
         // Event dispatch is already running before the initial global RECORD. It may update
         // arbitration, but no lifecycle SETUP can precede successful session activation.
         if !self.activated.load(Ordering::Acquire) { return Ok(()); }
@@ -191,7 +199,7 @@ impl ScreenSession {
             crate::emit_log(&format!("SCREEN-LIFECYCLE: SETUP after modes feedback revision={revision}"));
             // Conservatively clean up even if SETUP succeeded but the local data socket failed.
             state.negotiated = true;
-            let sender = match self.open().await {
+            let sender = match self.open_screen(std::mem::take(&mut literal_root)).await {
                 Ok(sender) => sender,
                 Err(error) => {
                     if let Err(cleanup) = self.release_resource_stream(&mut state).await {
@@ -873,6 +881,33 @@ mod tests {
             assert!(tokio::time::timeout(Duration::from_millis(30),f.car.read(&mut [0])).await.is_err());
         }
     }
+    #[tokio::test]
+    async fn mercedes_ready_retry_root_applies_only_to_exact_model_and_retry() {
+        for model in ["MB_E-P-4", "MB_D-PP-4", ""] {
+            let mut f = Fixture::new(Modes::initial()).await;
+            let session = Arc::get_mut(&mut f.session).unwrap();
+            session.params.mbux_media_compat = true;
+            session.control.set_session_uri(crate::rtsp_uri::SessionUri::new("127.0.0.1", 7).unwrap()).unwrap();
+            for retry in [false, true, false] {
+                let session = f.session.clone();
+                let modes = f.modes.clone();
+                let task = tokio::spawn(async move {
+                    if retry { session.reconcile_after_mbux_ready(&modes, model).await }
+                    else { session.reconcile_resource(&modes).await }
+                });
+                f.modes_reply(1).await;
+                let setup = read(&mut f.car).await;
+                let target = if retry && model == "MB_E-P-4" { "/" } else { "rtsp://127.0.0.1/7" };
+                assert_eq!(setup.first_line, format!("SETUP {target} RTSP/1.0"));
+                reply(&mut f.car, &setup, 400, &[]).await;
+                let teardown = read(&mut f.car).await;
+                assert_eq!(teardown.first_line, "TEARDOWN rtsp://127.0.0.1/7 RTSP/1.0");
+                reply(&mut f.car, &teardown, 200, &[]).await;
+                assert!(task.await.unwrap().is_err());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn rejected_setup_cleans_video_only_and_next_ui_can_retry() {
         let mut f=Fixture::new(Modes::initial()).await;

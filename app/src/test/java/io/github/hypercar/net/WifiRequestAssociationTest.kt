@@ -7,6 +7,41 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class WifiRequestAssociationTest {
+    @Test fun cleanupKeepsDeliveryAfterTheCallersLastSnapshot() {
+        val state = WifiRequestAssociation<Any, Int>()
+        val owner = Any()
+        assertTrue(state.register(owner))
+        assertNull(state.network())
+        state.available(owner, 7)
+        repeat(3) { assertEquals(7, state.finish(keepConnected = true) { fail("withdrew the car hotspot") }) }
+        assertTrue(state.lost(owner, 7))
+        state.available(owner, 8) // delayed cleanup for network 7 runs after its replacement arrives
+        assertEquals(8, state.finish(keepConnected = true) { fail("withdrew replacement") })
+        val detached = mutableListOf<Any?>()
+        assertNull(state.finish(keepConnected = false, detached::add))
+        assertEquals(listOf(owner), detached)
+    }
+
+    @Test fun cleanupBeforeDeliveryWithdrawsPendingAndPreventsLateRegistration() {
+        val state = WifiRequestAssociation<Any, Int>()
+        val owner = Any()
+        assertTrue(state.register(owner))
+        state.finish(keepConnected = true) { assertSame(owner, it) }
+        assertFalse(state.available(owner, 8))
+        assertFalse(state.register(Any()))
+        val scanning = WifiRequestAssociation<Any, Int>()
+        scanning.finish(keepConnected = true) { assertNull(it) }
+        assertFalse(scanning.register(owner))
+    }
+    @Test fun unavailableCannotEraseAnAlreadyDeliveredAssociationDuringCleanup() {
+        val state = WifiRequestAssociation<Any, Int>()
+        val owner = Any()
+        state.register(owner)
+        state.available(owner, 7)
+        assertFalse(state.unavailable(owner))
+        assertNull(state.cancelPending(owner))
+        assertTrue(state.owns(7))
+    }
     @Test fun availableBeforeWaitSignalSurvivesCancellationAndCapabilityGapsUntilActualLoss() {
         val state = WifiRequestAssociation<Any, Any>()
         val owner = Any(); val network = Any()

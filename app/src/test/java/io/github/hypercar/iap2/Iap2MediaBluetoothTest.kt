@@ -27,6 +27,7 @@ class Iap2MediaBluetoothTest {
         val signatureBody:ByteArray=Iap2Csm.param(0,byteArrayOf(1)),
         val communicationsBody:ByteArray=byteArrayOf(),
         val identificationExchange:ByteArray?=null, val afterGreetings:ByteArray?=null,
+        val controlVersion: Int? = null, val silentChallenge: Boolean = false,
         val wifiReply:ByteArray=wifiCredentials("fixture-ap")) : Iap2LinkChannel {
         val queue=ArrayDeque<ByteArray>()
         val sent=mutableListOf<Int>()
@@ -39,6 +40,7 @@ class Iap2MediaBluetoothTest {
         override val isAlive get()=open
         override fun awaitReady(timeoutMillis:Long)=true
         override fun peerMaxControlPayload()=65525
+        override val peerControlVersion get() = controlVersion
         override fun close(){open=false}
         override fun recvControl(timeoutMillis:Long):ByteArray? {
             if(queue.isNotEmpty())return queue.removeFirst()
@@ -69,7 +71,7 @@ class Iap2MediaBluetoothTest {
                     }
                     0xaa00->queue+=if(serial && frame.body.isNotEmpty()) Iap2Csm.encode(0xaa06,Iap2Csm.param(0,byteArrayOf(1)))
                         else Iap2Csm.encode(0xaa01,certificateBody)
-                    0xaa02->queue+=Iap2Csm.encode(0xaa03,signatureBody)
+                    0xaa02->if (!silentChallenge) queue+=Iap2Csm.encode(0xaa03,signatureBody)
                     0x4e0b -> afterGreetings?.let { queue += it }
                     0x5702 -> if (wifiReply.isNotEmpty()) queue += wifiReply
                 }
@@ -77,6 +79,68 @@ class Iap2MediaBluetoothTest {
             return open
         }
     }
+    private fun appsIdentification() = Iap2Csm.encode(0x1d01, Iap2Csm.string(1, "MGU-55-BMW") + Iap2Csm.string(2, "BMW Group") +
+            Iap2Csm.param(6, byteArrayOf(0xea.toByte(), 3, 0x4c, 0)) +
+            Iap2Csm.param(7, byteArrayOf(0xea.toByte(), 0, 0x4e, 0x0d, 0x4c, 1)) +
+            Iap2Csm.group(10, Iap2Csm.u8(0, 1), Iap2Csm.string(1, "de.bmw.a4a.pairing")))
+    @Test fun onlyPairedAppsV1RequiresVerifiedCertificateAndKeepsIdentificationFirst() {
+        for ((paired, version) in listOf(true to 1, true to 2, false to 1)) {
+            val channel = Channel(identificationExchange = appsIdentification(), controlVersion = version)
+            val session = Iap2SenderSession(channel, {}, onEndpoint = {}, pairedReceiver = paired, nanoTime = { channel.time })
+            val result = runCatching { session.run(10_000) }
+            assertEquals(listOf(0x1d00, 0x1d02, 0xaa00), channel.sent.take(3))
+            if (paired && version == 1) {
+                assertTrue(result.exceptionOrNull() is java.io.IOException)
+                assertEquals(0xaa04, channel.sent.last())
+                assertFalse(0xaa02 in channel.sent || 0xaa05 in channel.sent)
+            } else {
+                assertTrue(0xaa05 in channel.sent)
+            }
+        }
+    }
+
+    @Test fun verifiedAppsCertificateWithBadSignatureOrSilenceNeverSendsSuccess() {
+        val leaf = javaClass.getResourceAsStream("/io/github/hypercar/iap2/mfi3-leaf.der")!!.use { it.readBytes() }
+        for (silent in listOf(false, true)) {
+            val channel = Channel(identificationExchange = appsIdentification(), controlVersion = 1,
+                certificateBody = Iap2Csm.param(0, leaf), signatureBody = Iap2Csm.param(0, ByteArray(64)),
+                silentChallenge = silent)
+            val session = Iap2SenderSession(channel, {}, onEndpoint = {}, pairedReceiver = true, nanoTime = { channel.time })
+            assertThrows(java.io.IOException::class.java) { session.run(10_000) }
+            assertEquals(listOf(0x1d00, 0x1d02, 0xaa00, 0xaa02, 0xaa04), channel.sent)
+        }
+    }
+
+    @Test fun returningMguKeepsAppsLinkAndAcceptsCarPlayOnReidentification() {
+        val channel = Channel(identificationExchange = appsIdentification())
+        val endpoints = mutableListOf<CarPlayEndpoint>()
+        val session = Iap2SenderSession(channel, {}, onEndpoint = endpoints::add, profile = HeadUnitProfiles.BMW_ID85,
+            nanoTime = { channel.time }, pairedReceiver = true)
+        assertNull(session.run(10_000).ssid)
+        assertTrue(channel.isAlive)
+        assertTrue(channel.sent.none { it in setOf(0xea00, 0x4300, 0x5702, 0x4e0e) })
+        assertTrue(0x4e0d in channel.sent)
+        channel.queue += Iap2Csm.encode(0x4c00) + legacyBmwIdentification("MGU-55-BMW")
+        channel.endWhenEmpty = true
+        session.pumpIncomingForever()
+        assertTrue(0x4c01 in channel.sent)
+        assertEquals(listOf(0x1d02, 0x1d02, 0x5702), channel.sent.filter { it in setOf(0x1d02, 0xea00, 0x5702) })
+        assertEquals(listOf("fixture-ap"), endpoints.map { it.ssid })
+    }
+
+    @Test fun returningMguCarPlayConnectionRequestsCredentialsWithoutOpeningEa() {
+        for (model in listOf("MGU-55-BMW", "MGU-86-BMW")) {
+            val channel = Channel(identificationExchange = legacyBmwIdentification(model))
+            val start = channel.time
+            val session = Iap2SenderSession(channel, {}, onEndpoint = {}, profile = HeadUnitProfiles.BMW_ID85,
+                nanoTime = { channel.time }, pairedReceiver = true)
+            assertEquals("fixture-ap", session.run(10_000).ssid)
+            assertEquals(100L, (channel.time - start) / 1_000_000)
+            assertFalse(0xea00 in channel.sent)
+            assertEquals(1, channel.sent.count { it == 0x5702 })
+        }
+    }
+
     @Test fun mgu55WifiRequestIsIndependentOfOptionalEaAndHidReplies() {
         for ((model, expectedDelayMs) in listOf("MGU-55-BMW" to 100L, "MGU-86-BMW" to 2300L)) {
             val lateStatus = Iap2Csm.encode(0xea03, Iap2Csm.u16(0, 1) + Iap2Csm.u8(1, 0))

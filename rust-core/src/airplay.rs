@@ -118,7 +118,12 @@ pub async fn negotiate(
     pending_cleanup: &mut Option<crate::negotiation_cleanup::NegotiationCleanup>,
 ) -> Result<AirplayOutcome, String> {
     let mbux_media_compat = p.mbux_media_compat && !p.desktop_receiver;
-    let (mut channel, mut control_inbound) = RtspChannel::spawn(read, write, None);
+    let spawn_control = |read, write| {
+        let (control, inbound) = RtspChannel::spawn(read, write, None);
+        if mbux_media_compat { control.enable_mbux_session_header(); }
+        (control, inbound)
+    };
+    let (mut channel, mut control_inbound) = spawn_control(read, write);
     emit_log(&format!("AIRPLAY: 控制连接 RTSP#{} 开始", channel.trace_id()));
 
     // 保留配对前的 best-effort 身份读取，供旧凭证公钥索引兼容使用。
@@ -213,7 +218,7 @@ pub async fn negotiate(
                 match factory.open_tcp(&p.car_ip, p.airplay_port, 5_000) {
                     Some(stream) => {
                         let (r, w) = stream.into_split();
-                        let (fresh, rx) = RtspChannel::spawn(r, w, None);
+                        let (fresh, rx) = spawn_control(r, w);
                         channel = fresh;
                         control_inbound = rx;
                         emit_log("PAIR: 已换新控制连接");
@@ -258,7 +263,7 @@ pub async fn negotiate(
             match factory.open_tcp(&p.car_ip, p.airplay_port, 5_000) {
                 Some(stream) => {
                     let (r, w) = stream.into_split();
-                    let (fresh, rx) = RtspChannel::spawn(r, w, None);
+                    let (fresh, rx) = spawn_control(r, w);
                     channel = fresh;
                     control_inbound = rx;
                     emit_log("PAIR: 已换新控制连接");
@@ -571,7 +576,8 @@ pub async fn negotiate(
         emit_log(&format!("MBUX-MEDIA: pre-ready failure; retry_barrier={ready} screen_failed={screen_failed} audio_missing={}; no extra RECORD",audio.is_none()));
         if ready {
             if screen_failed && p.screen_resource_lifecycle {
-                if let Err(error)=screen_session.reconcile_resource(&modes).await {
+                let model = info.get("model").and_then(Value::as_str).unwrap_or("");
+                if let Err(error)=screen_session.reconcile_after_mbux_ready(&modes, model).await {
                     p.pipeline.lock().video_stream="FAILED".into();
                     emit_log(&format!("MBUX-MEDIA: one screen retry rejected: {error}; await real resource/UI event"));
                 }

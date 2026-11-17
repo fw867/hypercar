@@ -30,6 +30,18 @@ class RecoveringListenerTest {
         assertTrue(server.closed)
     }
 
+    @Test fun primaryIsPublishedBeforeStartingMarkerAndBeforeFirstAccept() {
+        val events = mutableListOf<String>()
+        lateinit var primary: RecoveringListener<Resource, Resource>
+        primary = RecoveringListener(ownerAlive = { true }, open = { Resource() },
+            onRegistered = { assertTrue(primary.isRegistered); events += "marker" },
+            accept = { events += "accept"; Resource() }, onFailure = {}, awaitRetry = {})
+        primary.acceptNext()
+        primary.acceptNext()
+        assertEquals(listOf("marker", "accept", "accept"), events)
+        primary.close()
+    }
+
     @Test fun failedAcceptClosesTheStaleListenerAndRegistersANewOne() {
         val stale = Resource()
         val replacement = Resource()

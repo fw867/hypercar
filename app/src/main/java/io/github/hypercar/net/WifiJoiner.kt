@@ -26,6 +26,7 @@ import java.util.concurrent.atomic.AtomicReference
 class WifiJoiner(
     private val context: Context,
     private val diagnostic: (String) -> Unit = {},
+    private val maySubmitRequest: () -> Boolean,
     onLost: () -> Unit,
 ) {
     /** 构造参数转存：避免与 NetworkCallback.onLost 回调方法名冲突。 */
@@ -118,8 +119,6 @@ class WifiJoiner(
             lastFailureReason = blocked
             return JoinResult.Failed
         }
-        // Only a deliberate different-SSID request can replace an available association.
-        release()
         if (ShizukuTools.isReady) withContext(Dispatchers.IO) {
             val shell = io.github.hypercar.spike.SpikeShell.connect(context)
             Log.i(TAG, "local-only shell: $shell")
@@ -247,19 +246,28 @@ class WifiJoiner(
                     "v6_count=${props.linkAddresses.count { it.address is java.net.Inet6Address }} routes=${props.routes.size}")
             }
         }
-        association.register(cb)
         trace.log("request timeout_ms=$timeoutMs exact_ap=${hint != null}")
         trace.start(specifier) { waiting.get() && association.owner() === cb }
         try {
             // 系统确认框和关联/DHCP 共用这一个超时窗口，不是单独计时。
             // （该重载的 timeout 参数是 Int，需从 Long 转换）
-            connectivityManager.requestNetwork(request, cb, timeoutMs.toInt())
+            currentCoroutineContext().ensureActive()
+            synchronized(bindLock) {
+                if (!maySubmitRequest() || !association.register(cb)) {
+                    waiting.set(false)
+                    trace.close()
+                    lastFailureReason = "本轮热点请求已失效"
+                    return null
+                }
+                connectivityManager.requestNetwork(request, cb, timeoutMs.toInt())
+            }
             trace.log("request_submitted")
         } catch (t: Throwable) {
             cancelPendingRegistration(cb)
             waiting.set(false)
             trace.log("request_exception=${t.javaClass.simpleName}")
             trace.close()
+            if (t is kotlinx.coroutines.CancellationException) throw t
             lastFailureReason = "requestNetwork 抛异常：${t.javaClass.simpleName}: ${t.message}"
             Log.i(TAG, "specifier requestNetwork 失败：${t.message}")
             return null
@@ -391,30 +399,29 @@ class WifiJoiner(
     }
 
     private fun handleNetworkLost(owner: ConnectivityManager.NetworkCallback, network: Network) {
-        val notify = synchronized(bindLock) {
-            val lost = association.lost(owner, network, boundFallback = boundNetwork.get() == network)
+        synchronized(bindLock) {
+            if (!association.lost(owner, network, boundFallback = boundNetwork.get() == network)) return
             boundNetwork.compareAndSet(network, null)
             if (connectivityManager.boundNetworkForProcess == network) {
                 connectivityManager.bindProcessToNetwork(null)
             }
-            lost
         }
-        if (notify) lostCallback()
+        lostCallback()
     }
 
-    /** Release only this instance's process binding and callback. */
-    fun release() = synchronized(bindLock) {
-        val previousHandle = association.network()?.networkHandle
-        requestIdentity = null
-        val previousCallback = association.release()
-        stopSelection()
-        previousCallback?.let {
-            diagnose("withdraw_request reason=release handle=$previousHandle")
-            runCatching { connectivityManager.unregisterNetworkCallback(it) }
-        }
-        val previous = boundNetwork.getAndSet(null)
-        if (previous != null && connectivityManager.boundNetworkForProcess == previous) {
-            connectivityManager.bindProcessToNetwork(null)
+    /** Ordinary cleanup keeps a delivered Wi-Fi request even if onAvailable just raced teardown. */
+    fun release(keepConnected: Boolean = true): Network? = synchronized(bindLock) {
+        association.finish(keepConnected) { callback ->
+            requestIdentity = null
+            stopSelection()
+            callback?.let {
+                diagnose("withdraw_request reason=${if (keepConnected) "idle" else "replace_hotspot"}")
+                runCatching { connectivityManager.unregisterNetworkCallback(it) }
+            }
+            val previous = boundNetwork.getAndSet(null)
+            if (previous != null && connectivityManager.boundNetworkForProcess == previous) {
+                connectivityManager.bindProcessToNetwork(null)
+            }
         }
     }
 

@@ -4,6 +4,14 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CarWifiPolicyTest {
+    @Test fun repeatInvitationCanUseItsVerifiedHandleWithRedactedSsid() {
+        fun reuse(current: String?, sameNetwork: Boolean) = CarWifiPolicy.canReuseInvitedCar(
+            knownCar = true, sameNetwork = sameNetwork, peerMatches = true, announcedSsid = null,
+            currentSsid = current, hasAddress = true, routeToPeer = true, boundSsid = "car")
+        assertTrue(reuse(null, true))
+        assertFalse(reuse(null, false))
+        assertFalse(reuse("home", true))
+    }
     @Test fun invitationBeforeBluetoothCredentialsReusesKnownCarWithoutInternetValidation() {
         val verified = CarWifiPolicy.canReuseInvitedCar(true, true, true, null, "car", true, true)
         assertTrue(verified)

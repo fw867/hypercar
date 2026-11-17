@@ -19,10 +19,12 @@ internal object CarWifiPolicy {
     /** A current invitation on the already identified car network can arrive before 0x5703. */
     fun canReuseInvitedCar(knownCar: Boolean, sameNetwork: Boolean, peerMatches: Boolean,
                           announcedSsid: String?, currentSsid: String?,
-                          hasAddress: Boolean, routeToPeer: Boolean): Boolean =
-        knownCar && sameNetwork && peerMatches && hasAddress && routeToPeer &&
-            !currentSsid.isNullOrBlank() &&
-            (announcedSsid.isNullOrBlank() || announcedSsid == currentSsid)
+                          hasAddress: Boolean, routeToPeer: Boolean, boundSsid: String? = null): Boolean {
+        val ssid = currentSsid ?: boundSsid
+        return knownCar && sameNetwork && peerMatches && hasAddress && routeToPeer &&
+            !ssid.isNullOrBlank() && (boundSsid == null || boundSsid == ssid) &&
+            (announcedSsid.isNullOrBlank() || announcedSsid == ssid)
+    }
 
     /** Desktop receivers share an internet LAN; their device MAC is not the router's BSSID. */
     fun canReuseDesktop(peerIdentifiedAsDesktop: Boolean, advertisedSsid: String?, currentSsid: String?,
