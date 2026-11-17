@@ -237,6 +237,10 @@ impl Drop for TransactionGuard<'_> {
 }
 
 impl RtspChannel {
+    pub async fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.write.lock().await.local_addr()
+    }
+
     /// 建立通道：返回共享句柄 + 入向请求接收器（车机 POST 来的 /command 等；
     /// reader 自动应答并仅分发合法命令，上层只需消费消息体）。
     pub fn spawn(

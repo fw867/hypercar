@@ -564,29 +564,26 @@ class Iap2LinkEngine(
 
     private fun drainSendWindow(nowMillis: Long) {
         if (state != State.NORMAL) return
+        val peer = peerSynchronization
+        // The box bypasses the outstanding-frame limit on a zero-retry, zero-ACK Wi-Fi link.
+        val bypassWindow = reliableTransport && peer?.retransmissionTimeoutMillis == 0 &&
+            peer.acknowledgementTimeoutMillis == 0 && peer.maxRetransmissions == 0 && peer.maxAcknowledgements == 0
+        val sendWindow = if (reliableTransport) (peer?.maxOutgoing ?: maxOutgoing).coerceIn(1, 127)
+            else declaredMaxOutgoing
         while (sendBacklog.isNotEmpty()) {
-            val packet = sendBacklog.first()
-            val sendWindow = if (reliableTransport) (peerSynchronization?.maxOutgoing ?: maxOutgoing).coerceIn(1,127)
-                else declaredMaxOutgoing // Preserve the established Bluetooth compatibility policy.
-            if (lastSentAcknowledged != null &&
-                sequenceDistance(sentSequence, lastSentAcknowledged!!) >= sendWindow
-            ) {
-                return
-            }
-            sendBacklog.removeFirst()
+            if (!bypassWindow && lastSentAcknowledged != null && outstandingPackets >= sendWindow) return
+            val packet = sendBacklog.removeFirst()
             sentSequence = nextSequence(sentSequence)
             packet.sequence = sentSequence
             packet.deadlineMillis = nowMillis + retransmissionTimeoutMillis
             writePacket(packet.payload, packet.sequence, CONTROL_ACKNOWLEDGEMENT, packet.sessionId ?: controlSessionId())
             if (!packet.awaitAck) continue // 发后不管：不追踪、不重传（见 sendControl 注释）
-            val peer = peerSynchronization
             if (peer == null || peer.maxRetransmissions > 0) {
                 unacknowledged += packet
                 retransmitDeadline = packet.deadlineMillis
             } else if (!reliableTransport) {
                 lastSentAcknowledged = sentSequence
             }
-            // A peer's zero-retry offer disables retransmission, not ACK-based Wi-Fi flow control.
         }
     }
 

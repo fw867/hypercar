@@ -368,6 +368,14 @@ impl JniSocketProvider {
 }
 
 impl SocketProvider for JniSocketProvider {
+    fn bind_timing_network(&self, socket: &std::net::UdpSocket) -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let mut env = self.vm.attach_current_thread_as_daemon().map_err(std::io::Error::other)?;
+        let bound = env.call_method(self.obj.as_obj(), "bindTimingFd", "(I)Z", &[socket.as_raw_fd().into()])
+            .and_then(|value| value.z()).map_err(std::io::Error::other)?;
+        if bound { Ok(()) } else { Err(std::io::Error::other("session Wi-Fi bind failed")) }
+    }
+
     fn open_tcp(&self, host: &str, port: u16, timeout_ms: u32) -> Option<TcpStream> {
         let fd = self.call_fd("openTcpFd", host, port, timeout_ms)?;
         unsafe {

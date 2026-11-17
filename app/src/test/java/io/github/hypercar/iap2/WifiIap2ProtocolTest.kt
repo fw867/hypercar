@@ -87,11 +87,11 @@ class WifiIap2ProtocolTest {
             commandSizes += commands.map { it.size }
             return commands.flatMap { split(it) }.also { out -> out.lastOrNull()?.let { ack=it.seq } }
         }
-        fun start(): List<Iap2Csm.Frame> {
+        fun start(configure: (Iap2LinkEngine.SynchronizationPayload) -> Iap2LinkEngine.SynchronizationPayload = { it }): List<Iap2Csm.Frame> {
             assertArrayEquals(Iap2LinkEngine.MARKER, protocol.feed(Iap2LinkEngine.MARKER, time++))
             val sync = Iap2LinkEngine.SynchronizationPayload(window, packetLength, 0, 0, 0, 0,
-                listOf(Iap2LinkEngine.SessionDescriptor(controlSession, 0, 2), Iap2LinkEngine.SessionDescriptor(2, 1, 2))).encode()
-            val syn = packet(0x80, sequence, 0, body = sync)
+                listOf(Iap2LinkEngine.SessionDescriptor(controlSession, 0, 2), Iap2LinkEngine.SessionDescriptor(2, 1, 2)))
+            val syn = packet(0x80, sequence, 0, body = configure(sync).encode())
             assertTrue(feed(syn.copyOfRange(0, 6)).isEmpty())
             val answer = feed(syn.copyOfRange(6, syn.size)).single()
             assertEquals(0xc0, answer.control)
@@ -285,8 +285,37 @@ class WifiIap2ProtocolTest {
         params.forEach { assertArrayEquals(byteArrayOf(0), it.value) }
     }
 
+    @Test fun allZeroWifiParametersSendSixGreetingsBeforeNextPeerAck() {
+        val car = Car(window = 5)
+        car.ready(vehicleMessages + vehicleComponent(3))
+        assertEquals(listOf(0xaa05, 0x4e0c, 0xa100, 0x4e0a, 0x4e09, 0x4e0b),
+            car.authenticationOutput.map { it.messageId })
+        assertTrue(car.protocol.diagnosticSummary.contains("pending=0 outstanding=6 "))
+        assertTrue(car.feed(packet(0x40, car.sequence, car.ack)).isEmpty())
+        assertTrue(car.protocol.diagnosticSummary.contains("pending=0 outstanding=0 "))
+    }
+
+    @Test fun anyNonzeroWifiAckOrRetryParameterKeepsSixthGreetingQueuedUntilAck() {
+        val offers = listOf<(Iap2LinkEngine.SynchronizationPayload) -> Iap2LinkEngine.SynchronizationPayload>(
+            { it.copy(retransmissionTimeoutMillis = 1500) },
+            { it.copy(acknowledgementTimeoutMillis = 73) },
+            { it.copy(maxRetransmissions = 5) },
+            { it.copy(maxAcknowledgements = 3) },
+        )
+        for (offer in offers) {
+            val car = Car(window = 5)
+            car.start(offer)
+            car.message(0x1d01, vehicleMessages + vehicleComponent(3))
+            car.message(0xaa01, Iap2Csm.param(0, byteArrayOf(1)))
+            val greetings = car.message(0xaa03, Iap2Csm.param(0, ByteArray(64)))
+            assertEquals(listOf(0xaa05, 0x4e0c, 0xa100, 0x4e0a, 0x4e09), greetings.map { it.messageId })
+            val released = messages(car.feed(packet(0x40, car.sequence, car.ack)))
+            assertEquals(listOf(0x4e0b), released.map { it.messageId })
+        }
+    }
+
     @Test fun readyWaitsForPostAuthenticationGreetingsToLeaveTheLinkBacklog() {
-        val car=Car(window=1);car.start();car.message(0x1d01)
+        val car=Car(window=1);car.start { it.copy(acknowledgementTimeoutMillis = 73) };car.message(0x1d01)
         assertEquals(listOf(0xaa00),messages(car.feed(packet(0x40,car.sequence,car.ack))).map { it.messageId })
         assertEquals(0xaa02,car.message(0xaa01,Iap2Csm.param(0,byteArrayOf(1))).single().messageId)
         assertEquals(listOf(0xaa05),car.message(0xaa03,Iap2Csm.param(0,ByteArray(64))).map { it.messageId })
@@ -299,7 +328,7 @@ class WifiIap2ProtocolTest {
     }
 
     @Test fun wifiWaitsForRealAckEvenWhenPeerDisablesRetransmission() {
-        val car=Car(window=1);car.start()
+        val car=Car(window=1);car.start { it.copy(acknowledgementTimeoutMillis = 73) }
         val accepted=car.message(0x1d01)
         assertEquals(listOf(0x1d02),accepted.map { it.messageId })
         assertEquals(listOf(16),car.commandSizes.last())
@@ -353,7 +382,7 @@ class WifiIap2ProtocolTest {
     }
 
     @Test fun fullWifiSendWindowStillFlushesReceiveAckWithoutSendingQueuedCertificate() {
-        val car = Car(window=1); car.start()
+        val car = Car(window=1); car.start { it.copy(acknowledgementTimeoutMillis = 73) }
         car.message(0x1d01) // 1D02 fills the window; AA00 remains queued.
         val frames = car.feed(packet(0x40, ++car.sequence, car.ack - 1, 1, Iap2Csm.encode(0x4154)))
         assertEquals(1, frames.size)

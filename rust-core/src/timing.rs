@@ -11,6 +11,7 @@
 //! ——NTP 差值计算只用相对量，任意起点均可（与 Kotlin 的 System.nanoTime 同语义）。
 
 use tokio::net::UdpSocket;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use parking_lot::Mutex;
 
@@ -119,8 +120,19 @@ pub fn build_timesync_response(request: &[u8], now_nanos: u64) -> Option<[u8; PA
     Some(response)
 }
 
-/// AirPlay 计时服务：绑定 0.0.0.0:0 UDP（端口由 OS 分配， SETUP 应答里把这个
-/// 端口作为 timingPort 通告给车机），后台任务应答 timesync 请求直到 `stop()`。
+/// Use the accepted or outbound control socket's local address, including its IPv6 interface.
+/// Android can represent IPv4 control sockets as IPv4-mapped IPv6.
+fn timing_bind_addr(mut local: SocketAddr) -> SocketAddr {
+    if let SocketAddr::V6(v6) = local {
+        if let Some(ipv4) = v6.ip().to_ipv4_mapped() {
+            return SocketAddr::new(ipv4.into(), 0);
+        }
+    }
+    local.set_port(0);
+    local
+}
+
+/// 会话 SETUP 通告本地 UDP 端口，后台任务应答校时请求。
 pub struct TimingServer {
     /** 实际绑定的本地 UDP 端口（通告给车机的 timingPort）。 */
     pub port: u16,
@@ -131,19 +143,18 @@ pub struct TimingServer {
 }
 
 impl TimingServer {
-    /// 绑定 0.0.0.0:0 并启动永久应答循环（tokio::spawn）。
-    ///
-    /// 非 async 签名下无法直接 await 绑定，故走「std 绑定 → 非阻塞 →
-    /// `UdpSocket::from_std`」路径；`from_std` 需要注册到 reactor，因此**必须在
-    /// tokio runtime 上下文中调用**（会话流程本就跑在 async 里，天然满足）。
-    pub fn start_with_pipeline(pipeline:Arc<Mutex<crate::pipeline::Pipeline>>)->std::io::Result<Self> {
-        Self::start_impl(Some(pipeline))
-    }
-    fn start_impl(pipeline:Option<Arc<Mutex<crate::pipeline::Pipeline>>>)->std::io::Result<Self> {
-        let std_socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    pub fn start(
+        control_local: SocketAddr,
+        bind_network: impl FnOnce(&std::net::UdpSocket) -> std::io::Result<()>,
+        pipeline: Arc<Mutex<crate::pipeline::Pipeline>>,
+    ) -> std::io::Result<Self> {
+        let std_socket = std::net::UdpSocket::bind(timing_bind_addr(control_local))?;
+        bind_network(&std_socket)?;
         std_socket.set_nonblocking(true)?; // tokio 要求非阻塞模式
-        let port = std_socket.local_addr()?.port();
+        let local = std_socket.local_addr()?;
+        let port = local.port();
         let socket = UdpSocket::from_std(std_socket)?;
+        crate::emit_log(&format!("TIMING: listening local={local} control_local={control_local}"));
 
         let diagnostics=Arc::new(Mutex::new(TimingDiagnostics::default()));
         let stats=diagnostics.clone();
@@ -154,7 +165,7 @@ impl TimingServer {
                     Ok(v) => v,
                     Err(error) => {
                         stats.lock().receive_errors+=1;
-                        if let Some(p)=&pipeline {p.lock().timing=stats.lock().clone();}
+                        pipeline.lock().timing=stats.lock().clone();
                         crate::emit_log(&format!("TIMING: receive failed: {error}"));
                         break;
                     }
@@ -163,8 +174,12 @@ impl TimingServer {
                 let now_nanos = monotonic_nanos();
                 // 非 timesync 报文静默丢弃（Kotlin 侧只计数不回包）
                 if let Some(response) = build_timesync_response(&buf[..len], now_nanos) {
-                    {
+                    let first_request = {
                         let mut s=stats.lock();s.requests+=1;s.last_request_ms=Some(now_nanos/1_000_000);
+                        s.requests == 1
+                    };
+                    if first_request {
+                        crate::emit_log(&format!("TIMING: first request peer={peer} local={local} bytes={len}"));
                     }
                     let sent=socket.send_to(&response, peer).await;
                     let done=monotonic_nanos();
@@ -176,13 +191,19 @@ impl TimingServer {
                         }
                         s.refresh_age(done/1_000_000);s.clone()
                     };
-                    if let Some(p)=&pipeline {p.lock().timing=snapshot.clone();}
+                    pipeline.lock().timing=snapshot.clone();
+                    match &sent {
+                        Ok(PACKET_BYTES) if snapshot.replies == 1 =>
+                            crate::emit_log(&format!("TIMING: first reply local={local} peer={peer} bytes={PACKET_BYTES}")),
+                        Err(error) => crate::emit_log(&format!("TIMING: reply failed local={local} peer={peer}: {error}")),
+                        _ => {}
+                    }
                     if snapshot.requests==1 || snapshot.requests%10==0 || !matches!(sent,Ok(PACKET_BYTES)) {
                         crate::emit_log(&format!("TIMING: {}; local reply cost is not network RTT",snapshot.summary()));
                     }
                 } else {
                     let snapshot={let mut s=stats.lock();s.invalid_datagrams+=1;s.clone()};
-                    if let Some(p)=&pipeline {p.lock().timing=snapshot;}
+                    pipeline.lock().timing=snapshot;
                 }
             }
         });
@@ -200,12 +221,28 @@ impl Drop for TimingServer {
 #[cfg(test)]
 mod diagnostics_tests {
     use super::*;
+    #[test]
+    fn control_address_preserves_ipv6_scope_and_normalizes_mapped_ipv4() {
+        assert_eq!(timing_bind_addr("[fe80::5%19]:7000".parse().unwrap()),
+            "[fe80::5%19]:0".parse().unwrap());
+        assert_eq!(timing_bind_addr("[::ffff:192.0.2.1]:7000".parse().unwrap()),
+            "192.0.2.1:0".parse().unwrap());
+    }
     #[tokio::test]
     async fn live_udp_counts_replies_and_invalid_datagrams() {
+        for ip in [std::net::IpAddr::from([127,0,0,1]), std::net::Ipv6Addr::LOCALHOST.into()] {
+            check_round_trip(ip).await;
+        }
+    }
+
+    async fn check_round_trip(ip: std::net::IpAddr) {
         let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
-        let server=TimingServer::start_with_pipeline(pipeline.clone()).unwrap();
-        let peer=UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        peer.connect((std::net::Ipv4Addr::LOCALHOST,server.port)).await.unwrap();
+        let server=TimingServer::start(SocketAddr::new(ip, 7000), |socket| {
+            assert_eq!(socket.local_addr()?.ip(), ip);
+            Ok(())
+        }, pipeline.clone()).unwrap();
+        let peer=UdpSocket::bind((ip,0)).await.unwrap();
+        peer.connect((ip,server.port)).await.unwrap();
         peer.send(&[1,2,3]).await.unwrap();
         let mut request=[0u8;32];request[0]=0x80;request[1]=0xd2;request[3]=7;
         request[24..32].copy_from_slice(&123456u64.to_be_bytes());

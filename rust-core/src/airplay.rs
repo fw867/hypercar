@@ -28,6 +28,9 @@ use crate::{emit_log, emit_state};
 pub trait SocketProvider: Send + Sync {
     fn open_tcp(&self, host: &str, port: u16, timeout_ms: u32) -> Option<TcpStream>;
     fn open_udp(&self, host: &str, port: u16) -> Option<UdpSocket>;
+    fn bind_timing_network(&self, _socket: &std::net::UdpSocket) -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "timing network binding unavailable"))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -310,7 +313,9 @@ pub async fn negotiate(
     let cleanup = pending_cleanup.insert(crate::negotiation_cleanup::NegotiationCleanup::new(channel.clone(), p.id9_screen_bootstrap));
     let result = async {
     // CatPlay bootstrap: 会话 SETUP → /info → 事件通道/保活 → 资源声明 → 屏幕流。
-    let timing = TimingServer::start_with_pipeline(p.pipeline.clone()).map_err(|e| format!("计时服务启动失败: {e}"))?;
+    let control_local = channel.local_addr().await.map_err(|e| format!("读取控制连接本地地址失败: {e}"))?;
+    let timing = TimingServer::start(control_local, |socket| factory.bind_timing_network(socket), p.pipeline.clone())
+        .map_err(|e| format!("计时服务启动失败 ({control_local}): {e}"))?;
     let (root, session_info, hevc_proposed) = setup_and_read_info(
         &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap, p.id9_screen_bootstrap, mbux_media_compat, p.bmw_capabilities, p.video_codec == "hevc", Some(&mut *cleanup), p.wifi_mac_address.as_deref(),
     ).await?;

@@ -2607,6 +2607,15 @@ object HyperCarRepo {
         )
 
     private fun socketProvider(sockets: SessionSocketLease<Network>) = object : RustCoreBridge.SocketProvider {
+        override fun bindTimingFd(fd: Int): Boolean = runCatching {
+            sockets.open(
+                create = { ParcelFileDescriptor.fromFd(fd) },
+                bind = { network, duplicate -> network.bindSocket(duplicate.fileDescriptor) },
+                connect = {},
+                handoff = { true },
+            )
+        }.onFailure { log("TIMING: bind to network=#${sockets.network} failed: ${it.message}") }.getOrDefault(false)
+
         override fun openTcpFd(host: String, port: Int, timeoutMs: Int): Int = runCatching {
             openTcpFd(sockets, host, port, timeoutMs)
         }.onFailure { socketFailure(sockets, "TCP", host, port, it) }.getOrElse { -1 }

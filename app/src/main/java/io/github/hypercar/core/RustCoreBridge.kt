@@ -26,6 +26,8 @@ object RustCoreBridge {
         fun openTcpFd(host: String, port: Int, timeoutMs: Int): Int
         /** port=0 binds an ephemeral, network-scoped receive socket without connecting a peer. */
         fun openUdpFd(host: String, port: Int): Int
+        /** Bind the native timing socket to this session's network. Rust retains ownership. */
+        fun bindTimingFd(fd: Int): Boolean
     }
 
     /** Rust → Kotlin 状态/日志回调（在 Rust 工作线程调用，实现方需自行切主线程）。 */
