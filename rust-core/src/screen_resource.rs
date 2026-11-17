@@ -48,9 +48,9 @@ impl ScreenSession {
         where F: std::future::Future<Output=Result<T,String>> {
         let mut state = self.resource_state.lock().await;
         let label = if self.params.nbt_audio_first { "NBT" } else if self.params.id9_screen_bootstrap { "ID9" } else { "MBUX" };
-        let (mut revision, mut owned, declaration) = {
+        let (screen_revision, mut revision, mut owned, declaration) = {
             let m = modes.lock();
-            (m.screen_generation(), m.screen_owned(), m.declaration())
+            (m.screen_generation(), m.screen_grant_generation(), m.screen_owned(), m.declaration())
         };
         let response = self.control.request("POST", "/command", &declaration,
             "application/x-apple-binary-plist", &[], Duration::from_secs(5)).await?;
@@ -58,9 +58,9 @@ impl ScreenSession {
         if self.params.id9_screen_bootstrap {
             let claim = {
                 let mut m = modes.lock();
-                if m.screen_generation() == revision { m.request_ui(); }
+                if m.screen_generation() == screen_revision { m.request_ui(); }
                 self.owned.store(m.screen_owned(), Ordering::Release);
-                revision = m.screen_generation();
+                revision = m.screen_grant_generation();
                 owned = m.screen_owned();
                 self.params.pipeline.lock().screen_owned = Some(owned);
                 m.declaration()
@@ -126,12 +126,12 @@ impl ScreenSession {
     }
 
     /// Query after event workers are stopped: graceful exit includes only negotiated streams.
-    pub async fn resource_teardown(&self, audio: Option<i64>) -> Vec<u8> {
+    pub async fn resource_teardown(&self, audio: Option<i64>) -> Vec<Value> {
         let state = self.resource_state.lock().await;
         let mut streams = Vec::new();
         if state.negotiated { streams.push(Value::dict(vec![("type",Value::int(110)),("uuid",Value::str(&self.uuid))])); }
         if let Some(kind) = audio { streams.push(Value::dict(vec![("type",Value::int(kind))])); }
-        bplist::encode(&Value::dict(vec![("streams",Value::array(streams))]))
+        streams
     }
 
     async fn release_resource_stream(&self, state: &mut ResourceStream) -> Result<(), String> {
@@ -163,7 +163,7 @@ impl ScreenSession {
         loop {
             let (revision, owned, declaration, note) = {
                 let m = modes.lock();
-                (m.screen_generation(), m.screen_owned(), m.declaration(), m.diagnostics())
+                (m.screen_grant_generation(), m.screen_owned(), m.declaration(), m.diagnostics())
             };
             crate::emit_log(&format!("SCREEN-LIFECYCLE: reconcile {note} negotiated={} installed_revision={:?}", state.negotiated, state.revision));
             // This also publishes audio/app updates while video is awaiting screen ownership.
@@ -173,12 +173,12 @@ impl ScreenSession {
             if response.status() != 200 || business.is_some_and(|s| s != 0) {
                 return Err("画面资源声明未被接受".into());
             }
-            if modes.lock().screen_generation() != revision { continue; }
+            if modes.lock().screen_grant_generation() != revision { continue; }
             let failed = self.params.pipeline.lock().video_stream == "FAILED";
             if state.negotiated && (!owned || state.revision != Some(revision) || failed) {
                 self.release_resource_stream(&mut state).await?;
                 // A grant arriving during TEARDOWN needs its own current declaration before SETUP.
-                if modes.lock().screen_generation() != revision { continue; }
+                if modes.lock().screen_grant_generation() != revision { continue; }
             }
             if !owned {
                 self.params.pipeline.lock().video_stream = "WAIT_OWNERSHIP".into();
@@ -221,7 +221,7 @@ impl ScreenSession {
             state.ever_installed = true;
             crate::emit_log(&format!("SCREEN-LIFECYCLE: stream installed revision={revision}; fresh config/IDR requested; global RECORD retained"));
             // A change concurrent with installation must be reconciled even on the initial call.
-            if modes.lock().screen_generation() != revision { continue; }
+            if modes.lock().screen_grant_generation() != revision { continue; }
             return Ok(());
         }
     }
@@ -372,8 +372,8 @@ mod tests {
                 assert_eq!(task.await.unwrap().unwrap(),42);
                 f.video_frame(&mut video,id).await;
                 crate::nbt::record_once(&f.session.control).await.unwrap();
-                let exit=bplist::parse(&f.session.resource_teardown(Some(102)).await).unwrap();
-                assert_eq!(exit.get("streams").unwrap().as_array().unwrap()[1].get("type").and_then(Value::as_int),Some(102));
+                let streams = f.session.resource_teardown(Some(102)).await;
+                assert_eq!(streams[1].get("type").and_then(Value::as_int),Some(102));
             }
             let mut byte=[0];assert!(tokio::time::timeout(Duration::from_millis(30),f.car.read(&mut byte)).await.is_err());
         }
@@ -409,6 +409,38 @@ mod tests {
         f.video_frame(&mut video, id).await;
         let idr_ms = start.elapsed().as_millis();
         (f, handoff, video, id, tasks.pop().unwrap(), setup_ms, idr_ms)
+    }
+
+    #[tokio::test]
+    async fn first_ui_after_mgu_startup_keeps_stream_and_sends_declaration() {
+        let (mut f, handoff, mut video, id, task, _, _) = streaming_mgu(std::time::Instant::now()).await;
+        reply(&mut f.car, &handoff, 200, &[]).await;
+        task.await.unwrap();
+
+        f.update(Modes::request_ui);
+        let reconcile = f.reconcile();
+        f.modes_reply(1).await;
+        // A healthy stream can still deliver a P-frame encrypted under the original key.
+        verify_followup_frame(&f, &mut video, id, 0x33).await;
+        reconcile.await.unwrap().unwrap();
+        assert_eq!(f.session.params.pipeline.lock().screen_rebuilds, 0);
+    }
+
+    #[tokio::test]
+    async fn first_ui_during_mgu_setup_preserves_inflight_grant() {
+        let mut modes = startup_screen_modes(500);
+        assert!(modes.claim_startup_screen());
+        let mut f = Fixture::new(modes).await;
+        let setup = f.reconcile();
+        f.modes_reply(1).await;
+        let request = read(&mut f.car).await;
+        f.update(Modes::request_ui);
+        let ui = f.reconcile();
+        let (mut video, id) = f.setup_reply(&request).await;
+        f.modes_reply(1).await;
+        setup.await.unwrap().unwrap();
+        ui.await.unwrap().unwrap();
+        f.video_frame(&mut video, id).await;
     }
 
     #[tokio::test]
@@ -798,8 +830,7 @@ mod tests {
         f.teardown_reply().await;task.await.unwrap().unwrap();
         let mut byte=[0];assert_eq!(tokio::time::timeout(Duration::from_secs(1),peer.read(&mut byte)).await.unwrap().unwrap(),0);
         assert!(f.session.params.pipeline.lock().video_tcp.is_none());
-        let exit=bplist::parse(&f.session.resource_teardown(Some(100)).await).unwrap();
-        let streams=exit.get("streams").unwrap().as_array().unwrap();
+        let streams = f.session.resource_teardown(Some(100)).await;
         assert_eq!(streams.len(),1);assert_eq!(streams[0].get("type").and_then(Value::as_int),Some(100));
         assert!(f.session.params.pipeline.lock().audio_ready);
         f.update(|m|m.request_ui());let task=f.reconcile();f.modes_reply(1).await;
@@ -877,7 +908,7 @@ mod tests {
         let video=TcpListener::bind("127.0.0.1:0").await.unwrap();
         let socket=TcpStream::connect(video.local_addr().unwrap()).await.unwrap();
         let (mut peer,_)=video.accept().await.unwrap();let (_,write)=socket.into_split();
-        let modes=Arc::new(Mutex::new(Modes::initial()));let revision=modes.lock().screen_generation();
+        let modes=Arc::new(Mutex::new(Modes::initial()));let revision=modes.lock().screen_grant_generation();
         let (commands,rx)=mpsc::channel(2);let (source,video_rx)=mpsc::unbounded_channel();
         let (done,accepted)=tokio::sync::oneshot::channel();
         commands.send(ScreenCommand::InstallIfOwned {

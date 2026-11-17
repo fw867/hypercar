@@ -167,11 +167,11 @@ class Iap2Bluetooth(
         handleIncomingSocket(socket, epoch, tag)
     }
 
-    @Synchronized fun setSessionEnabled(enabled: Boolean, reason: String = "caller") {
+    @Synchronized fun setSessionEnabled(enabled: Boolean, reason: String = "caller", closeCurrent: Boolean = true) {
         val previous = sessions.diagnostics()
         sessions.setEnabled(enabled)
         if (previous != sessions.diagnostics()) log("BT-GATE: reason=$reason before=[$previous] after=[${sessions.diagnostics()}] generation=${generation.get()}")
-        if (!enabled) dropCurrentSession()
+        if (!enabled && closeCurrent) dropCurrentSession()
     }
 
     /** 「蓝牙已连接→已断开」日志节流（车机可能反复自动重连，避免刷屏）。 */

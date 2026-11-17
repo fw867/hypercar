@@ -666,7 +666,9 @@ fn stop_engine(graceful: bool) -> bool {
     let previous = ENGINE.lock().take(); // 等待时不能持有全局引擎锁。
     let Some(handle) = previous else { return true };
     handle.shutdown.request(graceful);
-    let done = handle.shutdown.wait_done(std::time::Duration::from_millis(2_000));
+    // Auxiliary audio can take 4 s, followed by media task cleanup and bounded RTSP releases.
+    let budget_ms = if graceful { 7_000 } else { 2_000 };
+    let done = handle.shutdown.wait_done(std::time::Duration::from_millis(budget_ms));
     if !done {
         emit_log("SESSION-CLOSE: 旧引擎停止超时，强制取消");
         handle.abort.abort();

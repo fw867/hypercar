@@ -53,6 +53,17 @@ class PairingEvidenceTest {
         assertEquals(mac, PairingEvidence.receiverMac(null, mac, "AA:BB:CC:DD:EE:02", desktop = false))
     }
 
+    @Test fun wifiWakeBeforeBindingReadsTheSameCanvasKeyAsTheSubsequentSession() {
+        val profile = "bmw_id85"
+        val otherCar = "AA:BB:CC:DD:EE:02"
+        val sessionKey = PairingEvidence.canvasKey(profile, mac)
+        assertEquals("bmw_id85:bt_aabbccddee01", sessionKey) // existing preferences
+        assertEquals(sessionKey, PairingEvidence.canvasKey(profile, null, mac, otherCar))
+        assertEquals(sessionKey, PairingEvidence.canvasKey(profile, mac, otherCar))
+        assertNotEquals(sessionKey, PairingEvidence.canvasKey("winplay", mac))
+        assertNull(PairingEvidence.canvasKey(profile, null, "invalid"))
+    }
+
     @Test fun activePeerOverridesAFrozenOlderIdentityDuringRetry() {
         assertEquals("AA:BB:CC:DD:EE:02", PairingEvidence.receiverMac(
             "AA:BB:CC:DD:EE:02", mac, mac, desktop = true))

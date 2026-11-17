@@ -329,7 +329,7 @@ pub async fn run_engine(
     let (screen_ready_tx, screen_ready_rx) = mpsc::channel::<crate::screen_session::ScreenCommand>(2);
     let video_stats = Arc::new(Mutex::new(PumpStat::default()));
     tasks.spawn(video_pump(stop.clone(), video_stats.clone(), cfg.screen_resource_lifecycle,
-        pipeline.clone(), screen_ready_rx, video_rx, cfg.carlife_source && cfg.video_codec == "hevc", cfg.fps,
+        pipeline.clone(), screen_ready_rx, video_rx, cfg.carlife_source, cfg.fps,
         cfg.carlife_source.then_some(cfg.carwith_source_owner)));
 
     // ---- 音频泵：重采样 + 闪避混音 + RTP ----
@@ -417,9 +417,15 @@ pub async fn run_engine(
         screen_resource_lifecycle: cfg.screen_resource_lifecycle,
         pipeline: pipeline.clone(),
     };
+    let mut pending_cleanup = None;
     let outcome = tokio::select! {
         biased;
-        _ = shutdown.wait() => return Ok(()),
+        _ = shutdown.wait() => {
+            if let Some(mut cleanup) = pending_cleanup {
+                cleanup.stop(shutdown.graceful()).await;
+            }
+            return Ok(());
+        },
         result = airplay::negotiate(
         ctrl_r,
         ctrl_w,
@@ -429,13 +435,15 @@ pub async fn run_engine(
         key_tx,
         stop.clone(),
         screen_ready_tx,
+        &mut pending_cleanup,
         ) => result?,
     };
 
+    drop(pending_cleanup); // The negotiated outcome now owns both channels.
     // Requests share the encrypted control channel, with their own CSeq; feedback continues independently.
     let mut auxiliary=outcome.aux_audio.map(|session|crate::aux_audio::Controller::spawn(session,auxiliary_input,main_audio_tx,fallback_audio_tx));
     let keepalive = outcome.keepalive;
-    let mut teardown = outcome.teardown;
+    let mut teardown = outcome.teardown_streams;
     let resource_session = outcome.resource_session;
     let audio_stream_type = outcome.audio.as_ref().map(|audio| audio.stream_type());
     let had_audio = audio_stream_type.is_some();
@@ -524,21 +532,19 @@ pub async fn run_engine(
             teardown = current;
         }
     }
-    teardown=merge_auxiliary_teardown(&teardown,&remaining_auxiliary);
+    merge_auxiliary_teardown(&mut teardown, &remaining_auxiliary);
     airplay::finish_session(&close_control, &teardown, shutdown.graceful()).await;
+    drop(outcome.event);
     Ok(())
 }
 
-fn merge_auxiliary_teardown(body:&[u8],types:&[i64])->Vec<u8> {
-    if types.is_empty() {return body.to_vec();}
-    let parsed=crate::bplist::parse(body).ok();
-    let mut streams=parsed.as_ref().and_then(|v|v.get("streams")).and_then(crate::bplist::Value::as_array).cloned().unwrap_or_default();
-    for &typ in types {
-        if !streams.iter().any(|v|v.get("type").and_then(crate::bplist::Value::as_int)==Some(typ)) {
-            streams.push(crate::bplist::Value::dict(vec![("type",crate::bplist::Value::int(typ))]));
+fn merge_auxiliary_teardown(streams: &mut Vec<crate::bplist::Value>, pending: &[i64]) {
+    use crate::bplist::Value;
+    for &kind in pending {
+        if !streams.iter().any(|s| s.get("type").and_then(Value::as_int) == Some(kind)) {
+            streams.push(Value::dict(vec![("type", Value::int(kind))]));
         }
     }
-    crate::bplist::encode(&crate::bplist::Value::dict(vec![("streams",crate::bplist::Value::array(streams))]))
 }
 
 pub use crate::aux_audio::MainCommand;
@@ -874,7 +880,7 @@ pub(crate) async fn video_pump(
                     // 必须在首帧引出 VideoConfig 之前生效，否则车机按旧画布解码。
                     encoder_size = Some((width, height));
                     if let Some(s) = sender.as_mut() {
-                        if !converter.encoding_to_display() {
+                        if converter.output_size().is_none() {
                             s.set_size(width, height);
                         }
                     } else {
@@ -911,9 +917,7 @@ pub(crate) async fn video_pump(
                         let before_frames = s.frames_sent();
                         let before_bytes = s.bytes_per_second();
                         // 编码尺寸变化时先切画布，保证随后 send_config 标注正确。
-                        let output_size=if processed && converter.encoding_to_display() {
-                            s.receiver_size().or(encoder_size)
-                        }else{encoder_size};
+                        let output_size = converter.output_size().or(encoder_size);
                         if let Some((w, h)) = output_size {
                             if s.size() != (w, h) {
                                 s.set_size(w, h);
@@ -1390,13 +1394,12 @@ mod main_audio_command_tests {
     }
     #[test]
     fn final_teardown_keeps_screen_and_main_entries_and_deduplicates_aux_types() {
-        use crate::bplist::{self,Value};
-        let old=bplist::encode(&Value::dict(vec![("streams",Value::array(vec![
+        use crate::bplist::Value;
+        let mut streams = vec![
             Value::dict(vec![("type",Value::int(110)),("streamConnectionID",Value::int(42))]),
             Value::dict(vec![("type",Value::int(100))]),
-        ]))]));
-        let merged=bplist::parse(&merge_auxiliary_teardown(&old,&[100,101,101])).unwrap();
-        let streams=merged.get("streams").unwrap().as_array().unwrap();
+        ];
+        merge_auxiliary_teardown(&mut streams, &[100,101,101]);
         assert_eq!(streams.len(),3);
         assert_eq!(streams[0].get("streamConnectionID").unwrap().as_int(),Some(42));
         assert_eq!(streams.iter().map(|v|v.get("type").unwrap().as_int().unwrap()).collect::<Vec<_>>(),vec![110,100,101]);

@@ -8,6 +8,14 @@ class Iap2MediaBluetoothTest {
     private val descriptor=byteArrayOf(5,12,9,1,0xa1.toByte(),1,0x15,0,0x25,2,9,0,9,0xb5.toByte(),9,0xb6.toByte(),0x75,8,0x95.toByte(),1,0x81.toByte(),0,0xc0.toByte())
     private fun start(d:ByteArray=descriptor)=Iap2Csm.encode(0x6800,Iap2Csm.u16(0,1)+Iap2Csm.param(4,d))
     private fun report(value:Int)=Iap2Csm.encode(0x6802,Iap2Csm.u16(0,1)+Iap2Csm.param(1,byteArrayOf(value.toByte())))
+    private fun wifiCredentials(ssid: String) = Iap2Csm.encode(0x5703, Iap2Csm.string(1, ssid) +
+        Iap2Csm.string(2, "fixture-pass") + Iap2Csm.u8(3, 2) + Iap2Csm.u8(4, 6))
+    private fun legacyBmwIdentification(model: String) = Iap2Csm.encode(0x1d01,
+        Iap2Csm.string(1, model) + Iap2Csm.string(2, "BMW Group") +
+            Iap2Csm.param(6, byteArrayOf(0x57, 3, 0xea.toByte(), 3, 0x68, 0)) +
+            Iap2Csm.param(7, byteArrayOf(0x57, 2, 0xea.toByte(), 0)) +
+            Iap2Csm.group(10, Iap2Csm.u8(0, 8), Iap2Csm.string(1, "com.bmw.carplay")) +
+            Iap2Csm.group(0x12, Iap2Csm.u16(0, 1), Iap2Csm.u8(2, 1)))
     private fun identity(serial:Boolean=false)=Iap2Csm.encode(0x1d01,
         Iap2Csm.string(0,"BMW-test")+Iap2Csm.string(1,"MGU-fixture")+
         Iap2Csm.param(6,byteArrayOf(0x57,3,0x68,0,0x68,2,0x68,3)+(if(serial) byteArrayOf(0xaa.toByte(),6) else byteArrayOf()))+
@@ -17,7 +25,9 @@ class Iap2MediaBluetoothTest {
         val serial:Boolean=false,val statusEarly:Boolean=false,val rejectIdentification:Boolean=false,
         val certificateBody:ByteArray=Iap2Csm.param(0,byteArrayOf(1)),
         val signatureBody:ByteArray=Iap2Csm.param(0,byteArrayOf(1)),
-        val communicationsBody:ByteArray=byteArrayOf()) : Iap2LinkChannel {
+        val communicationsBody:ByteArray=byteArrayOf(),
+        val identificationExchange:ByteArray?=null, val afterGreetings:ByteArray?=null,
+        val wifiReply:ByteArray=wifiCredentials("fixture-ap")) : Iap2LinkChannel {
         val queue=ArrayDeque<ByteArray>()
         val sent=mutableListOf<Int>()
         val updates=mutableListOf<Iap2Csm.Frame>()
@@ -49,15 +59,57 @@ class Iap2MediaBluetoothTest {
                 }
                 sent+=frame.messageId
                 when(frame.messageId){
-                    0x1d00->queue+=(if(rejectIdentification) Iap2Csm.encode(0x1d03) else identity(serial))+start()+report(1)+(if(subscribeEarly) Iap2Csm.encode(0x5000) else byteArrayOf())+
-                        (if(statusEarly) listOf(0x4154,0x4157,0x4170,0xae00).fold(byteArrayOf()){a,id->a+Iap2Csm.encode(id,if(id==0x4157) communicationsBody else byteArrayOf())} else byteArrayOf()) // All in ONE RFCOMM read, before auth.
+                    0x1d00 -> {
+                        val response = if (rejectIdentification) Iap2Csm.encode(0x1d03) else identity(serial)
+                        val subscription = if (subscribeEarly) Iap2Csm.encode(0x5000) else byteArrayOf()
+                        val statuses = if (statusEarly) listOf(0x4154,0x4157,0x4170,0xae00).fold(byteArrayOf()) { bytes,id ->
+                            bytes + Iap2Csm.encode(id, if (id == 0x4157) communicationsBody else byteArrayOf())
+                        } else byteArrayOf()
+                        queue += identificationExchange ?: (response + start() + report(1) + subscription + statuses)
+                    }
                     0xaa00->queue+=if(serial && frame.body.isNotEmpty()) Iap2Csm.encode(0xaa06,Iap2Csm.param(0,byteArrayOf(1)))
                         else Iap2Csm.encode(0xaa01,certificateBody)
                     0xaa02->queue+=Iap2Csm.encode(0xaa03,signatureBody)
-                    0x5702->queue+=Iap2Csm.encode(0x5703,Iap2Csm.string(1,"fixture-ap")+Iap2Csm.string(2,"fixture-pass")+Iap2Csm.u8(3,2)+Iap2Csm.u8(4,6))
+                    0x4e0b -> afterGreetings?.let { queue += it }
+                    0x5702 -> if (wifiReply.isNotEmpty()) queue += wifiReply
                 }
             }
             return open
+        }
+    }
+    @Test fun mgu55WifiRequestIsIndependentOfOptionalEaAndHidReplies() {
+        for ((model, expectedDelayMs) in listOf("MGU-55-BMW" to 100L, "MGU-86-BMW" to 2300L)) {
+            val lateStatus = Iap2Csm.encode(0xea03, Iap2Csm.u16(0, 1) + Iap2Csm.u8(1, 0))
+            val channel = Channel(identificationExchange = legacyBmwIdentification(model),
+                wifiReply = lateStatus + start() + report(1) + wifiCredentials("fixture-ap"))
+            val logs = mutableListOf<String>()
+            val keys = mutableListOf<Int>()
+            val startTime = channel.time
+            val session = Iap2SenderSession(channel, logs::add, onEndpoint = {},
+                profile = HeadUnitProfiles.BMW_ID85, nanoTime = { channel.time }, onMediaKey = keys::add)
+            assertEquals("fixture-ap", session.run(10_000).ssid)
+            assertEquals(model, expectedDelayMs, (channel.time - startTime) / 1_000_000)
+            assertEquals(1, channel.sent.count { it == 0x5702 })
+            assertEquals(1, channel.sent.count { it == 0xea00 })
+            channel.endWhenEmpty = true
+            session.pumpIncomingForever()
+            assertTrue(logs.any { "0xea03 accepted=true allConfirmed=true" in it })
+            assertEquals(listOf(0xb5), keys)
+        }
+    }
+    @Test fun mgu55ReceivesCredentialsBeforeItsRequestOrAfterTheInitialExchange() {
+        for (early in listOf(true, false)) {
+            val identity = legacyBmwIdentification("MGU-55-BMW")
+            val channel = Channel(identificationExchange = identity,
+                afterGreetings = if (early) wifiCredentials("early") else null, wifiReply = byteArrayOf())
+            val endpoints = mutableListOf<CarPlayEndpoint>()
+            val session = Iap2SenderSession(channel, {}, onEndpoint = endpoints::add,
+                profile = HeadUnitProfiles.BMW_ID85, nanoTime = { channel.time })
+            assertEquals(if (early) "early" else null, session.run(10_000).ssid)
+            if (!early) channel.queue += wifiCredentials("late")
+            channel.endWhenEmpty = true
+            session.pumpIncomingForever()
+            assertEquals(listOf(if (early) "early" else "late"), endpoints.mapNotNull { it.ssid })
         }
     }
     @Test fun bluetoothUsesTheSameRandomDeviceUuidAsTheWifiTransport() {
@@ -121,13 +173,15 @@ class Iap2MediaBluetoothTest {
     }
     @Test fun lateStartSessionApOverridesPreviousConfigurationFromSameBluetoothSession() {
         val channel=Channel();val endpoints=mutableListOf<CarPlayEndpoint>()
-        val session=Iap2SenderSession(channel,{},onEndpoint=endpoints::add,profile=HeadUnitProfiles.WINPLAY,nanoTime={channel.time})
+        val session=Iap2SenderSession(channel,{},onEndpoint=endpoints::add,receiverAddress="00:11:22:33:44:55",
+            profile=HeadUnitProfiles.WINPLAY,nanoTime={channel.time})
         session.run(10_000)
         assertEquals("fixture-ap",endpoints.last().ssid)
         channel.queue+=Iap2Csm.encode(0x4301,Iap2Csm.group(1,Iap2Csm.string(0,"new-ap"),
             Iap2Csm.string(1,"new-password"),Iap2Csm.u8(2,1),Iap2Csm.u8(4,2)))
         channel.endWhenEmpty=true;session.pumpIncomingForever()
         assertEquals("new-ap",endpoints.last().ssid);assertEquals("new-password",endpoints.last().passphrase)
+        assertEquals("new-ap", endpoints.last().bluetoothHotspot?.ssid)
     }
 
     @Test fun bluetoothEarlySubscriptionPublishesRealMetadataAfterAuthAndHonoursStop() {

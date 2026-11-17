@@ -10,6 +10,9 @@ pub struct VideoFormat { pub width: u32, pub height: u32, pub codec: &'static st
 pub struct Pipeline {
     pub display_size: Option<(u32,u32)>,
     pub video_format: Option<VideoFormat>,
+    /// Dimensions in the current sender's last successfully written VideoConfig header.
+    #[serde(skip)]
+    pub screen_config_size: Option<(u32,u32)>,
     pub generation: u64,
     pub control_ready: bool,
     pub record_accepted: bool,
@@ -48,7 +51,7 @@ impl Pipeline {
         if gaps.is_empty(){"none_observed_receiver_presentation_unconfirmed".into()}else{gaps.join(",")}
     }
     pub fn new() -> Self {
-        Self { display_size:None, video_format:None, generation: NEXT.fetch_add(1,Ordering::Relaxed), control_ready:false, record_accepted:false, resources_accepted:false,
+        Self { display_size:None, video_format:None, screen_config_size:None, generation: NEXT.fetch_add(1,Ordering::Relaxed), control_ready:false, record_accepted:false, resources_accepted:false,
             screen_setup_accepted:false,video_channel_ready:false,wifi_id:0,
             wifi_iap2:"WAIT_SESSION".into(),screen_owned:None,video_stream:"WAIT_SETUP".into(),
             video_source_units:0,video_frames_written:0,audio_ready:false,audio_codec:String::new(),audio_kbps:0,audio_packets_written:0,

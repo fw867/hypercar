@@ -337,12 +337,13 @@ impl RtspChannel {
         self.pending.lock().insert(cseq, PendingReply { tx, trace_head: id9_kind.is_some() });
         let mut transaction = TransactionGuard { channel: self, cseq, writing: false };
 
+        let content_header = if content_type.is_empty() { String::new() }
+            else { format!("Content-Type: {content_type}\r\n") };
         let head = format!(
             "{method} {path} RTSP/1.0\r\n\
              CSeq: {cseq}\r\n\
              User-Agent: AirPlay/770.8.1\r\n\
-             Content-Type: {content_type}\r\n\
-             Content-Length: {}\r\n\
+             {content_header}Content-Length: {}\r\n\
              {extra}\r\n",
             body.len(),
             extra = extra_headers

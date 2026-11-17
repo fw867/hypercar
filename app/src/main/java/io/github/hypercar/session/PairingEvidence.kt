@@ -15,6 +15,10 @@ data class PairingEvidence(val identityPresent: Boolean, val receiverCredentialP
                 ?: wifiHint?.takeIf { !desktop && receiverKey(it) != null }
 
 
+        /** Same preference key before RFCOMM starts and after the AirPlay peer is known. */
+        fun canvasKey(profile: String, vararg candidates: String?): String? =
+            candidates.firstNotNullOfOrNull(::receiverKey)?.let { "$profile:$it" }
+
         fun receiverKey(mac: String?): String? {
             val normalized = mac?.trim()?.lowercase(Locale.ROOT) ?: return null
             if (!Regex("(?:[0-9a-f]{2}:){5}[0-9a-f]{2}").matches(normalized)) return null

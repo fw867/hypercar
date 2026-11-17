@@ -3,6 +3,10 @@ package io.github.hypercar.net
 import android.annotation.SuppressLint
 import android.app.ActivityManager
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.Build
@@ -64,6 +68,21 @@ internal class WifiJoinDiagnostics(
             previousStation = snapshot
             log(snapshot)
         }
+    }
+
+    @Suppress("DEPRECATION")
+    fun lost(cm: ConnectivityManager, lost: Network) {
+        val state = runCatching {
+            val station = wifi?.connectionInfo
+            val visible = cm.allNetworks.mapNotNull { network ->
+                val caps = cm.getNetworkCapabilities(network) ?: return@mapNotNull null
+                if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return@mapNotNull null
+                "${network.networkHandle}/ssid_match=${ssidMatch((caps.transportInfo as? WifiInfo)?.ssid, target)}"
+            }
+            "supplicant=${station?.supplicantState} sta_ssid_match=${ssidMatch(station?.ssid, target)} " +
+                "lost_handle_visible=${cm.getNetworkCapabilities(lost) != null} visible_wifi=$visible"
+        }.getOrElse { "snapshot_error=${it.javaClass.simpleName}" }
+        log("loss_snapshot $state")
     }
 
     @SuppressLint("MissingPermission")

@@ -101,6 +101,7 @@ pub struct Modes {
     speech: i64,
     playback_enabled: bool,
     revision: u64,
+    screen_grant_generation: u64,
     audio_epoch: u64,
     audio_change_epoch: u64,
     speech_epoch: u64,
@@ -197,11 +198,23 @@ impl Modes {
     }
     pub fn screen_owned(&self) -> bool { self.resources[0].current == 1 }
     pub fn screen_generation(&self) -> u64 { self.revision }
+    pub fn screen_grant_generation(&self) -> u64 { self.screen_grant_generation }
+    fn track_screen_change(&mut self, before: Resource) {
+        let after = self.resources[0];
+        if before != after {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        // Constraint updates still supersede a pending modes declaration. Only a change
+        // of holder invalidates the grant attached to a pending or installed video stream.
+        if before.current != after.current {
+            self.screen_grant_generation = self.screen_grant_generation.wrapping_add(1);
+        }
+    }
     pub fn diagnostics(&self) -> String {
         let r = self.resources[0];
-        format!("screen={}/{} revision={} take={} borrow={} unborrow={} borrows={} audio={}/{}",
+        format!("screen={}/{} revision={} take={} borrow={} unborrow={} borrows={} audio={}/{} grant={}",
             r.current,r.permanent,self.revision,r.take,r.borrow,r.unborrow,r.borrows,
-            self.resources[1].current,self.resources[1].permanent)
+            self.resources[1].current,self.resources[1].permanent,self.screen_grant_generation)
     }
 
     /// /info.modes is a ChangeModes declaration, not an incoming modesChanged snapshot.
@@ -319,7 +332,9 @@ impl Modes {
             for v in values {
                 let Some(id) = resource_id(v) else { return false; };
                 audio_request |= id == 1;
+                let before = next.resources[id];
                 if !next.resources[id].request(v, 2) { return false; }
+                if id == 0 { next.track_screen_change(before); }
             }
         }
         if !next.apply_apps(params) { return false; }
@@ -328,11 +343,6 @@ impl Modes {
         if audio_request {next.audio_borrow_epoch=self.audio_borrow_epoch.wrapping_add(1);}
         if requested_app(1) {next.speech_epoch=self.speech_epoch.wrapping_add(1);}
         if requested_app(3) {next.navigation_epoch=self.navigation_epoch.wrapping_add(1);}
-        // Only screen changes invalidate a pending video stream grant; audio/app changes
-        // must not cancel screen setup.
-        if next.resources[0] != self.resources[0] {
-            next.revision = self.revision.wrapping_add(1);
-        }
         // Even an identical receiver take supersedes a pending local audio claim.
         next.audio_epoch = self.audio_epoch.wrapping_add(1);
         if audio_request || next.apps != self.apps || next.speech != self.speech {
@@ -379,12 +389,14 @@ impl Modes {
         if accepted {
             // First acknowledge the release as requested, then publish a new local claim. A car
             // Untake must not leave playback permanently muted after the resource is available.
+            let before = self.resources[0];
             for (i,r) in self.resources.iter_mut().enumerate() {
                 if r.current == 0 && (i == 0 || self.playback_enabled) {
                     r.take_by(1, ANYTIME, ANYTIME, ANYTIME);
                     crate::emit_log(&format!("MODES: reclaimed released local resource={}",i+1));
                 }
             }
+            self.track_screen_change(before);
         }
         Some(body)
     }
@@ -392,7 +404,7 @@ impl Modes {
         let before=self.resources[0];
         crate::emit_log(&format!("MODES: requestUI before {}", self.diagnostics()));
         let accepted = self.resources[0].take_by(1, USER_INITIATED, ANYTIME, ANYTIME);
-        if self.resources[0]!=before { self.revision = self.revision.wrapping_add(1); }
+        self.track_screen_change(before);
         crate::emit_log(&format!("MODES: requestUI local screen claim accepted={accepted} screen={}/{} audio={}/{}; receiver display unconfirmed",
             self.resources[0].current, self.resources[0].permanent, self.resources[1].current, self.resources[1].permanent));
     }
@@ -404,20 +416,21 @@ impl Modes {
         let before = self.resources[0];
         let accepted = self.resources[0].take_by(1, USER_INITIATED, USER_INITIATED, ANYTIME);
         let changed = self.resources[0] != before;
-        if changed { self.revision = self.revision.wrapping_add(1); }
+        self.track_screen_change(before);
         crate::emit_log(&format!("MODES: box startup screen claim accepted={accepted} changed={changed} {}; receiver display unconfirmed",self.diagnostics()));
         changed
     }
 
     pub(crate) fn restore_startup_screen(&mut self, previous: &Self, revision: u64) {
         if self.revision == revision {
+            let before = self.resources[0];
             self.resources[0] = previous.resources[0];
-            self.revision = self.revision.wrapping_add(1);
+            self.track_screen_change(before);
         }
     }
 
 
-    pub fn can_restore_screen(&self,revision:u64) -> bool { self.revision==revision && self.screen_owned() }
+    pub fn can_restore_screen(&self,revision:u64) -> bool { self.screen_grant_generation==revision && self.screen_owned() }
 }
 
 fn integer(v: &Value, key: &str) -> Option<i64> { v.get(key).and_then(Value::as_int) }
@@ -486,10 +499,10 @@ mod tests {
         ]))])
     }
     #[test] fn screen_grant_revision_survives_audio_updates_and_repeated_ui() {
-        let mut modes=Modes::initial();modes.request_ui();let revision=modes.screen_generation();
+        let mut modes=Modes::initial();modes.request_ui();let revision=modes.screen_grant_generation();
         assert!(modes.change(&change(2,3)));assert!(!modes.audio_owned());
         assert!(modes.can_restore_screen(revision));
-        modes.request_ui();assert_eq!(modes.screen_generation(),revision);
+        modes.request_ui();assert_eq!(modes.screen_grant_generation(),revision);
         assert!(modes.change(&change(1,3)));assert!(!modes.can_restore_screen(revision));
         modes.request_ui();assert!(modes.screen_owned());
         assert!(!modes.can_restore_screen(revision));

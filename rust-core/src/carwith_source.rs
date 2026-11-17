@@ -268,7 +268,7 @@ mod tests {
             let modes = crate::modes::Modes::initial();
             let (reply, accepted) = tokio::sync::oneshot::channel();
             commands.send(crate::screen_session::ScreenCommand::InstallIfOwned {
-                sender, revision: modes.screen_generation(), modes: Arc::new(Mutex::new(modes)), reply,
+                sender, revision: modes.screen_grant_generation(), modes: Arc::new(Mutex::new(modes)), reply,
             }).await.unwrap();
             assert!(accepted.await.unwrap());
             feed.replay();

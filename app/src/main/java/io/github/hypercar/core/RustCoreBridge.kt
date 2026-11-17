@@ -83,8 +83,8 @@ object RustCoreBridge {
     external fun nativeInitLogger()
 
     /** JNI factory belongs to the stable bridge, independent of delegated session listeners. */
-    fun createCarWithTranscoder(inputHevc: Boolean, width: Int, height: Int, targetWidth: Int, targetHeight: Int, fps: Int, csd: ByteArray): CarWithHevcTranscoder =
-        CarWithHevcTranscoder.open(inputHevc, width, height, targetWidth, targetHeight, fps, csd)
+    fun createCarWithTranscoder(inputHevc: Boolean, outputHevc: Boolean, width: Int, height: Int, targetWidth: Int, targetHeight: Int, fps: Int, csd: ByteArray): CarWithHevcTranscoder =
+        CarWithHevcTranscoder.open(inputHevc, outputHevc, width, height, targetWidth, targetHeight, fps, csd)
 
     external fun nativeSetListener(listener: EventListener?)
 

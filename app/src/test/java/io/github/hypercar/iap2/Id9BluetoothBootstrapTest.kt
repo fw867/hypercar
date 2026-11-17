@@ -1,6 +1,7 @@
 package io.github.hypercar.iap2
 
 import io.github.hypercar.headunit.HeadUnitProfiles
+import io.github.hypercar.headunit.HeadUnitProfile
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.Before
@@ -84,6 +85,8 @@ class Id9BluetoothBootstrapTest {
         val subscribeEarly: Boolean = false,
         val replyWithWifi: Boolean = true,
         val replyWithEndpoint: Boolean = true,
+        val model: String = "IDC23-fixture",
+        val manufacturer: String = "BMW Group",
     ) : Iap2LinkChannel {
         val sent = mutableListOf<Iap2Csm.Frame>()
         val queue = ArrayDeque<ByteArray>()
@@ -103,7 +106,7 @@ class Id9BluetoothBootstrapTest {
                 sent += frame
                 when (frame.messageId) {
                     0x1d00 -> queue += Iap2Csm.encode(0x1d01,
-                        Iap2Csm.string(0,"BMW-fixture") + Iap2Csm.string(1,"IDC23-fixture") +
+                        Iap2Csm.string(0,"BMW-fixture") + Iap2Csm.string(1,model) + Iap2Csm.string(2,manufacturer) +
                         Iap2Csm.param(6,byteArrayOf(0xaa.toByte(),1,0xaa.toByte(),3,0x43,1) +
                             (if(serial!=null) byteArrayOf(0xaa.toByte(),6) else byteArrayOf()) +
                             (if(legacy) byteArrayOf(0x57,3) else byteArrayOf())) +
@@ -130,6 +133,27 @@ class Id9BluetoothBootstrapTest {
         assertEquals(1,ids.count { it==0x4300 })
         assertTrue(ids.none { it in 0x4e09..0x4e0e || it==0xea00 || it==0x5702 })
     }
+    @Test fun audi5703IdentifiesTheHotspotForFirstConnection() {
+        val channel = Channel(legacy = true, model = "MIB3", manufacturer = "Audi", replyWithEndpoint = false)
+        assertBluetoothHotspot(channel, HeadUnitProfiles.AUDI_MIB3)
+    }
+
+    @Test fun id9WirelessGroupIdentifiesTheHotspotWithout5703() {
+        val channel = Channel(replyWithWifi = false)
+        assertBluetoothHotspot(channel, HeadUnitProfiles.BMW_ID9)
+        assertFalse(channel.sent.any { it.messageId == 0x5702 })
+    }
+
+    private fun assertBluetoothHotspot(channel: Channel, profile: HeadUnitProfile) {
+        val endpoints = mutableListOf<CarPlayEndpoint>()
+        val peer = "00:11:22:33:44:55"
+        Iap2SenderSession(channel, {}, onEndpoint = endpoints::add, receiverAddress = peer,
+            profile = profile, nanoTime = { channel.time }).run(10_000)
+        val ap = endpoints.first { it.ssid == "fixture-ap" }.bluetoothHotspot
+        assertEquals(peer, ap?.peer)
+        assertEquals("fixture-ap", ap?.ssid)
+    }
+
     @Test fun id85NewWifiAlsoUsesTheBoxGreetingsBeforeAvailability() {
         val channel = Channel()
         Iap2SenderSession(channel,{},onEndpoint={},profile=HeadUnitProfiles.BMW_ID85,nanoTime={channel.time}).run(10_000)

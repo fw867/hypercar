@@ -1,5 +1,6 @@
 package io.github.hypercar.iap2
 
+import io.github.hypercar.net.BluetoothHotspot
 import java.io.IOException
 import java.io.InterruptedIOException
 import java.security.SecureRandom
@@ -284,6 +285,14 @@ class Iap2SenderSession(
         // 两轮实测稳定 5.37~5.45s 后车机拆 RFCOMM（另一台 MGU-86 五轮全败同签名）。
         sendDeviceStateGreetings(includeWirelessUpdate = boxOrderedGreetings || !legacyWifiExchange)
         enterPhase("EA_AND_HID")
+        val declaresReceiveWifi = ident.declaresReceive(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION)
+        val declaresSendWifi = ident.declaresSend(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION)
+        // The box schedules legacy 5702 independently 100 ms after authentication.
+        // EA and HID still process on the same link during and after the credential exchange.
+        val mgu55Legacy = boxOrderedGreetings && ident.model.equals("MGU-55-BMW", ignoreCase = true) &&
+            ident.manufacturer.equals("BMW Group", ignoreCase = true) && declaresReceiveWifi == true &&
+            declaresSendWifi == true && ident.declaresReceive(Iap2MessageIds.CARPLAY_AVAILABILITY) == false
+        val optionalDeadline = if (mgu55Legacy) rescueDeadline(deadline, 100) else deadline
 
         // ---- EA 会话（MFi 完成后发；认证前发会噎死 DiPlay）----
         // BMW iD8.5 档案 B 声明 com.bmw.carplay protocol=8；档案 A 声明 de.bmw.a4a.bt。
@@ -306,7 +315,7 @@ class Iap2SenderSession(
         }
         if (profile.openEaSessions && eaProtocols.isNotEmpty() && ident.declaresSend(Iap2MessageIds.EA_SESSION_STATUS) != false) {
             // 探 800ms 的 0xEA03 并记日志——回没回一眼可见（§9j 处置 1）
-            val status = expectOrNull(Iap2MessageIds.EA_SESSION_STATUS, minOf(deadline, nanoTime() + 800_000_000L))
+            val status = expectOrNull(Iap2MessageIds.EA_SESSION_STATUS, minOf(optionalDeadline, nanoTime() + 800_000_000L))
             if (status != null) {
                 handleEaSessionStatus(status, phase1 = true)
             } else {
@@ -334,7 +343,7 @@ class Iap2SenderSession(
         }
 
         // ---- Optional HID registration; CSM receive continuously consumes declared media components. ----
-        awaitOptionalHid(deadline)
+        awaitOptionalHid(optionalDeadline)
 
         // ---- WiFi 配置交换（按「车机画像 wifiGen」分派，不按清单硬拦）----
         // 旧协议（0x5702 → 0x5703）：手机请求，车机回 AP 明文。
@@ -347,8 +356,6 @@ class Iap2SenderSession(
         // 明确声明 0x4301 且未声明 0x57xx 才优先新路径，不按清单数量推断完整性。
         enterPhase("WIFI_CREDENTIALS")
         log("iap2 车机画像 wifiGen=${ReceiverProfile.describe(wifiGen)}")
-        val declaresReceiveWifi = ident.declaresReceive(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION)
-        val declaresSendWifi = ident.declaresSend(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION)
         if (legacyWifiExchange && (declaresReceiveWifi == false || declaresSendWifi == false)) {
             log(
                 "iap2 清单未声明 0x5702/0x5703（收=${declaresReceiveWifi ?: "未知"} " +
@@ -390,7 +397,7 @@ class Iap2SenderSession(
                             "security=${wifiConfiguration.securityType} " +
                             "psk=${if (wifiConfiguration.passphrase.isEmpty()) "(空)" else "***"}",
                     )
-                    this.wifi = wifiConfiguration
+                    wifi = wifiConfiguration
                     // 凭据即刻回调：上层据此绑车机网络 + mDNS，0x4301 到达前就能入网
                     onEndpoint(endpointOf(null, wifiConfiguration))
                     wifiConfiguration
@@ -802,6 +809,7 @@ class Iap2SenderSession(
             ipAddresses = startSession?.ipAddresses ?: emptyList(),
             // 网关不在 iAP2 消息里；上层入网后从 DHCP/链路信息取
             gateway = null,
+            bluetoothHotspot = BluetoothHotspot.fromPeer(receiverAddress, wifi?.ssid ?: startSession?.wirelessAp?.ssid),
         )
 
     // ---- MFi 挑战 ----

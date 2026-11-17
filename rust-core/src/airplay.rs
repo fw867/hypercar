@@ -89,9 +89,10 @@ pub struct AirplayOutcome {
     pub audio_resource: crate::audio_resource::AudioResource,
     pub aux_audio: Option<crate::aux_audio::Session>,
     pub control: Arc<RtspChannel>,
+    pub event: Arc<RtspChannel>,
     pub audio: Option<AudioOut>,
     pub keepalive: KeepaliveTasks,
-    pub teardown: Vec<u8>,
+    pub teardown_streams: Vec<Value>,
     pub resource_session: Option<Arc<crate::screen_session::ScreenSession>>,
 }
 
@@ -114,6 +115,7 @@ pub async fn negotiate(
     key_tx: mpsc::UnboundedSender<u32>,
     stop: Arc<Notify>,
     screen_ready: tokio::sync::mpsc::Sender<crate::screen_session::ScreenCommand>,
+    pending_cleanup: &mut Option<crate::negotiation_cleanup::NegotiationCleanup>,
 ) -> Result<AirplayOutcome, String> {
     let mbux_media_compat = p.mbux_media_compat && !p.desktop_receiver;
     let (mut channel, mut control_inbound) = RtspChannel::spawn(read, write, None);
@@ -300,12 +302,12 @@ pub async fn negotiate(
         return Err("ID9 requires successful pair-verify; no plaintext media fallback".into());
     }
 
-    let mut cleanup=crate::negotiation_cleanup::NegotiationCleanup::new(channel.clone(),p.id9_screen_bootstrap);
+    let cleanup = pending_cleanup.insert(crate::negotiation_cleanup::NegotiationCleanup::new(channel.clone(), p.id9_screen_bootstrap));
     let result = async {
     // CatPlay bootstrap: 会话 SETUP → /info → 事件通道/保活 → 资源声明 → 屏幕流。
     let timing = TimingServer::start_with_pipeline(p.pipeline.clone()).map_err(|e| format!("计时服务启动失败: {e}"))?;
     let (root, session_info, hevc_proposed) = setup_and_read_info(
-        &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap, p.id9_screen_bootstrap, mbux_media_compat, p.bmw_capabilities, p.video_codec == "hevc", Some(&mut cleanup), p.wifi_mac_address.as_deref(),
+        &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap, p.id9_screen_bootstrap, mbux_media_compat, p.bmw_capabilities, p.video_codec == "hevc", Some(&mut *cleanup), p.wifi_mac_address.as_deref(),
     ).await?;
     info = session_info;
     let id9_modes = p.id9_screen_bootstrap.then(|| {
@@ -417,17 +419,8 @@ pub async fn negotiate(
     }
     let event_for_bootstrap = event_channel.clone();
     let mut keepalive = KeepaliveTasks(Vec::new(), None, None);
-    // 事件通道必须活到会话结束：`RtspChannel` 的 `Drop` 会 abort 读任务并关闭 socket。
-    // 之前这里只是临时变量，函数返回时就被丢弃 → 事件通道刚连上即被我们自己关掉，
-    // 接收端（WinPlay）的 close 回调把 eventSock 清回 null，触摸全进 pendingEvents
-    // 队列，攒到 64 条报「事件通道发送队列超限」（现场 2026-10-23 23:33 定位）。
-    {
-        let stop_ev = stop.clone();
-        keepalive.0.push(tokio::spawn(async move {
-            let _keep_alive = event_channel;
-            stop_ev.notified().await;
-        }));
-    }
+    // Both rollback and manual pause keep the event socket until control teardown finishes.
+    cleanup.event = Some(event_channel.clone());
     let wifi_iap = crate::wifi_iap2::WifiIap2::start(channel.clone(), &p.device_id, &p.device_name, stop.clone());
     let wifi_iap_id = wifi_iap.id;
     p.pipeline.lock().wifi_id=wifi_iap_id;
@@ -467,8 +460,8 @@ pub async fn negotiate(
             };
             (dw.max(1), dh.max(1))
         },
-        // 只有 /info 报 0x0（PC 接收端）才用窗口矩形；真车用真实显示空间。
-        if disp_w >= 320 && disp_h >= 240 { None } else { p.touch_rect },
+        TouchSurface::for_receiver(&info, box_bootstrap && p.bmw_capabilities && !p.desktop_receiver
+            && p.carwith_display.is_some(), (disp_w,disp_h), p.touch_rect, &p.pipeline),
         p.touch_size.clone(),
         stop.clone(),
     ));
@@ -601,9 +594,13 @@ pub async fn negotiate(
         emit_log(&format!("AUDIO: actual sender rate={}Hz timestamp clock; SPF={}",audio.sample_rate(),audio.samples_per_packet()));
     }
 
-    let mut streams = vec![Value::dict(vec![("type", Value::int(110)), ("uuid", Value::str(&screen_session.uuid))])];
+    // Resource-managed screens can be returned or rejected. The stop path snapshots them
+    // after the workers exit. Only the legacy path has an unconditional successful SETUP.
+    let mut streams = Vec::new();
+    if !p.screen_resource_lifecycle {
+        streams.push(Value::dict(vec![("type", Value::int(110)), ("uuid", Value::str(&screen_session.uuid))]));
+    }
     if let Some(audio) = audio.as_ref() { streams.push(Value::dict(vec![("type", Value::int(audio.stream_type()))])); }
-    let teardown = bplist::encode(&Value::dict(vec![("streams", Value::array(streams))]));
     let speech_resource=Arc::new(crate::speech_resource::SpeechResource::new(channel.clone(),modes.clone(),audio_owned.clone()));
     let aux_audio=if p.enable_audio && independent_audio_receiver(p.bmw_capabilities,p.nbt_audio_first,p.id9_screen_bootstrap,p.desktop_receiver,&info) {
         shared_secret.map(|shared|crate::aux_audio::Session {
@@ -615,9 +612,10 @@ pub async fn negotiate(
         audio_resource: crate::audio_resource::AudioResource { control: channel.clone(), modes, owned: audio_owned, serial:speech_resource.serial() },
         aux_audio,
         control: channel,
+        event: event_channel,
         audio,
         keepalive,
-        teardown,
+        teardown_streams: streams,
         resource_session: p.screen_resource_lifecycle.then(|| screen_session.clone()),
     })
     }.await;
@@ -687,19 +685,38 @@ async fn bluetooth_handoff_transaction(
     if current() { Some(reply) } else { None }
 }
 
-/// 主动停止才发 TEARDOWN；EOF/断网只清理。外层超时也覆盖等待 write 锁和写 socket。
-pub(crate) async fn finish_session(control: &RtspChannel, teardown: &[u8], graceful: bool) {
+/// Retire active resources while control is writable. Reserve a separate deadline for the
+/// session request even when a receiver ignores all stream releases.
+pub(crate) async fn finish_session(control: &RtspChannel, streams: &[Value], graceful: bool) {
     if graceful && !control.is_closed() {
-        emit_log("SESSION-CLOSE: TEARDOWN begin（媒体泵已停止）");
-        match tokio::time::timeout(Duration::from_millis(900), control.request(
-            "TEARDOWN", "/", teardown, "application/x-apple-binary-plist", &[], Duration::from_millis(800),
-        )).await {
-            Ok(Ok(reply)) => emit_log(&format!("SESSION-CLOSE: TEARDOWN status={}", reply.status())),
-            Ok(Err(error)) => emit_log(&format!("SESSION-CLOSE: TEARDOWN failed: {error}；继续释放")),
-            Err(_) => emit_log("SESSION-CLOSE: TEARDOWN timeout；继续释放"),
+        let stream_deadline = tokio::time::Instant::now() + Duration::from_millis(900);
+        let mut ordered: Vec<_> = streams.iter().collect();
+        ordered.sort_by_key(|stream| stream.get("type").and_then(Value::as_int) == Some(110));
+        for stream in ordered {
+            let remaining = stream_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() || control.is_closed() { break; }
+            let kind = stream.get("type").and_then(Value::as_int);
+            let body = bplist::encode(&Value::dict(vec![("streams", Value::array(vec![stream.clone()]))]));
+            send_close_request(control, &format!("stream type={kind:?}"), &body,
+                remaining.min(Duration::from_millis(400))).await;
         }
-    } else { emit_log("SESSION-CLOSE: 跳过 TEARDOWN（强制停止/控制通道已关闭）"); }
+        if !control.is_closed() {
+            send_close_request(control, "session", &[], Duration::from_millis(800)).await;
+        } else {
+            emit_log("SESSION-CLOSE: peer closed before session TEARDOWN");
+        }
+    } else {
+        emit_log("SESSION-CLOSE: 跳过 TEARDOWN（强制停止/控制通道已关闭）");
+    }
     let _ = tokio::time::timeout(Duration::from_millis(200), control.shutdown()).await;
+}
+
+async fn send_close_request(control: &RtspChannel, scope: &str, body: &[u8], timeout: Duration) {
+    let content_type = if body.is_empty() { "" } else { "application/x-apple-binary-plist" };
+    match control.request("TEARDOWN", "/", body, content_type, &[], timeout).await {
+        Ok(reply) => emit_log(&format!("SESSION-CLOSE: {scope} TEARDOWN status={} CSeq={:?}", reply.status(), reply.cseq())),
+        Err(error) => emit_log(&format!("SESSION-CLOSE: {scope} TEARDOWN failed: {error}")),
+    }
 }
 
 #[cfg(test)]
@@ -967,34 +984,53 @@ mod shutdown_tests {
         });
         let setup=read_request(&mut peer).await;assert!(setup.first_line.starts_with("SETUP "));
         peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 3\r\n\r\nbad",setup.cseq().unwrap()).as_bytes()).await.unwrap();
-        let exit=read_request(&mut peer).await;assert_eq!(exit.first_line,"TEARDOWN / RTSP/1.0");assert_eq!(bplist::parse(&exit.body).unwrap().get("streams"), Some(&Value::Array(vec![])));
+        let exit=read_request(&mut peer).await;assert_eq!(exit.first_line,"TEARDOWN / RTSP/1.0");assert!(exit.body.is_empty());
         peer.write_all(format!("RTSP/1.0 500 Failed\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",exit.cseq().unwrap()).as_bytes()).await.unwrap();
         let error=task.await.unwrap().unwrap_err();assert!(error.contains("SETUP 应答解析失败"));assert!(control.is_closed());
     }
     #[tokio::test]
-    async fn active_session_sends_teardown_then_closes_control_after_ack() {
+    async fn manual_pause_releases_audio_then_screen_then_the_session_on_its_own_uri() {
         let (control, mut peer) = pair().await;
-        let server = tokio::spawn(async move {
-            let mut data = Vec::new();
-            let request = loop {
-                let mut buf = [0; 4096];
-                let n = peer.read(&mut buf).await.unwrap();
-                assert!(n > 0, "must not close control before TEARDOWN");
-                data.extend_from_slice(&buf[..n]);
-                if let Some(msg) = crate::rtsp::parse_rtsp_messages(&mut data).unwrap().into_iter().next() { break msg }
-            };
-            assert!(request.first_line.starts_with("TEARDOWN "));
-            assert!(request.first_line.starts_with("TEARDOWN / RTSP/1.0"));
-            let plist = bplist::parse(&request.body).unwrap();
-            assert_eq!(plist.get("streams").unwrap().as_array().unwrap().len(), 1);
-            let cseq = request.headers.get("cseq").unwrap();
-            peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Length: 0\r\n\r\n").as_bytes()).await.unwrap();
-            let mut end = [0];
-            assert_eq!(peer.read(&mut end).await.unwrap(), 0);
-        });
-        let body = bplist::encode(&Value::dict(vec![("streams", Value::array(vec![Value::dict(vec![("type", Value::int(110))])]))]));
-        finish_session(&control, &body, true).await;
-        tokio::time::timeout(Duration::from_secs(2), server).await.unwrap().unwrap();
+        control.set_session_uri(crate::rtsp_uri::SessionUri::new("127.0.0.1", 42).unwrap()).unwrap();
+        let screen = Value::dict(vec![("type", Value::int(110)), ("uuid", Value::str("main"))]);
+        let audio = Value::dict(vec![("type", Value::int(100))]);
+        let body = vec![screen.clone(), audio.clone()];
+        let task = tokio::spawn(async move { finish_session(&control, &body, true).await });
+        for (index, stream) in [Some(audio), Some(screen), None].into_iter().enumerate() {
+            let request = read_request(&mut peer).await;
+            assert_eq!(request.first_line, "TEARDOWN rtsp://127.0.0.1/42 RTSP/1.0");
+            assert_eq!(request.cseq().unwrap() as usize, index + 1);
+            if let Some(stream) = stream {
+                let body = bplist::parse(&request.body).unwrap();
+                assert_eq!(body.get("streams"), Some(&Value::array(vec![stream])));
+            } else {
+                assert!(request.body.is_empty());
+                assert!(!request.headers.contains_key("content-type"));
+                assert!(tokio::time::timeout(Duration::from_millis(30), peer.read(&mut [0])).await.is_err());
+            }
+            // A receiver may have already retired its audio stream.
+            let status = if index == 0 { 455 } else { 200 };
+            peer.write_all(format!("RTSP/1.0 {status} Result\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",
+                request.cseq().unwrap()).as_bytes()).await.unwrap();
+        }
+        task.await.unwrap();
+        assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+    }
+    #[tokio::test]
+    async fn unanswered_stream_release_still_leaves_time_to_end_session() {
+        let (control, mut peer) = pair().await;
+        let audio = Value::dict(vec![("type", Value::int(100))]);
+        let task = tokio::spawn(async move { finish_session(&control, &[audio], true).await });
+        let stream = read_request(&mut peer).await;
+        assert!(!stream.body.is_empty());
+        let session = read_request(&mut peer).await;
+        assert_eq!(session.first_line, stream.first_line);
+        assert!(session.body.is_empty());
+        // A late stream reply must not complete the final session transaction.
+        peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\n\r\n", stream.cseq().unwrap()).as_bytes()).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(30), peer.read(&mut [0])).await.is_err());
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap();
     }
     #[tokio::test]
     async fn silent_receiver_cannot_block_stop() {
@@ -1227,24 +1263,108 @@ mod display_size_tests {
     }
     #[test]
     fn hid_mapping_tracks_actual_carwith_source_without_changing_receiver_coordinates() {
-        let (tx,mut rx)=mpsc::unbounded_channel();let (key,_)=mpsc::unbounded_channel();
+        let (tx,mut rx)=mpsc::unbounded_channel();
         let source=Arc::new(Mutex::new((1280,372)));
-        let mut down=false;let mut logged=0;
+        let mut down=TouchContact::Idle;let mut logged=0;
         let report=[0,1,0x56,0x05,0x8d,0x01]; // receiver (1366,397), half of 2732x794.
-        handle_hid_report(&report,&tx,&key,(2732,794),None,&source,&mut down,&mut logged);
+        handle_hid_report(&report,&tx,(2732,794),&TouchSurface::Display,&source,&mut down,&mut logged);
         let touch=rx.try_recv().unwrap();assert_eq!((touch.action,touch.x,touch.y),(0,640,186));
         *source.lock()=(1920,720); // A negotiated source change is applied once, at the HID mapper.
-        handle_hid_report(&report,&tx,&key,(2732,794),None,&source,&mut down,&mut logged);
+        handle_hid_report(&report,&tx,(2732,794),&TouchSurface::Display,&source,&mut down,&mut logged);
         let touch=rx.try_recv().unwrap();assert_eq!((touch.action,touch.x,touch.y),(2,960,360));
         let release=[0,0,0x56,0x05,0x8d,0x01];
-        handle_hid_report(&release,&tx,&key,(2732,794),None,&source,&mut down,&mut logged);
+        handle_hid_report(&release,&tx,(2732,794),&TouchSurface::Display,&source,&mut down,&mut logged);
         assert_eq!(rx.try_recv().unwrap().action,1);
         // A stretched 16:9 source on a wide receiver still maps both axes independently.
         for ((x,y), expected) in [((0u16,0u16),(0,0)), ((2049,198),(1440,179))] {
             let [xl,xh]=x.to_le_bytes(); let [yl,yh]=y.to_le_bytes();
-            handle_hid_report(&[0,1,xl,xh,yl,yh],&tx,&key,(2732,794),None,&source,&mut down,&mut logged);
+            handle_hid_report(&[0,1,xl,xh,yl,yh],&tx,(2732,794),&TouchSurface::Display,&source,&mut down,&mut logged);
             let touch=rx.try_recv().unwrap();assert_eq!((touch.x,touch.y),expected);
         }
+    }
+    #[tokio::test]
+    async fn mgu55_carwith_contacts_follow_the_current_written_video_config() {
+        use crate::screen::{build_avcc, ScreenCipher, ScreenSender};
+        use crate::pipeline::Pipeline;
+        let pipeline = Arc::new(Mutex::new(Pipeline::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connect = |id| {
+            let pipeline = pipeline.clone();
+            let addr = listener.local_addr().unwrap();
+            async move {
+                let socket = TcpStream::connect(addr).await.unwrap();
+                let mut sender = ScreenSender::new(socket.into_split().1, ScreenCipher::ChaCha([7;32]), 2736, 800, false);
+                sender.attach_diagnostics(pipeline, id);
+                sender
+            }
+        };
+        let mut sender = connect(1).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let surface = TouchSurface::for_receiver(&Value::dict(vec![("model",Value::str("MGU-55"))]),
+            true, (2736,800), None, &pipeline);
+        let source = Arc::new(Mutex::new((2560,744)));
+        let mut down = TouchContact::Idle;
+        let mut logged = 0;
+        let mut touch = |pressed: bool, x: u16, y: u16| {
+            let [xl,xh] = x.to_le_bytes();
+            let [yl,yh] = y.to_le_bytes();
+            handle_hid_report(&[0,pressed as u8,xl,xh,yl,yh], &tx, (2736,800),
+                &surface, &source, &mut down, &mut logged);
+            rx.try_recv().ok().map(|t| (t.action,t.x,t.y))
+        };
+        // The 2560x744 SPS overrides the sender's 2736x800 size hint (passthrough/fallback).
+        let native = build_avcc(&[0x67,0x42,0x0,0x28,0xf4,0x1,0x40,0xb,0xff,0x2a], &[0x68,1]);
+        sender.send_config(&native).await.unwrap();
+        assert_eq!(touch(true,176,283), Some((0,88,255)));
+        assert_eq!(touch(true,2700,790), Some((2,2559,743)));
+        assert_eq!(touch(false,2700,790), Some((1,2559,743)));
+        for (x,y) in [(87,28), (88,27), (2648,28), (88,772)] {
+            assert_eq!(touch(true,x,y), None);
+            assert_eq!(touch(true,1368,400), None);
+            assert_eq!(touch(false,1368,400), None);
+        }
+        assert_eq!(touch(true,88,28), Some((0,0,0)));
+        assert_eq!(touch(false,2647,771), Some((1,2559,743)));
+
+        // First config of the replacement sender is pending. A stale sender cannot publish again.
+        let mut replacement = connect(2).await;
+        sender.send_config(&native).await.unwrap();
+        assert_eq!(touch(true,176,283), None);
+        assert_eq!(touch(false,176,283), None);
+        // Without parseable SPS the header uses the sender's output size (full hardware stretch).
+        let full = build_avcc(&[0x67,0x42,0,0x1f], &[0x68,1]);
+        replacement.send_config(&full).await.unwrap();
+        drop(sender);
+        assert_eq!(touch(true,0,0), Some((0,0,0)));
+        assert_eq!(touch(true,1368,400), Some((2,1280,372)));
+        assert_eq!(touch(false,2735,799), Some((1,2559,743)));
+        replacement.send_config(&native).await.unwrap();
+        assert_eq!(touch(true,176,283), Some((0,88,255)));
+        replacement.reset_source();
+        assert_eq!(touch(false,0,0), Some((1,88,255)));
+        assert_eq!(touch(true,176,283), None);
+        replacement.send_config(&native).await.unwrap();
+        assert_eq!(touch(true,176,283), None);
+        assert_eq!(touch(false,176,283), None);
+        *source.lock() = (1280,372);
+        assert_eq!(touch(true,176,284), Some((0,44,128)));
+    }
+
+    #[test]
+    fn mgu55_touch_viewport_requires_the_confirmed_receiver_and_carwith_profile() {
+        let pipeline = Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
+        pipeline.lock().screen_config_size = Some((2560,744));
+        for (model,name,carwith_profile) in [
+            ("MGU-55","BMW",false), ("MGU-55","DiPlay",true), ("MGU-55","WinPlay",true),
+            ("MGU-86","BMW",true), ("IDC23","BMW",true), ("MB_D-PP","Mercedes",true),
+        ] {
+            let info = Value::dict(vec![("model",Value::str(model)),("name",Value::str(name))]);
+            let surface = TouchSurface::for_receiver(&info,carwith_profile,(2736,800),None,&pipeline);
+            assert_eq!(surface.viewport((2736,800)),Some((0,0,2736,800)));
+        }
+        let info = Value::dict(vec![("model",Value::str("MGU-55"))]);
+        let surface = TouchSurface::for_receiver(&info,true,(0,0),Some((10,20,1610,920)),&pipeline);
+        assert_eq!(surface.viewport((1920,1080)),Some((10,20,1600,900)));
     }
     #[test]
     fn desktop_pcm_setup_uses_positive_latency_and_keeps_car_parameters() {
@@ -2094,17 +2214,17 @@ fn spawn_event_dispatcher(
     key_tx: mpsc::UnboundedSender<u32>,
     mut consumer_hid: crate::consumer_hid::ConsumerHid,
     display_size: (u32, u32),
-    touch_rect: Option<(u32, u32, u32, u32)>,
+    touch_surface: TouchSurface,
     target_size: Arc<Mutex<(u32, u32)>>,
     stop: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     let mode_feedback = spawn_mode_feedback(control.clone(), stop.clone(), modes.clone(), screen_lifecycle.clone());
     tokio::spawn(async move {
         let mut bad_commands = 0usize;
-        let mut tip_down = false; // 上一次报告的按下状态（down/move/up 边沿检测）
+        let mut contact = TouchContact::Idle;
         let mut seen_commands: Vec<String> = Vec::new();
         let mut hid_reports: u64 = 0;
-    let mut touch_logged: u32 = 0; // 触摸换算诊断计数（前几次 + 每 200 次记一行）
+        let mut touch_logged: u32 = 0;
         let mut other_lines: u64 = 0;
         loop {
             let msg = tokio::select! {
@@ -2219,11 +2339,10 @@ fn spawn_event_dispatcher(
                         handle_hid_report(
                             consumer_hid.touch_payload(uuid, report),
                             &touch_tx,
-                            &key_tx,
                             display_size,
-                            touch_rect,
+                            &touch_surface,
                             &target_size,
-                            &mut tip_down,
+                            &mut contact,
                             &mut touch_logged,
                         );
                     }
@@ -2344,22 +2463,50 @@ fn value_as_bool(v: &bplist::Value) -> Option<bool> {
     v.as_bool().or_else(|| v.as_int().map(|n| n != 0))
 }
 
-/// HID 触摸报告 → 本机界面触摸事件。
-///
-/// 坐标格式（cardeck 奥迪实测；BMW 按 /info hidDevices 描述符校准，见 docs）：
-/// 5 字节 `[tip 1bit][X u16LE][Y u16LE]`，X/Y 为车机显示空间绝对坐标；
-/// 这里缩放到编码画布空间（VideoConfig 画布）。
-///
-/// 动作边沿：按下沿 → DOWN(1)，保持 → MOVE(3)，抬起沿 → UP(2)——
-/// 本机界面需要完整的 down/move/up 序列才认点按。
+enum TouchSurface {
+    Display,
+    DesktopWindow(u32, u32, u32, u32),
+    Mgu55(Arc<Mutex<crate::pipeline::Pipeline>>),
+}
+
+impl TouchSurface {
+    fn for_receiver(info: &Value, mgu_carwith: bool, display: (u32,u32),
+        window: Option<(u32,u32,u32,u32)>, pipeline: &Arc<Mutex<crate::pipeline::Pipeline>>) -> Self {
+        if display.0 < 320 || display.1 < 240 {
+            return window.map(|(l,t,r,b)| Self::DesktopWindow(l,t,r,b)).unwrap_or(Self::Display);
+        }
+        if use_box_bootstrap(mgu_carwith, info) && info.get("model").and_then(Value::as_str) == Some("MGU-55") {
+            return Self::Mgu55(pipeline.clone());
+        }
+        Self::Display
+    }
+
+    fn viewport(&self, (dw,dh): (u32,u32)) -> Option<(u32,u32,u32,u32)> {
+        match *self {
+            Self::Display => Some((0,0,dw,dh)),
+            Self::DesktopWindow(l,t,r,b) => Some((l,t,r.saturating_sub(l).max(1),b.saturating_sub(t).max(1))),
+            Self::Mgu55(ref pipeline) => {
+                let (w,h) = pipeline.lock().screen_config_size?;
+                if w == 0 || h == 0 { return None; }
+                // Confirmed MGU-55 presentation for an encoded canvas fitting the display.
+                if w <= dw && h <= dh { Some(((dw-w)/2,(dh-h)/2,w,h)) }
+                else { Some((0,0,dw,dh)) }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TouchContact { Idle, Ignored, Active(u32,u32) }
+
+/// Map receiver HID pixels into the local input canvas. Actions use Android DOWN/MOVE/UP.
 fn handle_hid_report(
     report: &[u8],
     touch_tx: &mpsc::UnboundedSender<TouchInput>,
-    _key_tx: &mpsc::UnboundedSender<u32>,
     display: (u32, u32),
-    touch_rect: Option<(u32, u32, u32, u32)>,
+    surface: &TouchSurface,
     target_size: &Arc<Mutex<(u32, u32)>>,
-    tip_down: &mut bool,
+    contact: &mut TouchContact,
     logged: &mut u32,
 ) {
     if report.len() < 5 {
@@ -2409,56 +2556,42 @@ fn handle_hid_report(
             u16::from_le_bytes([report[3], report[4]]) as u32,
         )
     };
-    // 防下溢：`target.0 - 1` 在 target 为 0 时 release 会回绕成巨大值、
-    // debug 直接 panic（编码器还没回报尺寸时就是 0）。
-    let (tw, th) = (target.0.max(1), target.1.max(1));
-    let (dw, dh) = (display.0.max(1), display.1.max(1));
-    // DiPlay 实测：画面拉伸铺满整个窗口（无黑边）。HID 是桌面全局坐标时，
-    // 先用窗口矩形 (left,top,right,bottom) 归一化，再映射到画布。
-    let (x, y) = if let Some((l, t, r, b)) = touch_rect {
-        let rw = r.saturating_sub(l).max(1);
-        let rh = b.saturating_sub(t).max(1);
-        (
-            x_raw.saturating_sub(l).saturating_mul(tw) / rw,
-            y_raw.saturating_sub(t).saturating_mul(th) / rh,
-        )
-    } else {
-        (
-            x_raw.saturating_mul(tw) / dw,
-            y_raw.saturating_mul(th) / dh,
-        )
+    if matches!(contact, TouchContact::Ignored) {
+        if !pressed { *contact = TouchContact::Idle; }
+        return;
+    }
+    let (tw,th) = target;
+    let (dw,dh) = (display.0.max(1), display.1.max(1));
+    let Some((left,top,width,height)) = surface.viewport((dw,dh)) else {
+        // A reset or a new screen TCP sender invalidates the previous config.
+        if let TouchContact::Active(x,y) = *contact {
+            let _ = touch_tx.send(TouchInput { action: 1, x, y });
+        }
+        *contact = if pressed { TouchContact::Ignored } else { TouchContact::Idle };
+        return;
     };
-    let x = x.min(tw.saturating_sub(1));
-    let y = y.min(th.saturating_sub(1));
+    if matches!(surface, TouchSurface::Mgu55(_)) && matches!(contact, TouchContact::Idle) && pressed
+        && (!(left..left+width).contains(&x_raw) || !(top..top+height).contains(&y_raw)) {
+        *contact = TouchContact::Ignored;
+        return;
+    }
+    let scale = |raw: u32, origin, extent, target| {
+        let offset = raw.saturating_sub(origin);
+        (u64::from(offset) * u64::from(target) / u64::from(extent)).min(u64::from(target - 1)) as u32
+    };
+    let x = scale(x_raw,left,width,tw);
+    let y = scale(y_raw,top,height,th);
+    let action = match (*contact, pressed) {
+        (TouchContact::Idle, true) => 0,
+        (TouchContact::Active(..), true) => 2,
+        (TouchContact::Active(..), false) => 1,
+        _ => return,
+    };
+    *contact = if pressed { TouchContact::Active(x,y) } else { TouchContact::Idle };
     *logged = logged.wrapping_add(1);
     if *logged <= 5 || *logged % 200 == 0 {
-        crate::emit_log(&format!(
-            "TOUCH: 车机({x_raw},{y_raw}) 空间 {dw}x{dh} → 画布 {tw}x{th} = ({x},{y})（第 {n} 次）",
-            n = *logged
-        ));
-        if *logged == 1 {
-            let rd = dw as f32 / dh as f32;
-            let rt = tw as f32 / th as f32;
-            if (rd - rt).abs() / rt.max(0.1) > 0.03 {
-                crate::emit_log(&format!(
-                    "TOUCH: ⚠ 触摸空间 {dw}x{dh}（{rd:.2}:1）与画布 {tw}x{th}（{rt:.2}:1）宽高比不一致——\
-                     接收端拉伸显示时线性映射正确；若它加了黑边，边缘会偏",
-                ));
-            }
-        }
+        crate::emit_log(&format!("TOUCH: 车机({x_raw},{y_raw}) 空间 {dw}x{dh} 画面 ({left},{top}) {width}x{height} → 画布 {tw}x{th} = ({x},{y})（第 {logged} 次）"));
     }
-    // 动作边沿：按下沿 → DOWN，保持 → MOVE，抬起沿 → UP（0=DOWN/1=UP/2=MOVE）。
-    // 下游由 Kotlin 侧的自绘界面消费（P1 接线），这里只负责换算坐标与边沿。
-    const TOUCH_DOWN: u32 = 0;
-    const TOUCH_UP: u32 = 1;
-    const TOUCH_MOVE: u32 = 2;
-    let action = match (*tip_down, pressed) {
-        (false, true) => TOUCH_DOWN,
-        (true, true) => TOUCH_MOVE,
-        (true, false) => TOUCH_UP,
-        (false, false) => return, // 无状态变化
-    };
-    *tip_down = pressed;
     let _ = touch_tx.send(TouchInput { action, x, y });
 }
 // ---------------------------------------------------------------- 工具

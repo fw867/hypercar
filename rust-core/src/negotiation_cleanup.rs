@@ -2,26 +2,38 @@
 use std::sync::Arc;
 use crate::rtsp::RtspChannel;
 
-pub(crate) struct NegotiationCleanup { channel:Arc<RtspChannel>, enabled:bool, accepted:bool, transferred:bool }
+pub(crate) struct NegotiationCleanup {
+    channel: Arc<RtspChannel>,
+    pub event: Option<Arc<RtspChannel>>,
+    enabled: bool,
+    accepted: bool,
+    transferred: bool,
+}
 impl NegotiationCleanup {
-    pub fn new(channel:Arc<RtspChannel>,enabled:bool)->Self {Self{channel,enabled,accepted:false,transferred:false}}
+    pub fn new(channel:Arc<RtspChannel>,enabled:bool)->Self {Self{channel,event:None,enabled,accepted:false,transferred:false}}
     pub fn accepted(&mut self) { self.accepted=true; }
     pub fn transfer(&mut self) { self.transferred=true; }
     fn dispatch(&mut self)->Option<tokio::task::JoinHandle<()>> {
         if !self.enabled || self.transferred {return None;}
         self.transferred=true;
         let channel=self.channel.clone();let accepted=self.accepted;
+        let event = self.event.take();
         match tokio::runtime::Handle::try_current() {
             Ok(runtime)=>Some(runtime.spawn(async move {
                 crate::emit_log(&format!("NEGOTIATION-CLOSE: accepted={accepted}; bounded session cleanup; no fabricated media streams"));
-                // A parseable empty stream list tears down the session, including a SETUP accepted before parse failure.
-                let body=crate::bplist::encode(&crate::bplist::Value::dict(vec![("streams",crate::bplist::Value::Array(vec![]))]));
-                crate::airplay::finish_session(&channel,&body,accepted).await;
+                crate::airplay::finish_session(&channel, &[], accepted).await;
+                drop(event);
             })),
             Err(_)=>{channel.close();None}
         }
     }
     pub async fn finish(&mut self) {if let Some(task)=self.dispatch(){let _=task.await;}}
+    pub async fn stop(&mut self, graceful: bool) {
+        // A manual stop also owns accepted SETUPs on profiles without automatic rollback.
+        self.enabled = true;
+        self.accepted &= graceful;
+        self.finish().await;
+    }
 }
 impl Drop for NegotiationCleanup {
     fn drop(&mut self) {let _=self.dispatch();}
@@ -47,7 +59,7 @@ mod tests {
         let(c,mut car)=pair().await;let mut guard=NegotiationCleanup::new(c.clone(),true);guard.accepted();
         if absolute {c.set_session_uri(crate::rtsp_uri::SessionUri::new("fe80::1%wlan0",77).unwrap()).unwrap();}
         let task=tokio::spawn(async move{guard.finish().await;guard.finish().await;});
-        let m=read(&mut car).await;assert_eq!(m.first_line,if absolute {"TEARDOWN rtsp://[fe80::1%25wlan0]/77 RTSP/1.0"}else{"TEARDOWN / RTSP/1.0"});assert_eq!(crate::bplist::parse(&m.body).unwrap().get("streams"), Some(&crate::bplist::Value::Array(vec![])));
+        let m=read(&mut car).await;assert_eq!(m.first_line,if absolute {"TEARDOWN rtsp://[fe80::1%25wlan0]/77 RTSP/1.0"}else{"TEARDOWN / RTSP/1.0"});assert!(m.body.is_empty());
         car.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",m.cseq().unwrap()).as_bytes()).await.unwrap();
         task.await.unwrap();assert!(c.is_closed());
         }
@@ -57,6 +69,27 @@ mod tests {
         let task=tokio::spawn(async move{guard.finish().await;});
         let _=read(&mut car).await;task.abort();
         tokio::time::timeout(Duration::from_secs(2),async {while !c.is_closed(){tokio::task::yield_now().await;}}).await.unwrap();
+    }
+    #[tokio::test]
+    async fn pause_during_setup_only_notifies_an_accepted_session() {
+        for (accepted, manual) in [(true, true), (false, true), (true, false)] {
+            let (control, mut car) = pair().await;
+            let mut guard = NegotiationCleanup::new(control.clone(), false);
+            let (event, mut event_peer) = pair().await;
+            guard.event = Some(event);
+            if accepted { guard.accepted(); }
+            let task = tokio::spawn(async move { guard.stop(manual).await });
+            if accepted && manual {
+                let end = read(&mut car).await;
+                assert_eq!(end.first_line, "TEARDOWN / RTSP/1.0");
+                assert!(end.body.is_empty());
+                assert!(tokio::time::timeout(Duration::from_millis(30), event_peer.read(&mut [0])).await.is_err());
+                car.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\n\r\n", end.cseq().unwrap()).as_bytes()).await.unwrap();
+            }
+            task.await.unwrap();
+            assert_eq!(car.read(&mut [0]).await.unwrap(), 0);
+            assert_eq!(event_peer.read(&mut [0]).await.unwrap(), 0);
+        }
     }
     #[tokio::test] async fn unaccepted_failure_never_invents_streams_and_success_hands_off() {
         let(c,mut car)=pair().await;let mut guard=NegotiationCleanup::new(c.clone(),true);guard.finish().await;

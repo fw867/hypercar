@@ -8,9 +8,7 @@ import android.view.Surface
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.ArrayDeque
-import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.atomic.AtomicReference
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.Semaphore
 
@@ -27,8 +25,9 @@ class CarWithHevcTranscoder private constructor(private val inputHevc: Boolean) 
     private var decodeThread: Thread? = null
     private var encodeThread: Thread? = null
     private val failure = AtomicReference<Throwable?>(null)
-    private val output = ArrayBlockingQueue<ByteArray>(8)
-    private val outputBytes = AtomicInteger(0)
+    private val output = ArrayDeque<ByteArray>()
+    private val outputLock = Object()
+    private var outputBytes = 0
     private val info = MediaCodec.BufferInfo()
     private var initThread: Thread? = null
     private val lease = AtomicBoolean(false)
@@ -46,19 +45,21 @@ class CarWithHevcTranscoder private constructor(private val inputHevc: Boolean) 
 
     companion object {
         private val lifecycle = Semaphore(1, true)
-        @JvmStatic fun open(inputHevc: Boolean, width: Int, height: Int, targetWidth: Int, targetHeight: Int, fps: Int, csd: ByteArray): CarWithHevcTranscoder {
+        @JvmStatic fun open(inputHevc: Boolean, outputHevc: Boolean, width: Int, height: Int, targetWidth: Int, targetHeight: Int, fps: Int, csd: ByteArray): CarWithHevcTranscoder {
             require(width in 16..8192 && height in 16..8192 && targetWidth in 16..8192 && targetHeight in 16..8192 && fps in 1..120)
             val pair = CarWithHevcTranscoder(inputHevc)
-            val sourceMime = if (inputHevc) "video/hevc" else "video/avc"
+            val sourceMime = if (inputHevc) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
+            val outputMime = if (outputHevc) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
             pair.framePeriodUs = 1_000_000L / fps
             pair.initThread = Thread({
               try {
                 lifecycle.acquire()
                 pair.lease.set(true)
                 if (pair.closed) return@Thread
-                val format = MediaFormat.createVideoFormat("video/hevc", targetWidth, targetHeight).apply {
+                val format = MediaFormat.createVideoFormat(outputMime, targetWidth, targetHeight).apply {
                     setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                    setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain)
+                    setInteger(MediaFormat.KEY_PROFILE, if (outputHevc) MediaCodecInfo.CodecProfileLevel.HEVCProfileMain
+                        else MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
                     setInteger(MediaFormat.KEY_FRAME_RATE, fps)
                     setInteger(MediaFormat.KEY_BIT_RATE, (targetWidth.toLong() * targetHeight * fps / 12).coerceIn(4_000_000, 24_000_000).toInt())
                     setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
@@ -83,7 +84,7 @@ class CarWithHevcTranscoder private constructor(private val inputHevc: Boolean) 
                                     caps.isFormatSupported(f)
                             }.getOrDefault(false)
                     } ?: error("No hardware $mime ${if (encode) "encoder" else "decoder"} for ${f.getInteger(MediaFormat.KEY_WIDTH)}x${f.getInteger(MediaFormat.KEY_HEIGHT)}@$fps")
-                val enc = hardware("video/hevc", true, format)
+                val enc = hardware(outputMime, true, format)
                 val dec = hardware(sourceMime, false, decoderFormat)
                 pair.encoder = MediaCodec.createByCodecName(enc.name)
                 pair.encoder!!.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -150,7 +151,30 @@ class CarWithHevcTranscoder private constructor(private val inputHevc: Boolean) 
     /** Native calls never wait on hardware, EGL, or codec teardown. */
     fun drain(): ByteArray? {
         checkFailure()
-        return output.poll()?.also { outputBytes.addAndGet(-it.size) }
+        return synchronized(outputLock) {
+            output.pollFirst()?.also {
+                outputBytes -= it.size
+                outputLock.notifyAll()
+            }
+        }
+    }
+
+    /** Let the pump absorb a codec startup burst without blocking the pump or dropping a reference frame. */
+    private fun publishEncoded(packet: ByteArray) {
+        val maxBytes = 16 * 1024 * 1024
+        check(packet.size <= maxBytes) { "Encoded picture exceeds output budget" }
+        val deadline = System.nanoTime() + 250_000_000L
+        synchronized(outputLock) {
+            while (!closed && (output.size >= 8 || packet.size > maxBytes - outputBytes)) {
+                val remaining = deadline - System.nanoTime()
+                check(remaining > 0) { "Encoded output backlog" }
+                outputLock.wait((remaining / 1_000_000L).coerceAtLeast(1L))
+            }
+            if (!closed) {
+                output.addLast(packet)
+                outputBytes += packet.size
+            }
+        }
     }
     private fun startWorkers() {
         decodeThread = Thread({
@@ -192,7 +216,7 @@ class CarWithHevcTranscoder private constructor(private val inputHevc: Boolean) 
                     val packet = readEncoded()
                     if (packet != null && !closed) {
                         encoded++
-                        check(outputBytes.addAndGet(packet.size) <= 16 * 1024 * 1024 && output.offer(packet)) { "HEVC output backlog" }
+                        publishEncoded(packet)
                     } else if (packet == null) Thread.sleep(1)
                     if (System.nanoTime() - lastMetrics > 2_000_000_000L) {
                         lastMetrics = System.nanoTime()
@@ -280,7 +304,11 @@ class CarWithHevcTranscoder private constructor(private val inputHevc: Boolean) 
     override fun close() {
         closed = true
         synchronized(pending) { pending.clear(); pendingBytes = 0 }
-        output.clear(); outputBytes.set(0)
+        synchronized(outputLock) {
+            output.clear()
+            outputBytes = 0
+            outputLock.notifyAll()
+        }
         // Interrupt semaphore waits. Hardware initialization and cleanup never run on the video pump.
         initThread?.interrupt()
         // Init/worker finally blocks own resources and the process-wide hardware lifecycle permit.

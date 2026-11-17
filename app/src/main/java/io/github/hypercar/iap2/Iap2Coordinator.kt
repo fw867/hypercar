@@ -1,6 +1,7 @@
 package io.github.hypercar.iap2
 
 import android.content.Context
+import io.github.hypercar.net.BluetoothHotspot
 import kotlinx.coroutines.runBlocking
 
 /**
@@ -29,6 +30,7 @@ data class CarPlayEndpoint(
     val fromInvite: Boolean = false,
     /** Cached/discovered endpoint used without this round's activation invitation. */
     val proactive: Boolean = false,
+    val bluetoothHotspot: BluetoothHotspot? = null,
 )
 
 /**
@@ -90,7 +92,10 @@ class Iap2Coordinator(
 
     fun diagnosticSummary(): String = bluetooth?.diagnosticSummary() ?: "transport=not-created"
 
-    fun pauseSessions() { bluetooth?.setSessionEnabled(false, "pauseSessions"); endpointCallback = null }
+    fun pauseSessions(closeCurrent: Boolean = true) {
+        bluetooth?.setSessionEnabled(false, "pauseSessions", closeCurrent)
+        endpointCallback = null
+    }
 
     private fun startTransport(allowSessions: Boolean, onEndpoint: ((CarPlayEndpoint) -> Unit)?) {
         synchronized(this) {

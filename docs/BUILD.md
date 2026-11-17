@@ -75,7 +75,7 @@ adb install -r app/build/outputs/apk/release/app-release.apk
 
 ## 分辨率与帧率
 
-「拉伸铺满车机屏幕」当前暂时停用，视频按实际编码尺寸发送。CarWith 的源分辨率需在系统 CarWith 中调整，App 提供「打开 CarWith 设置」快捷入口。
+CarWith 的源分辨率在系统 CarWith 中调整，App 提供「打开 CarWith 设置」快捷入口。车机主屏与源视频宽高比的相对偏差超过 3% 时，App 自动硬件重编码并拉伸铺满主屏。触摸使用 CarWith 实际回复的源尺寸。
 
 优先读取 `/info` 的有效像素尺寸；缺失时使用手机设置页的宽高。使用原生尺寸，仅做偶数向下对齐，
 不再应用宽 1920、高 1080 或约 110 万像素上限。默认 60 fps，手动较低帧率仍有效，下次连接生效。

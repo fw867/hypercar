@@ -175,16 +175,22 @@ impl ScreenSender {
 
     pub fn attach_diagnostics(&mut self,pipeline:std::sync::Arc<parking_lot::Mutex<crate::pipeline::Pipeline>>,connection_id:u64) {
         self.tcp_monitor.take();
-        pipeline.lock().video_tcp=Some(crate::tcp_diagnostics::TcpSnapshot::capture(self.w.as_ref().as_raw_fd(),connection_id));
+        let snapshot = crate::tcp_diagnostics::TcpSnapshot::capture(self.w.as_ref().as_raw_fd(),connection_id);
+        {
+            let mut p = pipeline.lock();
+            p.video_tcp = Some(snapshot);
+            p.screen_config_size = None;
+            p.video_format = None;
+        }
         self.tcp_monitor=Some(crate::tcp_diagnostics::TcpMonitor::start(self.w.as_ref().as_raw_fd(),connection_id,pipeline.clone()));
         self.tcp_diagnostics=Some((pipeline,connection_id));
-        self.publish_format(None);
     }
-    fn publish_format(&self, size: Option<(u32,u32)>) {
+    fn publish_format(&self, sps_size: Option<(u32,u32)>, header_size: Option<(u32,u32)>) {
         if let Some((pipeline,id)) = &self.tcp_diagnostics {
             let mut p = pipeline.lock();
             if p.video_tcp.as_ref().is_some_and(|tcp| tcp.connection_id == *id) {
-                p.video_format = size.map(|(width,height)| crate::pipeline::VideoFormat {
+                p.screen_config_size = header_size;
+                p.video_format = sps_size.map(|(width,height)| crate::pipeline::VideoFormat {
                     width, height, codec: self.codec.as_str()
                 });
             }
@@ -224,7 +230,7 @@ impl ScreenSender {
 
     pub fn reset_source(&mut self) {
         crate::emit_log(&format!("VIDEO: reset source {}", self.diagnostics()));
-        self.publish_format(None);
+        self.publish_format(None, None);
         self.config_sent = false;
         self.last_vps = None; self.last_sps = None; self.last_pps = None;
         self.waiting_idr = true; self.last_sync_request = None;
@@ -320,7 +326,7 @@ impl ScreenSender {
         wire.extend_from_slice(&header);
         wire.extend_from_slice(avcc);
         self.w.write_all(&wire).await?;
-        self.publish_format(sps_size);
+        self.publish_format(sps_size, Some((display_w, display_h)));
         self.config_sent = true;
         self.waiting_idr = true;
         crate::emit_log(&format!("VIDEO: config TCP written {}B codec={} header={}x{} encoder_report={}x{} sps={sps_size:?} report_matches_sps={:?} flags=0x{:02x} header_stretch=false requested_target={:?}; receiver decode/display unconfirmed",
@@ -560,7 +566,7 @@ impl Drop for ScreenSender {
     fn drop(&mut self) {
         crate::emit_log(&format!("VIDEO: sender released {}", self.diagnostics()));
         // Must stop descriptor sampling BEFORE Rust drops the write half and closes its fd.
-        self.publish_format(None);
+        self.publish_format(None, None);
         self.tcp_monitor.take();
     }
 }

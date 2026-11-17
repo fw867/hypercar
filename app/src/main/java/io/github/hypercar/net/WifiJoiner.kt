@@ -94,7 +94,9 @@ class WifiJoiner(
      * @param psk  热点密码；空=开放热点；WEP 形态返回 [JoinResult.Unsupported]。
      */
     suspend fun joinCarHotspotSilently(ssid: String, psk: String,
-        verifiedFallback: suspend () -> Network? = { null }, deviceIdentifierHint: () -> String? = { null }): JoinResult {
+        verifiedFallback: suspend () -> Network? = { null },
+        alreadyAssociated: suspend () -> Network? = { null },
+        deviceIdentifierHint: () -> String? = { null }): JoinResult {
         lastFailureReason = null
         // Password length alone cannot distinguish WEP from valid 10/13/26-character WPA2.
         if (isUnsupportedPassphrase(psk)) {
@@ -135,6 +137,10 @@ class WifiJoiner(
                 now = SystemClock::elapsedRealtime)
         } else null
         currentCoroutineContext().ensureActive()
+        alreadyAssociated()?.let {
+            diagnose("复核扫描期间已连接的车机热点，跳过 requestNetwork")
+            return JoinResult.Joined(it)
+        }
         diagnose("scan_hint=${hint != null} freq=${hint?.frequency ?: 0} age_s=${hint?.ageSeconds ?: -1.0}; no AP address logged")
         requestIdentity = CarWifiRequestIdentity(ssid, psk)
         return joinViaSpecifier(ssid, psk, hint, verifiedFallback)
@@ -221,6 +227,7 @@ class WifiJoiner(
                 if (association.owner() !== this) return
                 result.compareAndSet(network, null)
                 trace.log("callback=lost handle=${network.networkHandle} bound=${boundNetwork.get() == network}")
+                trace.lost(connectivityManager, network)
                 handleNetworkLost(this, network)
             }
 
@@ -353,7 +360,10 @@ class WifiJoiner(
 
     private fun cancelPendingRegistration(owner: ConnectivityManager.NetworkCallback? = association.owner()) {
         owner ?: return
-        association.cancelPending(owner)?.let { runCatching { connectivityManager.unregisterNetworkCallback(it) } }
+        association.cancelPending(owner)?.let {
+            diagnose("withdraw_request reason=cancel_pending")
+            runCatching { connectivityManager.unregisterNetworkCallback(it) }
+        }
     }
 
     /** Drop only the process route; the request must survive a short protocol recovery. */
@@ -369,9 +379,9 @@ class WifiJoiner(
         association.owns(network) &&
             requestIdentity?.matches(ssid, passphrase) == true
 
-    fun bindProcess(network: Network): Boolean = synchronized(bindLock) {
+    fun bindProcess(network: Network, verifiedSystemHotspot: Boolean = false): Boolean = synchronized(bindLock) {
         if (boundNetwork.get() == network && connectivityManager.boundNetworkForProcess == network) return true // 快路径：已绑同一网络
-        if (!CarWifiPolicy.canReuse(connectivityManager.getNetworkCapabilities(network), ownsLiveRequest(network))) {
+        if (!CarWifiPolicy.canReuse(connectivityManager.getNetworkCapabilities(network), verifiedSystemHotspot || ownsLiveRequest(network))) {
             Log.w(TAG, "拒绝复用未验证的系统互联网 Wi-Fi；必须通过局域网请求连接")
             return false
         }
@@ -394,10 +404,12 @@ class WifiJoiner(
 
     /** Release only this instance's process binding and callback. */
     fun release() = synchronized(bindLock) {
+        val previousHandle = association.network()?.networkHandle
         requestIdentity = null
         val previousCallback = association.release()
         stopSelection()
         previousCallback?.let {
+            diagnose("withdraw_request reason=release handle=$previousHandle")
             runCatching { connectivityManager.unregisterNetworkCallback(it) }
         }
         val previous = boundNetwork.getAndSet(null)
