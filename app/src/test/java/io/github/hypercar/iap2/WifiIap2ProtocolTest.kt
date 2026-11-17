@@ -4,6 +4,90 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class WifiIap2ProtocolTest {
+    @Test fun wifiReauthenticationAndSameIdentityReinviteUseCurrentPositionAndResumeCadence() {
+        for (reuseProtocol in listOf(false,true)) {
+            val old = Car(); old.ready()
+            old.nowPlaying = Iap2NowPlaying(status=2,elapsedMs=90000)
+            old.message(0x5000,initialMediaRequest())
+            val current = if (reuseProtocol) old else Car()
+            current.nowPlaying = Iap2NowPlaying(status=2,elapsedMs=1000)
+            current.ready() // Actual DETECT/SYN/auth, or a fresh instance with the same identity.
+            if (!reuseProtocol) old.message(0x5002)
+            fun at(now: Long): List<Iap2Csm.Frame> {
+                current.time = now
+                return messages(current.feed(packet(0x40,current.sequence,current.ack)))
+            }
+            assertTrue(at(current.time+100).none { it.messageId==0x5001 })
+            val initial = mediaFields(current.message(0x5000,initialMediaRequest()))
+            assertArrayEquals(byteArrayOf(0,0,3,0xe8.toByte()),initial.getValue(1 to 1).value)
+            assertTrue(initial.containsKey(1 to 5))
+            current.nowPlaying = current.nowPlaying.copy(elapsedMs=2000)
+            val seek = mediaFields(at(current.time+100))
+            assertArrayEquals(byteArrayOf(0,0,7,0xd0.toByte()),seek.getValue(1 to 1).value)
+            assertFalse(seek.containsKey(1 to 5))
+            current.nowPlaying = current.nowPlaying.copy(status=1)
+            val resumedAt = current.time+100
+            assertEquals(1,mediaFields(at(resumedAt)).getValue(1 to 0).value.single().toInt())
+            current.nowPlaying = current.nowPlaying.copy(elapsedMs=3000)
+            assertTrue(at(resumedAt+100).none { it.messageId==0x5001 })
+            assertTrue(at(resumedAt+4900).none { it.messageId==0x5001 })
+            current.nowPlaying = current.nowPlaying.copy(elapsedMs=7000)
+            assertArrayEquals(byteArrayOf(0,0,0x1b,0x58),
+                mediaFields(at(resumedAt+5000)).getValue(1 to 1).value)
+            assertFalse(current.protocol.failed)
+        }
+    }
+
+    private fun initialMediaRequest() = Iap2Csm.group(0,
+        *intArrayOf(0,1,7,23).map { Iap2Csm.param(it, byteArrayOf()) }.toTypedArray()) +
+        Iap2Csm.group(1, *intArrayOf(0,1,2,5).map { Iap2Csm.param(it, byteArrayOf()) }.toTypedArray())
+
+    private fun mediaFields(messages: List<Iap2Csm.Frame>) =
+        Iap2Csm.parseParams(messages.single { it.messageId == 0x5001 }.body).flatMap { group ->
+            Iap2Csm.parseParams(group.value).map { (group.id to it.id) to it }
+        }.toMap()
+
+    @Test fun firstMediaDefaultsFollowRealWifiReauthenticationNotRepeatedAuthOrSubscription() {
+        val car = Car(window=5)
+        repeat(3) { round ->
+            car.ready() // Includes DETECT/SYN and authentication, not just session.reset().
+            car.time += 100
+            assertTrue(messages(split(car.protocol.advance(car.time))).none { it.messageId == 0x5001 })
+            val first = mediaFields(car.message(0x5000, initialMediaRequest()))
+            assertEquals(Iap2Csm.Param(5,byteArrayOf(0)), first[1 to 5])
+            repeat(2) {
+                assertTrue(car.message(0xaa03,Iap2Csm.param(0,ByteArray(64))).isEmpty())
+                assertEquals(listOf(0x1d02),car.message(0x1d01).map { it.messageId })
+                assertFalse(mediaFields(car.message(0x5000,initialMediaRequest())).containsKey(1 to 5))
+            }
+            car.message(0x5002)
+            car.nowPlaying = Iap2NowPlaying(title="stopped-update-$round",status=1)
+            car.time += 100
+            assertTrue(messages(split(car.protocol.advance(car.time))).none { it.messageId == 0x5001 })
+            val resumed = mediaFields(car.message(0x5000,initialMediaRequest()))
+            assertFalse(resumed.containsKey(1 to 5))
+            assertEquals(car.nowPlaying.title,resumed.getValue(0 to 1).asStringOrNull())
+            assertFalse(car.protocol.failed)
+        }
+    }
+
+    @Test fun sameIdentityNewWifiProtocolInitializesIndependentlyOfOldProtocolCleanup() {
+        val old = Car(); old.ready()
+        assertTrue(mediaFields(old.message(0x5000,initialMediaRequest())).containsKey(1 to 5))
+        val current = Car(); current.ready()
+        current.nowPlaying = Iap2NowPlaying(title="current",status=1)
+        val first = mediaFields(current.message(0x5000,initialMediaRequest()))
+        assertTrue(first.containsKey(1 to 5))
+        assertEquals("current",first.getValue(0 to 1).asStringOrNull())
+        old.message(0x5002); old.ready(); old.message(0x5000,initialMediaRequest())
+        current.nowPlaying = current.nowPlaying.copy(title="new song")
+        current.time += 100
+        val update = mediaFields(messages(current.feed(packet(0x40,current.sequence,current.ack))))
+        assertEquals("new song",update.getValue(0 to 1).asStringOrNull())
+        assertFalse(update.containsKey(1 to 5))
+        assertFalse(current.protocol.failed)
+    }
+
     @Test fun lateConfigurationCannotRestartReauthenticationOrResendRequest() {
         val car = Car(window = 5)
         car.ready()

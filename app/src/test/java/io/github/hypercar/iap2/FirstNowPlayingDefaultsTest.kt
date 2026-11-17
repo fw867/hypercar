@@ -125,4 +125,38 @@ class FirstNowPlayingDefaultsTest {
         start(session, request(0,10))
         assertArrayEquals(Iap2Csm.group(0,Iap2Csm.u16(10,0)), firstBody(session,1))
     }
+
+    @Test fun lateRealValuesIncludingZeroAndFalseAreSentDuringEmptyArtworkWait() {
+        var state = Iap2NowPlaying()
+        val session = Iap2NowPlayingSession({ state }, initializeArtworkWithEmptyFile=true)
+        session.authenticated(); start(session)
+        assertEquals(fields(iphone),fields(firstBody(session)))
+        // A real zero/false is still an available value, even when the initial default was identical.
+        state = Iap2NowPlaying(title="late",status=1,details=MediaPlaybackDetails(
+            itemId=0,trackNumber=0,trackCount=0,discNumber=0,genre="Jazz",composer="A",
+            liked=false,queueIndex=0,queueCount=0,speed=0f))
+        assertTrue(session.poll(99,2048,true).isEmpty())
+        val zero = session.poll(100,2048,true)
+        assertArrayEquals(state.body(0x80,explicitPlayback=true),controls(zero).single().body)
+        assertTrue(zero.none { it is Iap2NowPlayingSession.Output.File })
+        state = state.copy(title="latest",details=state.details.copy(itemId=42,trackNumber=3,
+            trackCount=12,discNumber=2,liked=true,queueIndex=2,queueCount=12,speed=1.25f))
+        val latest = session.poll(200,2048,true)
+        assertArrayEquals(state.body(0x80,explicitPlayback=true),controls(latest).single().body)
+        assertTrue(session.hasFileWork) // Metadata is live before the peer starts the empty file.
+        assertTrue(session.poll(300,2048,true).isEmpty())
+    }
+
+    @Test fun elapsedOnlyUpdatesKeepExistingCadenceAndCurrentRealValues() {
+        var state = Iap2NowPlaying(title="playing",status=1,elapsedMs=1000)
+        val session = Iap2NowPlayingSession({ state })
+        session.authenticated(); start(session)
+        firstBody(session)
+        state = state.copy(elapsedMs=2000)
+        assertTrue(session.poll(100,2048,true).isEmpty())
+        state = state.copy(elapsedMs=6000)
+        assertArrayEquals(state.body(null,explicitPlayback=true),firstBody(session,5000))
+        state = state.copy(status=2,elapsedMs=6100)
+        assertArrayEquals(state.body(null,explicitPlayback=true),firstBody(session,5100))
+    }
 }

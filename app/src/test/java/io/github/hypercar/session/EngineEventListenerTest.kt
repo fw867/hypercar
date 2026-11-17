@@ -1,11 +1,62 @@
 package io.github.hypercar.session
 
 import io.github.hypercar.core.RustCoreBridge
+import io.github.hypercar.iap2.Iap2Csm
+import io.github.hypercar.iap2.Iap2NowPlaying
+import io.github.hypercar.iap2.Iap2NowPlayingSession
+import io.github.hypercar.iap2.asStringOrNull
 import io.github.hypercar.net.PendingInvitation
 import org.junit.Assert.*
 import org.junit.Test
 
 class EngineEventListenerTest {
+    @Test fun oldSamePeerCallbacksCannotConsumeOrResetNewFirstMediaDefaults() {
+        val gate = EngineCallbackGate()
+        var linkId = 0L
+        var state = Iap2NowPlaying(title="real")
+        var session: Iap2NowPlayingSession? = null
+        val target = object : RustCoreBridge.EventListener {
+            override fun onState(state: String, detail: String) {}
+            override fun onLog(line: String) {}
+            override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {}
+            override fun onNightMode(night: Boolean) {}
+            override fun onIap2Start(id: Long, deviceId: String, deviceName: String) {
+                linkId = id
+                session = Iap2NowPlayingSession({ state }).also { it.authenticated() }
+            }
+            // Model the bridge's ID gates. The protocol tests separately exercise actual link framing.
+            override fun onIap2Bytes(id: Long, bytes: ByteArray) {
+                if (id == linkId) Iap2Csm.Parser().offer(bytes).forEach { session?.handle(it) }
+            }
+            override fun onIap2Stop(id: Long) { if (id == linkId) session = null }
+        }
+        val start = Iap2Csm.encode(0x5000,Iap2Csm.group(0,
+            Iap2Csm.param(0,byteArrayOf()),Iap2Csm.param(1,byteArrayOf())))
+        fun updates(now: Long) = session!!.poll(now,2048,false)
+            .filterIsInstance<Iap2NowPlayingSession.Output.Control>()
+        fun fields(now: Long) = Iap2Csm.parseParams(Iap2Csm.parseParams(updates(now).single().body).single().value)
+            .associateBy { it.id }
+        val old = EngineEventListener(gate,gate.begin(),target)
+        old.onIap2Start(11,"same-peer","phone"); old.onIap2Bytes(11,start)
+        assertTrue(fields(0).containsKey(0))
+        val current = EngineEventListener(gate,gate.begin(),target)
+        current.onIap2Start(12,"same-peer","phone")
+        old.onIap2Bytes(11,start); old.onIap2Bytes(12,start)
+        current.onIap2Bytes(11,start)
+        old.onIap2Stop(11)
+        assertTrue(updates(1).isEmpty()) // Old subscriptions cannot consume new initialization.
+        current.onIap2Bytes(12,start)
+        assertTrue(fields(2).containsKey(0))
+        old.onIap2Start(11,"same-peer","phone")
+        old.onIap2Bytes(12,Iap2Csm.encode(0x5002)); old.onIap2Stop(11)
+        state = state.copy(title="latest")
+        val changed = fields(102)
+        assertFalse(changed.containsKey(0)) // Old start/stop cannot reset initialization or stop updates.
+        assertEquals("latest",changed.getValue(1).asStringOrNull())
+        current.onIap2Bytes(12,start)
+        assertFalse(fields(103).containsKey(0))
+    }
+
     @Test fun oldArtworkCallbacksCannotCompleteNewLinkEvenWhenTransferIdIsReused() {
         val gate=EngineCallbackGate()
         var linkId=0L

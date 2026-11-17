@@ -152,8 +152,8 @@ internal class Iap2NowPlayingSession(
         val out = mutableListOf<Output>()
         expirePending(now)
         if (subscribed && (force || now >= nextPoll)) {
-            // Observe track changes and completed JPEG work promptly. Elapsed-only
-            // updates retain their independent five-second wire cadence below.
+            // Observe track changes, paused seeks and completed JPEG work promptly.
+            // Playing progress retains its independent five-second wire cadence below.
             nextPoll = now + 100
             val np = try { snapshot() } catch (error: Exception) {
                 note("snapshot unavailable: ${error.javaClass.simpleName}"); return out
@@ -187,10 +187,15 @@ internal class Iap2NowPlayingSession(
                 }
             }
             val progressDue = wants(1,1) && np.status == 1 && now - lastProgressAt >= 5_000
+            // Paused position changes are seeks, not the playing clock. Compare wire values
+            // before replacing lastSample, without changing the normal metadata deduplication.
+            val pausedSeek = wants(1,1) && np.status == 2 && lastSample?.let {
+                it.elapsedMs.coerceIn(0, 0xffff_ffffL) != np.elapsedMs.coerceIn(0, 0xffff_ffffL)
+            } == true
             if (force || progressDue || artworkChanged || np != lastSample) {
                 lastSample = np
                 val content = select(np.copy(elapsedMs = 0).body(artworkId, explicitPlayback = requested != null))
-                if (force || progressDue || !content.contentEquals(lastBody)) {
+                if (force || progressDue || pausedSeek || !content.contentEquals(lastBody)) {
                     val body = select(np.body(artworkId, explicitPlayback = requested != null),
                         includeInitialDefaults = !firstUpdateSent)
                     if (body.isNotEmpty()) {
