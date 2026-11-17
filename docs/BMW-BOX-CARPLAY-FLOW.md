@@ -626,3 +626,11 @@ NowPlaying的0x5000处理位于`0x62924`起；`0x62c90..0x62f18`对所订阅的�
 用户随后明确盒子成功日志未测试这两项，并要求独立SIRI/导航也实现。573同批继续补齐：libAirPlay `AirPlayAudioFormatToASBD@0x1dc64`的24k分支`0x1df3a`明确bit29/480帧，48k分支`0x1df4e`明确bit30/960帧，均20ms；`_AirPlay_SendAudio@0x40bc8`按实际ASBD帧数推进RTP时钟。SIRI用type100/speechRecognition，导航用type101/default；OPUS不填AAC专用spf/sr/ct。
 
 当前实现已连通静态OPUS编码、独立流SETUP、每流加密/同步、mainAudio借还与Speaking、导航appState和duck/unduck。主媒体PCM保留；SIRI切换前确认旧媒体停止，结束清理并重新建立媒体，导航并行。按接收端明确能力选择、失败清理后回退，receiver接管时不以旧lease恢复。详细生命周期与验证边界见[音频](AUDIO.md)。成功日志缺项不再作为暂缓实现的依据，实车是否成功仍须分别测试。
+
+## RTSP 整场重拨的证据边界（2026-11-17，587 同批）
+
+盒子 xiap2 固件有 `retry get info cmd`、`carplay video recover setup retry` 字符串及重启定时器，不能表述为完全没有重试。反汇编中 `carplay_restart`（0x2a780）的路径在 0x2a888 调用 `CarplayStop()`，随后处理 switch timer 和 USB 停止；已查路径不能作为“保持本轮蓝牙/网络，每 2.5 秒重开旧 RTSP 端点六次”的依据。成功摘要不覆盖全部失败分支，也不能证明固件不存在其他恢复路径。
+
+本机盒子二次上车原始日志 `hct_xiap2_20260811_085004.log` 在 51.598 s 记录 HTTP connect 邀请，51.600 s 才连接控制端点，52.231 s 完成 RECORD。iPhone 两份 sysdiagnose 的去重会话证据中，首次、切换热点恢复、二次上车三个控制连接分别在 19:43:21.836、19:44:40.652、19:51:16.249 开始，均对应本轮车机邀请。iPhone 没有可供核查的实现源码，抓包稀疏且部分负载加密，不能由成功样本推断完整重试策略。
+
+基于上述边界收紧 App：删除整场 RTSP 引擎的六次定时重拨。所有档案协商失败后等待新的车机邀请或 iAP2 端点，保留热点、RFCOMM 和 ctrl 监听；视频已建立后的 failed 回调不再重拨旧端点。没有删除活动控制连接内的单流 SETUP、资源交互或底层 TCP 候选尝试。

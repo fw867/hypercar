@@ -1,5 +1,5 @@
 //! AirPlay HID controls, scoped to the device, application collection and report ID.
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::bplist::Value;
 
 #[derive(Clone, Default)]
@@ -164,6 +164,29 @@ mod tests {
             Value::dict(vec![("uuid",Value::int(0)),("hidDescriptor",Value::Data(bitmap(false)))]),
             Value::dict(vec![("uuid",Value::int(1)),("hidDescriptor",Value::Data(array()))]),
         ]))]))
+    }
+    #[test] fn session_summary_counts_track_edges_separately_from_reports() {
+        let mut h = registry();
+        let device = Value::int(0);
+        h.report(Some(&device), &[4]);
+        h.report(Some(&device), &[4]);
+        h.report(Some(&Value::int(99)), &[8]);
+        let summary = h.diagnostic_summary();
+        assert!(summary.contains("uuid=0 track_descriptor=both reports=2 next=1 previous=0"));
+        assert!(summary.contains("uuid=1 track_descriptor=both reports=0 next=0 previous=0"));
+        assert!(summary.contains("unmatched_reports=1"));
+        assert!(registry().diagnostic_summary().contains("uuid=0 track_descriptor=both reports=0 next=0 previous=0"));
+    }
+    #[test] fn session_summary_keeps_bmw_knob_and_touch_separate_from_track_keys() {
+        let mut hid = ConsumerHid::from_info(&Value::dict(vec![("hidDevices", Value::array(vec![
+            Value::dict(vec![("uuid", Value::int(0)), ("hidDescriptor", Value::Data(MGU_KNOB.to_vec()))]),
+            Value::dict(vec![("uuid", Value::int(1)), ("hidDescriptor", Value::Data(MGU_TOUCH.to_vec()))]),
+        ]))]));
+        assert_eq!(hid.report(Some(&Value::int(0)), &[0, 0, 0, 2]), Some(vec![CONSOLE_NEXT; 2]));
+        assert_eq!(hid.report(Some(&Value::int(1)), &[1, 0, 0, 0, 0]), None);
+        let summary = hid.diagnostic_summary();
+        assert!(summary.contains("uuid=0 track_descriptor=none reports=1 next=0 previous=0"));
+        assert!(summary.contains("uuid=1 track_descriptor=none reports=1 next=0 previous=0"));
     }
     #[test] fn bitmap_padding_and_array_indices_are_different() {
         let mut b=Device::parse(&bitmap(false)).unwrap();
@@ -380,6 +403,13 @@ impl Device {
 }
 
 #[derive(Default)]
+struct ReportCounts {
+    reports: u64,
+    next: u64,
+    previous: u64,
+}
+
+#[derive(Default)]
 pub struct ConsumerHid {
     devices: HashMap<String, Device>,
     advertised: BTreeSet<Option<String>>,
@@ -387,8 +417,16 @@ pub struct ConsumerHid {
     unknown: usize,
     short_logs: usize,
     long_logs: usize,
+    session_id: Option<u64>,
+    counts: BTreeMap<String, ReportCounts>,
+    unmatched: ReportCounts,
 }
 impl ConsumerHid {
+    pub fn for_session(session_id: u64, info: &Value) -> Self {
+        let mut hid = Self::from_info(info);
+        hid.session_id = Some(session_id);
+        hid
+    }
     pub fn from_info(info:&Value)->Self {
         let mut result=Self::default();
         for key in ["hidDevices","hids","hid"] {
@@ -396,6 +434,7 @@ impl ConsumerHid {
                 let id = entry.get("uuid").and_then(identity);
                 result.advertised.insert(id.clone());
                 let Some(id) = id else { continue; };
+                result.counts.entry(id.clone()).or_default();
                 let descriptor=entry.get("hidDescriptor").or_else(||entry.get("reportDescriptor")).and_then(Value::as_bytes);
                 if let Some(device)=descriptor.and_then(Device::parse) {
                     crate::emit_log(&format!("HID-KEY: device={id} descriptor={}B control_fields={} report_ids={} touch_reports={:?}",descriptor.unwrap().len(),device.fields.len(),device.has_ids,device.touch_reports));
@@ -408,6 +447,24 @@ impl ConsumerHid {
         }
         crate::emit_log(&format!("HID-KEY: registered input devices={}",result.devices.len()));
         result
+    }
+    fn diagnostic_summary(&self) -> String {
+        let mut devices = Vec::new();
+        for (id, counts) in &self.counts {
+            let track = self.devices.get(id).map_or("unknown", |device| {
+                let declares = |usage| device.fields.iter().any(|f| f.usages.contains(&usage));
+                match (declares(0xc00b5), declares(0xc00b6)) {
+                    (true, true) => "both",
+                    (true, false) => "next",
+                    (false, true) => "previous",
+                    (false, false) => "none",
+                }
+            });
+            devices.push(format!("uuid={id} track_descriptor={track} reports={} next={} previous={}",
+                counts.reports, counts.next, counts.previous));
+        }
+        format!("devices=[{}] unmatched_reports={} unmatched_next={} unmatched_previous={}",
+            devices.join("; "), self.unmatched.reports, self.unmatched.next, self.unmatched.previous)
     }
     fn layout_id(&self, uuid: Option<&Value>, bytes: &[u8]) -> Option<String> {
         if let Some(uuid) = uuid { return identity(uuid); }
@@ -425,24 +482,38 @@ impl ConsumerHid {
     /// Some = control report consumed (including releases). None = forward to the touch decoder.
     pub fn report(&mut self,uuid:Option<&Value>,bytes:&[u8])->Option<Vec<u32>> {
         let id=self.layout_id(uuid,bytes);
+        let keys = self.decode_report(id.as_ref(), bytes);
+        let counts = id.as_ref().and_then(|id| self.counts.get_mut(id)).unwrap_or(&mut self.unmatched);
+        counts.reports += 1;
+        for key in keys.iter().flatten() {
+            match key {
+                0xb5 => counts.next += 1,
+                0xb6 => counts.previous += 1,
+                _ => {}
+            }
+        }
+        keys
+    }
+
+    fn decode_report(&mut self, id: Option<&String>, bytes: &[u8]) -> Option<Vec<u32>> {
         let budget=if bytes.len()<5 { &mut self.short_logs } else { &mut self.long_logs };
         let limit=if bytes.len()<5 {64} else {8};
         if *budget<limit {
             *budget+=1;
-            let device=id.as_ref().and_then(|id|self.devices.get(id));
+            let device=id.and_then(|id|self.devices.get(id));
             let layout=device.map(|d|d.diagnostic_report(bytes)).unwrap_or_else(||"layout=unmatched".into());
             // Never dump touch coordinates; short control reports alone get a hex sample.
             let sample=if bytes.len()<5 && !device.is_some_and(|d|d.is_touch_report(bytes)) {format!("{:02x?}",bytes)} else {"omitted-touch-or-long-report".into()};
             crate::emit_log(&format!("HID-INPUT: device={id:?} bytes={} {layout} sample={sample} short_budget={}/64 long_budget={}/8",bytes.len(),self.short_logs,self.long_logs));
         }
-        if let Some(device)=id.as_ref().and_then(|id|self.devices.get_mut(id)) {
+        if let Some(device)=id.and_then(|id|self.devices.get_mut(id)) {
             if device.is_touch_report(bytes) { return None; }
             return Some(device.report(bytes));
         }
         if bytes.len()>=5 {
             // A declared device lacking a usable descriptor keeps legacy touch decoding.
             // Otherwise an unresolved report matching a control layout must not become a tap.
-            let declared = id.is_some() && self.advertised.contains(&id);
+            let declared = id.is_some_and(|id| self.counts.contains_key(id));
             let possible_control = !declared && self.devices.values().any(|d|
                 d.matches_report_length(bytes) && !d.is_touch_report(bytes));
             return possible_control.then(Vec::new);
@@ -452,7 +523,7 @@ impl ConsumerHid {
         let value=match bytes { [v]=>*v as u32,[lo,hi]=>u16::from_le_bytes([*lo,*hi]) as u32,_=>u32::MAX };
         if value==0||supported(value) {
             let down=if value==0 {BTreeSet::new()} else {BTreeSet::from([value])};
-            let previous=self.raw.entry(id.unwrap_or_default()).or_default();
+            let previous=self.raw.entry(id.cloned().unwrap_or_default()).or_default();
             let mut edges:Vec<u32>=down.difference(previous).copied().collect();
             if previous.contains(&0xcf)&&!down.contains(&0xcf){edges.push(crate::voice_key::HID_UP);}
             *previous=down;return Some(edges);
@@ -462,5 +533,13 @@ impl ConsumerHid {
             crate::emit_log(&format!("HID-KEY: unresolved device={id:?} report={bytes:02x?}; need consumer descriptor, not guessing usage"));
         }
         Some(vec![])
+    }
+}
+
+impl Drop for ConsumerHid {
+    fn drop(&mut self) {
+        if let Some(id) = self.session_id {
+            crate::emit_log(&format!("WIFI-IAP#{id}: AirPlay HID END {}", self.diagnostic_summary()));
+        }
     }
 }

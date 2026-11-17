@@ -83,6 +83,8 @@ pub struct EngineConfig {
     #[serde(default)]
     pub bmw_box_bootstrap: bool,
     #[serde(default)]
+    pub head_unit_profile: String,
+    #[serde(default)]
     pub mbux_screen_bootstrap: bool,
     #[serde(default)]
     pub id9_screen_bootstrap: bool,
@@ -405,6 +407,7 @@ pub async fn run_engine(
         microphone_probe,
         keep_alive_stats: cfg.keep_alive_stats,
         bmw_box_bootstrap: cfg.bmw_box_bootstrap,
+        head_unit_profile: cfg.head_unit_profile.clone(),
         mbux_screen_bootstrap: cfg.mbux_screen_bootstrap,
         id9_screen_bootstrap: cfg.id9_screen_bootstrap,
         nbt_audio_first: cfg.nbt_audio_first,
@@ -1036,7 +1039,7 @@ mod video_pump_tests {
             let (commands,rx)=mpsc::channel(2);let (source,video_rx)=mpsc::unbounded_channel();
             let stats=Arc::new(Mutex::new(PumpStat::default()));let stop=Arc::new(Notify::new());
             let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
-            let pump=tokio::spawn(video_pump(stop.clone(),stats.clone(),recovery,pipeline,rx,video_rx,false,30,None));
+            let pump=crate::callback_context::spawn(video_pump(stop.clone(),stats.clone(),recovery,pipeline,rx,video_rx,false,30,None));
             commands.send(crate::screen_session::ScreenCommand::Install(ScreenSender::new(
                 write,crate::screen::ScreenCipher::ChaCha([7;32]),1920,720,false,
             ))).await.unwrap();
@@ -1078,7 +1081,7 @@ mod video_pump_tests {
 struct EngineTasks(Vec<tokio::task::JoinHandle<()>>);
 impl EngineTasks {
     fn spawn(&mut self, future: impl std::future::Future<Output = ()> + Send + 'static) {
-        self.0.push(tokio::spawn(future));
+        self.0.push(crate::callback_context::spawn(future));
     }
     async fn shutdown(&mut self) {
         for task in &self.0 { task.abort(); }
@@ -1321,7 +1324,7 @@ mod main_audio_command_tests {
         let(stop,stats)=(Arc::new(Notify::new()),Arc::new(Mutex::new(AudioPumpStat::default())));
         let(claims,_)=mpsc::channel(4);let(ready,rx)=tokio::sync::oneshot::channel();
         let(events,audio)=mpsc::unbounded_channel();let(commands,command_rx)=mpsc::unbounded_channel();
-        let worker=tokio::spawn(audio_pump(stop,stats,claims,rx,audio,command_rx,Arc::new(crate::aux_audio::Input::default())));
+        let worker=crate::callback_context::spawn(audio_pump(stop,stats,claims,rx,audio,command_rx,Arc::new(crate::aux_audio::Input::default())));
         let(first,peer,local)=output().await;assert!(ready.send(first).is_ok());
         let mut packet=[0;4096];tokio::time::timeout(Duration::from_secs(1),peer.recv(&mut packet)).await.unwrap().unwrap();
         events.send(SourceEvent::AudioData{tts:false,rate:48000,channels:2,data:10000i16.to_le_bytes().repeat(12000)}).unwrap();
@@ -1347,7 +1350,7 @@ mod main_audio_command_tests {
     async fn paused_pump_drops_late_initial_sender_until_explicit_install() {
         let(claims,_)=mpsc::channel(4);let(ready,rx)=tokio::sync::oneshot::channel();
         let(_events,audio)=mpsc::unbounded_channel();let(commands,command_rx)=mpsc::unbounded_channel();
-        let worker=tokio::spawn(audio_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(AudioPumpStat::default())),claims,rx,audio,command_rx,Arc::new(crate::aux_audio::Input::default())));
+        let worker=crate::callback_context::spawn(audio_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(AudioPumpStat::default())),claims,rx,audio,command_rx,Arc::new(crate::aux_audio::Input::default())));
         let(ack,done)=tokio::sync::oneshot::channel();commands.send(MainCommand::Pause(ack)).unwrap();
         assert!(tokio::time::timeout(Duration::from_millis(250),done).await.is_ok(),"pause before negotiation must be acknowledged");
         let(initial,peer,_)=output().await;assert!(ready.send(initial).is_ok());
@@ -1364,7 +1367,7 @@ mod main_audio_command_tests {
         commands.send(MainCommand::Install(Some(next))).unwrap();
         let(ack,done)=tokio::sync::oneshot::channel();drop(done);
         commands.send(MainCommand::Pause(ack)).unwrap();
-        let worker=tokio::spawn(audio_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(AudioPumpStat::default())),claims,rx,audio,command_rx,Arc::new(crate::aux_audio::Input::default())));
+        let worker=crate::callback_context::spawn(audio_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(AudioPumpStat::default())),claims,rx,audio,command_rx,Arc::new(crate::aux_audio::Input::default())));
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(UdpSocket::bind(local).await.is_err(),"cancelled pause cannot release a current sender");
         assert!(tokio::time::timeout(Duration::from_millis(100),peer.recv(&mut [0;4096])).await.is_ok(),"cancelled pause cannot stop current RTP");
@@ -1382,7 +1385,7 @@ mod main_audio_command_tests {
         let(claims,_)=mpsc::channel(4);let(ready,rx)=tokio::sync::oneshot::channel();
         let(events,audio)=mpsc::unbounded_channel();let(_commands,command_rx)=mpsc::unbounded_channel();
         let stats=Arc::new(Mutex::new(AudioPumpStat::default()));
-        let worker=tokio::spawn(audio_pump(Arc::new(Notify::new()),stats.clone(),claims,rx,audio,command_rx,input.clone()));
+        let worker=crate::callback_context::spawn(audio_pump(Arc::new(Notify::new()),stats.clone(),claims,rx,audio,command_rx,input.clone()));
         // Queue mirrored audio before capabilities arrive. The next independent tick
         // must retire these samples as well as bypassing subsequent source DATA.
         events.send(SourceEvent::VoiceAudioInit{rate:48000,channels:2}).unwrap();

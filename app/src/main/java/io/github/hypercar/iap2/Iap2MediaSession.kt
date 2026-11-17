@@ -97,6 +97,8 @@ internal class Iap2MediaSession(private val log: (String) -> Unit, private val k
         }
         return true
     }
+    val diagnosticSummary: String get() = "rx_6800=$starts rx_6802=$reports hid_parsed=$parsedReports hid_edges=$keyEdges"
+
     /** Called by the transport poll even when no HID reports arrive. */
     fun diagnosticsTick() {
         val now = nowMillis()

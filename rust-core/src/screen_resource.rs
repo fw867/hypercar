@@ -147,6 +147,7 @@ impl ScreenSession {
             let body = bplist::encode(&Value::dict(vec![("streams", Value::array(vec![Value::dict(vec![
                 ("type", Value::int(110)), ("uuid", Value::str(&self.uuid)),
             ])]))]));
+            self.control.udp_media.set(110, false);
             let response = self.control.request("TEARDOWN", "/", &body, "application/x-apple-binary-plist", &[], Duration::from_secs(3)).await?;
             crate::emit_log(&format!("SCREEN-LIFECYCLE: screen-only TEARDOWN status={}; audio/control retained", response.status()));
             if response.status() != 200 { return Err(format!("屏幕 TEARDOWN 被拒 {}", response.first_line)); }
@@ -289,6 +290,7 @@ mod tests {
                 wifi_mac_address:None,
                 car_ip:"127.0.0.1".into(),airplay_port:7000,device_id:"test".into(),device_name:"Test phone".into(),identity_path:"unused".into(),
                 receiver_id:None,receiver_previously_connected:true,enable_audio:true,audio_codec:String::new(),video_codec:String::new(),bmw_capabilities:true,microphone_probe:None,keep_alive_stats:false,
+                head_unit_profile:if mbux { "mercedes_mbux" } else { "bmw_id85" }.into(),
                 bmw_box_bootstrap:!mbux,mbux_screen_bootstrap:mbux,id9_screen_bootstrap:false,nbt_audio_first:false,mbux_media_compat:false,desktop_receiver:false,width:1920,height:720,touch_display:None,touch_rect:None,
                 encoder_size:Arc::new(Mutex::new((1920,720))),touch_size:Arc::new(Mutex::new((1920,720))),
                 carwith_display:None,carwith_stretch:false,screen_resource_lifecycle:true,pipeline:pipeline.clone(),
@@ -702,6 +704,7 @@ mod tests {
     async fn screen_business_rejection_or_missing_port_never_opens_data_socket_or_marks_setup() {
         for reject_business in [true, false] {
             let mut f=Fixture::new(Modes::initial()).await;
+            let media = f.session.control.udp_media.subscribe();
             let session=f.session.clone();
             let task=tokio::spawn(async move { session.open().await.err().unwrap() });
             let setup=read(&mut f.car).await;
@@ -719,6 +722,7 @@ mod tests {
             let error=task.await.unwrap();
             assert!(error.contains(if reject_business { "business rejection" } else { "dataPort" }));
             assert!(!f.session.params.pipeline.lock().screen_setup_accepted);
+            assert!(media.borrow().idle());
             assert!(tokio::time::timeout(Duration::from_millis(60),f.video.accept()).await.is_err());
         }
     }
@@ -831,15 +835,18 @@ mod tests {
     async fn first_grant_setup_then_borrow_closes_video_and_return_uses_fresh_crypto() {
         let mut modes=Modes::initial();borrow(&mut modes,100);
         let mut f=Fixture::new(modes).await;
+        let media = f.session.control.udp_media.subscribe();
         let task=f.reconcile();f.modes_reply(2).await;task.await.unwrap().unwrap();
         f.update(|m|m.request_ui());let task=f.reconcile();f.modes_reply(1).await;
         let setup=read(&mut f.car).await;let (mut peer,first)=f.setup_reply(&setup).await;task.await.unwrap().unwrap();
         f.video_frame(&mut peer,first).await;
+        assert!(!media.borrow().idle());
         // A repeated click with the same grant sends feedback, without destructive teardown.
         f.update(|m|m.request_ui());let task=f.reconcile();f.modes_reply(1).await;task.await.unwrap().unwrap();
         assert_eq!(f.session.params.pipeline.lock().screen_rebuilds,0);
         f.update(|m|borrow(m,100));let task=f.reconcile();f.modes_reply(2).await;
         f.teardown_reply().await;task.await.unwrap().unwrap();
+        assert!(media.borrow().idle());
         let mut byte=[0];assert_eq!(tokio::time::timeout(Duration::from_secs(1),peer.read(&mut byte)).await.unwrap().unwrap(),0);
         assert!(f.session.params.pipeline.lock().video_tcp.is_none());
         let streams = f.session.resource_teardown(Some(100)).await;

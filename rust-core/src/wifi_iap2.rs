@@ -163,7 +163,7 @@ async fn run_control_ingress(
 pub fn spawn_control_ingress(
     inbound: mpsc::UnboundedReceiver<crate::rtsp::RtspMessage>, id: u64, stop: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    crate::callback_context::spawn(async move {
         let reason=run_control_ingress(inbound,id,stop,||is_active(id),|bytes|{receive_bytes(id,bytes,"control");}).await;
         if reason=="closed" { mark_ready(id,false); }
         crate::emit_log(&format!("WIFI-IAP#{id}: control ingress ended={reason}"));
@@ -201,7 +201,7 @@ impl WifiIap2 {
         let (tx, mut rx) = mpsc::channel::<Outbound>(64);
         *OUTPUT.lock() = Some((id, tx));
         *HANDOFF.lock() = Handoff::new_session(id);
-        let task = tokio::spawn(async move {
+        let task = crate::callback_context::spawn(async move {
             let mut sent = 0u64;
             let mut last_written = String::from("none");
             loop {
@@ -372,7 +372,7 @@ mod tests {
         assert!(!wait_ready_barrier(||false,||true,stop.clone(),budget).await);
         stop.notify_one();assert!(!wait_ready_barrier(||true,||true,stop.clone(),budget).await);
         let flag=Arc::new(AtomicBool::new(false));let update=flag.clone();
-        let worker=tokio::spawn(async move {tokio::time::sleep(Duration::from_millis(30)).await;update.store(true,Ordering::Release);});
+        let worker=crate::callback_context::spawn(async move {tokio::time::sleep(Duration::from_millis(30)).await;update.store(true,Ordering::Release);});
         assert!(wait_ready_barrier(||true,||flag.load(Ordering::Acquire),stop,Duration::from_secs(1)).await);
         worker.await.unwrap();
     }

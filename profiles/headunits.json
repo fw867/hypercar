@@ -28,7 +28,6 @@
         17000
       ],
       "pairingHint": "首次要在 iDrive 里把这个设备选成 CarPlay 手机（车机会弹确认）",
-      "allowProactiveWifiSession": true,
       "advertiseOnCurrentWifi": false,
       "requireFreshCtrlInvite": false
     },
@@ -44,7 +43,6 @@
       "dropProfilesBeforeIap2": false,
       "allowOutboundIap2": false,
       "requireAirplayActivation": true,
-      "allowProactiveWifiSession": false,
       "useScreenResourceLifecycle": true,
       "nbtAudioFirst": true,
       "pairingHint": "适用于 NBT Evo，先在车机确认 Apple CarPlay 授权；MGU 和 IDC23 请使用各自配置。"
@@ -65,7 +63,6 @@
       "abortWhenCarPlayWindowClosed": false,
       "preferMdnsAirplay": true,
       "requireAirplayActivation": true,
-      "allowProactiveWifiSession": false,
       "advertiseOnCurrentWifi": false,
       "requireFreshCtrlInvite": false,
       "useScreenResourceLifecycle": true,
@@ -95,7 +92,6 @@
         7000
       ],
       "pairingHint": "首次要在车机里把本机选成 CarPlay 手机（部分车机会弹确认）",
-      "allowProactiveWifiSession": true,
       "advertiseOnCurrentWifi": false,
       "requireFreshCtrlInvite": false
     },
@@ -116,7 +112,6 @@
       ],
       "touchDisplay": "2732x794",
       "pairingHint": "先在 WinPlay 点「开始接收」，再让手机连（它不监听时连不上）",
-      "allowProactiveWifiSession": true,
       "advertiseOnCurrentWifi": false,
       "requireFreshCtrlInvite": false
     },
@@ -137,7 +132,6 @@
         17000
       ],
       "pairingHint": "在 MMI 中选择 Apple CarPlay 并确认手机；接受蓝牙与 Wi-Fi 提示，等待车机完成邀请",
-      "allowProactiveWifiSession": true,
       "advertiseOnCurrentWifi": false,
       "requireFreshCtrlInvite": false,
       "sendCarPlayAvailability": true,
@@ -160,7 +154,6 @@
       "abortWhenCarPlayWindowClosed": false,
       "preferMdnsAirplay": true,
       "requireAirplayActivation": true,
-      "allowProactiveWifiSession": false,
       "advertiseOnCurrentWifi": true,
       "requireFreshCtrlInvite": true,
       "fallbackAirplayPorts": [
@@ -187,7 +180,6 @@
       "abortWhenCarPlayWindowClosed": false,
       "preferMdnsAirplay": true,
       "requireAirplayActivation": true,
-      "allowProactiveWifiSession": false,
       "advertiseOnCurrentWifi": false,
       "requireFreshCtrlInvite": false,
       "useScreenResourceLifecycle": true,

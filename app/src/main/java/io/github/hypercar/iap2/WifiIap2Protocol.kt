@@ -18,7 +18,7 @@ internal class WifiIap2Protocol(
     private val engine = Iap2LinkEngine(reliableTransport = true, declaredWindow = 32)
     private var parser = Iap2Csm.Parser()
     private val media = Iap2MediaSession(log, onMediaKey)
-    private val nowPlaying = Iap2NowPlayingSession(nowPlayingProvider, log)
+    private val nowPlaying = Iap2NowPlayingSession(nowPlayingProvider, log, initializeArtworkWithEmptyFile = true)
     private val vehicle = Iap2VehicleStatusSession(onVehicleStatus, log)
     private var identification: Iap2Messages.Identification? = null
     private var navigation = RouteGuidanceSession(log)
@@ -35,8 +35,11 @@ internal class WifiIap2Protocol(
     private var lastTx = "none"
     private var lastReceivedMessage: Int? = null
     private var lastQueuedMessage: Int? = null
+    private var receivedNowPlayingStarts = 0L
+    private var queuedNowPlayingUpdates = 0L
     val diagnosticSummary: String get() = "phase=$diagnosticPhase pending=${engine.queuedControlPackets} outstanding=${engine.outstandingPackets} " +
         "rx_frames=$receivedFrames tx_frames=$sentFrames $lastRx $lastTx " +
+        "${media.diagnosticSummary} rx_5000=$receivedNowPlayingStarts queued_5001=$queuedNowPlayingUpdates " +
         "last_rx_csm=${lastReceivedMessage?.let { "0x${it.toString(16)}" } ?: "none"} " +
         "last_queued_csm=${lastQueuedMessage?.let { "0x${it.toString(16)}" } ?: "none"}; link output/queue only, RTSP acceptance separate"
     private var now = 0L
@@ -76,7 +79,7 @@ internal class WifiIap2Protocol(
         engine.onFrameReceived = { ctl, seq, ack, session, size -> trace("RX", ctl, seq, ack, session, size) }
         engine.onFrameSent = { ctl, seq, ack, session, size -> trace("TX", ctl, seq, ack, session, size) }
         engine.onPeerSynchronizationAdopted = { sync ->
-            log("LINK sessions=${sync.sessions.joinToString { "${it.id}/${it.kind}/${it.version}" }} peerWindow=${sync.maxOutgoing} localWindow=32 maxLength=${sync.maxLength} retry=${sync.retransmissionTimeoutMillis} maxRetries=${sync.maxRetransmissions} ack=${sync.acknowledgementTimeoutMillis}")
+            log("LINK sessions=${sync.sessions.joinToString { "${it.id}/${it.kind}/${it.version}" }} peerWindow=${sync.maxOutgoing} localWindow=32 maxLength=${sync.maxLength} retry=${sync.retransmissionTimeoutMillis} maxRetries=${sync.maxRetransmissions} ack=${sync.acknowledgementTimeoutMillis} maxCumAck=${sync.maxAcknowledgements}")
         }
     }
 
@@ -124,7 +127,8 @@ internal class WifiIap2Protocol(
             nextWaitLog = now + 2_000
         }
         if (started && phase != "READY" && now > deadline) fail("phase=$phase timeout")
-        if (phase == "READY" && !failed && engine.queuedControlPackets == 0 && engine.outstandingPackets < 8) {
+        if (phase == "READY" && !failed && engine.queuedControlPackets == 0 &&
+            (engine.zeroRetryAndAckMode || engine.outstandingPackets < 8)) {
             subscriptions.drain().forEach { send(it.messageId, it.body) }
             navigation.updates(now, navigationEnabled(), navigationCue()).forEach { send(it.messageId, it.body) }
             val limit = (engine.peerSynchronization?.maxLength ?: 0xffff) - Iap2LinkEngine.HEADER_BYTES - 1
@@ -143,6 +147,7 @@ internal class WifiIap2Protocol(
         if (failed) return
         val id = frame.messageId
         lastReceivedMessage = id
+        if (id == Iap2MessageIds.START_NOW_PLAYING_UPDATES) receivedNowPlayingStarts++
         if (id == Iap2MessageIds.VEHICLE_STATUS_UPDATE) {
             if (phase == "READY") vehicle.receive(frame.body)
             return
@@ -222,6 +227,9 @@ internal class WifiIap2Protocol(
     private fun greetings() {
         val zone = TimeZone.getDefault()
         send(0x4e0c, Iap2Csm.string(0, Iap2DeviceUuid.value))
+        // iPhone requests configuration again on its authenticated AirPlay endpoint.
+        // One request per authentication; 5703 stays ACK-only and never triggers Wi-Fi joining.
+        send(0x5702)
         identification?.let(::subscribeVehicle)
         send(0x4e0a, Iap2Csm.string(0, "zh"))
         send(0x4e09, Iap2Csm.string(0, deviceName))
@@ -247,6 +255,7 @@ internal class WifiIap2Protocol(
         }
         if (!failed) {
             lastQueuedMessage = id
+            if (id == Iap2MessageIds.NOW_PLAYING_UPDATE) queuedNowPlayingUpdates++
             log("QUEUED phase=$phase id=0x${id.toString(16)} body=${body.size}B pending=${engine.queuedControlPackets} outstanding=${engine.outstandingPackets}")
         }
     }

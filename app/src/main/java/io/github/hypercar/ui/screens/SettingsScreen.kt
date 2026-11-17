@@ -103,7 +103,6 @@ private val FpsOptions = listOf(30, 60)
 private enum class SettingsPage(val title: String) {
     Main("设置"),
     Car("我的车机"),
-    Connection("连接与唤醒"),
     Display("画面与声音"),
     Permissions("权限与后台"),
     Advanced("高级设置"),
@@ -144,9 +143,7 @@ fun SettingsScreen(
                         Text("选择要调整的功能", color = TextSecondary,
                             style = MaterialTheme.typography.bodySmall)
                         GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)) {
-                            SettingsMenuItem("我的车机", "车机型号、目标设备与增强发现") { open(SettingsPage.Car) }
-                            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-                            SettingsMenuItem("连接与唤醒", "上车自动连接与连接恢复") { open(SettingsPage.Connection) }
+                            SettingsMenuItem("我的车机", "车机型号、目标设备与上车自动连接") { open(SettingsPage.Car) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
                             SettingsMenuItem("画面与声音", "画面来源、音频格式与显示参数") { open(SettingsPage.Display) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
@@ -158,15 +155,16 @@ fun SettingsScreen(
                         }
                     }
                     SettingsPage.Car -> {
+                        AutoConnectSection(startup)
                         HeadUnitSection(connected = linkConnected)
                         TargetCarSection()
                     }
-                    SettingsPage.Connection -> BehaviorSection(startup)
                     SettingsPage.Display -> {
                         CarSourceSection(startup, onRefreshSetup, connected = linkConnected,
                             title = "画面来源", compact = true)
                         AudioSection()
                         ResolutionSection()
+                        ScreenResourceSection()
                     }
                     SettingsPage.Permissions -> {
                         PermissionSettingsSection()
@@ -1254,24 +1252,10 @@ private fun FpsSegment(fps: Int, onFpsChanged: (Int) -> Unit) {
 /* ---------- 开关组 ---------- */
 
 @Composable
-private fun BehaviorSection(startup: io.github.hypercar.session.StartupReadiness) {
+private fun AutoConnectSection(startup: io.github.hypercar.session.StartupReadiness) {
     val context = LocalContext.current
     var autoConnect by remember(io.github.hypercar.settings.SettingsRevision.value) { mutableStateOf(SettingsStore.autoConnect) }
-    var proactiveWifi by remember(io.github.hypercar.settings.SettingsRevision.value) { mutableStateOf(SettingsStore.proactiveWifiSession) }
-    var proactiveWifiReconnect by remember(io.github.hypercar.settings.SettingsRevision.value) { mutableStateOf(SettingsStore.proactiveWifiReconnect) }
-    val allowsProactiveWifi = remember(io.github.hypercar.settings.SettingsRevision.value) {
-        io.github.hypercar.headunit.HeadUnitActivationPolicy.permitsProactive(io.github.hypercar.headunit.HeadUnitProfiles.current())
-    }
-    var resourceLifecycle by rememberSaveable { mutableStateOf(SettingsStore.screenResourceLifecycle) }
-    val profileLifecycle = remember(io.github.hypercar.settings.SettingsRevision.value) {
-        io.github.hypercar.headunit.HeadUnitProfiles.current().useScreenResourceLifecycle
-    }
-
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        SectionLabel(text = "自动连接与恢复")
-        GlassPanel(
-            contentPadding = PaddingValues(horizontal = 20.dp, vertical = 6.dp),
-        ) {
+    GlassPanel(contentPadding = PaddingValues(horizontal = 20.dp, vertical = 6.dp)) {
             SwitchRow(
                 title = "上车自动连接",
                 subtitle = if (startup.automaticReady) "启动条件已满足，可开启待机监听与自动重连"
@@ -1283,45 +1267,27 @@ private fun BehaviorSection(startup: io.github.hypercar.session.StartupReadiness
                     autoConnect = SettingsStore.autoConnect
                 },
             )
-            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+    }
+}
+
+@Composable
+private fun ScreenResourceSection() {
+    var resourceLifecycle by rememberSaveable { mutableStateOf(SettingsStore.screenResourceLifecycle) }
+    val profileLifecycle = remember(io.github.hypercar.settings.SettingsRevision.value) {
+        io.github.hypercar.headunit.HeadUnitProfiles.current().useScreenResourceLifecycle
+    }
+    if (!profileLifecycle) {
+        GlassPanel(contentPadding = PaddingValues(horizontal = 20.dp, vertical = 6.dp)) {
             SwitchRow(
-                title = "已配对车机 Wi-Fi 主动连接（实验）",
-                subtitle = if (allowsProactiveWifi) "接入已配对车机 Wi-Fi 并稳定 10 秒后尝试连接，不要求本次先连接成功；优先响应车机邀请"
-                    else "当前车机配置要求车机发起连接，此开关不绕过该限制",
-                checked = proactiveWifiReconnect,
-                enabled = allowsProactiveWifi,
+                title = "画面资源联动（实验）",
+                subtitle = "取得主屏后建立视频通道，车机收回主屏时释放视频并保留音频，下次连接生效",
+                checked = resourceLifecycle,
                 onCheckedChange = {
-                    proactiveWifiReconnect = it
-                    SettingsStore.proactiveWifiReconnect = it
-                    HyperCarRepo.onProactiveWifiOptionsChanged()
-                    HyperCarRepo.log("WIFI-ACTIVE: 已配对网络主动连接开关=${if (it) "开" else "关"}；仍遵守手动停止暂停和车型要求")
+                    SettingsStore.screenResourceLifecycle = it
+                    resourceLifecycle = SettingsStore.screenResourceLifecycle
+                    HyperCarRepo.log("SCREEN-LIFECYCLE: 实验开关=${if (it) "开" else "关"}，下次连接生效")
                 },
             )
-            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-            SwitchRow(
-                title = "车机 Wi-Fi 中断恢复（实验）",
-                subtitle = "正常连接意外中断后，网络可用即首次恢复；失败退避，2 分钟内最多 5 次。不授权首次主动连接，与上方开关独立",
-                checked = proactiveWifi,
-                onCheckedChange = {
-                    proactiveWifi = it
-                    SettingsStore.proactiveWifiSession = it
-                    HyperCarRepo.onProactiveWifiOptionsChanged()
-                    HyperCarRepo.log("WIFI-ACTIVE: 中断恢复开关=${if (it) "开" else "关"}；已配对网络主动连接由独立开关控制")
-                },
-            )
-            if (!profileLifecycle) {
-                HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-                SwitchRow(
-                    title = "画面资源联动（实验）",
-                    subtitle = "取得主屏后建立视频通道，车机收回主屏时释放视频并保留音频，下次连接生效",
-                    checked = resourceLifecycle,
-                    onCheckedChange = {
-                        SettingsStore.screenResourceLifecycle = it
-                        resourceLifecycle = SettingsStore.screenResourceLifecycle
-                        HyperCarRepo.log("SCREEN-LIFECYCLE: 实验开关=${if (it) "开" else "关"}，下次连接生效")
-                    },
-                )
-            }
         }
     }
 }

@@ -10,18 +10,43 @@ class Iap2DetectionRestartTest {
         h[8] = (-h.sumOf { it.toInt() and 255 }).toByte()
         return if (body.isEmpty()) h else h + body + (-body.sumOf { it.toInt() and 255 }).toByte()
     }
-    private fun syn(session: Int = 10, seq: Int = 40) = packet(0x80, seq, 0, body =
-        Iap2LinkEngine.SynchronizationPayload(4, 65535, 4000, 1000, 4, 1,
+    private fun syn(session: Int = 10, seq: Int = 40, zeroRetryAndAck: Boolean = false) = packet(0x80, seq, 0, body =
+        Iap2LinkEngine.SynchronizationPayload(4, 65535,
+            if (zeroRetryAndAck) 0 else 4000, if (zeroRetryAndAck) 0 else 1000,
+            if (zeroRetryAndAck) 0 else 4, if (zeroRetryAndAck) 0 else 1,
             listOf(Iap2LinkEngine.SessionDescriptor(session, 0, 2))).encode())
-    private fun normal(reliable: Boolean = false): Iap2LinkEngine {
+    private fun normal(reliable: Boolean = false, zeroRetryAndAck: Boolean = false): Iap2LinkEngine {
         val link = Iap2LinkEngine(reliableTransport = reliable)
         link.start(0, passive = true)
-        link.feed(syn(), 1)
+        link.feed(syn(zeroRetryAndAck = zeroRetryAndAck), 1)
         val answer = link.takeOutput()
         link.feed(packet(0x40, 40, answer[5].toInt() and 255), 2)
         link.takeOutput()
         assertEquals(Iap2LinkEngine.State.NORMAL, link.state)
         return link
+    }
+
+    @Test fun zeroAckSuppressionIsWifiOnlyAndNewSynReplacesThePolicy() {
+        for (reliable in listOf(false, true)) {
+            val link = normal(reliable, zeroRetryAndAck = true)
+            val data = Iap2Csm.encode(0x1234)
+            link.feed(packet(0x40, 41, 100, 10, data), 3)
+            assertArrayEquals(data, (link.pollEvent() as Iap2LinkEngine.Event.Control).bytes)
+            assertEquals(reliable, link.takeOutput().isEmpty())
+
+            // Renegotiate on the same transport. The preceding zero-ACK policy must expire.
+            link.feed(Iap2LinkEngine.MARKER + syn(seq = 90), 4)
+            val output = link.takeOutput()
+            assertArrayEquals(Iap2LinkEngine.MARKER, output.copyOfRange(0, 6))
+            val sync = output.copyOfRange(6, output.size)
+            link.feed(packet(0x40, 90, sync[5].toInt() and 255), 5)
+            link.takeOutput()
+            link.feed(packet(0x40, 91, sync[5].toInt() and 255, 10, data), 6)
+            assertArrayEquals(data, (link.pollEvent() as Iap2LinkEngine.Event.Control).bytes)
+            val ack = link.takeOutput()
+            assertEquals(9, ack.size)
+            assertEquals(91, ack[6].toInt() and 255)
+        }
     }
 
     @Test fun fragmentedDetectRestartsBluetoothAndWifiWithoutOldRetries() {

@@ -4,6 +4,166 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class Iap2NowPlayingTest {
+    @Test fun bothEmptyHandshakeTimeoutsReleaseRealCoverAndIgnoreLateOldReplies() {
+        for (started in listOf(false,true)) {
+            var state=Iap2NowPlaying(artwork=byteArrayOf(7,8))
+            val session=initializing { state }
+            session.poll(0,2048,true)
+            if (started) {
+                session.fileResponse(byteArrayOf(0x80.toByte(),1),1)
+                assertArrayEquals(byteArrayOf(0x80.toByte(),0xc0.toByte()),files(session.poll(2,2048,true)).single())
+            }
+            val expired=session.poll(5002,2048,true)
+            assertArrayEquals(byteArrayOf(0x80.toByte(),2),files(expired).first())
+            assertEquals(0x81,artId(controls(expired).single().body))
+            for (command in listOf(1,5)) session.fileResponse(byteArrayOf(0x80.toByte(),command.toByte()),5003)
+            assertTrue(session.hasFileWork)
+            assertTrue(session.poll(5004,2048,true).isEmpty())
+            session.fileResponse(byteArrayOf(0x81.toByte(),1),5005)
+            assertArrayEquals(byteArrayOf(0x81.toByte(),0xc0.toByte(),7,8),files(session.poll(5006,2048,true)).single())
+            session.fileResponse(byteArrayOf(0x81.toByte(),5),5007)
+            assertFalse(session.hasFileWork)
+            state=state.copy(artwork=byteArrayOf(9))
+            assertEquals(0x82,artId(controls(session.poll(5200,2048,true)).single().body))
+        }
+    }
+
+    @Test fun stopBeforeOrAfterEmptyStartDoesNotRestartInitializationWithinSameAuthentication() {
+        for (started in listOf(false,true)) {
+            val session=initializing { Iap2NowPlaying(artwork=byteArrayOf(4)) }
+            session.poll(0,2048,true)
+            if (started) {
+                session.fileResponse(byteArrayOf(0x80.toByte(),1),1)
+                session.poll(2,2048,true)
+            }
+            session.handle(frame(0x5002))
+            assertArrayEquals(byteArrayOf(0x80.toByte(),2),files(session.poll(3,2048,true)).single())
+            for (command in listOf(1,5)) session.fileResponse(byteArrayOf(0x80.toByte(),command.toByte()),4)
+            assertTrue(session.poll(6000,2048,true).isEmpty())
+            session.handle(frame(0x5000))
+            val out=session.poll(6001,2048,true)
+            assertArrayEquals(byteArrayOf(0x81.toByte(),4,0,0,0,0,0,0,0,1,0,2),files(out).single())
+        }
+    }
+
+    @Test fun reauthenticationCreatesOneNewEmptyTransactionWithDistinctId() {
+        val session=initializing()
+        session.poll(0,2048,true)
+        session.reset()
+        for (command in listOf(1,5)) session.fileResponse(byteArrayOf(0x80.toByte(),command.toByte()),1)
+        assertTrue(session.poll(2,2048,true).isEmpty())
+        session.authenticated()
+        assertTrue(session.poll(3,2048,true).isEmpty()) // A fresh subscription is still required.
+        session.handle(frame(0x5000))
+        assertEquals(0x81,artId(controls(session.poll(4,2048,true)).single().body))
+        for (command in listOf(1,5)) session.fileResponse(byteArrayOf(0x80.toByte(),command.toByte()),5)
+        assertTrue(session.poll(6,2048,true).isEmpty())
+        assertTrue(session.hasFileWork)
+        session.handle(frame(0x5000))
+        assertTrue(files(session.poll(7,2048,true)).isEmpty())
+        session.fileResponse(byteArrayOf(0x81.toByte(),1),8)
+        assertArrayEquals(byteArrayOf(0x81.toByte(),0xc0.toByte()),files(session.poll(9,2048,true)).single())
+    }
+
+    private fun initializing(provider: () -> Iap2NowPlaying = { Iap2NowPlaying() }) =
+        Iap2NowPlayingSession(provider, initializeArtworkWithEmptyFile = true).also {
+            it.authenticated(); it.handle(frame(0x5000))
+        }
+
+    @Test fun emptyInitializationKeepsMetadataLiveAndThenTransfersLatestRealArtwork() {
+        var state = Iap2NowPlaying(title="first", status=1, artwork=byteArrayOf(1))
+        val session = initializing { state }
+        val first = session.poll(0,2048,true)
+        assertTrue(first.first() is Iap2NowPlayingSession.Output.Control)
+        assertArrayEquals(state.body(0x80), controls(first).single().body) // Other fields unchanged.
+        assertArrayEquals(byteArrayOf(0x80.toByte(),4,0,0,0,0,0,0,0,0,0,2),files(first).single())
+        state = state.copy(title="latest", artwork=byteArrayOf(2,3))
+        val changed = session.poll(100,2048,true)
+        assertArrayEquals(state.body(0x80), controls(changed).single().body)
+        assertTrue(files(changed).isEmpty())
+        session.handle(frame(0x5000)) // Repeated subscription cannot restart the empty transaction.
+        assertTrue(files(session.poll(101,2048,true)).isEmpty())
+        session.fileResponse(byteArrayOf(0x81.toByte(),1),102)
+        assertTrue(files(session.poll(103,2048,true)).isEmpty())
+        session.fileResponse(byteArrayOf(0x80.toByte(),1),104)
+        assertArrayEquals(byteArrayOf(0x80.toByte(),0xc0.toByte()),files(session.poll(105,2048,true)).single())
+        session.fileResponse(byteArrayOf(0x80.toByte(),1),106)
+        assertTrue(files(session.poll(107,2048,true)).isEmpty())
+        session.fileResponse(byteArrayOf(0x80.toByte(),5),108)
+        val real = session.poll(201,2048,true)
+        assertEquals(0x81,artId(controls(real).single().body))
+        assertArrayEquals(byteArrayOf(0x81.toByte(),4,0,0,0,0,0,0,0,2,0,2),files(real).single())
+        session.fileResponse(byteArrayOf(0x80.toByte(),5),202)
+        assertTrue(session.hasFileWork)
+        session.fileResponse(byteArrayOf(0x81.toByte(),1),203)
+        assertArrayEquals(byteArrayOf(0x81.toByte(),0xc0.toByte(),2,3),files(session.poll(204,2048,true)).single())
+    }
+
+    @Test fun emptyInitializationCompletesWithoutAnImageAndDoesNotRepeat() {
+        var state = Iap2NowPlaying()
+        val session = initializing { state }
+        session.poll(0,2048,true)
+        session.fileResponse(byteArrayOf(0x80.toByte(),1),1)
+        assertArrayEquals(byteArrayOf(0x80.toByte(),0xc0.toByte()), files(session.poll(2,2048,true)).single())
+        session.fileResponse(byteArrayOf(0x80.toByte(),5),3)
+        assertFalse(session.hasFileWork)
+        assertTrue(session.poll(6000,2048,true).isEmpty())
+        state = state.copy(artwork=byteArrayOf(7))
+        val real = session.poll(6100,2048,true)
+        assertEquals(0x81,artId(controls(real).single().body))
+        assertEquals(1,files(real).single()[9].toInt())
+    }
+
+    @Test fun emptyInitializationRequiresAuthenticationArtworkSubscriptionAndFileCapacity() {
+        val session = Iap2NowPlayingSession(initializeArtworkWithEmptyFile=true)
+        session.handle(frame(0x5000))
+        assertTrue(session.poll(0,2048,true).isEmpty())
+        session.authenticated()
+        for ((time,capacity,supported) in listOf(Triple(1L,2048,false),Triple(101L,11,true))) {
+            val out=session.poll(time,capacity,supported)
+            assertTrue(files(out).isEmpty())
+            controls(out).forEach { assertNull(artId(it.body)) }
+        }
+        session.handle(Iap2Csm.Frame(0x5000,Iap2Csm.group(0,Iap2Csm.param(1,byteArrayOf()))))
+        assertTrue(files(session.poll(202,2048,true)).isEmpty())
+        session.handle(Iap2Csm.Frame(0x5000,Iap2Csm.group(0,Iap2Csm.param(26,byteArrayOf()))))
+        val out=session.poll(203,2048,true)
+        assertArrayEquals(Iap2Csm.group(0,Iap2Csm.u8(26,0x80)),controls(out).single().body)
+        assertEquals(0,files(out).single()[9].toInt())
+    }
+
+    @Test fun emptyInitializationTimeoutOrRejectionDoesNotBlockRealArtworkOrRetryEmpty() {
+        for (rejection in listOf(false,true)) {
+            val session=initializing { Iap2NowPlaying(title="keep",artwork=byteArrayOf(4)) }
+            session.poll(0,2048,true)
+            if (rejection) session.fileResponse(byteArrayOf(0x80.toByte(),6),1)
+            val out=session.poll(5000,2048,true)
+            assertEquals(0x81,artId(controls(out).single().body))
+            val packets=files(out)
+            if (!rejection) assertArrayEquals(byteArrayOf(0x80.toByte(),2),packets.first())
+            assertArrayEquals(byteArrayOf(0x81.toByte(),4,0,0,0,0,0,0,0,1,0,2),packets.last())
+            session.fileResponse(byteArrayOf(0x80.toByte(),1),5001)
+            assertTrue(files(session.poll(5002,2048,true)).isEmpty())
+        }
+    }
+
+    @Test fun stoppingCancelsEmptyInitializationAndNewAuthenticationUsesFreshId() {
+        val session=initializing()
+        session.poll(0,2048,true)
+        session.handle(frame(0x5002))
+        assertArrayEquals(byteArrayOf(0x80.toByte(),2),files(session.poll(1,2048,true)).single())
+        session.fileResponse(byteArrayOf(0x80.toByte(),1),2)
+        assertTrue(session.poll(3,2048,true).isEmpty())
+        session.handle(frame(0x5000))
+        assertTrue(files(session.poll(4,2048,true)).isEmpty()) // Only once per authenticated link.
+        session.reset();session.authenticated();session.handle(frame(0x5000))
+        val fresh=session.poll(5,2048,true)
+        assertEquals(0x81,artId(controls(fresh).single().body))
+        session.fileResponse(byteArrayOf(0x80.toByte(),1),6)
+        assertTrue(files(session.poll(7,2048,true)).isEmpty())
+        assertTrue(session.hasFileWork)
+    }
+
     @Test fun bmwExplicitSubscriptionUsesPlayerMetadataAndFixedPointSpeed() {
         val details = io.github.hypercar.carui.MediaPlaybackDetails(itemId = 0x0102030405060708,
             trackNumber = 4, trackCount = 15, discNumber = 2, genre = "Jazz", composer = "A",
@@ -15,7 +175,8 @@ class Iap2NowPlayingTest {
             group(1, 2, 3, 12) + group(2, 0, 1, 6)))
         val expected = Iap2Csm.group(0, Iap2Csm.u64(0, 0x0102030405060708), Iap2Csm.u16(7, 4),
             Iap2Csm.u16(8, 15), Iap2Csm.u16(9, 2), Iap2Csm.string(16, "Jazz"), Iap2Csm.string(18, "A"),
-            Iap2Csm.u8(21, 0), Iap2Csm.u8(22, 0), Iap2Csm.u8(23, 1)) +
+            Iap2Csm.u8(21, 0), Iap2Csm.u8(22, 0), Iap2Csm.u8(23, 1),
+            Iap2Csm.u16(10, 0), Iap2Csm.u8(24, 0), Iap2Csm.u16(27, 0)) +
             Iap2Csm.group(1, Iap2Csm.u32(2, 3), Iap2Csm.u32(3, 8), Iap2Csm.u16(12, 125))
         assertArrayEquals(expected, controls(session.poll(0, 2048, true)).single().body)
     }
@@ -111,13 +272,13 @@ class Iap2NowPlayingTest {
         Iap2NowPlayingSession(provider).also { it.authenticated(); it.handle(frame(0x5000)) }
 
     @Test fun wireFieldsUseAlbumSixAndSingleByteArtworkIdentifier() {
-        val body = Iap2NowPlaying("歌曲", "歌手", "专辑", "播放器", 120_000, 4_000, 1).body(7)
+        val body = Iap2NowPlaying("歌曲", "歌手", "专辑", "播放器", 120_000, 4_000, 1).body(0x80)
         val groups = Iap2Csm.parseParams(body)
         val item = Iap2Csm.parseParams(groups.first { it.id == 0 }.value).associateBy { it.id }
         assertEquals("专辑", item.getValue(6).asStringOrNull())
         assertEquals("歌曲", item.getValue(1).asStringOrNull())
         assertEquals("歌手", item.getValue(12).asStringOrNull())
-        assertArrayEquals(byteArrayOf(7), item.getValue(26).value)
+        assertArrayEquals(byteArrayOf(0x80.toByte()), item.getValue(26).value)
         assertArrayEquals(byteArrayOf(0,1,0xd4.toByte(),0xc0.toByte()), item.getValue(4).value)
         val encoded = Iap2Csm.encode(Iap2MessageIds.NOW_PLAYING_UPDATE, body)
         val decoded = Iap2Csm.Parser().offer(encoded).single()
@@ -191,6 +352,7 @@ class Iap2NowPlayingTest {
         val session=subscribed { Iap2NowPlaying(artwork=data) }
         val setup=session.poll(0,512,true)
         val id=artId(controls(setup).single().body)!!
+        assertEquals(0x80, id) // Device -> accessory namespace, as in the box's 80 04 SETUP.
         assertTrue(setup.first() is Iap2NowPlayingSession.Output.Control)
         assertArrayEquals(byteArrayOf(id.toByte(),4,0,0,0,0,0,0,0x1b,0x58,0,2),files(setup).single())
         assertTrue(files(session.poll(1,512,true)).isEmpty())
@@ -254,17 +416,52 @@ class Iap2NowPlayingTest {
         val third=artId(controls(session.poll(4,2048,true)).single().body)!!
         assertNotEquals(second,third)
     }
-    @Test fun exhaustedIdentifiersDoNotReuseCachedCarArtwork() {
+    @Test fun completedArtworkIdentifiersWrapWithinDeviceNamespace() {
         var state=Iap2NowPlaying(artwork=byteArrayOf(1))
         val session=subscribed { state }
-        for (id in 1..255) {
-            state=state.copy(artwork=byteArrayOf(id.toByte()))
-            assertEquals(id,artId(controls(session.poll(id*1500L,2048,true)).single().body))
+        repeat(300) { index ->
+            val now = index * 100L
+            state=state.copy(artwork=byteArrayOf(index.toByte()))
+            val output = session.poll(now,2048,true)
+            val id = artId(controls(output).single().body)!!
+            assertEquals(0x80 + index % 128, id)
+            assertTrue(output.first() is Iap2NowPlayingSession.Output.Control)
+            assertArrayEquals(byteArrayOf(id.toByte(),4,0,0,0,0,0,0,0,1,0,2),files(output).single())
+            assertTrue(files(session.poll(now+1,2048,true)).isEmpty())
+            session.fileResponse(byteArrayOf(id.toByte(),1),now+2)
+            assertArrayEquals(byteArrayOf(id.toByte(),0xc0.toByte(),index.toByte()),
+                files(session.poll(now+3,2048,true)).single())
+            session.fileResponse(byteArrayOf(id.toByte(),5),now+4)
+            assertFalse(session.hasFileWork)
         }
-        state=state.copy(artwork=byteArrayOf(0))
-        val output=session.poll(256*1500L,2048,true)
-        assertNull(artId(controls(output).single().body))
-        assertTrue(files(output).none { it[1].toInt()==4 })
+    }
+    @Test fun wrappingAfterTrackChangesCancelsOldTransferBeforeSetupAndIgnoresItsReplies() {
+        var state=Iap2NowPlaying(artwork=byteArrayOf(1))
+        val session=subscribed { state }
+        var previous: Int? = null
+        repeat(260) { index ->
+            val now = index * 100L
+            state=state.copy(artwork=byteArrayOf(index.toByte()))
+            val output=session.poll(now,2048,true)
+            val id=artId(controls(output).single().body)!!
+            assertEquals(0x80 + index % 128,id)
+            val packets=files(output)
+            previous?.let { old ->
+                assertNotEquals(old,id)
+                assertEquals(2,packets.size)
+                assertArrayEquals(byteArrayOf(old.toByte(),2),packets.first())
+                session.fileResponse(byteArrayOf(old.toByte(),1),now+1)
+                session.fileResponse(byteArrayOf(old.toByte(),5),now+2)
+                assertTrue(files(session.poll(now+3,2048,true)).isEmpty())
+                assertTrue(session.hasFileWork)
+            }
+            assertArrayEquals(byteArrayOf(id.toByte(),4),packets.last().copyOfRange(0,2))
+            previous=id
+        }
+    }
+    @Test fun artworkBodyNeverAdvertisesAnAccessoryDirectionIdentifier() {
+        for (id in listOf(0,1,127,256)) assertNull(artId(Iap2NowPlaying().body(id)))
+        for (id in listOf(128,255)) assertEquals(id,artId(Iap2NowPlaying().body(id)))
     }
     @Test fun providerFailureIsRetriedWithoutResettingTheAuthenticatedLink() {
         var broken=true

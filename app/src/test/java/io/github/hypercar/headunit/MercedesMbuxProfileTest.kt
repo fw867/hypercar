@@ -29,8 +29,6 @@ class MercedesMbuxProfileTest {
     @Test fun realIap2EndpointIsEnoughWithoutAnUnobservedCtrlInvitation() {
         assertTrue(profile.requireAirplayActivation)
         assertFalse(profile.requireFreshCtrlInvite)
-        assertFalse(HeadUnitActivationPolicy.permitsProactive(profile))
-        assertFalse(HeadUnitActivationPolicy.needsFallbackGate(profile, false))
         assertTrue(profile.allowOutboundIap2)
         assertEquals(listOf(7000), profile.fallbackAirplayPorts)
     }

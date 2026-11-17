@@ -191,8 +191,15 @@ class Iap2LinkEngine(
 
     /** Same-transport detection restart: consumers must discard partial CSMs from the old link. */
     var onDetectionRestart: (() -> Unit)? = null
-    // Reliable Wi-Fi drains CSM responses before falling back to a bare ACK (CatPlay/box).
+    // Wi-Fi drains CSM responses before flushing a required standalone ACK.
     private var pendingReliableAck = false
+    internal val zeroRetryAndAckMode: Boolean
+        get() {
+            val peer = peerSynchronization ?: return false
+            return reliableTransport && state == State.NORMAL &&
+                peer.retransmissionTimeoutMillis == 0 && peer.acknowledgementTimeoutMillis == 0 &&
+                peer.maxRetransmissions == 0 && peer.maxAcknowledgements == 0
+        }
 
     val isDead: Boolean get() = state == State.DEAD
 
@@ -565,13 +572,11 @@ class Iap2LinkEngine(
     private fun drainSendWindow(nowMillis: Long) {
         if (state != State.NORMAL) return
         val peer = peerSynchronization
-        // The box bypasses the outstanding-frame limit on a zero-retry, zero-ACK Wi-Fi link.
-        val bypassWindow = reliableTransport && peer?.retransmissionTimeoutMillis == 0 &&
-            peer.acknowledgementTimeoutMillis == 0 && peer.maxRetransmissions == 0 && peer.maxAcknowledgements == 0
+        // Box firmware uses the same negotiated mode for the send window and standalone ACKs.
         val sendWindow = if (reliableTransport) (peer?.maxOutgoing ?: maxOutgoing).coerceIn(1, 127)
             else declaredMaxOutgoing
         while (sendBacklog.isNotEmpty()) {
-            if (!bypassWindow && lastSentAcknowledged != null && outstandingPackets >= sendWindow) return
+            if (!zeroRetryAndAckMode && lastSentAcknowledged != null && outstandingPackets >= sendWindow) return
             val packet = sendBacklog.removeFirst()
             sentSequence = nextSequence(sentSequence)
             packet.sequence = sentSequence
@@ -628,6 +633,9 @@ class Iap2LinkEngine(
     }
 
     private fun sendAcknowledgement() {
+        // xiap2 a48f8/a5ee8 skip standalone ACKs and their timer in this mode.
+        // Receive sequencing still advances, and business/file replies carry the current ACK.
+        if (zeroRetryAndAckMode) return
         if (reliableTransport) {
             pendingReliableAck = true
             return

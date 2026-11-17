@@ -211,6 +211,7 @@ pub struct RtspChannel {
     reader: tokio::task::JoinHandle<()>,
     closed: AtomicBool,
     pub(crate) nbt_recorded: tokio::sync::Mutex<bool>,
+    pub(crate) udp_media: crate::udp_keepalive::MediaActivity,
     session_uri: std::sync::OnceLock<crate::rtsp_uri::SessionUri>,
     mbux_session: MbuxSession,
     pub(crate) id9_trace: std::sync::OnceLock<String>,
@@ -263,7 +264,7 @@ impl RtspChannel {
         let trace_id = CHANNEL_IDS.fetch_add(1, Ordering::Relaxed);
         let mbux_session = Arc::new(std::sync::OnceLock::new());
 
-        let reader = tokio::spawn(reader_loop(
+        let reader = crate::callback_context::spawn(reader_loop(
             read,
             write.clone(),
             cipher.clone(),
@@ -283,6 +284,7 @@ impl RtspChannel {
             reader,
             closed: AtomicBool::new(false),
             nbt_recorded: tokio::sync::Mutex::new(false),
+            udp_media: Default::default(),
             session_uri: std::sync::OnceLock::new(),
             mbux_session,
             id9_trace: std::sync::OnceLock::new(),
@@ -890,7 +892,7 @@ mod tests {
         let client=tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (mut peer,_)=listener.accept().await.unwrap();let(r,w)=client.into_split();
         let (channel,mut inbound)=RtspChannel::spawn(r,w,None);
-        let server=tokio::spawn(async move {
+        let server=crate::callback_context::spawn(async move {
             let mut buffer=Vec::new();let mut chunk=[0;1024];
             let request=loop {
                 let n=peer.read(&mut chunk).await.unwrap();assert!(n>0);buffer.extend_from_slice(&chunk[..n]);
@@ -960,7 +962,7 @@ mod tests {
                 channel.set_session_uri(crate::rtsp_uri::SessionUri::new("fe80::1%wlan0",id).unwrap()).unwrap();
                 assert!(channel.set_session_uri(crate::rtsp_uri::SessionUri::new("192.0.2.2",999).unwrap()).is_err());
             }
-            let server=tokio::spawn(async move {
+            let server=crate::callback_context::spawn(async move {
                 let mut cipher=ControlCipher::new([2;32],[1;32]);let mut wire=vec![];let mut plain=vec![];
                 for (index,(method,path,body)) in expected.into_iter().enumerate() {
                     let request=loop {
@@ -1013,7 +1015,7 @@ mod tests {
         let (mut car, _) = listener.accept().await.unwrap();
         let (r, w) = phone.into_split();
         let (channel, _) = RtspChannel::spawn(r, w, None);
-        let peer = tokio::spawn(async move {
+        let peer = crate::callback_context::spawn(async move {
             let mut request = [0; 4096];
             assert!(car.read(&mut request).await.unwrap() > 0);
             car.write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: -1\r\n\r\n").await.unwrap();
@@ -1139,7 +1141,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let body = crate::airplay::build_screen_setup(42, "screen-id");
         let expected = body.clone();
-        let peer = tokio::spawn(async move {
+        let peer = crate::callback_context::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut buffer = Vec::new();
             let mut chunk = [0u8; 1024];
@@ -1192,7 +1194,7 @@ mod tests {
     async fn cancelled_queued_write_does_not_consume_an_encryption_nonce() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let peer = tokio::spawn(async move {
+        let peer = crate::callback_context::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut cipher = ControlCipher::new([2; 32], [1; 32]);
             let mut wire = Vec::new();
@@ -1262,7 +1264,7 @@ mod cancellation_tests {
             let (channel, mut peer) = pair().await;
             if enabled { channel.enable_mbux_session_header(); }
             let (sent, received) = oneshot::channel();
-            let responder = tokio::spawn(async move {
+            let responder = crate::callback_context::spawn(async move {
                 for (status, header, expected) in [
                     (200, "sEsSiOn: Box_1;timeout=60\r\n", None),
                     (400, "Session: rejected\r\n", Some("Box_1")),
@@ -1315,14 +1317,14 @@ mod cancellation_tests {
     async fn cancelled_response_waiter_is_removed_without_closing_healthy_channel() {
         let (channel,mut peer) = pair().await;
         let requester = channel.clone();
-        let task = tokio::spawn(async move { requester.request(
+        let task = crate::callback_context::spawn(async move { requester.request(
             "POST", "/command", &[], "application/octet-stream", &[], Duration::from_secs(3),
         ).await });
         let _ = read_request(&mut peer).await;
         task.abort(); assert!(task.await.unwrap_err().is_cancelled());
         assert!(channel.pending.lock().is_empty());
         assert!(!channel.is_closed());
-        let car = tokio::spawn(async move {
+        let car = crate::callback_context::spawn(async move {
             let request = read_request(&mut peer).await;
             peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",request.cseq().unwrap()).as_bytes()).await.unwrap();
         });

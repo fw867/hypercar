@@ -4,18 +4,12 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class HeadUnitActivationPolicyTest {
-    @Test fun volkswagenNeverBypassesItsInvitationGateWithTheGlobalWifiShortcut() {
+    @Test fun volkswagenRequiresActivationAndKeepsItsInvitationGate() {
         val vw = HeadUnitProfiles.VOLKSWAGEN
         assertTrue(vw.verified)
         assertTrue(vw.requireAirplayActivation)
         assertTrue(vw.allowOutboundIap2)
         assertFalse(vw.dropProfilesBeforeIap2)
-        assertFalse(HeadUnitActivationPolicy.permitsProactive(vw))
-        assertFalse(HeadUnitActivationPolicy.permitsProactive(vw.copy(allowProactiveWifiSession = true)))
-        assertTrue(HeadUnitActivationPolicy.permitsProactive(HeadUnitProfiles.BMW_ID85))
-        assertTrue(HeadUnitActivationPolicy.needsFallbackGate(vw, false))
-        assertFalse(HeadUnitActivationPolicy.needsFallbackGate(HeadUnitProfiles.BMW_ID85, false))
-        assertTrue(HeadUnitActivationPolicy.needsFallbackGate(HeadUnitProfiles.BMW_ID85, true))
     }
 
     @Test fun volkswagenRejectsOldMissingAndFutureInvites() {

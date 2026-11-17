@@ -58,6 +58,7 @@ impl ScreenSession {
             .map_err(|error|format!("屏幕 {error}"))?;
         let port=airplay::port_of(stream.get("dataPort"));
         if port==0 { return Err("屏幕 SETUP 没有 dataPort".into()); }
+        self.control.udp_media.set(110, true);
         crate::pipeline::activation(&self.params.pipeline, "SCREEN_SETUP");
         let cipher=match &self.shared {
             Some(shared)=>ScreenCipher::ChaCha(airplay::stream_key(shared,conn_id as u64)),

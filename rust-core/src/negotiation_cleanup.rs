@@ -19,11 +19,11 @@ impl NegotiationCleanup {
         let channel=self.channel.clone();let accepted=self.accepted;
         let event = self.event.take();
         match tokio::runtime::Handle::try_current() {
-            Ok(runtime)=>Some(runtime.spawn(async move {
+            Ok(runtime)=>Some(runtime.spawn(crate::callback_context::inherit(async move {
                 crate::emit_log(&format!("NEGOTIATION-CLOSE: accepted={accepted}; bounded session cleanup; no fabricated media streams"));
                 crate::airplay::finish_session(&channel, &[], accepted).await;
                 drop(event);
-            })),
+            }))),
             Err(_)=>{channel.close();None}
         }
     }

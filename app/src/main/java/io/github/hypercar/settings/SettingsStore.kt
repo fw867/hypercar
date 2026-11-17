@@ -20,7 +20,12 @@ object SettingsStore {
         if (prefs == null) {
             synchronized(this) {
                 if (prefs == null) {
-                    prefs = context.applicationContext.getSharedPreferences("hypercar_settings", Context.MODE_PRIVATE)
+                    prefs = context.applicationContext.getSharedPreferences("hypercar_settings", Context.MODE_PRIVATE).also {
+                        // Retired Wi-Fi experiments must not survive an upgrade as saved opt-ins.
+                        if (it.contains("proactive_wifi_reconnect") || it.contains("proactive_wifi_session")) {
+                            it.edit().remove("proactive_wifi_reconnect").remove("proactive_wifi_session").apply()
+                        }
+                    }
                 }
             }
         }
@@ -97,16 +102,6 @@ object SettingsStore {
     var autoConnect: Boolean
         get() = p().getBoolean(KEY_AUTO_CONNECT, true)
         set(v) = p().edit().putBoolean(KEY_AUTO_CONNECT, v).apply()
-
-    /** Restore the pre-recovery-only path as a separate opt-in, without changing existing installs. */
-    var proactiveWifiReconnect: Boolean
-        get() = p().getBoolean("proactive_wifi_reconnect", false)
-        set(v) = p().edit().putBoolean("proactive_wifi_reconnect", v).apply()
-
-    /** 实验：本次已正常工作的连接意外中断后，在短窗口内主动恢复。 */
-    var proactiveWifiSession: Boolean
-        get() = p().getBoolean("proactive_wifi_session", false)
-        set(v) = p().edit().putBoolean("proactive_wifi_session", v).apply()
 
     /** 实验：根据主屏使用权建立或释放视频通道。 */
     var screenResourceLifecycle: Boolean
@@ -390,6 +385,7 @@ object SettingsStore {
             append("\"device_name\":").append(org.json.JSONObject.quote(io.github.hypercar.bluetooth.LocalDeviceName.snapshot())).append(",")
             append("\"car_ip\":\"").append(esc(carIp)).append("\",")
             append("\"airplay_port\":").append(airplayPort).append(",")
+            append("\"head_unit_profile\":").append(org.json.JSONObject.quote(profile.id)).append(",")
             // CarWith 模式：视频/音频源改由本机 CarLife（CarWith）提供（2026-11-03）
             append("\"carlife_source\":").append(if (carWithSource) "true" else "false").append(",")
             append("\"mbux_screen_bootstrap\":").append(profile.mbuxScreenBootstrap).append(",")

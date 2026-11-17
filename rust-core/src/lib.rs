@@ -47,10 +47,12 @@ mod screen_resource;
 mod srp6a;
 mod tlv8;
 mod timing;
+mod udp_keepalive;
 mod wifi_iap2;
 mod auth_setup;
 mod display_layout;
 mod shutdown;
+mod callback_context;
 #[cfg(test)]
 mod wire_compat;
 
@@ -97,6 +99,9 @@ struct EngineHandle {
     touch_size: Arc<parking_lot::Mutex<(u32, u32)>>,
 }
 
+// JNI start/stop must serialize even while ENGINE is temporarily taken for shutdown.
+static ENGINE_LIFECYCLE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 static ENGINE: Lazy<parking_lot::Mutex<Option<EngineHandle>>> =
     Lazy::new(|| parking_lot::Mutex::new(None));
 
@@ -120,7 +125,7 @@ pub(crate) fn emit_pipeline(json: &str) {
 }
 
 pub(crate) fn emit_state(state: &str, detail: &str) {
-    log::info!("STATE {state}: {detail}");
+    log::info!("STATE engine={} {state}: {detail}", callback_context::current().map(|c|c.generation).unwrap_or(0));
     call_listener("onState", |env, obj| {
         let js = env.new_string(state)?;
         let jd = env.new_string(detail)?;
@@ -302,12 +307,18 @@ fn with_env<T>(
 }
 
 fn call_listener(method: &str, f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result<()>) {
+    // Task-local capture also applies to aborted futures' destructors and panic watchers.
+    if let Some(context) = callback_context::current() {
+        if let Some(global) = context.listener.as_ref() {
+            let _ = with_env(|env| f(env, global.as_obj()));
+        }
+        return;
+    }
+    // Engine state without an owner must never terminate whichever session happens to be current.
+    if method == "onState" { return; }
     let guard = LISTENER.read();
     let Some(global) = guard.as_ref() else { return };
-    // JObject 不实现 Clone；as_obj() 返回 &JObject，直接按引用传给 f。
-    let obj = global.as_obj();
-    let _ = with_env(|env| f(env, obj));
-    let _ = method;
+    let _ = with_env(|env| f(env, global.as_obj()));
 }
 
 /// Rust → Kotlin 触摸回调（action: 0=DOWN 1=UP 2=MOVE；坐标为编码画布像素）。
@@ -490,24 +501,28 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStart(
     control_fd: jint,
     socket_provider: JObject,
 ) -> jboolean {
-    // 任何 panic 都不得越过 JNI 边界：一旦越过（哪怕 panic=unwind）Rust 会 abort 整个进程，
-    // 现场只剩「进程消失 + 内存日志全丢」。这里兜住，翻译成 JNI_FALSE + 一条日志。
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        native_start_impl(env, config_json, control_fd, socket_provider)
-    }));
-    match outcome {
-        Ok(value) => value,
-        Err(payload) => {
-            let detail = payload
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "未知 panic".to_string());
-            emit_log(&format!("nativeStart 内部 panic（已兜住，进程未退出）：{detail}"));
-            emit_state("failed", "核心层启动时 panic（详见日志）");
-            JNI_FALSE
+    let _lifecycle = ENGINE_LIFECYCLE.lock();
+    let context = callback_context::Context::new(LISTENER.read().clone());
+    callback_context::sync_scope(context, || {
+        // 任何 panic 都不得越过 JNI 边界：一旦越过（哪怕 panic=unwind）Rust 会 abort 整个进程，
+        // 现场只剩「进程消失 + 内存日志全丢」。这里兜住，翻译成 JNI_FALSE + 一条日志。
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            native_start_impl(env, config_json, control_fd, socket_provider)
+        }));
+        match outcome {
+            Ok(value) => value,
+            Err(payload) => {
+                let detail = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "未知 panic".to_string());
+                emit_log(&format!("nativeStart 内部 panic（已兜住，进程未退出）：{detail}"));
+                emit_state("failed", "核心层启动时 panic（详见日志）");
+                JNI_FALSE
+            }
         }
-    }
+    })
 }
 
 fn native_start_impl(
@@ -587,7 +602,7 @@ fn native_start_impl(
     // 车机 HID 触摸 → Kotlin：airplay::handle_hid_report 只负责换算坐标与边沿，
     // 投递到这里后由独立任务回调监听器（P1 喂 Compose 首页，P2 注入 D2）。
     // 通道随引擎重建；监听器是独立 GlobalRef，不随引擎重启丢失。
-    TOKIO_RT.spawn(async move {
+    TOKIO_RT.spawn(callback_context::inherit(async move {
         while let Some(t) = touch_rx.recv().await {
             if let Some(source) = &carwith_touch_source {
                 let _ = source.send(engine::SourceEvent::CarWithTouch(t));
@@ -595,7 +610,7 @@ fn native_start_impl(
                 emit_touch(t.action, t.x, t.y);
             }
         }
-    });
+    }));
     // Self-rendered media still uses source_tx/source_rx; CarWith routes only its own input above.
     // 触摸坐标目标：手机实际编码尺寸（nativeSetVideoSize 直接更新）；
     // 与 /info 的 encoder_size 分开，避免车机显示参数覆盖后 HID 坐标被缩放错。
@@ -611,7 +626,7 @@ fn native_start_impl(
     let stop_result = shutdown.clone();
     let touch_tx_engine = touch_tx.clone();
     let key_tx_engine = key_tx.clone();
-    let engine_task = TOKIO_RT.spawn(async move {
+    let engine_task = TOKIO_RT.spawn(callback_context::inherit(async move {
         let _completion = completion;
         let result = engine::run_engine(
             cfg,
@@ -629,17 +644,17 @@ fn native_start_impl(
             emit_log(&format!("引擎退出: {e}"));
             if !stop_result.requested() { emit_state("failed", e); }
         }
-    });
+    }));
     let abort = engine_task.abort_handle();
     // panic 隔离看门狗：Cargo 已去掉 panic = "abort"，任务内 panic 由 tokio 捕获在
     // JoinHandle 里。这里把它报成「会话失败」并留日志，而不是让进程无声消失。
-    TOKIO_RT.spawn(async move {
+    TOKIO_RT.spawn(callback_context::inherit(async move {
         if let Err(join_error) = engine_task.await {
             if join_error.is_cancelled() { return; }
             emit_log(&format!("引擎任务异常退出: {join_error}"));
             emit_state("failed", "核心层内部异常（panic），请导出日志");
         }
-    });
+    }));
 
     // 发送端留在句柄里（触摸/按键通道 P1 起接给自绘 UI）
     // 发送端留在句柄里，供 nativePushVideoFrame / nativePushAudioPcm 投喂数据
@@ -662,28 +677,29 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStop(
     _env: JNIEnv,
     _class: JClass,
 ) {
+    let _lifecycle = ENGINE_LIFECYCLE.lock();
     stop_engine(false);
 }
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStopGracefully(
     _env: JNIEnv, _class: JClass,
-) -> jboolean { if stop_engine(true) { JNI_TRUE } else { JNI_FALSE } }
+) -> jboolean { let _lifecycle = ENGINE_LIFECYCLE.lock(); if stop_engine(true) { JNI_TRUE } else { JNI_FALSE } }
 
 fn stop_engine(graceful: bool) -> bool {
-    let previous = ENGINE.lock().take(); // 等待时不能持有全局引擎锁。
-    let Some(handle) = previous else { return true };
-    handle.shutdown.request(graceful);
-    // Auxiliary audio can take 4 s, followed by media task cleanup and bounded RTSP releases.
-    let budget_ms = if graceful { 7_000 } else { 2_000 };
-    let done = handle.shutdown.wait_done(std::time::Duration::from_millis(budget_ms));
-    if !done {
-        emit_log("SESSION-CLOSE: 旧引擎停止超时，强制取消");
-        handle.abort.abort();
-    }
-    let done = done || handle.shutdown.wait_done(std::time::Duration::from_millis(300));
-    emit_log(&format!("SESSION-CLOSE: 引擎清理 completed={done} graceful={graceful}"));
-    done
+    shutdown::stop_retaining(&ENGINE, |handle| {
+        handle.shutdown.request(graceful);
+        // Auxiliary audio can take 4 s, followed by media task cleanup and bounded RTSP releases.
+        let budget_ms = if graceful { 7_000 } else { 2_000 };
+        let done = handle.shutdown.wait_done(std::time::Duration::from_millis(budget_ms));
+        if !done {
+            emit_log("SESSION-CLOSE: 旧引擎停止超时，强制取消");
+            handle.abort.abort();
+        }
+        let done = done || handle.shutdown.wait_done(std::time::Duration::from_millis(300));
+        emit_log(&format!("SESSION-CLOSE: 引擎清理 completed={done} retained={} graceful={graceful}", !done));
+        done
+    })
 }
 
 /// 投喂一帧 H.264（Annex B，来自本机 MediaCodec 的编码输出）。

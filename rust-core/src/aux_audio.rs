@@ -79,7 +79,7 @@ impl Controller {
         let session=Arc::new(session);let stop=Arc::new(Stop::default());
         let allocated=Arc::new([AtomicBool::new(false),AtomicBool::new(false)]);
         let tasks=[Kind::Speech,Kind::Navigation].into_iter().map(|kind| {
-            tokio::spawn(run_lane(kind,session.clone(),input.clone(),commands.clone(),fallback.clone(),stop.clone(),allocated.clone()))
+            crate::callback_context::spawn(run_lane(kind,session.clone(),input.clone(),commands.clone(),fallback.clone(),stop.clone(),allocated.clone()))
         }).collect();
         Self{stop,tasks,allocated}
     }
@@ -115,6 +115,7 @@ impl Session {
     async fn retire_media(&self)->Result<(),String> {
         let Some(codec)=self.media_codec else {return Ok(());};
         let body=crate::bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![("type",Value::int(codec.stream_type()))])]))]));
+        self.control.udp_media.set(codec.stream_type(), false);
         let reply=self.control.request("TEARDOWN","/",&body,"application/x-apple-binary-plist",&[],Duration::from_secs(2)).await?;
         crate::resource_trace::validate_ack("AUX_MEDIA_PAUSE",&reply)
     }

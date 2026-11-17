@@ -131,7 +131,7 @@ pub fn spawn(control:Arc<RtspChannel>,factory:Arc<dyn SocketProvider>,shared:Opt
     trigger.armed.store(true,Ordering::Release);
     let host=params.car_ip.clone();let port=params.airplay_port;
     crate::emit_log(if trigger.carwith.is_some(){"CARWITH-MIC: armed declared type107; await authenticated RECOG_START, no background wake-word capture"}else{"MIC-PROBE: armed type107 Opus16k mono; long voice press toggles <=20s sample; phone assistant disabled only in this opt-in mode"});
-    Some(tokio::spawn(async move{
+    Some(crate::callback_context::spawn(async move{
         let _guard=guard;let mut handled=0;
         loop {
             let generation=*rx.borrow_and_update();
@@ -356,7 +356,7 @@ mod tests {
         let client=control.clone();let(_tx,mut rx)=watch::channel(0);
         let probe=Arc::new(ProbeControl::for_carwith());probe.arm_test();probe.request(true);
         let input=probe.clone();let generation=input.generation();
-        let capture=tokio::spawn(async move{sample(client,Arc::new(Factory),[7;32],"127.0.0.1",7000,&mut rx,Arc::new(Notify::new()),Duration::from_millis(250),Some((input,generation))).await});
+        let capture=crate::callback_context::spawn(async move{sample(client,Arc::new(Factory),[7;32],"127.0.0.1",7000,&mut rx,Arc::new(Notify::new()),Duration::from_millis(250),Some((input,generation))).await});
         let request=read(&mut peer).await;assert!(request.first_line.starts_with("SETUP "));
         let root=bplist::parse(&request.body).unwrap();let stream=&root.get("streams").unwrap().as_array().unwrap()[0];
         let id=stream.get("streamConnectionID").unwrap().as_int().unwrap();let port=stream.get("dataPort").unwrap().as_int().unwrap() as u16;

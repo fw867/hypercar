@@ -18,7 +18,6 @@ class ReceiverCompatibilityTest {
         assertTrue(id9.allowOutboundIap2)
         assertTrue(id9.requireAirplayActivation)
         assertFalse(id9.requireFreshCtrlInvite)
-        assertFalse(id9.allowProactiveWifiSession)
         assertEquals(listOf(7000), id9.fallbackAirplayPorts)
         assertTrue(HeadUnitProfiles.builtin.any { it.id == id9.id })
     }

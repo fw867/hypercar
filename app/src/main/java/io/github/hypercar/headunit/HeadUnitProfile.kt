@@ -66,9 +66,6 @@ data class HeadUnitProfile(
     /** Wait for this connection's ctrl invite or iAP2 endpoint; an open port is not activation. */
     val requireAirplayActivation: Boolean = false,
 
-    /** Receiver-specific opt-out of the global cached/scanned Wi-Fi shortcut. */
-    val allowProactiveWifiSession: Boolean = true,
-
     /** Some receivers invite over the already joined Wi-Fi before supplying 0x5703. Requires an explicit target. */
     val advertiseOnCurrentWifi: Boolean = false,
 
@@ -150,7 +147,7 @@ object HeadUnitProfiles {
         verified = false, sendCarPlayAvailability = true,
         openEaSessions = false, sendTransportIdentifier = false,
         dropProfilesBeforeIap2 = false, allowOutboundIap2 = false,
-        requireAirplayActivation = true, allowProactiveWifiSession = false,
+        requireAirplayActivation = true,
         useScreenResourceLifecycle = true, nbtAudioFirst = true,
         pairingHint = "适用于 NBT Evo，先在车机确认 Apple CarPlay 授权；MGU 和 IDC23 请使用各自配置。",
     )
@@ -171,7 +168,6 @@ object HeadUnitProfiles {
         allowOutboundIap2 = true,
         preferMdnsAirplay = true,
         requireAirplayActivation = true,
-        allowProactiveWifiSession = false,
         advertiseOnCurrentWifi = false,
         requireFreshCtrlInvite = false,
         useScreenResourceLifecycle = true,
@@ -276,7 +272,6 @@ object HeadUnitProfiles {
         abortWhenCarPlayWindowClosed = false,
         preferMdnsAirplay = true,
         requireAirplayActivation = true,
-        allowProactiveWifiSession = false,
         advertiseOnCurrentWifi = true,
         requireFreshCtrlInvite = true,
         fallbackAirplayPorts = listOf(7000, 7001, 7100, 17000),
@@ -300,7 +295,6 @@ object HeadUnitProfiles {
         abortWhenCarPlayWindowClosed = false,
         preferMdnsAirplay = true,
         requireAirplayActivation = true,
-        allowProactiveWifiSession = false,
         advertiseOnCurrentWifi = false,
         requireFreshCtrlInvite = false,
         useScreenResourceLifecycle = true,

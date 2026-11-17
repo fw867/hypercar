@@ -129,15 +129,8 @@ object HyperCarRepo {
     @Volatile
     private var streaming = false
 
-    /**
-     * AirPlay 协商失败时的「原地重试」：**不拆 iAP2 链路**，重开控制 socket 再谈一次。
-     *
-     * 依据（2026-10-24 真车 + 版本对照）：车机的 CarPlay 图标与窗口挂在 iAP2 会话上。
-     * 旧行为是 AirPlay 一失败就 [fail] → 拆 BT/Wi-Fi，车机立刻把图标收回去；
-     * 用户看到的现象正是「装了新版本后车机上没有 CarPlay 图标了」。
-     * 现在保留链路、按 2.5s 间隔重试 [AIRPLAY_MAX_ATTEMPTS] 次，仍不行才真失败。
-     */
     private val videoCapabilityGeneration = java.util.concurrent.atomic.AtomicLong()
+    private val engineCallbacks = EngineCallbackGate()
 
     private suspend fun startNativeForSession(
         fd: Int, sockets: SessionSocketLease<Network>, attempt: Long, configure: () -> String,
@@ -149,6 +142,8 @@ object HyperCarRepo {
                 kotlinx.coroutines.currentCoroutineContext().ensureActive()
                 if (!sessionLive.get() || connectionAttemptId != attempt || sessionSockets !== sockets)
                     throw CancellationException("旧核心启动结果已失效")
+                val callbackOwner = engineCallbacks.begin()
+                log("CORE-OWNER: start owner=$callbackOwner attempt=$attempt network=${sockets.network}")
                 val config = org.json.JSONObject(configure()).put("carwith_source_owner", attempt)
                 val stationMac = wifiStationSnapshot?.takeIf { it.first == attempt && it.second == sockets.network }?.third
                 if (stationMac != null) config.put("wifi_mac_address", stationMac)
@@ -156,14 +151,14 @@ object HyperCarRepo {
                 val json = io.github.hypercar.navigation.CarWithNavigation.prepareConfig(config.toString())
                 val videoGeneration = videoCapabilityGeneration.incrementAndGet()
                 SettingsStore.videoCapabilities.begin(videoGeneration)
-                RustCoreBridge.setListener(object : RustCoreBridge.EventListener by rustListener {
+                RustCoreBridge.setListener(EngineEventListener(engineCallbacks, callbackOwner, object : RustCoreBridge.EventListener by rustListener {
                     override fun onVideoCapabilities(hevcAllowed: Boolean) {
                         if (!sessionLive.get() || connectionAttemptId != attempt || sessionSockets !== sockets ||
                             videoCapabilityGeneration.get() != videoGeneration) return
                         if (SettingsStore.videoCapabilities.accept(videoGeneration, hevcAllowed))
                             log("VIDEO: receiver HEVC allowed=$hevcAllowed preference=${SettingsStore.videoCodec}")
                     }
-                })
+                }))
                 transferred = true
                 return RustCoreBridge.nativeStart(json, fd, socketProvider(sockets))
             } finally { autoConnectChanges.unlock() }
@@ -172,94 +167,11 @@ object HyperCarRepo {
         }
     }
 
-    private fun retryAirplayOrFail(detail: String) {
-        if (AirplayFailurePolicy.waitsForNewInvitation(headUnitProfile.id, detail)) {
-            reconnectJob?.cancel()
-            log("SESSION: ID9协议明确拒绝，本轮不重建相同参数/端点；等待新的车机连接或手动重试：$detail")
-            fail(detail, allowReconnect = false)
-            return
-        }
-        // 车机主动关掉控制通道时**不要重试同一个端点**：它紧接着会把 7000 的监听也关掉，
-        // 之后每次重试都是 ECONNREFUSED（2026-10-25 22:32 现场：6 轮 × 2.5s 全是拒连，
-        // 既没意义，还占着「等车机重新发起 iAP2」的时间窗）。
-        // 这种情况直接结束本轮：清掉记忆端点，等车机下一轮 iAP2 会话（它会自己重连蓝牙再邀请）。
-        val peerClosed = detail.contains("控制通道已关闭") ||
-            detail.contains("连接被对端关闭") ||
-            detail.contains("Broken pipe") ||
-            detail.contains("Connection reset")
-        if (peerClosed) {
-            log("SESSION: 车机主动关闭控制通道（$detail）——不再重试旧端口，等下一轮 iAP2 会话")
-            runCatching { SettingsStore.lastAirplayEndpoint = "" }
-            fail(detail)
-            return
-        }
-
-        val host = airplayHost
-        val port = airplayPort
-        val canRetry = host != null && port > 0 && airplayAttempts < AIRPLAY_MAX_ATTEMPTS && sessionLive.get()
-        if (!canRetry) {
-            fail(detail)
-            return
-        }
-        airplayAttempts++
-        val attempt = airplayAttempts
-        log(
-            "SESSION: AirPlay 协商失败（$detail）——保留 iAP2 链路（车机继续显示 CarPlay），" +
-                "第 $attempt/$AIRPLAY_MAX_ATTEMPTS 次原地重试",
-        )
-        push(link = LinkState.Negotiating("AirPlay 重试 $attempt/$AIRPLAY_MAX_ATTEMPTS"))
-        val sockets = sessionSockets ?: return
-        val owner = connectionAttemptId
-        scope.launch {
-            autoConnectChanges.lock()
-            try {
-                if (connectionAttemptId != owner || sessionSockets !== sockets || !sessionLive.get()) return@launch
-                io.github.hypercar.navigation.CarWithNavigation.clear()
-                runCatching { RustCoreBridge.nativeStop() }
-            } finally { autoConnectChanges.unlock() }
-            delay(AIRPLAY_RETRY_DELAY_MILLIS)
-            if (sessionSockets !== sockets || !sessionLive.get()) return@launch
-            val context = appContext() ?: return@launch
-            val carNetworkSsid = currentWifiSsid(context)
-            val connected = connectAirplayEndpoint(context, sockets, listOf(AirplayTarget(host!!, port)))
-            if (connected == null) {
-                if (connectionAttemptId == owner && sessionSockets === sockets && sessionLive.get())
-                    retryAirplayOrFail("控制端口重连失败 $host:$port（已重新发现）")
-                return@launch
-            }
-            val target = connected.target
-            val fd = connected.socket
-            val started = startNativeForSession(fd, sockets, owner) {
-                airplayHost = target.host
-                airplayPort = target.port
-                rememberAirplayEndpoint(carNetworkSsid, target)
-                val receiver = receiverForEngine()
-                val identity = PairingIdentityFiles.location(context.filesDir, receiver)
-                ensurePairingIdentity(identity)
-                sessionIdentity = identity
-                val identityPath = identity.file.absolutePath
-                val json = SettingsStore.engineConfigJson(target.host, target.port, sessionDeviceMac, identityPath,
-                    receiverBluetoothMac = receiver, carWithSource = sessionCarWithMode)
-                log("CORE: 重试 nativeStart（$target fd=$fd，第 $attempt 次）")
-                json
-            }
-            log("CORE: 重试 nativeStart 返回 $started")
-            if (!started) retryAirplayOrFail("核心层重启失败")
-        }
-    }
-
     /** 本轮连接的计时基准（毫秒）；日志里统一打成 `+Nms`，便于定位慢在哪一步。 */
     @Volatile
     private var sessionStageStart: Long = 0L
 
-    /**
-     * AirPlay 侧已确定的端点与重试计数（失败重试用）。
-     *
-     * 为什么要重试而不是直接失败：车机的 CarPlay 图标/窗口与 **iAP2 链路的存活**绑定。
-     * 2026-10-24 实测：拿到 ctrl 邀请后 AirPlay 若在 ~5s 内失败，我们会立刻拆 iAP2、
-     * 车机随即把 CarPlay 图标收回去——表现为「车机上根本看不到我们的 CarPlay」。
-     * 保留链路、原地重试，车机才会一直把窗口开着，也才有机会把 /info 走通。
-     */
+    /** 本轮已确定的 AirPlay 控制端点；不用于失败后的旧端点重拨。 */
     @Volatile
     private var airplayHost: String? = null
     /** Atomic host+port, scoped to the connection attempt by recordLateAirplayEndpoint. */
@@ -268,10 +180,7 @@ object HyperCarRepo {
     @Volatile
     private var airplayPort: Int = 0
 
-    @Volatile
-    private var airplayAttempts: Int = 0
-
-    /** 本机蓝牙 MAC（AirPlay 重试时重建引擎配置要用）。 */
+    /** 本轮用于 AirPlay 的手机身份。 */
     @Volatile
     private var sessionDeviceMac: String = ""
 
@@ -337,9 +246,6 @@ object HyperCarRepo {
 
     /** 连续失败次数（成功进 connected 时清零），用来做退避与上限。 */
     private val reconnectBudget = ReconnectBudget()
-    private val wifiSessionRecovery = WifiSessionRecovery()
-    @Volatile private var sessionReceiverInitiated = false
-    private val activationWakeEvidence = CarActivationWakeEvidence()
     @Volatile private var lastConnectInviteNudgeAt = 0L
     @Volatile private var lastHandoffInviteNudgeAt = 0L
     /** True while bound and waiting for ctrl invite / inbound iAP2 (not while streaming). */
@@ -493,11 +399,6 @@ object HyperCarRepo {
     val hasCurrentSession: Boolean get() = sessionLive.get() || connecting || streaming
     internal val hasAirPlayTransport: Boolean get() = sessionLive.get() && sessionSockets != null
 
-    /** Only the filtered classic ACL broadcast calls this, never the foreground-service relay. */
-    internal fun noteCarActivationWake(mac: String, connected: Boolean) {
-        activationWakeEvidence.observe(mac, connected, SystemClock.elapsedRealtime())
-    }
-
     /** BMW HUD: AMap notifications for self UI or structured CarWith data; other profiles send none. */
     @Volatile private var hudSessionEnabled = false
     internal val hudNavigationAllowed: Boolean get() = hudSessionEnabled && hasCurrentSession &&
@@ -527,8 +428,8 @@ object HyperCarRepo {
 
     /**
      * Known-Wi-Fi invite wait: ACL is often only a short BMW wake window before Wi-Fi takes
-     * over. Preserve `_carplay-ctrl._tcp` so the car can invite on Wi-Fi; do not start the
-     * experimental proactive AirPlay switch, and do not require a lasting BT iAP2 session.
+     * over. Preserve `_carplay-ctrl._tcp` while waiting for activation; a lasting BT iAP2
+     * session is not required for the head unit's Wi-Fi invitation.
      */
     private suspend fun nudgeInvitationDiscovery(
         context: Context,
@@ -614,7 +515,6 @@ object HyperCarRepo {
         val attempt = connectionAttemptId
         log("CONNECT: 等待邀请中手动重试——结束 attempt=$attempt 后重新开始，不创建10分钟暂停")
         reconnectBudget.clear()
-        wifiSessionRecovery.clear()
         userDisconnectRequested = false
         awaitingCarInvitation = false
         reconnectJob?.cancel()
@@ -645,8 +545,6 @@ object HyperCarRepo {
         reconnectJob?.cancel()
         reconnectJob = null
         reconnectBudget.start(retryReceiver(), manual = source == "manual")
-        if (source.startsWith("manual")) wifiSessionRecovery.clear()
-        sessionReceiverInitiated = false
         sessionHadLink = false
         roundSessionBaseline = iap2?.sessionStartCount ?: 0
         sessionCarWithMode = SettingsStore.carWithMode
@@ -700,7 +598,6 @@ object HyperCarRepo {
             if (mac != null && PairingEvidence.receiverKey(mac) == null) {
                 return@withContext "无效的车机地址，未清除配对信息"
             }
-            wifiSessionRecovery.clear()
             stopStandbyListening() // RFCOMM callbacks must not recreate credentials during reset.
             runCatching {
                 if (mac == null) {
@@ -773,12 +670,14 @@ object HyperCarRepo {
     private fun disconnect(
         userInitiated: Boolean,
         expectedAttempt: Long = connectionAttemptId,
+        expectedEngine: Long? = null,
         reason: String,
     ) {
         val attempt = expectedAttempt
         scope.launch {
             autoConnectChanges.lock()
             try {
+                if (expectedEngine != null && !engineCallbacks.isCurrent(expectedEngine)) return@launch
                 val decision = ConnectionStopPolicy.decide(userInitiated, attempt, connectionAttemptId,
                     hasCurrentSession, _snapshots.value.link, SettingsStore.autoConnect)
                 if (decision == ConnectionStopPolicy.Decision.IGNORE_STALE ||
@@ -788,7 +687,6 @@ object HyperCarRepo {
                 }
                 if (decision == ConnectionStopPolicy.Decision.STOP_AND_PAUSE) {
                     reconnectBudget.clear()
-                    wifiSessionRecovery.clear()
                     appContext()?.let { io.github.hypercar.autowake.AutomaticConnectionResume.pause(it) }
                     io.github.hypercar.settings.SettingsRevision.bump()
                     // releaseSessionResources closes the old RFCOMM after the AirPlay exit.
@@ -832,7 +730,6 @@ object HyperCarRepo {
                 if (enabled) clearAutomaticPause(app, "用户开启自动连接")
                 else {
                     reconnectBudget.clear()
-                    wifiSessionRecovery.clear()
                     stopWifiReconnectMonitor()
                     reconnectJob?.cancel()
                     reconnectJob = null
@@ -1259,7 +1156,7 @@ object HyperCarRepo {
                 "PROFILE: ${p.id}（${p.label}）0x4300=${p.sendCarPlayAvailability} " +
                     "EA=${p.openEaSessions} 0x4E0E=${p.sendTransportIdentifier} " +
                     "断HFP/A2DP=${p.dropProfilesBeforeIap2} 主动拨号=${p.allowOutboundIap2} 档案A退场=${p.abortWhenCarPlayWindowClosed} " +
-                    "主动WiFi=${HeadUnitActivationPolicy.permitsProactive(p)} 当前WiFi广播=${p.advertiseOnCurrentWifi} 新鲜邀请=${p.requireFreshCtrlInvite}"
+                    "当前WiFi广播=${p.advertiseOnCurrentWifi} 新鲜邀请=${p.requireFreshCtrlInvite}"
             )
             val coordinator = coordinatorFor(context)
 
@@ -1322,20 +1219,9 @@ object HyperCarRepo {
             // 它连 iAP2 都不再发起（10-25 日志：10 分钟里 0 次连入）。所以这里改成
             // 「超时只提示、不拆链，继续下一轮等」，直到用户断开 / ACL 断开 / 拿到端点。
             var invitationOnly = false
-            val knownWifiRetry = KnownWifiActivationRetry()
-            var retryEndpoint: CarPlayEndpoint? = null
             suspend fun waitForInvitation(
                 reason: String,
-                failedEndpoint: CarPlayEndpoint?,
-                activationClosed: Boolean = false,
-                suppressUninvitedReplay: Boolean = false,
             ) {
-                // Snapshot before the suspending network checks, so a later wake is not
-                // accidentally consumed as part of the old failure's baseline.
-                val failedAt = SystemClock.elapsedRealtime()
-                val failedNetwork = boundNetwork?.toString()
-                val failedReceiver = wifiReceiverMac
-                val failedWake = activationWakeEvidence.snapshot(failedReceiver)?.connectedRevision ?: 0L
                 invitationOnly = true
                 awaitingCarInvitation = true
                 sessionSockets?.invalidate() // Retire only the failed engine's socket factory, not Wi-Fi.
@@ -1352,43 +1238,17 @@ object HyperCarRepo {
                 lastSeen.set(null)
                 airplayHost = null
                 airplayPort = 0
-                // A temporary eligibility loss must not replenish the same scope's budget.
-                val scheduledDelay = if (suppressUninvitedReplay) {
-                    knownWifiRetry.suppressUninvitedReplay(failedNetwork, failedReceiver)
-                    null
-                } else {
-                    knownWifiRetry.failed(failedNetwork, failedReceiver, failedAt, activationClosed, failedWake)
-                }
-                val retryEligible = proactiveWifiSessionAllowed(context)
-                val retryDelay = scheduledDelay.takeIf { retryEligible }
-                // Keep only a scoped hint. It remains gated by ready() until a fresh wake
-                // actually reserves recovery; no TCP probe or full subnet rescan while blocked.
-                // An uninvited :7000 closed after RECORD is not reserved for that wake.
-                retryEndpoint = failedEndpoint.takeIf { !suppressUninvitedReplay && (scheduledDelay != null || activationClosed) }
-                connectionDiagnostics.mark(diagnosticId,
-                    if (retryDelay != null) ConnectionDiagnostics.Stage.WAITING_PROACTIVE_RETRY
-                    else ConnectionDiagnostics.Stage.WAITING_INVITATION, reason)
+                connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.WAITING_INVITATION, reason)
                 connectionDiagnostics.report().lastOrNull()?.let { log(it) }
-                if (suppressUninvitedReplay) {
-                    log("ACTIVATION: 无 ctrl 邀请、无 iAP2 的 :${KnownWifiActivationRetry.UNINVITED_PORT} 在 RECORD 后被车机拆掉：$reason；不再对同一端口做状态恢复，等待车机发起 iAP2")
-                    push(link = LinkState.Negotiating("等待车机发起 iAP2"))
-                } else if (retryDelay != null) {
-                    log("ACTIVATION: 主动建链失败：$reason；保留身份/Wi-Fi，已配对车机网络将在至少 ${retryDelay / 1000}s 后重试，车机邀请仍优先")
-                    push(link = LinkState.Negotiating("车机 Wi-Fi 恢复未完成，稍后自动重试"))
-                } else if (activationClosed && retryEligible) {
-                    log("ACTIVATION: RECORD 后、资源确认前关闭：$reason；等待新邀请或同车新 ACL 状态；距失败至少30s、状态安静10s后最多恢复${KnownWifiActivationRetry.MAX_STATE_RECOVERIES}次，计入${KnownWifiActivationRetry.MAX_RETRIES}次总重试；未收到明确拒绝码")
-                    push(link = LinkState.Negotiating("车机尚未激活，等待邀请或状态变化"))
-                } else {
-                    log("ACTIVATION: 主动建链失败：$reason；当前不满足已配对车机 Wi-Fi 条件，保留身份与广播，等待车机邀请")
-                    push(link = LinkState.Negotiating("主动连接未获接受，等待车机邀请"))
-                }
+                log("ACTIVATION: $reason；保留身份、Wi-Fi 与广播，等待车机新邀请或 iAP2 端点")
+                push(link = LinkState.Negotiating("等待车机开启 CarPlay"))
             }
             activation@ while (sessionLive.get()) {
                 var endpoint: CarPlayEndpoint? = null
                 var waitRounds = 0
                 while (endpoint == null) {
                     endpoint =
-                        awaitUsableEndpoint(context, coordinator, lastSeen, advertiser, invitationOnly, knownWifiRetry, retryEndpoint)
+                        awaitUsableEndpoint(context, coordinator, lastSeen, advertiser, invitationOnly)
                             ?: if (invitationOnly) null else gatewayFallbackEndpoint(context, lastSeen.get())
                     if (endpoint == null) {
                         waitRounds++
@@ -1490,29 +1350,15 @@ object HyperCarRepo {
                         },
                 )
                 airplayHost = apHost
-                airplayAttempts = 0
 
                 if (headUnitProfile.requireFreshCtrlInvite && usableCtrlInvitation(advertiser)?.host != apHost) {
-                    waitForInvitation("车机邀请已过期或端点已改变，等待新邀请", null)
+                    waitForInvitation("车机邀请已过期或端点已改变，等待新邀请")
                     continue@activation
                 }
                 // ---- 连 AirPlay 控制端口并移交 FD ----
-                var knownNetworkActivation = false
                 if (endpoint.proactive && !endpoint.fromInvite && usableCtrlInvitation(advertiser)?.host != apHost) {
-                    val mode = proactiveWifiSessionMode(context)
-                    val reserved = when (mode) {
-                        ProactiveWifiSessionPolicy.Mode.KNOWN_NETWORK -> true
-                        ProactiveWifiSessionPolicy.Mode.INTERRUPTION_RECOVERY ->
-                            wifiSessionRecovery.reserve(retryReceiver(), currentWifiSsid(context), SystemClock.elapsedRealtime())
-                        ProactiveWifiSessionPolicy.Mode.INVITATION_ONLY -> false
-                    }
-                    if (!reserved) {
-                        log("WIFI-ACTIVE: 主动授权已失效或中断恢复预算耗尽；等待车机邀请")
-                        waitForInvitation("等待车机邀请（主动连接条件未满足）", null)
-                        continue@activation
-                    }
-                    knownNetworkActivation = mode == ProactiveWifiSessionPolicy.Mode.KNOWN_NETWORK
-                    log("WIFI-ACTIVE: 开始候选连接 mode=$mode；端口可连不代表车机接受投屏")
+                    waitForInvitation("发现的端点缺少本轮车机邀请")
+                    continue@activation
                 }
                 push(link = LinkState.Negotiating("连接车机 AirPlay 端口"))
                 val carNetworkSsid = currentWifiSsid(context)
@@ -1524,7 +1370,7 @@ object HyperCarRepo {
                     })
                 if (connected == null) {
                     if (endpoint.proactive) {
-                        waitForInvitation("主动控制端口不可用；候选地址已失效", null)
+                        waitForInvitation("主动控制端口不可用；候选地址已失效")
                         continue@activation
                     }
                     fail("AirPlay 端点暂不可用；已失效旧缓存并重新发现，等待车机下一轮邀请")
@@ -1534,18 +1380,12 @@ object HyperCarRepo {
                 val port = connected.target.port
                 val controlFd = connected.socket
                 val activationInvite = usableCtrlInvitation(advertiser)
-                if (knownNetworkActivation && (!SettingsStore.proactiveWifiReconnect || !proactiveWifiSessionAllowed(context)) &&
-                    activationInvite?.host != apHostFinal) {
-                    runCatching { ParcelFileDescriptor.adoptFd(controlFd).close() }
-                    waitForInvitation("主动连接开关或网络条件已变化，等待车机邀请", null)
-                    continue@activation
-                }
                 if (headUnitProfile.requireFreshCtrlInvite && activationInvite?.host != apHostFinal) {
                     runCatching { ParcelFileDescriptor.adoptFd(controlFd).close() }
-                    waitForInvitation("连接期间车机邀请失效，已关闭候选 socket，等待新邀请", null)
+                    waitForInvitation("连接期间车机邀请失效，已关闭候选 socket，等待新邀请")
                     continue@activation
                 }
-                val activation = if (HeadUnitActivationPolicy.needsFallbackGate(headUnitProfile, endpoint.proactive)) ProactiveActivation() else null
+                val activation = ProactiveActivation()
                 val started = startNativeForSession(controlFd, sockets, diagnosticId) {
                     airplayHost = apHostFinal
                     airplayPort = port
@@ -1555,9 +1395,6 @@ object HyperCarRepo {
                     // 画面与音频由本机自绘界面自采自编，经 nativePushVideoFrame /
                     // nativePushAudioPcm 投喂给引擎；这里只负责下发会话参数。
                     sessionWifiSsid = carNetworkSsid
-                    sessionReceiverInitiated = endpoint.fromInvite ||
-                        (activationInvite?.host == apHostFinal) ||
-                        (!endpoint.proactive && coordinator.isSessionActive)
                     val receiver = receiverForEngine()
                     val identity = PairingIdentityFiles.location(context.filesDir, receiver)
                     ensurePairingIdentity(identity)
@@ -1579,55 +1416,46 @@ object HyperCarRepo {
                 }
                 log("CORE: nativeStart 返回 $started")
                 if (!started) {
-                    fail("核心层启动失败（查看日志）")
-                    return
+                    activation.interceptTerminal("核心层启动未完成；保留链路等待新邀请（查看旧引擎清理日志）")
                 }
-                // 拆除与新连接的竞争兜底：拆除已经把资源收走时（sessionLive=false）别再挂
-                // streaming，并把刚起的引擎停掉——否则会留下没人管的僵尸会话。
-                if (!sessionLive.get()) {
-                    runCatching { RustCoreBridge.nativeStop() }
-                    log("SESSION: 连接结果已过期（拆除途中），丢弃本次会话")
-                    return
-                }
-                streaming = true
-                if (activation == null) break@activation
+                // Teardown owns nativeStop. A stale startup continuation must never stop a newer engine.
+                autoConnectChanges.lock()
+                try {
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                    if (!sessionLive.get() || connectionAttemptId != diagnosticId || sessionSockets !== sockets) return
+                    streaming = true
+                } finally { autoConnectChanges.unlock() }
                 val rejected = activation.result.await()
                 if (rejected == null) {
                     proactiveActivation.compareAndSet(activation, null)
                     break@activation
                 }
-                // Stop only the failed media engine. Keep the same identity, Wi-Fi lease,
-                // RFCOMM session and ctrl listener/port alive for the receiver's next invite.
-                streaming = false
-                // Keep the source service and launch alive across media activations.
-                if (!sessionCarWithMode) {
-                    sessionUiJob?.cancel()
-                    sessionUiJob = null
-                }
-                CarUiCaster.stopAsync()
-                MusicBridge.onCarDisconnected()
-                // A failed VW activation must wait for another invitation, not reuse the
-                // consumed one. CAS preserves an invite that arrived during negotiation.
-                if (headUnitProfile.requireFreshCtrlInvite && activationInvite != null)
-                    advertiser.discardInvitation(activationInvite)
-                val closedAfterRecord = endpoint.proactive && !endpoint.fromInvite && activation.requiresFreshInvitation
-                val suppressUninvitedReplay = suppressUninvitedPortReplay(
-                    proactive = endpoint.proactive,
-                    fromInvite = endpoint.fromInvite,
-                    ctrlInvited = advertiser.lastInvitation != null,
-                    iap2Started = coordinator.isSessionActive || coordinator.sessionStartCount > baselineSessions,
-                    knownWifi = wifiReceiverMac != null,
-                    port = port,
-                    closedAfterRecord = closedAfterRecord,
-                )
-                waitForInvitation(rejected, endpoint.copy(ipAddresses = listOf(apHostFinal),
-                    airPlayPort = port, gateway = apHostFinal),
-                    activationClosed = closedAfterRecord && !suppressUninvitedReplay,
-                    suppressUninvitedReplay = suppressUninvitedReplay)
-                RustCoreBridge.nativeStop()
-                proactiveActivation.compareAndSet(activation, null)
-                kotlinx.coroutines.currentCoroutineContext().ensureActive()
-                if (!sessionLive.get() || connectionAttemptId != diagnosticId) return
+                autoConnectChanges.lock()
+                try {
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                    if (!sessionLive.get() || connectionAttemptId != diagnosticId || sessionSockets !== sockets) return
+                    engineCallbacks.retire()
+                    // Stop only the failed media engine. Keep the same identity, Wi-Fi lease,
+                    // RFCOMM session and ctrl listener/port alive for the receiver's next invite.
+                    streaming = false
+                    // Keep the source service and launch alive across media activations.
+                    if (!sessionCarWithMode) {
+                        sessionUiJob?.cancel()
+                        sessionUiJob = null
+                    }
+                    CarUiCaster.stopAsync()
+                    MusicBridge.onCarDisconnected()
+                    // Every failed activation consumes its invitation. CAS preserves a newer
+                    // invitation arriving during negotiation, even from the same address.
+                    if (activation.requiresFreshInvitation && activationInvite != null)
+                        advertiser.discardInvitation(activationInvite)
+                    waitForInvitation(rejected)
+                    RustCoreBridge.nativeStop()
+                    proactiveActivation.compareAndSet(activation, null)
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                    if (!sessionLive.get() || connectionAttemptId != diagnosticId) return
+                } finally { autoConnectChanges.unlock() }
+
             }
 
         } catch (cancelled: CancellationException) {
@@ -1675,9 +1503,6 @@ object HyperCarRepo {
         finishDiagnostic("STOPPED", reason)
         val hadLink = sessionHadLink
         val receiver = retryReceiver()
-        if (graceful || userDisconnectRequested) wifiSessionRecovery.clear()
-        else if (wifiSessionRecovery.interrupted(receiver, sessionWifiSsid, SystemClock.elapsedRealtime()))
-            log("WIFI-RECOVERY: 本次受邀媒体会话意外中断，开启120s/最多5次恢复窗口；不代表车机已显示")
         releaseSessionResources(keepListening, graceful)
         log("SESSION: 已断开（$reason）")
         _snapshots.update { s ->
@@ -1709,9 +1534,7 @@ object HyperCarRepo {
             return
         }
         val owner = connectionAttemptId
-        val retryDelay = if (SettingsStore.proactiveWifiSession && HeadUnitActivationPolicy.permitsProactive(headUnitProfile))
-            wifiSessionRecovery.reconnectDelay(receiver, SystemClock.elapsedRealtime(), retry.delayMs)
-        else retry.delayMs
+        val retryDelay = retry.delayMs
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
             log("RECONNECT: $reason——${retryDelay}ms 后重试（${retry.number}/${ReconnectBudget.MAX_RETRIES}）")
@@ -1730,6 +1553,7 @@ object HyperCarRepo {
 
     /** 释放保活服务、iAP2、Rust 和 WiFi 绑定；拆除与失败路径共用。 */
     private fun releaseSessionResources(keepListening: Boolean = false, graceful: Boolean = false) {
+        engineCallbacks.retire()
         val advertised = announcedHotspot.getAndSet(null)
         val requestPeer = advertised?.second?.takeIf {
             it.applies(advertised.first, connectionAttemptId, iap2?.activePeerAddress, SettingsStore.targetCarMac) &&
@@ -2404,7 +2228,7 @@ object HyperCarRepo {
 
     private fun invalidateRememberedEndpoint(ssid: String?, target: AirplayTarget) {
         val saved = SettingsStore.lastAirplayEndpoint
-        val remembered = ProactiveWifiSessionPolicy.rememberedEndpoint(saved, ssid)
+        val remembered = RememberedAirplayEndpoint.parse(saved, ssid)
         if (remembered == (target.host to target.port) && SettingsStore.lastAirplayEndpoint == saved) {
             SettingsStore.lastAirplayEndpoint = ""
             log("ENDPOINT: 连接失败，失效当前车机缓存 $target；配对身份保留")
@@ -2656,12 +2480,6 @@ object HyperCarRepo {
                 next.videoStream == "READY" && next.generation > closedPipelineGeneration.get() &&
                 next.generation >= _snapshots.value.pipeline.generation) {
                 reconnectBudget.videoReady(retryReceiver(), SystemClock.elapsedRealtime())
-                if (automaticConnectionAllowed && SettingsStore.proactiveWifiSession &&
-                    next.controlReady && next.resourcesAccepted && next.screenSetupAccepted &&
-                    next.screenOwned == true && (next.tcpAckedBytes ?: 0) > 1) {
-                    if (wifiSessionRecovery.mediaWorking(retryReceiver(), sessionWifiSsid, sessionReceiverInitiated))
-                        log("WIFI-RECOVERY: 本轮车机发起且视频已有TCP确认；仅意外中断后提供限时恢复资格，车机显示仍待确认")
-                }
                 connectionDiagnostics.mark(connectionAttemptId, ConnectionDiagnostics.Stage.FIRST_VIDEO_FRAME)
             }
             _snapshots.update { s ->
@@ -2686,6 +2504,7 @@ object HyperCarRepo {
             }
         }
         override fun onState(state: String, detail: String) {
+            val callbackOwner = engineCallbacks.current()
             log("CORE: [$state] $detail")
             if (!sessionLive.get() && state in setOf("activation", "negotiating", "connected", "failed", "ended")) return
             val activation = proactiveActivation.get()
@@ -2708,7 +2527,6 @@ object HyperCarRepo {
             when (state) {
                 "activation" -> {
                     val stage = runCatching { ConnectionDiagnostics.Stage.valueOf(detail) }.getOrNull() ?: return
-                    activation?.stage(stage)
                     connectionDiagnostics.mark(connectionAttemptId, stage)
                     log("ACTIVATION: attempt=$connectionAttemptId core=${_snapshots.value.pipeline.generation} stage=$stage")
                     if (stage == ConnectionDiagnostics.Stage.VIDEO_CHANNEL_READY) activation?.videoReady()
@@ -2792,11 +2610,14 @@ object HyperCarRepo {
                 }
                 "failed" -> {
                     MusicBridge.onCarDisconnected()
-                    retryAirplayOrFail(detail)
+                    // Negotiation failures are intercepted above. A failure after video
+                    // became ready must not rebuild the native session on the old endpoint.
+                    log("SESSION: 媒体会话失败，不重拨旧 RTSP 端点；等待车机重新邀请：$detail")
+                    fail(detail, allowReconnect = false, expectedEngine = callbackOwner)
                 }
                 "ended" -> {
                     MusicBridge.onCarDisconnected()
-                    disconnect(userInitiated = false, reason = detail)
+                    disconnect(userInitiated = false, expectedEngine = callbackOwner, reason = detail)
                 }
                 "stopping" -> { /* runDisconnect 内处理 */ }
             }
@@ -2929,48 +2750,16 @@ object HyperCarRepo {
             ?: endpoint.gateway?.takeIf { it.isNotBlank() }
     }
 
-    /** Live opt-ins are checked both while discovering and before consuming a socket. */
-    private suspend fun proactiveWifiSessionMode(context: Context): ProactiveWifiSessionPolicy.Mode {
-        val none = ProactiveWifiSessionPolicy.Mode.INVITATION_ONLY
-        val knownStart = SettingsStore.proactiveWifiReconnect
-        val recoveryEnabled = SettingsStore.proactiveWifiSession
-        if ((!knownStart && !recoveryEnabled) || !HeadUnitActivationPolicy.permitsProactive(headUnitProfile) ||
-            !sessionLive.get() || userDisconnectRequested) return none
-        val ssid = currentWifiSsid(context)
-        val receiver = knownWifiReceiver(ssid)
-        val network = ssid?.let { knownWifiNetwork(context, it) }
-        val recoveryAllowed = recoveryEnabled && wifiSessionRecovery.allows(
-            "${headUnitProfile.id}:${PairingEvidence.receiverKey(receiver)}", ssid, SystemClock.elapsedRealtime())
-        val mode = ProactiveWifiSessionPolicy.mode(knownStart, recoveryEnabled, recoveryAllowed)
-        val allowed = ProactiveWifiSessionPolicy.allows(mode != none, receiver, iap2?.activePeerAddress,
-            network != null && network == boundNetwork && receiver == wifiReceiverMac,
-            recoveryAllowed = mode == ProactiveWifiSessionPolicy.Mode.INTERRUPTION_RECOVERY,
-            knownNetworkStart = mode == ProactiveWifiSessionPolicy.Mode.KNOWN_NETWORK,
-            paused = automaticPauseRemaining > 0)
-        return if (allowed) mode else none
-    }
-
-    private suspend fun proactiveWifiSessionAllowed(context: Context): Boolean =
-        proactiveWifiSessionMode(context) != ProactiveWifiSessionPolicy.Mode.INVITATION_ONLY
-
-    fun onProactiveWifiOptionsChanged() {
-        // A known Wi-Fi network may already be available; do not require a new network edge.
-        // This does not start anything with automatic mode off or during the manual pause.
-        queueWifiReconnectCheck()
-    }
-
     private suspend fun probeRememberedEndpoint(
         context: Context,
         coordinator: Iap2Coordinator,
-        strictNetwork: Boolean,
     ): CarPlayEndpoint? {
         val diagnosticId = connectionAttemptId
         val currentSsid = currentWifiSsid(context)
         val saved = SettingsStore.lastAirplayEndpoint
         val desktop = io.github.hypercar.headunit.ReceiverCompatibility.isDesktopReceiver(headUnitProfile.id,
             io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(coordinator.activePeerAddress))
-        val remembered = ProactiveWifiSessionPolicy.rememberedEndpoint(saved, currentSsid, desktop) ?: return null
-        if (strictNetwork && knownWifiReceiver(currentSsid) == null) return null
+        val remembered = RememberedAirplayEndpoint.parse(saved, currentSsid, desktop) ?: return null
         val (host, port) = remembered
         // Use the real control connection once, without a connect/disconnect preflight which
         // can make a single-controller receiver close its service before nativeStart.
@@ -2982,7 +2771,7 @@ object HyperCarRepo {
         return CarPlayEndpoint(
             ssid = currentSsid, passphrase = null, airPlayPort = port,
             deviceIdentifier = null, publicKeyHex = null, sourceVersion = null,
-            ipAddresses = listOf(host), gateway = host, proactive = strictNetwork,
+            ipAddresses = listOf(host), gateway = host,
         )
     }
 
@@ -3008,67 +2797,28 @@ object HyperCarRepo {
         lastSeen: AtomicReference<CarPlayEndpoint?>,
         advertiser: CarPlayCtrlAdvertiser,
         invitationOnly: Boolean = false,
-        knownWifiRetry: KnownWifiActivationRetry = KnownWifiActivationRetry(),
-        retryEndpoint: CarPlayEndpoint? = null,
     ): CarPlayEndpoint? = withTimeoutOrNull(ENDPOINT_TIMEOUT_MILLIS) {
         val diagnosticId = connectionAttemptId
         // BMW's second-entry box trace still obtains Bluetooth credentials and a fresh ctrl invite.
         // Retain the network/identity shortcut, but never confuse a remembered/open port with activation.
         val profileRequiresActivation = headUnitProfile.requireAirplayActivation
-        val proactiveDelay = ProactiveWifiSessionDelay()
-        suspend fun proactiveReady(): Boolean {
-            val mode = proactiveWifiSessionMode(context)
-            val eligible = mode != ProactiveWifiSessionPolicy.Mode.INVITATION_ONLY
-            if (!sessionLive.get() || connectionAttemptId != diagnosticId || ctrlAdvertiser !== advertiser ||
-                iap2 !== coordinator) return false
-            val now = SystemClock.elapsedRealtime()
-            val network = boundNetwork?.toString()
-            val receiver = wifiReceiverMac
-            val immediate = mode == ProactiveWifiSessionPolicy.Mode.INTERRUPTION_RECOVERY &&
-                wifiSessionRecovery.firstAttempt(retryReceiver(), currentWifiSsid(context), now)
-            val stable = proactiveDelay.ready(eligible, network, now, immediate = immediate)
-            if (!stable) return false
-            if (!invitationOnly) return true // Explicit known-network opt-in or a verified interruption grant.
-            // Do not spend a recovery reservation on an invitation/endpoint already available.
-            if (usableCtrlInvitation(advertiser) != null || standbyEndpoint.get() != null) return false
-            if (immediate) return true // only the first repair of a verified interrupted session
-            val recovery = knownWifiRetry.recoverAfterStateChange(eligible, automaticPauseRemaining > 0,
-                network, receiver, now, activationWakeEvidence.snapshot(receiver))
-            if (recovery != null) {
-                log("ACTIVATION-RECOVERY: attempt=$diagnosticId network=$network 新车机 ACL 状态已安静10s，距失败至少30s；恢复${recovery.number}/${KnownWifiActivationRetry.MAX_STATE_RECOVERIES}，总重试${recovery.totalRetries}/${KnownWifiActivationRetry.MAX_RETRIES}；车机邀请仍优先")
-                connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.WAITING_PROACTIVE_RETRY,
-                    "车机状态变化后有界恢复 ${recovery.number}/${KnownWifiActivationRetry.MAX_STATE_RECOVERIES}")
-                push(link = LinkState.Negotiating("车机状态已稳定，恢复尝试 ${recovery.number}/${KnownWifiActivationRetry.MAX_STATE_RECOVERIES}"))
-            }
-            // A newly bound trusted network needs its own stable grace; never inherit an old
-            // endpoint or backoff from another receiver. Unknown networks remain invite-only.
-            return knownWifiRetry.allowsRetry(eligible, automaticPauseRemaining > 0, network, receiver, now)
-        }
         prepareInvitationNetwork(context, advertiser)
-        var requireActivation = (invitationOnly || profileRequiresActivation) && !proactiveReady()
-        if (invitationOnly || profileRequiresActivation) awaitingCarInvitation = true
-        log("WIFI-ACTIVE: 已知网络主动连接=${SettingsStore.proactiveWifiReconnect} 中断恢复=${SettingsStore.proactiveWifiSession}；主动连接需网络稳定10s，短时中断恢复保持120s/最多5次，车机邀请优先")
+        val requireActivation = invitationOnly || profileRequiresActivation
         if (requireActivation) {
-            if (SettingsStore.proactiveWifiReconnect && HeadUnitActivationPolicy.permitsProactive(headUnitProfile)) {
-                push(link = LinkState.Negotiating("等待已配对车机 Wi-Fi 稳定后主动连接"))
-            } else if (KnownWifiWaitCopy.waitsForHeadUnitEndpoint(headUnitProfile.id)) {
+            awaitingCarInvitation = true
+            if (KnownWifiWaitCopy.waitsForHeadUnitEndpoint(headUnitProfile.id)) {
                 log(KnownWifiWaitCopy.endpointOpening())
                 push(link = LinkState.Negotiating(KnownWifiWaitCopy.ENDPOINT_STEP))
             } else {
-                log("SESSION: 等待本轮 ctrl 邀请或 iAP2 端点；保持蓝牙监听与 Wi-Fi 广播，不预连记忆/扫描端口")
+                log("SESSION: 等待本轮 ctrl 邀请或 iAP2 端点；保持蓝牙监听与 Wi-Fi 广播")
                 push(link = LinkState.Negotiating("等待车机开启 CarPlay"))
             }
         }
         if (!requireActivation) {
-            val remembered = probeRememberedEndpoint(context, coordinator, profileRequiresActivation || invitationOnly)
-            val candidate = remembered ?: retryEndpoint?.takeIf {
-                invitationOnly && knownWifiRetry.ready(boundNetwork?.toString(), wifiReceiverMac,
-                    SystemClock.elapsedRealtime())
-            }
-            if (candidate != null && advertiser.lastInvitePeerIp == null &&
-                (!invitationOnly || proactiveReady())) {
+            val remembered = probeRememberedEndpoint(context, coordinator)
+            if (remembered != null && advertiser.lastInvitePeerIp == null) {
                 awaitingCarInvitation = false
-                return@withTimeoutOrNull candidate
+                return@withTimeoutOrNull remembered
             }
         }
 
@@ -3106,7 +2856,7 @@ object HyperCarRepo {
                 if (next == null) {
                     ticks++
                     // 手动连接可以早于车机热点出现。等待期间也检查已配对网络，
-                    // 不等本轮 300s 超时；实验模式仅允许已配对且已绑定的车机网络主动尝试。
+                    // 不等本轮 300s 超时；复用已连网络并保持邀请监听。
                     prepareInvitationNetwork(context, advertiser)
                     // ① 车机已经来邀请过（GET /ctrl-int/1/connect）→ 直接用邀请方 IP 当端点。
                     //    BMW MGU-55 实测：清单里声明「0x4301 不发」，等它是死等；而邀请一旦
@@ -3127,22 +2877,6 @@ object HyperCarRepo {
                             fromInvite = true,
                         )
                         continue
-                    }
-                    val waitBefore = requireActivation
-                    requireActivation = (invitationOnly || profileRequiresActivation) && !proactiveReady()
-                    if (waitBefore && !requireActivation) {
-                        log("WIFI-ACTIVE: 主动尝试条件已满足 mode=${proactiveWifiSessionMode(context)}；已配对/网络归属核验通过，新邀请仍优先")
-                        val remembered = probeRememberedEndpoint(context, coordinator, true)
-                        if (advertiser.lastInvitePeerIp != null) continue
-                        if (proactiveReady()) {
-                            usable = remembered ?: retryEndpoint?.takeIf {
-                                invitationOnly && knownWifiRetry.ready(boundNetwork?.toString(), wifiReceiverMac,
-                                    SystemClock.elapsedRealtime())
-                            }?.also {
-                                log("WIFI-ACTIVE: 复用同一车机/网络上失败的候选 ${it.ipAddresses}:${it.airPlayPort} 作实际建链重试，不重复全段扫描")
-                            }
-                        }
-                        if (usable != null) continue
                     }
                     // ① 静默网关试探：手机刚连上（或本来就该连）车机热点时，不用等 0x4301——
                     //    车机的 AirPlay 控制面通常就在热点网关的 7000 端口。
@@ -3306,15 +3040,14 @@ object HyperCarRepo {
         )
     }
 
-    private fun fail(reason: String, expectedAttempt: Long = connectionAttemptId, allowReconnect: Boolean = true) {
+    private fun fail(reason: String, expectedAttempt: Long = connectionAttemptId, allowReconnect: Boolean = true, expectedEngine: Long? = null) {
         scope.launch {
             autoConnectChanges.lock()
             try {
+                if (expectedEngine != null && !engineCallbacks.isCurrent(expectedEngine)) return@launch
                 if (expectedAttempt != connectionAttemptId || !sessionLive.compareAndSet(true, false)) return@launch
                 val receiver = retryReceiver()
                 val hadLink = sessionHadLink
-                if (allowReconnect && wifiSessionRecovery.interrupted(receiver, sessionWifiSsid, SystemClock.elapsedRealtime()))
-                    log("WIFI-RECOVERY: 本次受邀媒体会话意外失败，开启120s/最多5次恢复窗口；不代表车机已显示")
                 sessionSockets?.invalidate()
                 val pending = connectJob
                 connectJob = null
@@ -3700,12 +3433,6 @@ object HyperCarRepo {
      * 永远等不到（拆链还会把车机侧的等待计时反复清零）。窗口内链路保持、每 15s 报进度。
      */
     private const val ENDPOINT_TIMEOUT_MILLIS = 300_000L
-
-    /** AirPlay 协商失败后原地重试的次数上限（不拆 iAP2 链路，保持车机 CarPlay 窗口）。 */
-    private const val AIRPLAY_MAX_ATTEMPTS = 6
-
-    /** 两次 AirPlay 重试之间的间隔。 */
-    private const val AIRPLAY_RETRY_DELAY_MILLIS = 2_500L
 
     /** 同一次 ACL 事件会被 receiver 与 service 各转交一次：这段时间内只记一行。 */
     private const val ACL_EVENT_LOG_DEDUPE_MILLIS = 1_500L

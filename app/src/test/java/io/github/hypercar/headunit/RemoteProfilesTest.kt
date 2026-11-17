@@ -69,7 +69,7 @@ class RemoteProfilesTest {
         val vw = HeadUnitProfiles.VOLKSWAGEN
         val inherited = RemoteProfiles.parse("""{"profiles":[{"id":"volkswagen_mib"}]}""").single()
         assertEquals(vw, inherited)
-        val stale = vw.copy(requireFreshCtrlInvite = false, allowProactiveWifiSession = true)
+        val stale = vw.copy(requireFreshCtrlInvite = false)
         val merged = RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(stale), 5)
         assertEquals(vw, merged.single { it.id == vw.id })
         assertEquals(listOf(vw), RemoteProfiles.parse(RemoteProfiles.encode(listOf(vw))))

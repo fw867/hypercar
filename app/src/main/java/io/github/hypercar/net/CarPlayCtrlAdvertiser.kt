@@ -80,10 +80,10 @@ class CarPlayCtrlAdvertiser(
      * 于是把「邀请方 IP + 7000」当 AirPlay 端点，是这条链路上唯一可靠的来源。
      */
     internal class Invitation(val host: String, val receivedAtMillis: Long, val network: Network?)
-    private val invitations = java.util.concurrent.atomic.AtomicReference<Invitation?>(null)
+    private val invitations = PendingInvitation<Invitation>()
     internal val lastInvitation: Invitation? get() = invitations.get()
     val lastInvitePeerIp: String? get() = lastInvitation?.host
-    internal fun discardInvitation(expected: Invitation): Boolean = invitations.compareAndSet(expected, null)
+    internal fun discardInvitation(expected: Invitation): Boolean = invitations.discard(expected)
 
     /** 已注册的端口（-1 = 未启动）。 */
     val port: Int get() = serverSocket?.localPort ?: -1

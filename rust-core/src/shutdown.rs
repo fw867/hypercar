@@ -42,6 +42,13 @@ impl EngineShutdown {
 pub struct CompletionGuard(pub std::sync::Arc<EngineShutdown>);
 impl Drop for CompletionGuard { fn drop(&mut self) { self.0.finish(); } }
 
+/// Caller serializes start/stop. Timeout must leave the old owner available to the next stop.
+pub fn stop_retaining<T>(slot: &Mutex<Option<T>>, stop: impl FnOnce(&T) -> bool) -> bool {
+    let previous = slot.lock().take();
+    let Some(handle) = previous else { return true };
+    if stop(&handle) { true } else { *slot.lock() = Some(handle); false }
+}
+
 #[cfg(test)] mod tests {
     use super::*;
     #[tokio::test] async fn stop_before_wait_is_not_lost() {
@@ -54,5 +61,24 @@ impl Drop for CompletionGuard { fn drop(&mut self) { self.0.finish(); } }
         assert!(!stop.wait_done(Duration::from_millis(5)));
         drop(CompletionGuard(stop.clone()));
         assert!(stop.wait_done(Duration::from_millis(5)));
+    }
+    #[test] fn timed_out_handle_blocks_replacement_until_completion_is_confirmed() {
+        let stop = std::sync::Arc::new(EngineShutdown::new());
+        let slot = Mutex::new(Some(stop.clone()));
+        for _ in 0..2 {
+            assert!(!stop_retaining(&slot, |owner| {
+                owner.request(false);
+                owner.wait_done(Duration::from_millis(1))
+            }));
+            assert!(std::sync::Arc::ptr_eq(slot.lock().as_ref().unwrap(), &stop));
+        }
+        stop.finish();
+        assert!(stop_retaining(&slot, |owner| owner.wait_done(Duration::ZERO)));
+        assert!(slot.lock().is_none());
+        let next = std::sync::Arc::new(EngineShutdown::new());
+        *slot.lock() = Some(next.clone());
+        stop.finish(); // A late completion only belongs to the previous handle.
+        assert!(!stop_retaining(&slot, |owner| owner.wait_done(Duration::ZERO)));
+        assert!(std::sync::Arc::ptr_eq(slot.lock().as_ref().unwrap(), &next));
     }
 }

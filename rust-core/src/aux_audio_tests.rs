@@ -14,6 +14,7 @@ impl SocketProvider for Factory {
     }
 }
 struct Fixture {
+    media: tokio::sync::watch::Receiver<crate::udp_keepalive::MediaState>,
     controller:Controller,input:Arc<Input>,peer:TcpStream,data:UdpSocket,sync:UdpSocket,
     commands:mpsc::UnboundedReceiver<&'static str>,fallback:mpsc::UnboundedReceiver<crate::engine::SourceEvent>,
     command_task:tokio::task::JoinHandle<()>,buffer:Vec<u8>,order:Vec<String>,
@@ -30,7 +31,7 @@ impl Fixture {
                 wifi_mac_address:None,
             car_ip:"127.0.0.1".into(),airplay_port:7000,device_id:"test".into(),device_name:"Test phone".into(),identity_path:"unused".into(),
             receiver_id:None,receiver_previously_connected:true,enable_audio:true,audio_codec:"pcm".into(),video_codec:String::new(),bmw_capabilities:true,microphone_probe:None,keep_alive_stats:false,
-            bmw_box_bootstrap:true,mbux_screen_bootstrap:false,id9_screen_bootstrap:false,nbt_audio_first:false,mbux_media_compat:false,desktop_receiver:false,
+            head_unit_profile:"bmw_id85".into(),bmw_box_bootstrap:true,mbux_screen_bootstrap:false,id9_screen_bootstrap:false,nbt_audio_first:false,mbux_media_compat:false,desktop_receiver:false,
             width:1920,height:720,touch_display:None,touch_rect:None,encoder_size:Arc::new(Mutex::new((1920,720))),touch_size:Arc::new(Mutex::new((1920,720))),
             carwith_display:None,carwith_stretch:false,screen_resource_lifecycle:true,pipeline:Arc::new(Mutex::new(crate::pipeline::Pipeline::new())),
         };
@@ -39,6 +40,7 @@ impl Fixture {
             Value::dict(vec![("type",Value::int(101)),("audioType",Value::str("default")),("audioOutputFormats",Value::int(1<<30))]),
             Value::dict(vec![("type",Value::int(100)),("audioType",Value::str("media")),("audioOutputFormats",Value::int(1<<15))]),
         ]))]);
+        let media=control.udp_media.subscribe();
         let session=Session{control,factory:Arc::new(Factory),params,shared:[9;32],info,resource,media_codec:Some(AudioCodec::Pcm)};
         let input=Arc::new(Input::default());let(command_tx,mut command_rx)=mpsc::unbounded_channel();
         let(event_tx,commands)=mpsc::unbounded_channel();let(fallback_tx,fallback)=mpsc::unbounded_channel();
@@ -49,7 +51,7 @@ impl Fixture {
             }
         }});
         let controller=Controller::spawn(session,input.clone(),command_tx,fallback_tx);
-        Self{controller,input,peer,data:UdpSocket::bind("127.0.0.1:0").await.unwrap(),sync:UdpSocket::bind("127.0.0.1:0").await.unwrap(),commands,fallback,command_task,buffer:Vec::new(),order:Vec::new()}
+        Self{media,controller,input,peer,data:UdpSocket::bind("127.0.0.1:0").await.unwrap(),sync:UdpSocket::bind("127.0.0.1:0").await.unwrap(),commands,fallback,command_task,buffer:Vec::new(),order:Vec::new()}
     }
     async fn request(&mut self,expected:&str)->(RtspMessage,Value){
         let message=tokio::time::timeout(Duration::from_secs(3),async {loop {
@@ -110,6 +112,7 @@ async fn speech_handoff(fail_first_restore:bool){
     let(m,v)=f.request("setup:100:media").await;assert_eq!(v.get("streams").unwrap().as_array().unwrap()[0].get("audioFormat").and_then(Value::as_int),Some(1<<15));
     assert!(f.commands.try_recv().is_err(),"media install must wait for SETUP ACK");f.setup_reply(&m,&v).await;
     assert_eq!(tokio::time::timeout(Duration::from_secs(1),f.commands.recv()).await.unwrap(),Some("install"));
+    assert!(!f.media.borrow().idle());
     f.stopped().await;
     let mut expected=vec!["modesChanged","teardown:100","setup:100:speechRecognition","teardown:100","modesChanged","setup:100:media"];
     if fail_first_restore {expected.push("setup:100:media");}
@@ -123,8 +126,8 @@ async fn speech_handoff(fail_first_restore:bool){
     let(m,v)=f.request("modesChanged").await;let apps=v.get("params").unwrap().get("appStates").unwrap().as_array().unwrap();assert_eq!(apps[2].get("entity").and_then(Value::as_int),Some(1));f.ack(&m,None).await;
     let(m,_)=f.request("duckAudio").await;f.ack(&m,None).await;
     let(m,v)=f.request("setup:101:default").await;f.setup_reply(&m,&v).await;f.opus_packet(101).await;
-    let(m,_)=f.request("unduckAudio").await;f.ack(&m,None).await;
-    let(m,_)=f.request("teardown:101").await;f.ack(&m,None).await;
+    let(m,_)=f.request("unduckAudio").await;assert!(!f.media.borrow().idle());f.ack(&m,None).await;
+    let(m,_)=f.request("teardown:101").await;assert!(f.media.borrow().idle());f.ack(&m,None).await;
     let(m,v)=f.request("modesChanged").await;let apps=v.get("params").unwrap().get("appStates").unwrap().as_array().unwrap();assert_eq!(apps[2].get("entity").and_then(Value::as_int),Some(0));f.ack(&m,None).await;
     f.stopped().await;assert!(f.commands.try_recv().is_err());
     assert_eq!(f.order,["modesChanged","duckAudio","setup:101:default","unduckAudio","teardown:101","modesChanged"]);

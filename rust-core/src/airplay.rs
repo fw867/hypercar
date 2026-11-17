@@ -3,7 +3,7 @@
 //! 流程（参照 CatPlay bootstrap，保留已验证的配对与流参数）：
 //!  1. 配对前 /info best-effort 读取身份；pair-setup / pair-verify 建立加密控制通道。
 //!  2. 会话 SETUP /setup → 会话内 /info（真实显示 UUID / 能力）。
-//!  3. 连接事件通道，启动 UDP keepAlive（首发立即、后续 5s）及 /feedback（1s）。
+//!  3. 连接事件通道，启动 UDP keepAlive（立即首发，后续周期取决于车机档案和活动媒体流）及 /feedback（1s）。
 //!  4. RECORD 激活 → modesChanged 声明资源 → 屏幕流 SETUP / → 连接数据口。
 //!  5. 激活后协商音频；视频 pump 维持独立的屏幕流 keepAlive（1s）。
 //!  6. 事件通道 hidSendReport → 触摸坐标换算 → 本机自绘界面。
@@ -51,6 +51,7 @@ pub struct AirplayParams {
     pub microphone_probe: Option<Arc<crate::mic_probe::ProbeControl>>,
     pub keep_alive_stats: bool,
     pub bmw_box_bootstrap: bool,
+    pub head_unit_profile: String,
     pub mbux_screen_bootstrap: bool,
     pub id9_screen_bootstrap: bool,
     pub nbt_audio_first: bool,
@@ -455,7 +456,7 @@ pub async fn negotiate(
         p.screen_resource_lifecycle.then(|| screen_session.clone()),
         touch_tx,
         key_tx,
-        crate::consumer_hid::ConsumerHid::from_info(&info),
+        crate::consumer_hid::ConsumerHid::for_session(wifi_iap_id, &info),
         // 触摸的「显示空间」分母，优先级：
         //  ① /info 报的显示器尺寸（真车会给真实值）
         //  ② `--touch-display` 手动指定（仅无有效上报时使用；历史 WinPlay 按窗口
@@ -478,8 +479,11 @@ pub async fn negotiate(
 
     // 激活等待与后续音频协商期间也必须保持会话存活。
     // 句柄由协商结果持有；协商失败/取消时 Drop 自动停止本轮任务。
+    let receiver_model = info.get("model").and_then(Value::as_str).unwrap_or("");
+    let desktop = p.desktop_receiver || !use_box_bootstrap(true, &info);
+    let idle_only = crate::udp_keepalive::idle_only(&p.head_unit_profile, p.id9_screen_bootstrap, mbux_media_compat, desktop, receiver_model);
     let mut heartbeat_tasks = spawn_keepalive_loops(
-        channel.clone(), factory.clone(), keep_alive_port, p.car_ip.clone(), stop.clone(), Some(wifi_iap_id),
+        channel.clone(), factory.clone(), keep_alive_port, p.car_ip.clone(), stop.clone(), Some(wifi_iap_id), idle_only,
     );
     keepalive.0.append(&mut heartbeat_tasks.0);
     emit_log("AIRPLAY: 事件通道已建立，UDP/feedback 保活已启动（RECORD 前）");
@@ -513,7 +517,6 @@ pub async fn negotiate(
     emit_log(&format!("TIMING: after RECORD/resource response {}",p.pipeline.lock().timing.summary()));
     p.pipeline.lock().control_ready=true;
 
-    let receiver_model = info.get("model").and_then(Value::as_str).unwrap_or("");
     let mgu_handoff = box_bootstrap && !p.desktop_receiver && p.bmw_capabilities
         && (receiver_model == "MGU" || receiver_model.starts_with("MGU-"));
     if box_bootstrap && !p.desktop_receiver {
@@ -554,7 +557,6 @@ pub async fn negotiate(
     audio_owned.store(modes.lock().audio_owned(), std::sync::atomic::Ordering::Release);
     emit_log(&format!("AUDIO: enabled={} preference={} candidates={plan:?} owner_controller={}", p.enable_audio, p.audio_codec, modes.lock().audio_owned()));
     if p.enable_audio && !nbt_mode {
-        let desktop = p.desktop_receiver || !use_box_bootstrap(true, &info);
         for codec in plan.iter().copied() {
             audio = negotiate_audio(&channel, &factory, shared_secret.as_ref(), p, desktop, codec).await;
             if audio.is_some() { break; }
@@ -569,8 +571,7 @@ pub async fn negotiate(
         emit_log(&format!("MBUX-MEDIA: pre-ready failure; retry_barrier={ready} screen_failed={screen_failed} audio_missing={}; no extra RECORD",audio.is_none()));
         if ready {
             if screen_failed && p.screen_resource_lifecycle {
-                let model = info.get("model").and_then(Value::as_str).unwrap_or("");
-                if let Err(error)=screen_session.reconcile_after_mbux_ready(&modes, model).await {
+                if let Err(error)=screen_session.reconcile_after_mbux_ready(&modes, receiver_model).await {
                     p.pipeline.lock().video_stream="FAILED".into();
                     emit_log(&format!("MBUX-MEDIA: one screen retry rejected: {error}; await real resource/UI event"));
                 }
@@ -677,7 +678,7 @@ pub(crate) async fn start_mgu_handoff(
     current: impl Fn() -> bool + Send + 'static, stop: Arc<Notify>,
 ) -> Result<(), String> {
     let (written, flushed) = tokio::sync::oneshot::channel();
-    tasks.push(tokio::spawn(async move {
+    tasks.push(crate::callback_context::spawn(async move {
         match bluetooth_handoff_transaction(&control, &device, current, stop, Some(written)).await {
             Some(Ok(reply)) => {
                 let status = bplist::parse(&reply.body).ok().and_then(|v| v.get("status").and_then(Value::as_int));
@@ -770,7 +771,7 @@ mod shutdown_tests {
         log::set_max_level(log::LevelFilter::Info);
         let (control, mut peer) = pair().await;
         install_session_uri(&control, "127.0.0.1").unwrap();
-        let server = tokio::spawn(async move {
+        let server = crate::callback_context::spawn(async move {
             let mut captures = Vec::new();
             for seq in 1..=4 {
                 let mut wire = Vec::new();
@@ -852,7 +853,7 @@ mod shutdown_tests {
             (true,false,false,"MGU",None,"phone"),
         ] {
             let (control,mut peer)=pair().await;
-            let server=tokio::spawn(async move {
+            let server=crate::callback_context::spawn(async move {
                 let setup=read_request(&mut peer).await;
                 assert!(setup.first_line.starts_with("SETUP "));
                 let value=bplist::parse(&setup.body).unwrap();
@@ -876,7 +877,7 @@ mod shutdown_tests {
         for _ in 0..3 {
             let (control,mut peer)=pair().await;
             install_session_uri(&control,"fe80::1%wlan0").unwrap();
-            let server=tokio::spawn(async move {
+            let server=crate::callback_context::spawn(async move {
                 let mut target=None;
                 for method in ["SETUP","SETUP","RECORD","TEARDOWN"] {
                     let request=read_request(&mut peer).await;
@@ -908,7 +909,7 @@ mod shutdown_tests {
     async fn rejected_hevc_session_retries_once_without_changing_other_fields() {
         let (control,mut peer)=pair().await;
         control.set_session_uri(crate::rtsp_uri::SessionUri::new("fe80::1%wlan0",66).unwrap()).unwrap();
-        let server=tokio::spawn(async move {
+        let server=crate::callback_context::spawn(async move {
             let first=read_request(&mut peer).await;
             assert_eq!(first.first_line,"SETUP rtsp://[fe80::1%25wlan0]/66 RTSP/1.0");
             let first_body=bplist::parse(&first.body).unwrap();
@@ -934,7 +935,7 @@ mod shutdown_tests {
     async fn hevc_preference_never_retries_authorization_failures() {
         for status in [401,403] {
             let (control,mut peer)=pair().await;
-            let server=tokio::spawn(async move {
+            let server=crate::callback_context::spawn(async move {
                 let request=read_request(&mut peer).await;
                 peer.write_all(format!("RTSP/1.0 {status} Denied\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",request.cseq().unwrap()).as_bytes()).await.unwrap();
                 assert!(tokio::time::timeout(Duration::from_millis(50),peer.read(&mut [0u8;1])).await.is_err());
@@ -947,7 +948,7 @@ mod shutdown_tests {
     async fn handoff_requests_before_wifi_auth_and_rejection_is_not_replayed() {
         for status in [200,503] {
             let (control,mut peer)=pair().await;
-            let server=tokio::spawn(async move {
+            let server=crate::callback_context::spawn(async move {
                 let msg=read_request(&mut peer).await;
                 assert_eq!(msg.first_line,"POST /command RTSP/1.0");
                 let body=bplist::parse(&msg.body).unwrap();
@@ -974,7 +975,7 @@ mod shutdown_tests {
     async fn silent_handoff_is_bounded_and_inflight_request_can_be_cancelled() {
         for cancel in [true,false] {
             let (control,mut peer)=pair().await; let stop=Arc::new(Notify::new()); let signal=stop.clone();
-            let server=tokio::spawn(async move {
+            let server=crate::callback_context::spawn(async move {
                 let _=read_request(&mut peer).await;
                 if cancel {signal.notify_one();}
                 tokio::time::sleep(Duration::from_millis(3300)).await;
@@ -990,7 +991,7 @@ mod shutdown_tests {
     async fn late_handoff_reply_cannot_confirm_replaced_session() {
         use std::sync::atomic::{AtomicBool,Ordering};
         let (control,mut peer)=pair().await; let current=Arc::new(AtomicBool::new(true)); let flag=current.clone();
-        let server=tokio::spawn(async move {
+        let server=crate::callback_context::spawn(async move {
             let msg=read_request(&mut peer).await; flag.store(false,Ordering::SeqCst);
             peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",msg.headers.get("cseq").unwrap()).as_bytes()).await.unwrap();
         });
@@ -1001,7 +1002,7 @@ mod shutdown_tests {
     async fn malformed_accepted_session_still_gets_global_cleanup_before_original_error_returns() {
         let (control,mut peer)=pair().await;
         let c=control.clone();
-        let task=tokio::spawn(async move {
+        let task=crate::callback_context::spawn(async move {
             let mut cleanup=crate::negotiation_cleanup::NegotiationCleanup::new(c.clone(),true);
             let result=setup_and_read_info(&c,"phone","name",1234,true,Value::dict(vec![]),false,true,false,false,false,Some(&mut cleanup),None).await;
             cleanup.finish().await;result
@@ -1019,7 +1020,7 @@ mod shutdown_tests {
         let screen = Value::dict(vec![("type", Value::int(110)), ("uuid", Value::str("main"))]);
         let audio = Value::dict(vec![("type", Value::int(100))]);
         let body = vec![screen.clone(), audio.clone()];
-        let task = tokio::spawn(async move { finish_session(&control, &body, true).await });
+        let task = crate::callback_context::spawn(async move { finish_session(&control, &body, true).await });
         for (index, stream) in [Some(audio), Some(screen), None].into_iter().enumerate() {
             let request = read_request(&mut peer).await;
             assert_eq!(request.first_line, "TEARDOWN rtsp://127.0.0.1/42 RTSP/1.0");
@@ -1044,7 +1045,7 @@ mod shutdown_tests {
     async fn unanswered_stream_release_still_leaves_time_to_end_session() {
         let (control, mut peer) = pair().await;
         let audio = Value::dict(vec![("type", Value::int(100))]);
-        let task = tokio::spawn(async move { finish_session(&control, &[audio], true).await });
+        let task = crate::callback_context::spawn(async move { finish_session(&control, &[audio], true).await });
         let stream = read_request(&mut peer).await;
         assert!(!stream.body.is_empty());
         let session = read_request(&mut peer).await;
@@ -1528,7 +1529,7 @@ mod display_size_tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let peer = tokio::spawn(async move {
+        let peer = crate::callback_context::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut buffer = Vec::new();
             let mut chunk = [0u8; 4096];
@@ -1565,7 +1566,7 @@ mod display_size_tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let peer = tokio::spawn(async move {
+        let peer = crate::callback_context::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut buffer = Vec::new();
             let mut requests = Vec::new();
@@ -1634,24 +1635,103 @@ mod display_size_tests {
         assert_eq!(peer.await.unwrap().len(), 5);
     }
 
+    struct LocalSockets;
+    impl SocketProvider for LocalSockets {
+        fn open_tcp(&self, _: &str, _: u16, _: u32) -> Option<TcpStream> { None }
+        fn open_udp(&self, host: &str, port: u16) -> Option<UdpSocket> {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
+            socket.connect((host, port)).ok()?;
+            socket.set_nonblocking(true).ok()?;
+            UdpSocket::from_std(socket).ok()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_udp_keepalive_sends_immediately_then_every_ten_seconds() {
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stop = Arc::new(Notify::new());
+        let media = crate::udp_keepalive::MediaActivity::default();
+        let worker = crate::callback_context::spawn(crate::udp_keepalive::run(Arc::new(LocalSockets),
+            "127.0.0.1".into(), udp.local_addr().unwrap().port(), stop.clone(), 42, Some(media.subscribe())));
+        tokio::task::yield_now().await;
+        let mut bytes = [0; 4];
+        for sequence in [1u32, 2] {
+            if sequence == 2 {
+                tokio::time::advance(Duration::from_millis(9999)).await;
+                tokio::task::yield_now().await;
+                assert!(matches!(udp.try_recv(&mut bytes), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+                tokio::time::advance(Duration::from_millis(1)).await;
+            }
+            let size = tokio::time::timeout(Duration::from_millis(5), udp.recv(&mut bytes)).await
+                .expect("UDP packet missing at scheduled tick").unwrap();
+            assert_eq!(size, 4);
+            assert_eq!(bytes, sequence.to_be_bytes());
+        }
+        stop.notify_one();
+        worker.await.unwrap();
+    }
+
+    #[test]
+    fn idle_udp_keepalive_scope() {
+        for (id9, mbux, desktop, model, expected) in [
+            (true, false, false, "IDC23", true), (false, true, false, "MB_E-P-4", true),
+            (false, true, false, "MB_D-PP-4", false), (false, true, false, "", false),
+            (false, false, false, "MB_E-P-4", false), (false, false, false, "MGU-86", false),
+            (true, false, true, "IDC23", false), (false, true, true, "MB_E-P-4", false),
+        ] {
+            assert_eq!(crate::udp_keepalive::idle_only("", id9, mbux, desktop, model), expected);
+        }
+        for (profile, model, desktop, expected) in [
+            ("bmw_id85", "MGU-55", false, true), ("bmw_id85", "MGU-86", false, true),
+            ("bmw_id85", "", false, true), ("bmw_id85", "DiPlay", true, false),
+            ("bmw_id6", "NBT", false, false), ("bmw_custom", "MGU-55", false, false),
+        ] {
+            assert_eq!(crate::udp_keepalive::idle_only(profile, false, false, desktop, model), expected);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn udp_keepalive_only_rearms_after_last_media_teardown() {
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stop = Arc::new(Notify::new());
+        let activity = crate::udp_keepalive::MediaActivity::default();
+        let media = activity.subscribe();
+        activity.set(110, true); // A fast SETUP must not suppress the first packet.
+        let worker = crate::callback_context::spawn(crate::udp_keepalive::run(Arc::new(LocalSockets),
+            "127.0.0.1".into(), udp.local_addr().unwrap().port(), stop.clone(), 42, Some(media)));
+        let mut bytes = [0; 4];
+        assert_eq!(tokio::time::timeout(Duration::from_millis(5), udp.recv(&mut bytes)).await.unwrap().unwrap(), 4);
+        assert_eq!(bytes, 1u32.to_be_bytes());
+
+        activity.set(100, true);
+        activity.set(101, true);
+        activity.set(110, false);
+        activity.set(100, false); // Navigation still active.
+        assert!(tokio::time::timeout(Duration::from_secs(25), udp.recv(&mut bytes)).await.is_err());
+        activity.set(101, false);
+        tokio::time::advance(Duration::from_secs(9)).await;
+        activity.set(102, true); // MainHigh cancels the pending idle tick.
+        assert!(tokio::time::timeout(Duration::from_secs(15), udp.recv(&mut bytes)).await.is_err());
+        activity.set(102, false);
+        tokio::time::advance(Duration::from_secs(7)).await;
+        activity.set(110, false); // Repeated teardown does not restart the clock.
+        assert!(tokio::time::timeout(Duration::from_millis(2998), udp.recv(&mut bytes)).await.is_err());
+        assert_eq!(tokio::time::timeout(Duration::from_millis(5), udp.recv(&mut bytes)).await.unwrap().unwrap(), 4);
+        assert_eq!(bytes, 2u32.to_be_bytes());
+        activity.set(110, true);
+        stop.notify_one();
+        worker.await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(12), udp.recv(&mut bytes)).await.is_err());
+    }
+
     #[tokio::test]
     async fn keepalive_runs_while_record_waits_and_stops_with_its_owner() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        struct LocalSockets;
-        impl SocketProvider for LocalSockets {
-            fn open_tcp(&self, _: &str, _: u16, _: u32) -> Option<TcpStream> { None }
-            fn open_udp(&self, host: &str, port: u16) -> Option<UdpSocket> {
-                let socket = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
-                socket.connect((host, port)).ok()?;
-                socket.set_nonblocking(true).ok()?;
-                UdpSocket::from_std(socket).ok()
-            }
-        }
         let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let udp_port = udp.local_addr().unwrap().port();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let peer = tokio::spawn(async move {
+        let peer = crate::callback_context::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut buffer = Vec::new();
             let mut chunk = [0u8; 4096];
@@ -1681,7 +1761,7 @@ mod display_size_tests {
         let socket = TcpStream::connect(addr).await.unwrap();
         let (read, write) = socket.into_split();
         let (channel, _) = RtspChannel::spawn(read, write, None);
-        let tasks = spawn_keepalive_loops(channel.clone(), Arc::new(LocalSockets), udp_port, "127.0.0.1".to_string(), Arc::new(Notify::new()), None);
+        let tasks = spawn_keepalive_loops(channel.clone(), Arc::new(LocalSockets), udp_port, "127.0.0.1".to_string(), Arc::new(Notify::new()), None, false);
         let handles: Vec<_> = tasks.0.iter().map(|task| task.abort_handle()).collect();
         let record = record_session(&channel);
         let ping = async {
@@ -1702,7 +1782,7 @@ mod display_size_tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let peer = tokio::spawn(async move {
+        let peer = crate::callback_context::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut buffer = Vec::new();
             let mut methods = Vec::new();
@@ -2123,6 +2203,7 @@ pub(crate) async fn negotiate_audio(
             emit_log("AIRPLAY: 音频流未返回 dataPort");
             return None;
         }
+        channel.udp_media.set(codec.stream_type(), true);
         let key = match shared {
             Some(s) => stream_key(s, conn_id as u64),
             None => {
@@ -2146,6 +2227,7 @@ pub(crate) async fn negotiate_audio(
         // Retire just this audio type before trying another format; keep the screen/control alive.
         let body=bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![
             ("type",Value::int(codec.stream_type()))])]))]));
+        channel.udp_media.set(codec.stream_type(), false);
         match channel.request("TEARDOWN","/",&body,"application/x-apple-binary-plist",&[],Duration::from_secs(2)).await {
             Ok(reply) => emit_log(&format!("AUDIO: unusable {codec:?} SETUP cleanup status={}",reply.status())),
             Err(error) => emit_log(&format!("AUDIO: unusable {codec:?} SETUP cleanup failed: {error}")),
@@ -2157,7 +2239,7 @@ pub(crate) async fn negotiate_audio(
 // ---------------------------------------------------------------- 心跳
 
 /// 三条心跳里的前两条（屏幕 keepAlive 帧在视频 pump 里按 1s 节流）：
-///  - UDP keepAlive：4B 随机、5s（10s 与车机看门狗等长必输——奥迪 3315 实测 10.001s 被拆）
+///  - UDP keepAlive：首包立即，默认每 5s；指定实车档案仅在媒体空闲时每 10s 续发。
 ///  - RTSP /feedback：1s 空体 POST（车机 ~3s 看门狗）
 pub struct KeepaliveTasks(Vec<tokio::task::JoinHandle<()>>, Option<crate::wifi_iap2::WifiIap2>, Option<TimingServer>);
 
@@ -2174,34 +2256,19 @@ fn spawn_keepalive_loops(
     car_ip: String,
     stop: Arc<Notify>,
     wifi_iap_id: Option<u64>,
+    idle_only: bool,
 ) -> KeepaliveTasks {
     let mut tasks = Vec::new();
     if keep_alive_port != 0 {
-        let stop_k = stop.clone();
-        tasks.push(tokio::spawn(async move {
-            let Some(udp) = factory.open_udp(&car_ip, keep_alive_port) else {
-                emit_log("AIRPLAY: keepAlive UDP 端口不可用");
-                return;
-            };
-            let mut n: u32 = 0;
-            // 与 CatPlay 一致，连接后立即首发；后续保留已采用的 5s 间隔。
-            let mut tick = tokio::time::interval(Duration::from_secs(5));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tokio::select! {
-                    _ = stop_k.notified() => return,
-                    _ = tick.tick() => {}
-                }
-                n = n.wrapping_add(1);
-                if udp.send(&n.to_be_bytes()).await.is_err() {
-                    return;
-                }
-                if n == 1 { emit_log("AIRPLAY: keepAlive UDP 首包已发送"); }
-            }
-        }));
+        let media = idle_only.then(|| channel.udp_media.subscribe());
+        tasks.push(crate::callback_context::spawn(crate::udp_keepalive::run(factory, car_ip, keep_alive_port, stop.clone(),
+            wifi_iap_id.unwrap_or_default(), media)));
+    } else {
+        emit_log(&format!("AIRPLAY: keepAlive UDP 跳过 session={} port=0 reason=no_receiver_port",
+            wifi_iap_id.unwrap_or_default()));
     }
 
-    tasks.push(tokio::spawn(async move {
+    tasks.push(crate::callback_context::spawn(async move {
         let mut first_reply = true;
         loop {
             tokio::select! {
@@ -2250,7 +2317,7 @@ fn spawn_event_dispatcher(
     stop: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     let mode_feedback = spawn_mode_feedback(control.clone(), stop.clone(), modes.clone(), screen_lifecycle.clone());
-    tokio::spawn(async move {
+    crate::callback_context::spawn(async move {
         let mut bad_commands = 0usize;
         let mut contact = TouchContact::Idle;
         let mut seen_commands: Vec<String> = Vec::new();
@@ -2435,7 +2502,7 @@ fn spawn_mode_feedback(
     screen_lifecycle: Option<Arc<crate::screen_session::ScreenSession>>,
 ) -> ModeFeedbackWorker {
     let (tx, mut rx) = tokio::sync::watch::channel::<Option<ModeFeedback>>(None);
-    let task=tokio::spawn(async move {
+    let task=crate::callback_context::spawn(async move {
         loop {
             tokio::select! {
                 _ = stop.notified() => return,

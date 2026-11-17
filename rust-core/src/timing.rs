@@ -158,7 +158,7 @@ impl TimingServer {
 
         let diagnostics=Arc::new(Mutex::new(TimingDiagnostics::default()));
         let stats=diagnostics.clone();
-        let task = tokio::spawn(async move {
+        let task = crate::callback_context::spawn(async move {
             let mut buf = [0u8; 256];
             loop {
                 let (len, peer) = match socket.recv_from(&mut buf).await {

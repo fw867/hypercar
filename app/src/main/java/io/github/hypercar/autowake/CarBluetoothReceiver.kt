@@ -74,9 +74,6 @@ class CarBluetoothReceiver : BroadcastReceiver() {
             }
             return
         }
-        // Record actual, filtered classic edges once. A delayed service ACTION_START relay
-        // must not turn an old connected event into fresh evidence after a disconnect.
-        io.github.hypercar.session.HyperCarRepo.noteCarActivationWake(address, connected)
         if (!SettingsStore.autoConnect && connected) return // observe an existing manual session only
         val handler = AutoStart.handler
         if (handler == null) {

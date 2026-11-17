@@ -204,7 +204,6 @@ object RemoteProfiles {
             preferMdnsAirplay = o.optBoolean("preferMdnsAirplay", defaults.preferMdnsAirplay),
             requireAirplayActivation =
                 o.optBoolean("requireAirplayActivation", defaults.requireAirplayActivation),
-            allowProactiveWifiSession = o.optBoolean("allowProactiveWifiSession", defaults.allowProactiveWifiSession),
             advertiseOnCurrentWifi = o.optBoolean("advertiseOnCurrentWifi", defaults.advertiseOnCurrentWifi),
             requireFreshCtrlInvite = o.optBoolean("requireFreshCtrlInvite", defaults.requireFreshCtrlInvite),
             useScreenResourceLifecycle = o.optBoolean("useScreenResourceLifecycle", defaults.useScreenResourceLifecycle),
@@ -248,7 +247,6 @@ object RemoteProfiles {
                     put("abortWhenCarPlayWindowClosed", p.abortWhenCarPlayWindowClosed)
                     put("preferMdnsAirplay", p.preferMdnsAirplay)
                     put("requireAirplayActivation", p.requireAirplayActivation)
-                    put("allowProactiveWifiSession", p.allowProactiveWifiSession)
                     put("advertiseOnCurrentWifi", p.advertiseOnCurrentWifi)
                     put("requireFreshCtrlInvite", p.requireFreshCtrlInvite)
                     put("useScreenResourceLifecycle", p.useScreenResourceLifecycle)
