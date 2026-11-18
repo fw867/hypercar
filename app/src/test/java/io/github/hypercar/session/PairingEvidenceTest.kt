@@ -6,6 +6,16 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 
 class PairingEvidenceTest {
+    @Test fun prewarmReadsOnlyTheIdentifiedCarsCanvasAndPrefersItsCurrentProfile() {
+        val id9 = "bmw_id9:bt_112233445566"
+        val id85 = "bmw_id85:bt_112233445566"
+        val cache = mutableMapOf(id85 to (2880 to 960), "bmw_id9:bt_223344556677" to (1920 to 720))
+        assertEquals(2880 to 960, PairingEvidence.cachedCanvas(id9, cache::get))
+        cache[id9] = 2560 to 852
+        assertEquals(2560 to 852, PairingEvidence.cachedCanvas(id9, cache::get))
+        assertNull(PairingEvidence.cachedCanvas("bmw_id9:bt_334455667788", cache::get))
+        assertNull(PairingEvidence.cachedCanvas(null, cache::get))
+    }
     @get:Rule val temp = TemporaryFolder()
     private val mac = "AA:BB:CC:DD:EE:01"
 

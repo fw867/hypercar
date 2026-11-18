@@ -117,6 +117,12 @@ pub(crate) fn emit_log(line: &str) {
     });
 }
 
+pub(crate) fn reopen_carwith_entry(owner: u64) {
+    call_listener("onCarWithReopen", |env, obj| {
+        env.call_method(obj, "onCarWithReopen", "(J)V", &[(owner as jlong).into()]).map(|_| ())
+    });
+}
+
 pub(crate) fn emit_pipeline(json: &str) {
     call_listener("onPipeline", |env,obj| {
         let data=env.new_string(json)?;

@@ -10,6 +10,7 @@ pub trait Codec: Send {
 }
 type Factory = Box<dyn FnMut(VideoCodec,VideoCodec,(u32,u32),(u32,u32),u32,&[u8])->io::Result<Box<dyn Codec>> + Send>;
 pub struct Router {
+    pub fit_oversize_display: bool,
     enabled:bool, fps:u32, factory:Factory, active:Option<Box<dyn Codec>>, failed:bool,
     output_size: Option<(u32,u32)>, target: Option<(u32,u32)>, input_codec: Option<VideoCodec>, vps: Vec<u8>,
     sps:Vec<u8>,pps:Vec<u8>,waiting:bool, submitted:u64,produced:u64,
@@ -20,7 +21,7 @@ pub struct Router {
     last_input:std::time::Instant,
 }
 impl Router {
-    pub fn new(enabled:bool,fps:u32,factory:Factory)->Self {Self {output_size:None,target:None,input_codec:None,vps:vec![],origins:VecDeque::new(),enabled,fps,factory,active:None,failed:false,sps:vec![],pps:vec![],waiting:true,submitted:0,produced:0,progress:std::time::Instant::now(),last_input:std::time::Instant::now()}}
+    pub fn new(enabled:bool,fps:u32,factory:Factory)->Self {Self {fit_oversize_display:false,output_size:None,target:None,input_codec:None,vps:vec![],origins:VecDeque::new(),enabled,fps,factory,active:None,failed:false,sps:vec![],pps:vec![],waiting:true,submitted:0,produced:0,progress:std::time::Instant::now(),last_input:std::time::Instant::now()}}
     pub fn reset(&mut self) {
         self.pause();
         self.failed = false;
@@ -31,6 +32,10 @@ impl Router {
     }
     pub fn set_target(&mut self, target: Option<(u32,u32)>) {
         if self.target != target { self.reset(); self.target = target; } else { self.pause(); }
+    }
+    fn output_canvas(&self, source: (u32,u32)) -> (u32,u32) {
+        self.target.filter(|&(w,h)| needs_stretch(source, (w,h)) ||
+            (self.fit_oversize_display && w.max(h) > 2560)).unwrap_or(source)
     }
     pub fn output_size(&self) -> Option<(u32,u32)> { self.output_size }
     fn configuration(&self) -> Vec<u8> {
@@ -111,7 +116,7 @@ impl Router {
                     VideoCodec::H264 => crate::h264::sps_dimensions(&self.sps),
                 };
                 if let Some(source) = source {
-                    let target = self.target.filter(|&display| needs_stretch(source, display)).unwrap_or(source);
+                    let target = self.output_canvas(source);
                     let output = if hevc_allowed { VideoCodec::Hevc } else { VideoCodec::H264 };
                     if codec != output || source != target {
                         match (self.factory)(codec,output,source,target,self.fps,&configured) {
@@ -254,6 +259,16 @@ pub fn hardware_factory()->Factory {Box::new(|codec,output,(w,h),(tw,th),fps,csd
                 assert_eq!(router.output_size(), Some((2736,800)));
                 assert_eq!((output[0].pts, output[0].codec, output[0].origin), (90, codec, FrameOrigin::Cached));
             }
+        }
+    }
+    #[test]
+    fn id9_fills_oversize_screen_from_actual_source_even_when_aspect_matches() {
+        let (mut router, _) = router(true,false);
+        router.set_target(Some((2880,960)));
+        assert_eq!(router.output_canvas((2560,852)), (2560,852));
+        router.fit_oversize_display = true;
+        for actual in [(2560,852), (2400,800), (1024,576)] {
+            assert_eq!(router.output_canvas(actual), (2880,960));
         }
     }
     #[test]

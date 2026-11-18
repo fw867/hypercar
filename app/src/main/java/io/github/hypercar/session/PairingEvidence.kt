@@ -19,6 +19,18 @@ data class PairingEvidence(val identityPresent: Boolean, val receiverCredentialP
         fun canvasKey(profile: String, vararg candidates: String?): String? =
             candidates.firstNotNullOfOrNull(::receiverKey)?.let { "$profile:$it" }
 
+        /** The same BMW display may have been observed using the other MGU/IDC23 profile. */
+        fun cachedCanvas(key: String?, read: (String) -> Pair<Int, Int>?): Pair<Int, Int>? {
+            if (key == null) return null
+            read(key)?.let { return it }
+            val other = when (key.substringBefore(':')) {
+                "bmw_id9" -> "bmw_id85"
+                "bmw_id85" -> "bmw_id9"
+                else -> return null
+            }
+            return read("$other:${key.substringAfter(':')}")
+        }
+
         fun receiverKey(mac: String?): String? {
             val normalized = mac?.trim()?.lowercase(Locale.ROOT) ?: return null
             if (!Regex("(?:[0-9a-f]{2}:){5}[0-9a-f]{2}").matches(normalized)) return null

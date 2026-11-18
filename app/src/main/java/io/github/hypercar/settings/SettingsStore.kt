@@ -322,16 +322,19 @@ object SettingsStore {
             return mac
         }
 
-    /**
-     * 手动指定的本机蓝牙 MAC（大小写归一，非法值写不进去）。
-     *
-     * 优先级：手动值 > 自动解析（Shizuku/getAddress）> 稳定伪 ID。设为 null 即恢复自动。
-     */
+    // Use the existing preference so addresses entered in older versions retain priority.
+    internal val savedPhoneMac = SavedPhoneMac(
+        read = { manualBtMac },
+        write = { value ->
+            p().edit().putString(KEY_MANUAL_BT_MAC, value).apply()
+            SettingsRevision.bump()
+        },
+    )
+
     var manualBtMac: String?
         get() = io.github.hypercar.net.PhoneIdentitySnapshot.normalize(p().getString(KEY_MANUAL_BT_MAC, null))
         set(v) {
-            val normalized = io.github.hypercar.net.PhoneIdentitySnapshot.normalize(v)
-            p().edit().putString(KEY_MANUAL_BT_MAC, normalized).apply()
+            savedPhoneMac.edit(v)
         }
 
     /** 手动 MAC 是否已设置（UI 用来显示"手动/自动"）。 */

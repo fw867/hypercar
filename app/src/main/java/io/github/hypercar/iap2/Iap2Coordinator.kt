@@ -57,7 +57,7 @@ class Iap2Coordinator(
     private val targetMac: () -> String?,
     private val preferredMac: () -> String? = { null },
     /** 本机真实蓝牙 MAC（Shizuku 解析，由上层注入；0x4300/0x4E0C/0x4E0E 用）。 */
-    private val deviceMacProvider: suspend () -> String,
+    private val deviceMacProvider: suspend () -> String?,
     /** 车机档案：发 iAP2 前是否主动断开该车机的 HFP/A2DP（宝马=false，奥迪=true）。 */
     private val dropProfilesBeforeIap2: Boolean = true,
     private val allowOutboundIap2: Boolean = true,
@@ -72,7 +72,11 @@ class Iap2Coordinator(
     @Volatile
     private var endpointCallback: ((CarPlayEndpoint) -> Unit)? = null
 
-    private val phoneIdentity = io.github.hypercar.net.PhoneIdentitySnapshot()
+    private val phoneIdentity = io.github.hypercar.net.PhoneIdentitySnapshot(
+        nowMillis = android.os.SystemClock::elapsedRealtime,
+        rememberHardwareMac = { revision, mac -> io.github.hypercar.settings.SettingsStore.savedPhoneMac.remember(revision, mac) },
+        onBudgetExpired = { log("BT-MAC: 查询总预算 ${it}ms 已耗尽，本轮使用稳定手机标识") },
+    )
 
     val isRunning: Boolean get() = bluetooth?.isRunning == true
     val activePeerAddress: String? get() = bluetooth?.activePeerAddress
@@ -154,8 +158,8 @@ class Iap2Coordinator(
     fun invalidatePhoneIdentity() = phoneIdentity.invalidate()
 
     /** Adopt an already active iAP2 identity; never resolve a different identity for AirPlay. */
-    suspend fun deviceMacForSession(): String = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-        phoneIdentity.peek()?.takeIf { isSessionActive } ?: resolvePhoneIdentity()
+    internal suspend fun identityForSession() = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        resolvePhoneIdentity()
     }
 
     /** Wi-Fi is healthy. Suppress fresh outgoing dials while the car retires RFCOMM. */
@@ -168,16 +172,19 @@ class Iap2Coordinator(
     // ---- 内部 ----
 
     /** Both prefetch and live handshakes use the injected provider and the same snapshot. */
-    private suspend fun resolvePhoneIdentity(): String = phoneIdentity.resolve(
-        io.github.hypercar.settings.SettingsStore.manualBtMac,
+    private suspend fun resolvePhoneIdentity() = phoneIdentity.pin(
+        io.github.hypercar.settings.SettingsStore.savedPhoneMac::selection,
         deviceMacProvider,
         { io.github.hypercar.settings.SettingsStore.stableDeviceId },
     )
 
-    private fun currentBluetoothMac(): String = runBlocking { resolvePhoneIdentity() }
+    private fun currentBluetoothMac(): String = runBlocking { resolvePhoneIdentity().address }
 
     private fun prefetchDeviceMac() {
-        runCatching { runBlocking { resolvePhoneIdentity() } }
+        runCatching { runBlocking {
+            if (phoneIdentity.prefetch(io.github.hypercar.settings.SettingsStore.savedPhoneMac::selection, deviceMacProvider) == null)
+                log("IAP2: 待机预取未取得真实蓝牙地址，握手时按剩余查询预算解析")
+        } }
             .onFailure { log("IAP2: 手机身份预解析未完成，握手时将重新解析") }
     }
 }

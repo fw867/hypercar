@@ -46,6 +46,7 @@ pub(super) struct Session {
     seed: Option<Vec<u8>>,
     ready: bool,
     init_sent: bool,
+    fallback_init: Option<(u32,u32)>,
     declared_display: Option<(u32,u32)>,
     pub started: bool,
     matched: bool,
@@ -57,7 +58,7 @@ impl Default for Session {
     fn default() -> Self {
         Self { challenge: format!("2.0;{}", uuid::Uuid::new_v4().simple()), info: None,
             proof_ok: false, admitted: false, features_requested: false, features_sent: false,
-            rsa: None, seed: None, ready: false, init_sent: false, declared_display: None, started: false, matched: false, navigation_requested: false, navigation_started: false }
+            rsa: None, seed: None, ready: false, init_sent: false, fallback_init: None, declared_display: None, started: false, matched: false, navigation_requested: false, navigation_started: false }
     }
 }
 
@@ -192,6 +193,7 @@ impl Session {
             self.init_sent = true;
             let (width,height) = self.declared_display.unwrap_or((cfg.width,cfg.height));
             let (w,h) = canvas_for_receiver(width, height);
+            if self.declared_display.is_none() { self.fallback_init = Some((w,h)); }
             out.push((CMD_VIDEO_ENCODER_INIT, proto_encoder_info_payload(w,h,cfg.fps)));
         }
         Ok(out)
@@ -236,15 +238,28 @@ fn crypt(bytes: &[u8], key: Option<&[u8]>, encrypt: bool) -> Result<Vec<u8>,Stri
 }
 
 pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLifeEvent>,
-    size: Arc<Mutex<(u32,u32)>>, requested: Arc<Mutex<(u32,u32)>>, cfg: CarLifeConfig, state: Shared, reset_request: Arc<Notify>) -> Result<(),String> {
+    size: Arc<Mutex<(u32,u32)>>, requested: DisplayRequest, cfg: CarLifeConfig, state: Shared, reset_request: Arc<Notify>) -> Result<(),String> {
     let (mut rd, mut wr) = stream.into_split();
     if !send_cmd(&mut wr, CMD_HU_PROTOCOL_VERSION, &proto_version_payload()).await { return Err("version write failed".into()); }
     let mut buf=Vec::new(); let mut chunk=[0;4096];
+    let mut display_updates = requested.subscribe();
     let mut last_reset: Option<tokio::time::Instant> = None;
     let mut navigation_diagnostics = super::navigation::Diagnostics::default();
     loop {
         let started=state.lock().started;
+        // An already initialized handset can ACK another INIT with its old size.
+        // Reopen only the local source so feature negotiation and INIT see the display.
+        let display = *display_updates.borrow_and_update();
+        if started && display.0 >= 2 && display.1 >= 2 {
+            let target = canvas_for_receiver(display.0, display.1);
+            if state.lock().fallback_init.is_some_and(|initial| initial != target) {
+                *size.lock() = (0, 0);
+                emit_log(&format!("CARWITH-SIZE: late receiver={}x{} restart local source once for {}x{}",display.0,display.1,target.0,target.1));
+                return Ok(());
+            }
+        }
         let read = tokio::select! {
+            _ = display_updates.changed() => continue,
             _ = reset_request.notified(), if started => {
                 // mcarplay CarLifeSession.requestKeyFrame: CMD 0x1800B, not CTRL or START.
                 if last_reset.map(|t| t.elapsed() >= Duration::from_secs(1)).unwrap_or(true) {
@@ -265,7 +280,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
         while let Some((kind, payload, consumed)) = read_cmd_frame(&buf) {
             buf.drain(..consumed);
             let payload=state.lock().decrypt(&payload)?;
-            let display=*requested.lock();
+            let display=*requested.borrow();
             let declared = (display.0 >= 2 && display.1 >= 2).then_some(display);
             let cfg_copy=cfg.clone(); let session=state.clone(); let decoded=payload.clone();
             let actions=tokio::task::spawn_blocking(move || {
@@ -477,6 +492,57 @@ mod tests {
         assert_eq!(canvas_for_receiver(1920,720),(1920,720));
     }
 
+    #[tokio::test] async fn late_display_repro_requests_once_and_uses_the_returned_canvas() {
+        async fn frame(phone: &mut TcpStream) -> (u32, Vec<u8>) {
+            let mut header = [0; 8];
+            phone.read_exact(&mut header).await.unwrap();
+            let mut body = vec![0; u16::from_be_bytes([header[0], header[1]]) as usize];
+            phone.read_exact(&mut body).await.unwrap();
+            (u32::from_be_bytes(header[4..8].try_into().unwrap()), body)
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut phone, _) = listener.accept().await.unwrap();
+        let state = microphone_test_session();
+        state.lock().started = false;
+        let size = Arc::new(Mutex::new((0, 0)));
+        let display = DisplayRequest::new((0, 0));
+        let (events, _rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run(stream, events, size.clone(), display.clone(), cfg(), state.clone(), Arc::new(Notify::new())));
+        assert_eq!(frame(&mut phone).await.0, CMD_HU_PROTOCOL_VERSION);
+        phone.write_all(&build_cmd_frame(0x10026, &[])).await.unwrap();
+        assert_eq!(frame(&mut phone).await.0, CMD_VIDEO_ENCODER_INIT);
+        let reply = |w,h| build_cmd_frame(CMD_VIDEO_ENCODER_INIT_DONE,
+            &state.lock().encrypt(&proto_encoder_info_payload(w,h,60)).unwrap());
+        phone.write_all(&reply(1024,576)).await.unwrap();
+        assert_eq!(frame(&mut phone).await.0, CMD_VIDEO_ENCODER_START);
+        display.send_replace((2880,960));
+        tokio::time::timeout(Duration::from_secs(1),task).await.expect("late display did not restart source").unwrap().unwrap();
+        drop(phone);
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut phone, _) = listener.accept().await.unwrap();
+        let state = microphone_test_session();
+        state.lock().started = false;
+        let (events, mut rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run(stream, events, size.clone(), display.clone(), cfg(), state.clone(), Arc::new(Notify::new())));
+        assert_eq!(frame(&mut phone).await.0, CMD_HU_PROTOCOL_VERSION);
+        phone.write_all(&build_cmd_frame(0x10026, &[])).await.unwrap();
+        let (kind, bytes) = frame(&mut phone).await;
+        assert_eq!(kind, CMD_VIDEO_ENCODER_INIT);
+        let fields = state.lock().decrypt(&bytes).unwrap();
+        assert_eq!((first_int(&fields,1), first_int(&fields,2)), (Some(2560),Some(852)));
+        assert_eq!(*size.lock(),(0,0), "the fallback touch canvas survived the renegotiation gap");
+        let actual = state.lock().encrypt(&proto_encoder_info_payload(2400,800,60)).unwrap();
+        phone.write_all(&build_cmd_frame(CMD_VIDEO_ENCODER_INIT_DONE, &actual)).await.unwrap();
+        assert_eq!(frame(&mut phone).await.0, CMD_VIDEO_ENCODER_START);
+        assert_eq!(*size.lock(),(2400,800));
+        assert!(std::iter::from_fn(||rx.try_recv().ok()).any(|e|matches!(e,CarLifeEvent::EncoderResolution{width:2400,height:800})));
+        display.send_replace((2880,960));
+        assert!(tokio::time::timeout(Duration::from_millis(50),frame(&mut phone)).await.is_err());
+        drop(phone);
+        assert!(task.await.unwrap().is_err());
+    }
+
     #[test] fn carwith_touch_uses_separate_message_ids_and_actual_source_bounds() {
         let mut gesture=TouchGesture::default();
         assert!(gesture.accept(TOUCH_MOVE,100,100,(1280,372)).is_none());
@@ -532,7 +598,7 @@ mod tests {
         state.lock().started = false;
         let (events, mut rx) = mpsc::unbounded_channel();
         let size = Arc::new(Mutex::new((1280,720)));
-        let task = tokio::spawn(run(stream,events,size.clone(),size,cfg(),state.clone(),Arc::new(Notify::new())));
+        let task = tokio::spawn(run(stream,events,size.clone(),DisplayRequest::new((0,0)),cfg(),state.clone(),Arc::new(Notify::new())));
         let click = build_cmd_frame(CMD_GO_TO_DESKTOP,&[]);
         phone.write_all(&click).await.unwrap();
         assert!(tokio::time::timeout(Duration::from_millis(100),rx.recv()).await.is_err());
@@ -608,7 +674,7 @@ mod tests {
         let reset = Arc::new(Notify::new());
         let (events, _rx) = mpsc::unbounded_channel();
         let size = Arc::new(Mutex::new((1280, 720)));
-        let task = tokio::spawn(run(stream, events, size.clone(), size, cfg(), state.clone(), reset.clone()));
+        let task = tokio::spawn(run(stream, events, size.clone(), DisplayRequest::new((0,0)), cfg(), state.clone(), reset.clone()));
         assert_eq!(next(&mut phone).await, CMD_HU_PROTOCOL_VERSION);
         reset.notify_one();
         assert!(tokio::time::timeout(Duration::from_millis(30), next(&mut phone)).await.is_err());
@@ -637,7 +703,7 @@ mod tests {
         use std::io::Write;
         let stop=Arc::new(Notify::new());
         let mut config=cfg();config.width=2732;config.height=794;
-        let (_hub,mut events)=CarLifeHub::connect(config,"127.0.0.1".into(),stop.clone(),None).unwrap();
+        let (_hub,mut events)=CarLifeHub::connect(config,"127.0.0.1".into(),stop.clone(),None, || {}).unwrap();
         let mut authenticated=false;let mut frames=0;let mut touched=false;
         let began=std::time::Instant::now();
         let mut capture=std::fs::File::create("/data/local/tmp/hypercar-carwith-video.h264").unwrap();
@@ -667,6 +733,43 @@ mod tests {
 
     /// Source-only timing probe: no car connection, saved video, or injected user input.
     #[tokio::test]
+    #[ignore = "requires a Xiaomi phone with the local CarWith entry open"]
+    async fn live_carwith_late_display() {
+        let display = DisplayRequest::new((0, 0));
+        let stop = Arc::new(Notify::new());
+        let (_hub, mut events) = CarLifeHub::connect(cfg(), "127.0.0.1".into(), stop.clone(), Some(display.clone()), || {
+            // This opt-in probe runs as adb shell; the app uses the attempt-scoped Kotlin callback.
+            let status = std::process::Command::new("/system/bin/am").args(["start", "-n",
+                "com.miui.carlink/com.miui.carlink.castfwk.usb.CarlifeAdbActivity"]).status().unwrap();
+            assert!(status.success());
+        }).unwrap();
+        let mut rounds = 0;
+        let result = tokio::time::timeout(Duration::from_secs(35), async {
+            while let Some(event) = events.recv().await {
+                match event {
+                    CarLifeEvent::SourceReset { cache_cleared: Some(done) } => done.notify_one(),
+                    CarLifeEvent::SourceReset { cache_cleared: None } => rounds += 1,
+                    CarLifeEvent::EncoderResolution { width, height } =>
+                        println!("CarWith local round {rounds}, actual {width}x{height}"),
+                    CarLifeEvent::VideoFrame {..} | CarLifeEvent::VideoFrameTagged {..} if rounds == 1 => {
+                        display.send_if_modified(|value| {
+                            if *value == (2880, 960) { return false; }
+                            *value = (2880, 960);
+                            true
+                        });
+                    }
+                    CarLifeEvent::VideoFrame {..} | CarLifeEvent::VideoFrameTagged {..} if rounds == 2 => return true,
+                    _ => {}
+                }
+            }
+            false
+        }).await;
+        stop.notify_waiters();
+        assert_eq!(result, Ok(true), "no video after late display, local rounds={rounds}");
+    }
+
+    /// Source-only timing probe: no car connection, saved video, or injected user input.
+    #[tokio::test]
     #[ignore = "requires a real Xiaomi phone; launch CarWith after probe start"]
     async fn live_carwith_startup_timing() {
         struct Timeline(std::time::Instant);
@@ -687,14 +790,14 @@ mod tests {
         println!("SOURCE-PROBE start_epoch_ms={epoch}");
         let stop=Arc::new(Notify::new());
         let mut config=cfg();config.width=2736;config.height=800;
-        let (_hub,mut events)=CarLifeHub::connect(config,"127.0.0.1".into(),stop.clone(),None).unwrap();
+        let (_hub,mut events)=CarLifeHub::connect(config,"127.0.0.1".into(),stop.clone(),None, || {}).unwrap();
         let mut authenticated=false;
         let mut frames=0;
         let mut first_idr=None;
         let result=tokio::time::timeout(Duration::from_secs(25),async {
             while let Some(event)=events.recv().await {
                 let (data,codec)=match event {
-                    CarLifeEvent::SourceReset=>{println!("SOURCE-PROBE +{}ms all_channels_event",began.elapsed().as_millis());continue;},
+                    CarLifeEvent::SourceReset { .. }=>{println!("SOURCE-PROBE +{}ms all_channels_event",began.elapsed().as_millis());continue;},
                     CarLifeEvent::EncoderResolution{width,height}=>{println!("SOURCE-PROBE +{}ms encoder={width}x{height}",began.elapsed().as_millis());continue;},
                     CarLifeEvent::Handshake=>{authenticated=true;println!("SOURCE-PROBE +{}ms proof_admission_encryption_complete_video_START_written",began.elapsed().as_millis());continue;},
                     CarLifeEvent::VideoFrame{data,..}=>(data,crate::video_format::VideoCodec::H264),

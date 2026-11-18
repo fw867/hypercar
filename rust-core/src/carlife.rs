@@ -150,6 +150,8 @@ pub struct CarLifeConfig {
 /// Authenticated seven-channel CarWith gateway with video/audio events and touch input.
 struct QueuedControl { bytes:Vec<u8>, expires:Option<std::time::Instant> }
 
+pub type DisplayRequest = tokio::sync::watch::Sender<(u32, u32)>;
+
 pub struct CarLifeHub {
     owned_tasks: Vec<tokio::task::JoinHandle<()>>,
     touch_state: Arc<Mutex<session::TouchGesture>>,
@@ -169,14 +171,15 @@ impl CarLifeHub {
     /// 这与参考实现 `CarLifeWirelessBox` 的 `HuRole.connect(phoneIp, port)` 一致。
     /// Android CarWith uses this active seven-channel loopback connection.
     pub fn connect(
-        cfg: CarLifeConfig, md_host: String, stop: Arc<Notify>, requested: Option<Arc<Mutex<(u32,u32)>>>,
+        cfg: CarLifeConfig, md_host: String, stop: Arc<Notify>, requested: Option<DisplayRequest>,
+        reopen_source: impl Fn() + Send + 'static,
     ) -> Result<(Self, mpsc::UnboundedReceiver<CarLifeEvent>), String> {
         let keyframe_request = Arc::new(Notify::new());
         let reset_request = keyframe_request.clone();
         let (events, event_rx) = mpsc::unbounded_channel();
         let (touch_tx, mut touch_rx) = mpsc::unbounded_channel::<QueuedControl>();
         let encoder_size = Arc::new(Mutex::new((cfg.width.max(2),cfg.height.max(2))));
-        let requested = requested.unwrap_or_else(|| Arc::new(Mutex::new((0,0))));
+        let requested = requested.unwrap_or_else(|| DisplayRequest::new((0,0)));
         let touch_state=Arc::new(Mutex::new(session::TouchGesture::default()));
         let round_touch=touch_state.clone();
         let queue = Arc::new(Mutex::new(Vec::<QueuedControl>::new()));
@@ -212,7 +215,7 @@ impl CarLifeHub {
                 emit_log("CARWITH-HS: all seven channels connected; start fresh 4.1 handshake");
                 queue.lock().clear();
                 *round_touch.lock()=session::TouchGesture::default();
-                let _ = events_task.send(CarLifeEvent::SourceReset);
+                let _ = events_task.send(CarLifeEvent::SourceReset { cache_cleared: None });
                 let state=session::Shared::new(Mutex::new(session::Session::default()));
                 let mut sockets=sockets.into_iter();
                 let cmd=sockets.next().unwrap();
@@ -241,7 +244,14 @@ impl CarLifeHub {
                 queue.lock().clear();
                 if let Some(mic) = config.microphone.as_ref() { mic.request(false); }
                 let _ = events_task.send(CarLifeEvent::Navigation(None));
-                emit_log(&format!("CARWITH-HS: round closed: {}",outcome.err().unwrap_or_else(||"ended".into())));
+                if outcome.is_ok() {
+                    // All producers for the old round have exited. Flush their queued events
+                    // and the replay cache before letting a reattached engine see the waiting period.
+                    if !wait_for_canvas_reopen(&events_task, &stop).await { return; }
+                    reopen_source();
+                    continue;
+                }
+                emit_log(&format!("CARWITH-HS: round closed: {}",outcome.unwrap_err()));
                 tokio::select! { _=stop.notified()=>return, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
             }
         });
@@ -307,6 +317,20 @@ impl CarLifeHub {
 impl Drop for CarLifeHub {
     fn drop(&mut self) {
         for task in &self.owned_tasks { task.abort(); }
+    }
+}
+
+pub(crate) async fn wait_for_canvas_reopen(events: &mpsc::UnboundedSender<CarLifeEvent>, stop: &Notify) -> bool {
+    let cleared = Arc::new(Notify::new());
+    let stopped = stop.notified();
+    if events.send(CarLifeEvent::SourceReset { cache_cleared: Some(cleared.clone()) }).is_err() { return false; }
+    tokio::select! {
+        biased;
+        _ = stopped => false,
+        _ = async {
+            cleared.notified().await;
+            tokio::time::sleep(Duration::from_secs(4)).await;
+        } => true,
     }
 }
 

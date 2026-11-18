@@ -156,9 +156,9 @@ object ShizukuTools {
      *
      * @param timeoutMs 等待进程退出的上限；超时后 destroy 并返回已收集的输出。
      */
-    suspend fun exec(command: String, timeoutMs: Long = 8_000): ExecResult {
+    suspend fun exec(command: String, timeoutMs: Long = 8_000, canStart: (() -> Boolean)? = null): ExecResult {
         assertNotMainThread(command)
-        return withContext(Dispatchers.IO) { doExec(command, timeoutMs) }
+        return withContext(Dispatchers.IO) { doExec(command, timeoutMs, canStart) }
     }
 
     /** 主线程守卫：记录并断言，绝不放行到进程等待。 */
@@ -170,11 +170,19 @@ object ShizukuTools {
         }
     }
 
-    private fun doExec(command: String, timeoutMs: Long): ExecResult {
+    /** Called on the dedicated MAC worker. Bound the shell child as well as the caller's wait. */
+    internal fun readBluetoothAddress(): ExecResult {
+        val command = "timeout 2 content query --uri content://settings/secure/bluetooth_address"
+        assertNotMainThread(command)
+        return doExec(command, 2_000)
+    }
+
+    private fun doExec(command: String, timeoutMs: Long, canStart: (() -> Boolean)? = null): ExecResult {
         val binder = rikka.shizuku.Shizuku.getBinder()
             ?: return ExecResult(-1, "", "Shizuku 未连接")
         return try {
             val service = IShizukuService.Stub.asInterface(binder)
+            if (canStart?.invoke() == false) return ExecResult(-1, "", "启动请求已失效")
             val process = service.newProcess(arrayOf("sh", "-c", command), null, null)
             // stderr 独立线程排空：否则 stderr 填满管道会让进程阻塞在写端、stdout 永远读不完
             val errRef = AtomicReference<ByteArray?>(null)

@@ -23,9 +23,10 @@ impl Feed {
     fn clear_video(&mut self) {self.gop.clear(); self.bytes=0; self.since=None;}
     fn receive(&mut self, event: CarLifeEvent) {
         match &event {
-            CarLifeEvent::SourceReset => {
+            CarLifeEvent::SourceReset { cache_cleared } => {
                 self.clear_video(); self.parameters.clear(); self.codec=None;
                 self.size=None; self.formats=[None,None,None]; self.handshake=false;
+                if let Some(cleared) = cache_cleared { cleared.notify_one(); }
             }
             CarLifeEvent::Handshake => self.handshake=true,
             CarLifeEvent::EncoderResolution{width,height} => {
@@ -78,7 +79,7 @@ impl Feed {
     }
     fn attach(&mut self)->mpsc::UnboundedReceiver<(CarLifeEvent, FrameOrigin)> {
         let (tx,rx)=mpsc::unbounded_channel();
-        let _=tx.send((CarLifeEvent::SourceReset, FrameOrigin::Live));
+        let _=tx.send((CarLifeEvent::SourceReset { cache_cleared: None }, FrameOrigin::Live));
         if self.handshake {let _=tx.send((CarLifeEvent::Handshake, FrameOrigin::Live));}
         for format in self.formats.iter().flatten() {let _=tx.send((format.clone(), FrameOrigin::Cached));}
         self.target=Some(tx); self.replay(); rx
@@ -95,7 +96,7 @@ impl Feed {
 
 struct Prepared {
     owner: u64, hub: Arc<CarLifeHub>, feed: Arc<Mutex<Feed>>,
-    display: Arc<Mutex<(u32,u32)>>, microphone: Option<Arc<crate::mic_probe::ProbeControl>>,
+    display: crate::carlife::DisplayRequest, microphone: Option<Arc<crate::mic_probe::ProbeControl>>,
     stop: Arc<Notify>, task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Prepared {
@@ -112,11 +113,12 @@ pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
     slot.current=None;slot.newest=owner;
     let stop=Arc::new(Notify::new());
     // A missing declaration uses the prewarm fallback for INIT only.
-    let display=Arc::new(Mutex::new(if cfg.carwith_cached_canvas { (cfg.width,cfg.height) } else { (0,0) }));
+    let display=crate::carlife::DisplayRequest::new(if cfg.carwith_cached_canvas { (cfg.width,cfg.height) } else { (0,0) });
     let microphone=cfg.carwith_microphone.then(||Arc::new(crate::mic_probe::ProbeControl::for_carwith()));
     let config=CarLifeConfig{width:cfg.width,height:cfg.height,fps:cfg.carwith_fps(),bt_address:cfg.device_id.clone(),
         bt_name:"HyperCar".into(),navigation_updates:cfg.carwith_navigation_enabled,microphone:microphone.clone()};
-    let (hub,mut events)=CarLifeHub::connect(config,"127.0.0.1".into(),stop.clone(),Some(display.clone()))?;
+    let (hub,mut events)=CarLifeHub::connect(config,"127.0.0.1".into(),stop.clone(),Some(display.clone()),
+        move || crate::reopen_carwith_entry(owner))?;
     let feed=Arc::new(Mutex::new(Feed::default()));let sink=feed.clone();
     let task=tokio::spawn(async move {while let Some(event)=events.recv().await {sink.lock().receive(event);}});
     slot.current=Some(Prepared{owner,hub:Arc::new(hub),feed,display,microphone,stop,task});
@@ -125,7 +127,7 @@ pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
 }
 pub(crate) struct Attachment {
     pub hub:Arc<CarLifeHub>, pub events:mpsc::UnboundedReceiver<(CarLifeEvent, FrameOrigin)>,
-    pub display:Arc<Mutex<(u32,u32)>>, pub microphone:Option<Arc<crate::mic_probe::ProbeControl>>,
+    pub display:crate::carlife::DisplayRequest, pub microphone:Option<Arc<crate::mic_probe::ProbeControl>>,
 }
 pub(crate) struct InputLease(pub Arc<CarLifeHub>);
 impl Drop for InputLease {fn drop(&mut self) {self.0.release_touch();}}
@@ -152,6 +154,38 @@ mod tests {
     use super::*;
     fn video(kind: u8) -> CarLifeEvent {
         CarLifeEvent::VideoFrame { pts_us: 1, data: vec![0,0,0,1,kind,8] }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn media_reattach_during_canvas_wait_cannot_replay_old_source_or_restart_timer() {
+        for pause in [true, false] {
+            let mut feed = Feed::default();
+            feed.receive(CarLifeEvent::EncoderResolution { width: 1024, height: 576 });
+            for nal in [0x67, 0x68, 0x65] { feed.receive(video(nal)); }
+            let (events, mut source) = mpsc::unbounded_channel();
+            let stop = Arc::new(Notify::new());
+            let owner_stop = stop.clone();
+            let waiting = tokio::spawn(async move {
+                crate::carlife::wait_for_canvas_reopen(&events, &owner_stop).await
+            });
+            let reset = source.recv().await.unwrap();
+            // Even a slow consumer must invalidate the old source before the four seconds start.
+            tokio::time::advance(Duration::from_secs(5)).await;
+            assert!(!waiting.is_finished());
+            feed.receive(reset);
+            tokio::task::yield_now().await;
+            for _ in 0..2 {
+                let mut engine = feed.attach();
+                assert!(matches!(engine.try_recv(), Ok((CarLifeEvent::SourceReset { .. }, _))));
+                assert!(matches!(engine.try_recv(), Ok((CarLifeEvent::VideoReplay, _))));
+                assert!(engine.try_recv().is_err(), "reattached engine got a retired resolution, parameter or IDR");
+            }
+            tokio::time::advance(Duration::from_millis(3999)).await;
+            assert!(!waiting.is_finished());
+            if pause { stop.notify_waiters(); }
+            else { tokio::time::advance(Duration::from_millis(1)).await; }
+            assert_eq!(waiting.await.unwrap(), !pause);
+        }
     }
     #[tokio::test]
     #[ignore = "requires Xiaomi phone; launch CarWith after READY; no car connection or input injection"]
@@ -210,7 +244,7 @@ mod tests {
         feed.receive(video(0x67)); feed.receive(video(0x68));
         feed.receive(video(0x65)); feed.receive(video(0x41));
         let mut rx = feed.attach();
-        assert!(matches!(rx.try_recv(),Ok((CarLifeEvent::SourceReset, _))));
+        assert!(matches!(rx.try_recv(),Ok((CarLifeEvent::SourceReset { .. }, _))));
         assert!(matches!(rx.try_recv(),Ok((CarLifeEvent::VideoReplay, _))));
         assert!(matches!(rx.try_recv(),Ok((CarLifeEvent::EncoderResolution{width:1920,..}, _))));
         let mut kinds = Vec::new();
@@ -263,7 +297,7 @@ mod tests {
         let stop = Arc::new(Notify::new());
         let pump = tokio::spawn(crate::engine::video_pump(
             stop.clone(), Default::default(), true,
-            Arc::new(Mutex::new(crate::pipeline::Pipeline::new())), installs, video, false, 30, None,
+            Arc::new(Mutex::new(crate::pipeline::Pipeline::new())), installs, video, None, 30, None,
         ));
         let ready = Instant::now();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -314,7 +348,7 @@ mod tests {
         let mut feed = Feed::default(); feed.receive(video(0x65));
         for _ in 0..300 {feed.receive(video(0x41));}
         assert!(feed.gop.is_empty());
-        feed.receive(video(0x65)); feed.receive(CarLifeEvent::SourceReset);
+        feed.receive(video(0x65)); feed.receive(CarLifeEvent::SourceReset { cache_cleared: None });
         feed.receive(video(0x41)); assert!(feed.gop.is_empty());
         assert!(feed.parameters.is_empty());
     }

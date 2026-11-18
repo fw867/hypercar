@@ -70,6 +70,7 @@ object HyperCarRepo {
     private val proactiveActivation = AtomicReference<ProactiveActivation?>(null)
     private val connectionDiagnostics = ConnectionDiagnostics(SystemClock::elapsedRealtime)
     @Volatile private var connectionAttemptId = 0L
+    private val carWithEntries = CarWithEntryGate()
 
     private fun finishDiagnostic(outcome: String, reason: String) {
         connectionDiagnostics.finish(connectionAttemptId, outcome, reason)
@@ -180,9 +181,7 @@ object HyperCarRepo {
     @Volatile
     private var airplayPort: Int = 0
 
-    /** 本轮用于 AirPlay 的手机身份。 */
-    @Volatile
-    private var sessionDeviceMac: String = ""
+    @Volatile private var fallbackToRemember: io.github.hypercar.net.PhoneIdentitySnapshot.Identity? = null
 
     /** 当前车机档案（设置里可切换；每次连接重新读取）。 */
     private val headUnitProfile: io.github.hypercar.headunit.HeadUnitProfile
@@ -514,6 +513,7 @@ object HyperCarRepo {
     private suspend fun softRestartInvitationWait(context: Context) {
         val attempt = connectionAttemptId
         log("CONNECT: 等待邀请中手动重试——结束 attempt=$attempt 后重新开始，不创建10分钟暂停")
+        carWithEntries.retire(attempt)
         reconnectBudget.clear()
         userDisconnectRequested = false
         awaitingCarInvitation = false
@@ -564,6 +564,7 @@ object HyperCarRepo {
             "${profile.id} remote=${io.github.hypercar.headunit.RemoteProfiles.isRemote(profile.id)} " +
                 "activation=${profile.requireAirplayActivation} outbound=${profile.allowOutboundIap2} " +
                 "profileGuard=${profile.dropProfilesBeforeIap2}")
+        if (sessionCarWithMode) carWithEntries.begin(connectionAttemptId)
         sessionLive.set(true)
         standbyEndpoint.get()?.bluetoothHotspot?.let { announcedHotspot.compareAndSet(null, connectionAttemptId to it) }
         log(connectionDiagnostics.report().last())
@@ -652,7 +653,15 @@ object HyperCarRepo {
         log("TARGET: 用户目标=${target ?: "自动"}，已清除旧 ACL 候选；入站过滤立即生效，已建立会话保持")
     }
 
-    fun disconnect(expectedAttempt: Long) = disconnect(userInitiated = true, expectedAttempt = expectedAttempt, reason = "用户断开当前会话")
+    fun disconnect(expectedAttempt: Long) {
+        // Invalidate on the tap, before the asynchronous stop can wait on the previous connect job.
+        when (ConnectionStopPolicy.decide(true, expectedAttempt, connectionAttemptId, hasCurrentSession,
+                _snapshots.value.link, SettingsStore.autoConnect)) {
+            ConnectionStopPolicy.Decision.STOP, ConnectionStopPolicy.Decision.STOP_AND_PAUSE -> carWithEntries.retire(expectedAttempt)
+            else -> Unit
+        }
+        disconnect(userInitiated = true, expectedAttempt = expectedAttempt, reason = "用户断开当前会话")
+    }
 
     private fun clearAutomaticPause(context: Context, reason: String) {
         val hadPause = SettingsStore.automaticPause.isNotEmpty()
@@ -685,6 +694,7 @@ object HyperCarRepo {
                     log("SESSION-CONTROL: 忽略停止请求 decision=$decision user=$userInitiated expected=$attempt current=$connectionAttemptId state=${_snapshots.value.link.javaClass.simpleName}")
                     return@launch
                 }
+                carWithEntries.retire(attempt)
                 if (decision == ConnectionStopPolicy.Decision.STOP_AND_PAUSE) {
                     reconnectBudget.clear()
                     appContext()?.let { io.github.hypercar.autowake.AutomaticConnectionResume.pause(it) }
@@ -793,10 +803,7 @@ object HyperCarRepo {
             context,
             targetMac = { SettingsStore.targetCarMac },
             preferredMac = { aclCarMac },
-            deviceMacProvider = {
-                sessionDeviceMac.takeIf { sessionLive.get() && it.isNotBlank() }
-                    ?: BluetoothMac.resolveOrStable(force = true)
-            },
+            deviceMacProvider = BluetoothMac::resolve,
             dropProfilesBeforeIap2 = profile.dropProfilesBeforeIap2,
             allowOutboundIap2 = profile.allowOutboundIap2,
             log = ::log,
@@ -1134,16 +1141,17 @@ object HyperCarRepo {
             // WinPlay 就是拿它和「目标蓝牙设备」（Windows 里配对的经典蓝牙地址）比，
             // 不一致直接对会话级 SETUP 回 403（cpStack.ts 的 deviceFilter）。
             // 所以这里明确区分「真实 MAC」和「伪 MAC」，伪 MAC 时把后果写进日志。
-            sessionDeviceMac = ""
-            val deviceMac = coordinatorFor(context).deviceMacForSession()
-            sessionDeviceMac = deviceMac
+            val coordinator = coordinatorFor(context)
+            val phoneIdentity = coordinator.identityForSession()
+            val deviceMac = phoneIdentity.address
+            fallbackToRemember = phoneIdentity.takeIf { SettingsStore.manualBtMac == null && deviceMac == SettingsStore.stableDeviceId }
             if (sessionCarWithMode && !prepareCarWithSource(context, diagnosticId, deviceMac, wakePeer)) {
                 fail("CarWith 源端守候服务准备失败")
                 return
             }
             log(when {
+                SettingsStore.manualBtMac.equals(deviceMac, ignoreCase = true) -> "BT: 使用高级设置已保存的手机标识；iAP2、mDNS 与 AirPlay 共用"
                 deviceMac == SettingsStore.stableDeviceId -> "BT: 使用已有稳定手机标识；真实蓝牙地址未取得，严格接收端仍可能拒绝"
-                SettingsStore.manualBtMac.equals(deviceMac, ignoreCase = true) -> "BT: 使用手动指定手机标识；iAP2、mDNS 与 AirPlay 共用"
                 else -> "BT: 使用已解析手机标识；iAP2、mDNS 与 AirPlay 共用"
             })
 
@@ -1158,8 +1166,6 @@ object HyperCarRepo {
                     "断HFP/A2DP=${p.dropProfilesBeforeIap2} 主动拨号=${p.allowOutboundIap2} 档案A退场=${p.abortWhenCarPlayWindowClosed} " +
                     "当前WiFi广播=${p.advertiseOnCurrentWifi} 新鲜邀请=${p.requireFreshCtrlInvite}"
             )
-            val coordinator = coordinatorFor(context)
-
             // 等「可用」端点（有 IP），而不是等第一个回调：iAP2 两条消息分工不同——
             // 0x5703 只带热点凭据（无 IP/端口），0x4301 才带 AirPlay 端口与车机地址，
             // 谁先到由车机决定。WinPlay 实测 0x5703 先到、0x4301 晚 143ms：
@@ -1482,6 +1488,7 @@ object HyperCarRepo {
         keepListening: Boolean = AutomaticConnectionPolicy.keepListeningAfterStop(SettingsStore.autoConnect, automaticPauseRemaining > 0),
         graceful: Boolean = false,
     ) {
+        carWithEntries.retire(connectionAttemptId)
         videoCapabilityGeneration.incrementAndGet()
         SettingsStore.videoCapabilities.clear()
         // 幂等：重复的断开事件（ACL 断开广播 + 引擎 ended + service 转交）只真正拆一次。
@@ -1613,7 +1620,7 @@ object HyperCarRepo {
         val previousNetwork = boundNetwork
         if (previousNetwork != null && cm?.boundNetworkForProcess == previousNetwork)
             runCatching { cm.bindProcessToNetwork(null) }
-        sessionDeviceMac = ""
+        fallbackToRemember = null
         iap2?.invalidatePhoneIdentity()
         boundNetwork = null
         wifiReceiverMac = null
@@ -2063,8 +2070,7 @@ object HyperCarRepo {
      * 缺定位权限时它会返回 `<unknown ssid>`（HyperOS 常见），此时退回 Shizuku 的
      * `cmd wifi status`（与 WifiJoiner 同源的解析，一直可读）。
      */
-    private suspend fun currentWifiSsid(context: Context): String? {
-        val fromApi =
+    private fun wifiSsidFromApi(context: Context): String? =
             runCatching {
                 (context.getSystemService(Context.WIFI_SERVICE) as? android.net.wifi.WifiManager)
                     ?.connectionInfo
@@ -2072,7 +2078,9 @@ object HyperCarRepo {
                     ?.trim('"')
                     ?.takeIf { it.isNotBlank() && !it.contains("unknown", ignoreCase = true) }
             }.getOrNull()
-        if (fromApi != null) return fromApi
+
+    private suspend fun currentWifiSsid(context: Context): String? {
+        wifiSsidFromApi(context)?.let { return it }
         if (!ShizukuTools.isReady) return null
         val out = runCatching { ShizukuTools.exec("cmd wifi status", 3_000) }.getOrNull()?.out
         val match = out?.let { Regex("connected\\s+to\\s+\"([^\"]*)\"").find(it) }
@@ -2481,6 +2489,11 @@ object HyperCarRepo {
                 next.generation >= _snapshots.value.pipeline.generation) {
                 reconnectBudget.videoReady(retryReceiver(), SystemClock.elapsedRealtime())
                 connectionDiagnostics.mark(connectionAttemptId, ConnectionDiagnostics.Stage.FIRST_VIDEO_FRAME)
+                fallbackToRemember?.let { identity ->
+                    fallbackToRemember = null
+                    if (SettingsStore.savedPhoneMac.remember(identity.settingsRevision, identity.address))
+                        log("BT: 已将成功推流的稳定手机标识保存到高级设置")
+                }
             }
             _snapshots.update { s ->
                 if ((s.link !is LinkState.Negotiating && s.link !is LinkState.Connected) ||
@@ -2624,6 +2637,16 @@ object HyperCarRepo {
         }
 
         override fun onLog(line: String) = log(line)
+
+        override fun onCarWithReopen(attempt: Long) {
+            if (!carWithEntries.claimReopen(attempt)) return
+            scope.launch {
+                val ctx = appContext() ?: return@launch
+                if (!sessionLive.get() || connectionAttemptId != attempt || !sessionCarWithMode) return@launch
+                log("CARWITH-SIZE: 车机画布迟到，重新启动本机 CarWith 入口 attempt=$attempt")
+                log("CARWITH-SIZE: " + launchCarWith(ctx, attempt))
+            }
+        }
 
         override fun onForceKeyFrame() {
             io.github.hypercar.carui.CarUiCaster.requestKeyFrame()
@@ -3046,6 +3069,7 @@ object HyperCarRepo {
             try {
                 if (expectedEngine != null && !engineCallbacks.isCurrent(expectedEngine)) return@launch
                 if (expectedAttempt != connectionAttemptId || !sessionLive.compareAndSet(true, false)) return@launch
+                carWithEntries.retire(expectedAttempt)
                 val receiver = retryReceiver()
                 val hadLink = sessionHadLink
                 sessionSockets?.invalidate()
@@ -3493,9 +3517,13 @@ object HyperCarRepo {
         fun current() = sessionLive.get() && connectionAttemptId == diagnosticId
         if (!current()) return false
         // Known-Wi-Fi wakes run before resumeKnownCarNetwork populates wifiReceiverMac.
-        val key = PairingEvidence.canvasKey(headUnitProfile.id, iap2?.activePeerAddress,
+        val profile = headUnitProfile.id
+        val key = PairingEvidence.canvasKey(profile, iap2?.activePeerAddress,
             wakePeer, wifiReceiverMac, aclCarMac, SettingsStore.targetCarMac)
-        val cached = SettingsStore.carWithCanvas(key)
+            ?: if (profile in setOf("bmw_id85", "bmw_id9")) {
+                PairingEvidence.canvasKey(profile, knownWifiReceiver(wifiSsidFromApi(context)))
+            } else null
+        val cached = PairingEvidence.cachedCanvas(key, SettingsStore::carWithCanvas)
         val canvas = cached ?: (1920 to 1080)
         val config = org.json.JSONObject(SettingsStore.engineConfigJson("127.0.0.1", 0, deviceMac, "",
             carWithSource = true)).put("width", canvas.first).put("height", canvas.second)
@@ -3516,7 +3544,7 @@ object HyperCarRepo {
                 if (!current()) return@launch
                 log("CARWITH: 七路守候与接收服务就绪；启动源端 attempt=$diagnosticId；独立保持至本轮连接结束")
                 val launchTime = System.currentTimeMillis()
-                val result = launchCarWith(context)
+                val result = launchCarWith(context, diagnosticId)
                 if (!current()) return@launch
                 val version = runCatching {
                     context.packageManager.getPackageInfo("com.miui.carlink", 0).let { "${it.versionName}/${it.longVersionCode}" }
@@ -3539,21 +3567,6 @@ object HyperCarRepo {
 
     /** 重启时从落盘日志带回环形缓冲的行数（够覆盖崩溃前的一段现场）。 */
     private const val DISK_LOG_TAIL_LINES = 400
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     /**
      * CarWith 模式入口（2026-11-03）。
@@ -3566,21 +3579,25 @@ object HyperCarRepo {
      * 否则入口会被静默丢弃（7240 一直 ECONNREFUSED）。不再检查/冻结任何包。
      */
 
-    private suspend fun launchCarWith(ctx: android.content.Context): String {
+    private suspend fun launchCarWith(ctx: android.content.Context, attempt: Long): String {
         // Do not probe 7240 with a disposable client: it consumes a real CarLife connection.
         val comp = "com.miui.carlink/com.miui.carlink.castfwk.usb.CarlifeAdbActivity"
         var shellStatus = "Shizuku 未就绪"
-        if (ShizukuTools.isReady) {
-            val result = runCatching { ShizukuTools.exec("am start -n $comp", 8_000) }.getOrNull()
+        val launched = carWithEntries.launch(attempt, shell = {
+            if (!ShizukuTools.isReady) return@launch false
+            val result = runCatching { ShizukuTools.exec("am start -n $comp", 8_000) { carWithEntries.current(attempt) } }.getOrNull()
             kotlinx.coroutines.currentCoroutineContext().ensureActive()
             shellStatus = result?.let { "am start exit=${it.code} out=${it.out.take(320)} err=${it.err.take(240)}" }
                 ?: "am start 未取得结果"
-            if (result?.ok == true) return shellStatus
-        }
-        return runCatching {
-            ctx.startActivity(android.content.Intent().setComponent(
-                android.content.ComponentName("com.miui.carlink", "com.miui.carlink.castfwk.usb.CarlifeAdbActivity"))
-                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
-            "$shellStatus；startActivity($comp) 已调用"
-        }.getOrElse { "$shellStatus；startActivity($comp) 失败 ${it.javaClass.simpleName}" }
+            result?.ok == true
+        }, fallback = {
+            shellStatus += runCatching {
+                ctx.startActivity(android.content.Intent().setComponent(
+                    android.content.ComponentName("com.miui.carlink", "com.miui.carlink.castfwk.usb.CarlifeAdbActivity"))
+                    .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+                "；startActivity($comp) 已调用"
+            }.getOrElse { "；startActivity($comp) 失败 ${it.javaClass.simpleName}" }
+        })
+        return if (launched) shellStatus else "已跳过过期 CarWith 启动 attempt=$attempt"
     }
+}

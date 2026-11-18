@@ -75,7 +75,7 @@ pub struct AirplayParams {
     /// 避免被 `/info` 的车机显示尺寸覆盖后把 HID 坐标缩放到画布外。
     pub touch_size: Arc<Mutex<(u32, u32)>>,
     /// CarWith-only requested canvas. None leaves the self-rendered display path unchanged.
-    pub carwith_display: Option<Arc<Mutex<(u32, u32)>>>,
+    pub carwith_display: Option<crate::carlife::DisplayRequest>,
     pub carwith_stretch: bool,
     pub screen_resource_lifecycle: bool,
     pub pipeline: Arc<Mutex<crate::pipeline::Pipeline>>,
@@ -149,10 +149,10 @@ pub async fn negotiate(
     // CarWith prewarms before pairing. Give its encoder INIT this receiver's
     // declaration as soon as we have it, even on the first uncached connection.
     let early_carwith_display = p.carwith_display.as_ref().and_then(|requested| {
-        let display = select_display(&info)?;
+        let display = if p.id9_screen_bootstrap { select_id9_display(&info) } else { select_display(&info) }?;
         let size = read_display_size(display);
         if size.0 < 2 || size.1 < 2 { return None; }
-        *requested.lock() = size;
+        requested.send_replace(size);
         emit_log(&format!("CARWITH-SIZE: pre-SETUP /info display={}x{}", size.0, size.1));
         Some(size)
     });
@@ -362,7 +362,7 @@ pub async fn negotiate(
         .unwrap_or((0, 0));
     p.pipeline.lock().display_size = (disp_w >= 2 && disp_h >= 2).then_some((disp_w,disp_h));
     if let Some(requested) = &p.carwith_display {
-        if disp_w >= 2 && disp_h >= 2 { *requested.lock() = (disp_w, disp_h); }
+        if disp_w >= 2 && disp_h >= 2 { requested.send_replace((disp_w, disp_h)); }
     }
     // 车机能力位图：判断是否支持 HEVC 等能力，只能靠它（codec 由本机编码器决定）
     let car_features = info.get("features").and_then(Value::as_int).unwrap_or(0);
@@ -1392,6 +1392,20 @@ mod display_size_tests {
         assert_eq!(surface.viewport((1920,1080)),Some((10,20,1600,900)));
     }
     #[test]
+    fn only_id9_media_aac_changes_car_latency() {
+        for (profile,codec,expected) in [
+            ("bmw_id9", AudioCodec::Aac, 250), ("bmw_id9", AudioCodec::Aac441, 250),
+            ("bmw_id9", AudioCodec::Pcm, 0), ("bmw_id85", AudioCodec::Aac, 0),
+            ("mbux", AudioCodec::Aac, 0), ("bmw_id6", AudioCodec::Aac441, 0),
+        ] {
+            let body = bplist::parse(&build_audio_setup_for_codec(42, media_latency_ms(false, profile, codec), codec)).unwrap();
+            let stream = &body.get("streams").unwrap().as_array().unwrap()[0];
+            assert_eq!(stream.get("audioLatencyMs").and_then(Value::as_int), Some(expected));
+            assert_eq!(stream.get("audioType").and_then(Value::as_str), Some("media"));
+        }
+    }
+
+    #[test]
     fn desktop_pcm_setup_uses_positive_latency_and_keeps_car_parameters() {
         for desktop in [false,true] {
             let body=bplist::parse(&build_audio_setup(42,desktop)).unwrap();
@@ -1417,7 +1431,7 @@ mod display_size_tests {
             ("type",Value::int(102)),("audioType",Value::str("media")),("audioInputFormats",Value::int(1<<22))])]))]);
         assert!(nbt_audio_candidates(&input,"auto").is_empty());
         for codec in [AudioCodec::Aac441,AudioCodec::Aac] {
-            let setup=bplist::parse(&build_audio_setup_for_codec(42,false,codec)).unwrap();
+            let setup=bplist::parse(&build_audio_setup_for_codec(42,0,codec)).unwrap();
             let stream=&setup.get("streams").unwrap().as_array().unwrap()[0];
             for (key,value) in [("type",102),("sr",codec.rate() as i64),("audioFormat",codec.format()),("spf",1024),("ct",4)] {
                 assert_eq!(stream.get(key).and_then(Value::as_int),Some(value));
@@ -1439,7 +1453,7 @@ mod display_size_tests {
         assert_eq!(audio_candidates(&info(vec![format(102,"telephony",1<<23)]),"auto",true),vec![]);
         assert_eq!(audio_candidates(&info(vec![format(100,"media",1<<23)]),"auto",true),vec![]);
         assert_eq!(audio_candidates(&info(vec![]),"auto",false),vec![AudioCodec::Pcm]);
-        let setup=bplist::parse(&build_audio_setup_for_codec(42,true,AudioCodec::Aac)).unwrap();
+        let setup=bplist::parse(&build_audio_setup_for_codec(42,250,AudioCodec::Aac)).unwrap();
         let stream=&setup.get("streams").unwrap().as_array().unwrap()[0];
         for (key,value) in [("type",102),("audioFormat",1<<23),("spf",1024),("ct",4),("sr",48000)] {
             assert_eq!(stream.get(key).and_then(Value::as_int),Some(value));
@@ -2128,15 +2142,19 @@ fn audio_candidates(info: &Value, preference: &str, strict: bool) -> Vec<AudioCo
     if preference != "pcm" && aac && !result.contains(&AudioCodec::Aac) { result.push(AudioCodec::Aac); }
     result
 }
+fn media_latency_ms(desktop: bool, profile: &str, codec: AudioCodec) -> i64 {
+    if desktop || (profile == "bmw_id9" && codec.stream_type() == 102) { 250 } else { 0 }
+}
+
 #[cfg(test)]
-fn build_audio_setup(conn_id: i64, desktop: bool) -> Vec<u8> { build_audio_setup_for_codec(conn_id, desktop, AudioCodec::Pcm) }
-fn build_audio_setup_for_codec(conn_id: i64, desktop: bool, codec: AudioCodec) -> Vec<u8> {
+fn build_audio_setup(conn_id: i64, desktop: bool) -> Vec<u8> { build_audio_setup_for_codec(conn_id, media_latency_ms(desktop, "", AudioCodec::Pcm), AudioCodec::Pcm) }
+fn build_audio_setup_for_codec(conn_id: i64, latency_ms: i64, codec: AudioCodec) -> Vec<u8> {
     let mut stream = vec![
         ("type", Value::int(codec.stream_type())),
         ("streamConnectionID", Value::int(conn_id)),
         ("audioFormat", Value::int(codec.format())),
         ("audioType", Value::str("media")),
-        ("audioLatencyMs", Value::int(if desktop { 250 } else { 0 })),
+        ("audioLatencyMs", Value::int(latency_ms)),
         ("input", Value::bool(false)),
         ("supportsRTPPacketRedundancy", Value::bool(false)),
         ("spf", Value::int(codec.spf())),
@@ -2161,8 +2179,9 @@ pub(crate) async fn negotiate_audio(
         }
     } else { None };
     let conn_id = random_positive_i64();
-    let body = build_audio_setup_for_codec(conn_id, desktop, codec);
-    emit_log(&format!("AUDIO: SETUP {codec:?} {}Hz stereo SPF{} desktop={desktop} latencyMs={}", codec.rate(), codec.spf(), if desktop {250} else {0}));
+    let latency_ms = media_latency_ms(desktop, &p.head_unit_profile, codec);
+    let body = build_audio_setup_for_codec(conn_id, latency_ms, codec);
+    emit_log(&format!("AUDIO: SETUP {codec:?} {}Hz stereo SPF{} desktop={desktop} latencyMs={latency_ms}", codec.rate(), codec.spf()));
     // 音频 SETUP 必须用**绝对 URI**（cardeck runAudioStream 同款：`rtsp://host:port/`）；
     // 屏幕流与初始 SETUP 才用相对路径。URI 用反会 400/404。
     let audio_uri = crate::rtsp_uri::audio_uri(&p.car_ip, p.airplay_port);

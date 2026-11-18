@@ -15,6 +15,7 @@ internal class EngineEventListener(
             target.onLog("CORE-CALLBACK: 忽略旧引擎状态 owner=$owner current=${gate.current()} state=$state")
     }
     override fun onLog(line: String) = target.onLog(line) // Keep old cleanup diagnostics.
+    override fun onCarWithReopen(attempt: Long) = target.onCarWithReopen(attempt) // The source belongs to the connection attempt.
     override fun onPipeline(json: String) = deliver { target.onPipeline(json) }
     override fun onCarWithNavigation(token: Long, json: String) = deliver { target.onCarWithNavigation(token, json) }
     override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) =

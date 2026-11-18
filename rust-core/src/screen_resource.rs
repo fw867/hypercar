@@ -296,7 +296,7 @@ mod tests {
                 carwith_display:None,carwith_stretch:false,screen_resource_lifecycle:true,pipeline:pipeline.clone(),
             };
             let (commands,rx)=mpsc::channel(2);let (source,video_rx)=mpsc::unbounded_channel();
-            let pump=tokio::spawn(video_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(PumpStat::default())),true,pipeline,rx,video_rx,false,30,None));
+            let pump=tokio::spawn(video_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(PumpStat::default())),true,pipeline,rx,video_rx,None,30,None));
             let owned=Arc::new(AtomicBool::new(modes.screen_owned()));
             let session=Arc::new(ScreenSession {control,factory:Arc::new(Factory),params,shared:Some([9;32]),uuid:"screen-test".into(),
                 hevc_allowed:false,keep_stats:false,software_receiver:false,display:(1920,720),owned,commands,bootstrap_event:None,bootstrap_hids:Vec::new(),activated:AtomicBool::new(!mbux),resource_state:tokio::sync::Mutex::new(Default::default())});
@@ -963,7 +963,7 @@ mod tests {
         }).await.unwrap();
         {let mut m=modes.lock();borrow(&mut m,100);m.request_ui();assert!(m.screen_owned());}
         let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
-        let pump=tokio::spawn(video_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(PumpStat::default())),true,pipeline,rx,video_rx,false,30,None));
+        let pump=tokio::spawn(video_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(PumpStat::default())),true,pipeline,rx,video_rx,None,30,None));
         assert!(!tokio::time::timeout(Duration::from_secs(1),accepted).await.unwrap().unwrap());
         let mut byte=[0];assert_eq!(peer.read(&mut byte).await.unwrap(),0);
         pump.abort();drop(source);

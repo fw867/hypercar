@@ -220,7 +220,8 @@ pub async fn run_engine(
                                 let queued = carwith_ui.try_send(()).is_ok();
                                 emit_log(&format!("CARWITH-UI: GO_TO_DESKTOP -> AirPlay requestUI queued={queued}"));
                             }
-                            CarLifeEvent::SourceReset => {
+                            CarLifeEvent::SourceReset { .. } => {
+                                *carwith_touch_size.lock() = (0, 0);
                                 crate::emit_carwith_navigation(navigation_token,None);
                                 let _ = voice_keys.send(crate::voice_key::RESET); let _ = vtx.send(SourceEvent::ResetVideoSource);
                                 let _=atx.send(SourceEvent::AudioStop{tts:true});
@@ -344,7 +345,7 @@ pub async fn run_engine(
     let (screen_ready_tx, screen_ready_rx) = mpsc::channel::<crate::screen_session::ScreenCommand>(2);
     let video_stats = Arc::new(Mutex::new(PumpStat::default()));
     tasks.spawn(video_pump(stop.clone(), video_stats.clone(), cfg.screen_resource_lifecycle,
-        pipeline.clone(), screen_ready_rx, video_rx, cfg.carlife_source, cfg.carwith_fps(),
+        pipeline.clone(), screen_ready_rx, video_rx, cfg.carlife_source.then(|| cfg.head_unit_profile.clone()), cfg.carwith_fps(),
         cfg.carlife_source.then_some(cfg.carwith_source_owner)));
 
     // ---- 音频泵：重采样 + 闪避混音 + RTP ----
@@ -821,9 +822,11 @@ pub(crate) async fn video_pump(
     video_pipeline: Arc<Mutex<crate::pipeline::Pipeline>>,
     mut screen_ready_rx: mpsc::Receiver<crate::screen_session::ScreenCommand>,
     video_rx: mpsc::UnboundedReceiver<SourceEvent>,
-    transcode:bool, fps:u32, source_owner:Option<u64>,
+    carwith_profile: Option<String>, fps:u32, source_owner:Option<u64>,
 ) {
+    let transcode = carwith_profile.is_some();
     let mut converter=crate::video_transcode::Router::new(transcode,fps,crate::video_transcode::hardware_factory());
+    converter.fit_oversize_display = carwith_profile.as_deref() == Some("bmw_id9");
     let mut converted=std::collections::VecDeque::new();
     let mut sender: Option<ScreenSender> = None;
     let mut commands_open = true;
@@ -1039,7 +1042,7 @@ mod video_pump_tests {
             let (commands,rx)=mpsc::channel(2);let (source,video_rx)=mpsc::unbounded_channel();
             let stats=Arc::new(Mutex::new(PumpStat::default()));let stop=Arc::new(Notify::new());
             let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
-            let pump=crate::callback_context::spawn(video_pump(stop.clone(),stats.clone(),recovery,pipeline,rx,video_rx,false,30,None));
+            let pump=crate::callback_context::spawn(video_pump(stop.clone(),stats.clone(),recovery,pipeline,rx,video_rx,None,30,None));
             commands.send(crate::screen_session::ScreenCommand::Install(ScreenSender::new(
                 write,crate::screen::ScreenCipher::ChaCha([7;32]),1920,720,false,
             ))).await.unwrap();
@@ -1263,7 +1266,7 @@ struct AudioPumpStat {
 pub enum CarLifeEvent {
     GoToDesktop,
     Navigation(Option<crate::carlife::navigation::NavigationUpdate>),
-    SourceReset,
+    SourceReset { cache_cleared: Option<Arc<Notify>> },
     /// Replay for a new screen transport without resetting active audio/navigation.
     VideoReplay,
     Handshake,

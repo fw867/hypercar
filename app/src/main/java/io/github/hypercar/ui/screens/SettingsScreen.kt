@@ -74,7 +74,6 @@ import kotlinx.coroutines.launch
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
-import io.github.hypercar.net.BluetoothMac
 import io.github.hypercar.perm.AppPermissions
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.settings.SettingsStore
@@ -373,7 +372,7 @@ private fun ShizukuState.hint(): String = when (this) {
 @Composable
 private fun IdentitySection() {
     var dialogVisible by remember { mutableStateOf(false) }
-    var version by remember { mutableIntStateOf(0) }
+    val version = io.github.hypercar.settings.SettingsRevision.value
     val manual = remember(version) { SettingsStore.manualBtMac }
     val pseudo = remember(version) { SettingsStore.stableDeviceId }
 
@@ -395,9 +394,9 @@ private fun IdentitySection() {
                     )
                     Text(
                         text = if (manual != null) {
-                            "手动指定 · 所有协议身份都用它（与 Shizuku 无关，关掉也生效）"
+                            "已保存，下次连接继续使用此地址"
                         } else {
-                            "自动：有 Shizuku 用真实 MAC，否则用稳定伪 ID（$pseudo）"
+                            "自动获取地址；备用标识为 $pseudo"
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = TextSecondary,
@@ -417,9 +416,8 @@ private fun IdentitySection() {
             }
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "车机用这个值标识本机（AirPlay 会话 SETUP 的 deviceID）。宝马/iD8.5 不校验，" +
-                    "WinPlay 与部分奥迪会校验——连不上且日志提示 403 就填真值。" +
-                    "填好后与 Shizuku 无关，关掉不影响；改完下次连接生效。",
+                text = "Shizuku 读到真实地址后自动保存。使用备用标识时，首次成功写出视频帧后保存。" +
+                    "可手动修改或清除，改动在下次连接生效。",
                 style = MaterialTheme.typography.labelSmall,
                 color = TextSecondary.copy(alpha = 0.75f),
                 maxLines = 3,
@@ -434,16 +432,12 @@ private fun IdentitySection() {
             onDismiss = { dialogVisible = false },
             onCleared = {
                 SettingsStore.manualBtMac = null
-                BluetoothMac.invalidate()
                 HyperCarRepo.refreshSystemState()
-                version++
                 dialogVisible = false
             },
             onSaved = { value ->
                 SettingsStore.manualBtMac = value
-                BluetoothMac.invalidate()
                 HyperCarRepo.refreshSystemState()
-                version++
                 dialogVisible = false
             },
         )
@@ -460,7 +454,7 @@ private fun ManualBtMacDialog(
 ) {
     var text by rememberSaveable { mutableStateOf(initial) }
     val trimmed = text.trim()
-    val valid = Regex("([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}").matches(trimmed)
+    val valid = io.github.hypercar.net.PhoneIdentitySnapshot.normalize(trimmed) != null
 
     Dialog(
         onDismissRequest = onDismiss,
