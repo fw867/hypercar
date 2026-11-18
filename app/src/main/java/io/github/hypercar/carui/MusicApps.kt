@@ -29,6 +29,7 @@ object MusicApps {
         "com.spotify.music",        // Spotify
         "com.apple.android.music",  // Apple Music
         "cmccwm.mobilemusic",       // 咪咕音乐
+        "com.huawei.music",         // 华为音乐
     )
 
     fun installed(context: Context): List<Entry> {

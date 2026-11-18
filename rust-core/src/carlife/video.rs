@@ -27,6 +27,10 @@ pub(super) struct VideoParser {
 }
 
 impl VideoParser {
+    #[cfg(test)]
+    pub(super) fn probe_parameters(&self) -> (bool, bool, bool) {
+        (self.vps.is_some(), self.sps.is_some(), self.pps.is_some())
+    }
     pub fn push(&mut self, payload: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
         self.push_tagged(payload).map(|units| units.into_iter().map(|unit| unit.data).collect())
     }

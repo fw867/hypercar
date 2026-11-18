@@ -70,7 +70,7 @@ object HyperCarRepo {
     private val proactiveActivation = AtomicReference<ProactiveActivation?>(null)
     private val connectionDiagnostics = ConnectionDiagnostics(SystemClock::elapsedRealtime)
     @Volatile private var connectionAttemptId = 0L
-    private val carWithEntries = CarWithEntryGate()
+    private val carWithEntries = CarWithEntryGate { RustCoreBridge.nativeStopCarWith(it) }
 
     private fun finishDiagnostic(outcome: String, reason: String) {
         connectionDiagnostics.finish(connectionAttemptId, outcome, reason)
@@ -1146,7 +1146,7 @@ object HyperCarRepo {
             val deviceMac = phoneIdentity.address
             fallbackToRemember = phoneIdentity.takeIf { SettingsStore.manualBtMac == null && deviceMac == SettingsStore.stableDeviceId }
             if (sessionCarWithMode && !prepareCarWithSource(context, diagnosticId, deviceMac, wakePeer)) {
-                fail("CarWith 源端守候服务准备失败")
+                if (carWithEntries.current(diagnosticId)) fail("CarWith 源端守候服务准备失败")
                 return
             }
             log(when {
@@ -3514,7 +3514,7 @@ object HyperCarRepo {
     private const val DISK_LOG_MAX_BYTES = 1_500_000L
 
     private fun prepareCarWithSource(context: Context, diagnosticId: Long, deviceMac: String, wakePeer: String?): Boolean {
-        fun current() = sessionLive.get() && connectionAttemptId == diagnosticId
+        fun current() = sessionLive.get() && carWithEntries.current(diagnosticId)
         if (!current()) return false
         // Known-Wi-Fi wakes run before resumeKnownCarNetwork populates wifiReceiverMac.
         val profile = headUnitProfile.id

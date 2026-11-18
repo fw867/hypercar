@@ -2,8 +2,8 @@
 use std::{collections::VecDeque, sync::Arc, time::{Duration, Instant}};
 use parking_lot::Mutex;
 use once_cell::sync::Lazy;
-use tokio::sync::{mpsc, Notify};
-use crate::{engine::{CarLifeEvent, EngineConfig}, carlife::{CarLifeConfig, CarLifeHub}, video_format::{FrameOrigin, VideoCodec}};
+use tokio::sync::mpsc;
+use crate::{engine::{CarLifeEvent, EngineConfig}, carlife::{CarLifeConfig, CarLifeHub, DialStop}, video_format::{FrameOrigin, VideoCodec}};
 
 const MAX_GOP_BYTES: usize = 4 * 1024 * 1024;
 const MAX_GOP_FRAMES: usize = 180;
@@ -97,10 +97,10 @@ impl Feed {
 struct Prepared {
     owner: u64, hub: Arc<CarLifeHub>, feed: Arc<Mutex<Feed>>,
     display: crate::carlife::DisplayRequest, microphone: Option<Arc<crate::mic_probe::ProbeControl>>,
-    stop: Arc<Notify>, task: tokio::task::JoinHandle<()>,
+    stop: Arc<DialStop>, task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Prepared {
-    fn drop(&mut self) {self.stop.notify_waiters(); self.task.abort(); if let Some(mic)=&self.microphone {mic.request(false);}}
+    fn drop(&mut self) {self.stop.cancel(); self.task.abort(); if let Some(mic)=&self.microphone {mic.request(false);}}
 }
 #[derive(Default)]
 struct Slot {newest:u64, current:Option<Prepared>}
@@ -111,7 +111,7 @@ pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
     if slot.current.as_ref().is_some_and(|s|s.owner==owner) {return Ok(());}
     if owner==0 || owner<=slot.newest {return Err("stale CarWith source owner".into());}
     slot.current=None;slot.newest=owner;
-    let stop=Arc::new(Notify::new());
+    let stop=Arc::new(DialStop::default());
     // A missing declaration uses the prewarm fallback for INIT only.
     let display=crate::carlife::DisplayRequest::new(if cfg.carwith_cached_canvas { (cfg.width,cfg.height) } else { (0,0) });
     let microphone=cfg.carwith_microphone.then(||Arc::new(crate::mic_probe::ProbeControl::for_carwith()));
@@ -122,6 +122,7 @@ pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
     let feed=Arc::new(Mutex::new(Feed::default()));let sink=feed.clone();
     let task=tokio::spawn(async move {while let Some(event)=events.recv().await {sink.lock().receive(event);}});
     slot.current=Some(Prepared{owner,hub:Arc::new(hub),feed,display,microphone,stop,task});
+    drop(slot);
     crate::emit_log(&format!("CARWITH-SOURCE: owner={owner} seven-channel service prepared independently of AirPlay"));
     Ok(())
 }
@@ -139,6 +140,8 @@ pub(crate) fn attach(owner:u64)->Result<Attachment,String> {
 }
 pub(crate) fn stop(owner:u64) {
     let mut slot=SOURCE.lock();
+    // A tap may retire this attempt before its off-thread prepare reaches Rust.
+    slot.newest = slot.newest.max(owner);
     if slot.current.as_ref().is_some_and(|s|s.owner==owner) {slot.current=None;}
 }
 pub(crate) fn replay(owner:u64) {
@@ -152,8 +155,26 @@ pub(crate) fn replay(owner:u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::Notify;
     fn video(kind: u8) -> CarLifeEvent {
         CarLifeEvent::VideoFrame { pts_us: 1, data: vec![0,0,0,1,kind,8] }
+    }
+
+    #[tokio::test]
+    async fn pause_before_prepare_does_not_revive_retired_attempt() {
+        let config: EngineConfig = serde_json::from_value(serde_json::json!({
+            "device_id":"02:00:00:00:00:01","car_ip":"127.0.0.1","airplay_port":0,
+            "width":2880,"height":960,"fps":30,"identity_path":"","carlife_source":true
+        })).unwrap();
+        stop(710);
+        assert!(prepare(710, &config).is_err());
+        prepare(711, &config).unwrap();
+        let first = attach(711).unwrap();
+        stop(710);
+        prepare(711, &config).unwrap();
+        let next_engine = attach(711).unwrap();
+        assert!(Arc::ptr_eq(&first.hub, &next_engine.hub));
+        stop(711);
     }
 
     #[tokio::test(start_paused = true)]
@@ -163,7 +184,7 @@ mod tests {
             feed.receive(CarLifeEvent::EncoderResolution { width: 1024, height: 576 });
             for nal in [0x67, 0x68, 0x65] { feed.receive(video(nal)); }
             let (events, mut source) = mpsc::unbounded_channel();
-            let stop = Arc::new(Notify::new());
+            let stop = Arc::new(DialStop::default());
             let owner_stop = stop.clone();
             let waiting = tokio::spawn(async move {
                 crate::carlife::wait_for_canvas_reopen(&events, &owner_stop).await
@@ -182,7 +203,7 @@ mod tests {
             }
             tokio::time::advance(Duration::from_millis(3999)).await;
             assert!(!waiting.is_finished());
-            if pause { stop.notify_waiters(); }
+            if pause { stop.cancel(); }
             else { tokio::time::advance(Duration::from_millis(1)).await; }
             assert_eq!(waiting.await.unwrap(), !pause);
         }

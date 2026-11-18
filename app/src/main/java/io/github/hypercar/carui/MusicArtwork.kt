@@ -30,12 +30,12 @@ internal object MusicArtwork {
     fun invalidate() { refreshRequested = true; attemptedAt = -10_000L }
     fun clear() { generation++; key=""; cached=null; reportedSource=""; job?.cancel(); job=null; attemptedAt=-10_000L }
 
-    fun resolve(service: NotificationListenerService?, pkg: String, metadata: MediaMetadata?, changed: () -> Unit): Bitmap? {
+    fun resolve(service: NotificationListenerService?, pkg: String, metadata: MediaMetadata?, track: MusicTrackText, changed: () -> Unit): Bitmap? {
         val uris = listOf(MediaMetadata.METADATA_KEY_ALBUM_ART_URI, MediaMetadata.METADATA_KEY_ART_URI,
             MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI).mapNotNull { runCatching { metadata?.getString(it) }.getOrNull() }
             .plus(listOfNotNull(runCatching { metadata?.description?.iconUri?.toString() }.getOrNull())).distinct()
         val nextKey = listOf(pkg, metadata?.getString(MediaMetadata.METADATA_KEY_MEDIA_ID),
-            metadata?.getString(MediaMetadata.METADATA_KEY_TITLE), metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST),
+            track.title, track.artist,
             metadata?.getString(MediaMetadata.METADATA_KEY_ALBUM), uris.joinToString()).joinToString("\u0000")
         if (key != nextKey) { clear(); key = nextKey }
         val embedded = listOf(MediaMetadata.METADATA_KEY_ALBUM_ART, MediaMetadata.METADATA_KEY_ART,
@@ -58,7 +58,7 @@ internal object MusicArtwork {
             val image = uris.firstNotNullOfOrNull { text ->
                 runCatching { loadUri(service,Uri.parse(text)) }.getOrNull()?.also { source="uri" }
             } ?: runCatching {
-                val title=metadata?.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty()
+                val title=track.title
                 service.activeNotifications.orEmpty().filter { it.packageName == pkg }
                     .sortedByDescending { it.postTime }.asSequence().filter {
                         val notificationTitle=it.notification.extras.getCharSequence(android.app.Notification.EXTRA_TITLE)?.toString().orEmpty()

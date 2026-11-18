@@ -12,6 +12,8 @@ pub(super) mod channel_diagnostics;
 mod voice_audio;
 
 use std::sync::Arc;
+use std::future::{poll_fn, Future};
+use std::task::Poll;
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -152,8 +154,45 @@ struct QueuedControl { bytes:Vec<u8>, expires:Option<std::time::Instant> }
 
 pub type DisplayRequest = tokio::sync::watch::Sender<(u32, u32)>;
 
+/// Retirement persists across the gaps between the timer, the JNI callback and each dial.
+#[derive(Default)]
+pub(crate) struct DialStop {
+    retired: Mutex<bool>,
+    signal: Arc<Notify>,
+}
+impl DialStop {
+    pub(crate) fn cancel(&self) {
+        *self.retired.lock() = true;
+        self.signal.notify_waiters();
+    }
+    fn is_retired(&self) -> bool { *self.retired.lock() }
+    async fn cancelled(&self) {
+        let notified = self.signal.notified();
+        if !self.is_retired() { notified.await; }
+    }
+
+    async fn dial(&self, host: &str, port: u16) -> Option<std::io::Result<TcpStream>> {
+        let connect = dial(host, port);
+        tokio::pin!(connect);
+        tokio::select! {
+            biased;
+            _ = self.cancelled() => None,
+            result = poll_fn(|cx| {
+                // A tap between select's first branch and connect's first poll must also win.
+                // Hold the lock for a nonblocking poll only, never while waiting for TCP.
+                let retired = self.retired.lock();
+                if *retired { Poll::Ready(None) } else { connect.as_mut().poll(cx).map(Some) }
+            }) => result,
+        }
+    }
+}
+
+// All CarWith entries share the same local ports. Each task joins its predecessor, including
+// a predecessor cancelled before it got a turn, so a third attempt cannot overtake the first.
+static LAST_DIALER: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
+
 pub struct CarLifeHub {
-    owned_tasks: Vec<tokio::task::JoinHandle<()>>,
+    stop: Arc<DialStop>,
     touch_state: Arc<Mutex<session::TouchGesture>>,
     touch_tx: mpsc::UnboundedSender<QueuedControl>,
     /// 当前编码分辨率共享单元（与 AirPlay 协商/触摸换算共用）。
@@ -171,7 +210,15 @@ impl CarLifeHub {
     /// 这与参考实现 `CarLifeWirelessBox` 的 `HuRole.connect(phoneIp, port)` 一致。
     /// Android CarWith uses this active seven-channel loopback connection.
     pub fn connect(
-        cfg: CarLifeConfig, md_host: String, stop: Arc<Notify>, requested: Option<DisplayRequest>,
+        cfg: CarLifeConfig, md_host: String, stop: Arc<DialStop>, requested: Option<DisplayRequest>,
+        reopen_source: impl Fn() + Send + 'static,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<CarLifeEvent>), String> {
+        Self::connect_to_ports(cfg, md_host, [PORT_CMD,PORT_VIDEO,PORT_MEDIA,PORT_TTS,PORT_VR,PORT_CTRL,PORT_DATA],
+            stop, requested, reopen_source)
+    }
+
+    fn connect_to_ports(
+        cfg: CarLifeConfig, md_host: String, ports: [u16; 7], stop: Arc<DialStop>, requested: Option<DisplayRequest>,
         reopen_source: impl Fn() + Send + 'static,
     ) -> Result<(Self, mpsc::UnboundedReceiver<CarLifeEvent>), String> {
         let keyframe_request = Arc::new(Notify::new());
@@ -184,9 +231,9 @@ impl CarLifeHub {
         let round_touch=touch_state.clone();
         let queue = Arc::new(Mutex::new(Vec::<QueuedControl>::new()));
         let queue_fill=queue.clone(); let stop_fill=stop.clone();
-        let fill_task = tokio::spawn(async move {
+        tokio::spawn(async move {
             loop { tokio::select! {
-                _=stop_fill.notified()=>return,
+                _=stop_fill.cancelled()=>return,
                 value=touch_rx.recv()=>match value {
                     Some(value)=>{ let mut q=queue_fill.lock(); if q.len()>=256 {q.remove(0);} q.push(value); }
                     None=>return,
@@ -194,14 +241,17 @@ impl CarLifeHub {
             }}
         });
         let events_task=events.clone(); let size=encoder_size.clone(); let config=cfg.clone();
-        let connection_task = tokio::spawn(async move {
-            let ports=[PORT_CMD,PORT_VIDEO,PORT_MEDIA,PORT_TTS,PORT_VR,PORT_CTRL,PORT_DATA];
+        let hub_stop = stop.clone();
+        let mut last_dialer = LAST_DIALER.lock();
+        let previous = last_dialer.take();
+        *last_dialer = Some(tokio::spawn(async move {
+            if let Some(previous) = previous { let _ = previous.await; }
             let mut throttle=DialLogThrottle::new();
             loop {
                 // Own all seven sockets together. A failed/closed CMD invalidates the whole round.
                 let mut sockets=Vec::new();
                 for port in ports {
-                    let result=tokio::select! { _=stop.notified()=>return, result=dial(&md_host,port)=>result };
+                    let Some(result) = stop.dial(&md_host, port).await else { return; };
                     match result {
                         Ok(socket)=>sockets.push(socket),
                         Err(error)=>{ if throttle.ready() {emit_log(&format!("CARWITH-HS: waiting for all seven channels; port={port} error={error}"));} break; }
@@ -209,14 +259,20 @@ impl CarLifeHub {
                 }
                 if sockets.len()!=ports.len() {
                     drop(sockets);
-                    tokio::select! { _=stop.notified()=>return, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
+                    tokio::select! { biased; _=stop.cancelled()=>return, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
                     continue;
                 }
+                if stop.is_retired() { return; }
                 emit_log("CARWITH-HS: all seven channels connected; start fresh 4.1 handshake");
                 queue.lock().clear();
                 *round_touch.lock()=session::TouchGesture::default();
                 let _ = events_task.send(CarLifeEvent::SourceReset { cache_cleared: None });
                 let state=session::Shared::new(Mutex::new(session::Session::default()));
+                // Keep a probe RESET permit local to these seven sockets if this round terminates.
+                #[cfg(test)]
+                let reset_request = if std::env::var_os("HC_PROBE_VIDEO_RECOVERY").is_some() {
+                    Arc::new(Notify::new())
+                } else { reset_request.clone() };
                 let mut sockets=sockets.into_iter();
                 let cmd=sockets.next().unwrap();
                 let mut children=tokio::task::JoinSet::new();
@@ -230,13 +286,14 @@ impl CarLifeHub {
                 let vr = sockets.next().unwrap();
                 if let Some(mic) = config.microphone.clone() {
                     mic.request(false);
-                    children.spawn(microphone::run(vr, state.clone(), mic, stop.clone(), events_task.clone()));
+                    children.spawn(microphone::run(vr, state.clone(), mic, stop.signal.clone(), events_task.clone()));
                 } else { children.spawn(drain_stream(vr, state.clone(), events_task.clone())); }
-                let ctrl=sockets.next().unwrap(); let q=queue.clone(); let cipher=state.clone(); let stop_ctrl=stop.clone();
+                let ctrl=sockets.next().unwrap(); let q=queue.clone(); let cipher=state.clone(); let stop_ctrl=stop.signal.clone();
                 children.spawn(async move { session::control(ctrl,q,cipher,stop_ctrl).await; });
                 children.spawn(session::data(sockets.next().unwrap(),state.clone(),events_task.clone()));
                 let outcome=tokio::select! {
-                    _=stop.notified()=>{children.abort_all(); return;},
+                    biased;
+                    _=stop.cancelled()=>{children.shutdown().await; return;},
                     _=children.join_next()=>Err("CarWith media/control channel closed".into()),
                     result=session::run(cmd,events_task.clone(),size.clone(),requested.clone(),config.clone(),state.clone(),reset_request.clone())=>result,
                 };
@@ -247,15 +304,15 @@ impl CarLifeHub {
                 if outcome.is_ok() {
                     // All producers for the old round have exited. Flush their queued events
                     // and the replay cache before letting a reattached engine see the waiting period.
-                    if !wait_for_canvas_reopen(&events_task, &stop).await { return; }
+                    if !wait_for_canvas_reopen(&events_task, &stop).await || stop.is_retired() { return; }
                     reopen_source();
                     continue;
                 }
                 emit_log(&format!("CARWITH-HS: round closed: {}",outcome.unwrap_err()));
-                tokio::select! { _=stop.notified()=>return, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
+                tokio::select! { biased; _=stop.cancelled()=>return, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
             }
-        });
-        Ok((Self {owned_tasks:vec![fill_task,connection_task],touch_state,touch_tx,encoder_size,keyframe_request},event_rx))
+        }));
+        Ok((Self {stop:hub_stop,touch_state,touch_tx,encoder_size,keyframe_request},event_rx))
     }
 
     pub fn request_keyframe(&self) {
@@ -316,17 +373,16 @@ impl CarLifeHub {
 
 impl Drop for CarLifeHub {
     fn drop(&mut self) {
-        for task in &self.owned_tasks { task.abort(); }
+        self.stop.cancel();
     }
 }
 
-pub(crate) async fn wait_for_canvas_reopen(events: &mpsc::UnboundedSender<CarLifeEvent>, stop: &Notify) -> bool {
+pub(crate) async fn wait_for_canvas_reopen(events: &mpsc::UnboundedSender<CarLifeEvent>, stop: &DialStop) -> bool {
     let cleared = Arc::new(Notify::new());
-    let stopped = stop.notified();
     if events.send(CarLifeEvent::SourceReset { cache_cleared: Some(cleared.clone()) }).is_err() { return false; }
     tokio::select! {
         biased;
-        _ = stopped => false,
+        _ = stop.cancelled() => false,
         _ = async {
             cleared.notified().await;
             tokio::time::sleep(Duration::from_secs(4)).await;
@@ -552,6 +608,8 @@ async fn handle_media_client(
     // （2026-10-26 00:24 现场：没有任何 VideoFrame 产出）。这里把前几次读到的东西打出来，
     // 一眼就能分清「8240 上一个字节都没有」还是「有数据但帧头解析不出来」。
     let mut diag_reads: u32 = 0;
+    #[cfg(test)]
+    let mut video_probe = session::VideoPacketProbe::default();
     let mut parser = video::VideoParser::default();
     let mut access_units = 0u64;
     // **VIDEO 心跳**：官方 HU 实现（apollo-DuerOS `ConnectionEstablishHandler` 的
@@ -566,6 +624,9 @@ async fn handle_media_client(
     diagnostics.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
+        let socket_read = rd.read(&mut chunk);
+        #[cfg(test)]
+        let socket_read = video_probe.read_until_deadline(socket_read);
         let read = tokio::select! {
             _ = diagnostics.tick(), if !is_video => {
                 emit_log(&channel_stats.report(label,"periodic",buf.len()));
@@ -585,7 +646,7 @@ async fn handle_media_client(
                 }
                 continue;
             }
-            r = rd.read(&mut chunk) => r,
+            r = socket_read => r,
         };
         match read {
             Ok(0) => {
@@ -594,6 +655,8 @@ async fn handle_media_client(
                 return;
             }
             Ok(n) => {
+                #[cfg(test)]
+                if is_video { video_probe.read(n); }
                 if !is_video {channel_stats.rx_bytes+=n as u64;}
                 if is_video && diag_reads < 5 {
                     diag_reads += 1;
@@ -615,6 +678,20 @@ async fn handle_media_client(
             buf.clear();
         }
         while let Some((service_type, ts_ms, payload, consumed)) = read_media_frame(&buf) {
+            #[cfg(test)]
+            let mut payload = payload;
+            #[cfg(test)]
+            if is_video {
+                if let Some(state) = &encryption {
+                    video_probe.packet(&buf, consumed, access_units, &state.lock());
+                    if !video_probe.check_packet(service_type, &mut payload, &state.lock()) {
+                        return;
+                    }
+                    if video_probe.inspect_next && !video_probe.recovery_enabled() {
+                        video_probe.next_packet(&mut rd, &buf[consumed..], state).await;
+                    }
+                }
+            }
             buf.drain(..consumed);
             if !is_video {
                 channel_stats.frame(service_type);
@@ -629,6 +706,8 @@ async fn handle_media_client(
                 match state.lock().decrypt(&payload) {
                     Ok(bytes) => {if !is_video {channel_stats.decrypt_ok+=1;}bytes},
                     Err(error) => {
+                        #[cfg(test)]
+                        if is_video && video_probe.drop_first(service_type, &error, access_units) { continue; }
                         if !is_video {channel_stats.decrypt_fail+=1;emit_log(&channel_stats.report(label,"decryptFailed",buf.len()));}
                         emit_log(&format!("CARWITH-HS: {label} decrypt failed: {error}")); return;
                     }
@@ -637,14 +716,24 @@ async fn handle_media_client(
             match kind {
                 MediaKind::Video => match service_type {
                     VIDEO_DATA => {
+                        #[cfg(test)]
+                        if video_probe.expired() { return; }
+                        #[cfg(test)]
+                        if video_probe.recovery_enabled() && !video_probe.feed_after_reset(encryption.as_ref().unwrap()) {
+                            continue;
+                        }
                         if !payload.is_empty() {
                             if encryption.is_some() {
                                 let units = match parser.push_tagged(&payload) {
                                     Ok(units) => units,
                                     Err(error) => { emit_log(&format!("CARWITH-VIDEO: {error}")); return; }
                                 };
+                                #[cfg(test)]
+                                video_probe.observe_parameters(&parser);
                                 for unit in units {
                                     let video::AccessUnit { data, codec } = unit;
+                                    #[cfg(test)]
+                                    if !video_probe.accept_unit(&data, codec).await { continue; }
                                     access_units += 1;
                                     let types: Vec<_> = crate::screen::annexb_nals(&data).iter().map(|n|
                                         if codec == crate::video_format::VideoCodec::Hevc { (n[0]>>1)&63 } else { n[0]&31 }).collect();
@@ -823,7 +912,7 @@ mod input_lease_tests {
     use super::*;
     #[test] fn detaching_media_releases_finger_once_without_destroying_source() {
         let (tx,mut rx)=mpsc::unbounded_channel();
-        let hub=Arc::new(CarLifeHub{owned_tasks:vec![],touch_state:Arc::new(Mutex::new(session::TouchGesture::default())),
+        let hub=Arc::new(CarLifeHub{stop:Arc::new(DialStop::default()),touch_state:Arc::new(Mutex::new(session::TouchGesture::default())),
             touch_tx:tx,encoder_size:Arc::new(Mutex::new((1920,720))),keyframe_request:Arc::new(Notify::new())});
         hub.inject_touch(TOUCH_DOWN,33,44);
         assert_eq!(read_cmd_frame(&rx.try_recv().unwrap().bytes).unwrap().0,0x68002);

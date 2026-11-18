@@ -71,6 +71,7 @@
         <package android:name="com.spotify.music" />
         <package android:name="com.apple.android.music" />
         <package android:name="cmccwm.mobilemusic" />
+        <package android:name="com.huawei.music" />
     </queries>
 
     <application

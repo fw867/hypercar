@@ -719,7 +719,9 @@ object MusicBridge {
             }.orEmpty()
             val target = sessions.firstOrNull { it.packageName == preferred }
                 ?: sessions.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING && it.metadata != null }
-                ?: sessions.firstOrNull { !it.metadata?.getString(MediaMetadata.METADATA_KEY_TITLE).isNullOrBlank() }
+                ?: sessions.firstOrNull { session ->
+                    session.metadata?.let { musicTrackText(it::getString).title.isNotBlank() } == true
+                }
                 ?: sessions.firstOrNull()
             SessionSnapshot(target, target?.metadata, target?.playbackState,
                 target?.ratingType ?: Rating.RATING_NONE, sessions.size, denied,
@@ -795,13 +797,11 @@ object MusicBridge {
             val ai = ctx!!.packageManager.getApplicationInfo(pkg, 0)
             ctx.packageManager.getApplicationLabel(ai).toString()
         }.getOrDefault(pkg)
-        val art = MusicArtwork.resolve(ctx, pkg, md) { publish() }
+        val track = musicTrackText { md?.getString(it) }
+        val art = MusicArtwork.resolve(ctx, pkg, md, track) { publish() }
         val rating = md?.getRating(MediaMetadata.METADATA_KEY_USER_RATING)?.takeIf { it.isRated }
         val likeAction = favoriteAction(ps)
         val actions = ps?.actions ?: 0L
-        val title = md?.getString(MediaMetadata.METADATA_KEY_TITLE).orEmpty()
-        val artist = md?.getString(MediaMetadata.METADATA_KEY_ARTIST)
-            ?: md?.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST).orEmpty()
         val itemId = md?.getString(MediaMetadata.METADATA_KEY_MEDIA_ID)?.takeIf { it.isNotBlank() }?.let {
             java.util.UUID.nameUUIDFromBytes("$pkg\u0000$it".encodeToByteArray()).mostSignificantBits
         }
@@ -816,8 +816,8 @@ object MusicBridge {
             available = true,
             packageName = pkg,
             appLabel = label,
-            title = title,
-            artist = artist,
+            title = track.title,
+            artist = track.artist,
 
             album = md?.getString(MediaMetadata.METADATA_KEY_ALBUM).orEmpty(),
             playbackStatus = when (ps?.state) {

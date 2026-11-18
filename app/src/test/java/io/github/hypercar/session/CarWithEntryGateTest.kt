@@ -9,7 +9,8 @@ import org.junit.Test
 class CarWithEntryGateTest {
     @Test fun pauseDuringShizukuFailureDiscardsFallbackEvenAfterSameAddressReinvites() = runBlocking {
         for (reinvite in listOf(false, true)) {
-            val gate = CarWithEntryGate()
+            val stopped = mutableListOf<Long>()
+            val gate = CarWithEntryGate { stopped += it }
             val inShell = CompletableDeferred<Unit>()
             val result = CompletableDeferred<Boolean>()
             val intents = mutableListOf<Long>()
@@ -20,6 +21,7 @@ class CarWithEntryGateTest {
             }
             inShell.await()
             gate.retire(11)
+            assertEquals(listOf(11L), stopped)
             if (reinvite) gate.begin(12)
             result.complete(false)
             old.await()
@@ -27,6 +29,7 @@ class CarWithEntryGateTest {
             assertFalse(gate.claimReopen(11))
             if (reinvite) {
                 gate.retire(11)
+                assertEquals(listOf(11L), stopped)
                 assertTrue(gate.claimReopen(12))
                 gate.launch(12, { false }, { intents += 12L })
                 assertEquals(listOf(12L), intents)
@@ -36,7 +39,7 @@ class CarWithEntryGateTest {
     }
 
     @Test fun mediaReattachKeepsOneReopenAndPauseBeforeDispatchSuppressesBothLaunchPaths() = runBlocking {
-        val gate = CarWithEntryGate()
+        val gate = CarWithEntryGate {}
         gate.begin(21)
         assertTrue(gate.claimReopen(21))
         assertFalse(gate.claimReopen(21))
@@ -45,5 +48,26 @@ class CarWithEntryGateTest {
         gate.begin(22)
         assertTrue(gate.claimReopen(22))
         assertTrue(gate.launch(22, { true }, { error("duplicate intent") }))
+    }
+
+    @Test fun sameAddressReinviteAfterShellSubmissionRetiresOnlyOldDialer() = runBlocking {
+        val stopped = mutableListOf<Long>()
+        val gate = CarWithEntryGate { stopped += it }
+        gate.begin(31)
+        assertTrue(gate.claimReopen(31))
+        val submitted = CompletableDeferred<Unit>()
+        val shellReturned = CompletableDeferred<Unit>()
+        val shell = async {
+            gate.launch(31, { submitted.complete(Unit); shellReturned.await(); true }, { error("duplicate intent") })
+        }
+        submitted.await()
+        gate.retire(31)
+        assertEquals(listOf(31L), stopped)
+        gate.begin(32)
+        shellReturned.complete(Unit)
+        shell.await()
+        gate.retire(31)
+        assertTrue(gate.current(32))
+        assertEquals(listOf(31L), stopped)
     }
 }
