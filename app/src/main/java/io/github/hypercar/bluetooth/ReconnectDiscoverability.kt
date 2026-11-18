@@ -8,6 +8,10 @@ import io.github.hypercar.spike.SpikeShell
 import java.util.UUID
 import kotlinx.coroutines.*
 
+private const val AUTO_BMW_KEY_PREFIX = "bt:auto:"
+private val bluetoothAddress = Regex("(?:[0-9A-F]{2}:){5}[0-9A-F]{2}")
+private val bmwName = Regex("""(?:^|[^a-z])bmw(?![a-z])|宝马""", RegexOption.IGNORE_CASE)
+
 /** 每轮连接只消费一次机会，网络/服务未就绪时不启动宽限计时；ACL 唤醒可再给一次。 */
 internal class ReconnectDiscoverabilityPolicy {
     private var key: String? = null
@@ -31,6 +35,7 @@ internal class ReconnectDiscoverabilityPolicy {
         if (!enabled || readyKey == null) { key = null; return false }
         if (wakeArmed) {
             wakeArmed = false
+            if (readyKey.startsWith(AUTO_BMW_KEY_PREFIX)) return false
             attempted = true
             key = readyKey
             readyAt = now
@@ -69,12 +74,26 @@ internal suspend fun runDiscoverableWindow(
 }
 
 internal object ReconnectDiscoverability {
+    internal fun automaticBmwPreparationKey(
+        profileId: String, listening: Boolean, connectionAllowed: Boolean,
+        successfulCars: Set<String>, bondedName: (String) -> String?,
+    ): String? {
+        if (profileId != "bmw_id85" || !listening || !connectionAllowed) return null
+        // 历史名称可能是当时档案的默认标签；用同一地址的系统蓝牙名称识别宝马。
+        val mac = successfulCars.asSequence()
+            .map { it.substringBefore('|').trim().uppercase(java.util.Locale.ROOT) }
+            .distinct()
+            .filter { bluetoothAddress.matches(it) && bmwName.containsMatchIn(bondedName(it).orEmpty()) }
+            .singleOrNull() ?: return null
+        return "$AUTO_BMW_KEY_PREFIX$mac"
+    }
+
     /** 仅准备被动接受蓝牙连接；不授权主动拨号、Wi-Fi 入网或 RTSP 建链。 */
     fun bmwPreparationKey(profileId: String, targetMac: String?, isBonded: Boolean,
                           listening: Boolean, connectionAllowed: Boolean): String? {
         if (profileId != "bmw_id85" || !isBonded || !listening || !connectionAllowed) return null
         val mac = targetMac?.trim()?.uppercase(java.util.Locale.ROOT) ?: return null
-        if (!Regex("(?:[0-9A-F]{2}:){5}[0-9A-F]{2}").matches(mac)) return null
+        if (!bluetoothAddress.matches(mac)) return null
         return "bt:$mac"
     }
 
@@ -119,7 +138,12 @@ internal object ReconnectDiscoverability {
                         runDiscoverableWindow(
                             start = {
                                 val result = SpikeShell.startBluetoothDiscoverable(owner, token, 30)
-                                log("BT-DISCOVERY: ${if (preparation != null) "ID8.5 已配对目标/蓝牙监听" else "已配对车机 Wi-Fi/广播/监听"}就绪 5s 后：$result")
+                                val source = when {
+                                    preparation?.startsWith(AUTO_BMW_KEY_PREFIX) == true -> "ID8.5 自动匹配唯一已连接宝马/蓝牙监听"
+                                    preparation != null -> "ID8.5 已配对目标/蓝牙监听"
+                                    else -> "已配对车机 Wi-Fi/广播/监听"
+                                }
+                                log("BT-DISCOVERY: ${source}就绪 5s 后：$result")
                                 result.startsWith("OK").also { started = it }
                             },
                             keepOpen = {

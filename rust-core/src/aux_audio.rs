@@ -8,7 +8,7 @@ pub enum MainCommand { Pause(oneshot::Sender<()>), Install(Option<AudioOut>) }
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum Route {Mix,Independent,Drop}
 #[derive(Default)]
-struct Pending { epoch:u64,format:Option<(u32,u8)>,samples:VecDeque<i16>,remain:Vec<i16>,ended:bool,failed:Option<Route> }
+struct Pending { epoch:u64,format:Option<(u32,u8)>,samples:VecDeque<i16>,remain:crate::audio_resample::PcmToStereo,ended:bool,failed:Option<Route> }
 #[derive(Default)]
 pub struct Input { lanes:[Mutex<Pending>;2],supported:AtomicU8,media_epoch:AtomicU64,wake:Notify,user_intent:Mutex<Option<std::time::Instant>> }
 fn index(kind:Kind)->usize {if kind==Kind::Speech {0}else{1}}
@@ -25,7 +25,7 @@ impl Input {
         let route=self.route(kind,&pending);
         if route!=Route::Drop {
             let Pending{remain,samples,..}=&mut *pending;
-            crate::engine::push_resampled(data,rate,channels,remain,samples);
+            remain.push(data,rate,channels,48000,samples);
             let overflow=samples.len().saturating_sub(48000);
             if overflow>0 {samples.drain(..overflow);}
         }
@@ -52,13 +52,15 @@ impl Input {
     fn user_initiated(&self)->bool {self.user_intent.lock().is_some_and(|at|at.elapsed()<Duration::from_secs(30))}
     pub fn media_restart(&self) {self.media_epoch.fetch_add(1,Ordering::AcqRel);self.wake.notify_waiters();}
     pub fn mark_user_intent(&self) {*self.user_intent.lock()=Some(std::time::Instant::now());}
-    pub(crate) fn configure(&self,info:&Value) {
-        let mask=[Kind::Speech,Kind::Navigation].into_iter().fold(0,|mask,kind|mask|if crate::aux_setup::supports(info,kind) {1<<index(kind)}else{0});
+    pub(crate) fn configure(&self,info:&Value,kinds:&[Kind]) {
+        let mask=kinds.iter().copied().filter(|kind| crate::aux_setup::supports(info,*kind))
+            .fold(0,|mask,kind| mask | 1<<index(kind));
         self.supported.store(mask,Ordering::Release);self.wake.notify_waiters();
     }
 }
 
 pub struct Session {
+    pub kinds: &'static [Kind],
     pub control:Arc<RtspChannel>,pub factory:Arc<dyn SocketProvider>,pub params:AirplayParams,
     pub shared:[u8;32],pub info:Value,pub resource:Arc<SpeechResource>,pub media_codec:Option<AudioCodec>,
 }
@@ -75,10 +77,10 @@ impl Stop {
 }
 impl Controller {
     pub fn spawn(session:Session,input:Arc<Input>,commands:mpsc::UnboundedSender<MainCommand>,fallback:mpsc::UnboundedSender<crate::engine::SourceEvent>)->Self {
-        input.configure(&session.info);
+        input.configure(&session.info,session.kinds);
         let session=Arc::new(session);let stop=Arc::new(Stop::default());
         let allocated=Arc::new([AtomicBool::new(false),AtomicBool::new(false)]);
-        let tasks=[Kind::Speech,Kind::Navigation].into_iter().map(|kind| {
+        let tasks=session.kinds.iter().copied().map(|kind| {
             crate::callback_context::spawn(run_lane(kind,session.clone(),input.clone(),commands.clone(),fallback.clone(),stop.clone(),allocated.clone()))
         }).collect();
         Self{stop,tasks,allocated}
@@ -110,7 +112,7 @@ impl Lease {
     }}
 }
 struct Active { output:AudioOut,lease:Lease }
-enum StartError {Refused(String),Failed(String)}
+enum StartError {Refused(String),Failed(String),AwaitNavigationCleanup(String)}
 impl Session {
     async fn retire_media(&self)->Result<(),String> {
         let Some(codec)=self.media_codec else {return Ok(());};
@@ -195,6 +197,9 @@ async fn start(kind:Kind,session:&Session,input:&Input,commands:&mpsc::Unbounded
             if error.cleanup_confirmed {allocated[index(kind)].store(false,Ordering::Release);}
             let cleaned=cleanup.run(kind,session,commands,allocated,false).await;
             if cleaned {Err(StartError::Failed(error.to_string()))}
+            else if kind == Kind::Navigation && session.params.head_unit_profile == "bmw_id9" {
+                Err(StartError::AwaitNavigationCleanup(error.to_string()))
+            }
             else {Err(StartError::Refused(format!("cleanup/recovery pending: {error}")))}
         }
     }
@@ -208,6 +213,7 @@ async fn finish(kind:Kind,active:Active,session:&Session,commands:&mpsc::Unbound
 async fn run_lane(kind:Kind,session:Arc<Session>,input:Arc<Input>,commands:mpsc::UnboundedSender<MainCommand>,fallback:mpsc::UnboundedSender<crate::engine::SourceEvent>,stop:Arc<Stop>,allocated:Arc<[AtomicBool;2]>) {
     if !crate::aux_setup::supports(&session.info,kind) {return;}
     let mut active:Option<Active>=None;let mut handled=0;
+    let mut fallback_after_cleanup = None;
     let mut cleanup=Cleanup::default();let mut cleanup_attempts=0;
     let mut cleanup_mark=tokio::time::Instant::now();
     let mut recovery_media_epoch=input.media_epoch.load(Ordering::Acquire);
@@ -245,6 +251,10 @@ async fn run_lane(kind:Kind,session:Arc<Session>,input:Arc<Input>,commands:mpsc:
                 recovery_media_epoch=media_epoch;recovery_source_epoch=epoch;
             }
             if cleanup.pending() {continue;}
+            if let Some(epoch) = fallback_after_cleanup.take() {
+                fallback_to_mix(&input, kind, epoch, &fallback);
+                continue;
+            }
         }
         if let Some(current)=active.as_ref() {
             let stale=epoch!=handled || !current.lease.valid(&session);
@@ -265,9 +275,15 @@ async fn run_lane(kind:Kind,session:Arc<Session>,input:Arc<Input>,commands:mpsc:
                     crate::emit_log(&format!("AUX-AUDIO: {:?} independent type={} OPUS {}Hz mono SPF{} ready; receiver audibility unconfirmed",kind,kind.stream_type(),kind.rate(),kind.spf()));
                 }
                 Err(error)=>{
-                    let (message,route)=match error {StartError::Refused(e)=>(e,Route::Drop),StartError::Failed(e)=>(e,Route::Mix)};
-                    let samples=input.fail(kind,epoch,route);
-                    if route==Route::Mix && !samples.is_empty() {let _=fallback.send(crate::engine::SourceEvent::AuxFallback{kind,samples});}
+                    let (message,route)=match error {
+                        StartError::AwaitNavigationCleanup(e) => {
+                            fallback_after_cleanup = Some(epoch);
+                            crate::emit_log(&format!("AUX-AUDIO: navigation SETUP failed: {e}; waiting for cleanup before mixing"));
+                            continue;
+                        }
+                        StartError::Refused(e)=>{input.fail(kind,epoch,Route::Drop);(e,Route::Drop)}
+                        StartError::Failed(e)=>{fallback_to_mix(&input,kind,epoch,&fallback);(e,Route::Mix)}
+                    };
                     crate::emit_log(&format!("AUX-AUDIO: {:?} start failed: {message}; route={route:?}",kind));
                 }
             }
@@ -300,6 +316,13 @@ async fn run_lane(kind:Kind,session:Arc<Session>,input:Arc<Input>,commands:mpsc:
     if cleanup.pending() {cleanup.run(kind,&session,&commands,&allocated,true).await;}
 }
 
+fn fallback_to_mix(input: &Input, kind: Kind, epoch: u64, fallback: &mpsc::UnboundedSender<crate::engine::SourceEvent>) {
+    let samples = input.fail(kind, epoch, Route::Mix);
+    if !samples.is_empty() {
+        let _ = fallback.send(crate::engine::SourceEvent::AuxFallback { kind, samples });
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -310,7 +333,7 @@ mod tests {
     ]))])}
     #[test]
     fn independent_input_is_bounded_and_stop_keeps_only_its_tail() {
-        let input=Input::default();input.configure(&capabilities());
+        let input=Input::default();input.configure(&capabilities(), &[Kind::Speech,Kind::Navigation]);
         input.init(Kind::Speech,16000,1);input.init(Kind::Navigation,48000,2);
         assert_eq!(input.push(Kind::Speech,16000,1,&1500i16.to_le_bytes().repeat(160)),Route::Independent);
         assert!(input.independent(Kind::Speech));
@@ -324,7 +347,7 @@ mod tests {
     }
     #[test]
     fn old_stream_lateness_cannot_discard_a_new_reply_generation() {
-        let input=Input::default();input.configure(&capabilities());
+        let input=Input::default();input.configure(&capabilities(), &[Kind::Speech,Kind::Navigation]);
         input.init(Kind::Speech,16000,1);
         let old=input.lanes[0].lock().epoch;
         input.push(Kind::Speech,16000,1,&[1;640]);
@@ -339,7 +362,7 @@ mod tests {
     }
     #[test]
     fn unsupported_lanes_keep_the_existing_mixer_route() {
-        let input=Input::default();input.configure(&Value::dict(vec![]));input.init(Kind::Speech,16000,1);
+        let input=Input::default();input.configure(&Value::dict(vec![]), &[Kind::Speech,Kind::Navigation]);input.init(Kind::Speech,16000,1);
         assert_eq!(input.push(Kind::Speech,16000,1,&[1,0]),Route::Mix);
         assert!(!input.independent(Kind::Speech));
     }

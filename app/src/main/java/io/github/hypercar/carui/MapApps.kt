@@ -28,6 +28,19 @@ enum class MapProvider(val id: String, val label: String, val packageName: Strin
 
 }
 
+/** Only refresh an existing UCar activity on the map display. Another foreground page may own the route. */
+internal fun hasResumedUcarActivity(summary: String, displayId: Int): Boolean {
+    var onMapDisplay = false
+    for (line in summary.lineSequence().map { it.trim() }) {
+        if (line.startsWith("Display #")) {
+            onMapDisplay = line.substringAfter('#').takeWhile(Char::isDigit).toIntOrNull() == displayId
+        } else if (onMapDisplay && (line.startsWith("topResumedActivity=") || line.startsWith("mResumedActivity:"))) {
+            if (line.contains(" com.autonavi.minimap/com.autonavi.map.activity.UcarMapActivity ")) return true
+        }
+    }
+    return false
+}
+
 object MapApps {
     fun installed(context: Context): List<MapProvider> = MapProvider.entries.filter { provider ->
         runCatching { context.packageManager.getApplicationInfo(provider.packageName, 0).enabled }.getOrDefault(false)

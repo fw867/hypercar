@@ -21,3 +21,24 @@ internal class MapCardInputState {
     fun accepts(binding: Binding): Boolean = current === binding
     fun clear() { current = null }
 }
+
+/** Once a finger has dragged or a second pointer joined, lifting cannot become a card click. */
+internal class MapCardTap(private val slop: Int, private val longPressMs: Int) {
+    private var x = 0f
+    private var y = 0f
+    private var eligible = false
+
+    fun down(x: Float, y: Float) {
+        this.x = x
+        this.y = y
+        eligible = true
+    }
+
+    fun observe(x: Float, y: Float, pointers: Int) {
+        val dx = x - this.x
+        val dy = y - this.y
+        if (pointers != 1 || dx * dx + dy * dy > slop.toFloat() * slop) eligible = false
+    }
+
+    fun isTap(durationMs: Long) = eligible && durationMs in 0 until longPressMs.toLong()
+}

@@ -61,5 +61,6 @@ interface ISpikeShell {
     ParcelFileDescriptor[] startSplitAudioCapture(IBinder owner, int navigationUid);
 
     String consoleKey(int displayId, int keyCode, int metaState);
+    String readDisplayImePolicy(int displayId);
 
 }

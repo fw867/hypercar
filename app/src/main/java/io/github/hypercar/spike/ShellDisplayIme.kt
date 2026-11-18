@@ -9,6 +9,12 @@ internal object ShellDisplayIme {
 
     fun configure(displayId: Int, trusted: Boolean): String {
         if (!trusted) return "unavailable(untrusted display)"
+        return access(displayId, setLocal = true)
+    }
+
+    fun read(displayId: Int): String = access(displayId, setLocal = false)
+
+    private fun access(displayId: Int, setLocal: Boolean): String {
         val identity = Binder.clearCallingIdentity()
         return try {
             val binder = Class.forName("android.os.ServiceManager")
@@ -16,11 +22,19 @@ internal object ShellDisplayIme {
             val api = Class.forName("android.view.IWindowManager")
             val wm = Class.forName("android.view.IWindowManager\$Stub")
                 .getMethod("asInterface", IBinder::class.java).invoke(null, binder)
-            api.getMethod("setDisplayImePolicy", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
-                .invoke(wm, displayId, LOCAL)
+            if (setLocal) {
+                api.getMethod("setDisplayImePolicy", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType)
+                    .invoke(wm, displayId, LOCAL)
+            }
             val actual = api.getMethod("getDisplayImePolicy", Int::class.javaPrimitiveType)
                 .invoke(wm, displayId) as Int
-            if (actual == LOCAL) "local" else "unavailable(policy=$actual)"
+            when {
+                actual == LOCAL -> "local"
+                setLocal -> "unavailable(policy=$actual)"
+                actual == 1 -> "fallback_display"
+                actual == 2 -> "hide"
+                else -> "unknown($actual)"
+            }
         } catch (t: Throwable) {
             val cause = (t as? java.lang.reflect.InvocationTargetException)?.targetException ?: t
             // Keep the display usable on ROMs which deny this operation, but expose the failure.

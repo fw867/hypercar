@@ -214,6 +214,7 @@ pub struct RtspChannel {
     pub(crate) udp_media: crate::udp_keepalive::MediaActivity,
     session_uri: std::sync::OnceLock<crate::rtsp_uri::SessionUri>,
     mbux_session: MbuxSession,
+    pub(crate) view_areas: SharedViewAreas,
     pub(crate) id9_trace: std::sync::OnceLock<String>,
     first_screen_cseq: std::sync::OnceLock<i32>,
 }
@@ -226,6 +227,7 @@ struct MbuxHeaderState {
     async_cseqs: VecDeque<i32>,
 }
 type MbuxSession = Arc<std::sync::OnceLock<Mutex<MbuxHeaderState>>>;
+type SharedViewAreas = Arc<std::sync::OnceLock<crate::display_layout::ViewAreas>>;
 
 // Removal is also required when a request future is cancelled by its caller. A partially
 // written encrypted transaction cannot be resumed: its cipher counter has already advanced.
@@ -249,12 +251,12 @@ impl RtspChannel {
         write: OwnedWriteHalf,
         cipher: Option<ControlCipher>,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<RtspMessage>) {
-        Self::spawn_with_reply(read, write, cipher, None)
+        Self::spawn_with_reply(read, write, cipher, None, Default::default())
     }
 
     pub fn spawn_with_reply(
         read: OwnedReadHalf, write: OwnedWriteHalf, cipher: Option<ControlCipher>,
-        reply: Option<CommandReply>,
+        reply: Option<CommandReply>, view_areas: SharedViewAreas,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<RtspMessage>) {
         let write = Arc::new(tokio::sync::Mutex::new(write));
         let cipher = Arc::new(Mutex::new(cipher));
@@ -273,6 +275,7 @@ impl RtspChannel {
             trace_id,
             reply,
             mbux_session.clone(),
+            view_areas.clone(),
         ));
 
         let this = Arc::new(Self {
@@ -287,6 +290,7 @@ impl RtspChannel {
             udp_media: Default::default(),
             session_uri: std::sync::OnceLock::new(),
             mbux_session,
+            view_areas,
             id9_trace: std::sync::OnceLock::new(),
             first_screen_cseq: std::sync::OnceLock::new(),
         });
@@ -569,6 +573,7 @@ async fn reader_loop(
     trace_id: u64,
     reply: Option<CommandReply>,
     mbux_session: MbuxSession,
+    view_areas: SharedViewAreas,
 ) {
     let mut raw: Vec<u8> = Vec::with_capacity(8192);
     let mut plain: Vec<u8> = Vec::with_capacity(8192);
@@ -662,7 +667,7 @@ async fn reader_loop(
             } else {
                 let cseq = msg.cseq();
                 let protocol = msg.response_protocol();
-                let validation = validate_inbound_command(&msg);
+                let validation = validate_inbound_command(&msg, view_areas.get());
                 inbound_requests += 1;
                 if validation.is_err() { rejected_requests += 1; }
                 let trace_count=if validation.is_err() { &mut rejected_trace } else { &mut accepted_trace };
@@ -676,6 +681,9 @@ async fn reader_loop(
                         crate::emit_log(&format!("RTSP#{trace_id}: rejection write failed CSeq={cseq:?} status={status}: {error}"));
                     }
                     continue;
+                }
+                if let (Ok(Some(layout)), Some(areas)) = (validation, view_areas.get()) {
+                    crate::emit_display_layout(areas.width, areas.height, layout);
                 }
                 let body = reply.as_ref().and_then(|f| f(&msg)).unwrap_or_default();
                 let ui_type = if msg.first_line.contains("/command") {
@@ -743,7 +751,7 @@ mod ingress_metadata_tests {
                     ("data",Value::Data(b"PRIVATE_PAYLOAD".to_vec())),("url",Value::str("scheme:PRIVATE_URL")),
                 ]))])),
             };
-            let validation=validate_inbound_command(&message);
+            let validation=validate_inbound_command(&message, None);
             assert_eq!(validation.err().map(|v|v.0).unwrap_or(200),expected);
             let note=inbound_command_metadata(&message);
             assert!(note.contains(&format!("type={kind}")));
@@ -767,15 +775,20 @@ pub(crate) fn is_box_observation_command(kind: &str) -> bool {
 // Validate only the command endpoint; other RTSP methods retain their existing behavior.
 // Known no-op notifications remain accepted. Parameter rules follow our actual consumers,
 // including both HID layouts and optional device UUID, rather than a stricter peer schema.
-fn validate_inbound_command(message: &RtspMessage) -> Result<(), (u16, &'static str)> {
+fn validate_inbound_command<'a>(message: &RtspMessage, areas: Option<&'a crate::display_layout::ViewAreas>)
+    -> Result<Option<&'a crate::display_layout::Layout>, (u16, &'static str)> {
     use crate::bplist::Value;
     let mut line = message.first_line.split_whitespace();
-    if line.next() != Some("POST") || line.next() != Some("/command") { return Ok(()); }
+    if line.next() != Some("POST") || line.next() != Some("/command") { return Ok(None); }
     let bad = (400, "Bad Request");
     let command = crate::bplist::parse(&message.body).map_err(|_| bad)?;
     let kind = command.get("type").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or(bad)?;
     let field = |name: &str| command.get(name).or_else(|| command.get("params").and_then(|p| p.get(name)));
     let valid = match kind {
+        "updateViewArea" => {
+            return crate::display_layout::match_update(areas, command.get("params"), crate::emit_log)
+                .map(Some).map_err(|_| if areas.is_none() { (501, "Not Implemented") } else { bad });
+        }
         "iAPSendMessage" => crate::wifi_iap2::command_data(&command).is_some(),
         kind if is_box_observation_command(kind) => command.get("params").is_none_or(|p|matches!(p,Value::Dict(_))),
         "hidSendReport" => {
@@ -795,7 +808,7 @@ fn validate_inbound_command(message: &RtspMessage) -> Result<(), (u16, &'static 
         "hidSetInputMode" | "ping" | "fps" => true,
         _ => return Err((501, "Not Implemented")),
     };
-    if valid { Ok(()) } else { Err(bad) }
+    if valid { Ok(None) } else { Err(bad) }
 }
 
 async fn respond_ok(write: &SharedWrite, cipher: &SharedCipher, protocol: &str, cseq: Option<i32>, body: &[u8]) -> std::io::Result<()> {
@@ -825,6 +838,30 @@ async fn respond(write: &SharedWrite, cipher: &SharedCipher, protocol: &str, cse
 mod tests {
     use super::*;
 
+    #[test]
+    fn view_area_event_resolves_only_this_displays_declared_index() {
+        use crate::bplist::{encode, Value};
+        use crate::display_layout::{Rect, ViewAreas};
+        let rect = |x, w| Value::dict(vec![("originXPixels", Value::int(x)),
+            ("widthPixels", Value::int(w)), ("heightPixels", Value::int(400))]);
+        let cropped = Value::dict(vec![("widthPixels", Value::int(700)), ("heightPixels", Value::int(450)),
+            ("safeArea", rect(20, 650))]);
+        let info = Value::dict(vec![("viewAreas", Value::array(vec![rect(0, 800), cropped]))]);
+        let areas = ViewAreas::new(&info, 800, 480, Some("Main"));
+        let event = |uuid, index| RtspMessage { first_line: "POST /command RTSP/1.0".into(),
+            headers: HashMap::new(), body: encode(&Value::dict(vec![("type", Value::str("updateViewArea")),
+                ("params", Value::dict(vec![("uuid", Value::str(uuid)), ("viewAreaIndex", Value::int(index))]))])) };
+        let layout = validate_inbound_command(&event("main", 1), Some(&areas)).unwrap().unwrap();
+        assert_eq!(layout.safe, Rect { x: 20, y: 0, w: 650, h: 400 });
+        for invalid in [event("aux", 1), event("Main", 2), event("Main", -1)] {
+            assert_eq!(validate_inbound_command(&invalid, Some(&areas)), Err((400, "Bad Request")));
+        }
+        assert_eq!(validate_inbound_command(&event("Main", 0), None), Err((501, "Not Implemented")));
+        let missing_params = RtspMessage { body: encode(&Value::dict(vec![("type", Value::str("updateViewArea"))])),
+            ..event("Main", 0) };
+        assert_eq!(validate_inbound_command(&missing_params, Some(&areas)), Err((400, "Bad Request")));
+    }
+
     async fn box_startup_sequence(kinds: &[&str]) {
         use crate::bplist::{encode,Value};
         for (protocol,encrypted) in [("RTSP/1.0",false),("HTTP/1.1",true)] {
@@ -838,7 +875,7 @@ mod tests {
                 let command=crate::bplist::parse(&request.body).ok()?;
                 reply_modes.lock().response(&command)
             });
-            let (_channel,mut inbound)=RtspChannel::spawn_with_reply(r,w,encrypted.then(||ControlCipher::new([1;32],[2;32])),Some(reply));
+            let (_channel,mut inbound)=RtspChannel::spawn_with_reply(r,w,encrypted.then(||ControlCipher::new([1;32],[2;32])),Some(reply),Default::default());
             let mut peer_cipher=ControlCipher::new([2;32],[1;32]);
             for (index,kind) in kinds.iter().chain(std::iter::once(&"iAPSendMessage")).enumerate() {
                 let last=index==kinds.len();
@@ -1174,7 +1211,7 @@ mod tests {
         let (r,w) = phone.into_split();
         let body = crate::bplist::encode(&crate::bplist::Value::dict(vec![("status", crate::bplist::Value::int(0))]));
         let expected = body.clone();
-        let (_channel, mut inbound) = RtspChannel::spawn_with_reply(r,w,None,Some(Arc::new(move |_| Some(body.clone()))));
+        let (_channel, mut inbound) = RtspChannel::spawn_with_reply(r,w,None,Some(Arc::new(move |_| Some(body.clone()))),Default::default());
         let command = crate::bplist::encode(&crate::bplist::Value::dict(vec![("type",crate::bplist::Value::str("changeModes"))]));
         car.write_all(format!("POST /command RTSP/1.0\r\nCSeq: 19\r\nContent-Length: {}\r\n\r\n",command.len()).as_bytes()).await.unwrap();
         car.write_all(&command).await.unwrap();

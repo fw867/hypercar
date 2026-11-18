@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::airplay::{self, AirplayParams, SocketProvider, TouchInput};
 use crate::audio_out::AudioOut;
+use crate::audio_resample::PcmToStereo;
 use crate::screen::ScreenSender;
 use crate::video_format::FrameOrigin;
 use crate::{emit_log, emit_stats, emit_state};
@@ -193,6 +194,7 @@ pub async fn run_engine(
     // 引擎下游（screen/audio pump、触摸反向）完全复用，不需要第二套实现。
     // The connection attempt owns the source; a media retry only replaces its subscriber.
     let prepared = if cfg.carlife_source {Some(crate::carwith_source::attach(cfg.carwith_source_owner)?)} else {None};
+    let carwith_media_rate = prepared.as_ref().map(|source|source.media_rate.clone());
     let carwith_display = prepared.as_ref().map(|source|source.display.clone());
     let microphone_probe = if cfg.carlife_source {
         prepared.as_ref().and_then(|source|source.microphone.clone())
@@ -224,6 +226,7 @@ pub async fn run_engine(
                                 *carwith_touch_size.lock() = (0, 0);
                                 crate::emit_carwith_navigation(navigation_token,None);
                                 let _ = voice_keys.send(crate::voice_key::RESET); let _ = vtx.send(SourceEvent::ResetVideoSource);
+                                let _=atx.send(SourceEvent::AudioStop{tts:false});
                                 let _=atx.send(SourceEvent::AudioStop{tts:true});
                                 let _=atx.send(SourceEvent::VoiceAudioStop);
                             }
@@ -316,7 +319,11 @@ pub async fn run_engine(
                             if let Some(mic)=&microphone_cancel {mic.cancel_asr(id);}
                         }
                         Some(SourceEvent::RequestHostUi) => { let _ = host_ui_tx.try_send(()); }
-                        Some(SourceEvent::RequestAudioOwnership) => { let _ = claims.try_send((true, std::time::Instant::now())); }
+                        Some(SourceEvent::RequestAudioOwnership) => {
+                            if let Err(error) = claims.try_send((true, std::time::Instant::now())) {
+                                emit_log(&format!("AUDIO-RESOURCE: claim user=true queue rejected: {error}"));
+                            }
+                        }
                         Some(ev) => {
                             let to_audio = matches!(
                                 ev,
@@ -430,6 +437,7 @@ pub async fn run_engine(
         encoder_size: encoder_size.clone(),
         touch_size: touch_size.clone(),
         carwith_display,
+        carwith_media_rate,
         carwith_stretch: cfg.carlife_source && cfg.carwith_stretch,
         screen_resource_lifecycle: cfg.screen_resource_lifecycle,
         pipeline: pipeline.clone(),
@@ -475,9 +483,14 @@ pub async fn run_engine(
                     let intent = fresh_audio_claim(first, &mut audio_claim_rx);
                     if let Some(user) = intent.filter(|_| had_audio) {
                         tokio::select! {
-                            _ = stop_audio_claim.notified() => return,
+                            _ = stop_audio_claim.notified() => {
+                                emit_log(&format!("AUDIO-RESOURCE: claim user={user} cancelled by session stop"));
+                                return;
+                            }
                             _ = audio_resource.request(user) => {}
                         }
+                    } else if let Some(user) = intent {
+                        emit_log(&format!("AUDIO-RESOURCE: claim user={user} skipped: no negotiated main audio"));
                     }
                 }
             }
@@ -578,11 +591,11 @@ async fn audio_pump(
     let mut ready = Some(audio_out_rx);
     let mut audio_rx = audio_rx;
     // 源格式余数缓冲（重采样跨包连续）
-    let mut media_remain: Vec<i16> = Vec::new();
-    let mut tts_remain: Vec<i16> = Vec::new();
+    let mut media_remain = PcmToStereo::default();
+    let mut tts_remain = PcmToStereo::default();
     let mut media_fmt: (u32, u8) = (44_100, 2);
     let mut tts_fmt: (u32, u8) = (16_000, 1);
-    // 48k 立体声混音缓冲
+    // Interleaved stereo in the negotiated main stream clock.
     let mut media_mix: VecDeque<i16> = VecDeque::with_capacity(48_000 * 2);
     let mut tts_mix: VecDeque<i16> = VecDeque::with_capacity(48_000 * 2);
     let mut voice = VoicePcm::default();
@@ -591,7 +604,8 @@ async fn audio_pump(
     let mut gain: f32 = 1.0;
     // Retain absolute pacing. A stalled worker skips expired source blocks and
     // advances the RTP clock instead of flooding the receiver with catch-up audio.
-    let mut tick = crate::audio_pacing::interval();
+    let mut mix_rate = TARGET_RATE;
+    let mut tick = crate::audio_pacing::interval(mix_rate);
     let mut sync_tick = tokio::time::interval(Duration::from_secs(1));
     sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // 发包速率自测：每秒记一行，联调时能直接看出节拍对不对。
@@ -607,6 +621,16 @@ async fn audio_pump(
     let mut max_late_us=0u128;
     let mut pacing_log=std::time::Instant::now();
     loop {
+        if let Some(rate) = out.as_ref().map(AudioOut::sample_rate).filter(|&rate| rate != mix_rate) {
+            mix_rate = rate;
+            emit_log(&format!("AUDIO: mixer clock set to negotiated {rate}Hz"));
+            tick = crate::audio_pacing::interval(rate);
+            // Samples prepared before SETUP belong to the previous clock.
+            media_mix.clear(); media_remain.clear();
+            tts_mix.clear(); tts_remain.clear();
+            voice.mix.clear(); voice.remain.clear();
+            duck_hold = 0;
+        }
         tokio::select! {
             _ = stop_a.notified() => return,
             command = commands.recv(), if commands_open => match command {
@@ -645,8 +669,13 @@ async fn audio_pump(
             ev = async { if let Some(event)=pending_events.pop_front() {Some(event)} else {audio_rx.recv().await} } => match ev {
                 Some(SourceEvent::AuxFallback{kind,samples}) => {
                     let queue=if kind==crate::aux_setup::Kind::Speech {&mut voice.mix} else {&mut tts_mix};
-                    queue.extend(samples);
-                    let overflow=queue.len().saturating_sub(TARGET_RATE as usize);
+                    // A failed independent setup hands us one buffered 48 kHz stereo clip.
+                    if mix_rate == 48000 { queue.extend(samples); }
+                    else {
+                        let pcm: Vec<_> = samples.into_iter().flat_map(i16::to_le_bytes).collect();
+                        PcmToStereo::default().push(&pcm,48000,2,mix_rate,queue);
+                    }
+                    let overflow=queue.len().saturating_sub(mix_rate as usize);
                     if overflow>0 {queue.drain(..overflow);}
                 }
                 Some(SourceEvent::VoiceAudioInit {rate,channels}) => {
@@ -656,7 +685,7 @@ async fn audio_pump(
                 }
                 Some(SourceEvent::VoiceAudioData {rate,channels,data}) => {
                     let accepted=match auxiliary.push(crate::aux_setup::Kind::Speech,rate,channels,&data) {
-                        crate::aux_audio::Route::Mix=>voice.push(rate,channels,&data),
+                        crate::aux_audio::Route::Mix=>voice.push(rate,channels,&data,mix_rate),
                         crate::aux_audio::Route::Independent=>true,
                         crate::aux_audio::Route::Drop=>false,
                     };
@@ -668,28 +697,34 @@ async fn audio_pump(
                 Some(SourceEvent::VoiceAudioStop) => {
                     auxiliary.stop(crate::aux_setup::Kind::Speech);
                     voice.stop();
-                    emit_log(&format!("VOICE-AUDIO: input ended; queued={}ms tail retained",voice.mix.len()*1000/TARGET_RATE as usize/2));
+                    emit_log(&format!("VOICE-AUDIO: input ended; queued={}ms tail retained",voice.mix.len()*1000/mix_rate as usize/2));
                 }
                 Some(SourceEvent::AudioInit { tts, rate, channels }) => {
                     // A new source session may reclaim only an ANYTIME grant. TTS and
                     // continuous PCM never masquerade as a user-initiated media request.
                     if !tts {
                         auxiliary.media_restart();
-                        let _ = claims.try_send((false, std::time::Instant::now()));
+                        if let Err(error) = claims.try_send((false, std::time::Instant::now())) {
+                            emit_log(&format!("AUDIO-RESOURCE: claim user=false queue rejected: {error}"));
+                        }
                     }
                     if tts {
                         auxiliary.init(crate::aux_setup::Kind::Navigation,rate,channels);
+                        tts_remain.clear();
                         tts_fmt = (rate.max(1), channels.max(1));
                     }
-                    else { media_fmt = (rate.max(1), channels.max(1)); }
+                    else {
+                        media_remain.clear(); media_fmt = (rate.max(1), channels.max(1));
+                        if out.is_some() { emit_log(&format!("AUDIO: MEDIA_INIT={rate}Hz mix={mix_rate}Hz")); }
+                    }
                     stats.lock().playing = true;
                 }
                 Some(SourceEvent::AudioStop { tts }) => {
                     if tts {
                         auxiliary.stop(crate::aux_setup::Kind::Navigation);
-                        tts_mix.clear();
+                        tts_mix.clear(); tts_remain.clear();
                     } else {
-                        media_mix.clear();
+                        media_mix.clear(); media_remain.clear();
                         if tts_mix.is_empty() && voice.mix.is_empty() { last_audio_at = None; }
                     }
                 }
@@ -714,9 +749,9 @@ async fn audio_pump(
                         stats.lock().playing = true;
                         last_audio_at = Some(std::time::Instant::now());
                     }
-                    push_resampled(&data, fmt.0, fmt.1, remain, mix);
+                    remain.push(&data, fmt.0, fmt.1, mix_rate, mix);
                     // 缓冲上限 ~0.5s：过载丢旧（导航长语音不至于拖垮媒体）
-                    let cap = (TARGET_RATE as usize) * 2 / 2;
+                    let cap = mix_rate as usize;
                     while mix.len() > cap { mix.pop_front(); }
                 }
                 Some(_) => {}
@@ -735,7 +770,7 @@ async fn audio_pump(
             }
             scheduled = tick.tick() => {
                 let now=tokio::time::Instant::now();
-                let skipped=crate::audio_pacing::missed_source_frames(scheduled,now);
+                let skipped=crate::audio_pacing::missed_source_frames(scheduled,now,mix_rate);
                 max_late_us=max_late_us.max(now.saturating_duration_since(scheduled).as_micros());
                 if skipped>0 {
                     pacing_recoveries+=1; skipped_source_frames=skipped_source_frames.saturating_add(skipped);
@@ -764,7 +799,7 @@ async fn audio_pump(
                 gain += (target - gain) * 0.15;
 
                 for i in 0..SPF {
-                    // 混音队列里是**交错立体声**（push_resampled 每帧压 L、R 两个样本）。
+                    // 混音队列里是**交错立体声**（每帧含 L、R 两个样本）。
                     // 之前每帧只取一个样本再左右都填它——只消费了一半数据、还把立体声
                     // 压成单声道，听感就是沙沙声 + 断续（现场 2026-10-23 23:10 定位）。
                     let ml = take_or_zero(&mut media_mix);
@@ -796,14 +831,15 @@ async fn audio_pump(
                 if rate_mark.elapsed() >= Duration::from_secs(1) {
                     let secs = rate_mark.elapsed().as_secs_f64().max(0.001);
                     emit_log(&format!(
-                        "AUDIO: 发包 {:.0}/s（应 {:.0}/s） 队列 media={}ms tts={}ms vr={}ms owner_phone={} blocked_samples={}",
+                        "AUDIO: 发包 {:.0}/s（应 {:.0}/s） 队列 media={}ms tts={}ms vr={}ms owner_phone={} blocked_samples={} udp_congestion_drops={}",
                         sent_packets as f64 / secs,
-                        TARGET_RATE as f64 / out.as_ref().map(|a| a.samples_per_packet()).unwrap_or(SPF) as f64,
-                        media_mix.len() * 1000 / (TARGET_RATE as usize).max(1) / 2,
-                        tts_mix.len() * 1000 / (TARGET_RATE as usize).max(1) / 2,
-                        voice.mix.len() * 1000 / TARGET_RATE as usize / 2,
+                        out.as_ref().map_or(mix_rate as f64 / SPF as f64, |a| a.sample_rate() as f64 / a.samples_per_packet() as f64),
+                        media_mix.len() * 1000 / (mix_rate as usize).max(1) / 2,
+                        tts_mix.len() * 1000 / (mix_rate as usize).max(1) / 2,
+                        voice.mix.len() * 1000 / mix_rate as usize / 2,
                         out.as_ref().map(|a| a.owns_audio()).unwrap_or(false),
-                        out.as_ref().map(|a| a.blocked_samples()).unwrap_or(0)
+                        out.as_ref().map(|a| a.blocked_samples()).unwrap_or(0),
+                        out.as_ref().map_or(0, |a| a.congestion_drops)
                     ));
                     sent_packets = 0;
                     rate_mark = std::time::Instant::now();
@@ -1108,76 +1144,12 @@ fn pcm_has_signal(raw: &[u8]) -> bool {
     })
 }
 
-/// 把一包 PCM（LE i16 交错）线性重采样为 48kHz 立体声，推入混音缓冲。
-pub(crate) fn push_resampled(
-    raw: &[u8],
-    src_rate: u32,
-    src_ch: u8,
-    remain: &mut Vec<i16>,
-    out: &mut VecDeque<i16>,
-) {
-    let shorts = raw.len() / 2;
-    for i in 0..shorts {
-        remain.push(i16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]));
-    }
-    let ch = src_ch.max(1) as usize;
-    let src_frames = remain.len() / ch;
-    if src_frames == 0 || src_rate == 0 {
-        return;
-    }
-    if src_rate == TARGET_RATE && ch == 2 {
-        let total = src_frames * 2;
-        for i in 0..total {
-            out.push_back(remain[i]);
-        }
-        remain.drain(..total);
-        return;
-    }
-    let ratio = src_rate as f64 / TARGET_RATE as f64;
-    let dst_frames = ((src_frames as f64) / ratio) as usize;
-    let read = |idx: usize, lane: usize| -> i16 {
-        if ch == 1 {
-            remain[idx]
-        } else {
-            remain[idx * ch + lane]
-        }
-    };
-    for i in 0..dst_frames {
-        let pos = i as f64 * ratio;
-        let i0 = (pos as usize).min(src_frames - 1);
-        let i1 = (i0 + 1).min(src_frames - 1);
-        let frac = (pos - i0 as f64) as f32;
-        let l = if ch == 1 {
-            let m0 = read(i0, 0) as f32;
-            let m1 = read(i1, 0) as f32;
-            m0 + (m1 - m0) * frac
-        } else {
-            let l0 = read(i0, 0) as f32;
-            let l1 = read(i1, 0) as f32;
-            l0 + (l1 - l0) * frac
-        };
-        let r = if ch == 1 {
-            l
-        } else {
-            let r0 = read(i0, 1) as f32;
-            let r1 = read(i1, 1) as f32;
-            r0 + (r1 - r0) * frac
-        };
-        out.push_back(l.clamp(i16::MIN as f32, i16::MAX as f32) as i16);
-        out.push_back(r.clamp(i16::MIN as f32, i16::MAX as f32) as i16);
-    }
-    // 已消费的源帧丢弃（浮点取整误差在余数里可忽略）
-    let consumed = (dst_frames as f64 * ratio) as usize;
-    let consumed = consumed.min(src_frames) * ch;
-    remain.drain(..consumed);
-}
-
 // Keep VR replies separate from navigation TTS: ending either source must not
 // erase the other's queued audio. A normal VR STOP closes input, then drains.
 #[derive(Default)]
 struct VoicePcm {
     format:Option<(u32,u8)>,
-    remain:Vec<i16>,
+    remain:PcmToStereo,
     mix:VecDeque<i16>,
 }
 impl VoicePcm {
@@ -1186,11 +1158,11 @@ impl VoicePcm {
         self.remain.clear(); self.mix.clear();
     }
     fn stop(&mut self) {self.format=None; self.remain.clear();}
-    fn push(&mut self,rate:u32,channels:u8,data:&[u8])->bool {
+    fn push(&mut self,rate:u32,channels:u8,data:&[u8],mix_rate:u32)->bool {
         if self.format!=Some((rate,channels)) {return false;}
-        push_resampled(data,rate,channels,&mut self.remain,&mut self.mix);
+        self.remain.push(data,rate,channels,mix_rate,&mut self.mix);
         // Match the existing half-second limit and retire whole stereo frames.
-        let overflow=self.mix.len().saturating_sub(TARGET_RATE as usize);
+        let overflow=self.mix.len().saturating_sub(mix_rate as usize);
         if overflow>0 {self.mix.drain(..overflow);}
         true
     }
@@ -1204,24 +1176,45 @@ fn mix_audio_sample(media:i16,tts:i16,voice:i16,gain:f32)->i16 {
 mod voice_mix_tests {
     use super::*;
     #[test]
+    fn carlife_44100_media_clock_and_waveform_are_independent_of_packet_size() {
+        let raw: Vec<_> = (0..44_100).flat_map(|i| {
+            let left = (i % 12000) as i16;
+            [left, -left].into_iter().flat_map(i16::to_le_bytes)
+        }).collect();
+        let convert = |chunk: usize| {
+            let mut state = PcmToStereo::default();
+            let mut output = VecDeque::new();
+            for part in raw.chunks(chunk) {
+                state.push(part, 44_100, 2, 48_000, &mut output);
+            }
+            output
+        };
+        let whole = convert(raw.len());
+        let packets = convert(1024 * 4);
+        assert_eq!(packets.len(), whole.len());
+        assert!((47_999..=48_000).contains(&(whole.len() / 2)));
+        assert!(packets == whole);
+    }
+
+    #[test]
     fn voice_end_preserves_tail_and_new_init_cannot_replay_old_reply() {
         let mut voice=VoicePcm::default();
         let pcm=1500i16.to_le_bytes().repeat(160);
-        assert!(!voice.push(16000,1,&pcm));
+        assert!(!voice.push(16000,1,&pcm,48000));
         voice.init(16000,1);
-        assert!(voice.push(16000,1,&pcm));
+        assert!(voice.push(16000,1,&pcm,48000));
         let queued=voice.mix.len(); assert!(queued>0);
         voice.stop();
         assert_eq!(voice.mix.len(),queued);
-        assert!(!voice.push(16000,1,&pcm));
+        assert!(!voice.push(16000,1,&pcm,48000));
         assert_eq!(mix_audio_sample(0,0,take_or_zero(&mut voice.mix),0.25),1500);
         voice.init(4000,1);
-        assert!(voice.push(4000,1,&pcm));
+        assert!(voice.push(4000,1,&pcm,48000));
         assert!(voice.mix.len()>queued);
         voice.init(48000,2);
         assert!(voice.mix.is_empty());
-        assert!(!voice.push(16000,1,&pcm));
-        assert!(voice.push(48000,2,&[1;500000]));
+        assert!(!voice.push(16000,1,&pcm,48000));
+        assert!(voice.push(48000,2,&[1;500000],48000));
         assert_eq!(voice.mix.len(),TARGET_RATE as usize);
     }
     #[test]
@@ -1288,6 +1281,7 @@ fn fresh_audio_claim(first: (bool, std::time::Instant), pending: &mut mpsc::Rece
     let mut next = Some(first);
     while let Some((user, at)) = next {
         if at.elapsed() < Duration::from_secs(2) { intent = Some(intent.unwrap_or(false) || user); }
+        else { emit_log(&format!("AUDIO-RESOURCE: claim user={user} expired before dispatch")); }
         next = pending.try_recv().ok();
     }
     intent
@@ -1350,6 +1344,39 @@ mod main_audio_command_tests {
         worker.abort();let _=worker.await;
     }
     #[tokio::test]
+    async fn navigation_and_speech_mix_at_both_negotiated_pcm_rates() {
+        for mix_rate in [44100,48000] {
+            let peer=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let socket=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            socket.connect(peer.local_addr().unwrap()).await.unwrap();
+            let (ready,rx)=tokio::sync::oneshot::channel();
+            let (events,audio)=mpsc::unbounded_channel();
+            let (_commands,cmd)=mpsc::unbounded_channel();
+            let (claims,_)=mpsc::channel(4);
+            let task=crate::callback_context::spawn(audio_pump(Arc::new(Notify::new()),
+                Arc::new(Mutex::new(AudioPumpStat::default())),claims,rx,audio,cmd,Arc::default()));
+            assert!(ready.send(AudioOut::new_pcm(socket,None,[7;32],mix_rate)).is_ok());
+            let mut packet=[0;4096];
+            tokio::time::timeout(Duration::from_secs(1),peer.recv(&mut packet)).await.unwrap().unwrap();
+            // Left-only stereo navigation and mono speech should produce different L/R sums.
+            let nav:Vec<_>=[1000i16,0].into_iter().flat_map(i16::to_le_bytes).collect();
+            events.send(SourceEvent::AudioInit{tts:true,rate:24000,channels:2}).unwrap();
+            events.send(SourceEvent::AudioData{tts:true,rate:24000,channels:2,data:nav.repeat(4800)}).unwrap();
+            events.send(SourceEvent::VoiceAudioInit{rate:16000,channels:1}).unwrap();
+            events.send(SourceEvent::VoiceAudioData{rate:16000,channels:1,data:2000i16.to_le_bytes().repeat(3200)}).unwrap();
+            tokio::time::timeout(Duration::from_secs(1),async {
+                loop {
+                    let n=peer.recv(&mut packet).await.unwrap();
+                    let nonce=u64::from_le_bytes(packet[n-8..n].try_into().unwrap());
+                    let pcm=crate::crypto::chacha_open(&[7;32],&crate::crypto::nonce64(nonce),&packet[12..n-8],&packet[4..12]).unwrap();
+                    if pcm.chunks_exact(4).all(|frame| frame==[0x0b,0xb8,0x07,0xd0]) { break; }
+                }
+            }).await.expect("both navigation and speech must reach stereo media RTP");
+            task.abort(); let _=task.await;
+        }
+    }
+
+    #[tokio::test]
     async fn paused_pump_drops_late_initial_sender_until_explicit_install() {
         let(claims,_)=mpsc::channel(4);let(ready,rx)=tokio::sync::oneshot::channel();
         let(_events,audio)=mpsc::unbounded_channel();let(commands,command_rx)=mpsc::unbounded_channel();
@@ -1396,7 +1423,7 @@ mod main_audio_command_tests {
         events.send(SourceEvent::AudioInit{tts:true,rate:48000,channels:2}).unwrap();
         events.send(SourceEvent::AudioData{tts:true,rate:48000,channels:2,data:2000i16.to_le_bytes().repeat(12000)}).unwrap();
         tokio::time::timeout(Duration::from_secs(1),async {while !stats.lock().playing {tokio::task::yield_now().await;}}).await.unwrap();
-        input.configure(&info);
+        input.configure(&info, &[Kind::Speech,Kind::Navigation]);
         let(out,peer,_)=output().await;assert!(ready.send(out).is_ok());
         let mut packet=[0;4096];
         for _ in 0..5 {

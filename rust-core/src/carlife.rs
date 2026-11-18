@@ -117,6 +117,8 @@ const VIDEO_DATA: u32 = 0x0002_0001;
 const VIDEO_HEARTBEAT: u32 = 0x0002_0002;
 const MEDIA_INIT: u32 = 0x0003_0001;
 const MEDIA_STOP: u32 = 0x0003_0002;
+const MEDIA_PAUSE: u32 = 0x0003_0003;
+const MEDIA_RESUME: u32 = 0x0003_0004;
 const MEDIA_DATA: u32 = 0x0003_0006;
 const TTS_INIT: u32 = 0x0004_0001;
 const TTS_STOP: u32 = 0x0004_0002;
@@ -697,6 +699,18 @@ async fn handle_media_client(
                 channel_stats.frame(service_type);
                 if service_type==0 {channel_stats.parse_fail+=1;}
             }
+            if matches!(kind, MediaKind::Media) {
+                let marker = match service_type {
+                    MEDIA_INIT => Some("INIT"),
+                    MEDIA_PAUSE => Some("PAUSE"),
+                    MEDIA_RESUME => Some("RESUME"),
+                    _ => None,
+                };
+                if let Some(marker) = marker {
+                    channel_stats.awaiting_signal_after = Some(marker);
+                    emit_log(&format!("CARWITH-MEDIA: 9240 rx={marker} service=0x{service_type:x} frame={}", channel_stats.frames));
+                }
+            }
             if service_type == VIDEO_DATA && encryption.as_ref().is_some_and(|s| !s.lock().started) {
                 continue; // A landing-page frame is not proof of a completed CarWith handshake.
             }
@@ -782,8 +796,11 @@ async fn handle_media_client(
                         MEDIA_STOP | TTS_STOP => {
                             if events.send(CarLifeEvent::AudioStop { tts }).is_err() {channel_stats.event_closed+=1;}
                         }
+                        MEDIA_PAUSE | MEDIA_RESUME if !tts => {} // Source notifications have no response.
                         MEDIA_DATA | TTS_DATA => {
-                            channel_stats.pcm(&payload);
+                            if let Some(marker) = channel_stats.pcm(&payload) {
+                                emit_log(&format!("CARWITH-MEDIA: 9240 rx=firstNonSilentPCM after={marker} frame={} bytes={} rate={rate} channels={channels}", channel_stats.frames, payload.len()));
+                            }
                             if !payload.is_empty() {
                                 // **剥掉 12 字节 PCM 包头**（2026-10-27 23:56 定案）：
                                 // 反编译 `PCMPackageHead` 明确 mMediaHeadLen=12/mTTSHeadLen=12，

@@ -58,6 +58,7 @@ pub struct AudioOut {
     pt: u8,
     /** 已发包数（对外统计）。 */
     packets: u64,
+    pub(crate) congestion_drops: u64,
     payload_bytes: u64,
     /** 同步包自己的序号（与音频 RTP 序号无关，独立递增）。 */
     sync_seq: u16,
@@ -69,8 +70,6 @@ pub struct AudioOut {
     opus: Option<crate::opus_encode::OpusEncoder>,
     aac_needs_reset: bool,
     sample_rate: u32,
-    resampler: Option<crate::audio_resample::Stereo48To441>,
-    skipped_rate_remainder: u64,
 }
 
 impl AudioOut {
@@ -90,6 +89,7 @@ impl AudioOut {
             nonce: 0,
             pt: payload_type,
             packets: 0,
+            congestion_drops: 0,
             payload_bytes: 0,
             sync_seq: 0,
             marker_pending: true,
@@ -99,15 +99,18 @@ impl AudioOut {
             opus: None,
             aac_needs_reset: false,
             sample_rate: 48000,
-            resampler: None,
-            skipped_rate_remainder: 0,
         }
+    }
+
+    pub fn new_pcm(data: UdpSocket, sync: Option<UdpSocket>, key: [u8;32], rate: u32) -> Self {
+        let mut output = Self::new(data, sync, key, 100);
+        output.sample_rate = rate;
+        output
     }
 
     pub fn new_aac(data: UdpSocket, sync: Option<UdpSocket>, key: [u8;32], encoder: crate::aac::AacEncoder) -> Self {
         let mut output = Self::new(data, sync, key, 102);
         output.sample_rate = encoder.sample_rate();
-        if output.sample_rate == 44100 { output.resampler = Some(Default::default()); }
         output.aac = Some(encoder);
         output
     }
@@ -139,11 +142,13 @@ impl AudioOut {
     /// count transmitted attempts only; the sample clock advances across the discontinuity.
     pub(crate) fn skip_source_frames(&mut self, source_frames: u64) {
         if source_frames == 0 { return; }
-        let scaled=source_frames as u128*self.sample_rate as u128+self.skipped_rate_remainder as u128;
-        self.skipped_rate_remainder=(scaled%48_000) as u64;
-        self.ts=self.ts.wrapping_add((scaled/48_000) as u32);
+        // Independent Opus takes 48 kHz input. Main media takes mixer frames at its RTP rate.
+        let frames = if self.opus.is_some() {
+            (u128::from(source_frames) * u128::from(self.sample_rate) / 48_000) as u32
+        } else { source_frames as u32 };
+        self.ts = self.ts.wrapping_add(frames);
         self.marker_pending=true;
-        // Retain the codec's partial frame and resampler phase. stop/create/start here
+        // Retain the codec's partial frame. stop/create/start here
         // can itself miss the next deadline and repeatedly starve AAC before 1024 frames.
         // Expired PCM is retired in the mix queues; no elapsed ticks enter this encoder.
     }
@@ -154,7 +159,6 @@ impl AudioOut {
             self.marker_pending = true;
             if self.pt == 102 { self.aac.take(); self.aac_needs_reset = true; }
             if let Some(encoder)=self.opus.as_mut() { encoder.reset()?; }
-            if let Some(converter) = self.resampler.as_mut() { converter.reset(); }
             return Ok(());
         }
         if let Some(encoder)=self.opus.as_mut() {
@@ -166,8 +170,6 @@ impl AudioOut {
                 self.aac_needs_reset = false;
                 self.aac = Some(crate::aac::AacEncoder::at_rate(self.sample_rate)?);
             }
-            let converted = self.resampler.as_mut().map(|converter| converter.convert(frames));
-            let frames = converted.as_deref().unwrap_or(frames);
             let encoded = self.aac.as_mut().ok_or_else(|| std::io::Error::other("AAC encoder stopped"))?.encode(frames);
             let encoded = match encoded { Ok(frames) => frames, Err(error) => { self.aac.take(); return Err(error); } };
             for payload in encoded { self.send_payload(&payload, crate::aac::FRAMES as u32).await?; }
@@ -187,7 +189,6 @@ impl AudioOut {
             self.marker_pending = true;
             if self.pt == 102 { self.aac.take(); self.aac_needs_reset = true; }
             if let Some(encoder)=self.opus.as_mut() { encoder.reset()?; }
-            if let Some(converter) = self.resampler.as_mut() { converter.reset(); }
             return Ok(());
         }
         let mut header = [0u8; RTP_HEADER_LEN];
@@ -204,7 +205,15 @@ impl AudioOut {
         self.nonce = self.nonce.wrapping_add(1);
         self.seq = self.seq.wrapping_add(1);
         self.ts = self.ts.wrapping_add(sample_frames);
-        self.udp.send(&wire).await?;
+        // The connected Tokio socket is nonblocking. Attempt one kernel write per RTP
+        // packet, even on the first tick before Tokio has observed writable readiness.
+        if let Err(error) = socket2::SockRef::from(&self.udp).send_with_flags(&wire, libc::MSG_DONTWAIT) {
+            if error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == Some(libc::ENOBUFS) {
+                self.congestion_drops = self.congestion_drops.saturating_add(1);
+                return Ok(());
+            }
+            return Err(error);
+        }
         self.payload_bytes = self.payload_bytes.saturating_add(payload.len() as u64);
         if self.packets == 0 && self.pt == 102 {
             crate::emit_log(&format!("AUDIO: first AAC RTP type=102 SPF=1024 raw_bytes={}", payload.len()));
@@ -342,7 +351,7 @@ mod ownership_tests {
     }
 
     #[test]
-    fn missed_aac441_time_preserves_fractional_sample_rate_and_wraps_rtp() {
+    fn missed_aac441_mix_frames_advance_rtp_in_the_negotiated_clock() {
         let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {
             let socket=UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -350,7 +359,7 @@ mod ownership_tests {
             sender.sample_rate=44100;
             sender.ts=u32::MAX-100;
             for _ in 0..10 { sender.skip_source_frames(352); }
-            assert_eq!(sender.ts,(u32::MAX-100).wrapping_add(3234));
+            assert_eq!(sender.ts,(u32::MAX-100).wrapping_add(3520));
             assert_eq!(sender.seq,0);
             assert_eq!(sender.nonce,0);
             assert!(sender.marker_pending);
@@ -388,7 +397,7 @@ mod ownership_tests {
         assert_eq!(sender.packets_sent(),0);
         sender.skip_source_frames(352);
         assert!(sender.aac.is_some(),"recovery must not synchronously destroy/recreate the codec on every late tick");
-        assert_eq!(sender.ts,323);
+        assert_eq!(sender.ts,352);
         assert!(sender.marker_pending);
         for _ in 0..60 {
             sender.send_pcm(&vec![0;704]).await.unwrap();
@@ -400,13 +409,13 @@ mod ownership_tests {
     }
     #[cfg(target_os="android")]
     #[tokio::test]
-    async fn aac441_sender_converts_48k_input_and_keeps_rtp_sample_clock() {
+    async fn aac441_sender_encodes_negotiated_mix_and_keeps_rtp_sample_clock() {
         let receiver=UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let socket=UdpSocket::bind("127.0.0.1:0").await.unwrap();
         socket.connect(receiver.local_addr().unwrap()).await.unwrap();
         let key=[7;32];
         let mut sender=AudioOut::new_aac(socket,None,key,crate::aac::AacEncoder::at_rate(44100).unwrap());
-        let pcm=vec![500;960]; // 480 source frames / 10ms at 48kHz.
+        let pcm=vec![500;882]; // 441 negotiated frames / 10 ms.
         for _ in 0..100 {
             sender.send_pcm(&pcm).await.unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -462,6 +471,41 @@ mod ownership_tests {
         assert_eq!(audio.codec_name(),"PCM");
         assert_eq!(audio.payload_bytes_sent(),(samples.len()*2) as u64);
         assert_ne!(packet[1] & 0x80, 0);
+    }
+
+    #[tokio::test]
+    async fn full_audio_socket_drops_one_tick_and_resumes_with_the_correct_clock() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixDatagram;
+        use std::{io::ErrorKind, time::Duration};
+
+        // A connected datagram pair gives reproducible kernel backpressure without Wi-Fi loss.
+        let (tx, rx) = UnixDatagram::pair().unwrap();
+        tx.set_nonblocking(true).unwrap();
+        rx.set_nonblocking(true).unwrap();
+        while tx.send(&[0; 2048]).is_ok() {}
+        let fd: OwnedFd = tx.into();
+        let socket = UdpSocket::from_std(std::net::UdpSocket::from(fd)).unwrap();
+        let mut sender = AudioOut::new(socket, None, [7; 32], 102);
+        tokio::time::timeout(Duration::from_millis(100), sender.send_payload(&[42; 64], 1024))
+            .await.expect("an unwritable data port must not hold the audio pump").unwrap();
+        assert_eq!((sender.packets_sent(), sender.payload_bytes_sent()), (0, 0));
+        assert_eq!(sender.congestion_drops, 1);
+        let mut wire = [0; 2048];
+        loop {
+            match rx.recv(&mut wire) {
+                Ok(_) => continue,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        sender.send_payload(&[43; 64], 1024).await.unwrap();
+        let n = rx.recv(&mut wire).unwrap();
+        assert_eq!(u16::from_be_bytes(wire[2..4].try_into().unwrap()), 1);
+        assert_eq!(u32::from_be_bytes(wire[4..8].try_into().unwrap()), 1024);
+        assert_eq!(u64::from_le_bytes(wire[n-8..n].try_into().unwrap()), 1);
+        assert_ne!(wire[1] & 0x80, 0);
+        assert_eq!((sender.packets_sent(), sender.payload_bytes_sent()), (1, 64));
     }
 
     #[tokio::test]

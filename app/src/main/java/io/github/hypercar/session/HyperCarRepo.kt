@@ -1202,15 +1202,23 @@ object HyperCarRepo {
                     servicesReady = { coordinator.isListening && advertiser.isAdvertising },
                     sessionStarted = { coordinator.isSessionActive || coordinator.sessionStartCount > baselineSessions ||
                         advertiser.lastInvitePeerIp != null || streaming },
-                    preparationKey = {
+                    preparationKey = preparation@{
+                        if (p.id != "bmw_id85") return@preparation null
                         val target = SettingsStore.targetCarMac
-                        val bonded = runCatching {
-                            android.bluetooth.BluetoothAdapter.getDefaultAdapter()?.bondedDevices
-                                ?.any { it.address.equals(target, ignoreCase = true) } == true
-                        }.getOrDefault(false)
-                        io.github.hypercar.bluetooth.ReconnectDiscoverability.bmwPreparationKey(
-                            p.id, target, bonded, coordinator.isListening,
-                            sessionLive.get() && connectionAttemptId == discoveryAttempt && !userDisconnectRequested)
+                        val allowed = sessionLive.get() && connectionAttemptId == discoveryAttempt && !userDisconnectRequested
+                        val listening = coordinator.isListening
+                        if (!allowed || !listening || (target.isNullOrBlank() && boundNetwork != null)) return@preparation null
+                        runCatching {
+                            val devices = android.bluetooth.BluetoothAdapter.getDefaultAdapter()?.bondedDevices.orEmpty()
+                            if (target.isNullOrBlank()) {
+                                ReconnectDiscoverability.automaticBmwPreparationKey(p.id, listening, allowed, SettingsStore.pairedCars) { mac ->
+                                    devices.firstOrNull { it.address.equals(mac, ignoreCase = true) }?.name
+                                }
+                            } else {
+                                ReconnectDiscoverability.bmwPreparationKey(p.id, target,
+                                    devices.any { it.address.equals(target, ignoreCase = true) }, listening, allowed)
+                            }
+                        }.getOrNull()
                     },
                     log = ::log,
                 ) } catch (cancelled: CancellationException) {
@@ -2636,7 +2644,13 @@ object HyperCarRepo {
             }
         }
 
-        override fun onLog(line: String) = log(line)
+        override fun onLog(line: String) {
+            if (line.startsWith("CARWITH-MEDIA:") || line.startsWith("AUDIO-RESOURCE:")) {
+                log("$line ${MusicBridge.audioListenerSnapshot}")
+            } else {
+                log(line)
+            }
+        }
 
         override fun onCarWithReopen(attempt: Long) {
             if (!carWithEntries.claimReopen(attempt)) return

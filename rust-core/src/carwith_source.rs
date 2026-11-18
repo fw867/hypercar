@@ -16,6 +16,7 @@ struct Feed {
     gop: VecDeque<CarLifeEvent>, bytes: usize, since: Option<Instant>,
     codec: Option<VideoCodec>, size: Option<(u32,u32)>,
     formats: [Option<CarLifeEvent>;3], handshake: bool,
+    media_rate: tokio::sync::watch::Sender<Option<u32>>,
     #[cfg(test)]
     frames: u64,
 }
@@ -26,6 +27,7 @@ impl Feed {
             CarLifeEvent::SourceReset { cache_cleared } => {
                 self.clear_video(); self.parameters.clear(); self.codec=None;
                 self.size=None; self.formats=[None,None,None]; self.handshake=false;
+                self.media_rate.send_replace(None);
                 if let Some(cleared) = cache_cleared { cleared.notify_one(); }
             }
             CarLifeEvent::Handshake => self.handshake=true,
@@ -35,7 +37,10 @@ impl Feed {
                 }
                 self.size=Some((*width,*height));
             }
-            CarLifeEvent::AudioInit{tts,..} => self.formats[*tts as usize]=Some(event.clone()),
+            CarLifeEvent::AudioInit{tts,rate,..} => {
+                self.formats[*tts as usize]=Some(event.clone());
+                if !tts { self.media_rate.send_replace(Some(*rate)); }
+            }
             CarLifeEvent::VoiceAudioInit{..} => self.formats[2]=Some(event.clone()),
             CarLifeEvent::AudioStop{tts} => self.formats[*tts as usize]=None,
             CarLifeEvent::VoiceAudioStop => self.formats[2]=None,
@@ -127,6 +132,7 @@ pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
     Ok(())
 }
 pub(crate) struct Attachment {
+    pub media_rate:tokio::sync::watch::Receiver<Option<u32>>,
     pub hub:Arc<CarLifeHub>, pub events:mpsc::UnboundedReceiver<(CarLifeEvent, FrameOrigin)>,
     pub display:crate::carlife::DisplayRequest, pub microphone:Option<Arc<crate::mic_probe::ProbeControl>>,
 }
@@ -134,9 +140,10 @@ pub(crate) struct InputLease(pub Arc<CarLifeHub>);
 impl Drop for InputLease {fn drop(&mut self) {self.0.release_touch();}}
 pub(crate) fn attach(owner:u64)->Result<Attachment,String> {
     let slot=SOURCE.lock();let source=slot.current.as_ref().filter(|s|s.owner==owner).ok_or("CarWith source not prepared for this attempt")?;
+    let media_rate=source.feed.lock().media_rate.subscribe();
     let events=source.feed.lock().attach(); source.hub.request_keyframe();
     crate::emit_log(&format!("CARWITH-SOURCE: owner={owner} media attached; cached GOP then live events"));
-    Ok(Attachment{hub:source.hub.clone(),events,display:source.display.clone(),microphone:source.microphone.clone()})
+    Ok(Attachment{media_rate,hub:source.hub.clone(),events,display:source.display.clone(),microphone:source.microphone.clone()})
 }
 pub(crate) fn stop(owner:u64) {
     let mut slot=SOURCE.lock();
@@ -160,6 +167,22 @@ mod tests {
         CarLifeEvent::VideoFrame { pts_us: 1, data: vec![0,0,0,1,kind,8] }
     }
 
+    #[test]
+    fn only_current_source_media_init_controls_the_negotiation_clock() {
+        let mut feed=Feed::default();
+        let rate=feed.media_rate.subscribe();
+        feed.receive(CarLifeEvent::AudioInit{tts:false,rate:44100,channels:2});
+        feed.receive(CarLifeEvent::VoiceAudioInit{rate:16000,channels:1});
+        feed.receive(CarLifeEvent::AudioInit{tts:true,rate:24000,channels:1});
+        feed.receive(CarLifeEvent::AudioStop{tts:false});
+        assert_eq!(*rate.borrow(),Some(44100));
+        feed.attach();
+        assert_eq!(*feed.media_rate.subscribe().borrow(),Some(44100));
+        feed.receive(CarLifeEvent::SourceReset{cache_cleared:None});
+        assert_eq!(*rate.borrow(),None);
+        feed.receive(CarLifeEvent::AudioInit{tts:false,rate:48000,channels:2});
+        assert_eq!(*rate.borrow(),Some(48000));
+    }
     #[tokio::test]
     async fn pause_before_prepare_does_not_revive_retired_attempt() {
         let config: EngineConfig = serde_json::from_value(serde_json::json!({

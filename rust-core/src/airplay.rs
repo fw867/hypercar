@@ -76,6 +76,7 @@ pub struct AirplayParams {
     pub touch_size: Arc<Mutex<(u32, u32)>>,
     /// CarWith-only requested canvas. None leaves the self-rendered display path unchanged.
     pub carwith_display: Option<crate::carlife::DisplayRequest>,
+    pub carwith_media_rate: Option<tokio::sync::watch::Receiver<Option<u32>>>,
     pub carwith_stretch: bool,
     pub screen_resource_lifecycle: bool,
     pub pipeline: Arc<Mutex<crate::pipeline::Pipeline>>,
@@ -354,6 +355,8 @@ pub async fn negotiate(
             .unwrap_or(false);
     let display = if p.id9_screen_bootstrap { select_id9_display(&info) } else { select_display(&info) };
     let display_uuid = display.and_then(|d| uuid_text(d.get("uuid")));
+    let area_source = display.filter(|d| d.get("viewAreas").and_then(Value::as_array).is_some()).unwrap_or(&info);
+    crate::display_layout::log_declaration(area_source, display_uuid.as_deref(), emit_log);
     if p.id9_screen_bootstrap && display_uuid.is_none() {
         return Err("ID9 /info lacks a valid main display UUID/size; refusing guessed screen SETUP".into());
     }
@@ -374,9 +377,10 @@ pub async fn negotiate(
     // The receiver defines the viewport ratio, not the phone's encoding workload.
     // Kotlin chooses a proportional capped canvas and reports the actual size before its first frame.
     crate::emit_display_size(disp_w, disp_h);
-    if let Some(layout) = crate::display_layout::read(if p.id9_screen_bootstrap { display.unwrap() } else { &info }, disp_w, disp_h, display_uuid.as_deref()) {
+    if let Some(layout) = crate::display_layout::read(area_source, disp_w, disp_h, display_uuid.as_deref()) {
         emit_log(&format!("DISPLAY: canvas={disp_w}x{disp_h} view={:?} safe={:?} drawOutside={}", layout.view,layout.safe,layout.draw_outside));
         crate::emit_display_layout(disp_w,disp_h,&layout);
+        let _ = channel.view_areas.set(crate::display_layout::ViewAreas::new(area_source, disp_w, disp_h, display_uuid.as_deref()));
     }
 
     // ---- 5. 事件通道 ----
@@ -418,7 +422,7 @@ pub async fn negotiate(
                 command.get("type").and_then(Value::as_str).unwrap_or("?"),modes.diagnostics(),response.as_ref().map(Vec::len).unwrap_or(0)));
         }
         response
-    })));
+    })), channel.view_areas.clone());
 
     emit_log(&format!("AIRPLAY: 事件连接 RTSP#{} 建立，port={event_port}", event_channel.trace_id()));
     if let Some(trace) = channel.id9_trace.get() {
@@ -495,15 +499,15 @@ pub async fn negotiate(
         (m.declaration(),m.screen_generation())
     };
     emit_log(&format!("TIMING: before RECORD {}",p.pipeline.lock().timing.summary()));
-    let plan = if nbt_mode { nbt_audio_candidates(&info, &p.audio_codec) }
-        else { audio_candidates(&info, &p.audio_codec, p.id9_screen_bootstrap || mbux_media_compat) };
+    let media_plan = || media_setup_candidates(&info, &p.audio_codec, nbt_mode,
+        p.id9_screen_bootstrap || mbux_media_compat, p.carwith_media_rate.as_ref());
     let mut audio = None;
     if nbt_mode {
         emit_log("NBT: screen TCP -> audio SETUP -> single RECORD; media waits for activation");
         audio = screen_session.bootstrap_before_record_with(&modes, async {
             if !p.enable_audio { return Ok(None); }
-            for codec in &plan {
-                if let Some(audio) = negotiate_audio(&channel,&factory,shared_secret.as_ref(),p,false,*codec).await {
+            for codec in media_plan().await {
+                if let Some(audio) = negotiate_audio(&channel,&factory,shared_secret.as_ref(),p,false,codec).await {
                     return Ok(Some(audio));
                 }
             }
@@ -555,9 +559,9 @@ pub async fn negotiate(
     // sending it to BMW returned 422. Initial local ownership was already published via
     // modesChanged before stream SETUP. Receiver borrow/take requests still gate packets.
     audio_owned.store(modes.lock().audio_owned(), std::sync::atomic::Ordering::Release);
-    emit_log(&format!("AUDIO: enabled={} preference={} candidates={plan:?} owner_controller={}", p.enable_audio, p.audio_codec, modes.lock().audio_owned()));
+    emit_log(&format!("AUDIO: enabled={} preference={} owner_controller={}", p.enable_audio, p.audio_codec, modes.lock().audio_owned()));
     if p.enable_audio && !nbt_mode {
-        for codec in plan.iter().copied() {
+        for codec in media_plan().await {
             audio = negotiate_audio(&channel, &factory, shared_secret.as_ref(), p, desktop, codec).await;
             if audio.is_some() { break; }
         }
@@ -577,7 +581,7 @@ pub async fn negotiate(
                 }
             }
             if p.enable_audio && audio.is_none() {
-                for codec in plan.iter().copied() {
+                for codec in media_plan().await {
                     audio=negotiate_audio(&channel,&factory,shared_secret.as_ref(),p,false,codec).await;
                     if audio.is_some() {break;}
                 }
@@ -602,10 +606,12 @@ pub async fn negotiate(
     }
     if let Some(audio) = audio.as_ref() { streams.push(Value::dict(vec![("type", Value::int(audio.stream_type()))])); }
     let speech_resource=Arc::new(crate::speech_resource::SpeechResource::new(channel.clone(),modes.clone(),audio_owned.clone()));
-    let aux_audio=if p.enable_audio && independent_audio_receiver(p.bmw_capabilities,p.nbt_audio_first,p.id9_screen_bootstrap,p.desktop_receiver,&info) {
+    let kinds = independent_audio_kinds(p, &info);
+    let aux_audio=if p.enable_audio && !kinds.is_empty() {
         shared_secret.map(|shared|crate::aux_audio::Session {
+            kinds,
             control:channel.clone(),factory:factory.clone(),params:p.clone(),shared,info:info.clone(),resource:speech_resource.clone(),
-            media_codec:audio.as_ref().map(|a|match (a.codec_name(),a.sample_rate()) {("AAC",44100)=>AudioCodec::Aac441,("AAC",_)=>AudioCodec::Aac,_=>AudioCodec::Pcm}),
+            media_codec:audio.as_ref().map(|a|match (a.codec_name(),a.sample_rate()) {("AAC",44100)=>AudioCodec::Aac441,("AAC",_)=>AudioCodec::Aac,("PCM",44100)=>AudioCodec::Pcm441,_=>AudioCodec::Pcm}),
         })
     }else{None};
     Ok(AirplayOutcome {
@@ -648,6 +654,24 @@ pub(crate) async fn activate_screen_before_handoff(
     }
     if let Some(request) = handoff { request.await?; }
     Ok(screen_failed)
+}
+
+pub(crate) fn independent_audio_kinds(p: &AirplayParams, info: &Value) -> &'static [crate::aux_setup::Kind] {
+    use crate::aux_setup::{supports, Kind};
+    // This receiver's CarWith rate watch is present as soon as its source is attached,
+    // even if 9240 has never sent INIT. Only the navigation worker consumes 9241.
+    if p.head_unit_profile == "bmw_id9" {
+        if !p.nbt_audio_first && !p.desktop_receiver
+            && p.carwith_media_rate.is_some() && supports(info, Kind::Navigation) {
+            return &[Kind::Navigation];
+        }
+        return &[];
+    }
+    if independent_audio_receiver(p.bmw_capabilities,p.nbt_audio_first,p.id9_screen_bootstrap,p.desktop_receiver,info) {
+        &[Kind::Speech, Kind::Navigation]
+    } else {
+        &[]
+    }
 }
 
 fn independent_audio_receiver(bmw:bool,nbt:bool,id9:bool,desktop:bool,info:&Value)->bool {
@@ -1119,13 +1143,6 @@ fn id9_hid_ids(info: &Value, display_uuid: Option<&str>) -> Vec<Value> {
     ids
 }
 
-fn id9_pcm_media_supported(info: &Value) -> bool {
-    info.get("audioFormats").and_then(Value::as_array).into_iter().flatten().any(|f|
-        f.get("type").and_then(Value::as_int) == Some(100) &&
-        f.get("audioType").and_then(Value::as_str) == Some("media") &&
-        f.get("audioOutputFormats").and_then(Value::as_int).is_some_and(|bits| bits & (1 << 15) != 0))
-}
-
 #[cfg(test)]
 mod id9_tests {
     use super::*;
@@ -1176,10 +1193,10 @@ mod id9_tests {
     fn aac_only_receiver_is_never_sent_unadvertised_pcm_media() {
         let fmt=|kind,typ:&str,bits| Value::dict(vec![("type",Value::int(kind)),("audioType",Value::str(typ)),("audioOutputFormats",Value::int(bits))]);
         let info=Value::dict(vec![("audioFormats",Value::array(vec![fmt(102,"media",0x800000),fmt(100,"default",0x30000000)]))]);
-        assert!(!id9_pcm_media_supported(&info));
-        assert!(!id9_pcm_media_supported(&Value::dict(vec![])));
-        assert!(!id9_pcm_media_supported(&Value::dict(vec![("audioFormats",Value::array(vec![fmt(100,"telephony",0x8000)]))])));
-        assert!(id9_pcm_media_supported(&Value::dict(vec![("audioFormats",Value::array(vec![fmt(100,"media",0x8000)]))])));
+        assert!(!declares_media(&info, AudioCodec::Pcm));
+        assert!(!declares_media(&Value::dict(vec![]), AudioCodec::Pcm));
+        assert!(!declares_media(&Value::dict(vec![("audioFormats",Value::array(vec![fmt(100,"telephony",0x8000)]))]), AudioCodec::Pcm));
+        assert!(declares_media(&Value::dict(vec![("audioFormats",Value::array(vec![fmt(100,"media",0x8000)]))]), AudioCodec::Pcm));
     }
 }
 
@@ -1416,6 +1433,32 @@ mod display_size_tests {
             assert_eq!(stream.get("streamConnectionID").and_then(Value::as_int),Some(42));
         }
     }
+    #[tokio::test(start_paused = true)]
+    async fn carwith_media_init_orders_only_declared_matching_output_rates() {
+        use AudioCodec::*;
+        let formats = |aac,pcm| Value::dict(vec![("audioFormats",Value::array(vec![
+            Value::dict(vec![("type",Value::int(102)),("audioType",Value::str("media")),
+                ("audioOutputFormats",Value::int(aac)),("audioInputFormats",Value::int(1<<22))]),
+            Value::dict(vec![("type",Value::int(100)),("audioType",Value::str("media")),
+                ("audioOutputFormats",Value::int(pcm))]),
+        ]))]);
+        let both=formats((1<<22)|(1<<23),1<<15);
+        let (tx,rx)=tokio::sync::watch::channel(None);
+        let (plan,())=tokio::join!(media_setup_candidates(&both,"auto",false,true,Some(&rx)),async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tx.send_replace(Some(44100));
+        });
+        assert_eq!(plan, [Aac441,Pcm,Aac]);
+        assert_eq!(media_setup_candidates(&formats(1<<23,0),"auto",false,true,Some(&rx)).await,[Aac]);
+        assert_eq!(media_setup_candidates(&formats(1<<23,1<<11),"pcm",false,true,Some(&rx)).await,[Pcm441]);
+        assert_eq!(media_setup_candidates(&both,"pcm",false,true,Some(&rx)).await,[Pcm]);
+        tx.send_replace(Some(48000));
+        assert_eq!(media_setup_candidates(&both,"auto",true,true,Some(&rx)).await,[Aac,Pcm,Aac441]);
+        tx.send_replace(None);
+        assert_eq!(media_setup_candidates(&both,"auto",false,true,Some(&rx)).await,[Pcm,Aac,Aac441]);
+        assert_eq!(media_setup_candidates(&both,"auto",false,true,None).await,[Pcm,Aac]);
+    }
+
     #[test]
     fn nbt_selects_only_declared_output_and_setup_matches_encoder_rate() {
         let info=Value::dict(vec![("audioFormats",Value::array(vec![
@@ -2114,28 +2157,57 @@ pub(crate) fn build_screen_setup_with_latency(conn_id: i64, uuid: &str, latency_
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 // type100 = Main; type102 = MainHigh (UDP). MainBuffered is type103 (TCP),
 // which this sender does not implement. The session feature is a separate capability.
-pub(crate) enum AudioCodec { Pcm, Aac, Aac441 }
+pub(crate) enum AudioCodec { Pcm, Pcm441, Aac, Aac441 }
 impl AudioCodec {
-    pub(crate) fn stream_type(self) -> i64 { if self == Self::Pcm {100} else {102} }
-    fn format(self) -> i64 { match self {Self::Pcm=>1<<15,Self::Aac=>1<<23,Self::Aac441=>1<<22} }
-    fn rate(self) -> u32 { if self == Self::Aac441 {44100} else {48000} }
-    fn spf(self) -> i64 { if self == Self::Pcm {352} else {1024} }
+    pub(crate) fn stream_type(self) -> i64 { if matches!(self, Self::Pcm | Self::Pcm441) {100} else {102} }
+    fn format(self) -> i64 { match self {Self::Pcm=>1<<15,Self::Pcm441=>1<<11,Self::Aac=>1<<23,Self::Aac441=>1<<22} }
+    fn rate(self) -> u32 { if matches!(self, Self::Aac441 | Self::Pcm441) {44100} else {48000} }
+    fn spf(self) -> i64 { if matches!(self, Self::Pcm | Self::Pcm441) {352} else {1024} }
 }
-fn nbt_audio_candidates(info: &Value, preference: &str) -> Vec<AudioCodec> {
-    let supports = |codec: AudioCodec| info.get("audioFormats").and_then(Value::as_array).into_iter().flatten().any(|f|
+fn declares_media(info: &Value, codec: AudioCodec) -> bool {
+    info.get("audioFormats").and_then(Value::as_array).into_iter().flatten().any(|f|
         f.get("type").and_then(Value::as_int)==Some(codec.stream_type()) &&
         f.get("audioType").and_then(Value::as_str)==Some("media") &&
-        f.get("audioOutputFormats").and_then(Value::as_int).is_some_and(|bits|bits & codec.format()!=0));
+        f.get("audioOutputFormats").and_then(Value::as_int).is_some_and(|bits|bits & codec.format()!=0))
+}
+
+// Check the source at the point of SETUP, including a late INIT during screen negotiation.
+// A silent CarWith source must still allow navigation and session activation to proceed.
+async fn media_setup_candidates(info: &Value, preference: &str, nbt: bool, strict: bool,
+    source: Option<&tokio::sync::watch::Receiver<Option<u32>>>) -> Vec<AudioCodec> {
+    let defaults = if nbt { nbt_audio_candidates(info, preference) }
+        else { audio_candidates(info, preference, strict) };
+    let Some(source) = source else { return defaults };
+    let mut declared: Vec<_> = if nbt || preference == "aac" {
+        vec![AudioCodec::Aac, AudioCodec::Aac441, AudioCodec::Pcm, AudioCodec::Pcm441]
+    } else {
+        vec![AudioCodec::Pcm, AudioCodec::Pcm441, AudioCodec::Aac, AudioCodec::Aac441]
+    };
+    declared.retain(|codec| (preference != "pcm" || codec.stream_type() == 100) && declares_media(info,*codec));
+    let mut source = source.clone();
+    let mut rate = *source.borrow_and_update();
+    if rate.is_none() && declared.iter().any(|c| c.rate()==44100) && declared.iter().any(|c| c.rate()==48000) {
+        if let Ok(Ok(value)) = tokio::time::timeout(Duration::from_millis(350),source.wait_for(Option::is_some)).await {
+            rate = *value;
+        }
+    }
+    let mut plan = Vec::new();
+    for codec in declared.iter().copied().filter(|c| Some(c.rate())==rate)
+        .chain(defaults.iter().copied().filter(|c| declared.contains(c)))
+        .chain(declared.iter().copied()).chain(defaults.iter().copied()) {
+        if !plan.contains(&codec) { plan.push(codec); }
+    }
+    emit_log(&format!("AUDIO: CarWith MEDIA_INIT={rate:?}Hz media SETUP candidates={plan:?}"));
+    plan
+}
+fn nbt_audio_candidates(info: &Value, preference: &str) -> Vec<AudioCodec> {
     let candidates = if preference=="pcm" { vec![AudioCodec::Pcm] }
         else {vec![AudioCodec::Aac441,AudioCodec::Aac,AudioCodec::Pcm]};
-    candidates.into_iter().filter(|codec|supports(*codec)).collect()
+    candidates.into_iter().filter(|codec|declares_media(info,*codec)).collect()
 }
 fn audio_candidates(info: &Value, preference: &str, strict: bool) -> Vec<AudioCodec> {
-    let aac = info.get("audioFormats").and_then(Value::as_array).into_iter().flatten().any(|f|
-        f.get("type").and_then(Value::as_int) == Some(102) &&
-        f.get("audioType").and_then(Value::as_str) == Some("media") &&
-        f.get("audioOutputFormats").and_then(Value::as_int).is_some_and(|bits| bits & (1 << 23) != 0));
-    let pcm = !strict || id9_pcm_media_supported(info);
+    let aac = declares_media(info, AudioCodec::Aac);
+    let pcm = !strict || declares_media(info, AudioCodec::Pcm);
     let mut result = Vec::new();
     if preference == "aac" && aac { result.push(AudioCodec::Aac); }
     if pcm { result.push(AudioCodec::Pcm); }
@@ -2160,7 +2232,7 @@ fn build_audio_setup_for_codec(conn_id: i64, latency_ms: i64, codec: AudioCodec)
         ("spf", Value::int(codec.spf())),
     ];
     // Leave the validated PCM proposal unchanged. AAC explicitly describes compression/rate.
-    if codec != AudioCodec::Pcm { stream.extend([("ct",Value::int(4)),("sr",Value::int(codec.rate() as i64))]); }
+    if codec.stream_type() == 102 { stream.extend([("ct",Value::int(4)),("sr",Value::int(codec.rate() as i64))]); }
     bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(stream)]))]))
 }
 
@@ -2172,7 +2244,7 @@ pub(crate) async fn negotiate_audio(
     desktop: bool,
     codec: AudioCodec,
 ) -> Option<AudioOut> {
-    let encoder = if codec != AudioCodec::Pcm {
+    let encoder = if codec.stream_type() == 102 {
         match crate::aac::AacEncoder::at_rate(codec.rate()) {
             Ok(encoder) => { emit_log(&format!("AUDIO: AAC-LC encoder ready {}Hz stereo 256kbps raw/SPF1024",codec.rate())); Some(encoder) }
             Err(error) => { emit_log(&format!("AUDIO: AAC encoder unavailable: {error}")); return None; }
@@ -2216,6 +2288,11 @@ pub(crate) async fn negotiate_audio(
             Ok(stream) => stream,
             Err(error) => { emit_log(&format!("AUDIO: {error}")); return None; }
         };
+        if stream.get("audioFormat").is_some_and(|v| v.as_int()!=Some(codec.format()))
+            || stream.get("sr").is_some_and(|v| v.as_int()!=Some(i64::from(codec.rate()))) {
+            emit_log(&format!("AUDIO: receiver SETUP format/rate differs from {codec:?}; release stream and try next declared format"));
+            return None;
+        }
         let data_port = port_of(stream.get("dataPort"));
         let control_port = port_of(stream.get("controlPort"));
         if data_port == 0 {
@@ -2239,7 +2316,7 @@ pub(crate) async fn negotiate_audio(
         emit_log(&format!(
             "AIRPLAY: ✓ 音频流就绪 data={data_port} control={control_port}（{codec:?} {}Hz/SPF{}）", codec.rate(), codec.spf()
         ));
-        Some(match encoder { Some(encoder) => AudioOut::new_aac(udp, sync, key, encoder), None => AudioOut::new(udp, sync, key, 100) })
+        Some(match encoder { Some(encoder) => AudioOut::new_aac(udp, sync, key, encoder), None => AudioOut::new_pcm(udp, sync, key, codec.rate()) })
     }.await;
     if result.is_none() {
         // SETUP 200 can allocate a stream even when ports are missing or local socket creation fails.
@@ -2809,7 +2886,7 @@ pub(crate) fn aes_stream_keys_zero(conn_id: u64) -> ([u8; 16], [u8; 16]) {
 }
 
 /// /info displays[].uuid 三种编码统一字符串化（字符串 / 16B UUID / UID 整数）。
-fn uuid_text(v: Option<&Value>) -> Option<String> {
+pub(crate) fn uuid_text(v: Option<&Value>) -> Option<String> {
     match v? {
         Value::String(s) if !s.is_empty() => Some(s.clone()),
         Value::Data(d) if d.len() == 16 => {

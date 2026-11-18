@@ -355,6 +355,8 @@ class SpikeShellService : ISpikeShell.Stub {
     private var setDisplayIdMethod: Method? = null
     private var inputError: String = "未初始化"
 
+    override fun readDisplayImePolicy(displayId: Int): String = ShellDisplayIme.read(displayId)
+
     override fun inputState(): String {
         val ok = ensureInput()
         return if (ok) "OK inject=${injectMethod != null} displayId=${setDisplayIdMethod != null}"

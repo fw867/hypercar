@@ -6,6 +6,7 @@ pub(super) struct Stats {
     pub forwarded: u64, pub event_closed: u64, pub empty: u64, pub unknown: u64,
     pub parse_fail: u64, pub observed_only: u64, pub not_ready: u64,
     services: Vec<(u32,u64)>, other_services: u64,
+    pub awaiting_signal_after: Option<&'static str>,
 }
 impl Stats {
     pub fn frame(&mut self, service:u32) {
@@ -14,10 +15,12 @@ impl Stats {
         else if self.services.len()<8 {self.services.push((service,1));}
         else {self.other_services+=1;}
     }
-    pub fn pcm(&mut self, data:&[u8]) {
+    pub fn pcm(&mut self, data:&[u8]) -> Option<&'static str> {
         self.pcm_bytes+=data.len() as u64;
-        self.nonzero_samples+=data.chunks_exact(2).filter(|p|p[0]!=0 || p[1]!=0).count() as u64;
+        let nonzero = data.chunks_exact(2).filter(|p|p[0]!=0 || p[1]!=0).count() as u64;
+        self.nonzero_samples+=nonzero;
         self.odd_bytes+=(data.len()%2) as u64;
+        if nonzero > 0 { self.awaiting_signal_after.take() } else { None }
     }
     pub fn report(&self,label:&str,reason:&str,pending:usize)->String {
         let services=self.services.iter().map(|(s,n)|format!("0x{s:x}:{n}")).collect::<Vec<_>>().join(",");
@@ -57,6 +60,21 @@ mod tests {
     fn pcm_counts_samples_without_exposing_content() {
         let mut s=Stats::default();s.pcm(&[0,0,1,0,0,128,9]);
         assert_eq!((s.pcm_bytes,s.nonzero_samples,s.odd_bytes),(7,2,1));
+    }
+    #[test]
+    fn first_signal_follows_latest_media_marker_once_even_without_resume() {
+        let mut s = Stats::default();
+        assert_eq!(s.pcm(&[1, 0]), None);
+        for marker in ["INIT", "PAUSE", "RESUME"] {
+            s.awaiting_signal_after = Some(marker);
+            assert_eq!(s.pcm(&[0, 0, 7]), None);
+            assert_eq!(s.pcm(&[1, 0]), Some(marker));
+            assert_eq!(s.pcm(&[1, 0]), None);
+        }
+        s.awaiting_signal_after = Some("PAUSE");
+        assert_eq!(s.pcm(&[0, 0]), None);
+        s.awaiting_signal_after = Some("INIT");
+        assert_eq!(s.pcm(&[0, 1]), Some("INIT"));
     }
     #[test]
     fn service_cardinality_is_bounded_and_overflow_is_counted() {

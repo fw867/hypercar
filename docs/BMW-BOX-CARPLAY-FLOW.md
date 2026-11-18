@@ -422,7 +422,7 @@ App复用Android蓝牙/Wi-Fi系统栈，已有CarPlay SDP marker和iAP2来向监
 | accessoryGiveFocus | 读取尺寸、原点、focusHeading并记录，随后空体200，未改变资源归属 | 原501；现观察并正常应答 |
 | iAPSendMessage，params.data为合法空Data | 0x45df4显式创建并push空vector；0x6adb4看到begin=end直接丢弃，不进入链路解析，仍普通200 | 原command_bytes将空Data与缺字段一起判错，RTSP层回400；现接受运输封装但不投递到链接/认证，不计入非空iAP入站 |
 | requestUI / changeModes | 前者调用ResourceManager_RequestUi等，后者应用模式并构造带status/params的业务回复 | 不是观察通知；保持App既有资源与业务应答处理 |
-| updateViewArea | 根据显示uuid/viewAreaIndex等更新显示状态，并通知视区、按手机模式设置视区 | 不是无操作通知，本轮不简单回200。当前未实现路径仍可501，需区分实车是否命中及视区业务实现 |
+| updateViewArea | 根据显示uuid/viewAreaIndex等更新显示状态，并通知视区、按手机模式设置视区 | 591 按本轮主屏 uuid 和声明的视区索引应用 view/safeArea，更新后回 200。错误显示或索引回 400，尚未取得显示声明时回 501。 |
 | 其它未知type / 畸形iAP封装 | 不据盒子的宽松普通回复推导App应接受任意业务 | 未知501、缺字段/非Data/超过65535B仍400；五类观察通知的params可省略，提供时须为Dictionary |
 
 实现将合法运输数据与非空链路字节分开：command_data用于RTSP校验及event/control入口，command_bytes保留只返回非空字节的用途。event与control两处都显式跳过空数据，故不触发JNI、识别认证、媒体订阅或就绪标志。RTSP诊断对合法空Data记iap_bytes=Some(0)，与缺失/错误类型区别。五类通知使用同一精确名称集合；没有改成未知类型一律200。

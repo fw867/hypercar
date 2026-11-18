@@ -22,26 +22,31 @@ struct Fixture {
 impl Drop for Fixture {fn drop(&mut self){self.command_task.abort();}}
 impl Fixture {
     async fn new()->Self {
+        Self::with_config(|_, _| {}).await
+    }
+    async fn with_config(configure: impl FnOnce(&mut AirplayParams, &mut Value))->Self {
         let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
         let stream=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();let(peer,_)=listener.accept().await.unwrap();
         let(r,w)=stream.into_split();let(control,_)=RtspChannel::spawn(r,w,None);
         let modes=Arc::new(Mutex::new(Modes::initial()));
         let resource=Arc::new(SpeechResource::new(control.clone(),modes,Arc::new(AtomicBool::new(true))));
-        let params=AirplayParams {
+        let mut params=AirplayParams {
                 wifi_mac_address:None,
             car_ip:"127.0.0.1".into(),airplay_port:7000,device_id:"test".into(),device_name:"Test phone".into(),identity_path:"unused".into(),
             receiver_id:None,receiver_previously_connected:true,enable_audio:true,audio_codec:"pcm".into(),video_codec:String::new(),bmw_capabilities:true,microphone_probe:None,keep_alive_stats:false,
             head_unit_profile:"bmw_id85".into(),bmw_box_bootstrap:true,mbux_screen_bootstrap:false,id9_screen_bootstrap:false,nbt_audio_first:false,mbux_media_compat:false,desktop_receiver:false,
             width:1920,height:720,touch_display:None,touch_rect:None,encoder_size:Arc::new(Mutex::new((1920,720))),touch_size:Arc::new(Mutex::new((1920,720))),
-            carwith_display:None,carwith_stretch:false,screen_resource_lifecycle:true,pipeline:Arc::new(Mutex::new(crate::pipeline::Pipeline::new())),
+            carwith_display:None,carwith_media_rate:None,carwith_stretch:false,screen_resource_lifecycle:true,pipeline:Arc::new(Mutex::new(crate::pipeline::Pipeline::new())),
         };
-        let info=Value::dict(vec![("audioFormats",Value::array(vec![
+        let mut info=Value::dict(vec![("audioFormats",Value::array(vec![
             Value::dict(vec![("type",Value::int(100)),("audioType",Value::str("speechRecognition")),("audioOutputFormats",Value::int(1<<29))]),
             Value::dict(vec![("type",Value::int(101)),("audioType",Value::str("default")),("audioOutputFormats",Value::int(1<<30))]),
             Value::dict(vec![("type",Value::int(100)),("audioType",Value::str("media")),("audioOutputFormats",Value::int(1<<15))]),
         ]))]);
         let media=control.udp_media.subscribe();
-        let session=Session{control,factory:Arc::new(Factory),params,shared:[9;32],info,resource,media_codec:Some(AudioCodec::Pcm)};
+        configure(&mut params, &mut info);
+        let kinds = crate::airplay::independent_audio_kinds(&params, &info);
+        let session=Session{kinds,control,factory:Arc::new(Factory),params,shared:[9;32],info,resource,media_codec:Some(AudioCodec::Pcm)};
         let input=Arc::new(Input::default());let(command_tx,mut command_rx)=mpsc::unbounded_channel();
         let(event_tx,commands)=mpsc::unbounded_channel();let(fallback_tx,fallback)=mpsc::unbounded_channel();
         let command_task=tokio::spawn(async move {while let Some(command)=command_rx.recv().await {
@@ -121,16 +126,90 @@ async fn speech_handoff(fail_first_restore:bool){
 #[tokio::test] async fn siri_main_stream_handoff_restores_pcm_only_after_speech_teardown_and_end_ack(){speech_handoff(false).await;}
 #[tokio::test] async fn rejected_first_media_restore_retries_without_installing_an_empty_sender(){speech_handoff(true).await;}
 
+fn id9_carwith(params: &mut AirplayParams, _: &mut Value) {
+    params.head_unit_profile = "bmw_id9".into();
+    params.id9_screen_bootstrap = true;
+    params.carwith_media_rate = Some(tokio::sync::watch::channel(None).1);
+}
+
+#[tokio::test] async fn id9_requires_carwith_and_current_navigation_output_capability() {
+    let mut f = Fixture::with_config(|p, info| {
+        id9_carwith(p, info);
+        let kinds = crate::airplay::independent_audio_kinds;
+        assert_eq!(kinds(p, info), &[Kind::Navigation]);
+        for (typ, label, field, mask) in [(100,"default","audioOutputFormats",1<<30),
+            (101,"media","audioOutputFormats",1<<30),(101,"default","audioInputFormats",1<<30),
+            (101,"default","audioOutputFormats",1<<29)] {
+            let entry = Value::dict(vec![("type",Value::int(typ)),("audioType",Value::str(label)),(field,Value::int(mask))]);
+            assert!(kinds(p,&Value::dict(vec![("audioFormats",Value::array(vec![entry]))])).is_empty());
+        }
+        p.carwith_media_rate = None;
+        assert!(kinds(p, info).is_empty());
+    }).await;
+    f.stopped().await;
+}
+
 #[tokio::test] async fn navigation_owns_only_alt_stream_and_never_pauses_or_replaces_media(){
-    let mut f=Fixture::new().await;f.source(Kind::Navigation);
+    navigation_duck_cycle(Fixture::new().await).await;
+}
+
+#[tokio::test] async fn id9_navigation_waits_for_pcm_then_restores_music_volume() {
+    let mut f = Fixture::with_config(id9_carwith).await;
+    f.input.init(Kind::Speech,16000,1);
+    assert_eq!(f.input.push(Kind::Speech,16000,1,&[1;640]),super::Route::Mix);
+    f.input.init(Kind::Navigation,16000,1);
+    let mut wire = [0; 512];
+    let read = tokio::time::timeout(Duration::from_millis(80), f.peer.read(&mut wire)).await;
+    assert!(read.is_err(), "unexpected RTSP bytes before navigation PCM: {read:?} {:?}", String::from_utf8_lossy(&wire));
+    navigation_duck_cycle(f).await;
+}
+
+async fn navigation_duck_cycle(mut f: Fixture) {
+    f.source(Kind::Navigation);
     let(m,v)=f.request("modesChanged").await;let apps=v.get("params").unwrap().get("appStates").unwrap().as_array().unwrap();assert_eq!(apps[2].get("entity").and_then(Value::as_int),Some(1));f.ack(&m,None).await;
-    let(m,_)=f.request("duckAudio").await;f.ack(&m,None).await;
+    let(m,v)=f.request("duckAudio").await;
+    assert_eq!(v.get("params").unwrap().get("volume"),Some(&Value::real(-12.0)));
+    f.ack(&m,None).await;
     let(m,v)=f.request("setup:101:default").await;f.setup_reply(&m,&v).await;f.opus_packet(101).await;
-    let(m,_)=f.request("unduckAudio").await;assert!(!f.media.borrow().idle());f.ack(&m,None).await;
+    let(m,v)=f.request("unduckAudio").await;assert!(!f.media.borrow().idle());
+    assert_eq!(v.get("params").unwrap().get("volume"),Some(&Value::real(0.2)));
+    f.ack(&m,None).await;
     let(m,_)=f.request("teardown:101").await;assert!(f.media.borrow().idle());f.ack(&m,None).await;
     let(m,v)=f.request("modesChanged").await;let apps=v.get("params").unwrap().get("appStates").unwrap().as_array().unwrap();assert_eq!(apps[2].get("entity").and_then(Value::as_int),Some(0));f.ack(&m,None).await;
     f.stopped().await;assert!(f.commands.try_recv().is_err());
     assert_eq!(f.order,["modesChanged","duckAudio","setup:101:default","unduckAudio","teardown:101","modesChanged"]);
+}
+
+#[tokio::test] async fn id9_rejected_navigation_setup_returns_pcm_to_mix_after_cleanup() {
+    id9_setup_failure(false).await;
+}
+
+#[tokio::test] async fn id9_deferred_navigation_release_keeps_pcm_until_cleanup_ack() {
+    id9_setup_failure(true).await;
+}
+
+async fn id9_setup_failure(reject_first_release: bool) {
+    let mut f = Fixture::with_config(id9_carwith).await;
+    f.input.init(Kind::Navigation,48000,2);
+    let pcm = 3000i16.to_le_bytes().repeat(1920);
+    assert_eq!(f.input.push(Kind::Navigation,48000,2,&pcm),super::Route::Independent);
+    let (m,_) = f.request("modesChanged").await; f.ack(&m,None).await;
+    let (m,_) = f.request("duckAudio").await; f.ack(&m,None).await;
+    let (m,_) = f.request("setup:101:default").await; f.reject(&m,400).await;
+    for command in ["unduckAudio", "teardown:101", "modesChanged"] {
+        if command == "modesChanged" && reject_first_release {
+            let (m,_) = f.request(command).await;
+            f.reject(&m,403).await;
+        }
+        let (m,_) = f.request(command).await;
+        assert!(f.fallback.try_recv().is_err(), "cannot mix before cleanup ACK");
+        f.ack(&m,None).await;
+    }
+    let event = tokio::time::timeout(Duration::from_secs(1), f.fallback.recv()).await.unwrap();
+    assert!(matches!(event,Some(crate::engine::SourceEvent::AuxFallback{kind:Kind::Navigation,samples}) if samples == vec![3000;1920]));
+    assert_eq!(f.input.push(Kind::Navigation,48000,2,&pcm),super::Route::Mix);
+    assert!(f.commands.try_recv().is_err());
+    f.stopped().await;
 }
 
 #[tokio::test] async fn accepted_unusable_speech_setup_cleans_once_then_restores_media(){

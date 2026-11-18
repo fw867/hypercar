@@ -46,6 +46,16 @@ object CarUiSettings {
         wallpaper = CarWallpapers.fromId(p.getString("wallpaper", CarWallpaper.GUANGYING.id))
     }
 
+    internal fun mapButtonPosition(): MapButtonPosition? {
+        val p = prefs ?: return null
+        if (!p.contains("map_buttons_x") || !p.contains("map_buttons_y")) return null
+        return MapButtonPosition(p.getFloat("map_buttons_x", 0f), p.getFloat("map_buttons_y", 0f))
+    }
+
+    internal fun saveMapButtonPosition(position: MapButtonPosition) {
+        prefs?.edit()?.putFloat("map_buttons_x", position.x)?.putFloat("map_buttons_y", position.y)?.apply()
+    }
+
     fun updateDefaultMap(provider: MapProvider) {
         defaultMap = provider
         io.github.hypercar.navigation.AmapNavigation.clear()

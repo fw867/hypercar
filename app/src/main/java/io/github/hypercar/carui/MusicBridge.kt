@@ -191,6 +191,16 @@ object MusicBridge {
     private val snapshotEpoch = MusicSnapshotEpoch()
     private var lastRefreshAt = 0L
     private var callback: MediaController.Callback? = null
+    private var callbackRegistered = false
+    @Volatile internal var audioListenerSnapshot = "listener=false callback=false target=none state=null"
+        private set
+
+    private fun recordAudioListener(event: String, force: Boolean = false) {
+        val snapshot = "listener=${service != null} callback=$callbackRegistered target=${controller?.packageName ?: "none"} state=${playback?.state} denied=$permissionDenied generation=$sessionGeneration"
+        val changed = snapshot != audioListenerSnapshot
+        audioListenerSnapshot = snapshot
+        if (carConnected && (changed || force)) HyperCarRepo.log("AUDIO-PLAYER: $event $snapshot")
+    }
     private val sessionQueries = musicQuery<SessionSnapshot>("music-session-query")
     private fun <T> musicQuery(name: String) = LatestMusicQuery<T>(
         name, { action -> main.post { action() }; Unit },
@@ -233,6 +243,7 @@ object MusicBridge {
 
     fun onCarConnected() = onMusicThread {
         carConnected = true
+        recordAudioListener("connected", force = true)
         mediaDiagnosticCount = 0
         carAudioReady = false
         autoPlayPending = CarUiSettings.autoPlayOnConnect
@@ -541,7 +552,8 @@ object MusicBridge {
             snapshotEpoch.playbackChanged()
             val resumed = audioResume.onState(value?.state)
             playback = value
-            if (resumed) requestPlaybackAudio()
+            recordAudioListener("stateCallback resumeIntent=$resumed", force = resumed)
+            if (resumed) requestPlaybackAudio("playerState")
             if (value?.state == PlaybackState.STATE_PAUSED || value?.state == PlaybackState.STATE_STOPPED) {
                 manualPauseRequested = false
             }
@@ -550,6 +562,7 @@ object MusicBridge {
         override fun onSessionDestroyed() {
             if (generation != sessionGeneration) return
             clearController()
+            recordAudioListener("sessionDestroyed")
             publish()
             choose()
         }
@@ -566,6 +579,7 @@ object MusicBridge {
         snapshotEpoch.sessionChanged()
         callback?.let { old -> runCatching { controller?.unregisterCallback(old) } }
         callback = null
+        callbackRegistered = false
         controller = null
         metadata = null
         playback = null
@@ -666,6 +680,7 @@ object MusicBridge {
         preferredPackage = CarUiSettings.defaultMusicPackage.takeIf { it.isNotBlank() }
             ?: playbackPrefs?.getString("preferred_package", null)
         permissionDenied = false
+        recordAudioListener("attached")
         val msm = service.getSystemService(MediaSessionManager::class.java)
         val component = ComponentName(service, MusicNotificationListener::class.java)
         if (sessionsListener == null && msm != null) {
@@ -698,6 +713,7 @@ object MusicBridge {
         }
         sessionsListener = null
         service = null
+        recordAudioListener("detached")
         _state.value = NowPlaying(reason = reason)
         HyperCarRepo.log("MUSIC: listener disconnected")
     }
@@ -742,7 +758,7 @@ object MusicBridge {
                 if (target != null) {
                     val generation = sessionGeneration
                     callback = sessionCallback(generation).also {
-                        runCatching { target.registerCallback(it, main) }
+                        callbackRegistered = runCatching { target.registerCallback(it, main) }.isSuccess
                     }
                 }
                 val key = "${target?.packageName ?: "-"}|${snapshot.count}"
@@ -758,6 +774,7 @@ object MusicBridge {
                 if (snapshotEpoch.acceptsQueue(epoch)) queueIds = snapshot.queueIds
                 ratingType = snapshot.ratingType
             }
+            recordAudioListener("sessionSnapshot")
             publish()
         })
     }
@@ -866,15 +883,19 @@ object MusicBridge {
             c.transportControls.pause()
         } else {
             manualPauseRequested = false
-            requestPlaybackAudio()
+            requestPlaybackAudio("playPause")
             c.transportControls.play()
         }
     }
 
-    private fun requestPlaybackAudio() {
-        if (!carConnected) return
+    private fun requestPlaybackAudio(source: String) {
+        if (!carConnected) {
+            HyperCarRepo.log("AUDIO-PLAYER: claim source=$source skipped=disconnected $audioListenerSnapshot")
+            return
+        }
         runCatching { io.github.hypercar.core.RustCoreBridge.nativeRequestAudioOwnership() }
-            .onSuccess { HyperCarRepo.log("MUSIC: 恢复播放，音频资源申请已排队=$it（非车机出声确认）") }
+            .onSuccess { HyperCarRepo.log("AUDIO-PLAYER: claim source=$source queued=$it $audioListenerSnapshot") }
+            .onFailure { HyperCarRepo.log("AUDIO-PLAYER: claim source=$source failed=${it.javaClass.simpleName} $audioListenerSnapshot") }
     }
 
     fun next() {
@@ -897,7 +918,7 @@ object MusicBridge {
         resumePackage = null
         playbackPrefs?.edit()?.remove("resume_package")?.apply()
         if (usage == 0xB0 || usage == 0xCD && playback?.state != PlaybackState.STATE_PLAYING ||
-            (usage == 0xB5 || usage == 0xB6) && playback?.state == PlaybackState.STATE_PLAYING) requestPlaybackAudio()
+            (usage == 0xB5 || usage == 0xB6) && playback?.state == PlaybackState.STATE_PLAYING) requestPlaybackAudio("hid-0x${usage.toString(16)}")
         runCatching {
             val target = controller
             val beforeMetadata = metadata

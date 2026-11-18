@@ -4,6 +4,42 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ReconnectDiscoverabilityPolicyTest {
+    private val bmw = "AA:BB:CC:DD:EE:01"
+    private val second = "AA:BB:CC:DD:EE:02"
+    private val desktop = "AA:BB:CC:DD:EE:03"
+
+    private fun automaticKey(
+        bonded: Map<String, String?>,
+        history: Set<String>,
+        profile: String = "bmw_id85",
+        listening: Boolean = true,
+        allowed: Boolean = true,
+    ) = ReconnectDiscoverability.automaticBmwPreparationKey(profile, listening, allowed, history) { bonded[it] }
+
+    @Test fun automaticUsesOnlyTheUniqueCurrentlyBondedSuccessfulBmw() {
+        val bonded = mapOf(bmw to "BMW 53636", second to "BMW 12345", desktop to "ZS1-PC")
+        val history = setOf("${bmw.lowercase()}|车机|10", "$desktop|BMW|20")
+        val key = automaticKey(bonded, history)
+        assertNotNull(key)
+        assertEquals(key, automaticKey(bonded, history + "$bmw|旧名称|1"))
+        assertNull(automaticKey(bonded, history + "$second|车机|30"))
+        assertNull(automaticKey(bonded - bmw, history))
+        assertNull(automaticKey(bonded, emptySet()))
+        assertNull(automaticKey(bonded, history, profile = "bmw_id9"))
+        assertNull(automaticKey(bonded, history, listening = false))
+        assertNull(automaticKey(bonded, history, allowed = false))
+    }
+
+    @Test fun automaticOpensOnceBeforeWifiEvenIfAclWakesAgain() {
+        val key = automaticKey(mapOf(bmw to "BMW 53636"), setOf("$bmw|BMW 53636|10"))
+        val p = ReconnectDiscoverabilityPolicy()
+        assertFalse(p.shouldAttempt(true, null, false, false, 0, key))
+        assertFalse(p.shouldAttempt(true, null, false, false, 4_999, key))
+        assertTrue(p.shouldAttempt(true, null, false, false, 5_000, key))
+        p.armForWake()
+        assertFalse(p.shouldAttempt(true, null, false, false, 40_000, key))
+    }
+
     @Test fun coldBmwPreparationDoesNotNeedWifiAndSurvivesWifiArrival() {
         val p = ReconnectDiscoverabilityPolicy()
         val prep = ReconnectDiscoverability.bmwPreparationKey("bmw_id85", "AA:BB:CC:DD:EE:FF", true, true, true)

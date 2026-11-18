@@ -1,168 +1,125 @@
 package io.github.hypercar.carui
 
-import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.PixelFormat
-import android.graphics.drawable.GradientDrawable
-import android.hardware.display.DisplayManager
+import android.graphics.Paint
+import android.graphics.Path
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
-import android.view.Gravity
-import android.view.View
-import android.view.WindowManager
-import android.widget.TextView
-import io.github.hypercar.session.HyperCarRepo
+import android.view.Surface
+import io.github.hypercar.core.CodecSurfaceBridge
+import io.github.hypercar.spike.SpikeCaster
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
-/**
- * P2：全屏地图右侧中间的「返回主页」浮动按钮。
- *
- * 参照主屏风格：深紫玻璃底 + 青色描边。点全屏画面后浮出，4 秒后自动收起；
- * 点击按钮回 D1 首页。实现为地图副屏的 TYPE_APPLICATION_OVERLAY 小窗，
- * 只占按钮区域，其他触摸照常穿透给高德。
- */
-object MapHomeOverlay {
-
-    private const val TAG = "HyperCar-Overlay"
-
-    /** HID hit box 跟随右侧按钮，避开导航列表/工具条。 */
-    fun hitTest(x: Int, y: Int, displayWidth: Int, displayHeight: Int): Boolean {
-        val bounds = CarDisplayLayout.homeButtonBounds(displayWidth, displayHeight)
-        return x >= bounds.x && x < bounds.right && y >= bounds.y && y < bounds.bottom
-    }
-
+/** Buttons are part of the encoded map frame. Android can hide application overlay windows. */
+internal class MapHomeOverlay(
+    private val caster: SpikeCaster, output: Surface, private val width: Int, private val height: Int,
+    private val onFailure: (Exception) -> Unit,
+) : AutoCloseable {
+    private val bridge = CodecSurfaceBridge(output, width, height, width, height, onFailure)
+    val inputSurface get() = bridge.input
+    @Volatile var input: MapOverlayInput? = null
+        private set
     private val main = Handler(Looper.getMainLooper())
-    private var attempts = 0
+    @Volatile private var closed = false
+    private val hide = Runnable { if (!closed) bridge.setOverlayVisible(false) }
+    private val scope = CoroutineScope(Dispatchers.Default)
+    private lateinit var placement: MapButtonPlacement
+    private var previouslyShown = false
 
-    private var appContext: Context? = null
-    private var displayId = -1
-    private var onHome: (() -> Unit)? = null
-    private var view: View? = null
-    private var wm: WindowManager? = null
-    private var params: WindowManager.LayoutParams? = null
-    private var hideTask: Runnable? = null
-
-    fun attach(context: Context, displayId: Int, onHome: () -> Unit) {
-        appContext = context.applicationContext
-        this.displayId = displayId
-        this.onHome = onHome
-        attempts = 0
-        main.post { ensureView() }
-    }
-
-    /** 点全屏画面：把按钮显示出来并提到最上层，重新计时 4 秒。 */
-    fun peek() {
-        main.post {
-            ensureView()
-            val v = view ?: return@post
-            // 自动收起后当前窗口可能被高德盖住；重新挂一次确保回到最高层。
-            if (v.visibility != View.VISIBLE) {
-                val manager = wm
-                val layout = params
-                if (manager != null && layout != null) {
-                    runCatching {
-                        manager.removeViewImmediate(v)
-                        manager.addView(v, layout)
-                    }.onFailure {
-                        view = null
-                        wm = null
-                        params = null
+    @Synchronized fun attach(withReset: Boolean) {
+        placement = MapButtonPlacement(CarDisplayLayout.contentBounds(width, height), withReset,
+            CarUiSettings.mapButtonPosition())
+        install(placement.layout)
+        scope.launch {
+            CarDisplayLayout.state.collect { display ->
+                // Renegotiation clears the declaration before the receiver sends its next one.
+                val bounds = display?.contentBounds(width, height) ?: return@collect
+                synchronized(this@MapHomeOverlay) {
+                    if (!closed && placement.resize(bounds)) {
+                        try { install(placement.layout) } catch (error: Exception) { onFailure(error) }
                     }
                 }
             }
-            view?.visibility = View.VISIBLE
-            view?.bringToFront()
-            Log.i(TAG, "peek visible=${view?.visibility} display=$displayId")
-            scheduleHide()
         }
+        peek()
     }
 
-    fun detach() {
-        main.post { removeView() }
-        appContext = null
-        displayId = -1
-        onHome = null
-    }
-
-    private fun ensureView() {
-        if (view != null) return
-        val ctx = appContext ?: return
-        val dm = ctx.getSystemService(DisplayManager::class.java)
-        val display = dm?.getDisplay(displayId)
-        if (display == null) {
-            HyperCarRepo.log("CARUI-OVERLAY: display=$displayId 不存在")
-            if (attempts++ < 8) main.postDelayed({ ensureView() }, 250)
-            return
-        }
-        runCatching {
-            val displayContext = ctx.createDisplayContext(display)
-            val manager = displayContext.getSystemService(WindowManager::class.java) ?: return
-            val button = TextView(displayContext).apply {
-                text = "⌂"
-                textSize = 28f
-                setTextColor(Color.WHITE)
-                gravity = Gravity.CENTER
-                alpha = 0.88f
-                contentDescription = "返回主页"
-                elevation = 8f
-                background = GradientDrawable(
-                    GradientDrawable.Orientation.TL_BR,
-                    intArrayOf(0xE62A2350.toInt(), 0xE6120F24.toInt()),
-                ).apply {
-                    shape = GradientDrawable.OVAL
-                    setStroke(3, 0xCC22D3EE.toInt())
+    private fun install(layout: MapControlBar) {
+        val first = layout.buttons.values.first()
+        val last = layout.buttons.values.last()
+        val bitmap = Bitmap.createBitmap(first.width, last.bottom - first.y, Bitmap.Config.ARGB_8888)
+        try {
+            val canvas = Canvas(bitmap)
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+            for ((control, bounds) in layout.buttons) {
+                canvas.save()
+                canvas.translate(0f, (bounds.y - first.y).toFloat())
+                val size = bounds.width.toFloat()
+                paint.color = 0xCF171B24.toInt()
+                canvas.drawRoundRect(0f, 0f, size, size, size * .25f, size * .25f, paint)
+                paint.color = Color.WHITE
+                if (control == MapControl.RESET) {
+                    paint.textAlign = Paint.Align.CENTER
+                    paint.textSize = size * .28f
+                    val middle = size * .5f - (paint.ascent() + paint.descent()) / 2
+                    canvas.drawText("界面", size * .5f, middle - size * .16f, paint)
+                    canvas.drawText("复位", size * .5f, middle + size * .16f, paint)
+                } else {
+                    canvas.scale(size, size)
+                    val house = Path().apply {
+                        moveTo(.18f, .47f); lineTo(.5f, .19f); lineTo(.82f, .47f)
+                        lineTo(.76f, .47f); lineTo(.76f, .79f); lineTo(.55f, .79f)
+                        lineTo(.55f, .59f); lineTo(.45f, .59f); lineTo(.45f, .79f)
+                        lineTo(.24f, .79f); lineTo(.24f, .47f); close()
+                    }
+                    canvas.drawPath(house, paint)
                 }
-                setOnClickListener {
-                    HyperCarRepo.log("CARUI-OVERLAY: 点击主页按钮")
-                    onHome?.invoke()
+                canvas.restore()
+            }
+            synchronized(bridge) {
+                input = MapOverlayInput(caster, layout)
+                bridge.installOverlay(bitmap, first.x, first.y) { shown, left, top ->
+                    input = MapOverlayInput(caster, layout.at(left, top), if (shown) layout.buttons.keys else emptySet())
+                    if (shown != previouslyShown) caster.requestSyncFrame()
+                    previouslyShown = shown
                 }
             }
-            val metrics = displayContext.resources.displayMetrics
-            val bounds = CarDisplayLayout.homeButtonBounds(metrics.widthPixels, metrics.heightPixels)
-            val layout = WindowManager.LayoutParams(
-                bounds.width,
-                bounds.height,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                PixelFormat.TRANSLUCENT,
-            ).apply {
-                gravity = Gravity.TOP or Gravity.LEFT
-                x = bounds.x
-                y = bounds.y
+        } finally { bitmap.recycle() }
+    }
+
+    @Synchronized fun move(dx: Int, dy: Int, save: Boolean = false) {
+        if (closed) return
+        placement.dragBy(dx, dy)
+        if (save) placement.endDrag(true)?.let(CarUiSettings::saveMapButtonPosition)
+        bridge.moveOverlay(placement.layout.left, placement.layout.top)
+    }
+
+    @Synchronized fun cancelDrag() {
+        if (closed) return
+        placement.endDrag(false)
+        bridge.moveOverlay(placement.layout.left, placement.layout.top)
+    }
+
+    fun peek(hold: Boolean = false) {
+        main.post {
+            if (!closed) {
+                bridge.setOverlayVisible(true)
+                main.removeCallbacks(hide)
+                if (!hold) main.postDelayed(hide, 4000)
             }
-            manager.addView(button, layout)
-            view = button
-            wm = manager
-            params = layout
-            scheduleHide()
-            HyperCarRepo.log("CARUI-OVERLAY: attached display=$displayId overlay=true")
-            Log.i(TAG, "attached display=$displayId overlay=true")
-        }.onFailure {
-            HyperCarRepo.log("CARUI-OVERLAY: 添加失败 ${it.javaClass.simpleName}: ${it.message}")
-            Log.w(TAG, "attach failed: ${it.javaClass.simpleName}: ${it.message}")
-            if (attempts++ < 5) main.postDelayed({ ensureView() }, 300)
         }
     }
 
-    private fun scheduleHide() {
-        hideTask?.let { main.removeCallbacks(it) }
-        val task = Runnable { view?.visibility = View.INVISIBLE }
-        hideTask = task
-        main.postDelayed(task, 4_000)
-    }
-
-    private fun removeView() {
-        hideTask?.let { main.removeCallbacks(it) }
-        hideTask = null
-        val v = view
-        val manager = wm
-        view = null
-        wm = null
-        params = null
-        if (v != null && manager != null) {
-            runCatching { manager.removeViewImmediate(v) }
-        }
+    @Synchronized override fun close() {
+        closed = true
+        scope.cancel()
+        main.removeCallbacks(hide)
+        bridge.close()
+        input = null
     }
 }

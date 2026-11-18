@@ -25,7 +25,7 @@ CarWith新增`CARWITH-CHANNEL`诊断：MEDIA、TTS及VR每5秒输出接收字节
 
 ## 573：BMW ID8.5 独立 SIRI / 导航输出
 
-盒子成功日志当时未测试SIRI和导航，缺少相关记录不代表未实现。以下按xiap2及libAirPlay固件静态路径实现，接收端必须在本轮`/info`明确声明对应输出；对MGU/BMW ID8.5及明确识别的DiPlay验证接收端启用，NBT、ID9、WinPlay及其它桌面接收端保持既有策略。
+以下路径依据 xiap2 及 libAirPlay 固件实现。盒子的两轮成功日志未测试 SIRI 和导航。MGU/BMW ID8.5 及 DiPlay 按本轮 `/info` 声明启用对应的辅助流。BMW ID9 使用 CarWith 时，仅当车机声明 101/default 输出支持 bit30，且 9241 已收到导航 PCM，才申请导航状态并建立独立流。ID9 的实车播报和音量恢复待复测。
 
 | 输入类别 | AirPlay流 | 编码与时钟 | 生命周期 |
 |---|---|---|---|

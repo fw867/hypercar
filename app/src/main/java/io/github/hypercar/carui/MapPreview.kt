@@ -4,6 +4,7 @@ import android.graphics.SurfaceTexture
 import android.graphics.Matrix
 import android.view.MotionEvent
 import android.view.Surface
+import android.view.ViewConfiguration
 import android.view.TextureView
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
@@ -19,12 +20,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
-/** One persistent map task, native preview/full layouts and constant density across reconnects. */
+/** One persistent map task. Projection controls never change the source density. */
 object MapPreview {
     private var appContext: android.content.Context? = null
     private var activeProvider: MapProvider? = null
     fun init(context: android.content.Context) { appContext = context.applicationContext }
-    private var mapDpi = 240
     private var compatProvider: MapProvider? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val lock = Mutex()
@@ -134,7 +134,6 @@ object MapPreview {
         }
         displayId = retainedId
         activeProvider = provider.takeIf { displayId > 0 }
-        mapDpi = Regex("dpi=(\\d+)").find(result)?.groupValues?.get(1)?.toInt() ?: CarUiCaster.DPI
         HyperCarRepo.log("CARUI-PREVIEW: 重连复用检查 $result presentation=$presentation")
     }
 
@@ -173,12 +172,35 @@ object MapPreview {
         }
     }
 
-    suspend fun showFullscreen(surface: Surface, w: Int, h: Int): Int = lock.withLock {
+    internal suspend fun showFullscreen(surface: Surface, w: Int, h: Int): Int = lock.withLock {
         check(!stopped) { "地图会话已停止" }
         clearCardInput()
         fullscreen = true
-        val id = route(surface, w, h, MapPresentation.FULLSCREEN)
-        id
+        route(surface, w, h, MapPresentation.FULLSCREEN)
+    }
+
+    internal suspend fun supportsLayoutReset(id: Int) = lock.withLock { canResetLayout(id) }
+
+    private fun canResetLayout(id: Int) = id > 0 && displayId == id && !stopped && fullscreen &&
+        carMode && activeProvider == MapProvider.AMAP
+
+    private suspend fun applyAmapLayout(id: Int, layout: MapPresentation, timeoutMs: Long = 4000): Boolean {
+        val result = ShizukuTools.exec(MapProvider.AMAP.carLaunchCommand(id, layout, false), timeoutMs)
+        return result.ok && !result.err.contains("Error") && !result.out.contains("Error")
+    }
+
+    internal suspend fun resetFullscreenLayout(id: Int): String = lock.withLock {
+        if (!canResetLayout(id)) return@withLock "已跳过：地图输出已切换"
+        val snapshot = ShizukuTools.exec(
+            "dumpsys activity activities | grep -E '^(Display #|[[:space:]]*(topResumedActivity=|mResumedActivity:))'", 4000)
+        if (!snapshot.ok || !hasResumedUcarActivity(snapshot.out, id)) return@withLock "已跳过：未确认当前高德车联窗口"
+
+        // UCar only notifies layout listeners when its mode changes. Keep the encoder, display
+        // metrics and map task throughout. Restore full mode even if preview delivery was ambiguous.
+        val previewApplied = applyAmapLayout(id, MapPresentation.CARD)
+        val restored = applyAmapLayout(id, MapPresentation.FULLSCREEN) || applyAmapLayout(id, MapPresentation.FULLSCREEN)
+        presentation = if (restored) MapPresentation.FULLSCREEN else null
+        "高德原生布局 preview=$previewApplied fullscreen=$restored"
     }
 
     suspend fun resumePreview() = lock.withLock {
@@ -217,7 +239,7 @@ object MapPreview {
         releaseMapTask()
     }
 
-    private suspend fun route(output: Surface, w: Int, h: Int, nextPresentation: MapPresentation): Int {
+    private suspend fun route(output: Surface, w: Int, h: Int, nextPresentation: MapPresentation, mapDpi: Int = CarUiCaster.DPI): Int {
         clearCardInput()
         val context = appContext ?: error("地图未初始化")
         val provider = MapApps.selected(context) ?: error("请在手机安装高德地图或百度地图")
@@ -233,10 +255,7 @@ object MapPreview {
             } else {
                 check(update.startsWith("OK")) { update }
                 if (carMode && provider == MapProvider.AMAP && presentation != nextPresentation) {
-                    val layout = ShizukuTools.exec(provider.carLaunchCommand(displayId, nextPresentation, false), 12000)
-                    check(layout.ok && !layout.err.contains("Error") && !layout.out.contains("Error")) {
-                        "地图布局切换失败: ${layout.err}"
-                    }
+                    check(applyAmapLayout(displayId, nextPresentation, 12000)) { "地图布局切换失败" }
                 }
                 presentation = nextPresentation
                 bindCardInput(nextPresentation, w, h)
@@ -315,20 +334,77 @@ fun MapPreviewView(modifier: Modifier = Modifier) {
         MapPreview.init(context)
         TextureView(context).apply {
             isOpaque = false
+            val config = ViewConfiguration.get(context)
+            val tap = MapCardTap(config.scaledTouchSlop, ViewConfiguration.getLongPressTimeout())
             var gesture: MapCardInputState.Binding? = null
+            var firstDown: MotionEvent? = null
+            var pendingDown: MotionEvent? = null
+            var pendingUp: MotionEvent? = null
+            var pendingBinding: MapCardInputState.Binding? = null
+            var doubleTap = false
+            fun clearPending() {
+                pendingDown?.recycle()
+                pendingUp?.recycle()
+                pendingDown = null
+                pendingUp = null
+                pendingBinding = null
+            }
+            setOnClickListener { MapController.requestEnter() }
+            contentDescription = "全屏地图"
+            val confirmTap = Runnable {
+                val binding = pendingBinding
+                clearPending()
+                if (binding != null && surfaceTexture?.let(MapPreview::acquireCardTouch) === binding) performClick()
+            }
             setOnTouchListener { view, event ->
-                if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-                    gesture = surfaceTexture?.let { MapPreview.acquireCardTouch(it) }
+                val action = event.actionMasked
+                if (action == MotionEvent.ACTION_DOWN) {
+                    gesture = surfaceTexture?.let(MapPreview::acquireCardTouch)
+                    tap.down(event.x, event.y)
+                    firstDown?.recycle()
+                    firstDown = MotionEvent.obtainNoHistory(event)
+                    val up = pendingUp
+                    val down = pendingDown
+                    val binding = gesture
+                    val dx = event.x - (down?.x ?: event.x)
+                    val dy = event.y - (down?.y ?: event.y)
+                    val radius = config.scaledDoubleTapSlop.toFloat()
+                    doubleTap = binding != null && pendingBinding === binding && up != null &&
+                        event.eventTime - up.eventTime in 0..ViewConfiguration.getDoubleTapTimeout().toLong() &&
+                        dx * dx + dy * dy <= radius * radius
+                    if (doubleTap && binding != null && down != null && up != null) {
+                        // Replay the withheld first tap with its original times before the second DOWN.
+                        removeCallbacks(confirmTap)
+                        MapPreview.forwardCardTouch(binding, down, width, height)
+                        MapPreview.forwardCardTouch(binding, up, width, height)
+                        clearPending()
+                    } else if (up != null) {
+                        removeCallbacks(confirmTap)
+                        confirmTap.run()
+                    }
                 }
                 val binding = gesture ?: return@setOnTouchListener false
-                if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-                    view.parent?.requestDisallowInterceptTouchEvent(true)
+                if (action == MotionEvent.ACTION_DOWN) view.parent?.requestDisallowInterceptTouchEvent(true)
+                tap.observe(event.x, event.y, event.pointerCount)
+                if (action == MotionEvent.ACTION_UP && !doubleTap && tap.isTap(event.eventTime - event.downTime)) {
+                    // The native view saw DOWN for responsive drag/long press. Never select a POI on a card click.
+                    val cancel = MotionEvent.obtainNoHistory(event)
+                    cancel.action = MotionEvent.ACTION_CANCEL
+                    MapPreview.forwardCardTouch(binding, cancel, width, height)
+                    cancel.recycle()
+                    pendingDown = firstDown
+                    firstDown = null
+                    pendingUp = MotionEvent.obtainNoHistory(event)
+                    pendingBinding = binding
+                    postDelayed(confirmTap, ViewConfiguration.getDoubleTapTimeout().toLong())
+                } else {
+                    MapPreview.forwardCardTouch(binding, event, width, height)
                 }
-                MapPreview.forwardCardTouch(binding, event, view.width, view.height)
-                if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) {
+                if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                    firstDown?.recycle()
+                    firstDown = null
                     gesture = null
                     view.parent?.requestDisallowInterceptTouchEvent(false)
-                    if (event.actionMasked == MotionEvent.ACTION_UP) view.performClick()
                 }
                 true
             }
@@ -340,6 +416,11 @@ fun MapPreviewView(modifier: Modifier = Modifier) {
                     MapPreview.attach(texture, width, height)
                 }
                 override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
+                    removeCallbacks(confirmTap)
+                    clearPending()
+                    firstDown?.recycle()
+                    firstDown = null
+                    gesture = null
                     MapPreview.detach(texture)
                     return false
                 }

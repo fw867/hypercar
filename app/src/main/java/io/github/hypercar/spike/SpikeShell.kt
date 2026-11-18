@@ -93,7 +93,7 @@ object SpikeShell {
             .processNameSuffix("spike")
             .debuggable(BuildConfig.DEBUG)
             // AIDL revision also distinguishes local installs sharing the same versionCode.
-            .version(BuildConfig.VERSION_CODE + 1)
+            .version(BuildConfig.VERSION_CODE + 2)
         args = a
         // 注意：**不要**在 Main 线程调 bindUserService。Shizuku 13.6 在某些机型上会同步等待
         // 用户服务把 binder 交回来；放主线程会与「回调也要主线程」互相等死（真机踩过：
@@ -158,6 +158,8 @@ object SpikeShell {
         call("pinch") { it.pinch(displayId, cx, cy, from, to, steps) }
 
     fun inputState(): String = call("inputState") { it.inputState() }
+
+    fun readDisplayImePolicy(displayId: Int): String = call("readDisplayImePolicy") { it.readDisplayImePolicy(displayId) }
 
     fun consoleKey(displayId: Int, keyCode: Int, metaState: Int): String =
         call("consoleKey") { it.consoleKey(displayId, keyCode, metaState) }
