@@ -9,11 +9,11 @@
 | 自绘 UI | Shizuku shell AudioPolicy双sink，MEDIA排除高德UID、导航仅含该UID，PCM16/48k/双声道 | policy不可用时完整退回单一系统混音；不采麦克风 |
 | CarWith | 本机 CarLife MEDIA / TTS / VR：媒体、导航提示与助手回复 | 不启动自绘系统播放采集；MGU按能力分配独立流 |
 
-首页音频卡单行显示实际协商的 PCM / AAC 和约每秒更新的发送负载码率，不再添加播放状态文字前缀。统计仅包含成功交给 UDP 的音频有效负载，不含 RTP 头、加密开销或同步包；发送失败、资源被接管后未发出的数据不计入。未协商时不显示编码/码率，停止后不沿用旧会话数值。静音保活也可能有发送码率，不能据此判断车机已出声。
+首页音频卡单行显示实际协商的 PCM / AAC 和约每秒更新的发送负载码率，不再添加播放状态文字前缀。统计仅包含成功写入 UDP 或缓冲音频 TCP 的音频有效负载，不含 RTP 头、加密开销或同步包；发送失败、资源被接管后未发出的数据不计入。未协商时不显示编码/码率，停止后不沿用旧会话数值。静音保活也可能有发送码率，不能据此判断车机已出声。
 
 新增 AAC-LC48k 双声道发送：Android NDK MediaCodec 编码，目标 256kbps；type102 / audioFormat0x800000 / spf1024 / ct4 / sr48000。一包一个裸 AAC 帧，不加 ADTS/AU 头、不换字节序；RTP 时间戳和同步包按1024采样推进。编码器配置输出不作音频发送；采集、重采样、TTS 混音仍共用48k PCM输入，CarWith和自绘均可使用。资源被车机接管时停止编码/发包并丢弃待编码数据，重新取得资源时重建编码器，保持密钥/nonce计数连续。
 
-主音频使用 type100（Main）或 type102（MainHigh），均走 UDP。所有车机档案的初始会话 SETUP 均省略 `mainBuffered`，ID9 旧版实验开关的保存值也会被忽略。type103（MainBuffered）使用 TCP，当前未实现。参考接收端的 `audioBufferSize` 位于 type103 的 SETUP 响应。
+593 的 ID9 和奔驰 MBUX 档案中识别为 MB_E-P-4 的实车在自动或 AAC 优先时提议 `mainBuffered`。本轮 `/info` 的同一条输出记录须同时包含 type103、media 和 AAC-LC 48 kHz（bit23），才尝试用 TCP 发送主媒体。日志记录 SETUP 应答、TCP 首包、播放锚点，以及车机接管后清缓冲与暂停的应答。103 建流或起播失败时，按本轮能力回退 type102/UDP；如车机可能已分配 103，须先确认该流已释放。接收端实际起播、接管后的停声和卡顿情况待 ID9 和 MB_E-P-4 实车验证。其他车型继续使用 type100 或 type102 的 UDP 主媒体。
 
 设置「画面与声音 → 音频格式」提供自动、PCM、AAC优先，下次连接生效。自动保持旧车型的PCM48k首选；ID9只尝试/info明确声明的媒体输出格式，PCM48不可用但声明AAC48时用AAC。AAC优先只在type102/media/output声明AAC48时尝试，否则保留可用PCM路径；仅AAC44的车机本次仍不支持。DiPlay已实测AAC协商成功、约47包/秒，用户确认出声；不等于ID9实车验证。参考[CarPToCarL](https://github.com/jjuugk/CarPToCarL)的AAC裸帧和RTP约定，编码/发送实现位于Rust核心。
 

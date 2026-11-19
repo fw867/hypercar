@@ -4,6 +4,19 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PipelineDiagnosticsTest {
+    @Test fun buffered_label_tracks_the_active_main_sender_through_fallback_and_stop() {
+        fun snapshot(type: Int?, ready: Boolean = true) = PipelineDiagnostics.parse(
+            """{"generation":1,"audio_ready":$ready,"audio_codec":"AAC","main_audio_stream_type":$type}"""
+        )!!
+        val buffered = snapshot(103)
+        assertEquals("通道就绪 · mainBuffered", buffered.audioChannelLabel)
+        assertFalse(buffered.copy(active = false).audioChannelLabel.contains("mainBuffered"))
+        assertEquals("未就绪", snapshot(103, ready = false).audioChannelLabel)
+        for (type in listOf(102, 100, null)) {
+            assertEquals("通道就绪", snapshot(type).audioChannelLabel)
+        }
+    }
+
     @Test fun declared_screen_and_written_video_are_independent() {
         val pending = PipelineDiagnostics.parse("""{"generation":1,"display_size":[2400,1080]}""")!!
         assertEquals("2400×1080", pending.displaySize)

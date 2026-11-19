@@ -30,7 +30,7 @@ impl MediaActivity {
 
     pub(crate) fn set(&self, kind: i64, active: bool) {
         let Some(tx) = self.0.get() else { return; };
-        let bit = match kind { 110 => 1, 100 => 2, 102 => 4, 101 => 8, _ => return };
+        let bit = match kind { 110 => 1, 100 => 2, 102 => 4, 101 => 8, 103 => 16, _ => return };
         tx.send_if_modified(|state| {
             let was_idle = state.idle();
             if active { state.streams |= bit; } else { state.streams &= !bit; }
@@ -39,6 +39,19 @@ impl MediaActivity {
             true
         });
     }
+}
+
+#[cfg(test)]
+#[test]
+fn buffered_media_suppresses_idle_until_its_own_teardown() {
+    let activity = MediaActivity::default();
+    let state = activity.subscribe();
+    activity.set(103, true);
+    activity.set(102, true);
+    activity.set(102, false);
+    assert!(!state.borrow().idle());
+    activity.set(103, false);
+    assert!(state.borrow().idle());
 }
 
 // KeepaliveTasks::drop aborts the worker even when negotiation fails before its first tick.

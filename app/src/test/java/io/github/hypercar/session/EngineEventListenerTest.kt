@@ -10,6 +10,39 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class EngineEventListenerTest {
+    @Test fun lateScreenSnapshotsCannotRestoreBufferedBadgeAfterFallbackOrSamePeerReinvite() {
+        val gate = EngineCallbackGate()
+        var shown = io.github.hypercar.core.PipelineDiagnostics()
+        var deliveries = 0
+        val target = object : RustCoreBridge.EventListener {
+            override fun onState(state: String, detail: String) {}
+            override fun onLog(line: String) {}
+            override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {}
+            override fun onNightMode(night: Boolean) {}
+            override fun onPipeline(json: String) {
+                deliveries++
+                val next = io.github.hypercar.core.PipelineDiagnostics.parse(json)!!
+                if (next.canReplace(shown)) shown = next
+            }
+        }
+        fun snapshot(generation: Int, sequence: Int, type: Int?) =
+            """{"generation":$generation,"snapshot_sequence":$sequence,"audio_ready":true,"main_audio_stream_type":$type}"""
+        val old = EngineEventListener(gate, gate.begin(), target)
+        old.onPipeline(snapshot(1, 4, 103))
+        assertTrue(shown.audioChannelLabel.contains("mainBuffered"))
+        old.onPipeline(snapshot(1, 6, 102))
+        old.onPipeline(snapshot(1, 5, 103))
+        assertEquals(102L, shown.mainAudioStreamType)
+        gate.retire()
+        val current = EngineEventListener(gate, gate.begin(), target)
+        current.onPipeline(snapshot(2, 1, null))
+        old.onPipeline(snapshot(1, 7, 103))
+        assertEquals(4, deliveries)
+        assertNull(shown.mainAudioStreamType)
+        current.onPipeline(snapshot(2, 2, 103))
+        assertTrue(shown.audioChannelLabel.contains("mainBuffered"))
+    }
+
     @Test fun oldSamePeerCallbacksCannotConsumeOrResetNewFirstMediaDefaults() {
         val gate = EngineCallbackGate()
         var linkId = 0L

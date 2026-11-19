@@ -14,6 +14,7 @@ pub struct Pipeline {
     #[serde(skip)]
     pub screen_config_size: Option<(u32,u32)>,
     pub generation: u64,
+    pub snapshot_sequence: u64,
     pub control_ready: bool,
     pub record_accepted: bool,
     pub resources_accepted: bool,
@@ -27,6 +28,7 @@ pub struct Pipeline {
     pub video_frames_written: u64,
     pub audio_ready: bool,
     pub audio_codec: String,
+    pub main_audio_stream_type: Option<i64>,
     pub audio_kbps: u64,
     pub audio_packets_written: u64,
     pub audio_signal_packets: u64,
@@ -36,6 +38,28 @@ pub struct Pipeline {
     pub video_tcp: Option<crate::tcp_diagnostics::TcpSnapshot>,
 }
 impl Pipeline {
+    pub(crate) fn observe_main_sender(&mut self, sender: Option<&crate::audio_out::AudioOut>) {
+        self.main_audio_stream_type = sender.map(crate::audio_out::AudioOut::stream_type);
+        self.audio_codec = sender.map(crate::audio_out::AudioOut::codec_name).unwrap_or("").into();
+    }
+
+    /// Allocate the order under the same lock that protects the captured facts.
+    pub(crate) fn snapshot(&mut self) -> Self {
+        self.snapshot_sequence += 1;
+        self.clone()
+    }
+
+    pub(crate) fn activation_snapshot(&mut self, stage: &str) -> Option<Self> {
+        match stage {
+            "RECORD" => self.record_accepted = true,
+            "RESOURCES_ACCEPTED" => self.resources_accepted = true,
+            "SCREEN_SETUP" => self.screen_setup_accepted = true,
+            "VIDEO_CHANNEL_READY" => self.video_channel_ready = true,
+            _ => return None,
+        }
+        Some(self.snapshot())
+    }
+
     /// Missing observations, not inferred receiver requirements or a retry instruction.
     pub fn activation_gaps(&self) -> String {
         let mut gaps=Vec::new();
@@ -51,10 +75,10 @@ impl Pipeline {
         if gaps.is_empty(){"none_observed_receiver_presentation_unconfirmed".into()}else{gaps.join(",")}
     }
     pub fn new() -> Self {
-        Self { display_size:None, video_format:None, screen_config_size:None, generation: NEXT.fetch_add(1,Ordering::Relaxed), control_ready:false, record_accepted:false, resources_accepted:false,
+        Self { display_size:None, video_format:None, screen_config_size:None, generation: NEXT.fetch_add(1,Ordering::Relaxed), snapshot_sequence:0, control_ready:false, record_accepted:false, resources_accepted:false,
             screen_setup_accepted:false,video_channel_ready:false,wifi_id:0,
             wifi_iap2:"WAIT_SESSION".into(),screen_owned:None,video_stream:"WAIT_SETUP".into(),
-            video_source_units:0,video_frames_written:0,audio_ready:false,audio_codec:String::new(),audio_kbps:0,audio_packets_written:0,
+            video_source_units:0,video_frames_written:0,audio_ready:false,audio_codec:String::new(),main_audio_stream_type:None,audio_kbps:0,audio_packets_written:0,
             audio_signal_packets:0,ui_requests:0,screen_rebuilds:0,timing:Default::default(),video_tcp:None }
     }
     pub fn summary(&self) -> String {
@@ -73,6 +97,23 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn periodic_and_immediate_snapshots_share_an_order_per_engine() {
+        let mut pipeline = Pipeline::new();
+        let first = pipeline.snapshot();
+        let setup = pipeline.activation_snapshot("SCREEN_SETUP").unwrap();
+        let tcp = pipeline.activation_snapshot("VIDEO_CHANNEL_READY").unwrap();
+        let last = pipeline.snapshot();
+        for (index, captured) in [first, setup, tcp, last].iter().enumerate() {
+            assert_eq!(captured.generation, pipeline.generation);
+            assert_eq!(serde_json::to_value(captured).unwrap()["snapshot_sequence"], index + 1);
+        }
+        let next = Pipeline::new().snapshot();
+        assert!(next.generation > pipeline.generation);
+        assert_eq!(next.snapshot_sequence, 1);
+        assert!(next.main_audio_stream_type.is_none());
+    }
     #[test] fn control_and_audio_do_not_prove_carplay_activation() {
         let mut p=Pipeline::new();p.control_ready=true;p.record_accepted=true;p.resources_accepted=true;p.audio_ready=true;
         assert!(p.activation_gaps().contains("wifi_iap2_unconfirmed"));
@@ -88,17 +129,7 @@ mod tests {
 
 /// Publish exact acceptance boundaries immediately; a peer can close before the next heartbeat.
 pub(crate) fn activation(pipeline: &std::sync::Arc<parking_lot::Mutex<Pipeline>>, stage: &str) {
-    let snapshot = {
-        let mut p = pipeline.lock();
-        match stage {
-            "RECORD" => p.record_accepted = true,
-            "RESOURCES_ACCEPTED" => p.resources_accepted = true,
-            "SCREEN_SETUP" => p.screen_setup_accepted = true,
-            "VIDEO_CHANNEL_READY" => p.video_channel_ready = true,
-            _ => return,
-        }
-        p.clone()
-    };
+    let Some(snapshot) = pipeline.lock().activation_snapshot(stage) else { return };
     if let Ok(json) = serde_json::to_string(&snapshot) { crate::emit_pipeline(&json); }
     crate::emit_state("activation", stage);
 }

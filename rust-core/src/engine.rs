@@ -48,7 +48,7 @@ pub enum SourceEvent {
     /// 音频流停止。
     AudioStop { tts: bool },
     /// 一包 PCM（16-bit 小端，交错）。
-    AudioData { tts: bool, rate: u32, channels: u8, data: Vec<u8> },
+    AudioData { tts: bool, rate: u32, channels: u8, data: Vec<u8>, received_at: std::time::Instant },
 }
 
 /// 引擎配置（SettingsStore.engineConfigJson 的反序列化目标）。
@@ -115,6 +115,8 @@ pub struct EngineConfig {
     pub identity_path: String,
     #[serde(default)]
     pub receiver_id: Option<String>,
+    #[serde(default)]
+    pub receiver_model: Option<String>,
     #[serde(default)]
     pub receiver_previously_connected: bool,
     /// 接收端 `/info` 报 0x0 时的**触摸显示空间**宽/高（0 = 用协商的屏幕尺寸）。
@@ -257,8 +259,8 @@ pub async fn run_engine(
                             CarLifeEvent::AudioStop { tts } => {
                                 let _ = atx.send(SourceEvent::AudioStop { tts });
                             }
-                            CarLifeEvent::AudioData { tts, rate, channels, data } => {
-                                let _ = atx.send(SourceEvent::AudioData { tts, rate, channels, data });
+                            CarLifeEvent::AudioData { tts, rate, channels, data, received_at } => {
+                                let _ = atx.send(SourceEvent::AudioData { tts, rate, channels, data, received_at });
                             }
                             CarLifeEvent::Handshake => emit_log("CARLIFE: 握手完成（CarWith）"),
                             CarLifeEvent::ClientLeft { video } => {
@@ -361,7 +363,7 @@ pub async fn run_engine(
     let (audio_out_tx, audio_out_rx) = tokio::sync::oneshot::channel::<AudioOut>();
     let audio_stats = Arc::new(Mutex::new(AudioPumpStat::default()));
     let (main_audio_tx, main_audio_rx) = mpsc::unbounded_channel();
-    tasks.spawn(audio_pump(stop.clone(),audio_stats.clone(),audio_claim_tx.clone(),audio_out_rx,audio_rx,main_audio_rx,auxiliary_input.clone()));
+    tasks.spawn(audio_pump(stop.clone(),audio_stats.clone(),audio_claim_tx.clone(),audio_out_rx,audio_rx,main_audio_rx,auxiliary_input.clone(),pipeline.clone()));
 
     // ---- AirPlay 协商（控制 FD 已连接车机端口）----
     {
@@ -372,12 +374,11 @@ pub async fn run_engine(
             let mut last_audio_tick=tokio::time::Instant::now();
             let mut last_log=tokio::time::Instant::now()-Duration::from_secs(10);
             loop {
-                let mut snapshot=health.lock().clone();
+                let mut snapshot=health.lock().snapshot();
                 { let v=vs.lock(); snapshot.video_source_units=v.source_units; snapshot.video_frames_written=v.frames; }
                 {
                     let a=aus.lock();
                     snapshot.audio_packets_written=a.packets; snapshot.audio_signal_packets=a.signal_packets;
-                    snapshot.audio_codec=a.codec.into();
                     snapshot.audio_kbps=(a.payload_bytes.saturating_sub(last_audio_bytes) as f64 * 8.0 /
                         last_audio_tick.elapsed().as_secs_f64().max(0.001) / 1000.0).round() as u64;
                     last_audio_bytes=a.payload_bytes;
@@ -409,6 +410,7 @@ pub async fn run_engine(
         device_name: if cfg.device_name.trim().is_empty() { "HyperCar".into() } else { cfg.device_name.clone() },
         identity_path: cfg.identity_path.clone(),
         receiver_id: cfg.receiver_id.clone(),
+        receiver_model: cfg.receiver_model.clone(),
         receiver_previously_connected: cfg.receiver_previously_connected,
         enable_audio: cfg.enable_audio,
         audio_codec: cfg.audio_codec.clone(),
@@ -558,10 +560,15 @@ pub async fn run_engine(
     emit_state("stopping", "引擎停止");
     // 停媒体泵后才发业务 TEARDOWN，控制通道保留到应答/超时，最后再解绑网络。
     let remaining_auxiliary=if let Some(auxiliary)=auxiliary.as_mut() {auxiliary.shutdown().await} else {Vec::new()};
+    let final_audio_type = auxiliary.as_ref().map_or(audio_stream_type, |aux| aux.media_stream_type());
+    if final_audio_type != audio_stream_type {
+        teardown.retain(|entry| entry.get("type").and_then(crate::bplist::Value::as_int) != audio_stream_type);
+        if let Some(kind) = final_audio_type { merge_auxiliary_teardown(&mut teardown, &[kind]); }
+    }
     tasks.shutdown().await;
     drop(keepalive);
     if let Some(session) = resource_session {
-        if let Ok(current) = tokio::time::timeout(Duration::from_millis(250), session.resource_teardown(audio_stream_type)).await {
+        if let Ok(current) = tokio::time::timeout(Duration::from_millis(250), session.resource_teardown(final_audio_type)).await {
             teardown = current;
         }
     }
@@ -586,6 +593,7 @@ async fn audio_pump(
     stop_a:Arc<Notify>, stats:Arc<Mutex<AudioPumpStat>>, claims:mpsc::Sender<(PlaybackIntent,std::time::Instant)>,
     audio_out_rx:tokio::sync::oneshot::Receiver<AudioOut>, audio_rx:mpsc::UnboundedReceiver<SourceEvent>,
     mut commands:mpsc::UnboundedReceiver<MainCommand>, auxiliary:Arc<crate::aux_audio::Input>,
+    pipeline: Arc<Mutex<crate::pipeline::Pipeline>>,
 ) {
     let mut out: Option<AudioOut> = None;
     let mut paused = false;
@@ -614,6 +622,7 @@ async fn audio_pump(
     // 发包速率自测：每秒记一行，联调时能直接看出节拍对不对。
     let mut sent_packets: u64 = 0;
     let mut audio_errors: u64 = 0;
+    let mut mixed_generation = None;
     let mut rate_mark = std::time::Instant::now();
     let mut mixed = vec![0i16; SPF * 2];
     let mut pacing_recoveries=0u64;
@@ -634,12 +643,22 @@ async fn audio_pump(
             voice.mix.clear(); voice.remain.clear();
             duck_hold = 0;
         }
+        // Keep the input cutoff across a 103 -> 102 recovery. Old CarWith PCM
+        // can already be in the dispatch queue when ownership returns.
+        let buffered = auxiliary.buffered_owner.get().map(|rx| *rx.borrow());
+        let generation = buffered.map(|state| state.losses);
+        if generation != mixed_generation || buffered.is_some_and(|state| !state.owned) {
+            media_mix.clear();
+            media_remain.clear();
+            mixed_generation = generation;
+        }
         tokio::select! {
             _ = stop_a.notified() => return,
             command = commands.recv(), if commands_open => match command {
                 Some(MainCommand::Pause(reply)) => {
                     if reply.is_closed() {continue;}
                     drop(out.take()); paused = true;
+                    pipeline.lock().observe_main_sender(None);
                     media_mix.clear(); media_remain.clear();
                     // Retire queued main media but preserve assistant/navigation boundaries.
                     while let Ok(event)=audio_rx.try_recv() {
@@ -653,7 +672,7 @@ async fn audio_pump(
                 Some(MainCommand::Install(next)) => {
                     ready = None;
                     media_mix.clear(); media_remain.clear();
-                    stats.lock().codec=next.as_ref().map(AudioOut::codec_name).unwrap_or("");
+                    pipeline.lock().observe_main_sender(next.as_ref());
                     out=next; paused=false;
                 }
                 None => commands_open=false,
@@ -665,7 +684,7 @@ async fn audio_pump(
                 }
             } => {
                 if let Some(a) = r.flatten() {
-                    if !paused { stats.lock().codec = a.codec_name(); out = Some(a); }
+                    if !paused { pipeline.lock().observe_main_sender(Some(&a)); out = Some(a); }
                 }
                 ready = None;
             }
@@ -731,14 +750,14 @@ async fn audio_pump(
                         if tts_mix.is_empty() && voice.mix.is_empty() { last_audio_at = None; }
                     }
                 }
-                Some(SourceEvent::AudioData { tts, rate, channels, data }) => {
+                Some(SourceEvent::AudioData { tts, rate, channels, data, received_at }) => {
                     if tts {
                         let route=auxiliary.push(crate::aux_setup::Kind::Navigation,rate,channels,&data);
                         if route!=crate::aux_audio::Route::Drop && pcm_has_signal(&data) {
                             stats.lock().playing=true;last_audio_at=Some(std::time::Instant::now());
                         }
                         if route!=crate::aux_audio::Route::Mix {continue;}
-                    } else if paused {continue;}
+                    } else if paused || buffered.is_some_and(|state| !state.accepts_pcm(received_at)) {continue;}
                     let (fmt, remain, mix) = if tts {
                         (&mut tts_fmt, &mut tts_remain, &mut tts_mix)
                     } else {
@@ -818,7 +837,22 @@ async fn audio_pump(
                 if let Some(a) = out.as_mut() {
                     // 静音时也发包：保持 RTP 时钟连续（车机按包排播）
                     let before = a.packets_sent();
-                    if let Err(error)=a.send_pcm(&mixed).await {
+                    let result = if a.buffered_failed() {
+                        Err(std::io::Error::other("buffered playback control failed"))
+                    } else {
+                        a.send_pcm_for_generation(&mixed, generation).await
+                    };
+                    if let Err(error)=result {
+                        if a.stream_type() == 103 {
+                            emit_log(&format!("BUFFERED-AUDIO: type103 sender retired error={error}; requesting type102 fallback"));
+                            drop(out.take());
+                            paused = true;
+                            media_mix.clear();
+                            media_remain.clear();
+                            pipeline.lock().observe_main_sender(None);
+                            auxiliary.buffered_failed.notify_one();
+                            continue;
+                        }
                         audio_errors+=1;
                         if audio_errors==1 || audio_errors%100==0 { emit_log(&format!("AUDIO: RTP write failed count={audio_errors}: {error}")); }
                     }
@@ -1244,13 +1278,14 @@ pub(crate) struct PumpStat {
 
 #[derive(Default)]
 struct AudioPumpStat {
-    codec: &'static str,
     payload_bytes: u64,
     packets: u64,
     signal_packets: u64,
     playing: bool,
     ducking: bool,
 }
+
+
 
 
 
@@ -1273,7 +1308,7 @@ pub enum CarLifeEvent {
     VoiceAudioData { rate:u32, channels:u8, data:Vec<u8> },
     VoiceAudioStop,
     AudioStop { tts: bool },
-    AudioData { tts: bool, rate: u32, channels: u8, data: Vec<u8> },
+    AudioData { tts: bool, rate: u32, channels: u8, data: Vec<u8>, received_at: std::time::Instant },
     /// 手机在 VIDEO_ENCODER_INIT_DONE 里回报的实际编码分辨率。
     EncoderResolution { width: u32, height: u32 },
     ClientLeft { video: bool },
@@ -1364,6 +1399,9 @@ mod audio_intent_tests {
 mod main_audio_command_tests {
     use super::*;
     use tokio::net::UdpSocket;
+    fn test_pipeline() -> Arc<Mutex<crate::pipeline::Pipeline>> {
+        Arc::new(Mutex::new(crate::pipeline::Pipeline::new()))
+    }
     async fn output() -> (AudioOut,UdpSocket,std::net::SocketAddr) {
         let rx=UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let tx=UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1375,13 +1413,16 @@ mod main_audio_command_tests {
         let(stop,stats)=(Arc::new(Notify::new()),Arc::new(Mutex::new(AudioPumpStat::default())));
         let(claims,_)=mpsc::channel(4);let(ready,rx)=tokio::sync::oneshot::channel();
         let(events,audio)=mpsc::unbounded_channel();let(commands,command_rx)=mpsc::unbounded_channel();
-        let worker=crate::callback_context::spawn(audio_pump(stop,stats,claims,rx,audio,command_rx,Arc::new(crate::aux_audio::Input::default())));
+        let pipeline = test_pipeline();
+        let worker=crate::callback_context::spawn(audio_pump(stop,stats,claims,rx,audio,command_rx,Arc::new(crate::aux_audio::Input::default()),pipeline.clone()));
         let(first,peer,local)=output().await;assert!(ready.send(first).is_ok());
         let mut packet=[0;4096];tokio::time::timeout(Duration::from_secs(1),peer.recv(&mut packet)).await.unwrap().unwrap();
-        events.send(SourceEvent::AudioData{tts:false,rate:48000,channels:2,data:10000i16.to_le_bytes().repeat(12000)}).unwrap();
+        assert_eq!(pipeline.lock().activation_snapshot("SCREEN_SETUP").unwrap().main_audio_stream_type, Some(100));
+        events.send(SourceEvent::AudioData{received_at:std::time::Instant::now(),tts:false,rate:48000,channels:2,data:10000i16.to_le_bytes().repeat(12000)}).unwrap();
         let(ack,done)=tokio::sync::oneshot::channel();commands.send(MainCommand::Pause(ack)).unwrap();
         assert!(tokio::time::timeout(Duration::from_millis(250),done).await.is_ok(),"pause must finish before lifecycle allocates speech");
         let rebound=UdpSocket::bind(local).await;assert!(rebound.is_ok(),"pause acknowledgment must follow physical sender drop");
+        assert_eq!(pipeline.lock().activation_snapshot("SCREEN_SETUP").unwrap().main_audio_stream_type, None);
         let(next,peer,_)=output().await;commands.send(MainCommand::Install(Some(next))).unwrap();
         events.send(SourceEvent::AuxFallback{kind:crate::aux_setup::Kind::Speech,samples:vec![2000;7040]}).unwrap();
         let mut heard=false;
@@ -1395,8 +1436,46 @@ mod main_audio_command_tests {
             }
         }
         assert!(heard,"independent stream fallback must enter the main mix once");
+        assert_eq!(pipeline.lock().activation_snapshot("SCREEN_SETUP").unwrap().main_audio_stream_type, Some(100));
         worker.abort();let _=worker.await;
     }
+    #[tokio::test]
+    async fn buffered_session_mixer_rejects_pcm_captured_before_regain_even_if_delivered_after() {
+        let owner = crate::buffered_ownership::BufferedOwnership::default();
+        owner.publish(true);
+        let before_take = std::time::Instant::now() - Duration::from_millis(5);
+        owner.publish(false);
+        owner.publish(true);
+        let input = Arc::new(crate::aux_audio::Input::default());
+        assert!(input.buffered_owner.set(owner.subscribe()).is_ok());
+        let (ready, rx) = tokio::sync::oneshot::channel();
+        let (events, audio) = mpsc::unbounded_channel();
+        let (_commands, cmd) = mpsc::unbounded_channel();
+        let (claims, _) = mpsc::channel(4);
+        let task = crate::callback_context::spawn(audio_pump(Arc::default(), Arc::default(), claims, rx, audio, cmd, input, test_pipeline()));
+        let (out, peer, _) = output().await;
+        assert!(ready.send(out).is_ok());
+        let mut packet = [0;4096];
+        tokio::time::timeout(Duration::from_secs(1),peer.recv(&mut packet)).await.unwrap().unwrap();
+        for (received_at, sample) in [(before_take, -901i16), (std::time::Instant::now(), 300i16)] {
+            events.send(SourceEvent::AudioData { tts:false, rate:48000, channels:2, received_at,
+                data:sample.to_le_bytes().repeat(4096) }).unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let n = peer.recv(&mut packet).await.unwrap();
+                let nonce = u64::from_le_bytes(packet[n-8..n].try_into().unwrap());
+                let pcm = crate::crypto::chacha_open(&[7;32], &crate::crypto::nonce64(nonce),
+                    &packet[12..n-8], &packet[4..12]).unwrap();
+                let samples = pcm.chunks_exact(2).map(|s| i16::from_be_bytes([s[0],s[1]]));
+                assert!(samples.clone().all(|s| s == 0 || s == 300), "stale music reached the replacement stream");
+                if samples.into_iter().any(|s| s == 300) { break; }
+            }
+        }).await.expect("fresh playback must reach the receiver");
+        task.abort();
+        let _ = task.await;
+    }
+
     #[tokio::test]
     async fn navigation_and_speech_mix_at_both_negotiated_pcm_rates() {
         for mix_rate in [44100,48000] {
@@ -1408,14 +1487,14 @@ mod main_audio_command_tests {
             let (_commands,cmd)=mpsc::unbounded_channel();
             let (claims,_)=mpsc::channel(4);
             let task=crate::callback_context::spawn(audio_pump(Arc::new(Notify::new()),
-                Arc::new(Mutex::new(AudioPumpStat::default())),claims,rx,audio,cmd,Arc::default()));
+                Arc::new(Mutex::new(AudioPumpStat::default())),claims,rx,audio,cmd,Arc::default(),test_pipeline()));
             assert!(ready.send(AudioOut::new_pcm(socket,None,[7;32],mix_rate)).is_ok());
             let mut packet=[0;4096];
             tokio::time::timeout(Duration::from_secs(1),peer.recv(&mut packet)).await.unwrap().unwrap();
             // Left-only stereo navigation and mono speech should produce different L/R sums.
             let nav:Vec<_>=[1000i16,0].into_iter().flat_map(i16::to_le_bytes).collect();
             events.send(SourceEvent::AudioInit{tts:true,rate:24000,channels:2}).unwrap();
-            events.send(SourceEvent::AudioData{tts:true,rate:24000,channels:2,data:nav.repeat(4800)}).unwrap();
+            events.send(SourceEvent::AudioData{received_at:std::time::Instant::now(),tts:true,rate:24000,channels:2,data:nav.repeat(4800)}).unwrap();
             events.send(SourceEvent::VoiceAudioInit{rate:16000,channels:1}).unwrap();
             events.send(SourceEvent::VoiceAudioData{rate:16000,channels:1,data:2000i16.to_le_bytes().repeat(3200)}).unwrap();
             tokio::time::timeout(Duration::from_secs(1),async {
@@ -1434,7 +1513,7 @@ mod main_audio_command_tests {
     async fn paused_pump_drops_late_initial_sender_until_explicit_install() {
         let(claims,_)=mpsc::channel(4);let(ready,rx)=tokio::sync::oneshot::channel();
         let(_events,audio)=mpsc::unbounded_channel();let(commands,command_rx)=mpsc::unbounded_channel();
-        let worker=crate::callback_context::spawn(audio_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(AudioPumpStat::default())),claims,rx,audio,command_rx,Arc::new(crate::aux_audio::Input::default())));
+        let worker=crate::callback_context::spawn(audio_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(AudioPumpStat::default())),claims,rx,audio,command_rx,Arc::new(crate::aux_audio::Input::default()),test_pipeline()));
         let(ack,done)=tokio::sync::oneshot::channel();commands.send(MainCommand::Pause(ack)).unwrap();
         assert!(tokio::time::timeout(Duration::from_millis(250),done).await.is_ok(),"pause before negotiation must be acknowledged");
         let(initial,peer,_)=output().await;assert!(ready.send(initial).is_ok());
@@ -1451,7 +1530,7 @@ mod main_audio_command_tests {
         commands.send(MainCommand::Install(Some(next))).unwrap();
         let(ack,done)=tokio::sync::oneshot::channel();drop(done);
         commands.send(MainCommand::Pause(ack)).unwrap();
-        let worker=crate::callback_context::spawn(audio_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(AudioPumpStat::default())),claims,rx,audio,command_rx,Arc::new(crate::aux_audio::Input::default())));
+        let worker=crate::callback_context::spawn(audio_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(AudioPumpStat::default())),claims,rx,audio,command_rx,Arc::new(crate::aux_audio::Input::default()),test_pipeline()));
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(UdpSocket::bind(local).await.is_err(),"cancelled pause cannot release a current sender");
         assert!(tokio::time::timeout(Duration::from_millis(100),peer.recv(&mut [0;4096])).await.is_ok(),"cancelled pause cannot stop current RTP");
@@ -1469,13 +1548,13 @@ mod main_audio_command_tests {
         let(claims,_)=mpsc::channel(4);let(ready,rx)=tokio::sync::oneshot::channel();
         let(events,audio)=mpsc::unbounded_channel();let(_commands,command_rx)=mpsc::unbounded_channel();
         let stats=Arc::new(Mutex::new(AudioPumpStat::default()));
-        let worker=crate::callback_context::spawn(audio_pump(Arc::new(Notify::new()),stats.clone(),claims,rx,audio,command_rx,input.clone()));
+        let worker=crate::callback_context::spawn(audio_pump(Arc::new(Notify::new()),stats.clone(),claims,rx,audio,command_rx,input.clone(),test_pipeline()));
         // Queue mirrored audio before capabilities arrive. The next independent tick
         // must retire these samples as well as bypassing subsequent source DATA.
         events.send(SourceEvent::VoiceAudioInit{rate:48000,channels:2}).unwrap();
         events.send(SourceEvent::VoiceAudioData{rate:48000,channels:2,data:1000i16.to_le_bytes().repeat(12000)}).unwrap();
         events.send(SourceEvent::AudioInit{tts:true,rate:48000,channels:2}).unwrap();
-        events.send(SourceEvent::AudioData{tts:true,rate:48000,channels:2,data:2000i16.to_le_bytes().repeat(12000)}).unwrap();
+        events.send(SourceEvent::AudioData{received_at:std::time::Instant::now(),tts:true,rate:48000,channels:2,data:2000i16.to_le_bytes().repeat(12000)}).unwrap();
         tokio::time::timeout(Duration::from_secs(1),async {while !stats.lock().playing {tokio::task::yield_now().await;}}).await.unwrap();
         input.configure(&info, &[Kind::Speech,Kind::Navigation]);
         let(out,peer,_)=output().await;assert!(ready.send(out).is_ok());

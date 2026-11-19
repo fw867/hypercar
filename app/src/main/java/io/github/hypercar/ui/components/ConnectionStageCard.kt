@@ -86,7 +86,7 @@ fun ConnectionStageCard(pipeline: PipelineDiagnostics, modifier: Modifier = Modi
                 Facts("控制 " to neutral, (if (p.controlReady) "✓ 就绪" else "协商中") to color(p.controlStatus),
                     "   ·   Wi-Fi iAP2 " to neutral, p.wifiLabel to color(p.wifiStatus))
                 Facts("视频 " to neutral, p.videoLabel to color(p.videoStatus),
-                    "   ·   音频 " to neutral, (if (p.audioReady) "通道就绪" else "未就绪") to color(p.audioStatus),
+                    "   ·   音频 " to neutral, p.audioChannelLabel to color(p.audioStatus),
                     "   ·   归属 " to neutral, when (p.screenOwned) { true -> "手机"; false -> "车机"; null -> "未知" } to neutral)
                 HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
                 if (p.active) {

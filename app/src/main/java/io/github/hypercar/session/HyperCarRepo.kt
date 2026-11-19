@@ -1427,7 +1427,9 @@ object HyperCarRepo {
                     sessionIdentity = identity
                     val identityPath = identity.file.absolutePath
                     val json = SettingsStore.engineConfigJson(apHostFinal, port, deviceMac, identityPath,
-                        receiverBluetoothMac = receiver, carWithSource = sessionCarWithMode)
+                        receiverBluetoothMac = receiver, carWithSource = sessionCarWithMode,
+                        receiverModel = coordinator.activePeerAddress?.takeIf { it.equals(receiver, ignoreCase = true) }
+                            ?.let { io.github.hypercar.iap2.Iap2Peer.modelFor(it) } ?: mdnsEndpoint?.model)
                     // 下发配置原样打一行（不含密钥）：分辨率/帧率一目了然，
                     // 免得再靠猜「这次到底请求了多大尺寸」
                     log("SESSION-ORIGIN: ctrlInvite=${advertiser.lastInvitation != null} endpointFromInvite=${endpoint.fromInvite} " +
@@ -2517,7 +2519,7 @@ object HyperCarRepo {
             }
             _snapshots.update { s ->
                 if ((s.link !is LinkState.Negotiating && s.link !is LinkState.Connected) ||
-                    next.generation <= closedPipelineGeneration.get() || next.generation < s.pipeline.generation) s
+                    next.generation <= closedPipelineGeneration.get() || !next.canReplace(s.pipeline)) s
                 else s.copy(pipeline = next)
             }
             if (_snapshots.value.pipeline == next) {

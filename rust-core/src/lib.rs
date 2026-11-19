@@ -48,6 +48,8 @@ mod srp6a;
 mod tlv8;
 mod timing;
 mod udp_keepalive;
+mod buffered_ownership;
+mod buffered_control;
 mod wifi_iap2;
 mod auth_setup;
 mod display_layout;
@@ -801,6 +803,7 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePushAud
             tts: false,
             rate: rate.max(8000) as u32,
             channels: channels.clamp(1, 2) as u8,
+            received_at: std::time::Instant::now(),
             data: bytes,
         });
     }
@@ -815,7 +818,7 @@ fn navigation_audio_event(rate:jint,channels:jint,pcm:Option<&[i16]>)->Option<en
     let (rate,channels)=navigation_audio_format(rate,channels,pcm.map(<[i16]>::len))?;
     Some(match pcm {
         None=>engine::SourceEvent::AudioInit{tts:true,rate,channels},
-        Some(pcm)=>engine::SourceEvent::AudioData{tts:true,rate,channels,data:pcm.iter().flat_map(|s|s.to_le_bytes()).collect()},
+        Some(pcm)=>engine::SourceEvent::AudioData{received_at:std::time::Instant::now(),tts:true,rate,channels,data:pcm.iter().flat_map(|s|s.to_le_bytes()).collect()},
     })
 }
 fn send_navigation_audio(event:engine::SourceEvent) {
@@ -857,7 +860,7 @@ mod navigation_audio_jni_tests {
     }
     #[test] fn navigation_events_preserve_pcm_and_use_only_the_tts_lane() {
         assert!(matches!(navigation_audio_event(48000,2,None),Some(engine::SourceEvent::AudioInit{tts:true,rate:48000,channels:2})));
-        assert!(matches!(navigation_audio_event(16000,1,Some(&[1,-2])),Some(engine::SourceEvent::AudioData{tts:true,rate:16000,channels:1,data}) if data==[1,0,254,255]));
+        assert!(matches!(navigation_audio_event(16000,1,Some(&[1,-2])),Some(engine::SourceEvent::AudioData{tts:true,rate:16000,channels:1,data,..}) if data==[1,0,254,255]));
         assert!(navigation_audio_event(48000,2,Some(&[1])).is_none());
     }
 }

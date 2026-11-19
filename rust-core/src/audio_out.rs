@@ -1,4 +1,5 @@
-//! CarPlay 主音频发送端（RTP over UDP + ChaCha20-Poly1305，对照 cardeck
+//! CarPlay 主音频发送端。type103 的 TCP 分帧和播放控制见 buffered 子模块。
+//! 以下为实时音频（RTP over UDP + ChaCha20-Poly1305，对照 cardeck
 //! `audio/AudioSender.kt` 与 `audio/AudioSyncPacket.kt`）。
 //!
 //! 线格式：`[12B RTP 头][ChaCha20-Poly1305 密封 PCM + 16B tag][8B 小端 nonce]`
@@ -25,8 +26,9 @@
 //! （2026-10-20 实测；视频不受影响，因为每个视频帧自带呈现时间戳）。
 
 use crate::crypto::{chacha_seal, nonce64};
+mod buffered;
 use crate::timing::ntp_be;
-use tokio::net::UdpSocket;
+use tokio::net::{TcpStream, UdpSocket};
 
 /** 每包样本帧数 = AirPlay 标准 SPF 352（48000/352 ≈ 136 包/秒）。 */
 pub const SAMPLES_PER_PACKET: usize = 352;
@@ -40,10 +42,14 @@ const NONCE_TAIL_LEN: usize = 8;
 /** 同步包定长（8B 头 + 8B NTP + 4B 下一包时间戳）。 */
 const SYNC_PACKET_LEN: usize = 20;
 
-/// CarPlay 音频发送器：RTP over UDP，ChaCha20-Poly1305 密封。
+enum AudioTransport {
+    Realtime(UdpSocket),
+    Buffered(buffered::BufferedTransport),
+}
+
+/// CarPlay 音频发送器。
 pub struct AudioOut {
-    /** 音频数据报套接字（调用方 connect 好到车机 dataPort）。 */
-    udp: UdpSocket,
+    transport: AudioTransport,
     /** 同步包套接字（调用方 connect 好到车机 controlPort；车机没下发时为 None）。 */
     sync: Option<UdpSocket>,
     /** 流密钥（pair-verify 派生，32 字节）。 */
@@ -80,8 +86,12 @@ impl AudioOut {
         stream_key: [u8; 32],
         payload_type: u8,
     ) -> Self {
+        Self::with_transport(AudioTransport::Realtime(data), sync, stream_key, payload_type)
+    }
+
+    fn with_transport(transport: AudioTransport, sync: Option<UdpSocket>, stream_key: [u8; 32], payload_type: u8) -> Self {
         Self {
-            udp: data,
+            transport,
             sync,
             key: stream_key,
             seq: 0,
@@ -114,6 +124,14 @@ impl AudioOut {
         output.aac = Some(encoder);
         output
     }
+    pub fn new_buffered_aac(data: TcpStream, key: [u8;32], encoder: crate::aac::AacEncoder,
+        control: crate::buffered_control::BufferedControl, buffer_bytes: u32) -> Self {
+        let buffered = buffered::BufferedTransport::new(data, control, buffer_bytes);
+        let mut output = Self::with_transport(AudioTransport::Buffered(buffered), None, key, 103);
+        output.sample_rate = encoder.sample_rate();
+        output.aac = Some(encoder);
+        output
+    }
     pub fn new_opus(data: UdpSocket, sync: Option<UdpSocket>, key: [u8;32], sample_rate:u32, samples_per_packet:usize, stream_type:u8) -> std::io::Result<Self> {
         let encoder=crate::opus_encode::OpusEncoder::new(sample_rate,samples_per_packet)?;
         let mut output=Self::new(data,sync,key,stream_type);
@@ -121,9 +139,24 @@ impl AudioOut {
     }
     pub fn sample_rate(&self) -> u32 { self.sample_rate }
     pub fn stream_type(&self) -> i64 { self.pt as i64 }
-    pub fn codec_name(&self) -> &'static str { if self.opus.is_some() { "OPUS" } else { match self.pt {100=>"PCM",102=>"AAC",_=>""} } }
-    pub fn payload_bytes_sent(&self) -> u64 { self.payload_bytes }
-    pub fn samples_per_packet(&self) -> usize { if let Some(opus)=self.opus.as_ref() {opus.samples_per_packet()} else if self.pt == 102 { crate::aac::FRAMES } else { SAMPLES_PER_PACKET } }
+    fn is_aac(&self) -> bool { matches!(self.pt, 102 | 103) && self.opus.is_none() }
+    pub fn codec_name(&self) -> &'static str { if self.opus.is_some() { "OPUS" } else if self.is_aac() { "AAC" } else if self.pt==100 { "PCM" } else { "" } }
+    pub fn payload_bytes_sent(&self) -> u64 {
+        match &self.transport {
+            AudioTransport::Buffered(link) => link.payload_bytes,
+            AudioTransport::Realtime(_) => self.payload_bytes,
+        }
+    }
+    pub fn samples_per_packet(&self) -> usize { if let Some(opus)=self.opus.as_ref() {opus.samples_per_packet()} else if self.is_aac() { crate::aac::FRAMES } else { SAMPLES_PER_PACKET } }
+    pub fn buffered_loss_generation(&self) -> Option<u64> {
+        match &self.transport {
+            AudioTransport::Realtime(_) => None,
+            AudioTransport::Buffered(link) => link.generation(),
+        }
+    }
+    pub fn buffered_failed(&self) -> bool {
+        matches!(&self.transport, AudioTransport::Buffered(link) if link.failed())
+    }
 
     /// 发送交错 PCM（48kHz 立体声 i16）。内部按 352 帧切包逐包发送，
     /// **尾部不足一包的余数不发**（由调用方留存到下一批）。
@@ -154,10 +187,23 @@ impl AudioOut {
     }
 
     pub async fn send_pcm(&mut self, frames: &[i16]) -> std::io::Result<()> {
-        if !self.owns_audio() {
+        self.send_pcm_for_generation(frames, self.buffered_loss_generation()).await
+    }
+
+    pub async fn send_pcm_for_generation(&mut self, frames: &[i16], expected_generation: Option<u64>) -> std::io::Result<()> {
+        let mut fresh = true;
+        if let AudioTransport::Buffered(link) = &mut self.transport {
+            let generation = link.generation().ok_or_else(buffered::closed)?;
+            if link.encoder_generation_changed(generation) {
+                self.aac.take();
+                self.aac_needs_reset = true;
+            }
+            fresh = expected_generation == Some(generation);
+        }
+        if !fresh || !self.owns_audio() {
             self.blocked_samples = self.blocked_samples.saturating_add(frames.len() as u64);
             self.marker_pending = true;
-            if self.pt == 102 { self.aac.take(); self.aac_needs_reset = true; }
+            if self.is_aac() { self.aac.take(); self.aac_needs_reset = true; }
             if let Some(encoder)=self.opus.as_mut() { encoder.reset()?; }
             return Ok(());
         }
@@ -165,14 +211,32 @@ impl AudioOut {
             let sample_frames=encoder.samples_per_packet() as u32;
             let encoded=encoder.encode(frames)?;
             for payload in encoded { self.send_payload(&payload,sample_frames).await?; }
-        } else if self.pt == 102 {
+        } else if self.is_aac() {
             if self.aac_needs_reset {
                 self.aac_needs_reset = false;
                 self.aac = Some(crate::aac::AacEncoder::at_rate(self.sample_rate)?);
             }
             let encoded = self.aac.as_mut().ok_or_else(|| std::io::Error::other("AAC encoder stopped"))?.encode(frames);
             let encoded = match encoded { Ok(frames) => frames, Err(error) => { self.aac.take(); return Err(error); } };
-            for payload in encoded { self.send_payload(&payload, crate::aac::FRAMES as u32).await?; }
+            for payload in encoded {
+                if let AudioTransport::Buffered(link) = &mut self.transport {
+                    let generation = expected_generation.ok_or_else(buffered::closed)?;
+                    if !link.send(&self.key, &payload, self.ts, self.sample_rate, generation).await? {
+                        // A full receiver buffer can suppress a write during priming.
+                        // Only an ownership change invalidates remaining codec input.
+                        if link.generation() != Some(generation) {
+                            self.aac.take();
+                            self.aac_needs_reset = true;
+                            break;
+                        }
+                    }
+                    // Suppressed priming AUs still occupied this interval on the
+                    // source timeline. Wire sequence and nonce count only writes.
+                    self.ts = self.ts.wrapping_add(crate::aac::FRAMES as u32);
+                } else {
+                    self.send_payload(&payload, crate::aac::FRAMES as u32).await?;
+                }
+            }
         } else {
             for chunk in frames.chunks_exact(SAMPLES_PER_PACKET * CHANNELS) {
                 let mut payload = Vec::with_capacity(chunk.len() * 2);
@@ -207,7 +271,10 @@ impl AudioOut {
         self.ts = self.ts.wrapping_add(sample_frames);
         // The connected Tokio socket is nonblocking. Attempt one kernel write per RTP
         // packet, even on the first tick before Tokio has observed writable readiness.
-        if let Err(error) = socket2::SockRef::from(&self.udp).send_with_flags(&wire, libc::MSG_DONTWAIT) {
+        let AudioTransport::Realtime(udp) = &self.transport else {
+            return Err(std::io::Error::other("UDP payload on a buffered stream"));
+        };
+        if let Err(error) = socket2::SockRef::from(udp).send_with_flags(&wire, libc::MSG_DONTWAIT) {
             if error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == Some(libc::ENOBUFS) {
                 self.congestion_drops = self.congestion_drops.saturating_add(1);
                 return Ok(());
@@ -245,7 +312,10 @@ impl AudioOut {
 
     /// 已发送音频包数（对外统计）。
     pub fn packets_sent(&self) -> u64 {
-        self.packets
+        match &self.transport {
+            AudioTransport::Buffered(link) => link.written,
+            AudioTransport::Realtime(_) => self.packets,
+        }
     }
 }
 
@@ -517,7 +587,8 @@ mod ownership_tests {
         let payload=[1u8;32];
         assert!(audio.send_payload(&payload,1024).await.is_err());
         assert_eq!(audio.payload_bytes_sent(),0);
-        audio.udp.connect(receiver.local_addr().unwrap()).await.unwrap();
+        let AudioTransport::Realtime(udp) = &audio.transport else { panic!("expected UDP"); };
+        udp.connect(receiver.local_addr().unwrap()).await.unwrap();
         audio.send_payload(&payload,1024).await.unwrap();
         let mut packet=[0u8;128];
         let received=receiver.recv(&mut packet).await.unwrap();

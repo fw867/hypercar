@@ -4,6 +4,18 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class Iap2PeerTest {
+    @Test fun modelRequiresCurrentPeerIdentificationEvenAfterSameAddressReconnect() {
+        val address = "AA:BB:CC:DD:EE:01"
+        Iap2Peer.remember(address, "MB_E-P-4")
+        assertNull(Iap2Peer.modelFor(address))
+        Iap2Peer.rememberIdentification(address, "MBUX", "MB_E-P-4")
+        assertEquals("MB_E-P-4", Iap2Peer.modelFor(address.lowercase()))
+        assertNull(Iap2Peer.modelFor("AA:BB:CC:DD:EE:02"))
+        Iap2Peer.remember(address, "MBUX")
+        assertNull(Iap2Peer.modelFor(address))
+        Iap2Peer.clear()
+    }
+
     @Test fun softwareIdentityIsScopedToCurrentPeerAndSession() {
         Iap2Peer.clear()
         Iap2Peer.remember("AA:BB:CC:DD:EE:01", "Beam Pro")

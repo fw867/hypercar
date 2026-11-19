@@ -25,6 +25,9 @@ impl Fixture {
         Self::with_config(|_, _| {}).await
     }
     async fn with_config(configure: impl FnOnce(&mut AirplayParams, &mut Value))->Self {
+        Self::with_codec(AudioCodec::Pcm, configure).await
+    }
+    async fn with_codec(codec: AudioCodec, configure: impl FnOnce(&mut AirplayParams, &mut Value))->Self {
         let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
         let stream=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();let(peer,_)=listener.accept().await.unwrap();
         let(r,w)=stream.into_split();let(control,_)=RtspChannel::spawn(r,w,None);
@@ -33,7 +36,7 @@ impl Fixture {
         let mut params=AirplayParams {
                 wifi_mac_address:None,
             car_ip:"127.0.0.1".into(),airplay_port:7000,device_id:"test".into(),device_name:"Test phone".into(),identity_path:"unused".into(),
-            receiver_id:None,receiver_previously_connected:true,enable_audio:true,audio_codec:"pcm".into(),video_codec:String::new(),bmw_capabilities:true,microphone_probe:None,keep_alive_stats:false,
+            receiver_id:None,receiver_model:None,receiver_previously_connected:true,enable_audio:true,audio_codec:"pcm".into(),video_codec:String::new(),bmw_capabilities:true,microphone_probe:None,keep_alive_stats:false,
             head_unit_profile:"bmw_id85".into(),bmw_box_bootstrap:true,mbux_screen_bootstrap:false,id9_screen_bootstrap:false,nbt_audio_first:false,mbux_media_compat:false,desktop_receiver:false,
             width:1920,height:720,touch_display:None,touch_rect:None,encoder_size:Arc::new(Mutex::new((1920,720))),touch_size:Arc::new(Mutex::new((1920,720))),
             carwith_display:None,carwith_media_rate:None,carwith_stretch:false,screen_resource_lifecycle:true,pipeline:Arc::new(Mutex::new(crate::pipeline::Pipeline::new())),
@@ -46,7 +49,7 @@ impl Fixture {
         let media=control.udp_media.subscribe();
         configure(&mut params, &mut info);
         let kinds = crate::airplay::independent_audio_kinds(&params, &info);
-        let session=Session{kinds,control,factory:Arc::new(Factory),params,shared:[9;32],info,resource,media_codec:Some(AudioCodec::Pcm)};
+        let session=Session{kinds,control,factory:Arc::new(Factory),params,shared:[9;32],info,resource,media_codec:Mutex::new(Some(codec))};
         let input=Arc::new(Input::default());let(command_tx,mut command_rx)=mpsc::unbounded_channel();
         let(event_tx,commands)=mpsc::unbounded_channel();let(fallback_tx,fallback)=mpsc::unbounded_channel();
         let command_task=tokio::spawn(async move {while let Some(command)=command_rx.recv().await {
@@ -96,6 +99,39 @@ impl Fixture {
     async fn stopped(&mut self){
         assert!(self.controller.shutdown().await.is_empty());assert!(self.fallback.try_recv().is_err());
     }
+}
+
+#[tokio::test]
+async fn failed_buffered_teardown_never_starts_a_second_main_stream() {
+    let mut f = Fixture::with_codec(AudioCodec::BufferedAac, |params, _| {
+        params.head_unit_profile = "bmw_id9".into();
+    }).await;
+    f.input.buffered_failed.notify_one();
+    let (teardown, _) = f.request("teardown:103").await;
+    f.reject(&teardown, 500).await;
+    assert!(tokio::time::timeout(Duration::from_millis(80), f.peer.read_u8()).await.is_err());
+    assert_eq!(f.controller.media_stream_type(), Some(103));
+    f.stopped().await;
+}
+
+#[cfg(target_os="android")]
+#[tokio::test]
+async fn failed_buffered_playback_recovers_only_main_audio_with_aac_102() {
+    let mut f = Fixture::with_codec(AudioCodec::BufferedAac, |params, info| {
+        params.head_unit_profile = "bmw_id9".into();
+        *info = Value::dict(vec![("audioFormats", Value::array(vec![Value::dict(vec![
+            ("type", Value::int(102)), ("audioType", Value::str("media")),
+            ("audioOutputFormats", Value::int(1 << 23)),
+        ])]))]);
+    }).await;
+    f.input.buffered_failed.notify_one();
+    let (teardown, _) = f.request("teardown:103").await;
+    f.ack(&teardown, None).await;
+    let (setup, request) = f.request("setup:102:media").await;
+    f.setup_reply(&setup, &request).await;
+    assert_eq!(f.commands.recv().await, Some("install"));
+    assert_eq!(f.controller.media_stream_type(), Some(102));
+    f.stopped().await;
 }
 
 async fn speech_handoff(fail_first_restore:bool){

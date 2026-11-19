@@ -809,6 +809,7 @@ async fn handle_media_client(
                                 // 不剥掉就会被当样本播 → 每包一次"咔"（破音）。
                                 {
                                     if events.send(CarLifeEvent::AudioData {
+                                        received_at: std::time::Instant::now(),
                                         tts,
                                         rate,
                                         channels,
@@ -1064,7 +1065,7 @@ mod media_tts_downlink_tests {
         assert!(matches!(event,Some(CarLifeEvent::AudioInit{tts:t,rate:r,channels:c}) if (t,r,c)==(tts,rate,channels)),"INIT must preserve stream and source format: {event:?}");
         for _ in 0..2 {
             let event=tokio::time::timeout(Duration::from_secs(1),rx.recv()).await.unwrap();
-            assert!(matches!(event,Some(CarLifeEvent::AudioData{tts:t,rate:r,channels:c,data}) if (t,r,c)==(tts,rate,channels) && data==pcm),"PCM must stay byte-exact and on its own stream");
+            assert!(matches!(event,Some(CarLifeEvent::AudioData{tts:t,rate:r,channels:c,data,..}) if (t,r,c)==(tts,rate,channels) && data==pcm),"PCM must stay byte-exact and on its own stream");
         }
         let event=tokio::time::timeout(Duration::from_secs(1),rx.recv()).await.unwrap();
         assert!(matches!(event,Some(CarLifeEvent::AudioStop{tts:t}) if t==tts),"STOP cannot affect another stream: {event:?}");

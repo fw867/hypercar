@@ -722,7 +722,10 @@ class Iap2Bluetooth(
                     bluetoothMac = bluetoothMacProvider(),
                 nowPlayingProvider = Iap2NowPlayingSource::snapshot,
                     deviceName = deviceName,
-                    onIdentification = { if (sessions.allows(ticket)) Iap2Peer.rememberIdentification(safeAddress(socket.remoteDevice), it) },
+                    onIdentification = { ident ->
+                        if (sessions.allows(ticket)) Iap2Peer.rememberIdentification(safeAddress(socket.remoteDevice),
+                            listOfNotNull(ident.name, ident.model, ident.manufacturer).joinToString(" "), ident.model)
+                    },
                     // 端点回调顺手标记「本轮已拿到凭据」：acceptLoop 用它决定是否允许
                     // 车机的新连入顶替本轮（空转轮次可顶替，有凭据的不许抢）
                     onEndpoint = { endpoint ->

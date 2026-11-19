@@ -43,6 +43,7 @@ pub struct AirplayParams {
     pub device_name: String,
     pub identity_path: String,
     pub receiver_id: Option<String>,
+    pub receiver_model: Option<String>,
     pub receiver_previously_connected: bool,
     pub enable_audio: bool,
     pub audio_codec: String,
@@ -319,8 +320,9 @@ pub async fn negotiate(
     let control_local = channel.local_addr().await.map_err(|e| format!("读取控制连接本地地址失败: {e}"))?;
     let timing = TimingServer::start(control_local, |socket| factory.bind_timing_network(socket), p.pipeline.clone())
         .map_err(|e| format!("计时服务启动失败 ({control_local}): {e}"))?;
-    let (root, session_info, hevc_proposed) = setup_and_read_info(
-        &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap, p.id9_screen_bootstrap, mbux_media_compat, p.bmw_capabilities, p.video_codec == "hevc", Some(&mut *cleanup), p.wifi_mac_address.as_deref(),
+    let propose_buffered = p.offers_buffered_media(&info);
+    let (root, session_info, hevc_proposed, buffered_offered) = setup_and_read_info(
+        &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap, p.id9_screen_bootstrap, mbux_media_compat, p.bmw_capabilities, p.video_codec == "hevc", propose_buffered, Some(&mut *cleanup), p.wifi_mac_address.as_deref(),
     ).await?;
     info = session_info;
     let id9_modes = p.id9_screen_bootstrap.then(|| {
@@ -400,6 +402,8 @@ pub async fn negotiate(
     let modes = Arc::new(Mutex::new(initial_modes));
     let screen_owned = Arc::new(std::sync::atomic::AtomicBool::new(modes.lock().screen_owned()));
     let audio_owned = Arc::new(std::sync::atomic::AtomicBool::new(modes.lock().audio_owned()));
+    channel.buffered_ownership.publish(modes.lock().audio_owned());
+    let reply_buffered = channel.buffered_ownership.clone();
     let reply_audio = audio_owned.clone();
     let reply_audio_generation = receiver_audio_generation.clone();
     let reply_modes = modes.clone();
@@ -418,6 +422,7 @@ pub async fn negotiate(
         }
         reply_owner.store(modes.screen_owned(), std::sync::atomic::Ordering::Release);
         reply_audio.store(modes.audio_owned(), std::sync::atomic::Ordering::Release);
+        reply_buffered.publish(modes.audio_owned());
         let mut health=reply_pipeline.lock();
         health.screen_owned=Some(modes.screen_owned());
         if command.get("type").and_then(Value::as_str)==Some("requestUI") { health.ui_requests+=1; }
@@ -514,7 +519,7 @@ pub async fn negotiate(
         audio = screen_session.bootstrap_before_record_with(&modes, async {
             if !p.enable_audio { return Ok(None); }
             for codec in media_plan().await {
-                if let Some(audio) = negotiate_audio(&channel,&factory,shared_secret.as_ref(),p,false,codec).await {
+                if let Some(audio) = negotiate_audio(&channel,&factory,shared_secret.as_ref(),p,false,&info,codec).await {
                     return Ok(Some(audio));
                 }
             }
@@ -565,12 +570,25 @@ pub async fn negotiate(
     // The phone is the resource arbiter. CatPlay marks changeModes FromAccessory;
     // sending it to BMW returned 422. Initial local ownership was already published via
     // modesChanged before stream SETUP. Receiver borrow/take requests still gate packets.
-    audio_owned.store(modes.lock().audio_owned(), std::sync::atomic::Ordering::Release);
+    {
+        let modes = modes.lock();
+        audio_owned.store(modes.audio_owned(), std::sync::atomic::Ordering::Release);
+        channel.buffered_ownership.publish(modes.audio_owned());
+    }
     emit_log(&format!("AUDIO: enabled={} preference={} owner_controller={}", p.enable_audio, p.audio_codec, modes.lock().audio_owned()));
     if p.enable_audio && !nbt_mode {
-        for codec in media_plan().await {
-            audio = negotiate_audio(&channel, &factory, shared_secret.as_ref(), p, desktop, codec).await;
+        let mut candidates = media_plan().await;
+        if buffered_offered && !desktop && p.offers_buffered_media(&info) {
+            prioritize_buffered_media(&info, &root, &mut candidates);
+            emit_log(&format!("BUFFERED-AUDIO: session_features={:?} type103_media_output_aac48={} candidates={candidates:?}",
+                root.get("enabledFeatures"), declares_media(&info, AudioCodec::BufferedAac)));
+        }
+        let mut buffered_failed = false;
+        for codec in candidates {
+            if buffered_failed { emit_log(&format!("BUFFERED-AUDIO: after type103 failure trying {codec:?} type={}", codec.stream_type())); }
+            audio = negotiate_audio(&channel, &factory, shared_secret.as_ref(), p, desktop, &info, codec).await;
             if audio.is_some() { break; }
+            buffered_failed |= codec == AudioCodec::BufferedAac;
         }
         if audio.is_none() { emit_log("AUDIO: no usable media stream; retain video/control"); }
     }
@@ -589,7 +607,7 @@ pub async fn negotiate(
             }
             if p.enable_audio && audio.is_none() {
                 for codec in media_plan().await {
-                    audio=negotiate_audio(&channel,&factory,shared_secret.as_ref(),p,false,codec).await;
+                    audio=negotiate_audio(&channel,&factory,shared_secret.as_ref(),p,false,&info,codec).await;
                     if audio.is_some() {break;}
                 }
             }
@@ -614,11 +632,15 @@ pub async fn negotiate(
     if let Some(audio) = audio.as_ref() { streams.push(Value::dict(vec![("type", Value::int(audio.stream_type()))])); }
     let speech_resource=Arc::new(crate::speech_resource::SpeechResource::new(channel.clone(),modes.clone(),audio_owned.clone()));
     let kinds = independent_audio_kinds(p, &info);
-    let aux_audio=if p.enable_audio && !kinds.is_empty() {
+    let buffered_media = audio.as_ref().is_some_and(|out| out.stream_type() == 103);
+    let aux_audio=if p.enable_audio && (!kinds.is_empty() || buffered_media) {
         shared_secret.map(|shared|crate::aux_audio::Session {
             kinds,
             control:channel.clone(),factory:factory.clone(),params:p.clone(),shared,info:info.clone(),resource:speech_resource.clone(),
-            media_codec:audio.as_ref().map(|a|match (a.codec_name(),a.sample_rate()) {("AAC",44100)=>AudioCodec::Aac441,("AAC",_)=>AudioCodec::Aac,("PCM",44100)=>AudioCodec::Pcm441,_=>AudioCodec::Pcm}),
+            media_codec:Mutex::new(audio.as_ref().map(|a|match (a.stream_type(), a.sample_rate()) {
+                (103, _) => AudioCodec::BufferedAac, (102, 44100) => AudioCodec::Aac441, (102, _) => AudioCodec::Aac,
+                (100, 44100) => AudioCodec::Pcm441, _ => AudioCodec::Pcm,
+            })),
         })
     }else{None};
     Ok(AirplayOutcome {
@@ -745,8 +767,20 @@ async fn bluetooth_handoff_transaction(
 /// session request even when a receiver ignores all stream releases.
 pub(crate) async fn finish_session(control: &RtspChannel, streams: &[Value], graceful: bool) {
     if graceful && !control.is_closed() {
+        let buffered = control.buffered_cleanup_pending.load(std::sync::atomic::Ordering::Acquire)
+            || streams.iter().any(|s| s.get("type").and_then(Value::as_int) == Some(103));
+        // Let an already-written buffered command retire before the final close. A slow
+        // or gone control peer still has a bounded shutdown path.
+        let _buffered_guard = if buffered {
+            tokio::time::timeout(Duration::from_secs(3), control.buffered_commands.lock()).await.ok()
+        } else { None };
         let stream_deadline = tokio::time::Instant::now() + Duration::from_millis(900);
+        let pending = Value::dict(vec![("type", Value::int(103))]);
         let mut ordered: Vec<_> = streams.iter().collect();
+        if control.buffered_cleanup_pending.load(std::sync::atomic::Ordering::Acquire)
+            && !streams.iter().any(|s| s.get("type").and_then(Value::as_int) == Some(103)) {
+            ordered.push(&pending);
+        }
         ordered.sort_by_key(|stream| stream.get("type").and_then(Value::as_int) == Some(110));
         for stream in ordered {
             let remaining = stream_deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -823,7 +857,7 @@ mod shutdown_tests {
             captures
         });
         setup_and_read_info(&control, "phone", "test", 1234, true, Value::dict(vec![]),
-            false, true, false, true, false, None, None).await.unwrap();
+            false, true, false, true, false, true, None, None).await.unwrap();
         for (method, path, body) in [
             ("POST", "/command", crate::modes::Modes::initial().declaration()),
             ("SETUP", "/", build_screen_setup(42, "display")),
@@ -897,7 +931,7 @@ mod shutdown_tests {
                     peer.write_all(&body).await.unwrap();
                 }
             });
-            setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![("model",Value::str(model))]),mbux,id9,false,bmw,false,None,mac).await.unwrap();
+            setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![("model",Value::str(model))]),mbux,id9,false,bmw,false,false,None,mac).await.unwrap();
             server.await.unwrap();
         }
     }
@@ -945,7 +979,7 @@ mod shutdown_tests {
             assert_eq!(first.first_line,"SETUP rtsp://[fe80::1%25wlan0]/66 RTSP/1.0");
             let first_body=bplist::parse(&first.body).unwrap();
             assert!(!first_body.get("features").unwrap().as_array().unwrap().iter()
-                .any(|feature| feature.as_str() == Some("mainBuffered")), "ID9 proposed TCP buffered audio");
+                .any(|feature| feature.as_str() == Some("mainBuffered")));
             assert!(first_body.get("features").unwrap().as_array().unwrap().iter().any(|f|f.as_str()==Some("hevc")));
             peer.write_all(format!("RTSP/1.0 400 Bad Request\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",first.cseq().unwrap()).as_bytes()).await.unwrap();
             let retry=read_request(&mut peer).await;
@@ -959,8 +993,228 @@ mod shutdown_tests {
             let body=bplist::encode(&Value::dict(vec![("model",Value::str("test"))]));
             peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: {}\r\n\r\n",info.cseq().unwrap(),body.len()).as_bytes()).await.unwrap();peer.write_all(&body).await.unwrap();
         });
-        let result=setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,true,true,None,None).await;
+        let result=setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,true,true,false,None,None).await;
         assert!(result.is_ok(),"{result:?}");assert!(!result.unwrap().2);server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn mb_ep4_session_setup_includes_buffered_offer_before_reading_formats() {
+        let (channel, mut peer) = pair().await;
+        let receiver = tokio::spawn(async move {
+            for stage in ["SETUP", "GET"] {
+                let msg = read_request(&mut peer).await;
+                assert!(msg.first_line.starts_with(stage));
+                if stage == "SETUP" {
+                    let body = bplist::parse(&msg.body).unwrap();
+                    assert!(body.get("features").unwrap().as_array().unwrap().contains(&Value::str("mainBuffered")));
+                }
+                let body = bplist::encode(&Value::dict(vec![("model", Value::str("MB_E-P-4"))]));
+                peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: {}\r\n\r\n",
+                    msg.cseq().unwrap(), body.len()).as_bytes()).await.unwrap();
+                peer.write_all(&body).await.unwrap();
+            }
+        });
+        let outcome = setup_and_read_info(&channel,"phone","name",1234,true,Value::dict(vec![]),
+            false,false,true,false,false,true,None,None).await;
+        receiver.await.unwrap();
+        assert!(outcome.unwrap().3);
+    }
+
+    #[tokio::test]
+    async fn session_rejection_withdraws_buffered_offer_before_other_features() {
+        let (channel, mut peer) = pair().await;
+        let server = tokio::spawn(async move {
+            let first = read_request(&mut peer).await;
+            let mut expected = bplist::parse(&first.body).unwrap();
+            if let Value::Dict(fields) = &mut expected {
+                let (_, Value::Array(offer)) = fields.iter_mut().find(|(k,_)| k.as_str() == Some("features")).unwrap() else { panic!() };
+                assert!(offer.contains(&Value::str("hevc")));
+                assert!(offer.contains(&Value::str("mainBuffered")));
+                offer.retain(|f| f.as_str() != Some("mainBuffered"));
+            }
+            peer.write_all(format!("RTSP/1.0 400 Bad Request\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n", first.cseq().unwrap()).as_bytes()).await.unwrap();
+            let retry = read_request(&mut peer).await;
+            assert_eq!(retry.first_line, first.first_line);
+            assert_eq!(bplist::parse(&retry.body).unwrap(), expected);
+            for request in [Some(retry), None] {
+                let request = match request { Some(msg) => msg, None => read_request(&mut peer).await };
+                let body = bplist::encode(&Value::dict(vec![("model",Value::str("IDC23"))]));
+                peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: {}\r\n\r\n",request.cseq().unwrap(),body.len()).as_bytes()).await.unwrap();
+                peer.write_all(&body).await.unwrap();
+            }
+        });
+        let outcome = setup_and_read_info(&channel,"phone","name",1234,true,Value::dict(vec![]),false,true,false,true,true,true,None,None).await.unwrap();
+        assert!(outcome.2, "HEVC offer survives the buffered-only retry");
+        assert!(!outcome.3, "withdrawn buffered feature cannot select type103 later");
+        server.await.unwrap();
+    }
+    #[cfg(target_os = "android")]
+    #[tokio::test]
+    async fn buffered_tcp_or_anchor_failure_releases_103_before_fallback_to_102() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Network {
+            fail_tcp: bool,
+            tcp_opens: AtomicUsize,
+            udp_opens: AtomicUsize,
+        }
+        impl SocketProvider for Network {
+            fn open_tcp(&self, host: &str, port: u16, timeout: u32) -> Option<TcpStream> {
+                assert_eq!(host, "127.0.0.1");
+                assert!((1..=3000).contains(&timeout));
+                self.tcp_opens.fetch_add(1, Ordering::Relaxed);
+                if self.fail_tcp { return None; }
+                let tcp = std::net::TcpStream::connect((host, port)).unwrap();
+                tcp.set_nonblocking(true).unwrap();
+                Some(TcpStream::from_std(tcp).unwrap())
+            }
+            fn open_udp(&self, host: &str, port: u16) -> Option<UdpSocket> {
+                self.udp_opens.fetch_add(1, Ordering::Relaxed);
+                let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                udp.connect((host, port)).unwrap();
+                udp.set_nonblocking(true).unwrap();
+                Some(UdpSocket::from_std(udp).unwrap())
+            }
+        }
+        async fn reply(peer: &mut TcpStream, msg: &crate::rtsp::RtspMessage, status: u16, body: Value) {
+            let bytes = bplist::encode(&body);
+            peer.write_all(format!("RTSP/1.0 {status} Test\r\nCSeq: {}\r\nContent-Length: {}\r\n\r\n",
+                msg.cseq().unwrap(), bytes.len()).as_bytes()).await.unwrap();
+            peer.write_all(&bytes).await.unwrap();
+        }
+        let mut p = buffered_profile_params_for_test();
+        let info = Value::dict(vec![("model",Value::str("MB_E-P-4")), ("audioFormats", Value::array(vec![
+            Value::dict(vec![("type", Value::int(103)), ("audioType", Value::str("media")), ("audioOutputFormats", Value::int(0xc00000))])
+        ]))]);
+        let cases = ["bmw_id9", "mercedes_mbux"].into_iter().flat_map(|profile|
+            ["setup", "wrong_stream", "tcp", "anchor", "none"].map(|failure| (profile, failure)));
+        for (profile, failure) in cases {
+            p.head_unit_profile = profile.into();
+            p.id9_screen_bootstrap = profile == "bmw_id9";
+            p.mbux_media_compat = profile == "mercedes_mbux";
+            let (channel, mut peer) = pair().await;
+            let data = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = data.local_addr().unwrap().port();
+            let net = Arc::new(Network { fail_tcp:failure == "tcp", tcp_opens:0.into(), udp_opens:0.into() });
+            let factory: Arc<dyn SocketProvider> = net.clone();
+            channel.buffered_ownership.publish(true);
+            let (pause_tx,pause_rx) = tokio::sync::oneshot::channel();
+            let (play_tx,play_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let streams = |fields| Value::dict(vec![("streams",Value::array(vec![Value::dict(fields)]))]);
+                let request = read_request(&mut peer).await;
+                assert_eq!(request.first_line, "SETUP rtsp://127.0.0.1:7000/ RTSP/1.0");
+                let root = bplist::parse(&request.body).unwrap();
+                let s = &root.get("streams").unwrap().as_array().unwrap()[0];
+                for (k,v) in [("type",103),("audioFormat",1<<23),("spf",1024),("sr",48000),("ct",4)] {
+                    assert_eq!(s.get(k).and_then(Value::as_int),Some(v),"{k}");
+                }
+                assert_eq!(s.get("input"), Some(&Value::bool(false)));
+                assert!(s.get("audioBufferSize").is_none());
+                let selected = if failure == "wrong_stream" { 102 } else { 103 };
+                reply(&mut peer,&request,if failure == "setup" {400} else {200},streams(vec![
+                    ("type",Value::int(selected)), ("dataPort",Value::int(i64::from(port))),
+                    ("audioBufferSize",Value::int(8388608))
+                ])).await;
+                if matches!(failure, "anchor" | "none") {
+                    let (mut tcp,_) = data.accept().await.unwrap();
+                    let anchor = read_request(&mut peer).await;
+                    assert!(anchor.first_line.starts_with("GETANCHOR "));
+                    reply(&mut peer, &anchor, if failure == "anchor" {501} else {200}, Value::dict(vec![
+                        ("networkTimeSecs",Value::int(42)),("networkTimeFrac",Value::int(0)),
+                        ("networkTimeTimelineID",Value::int(0)),("networkTimeFlags",Value::int(0)),
+                    ])).await;
+                    if failure == "none" {
+                        let size = usize::from(tcp.read_u16().await.unwrap());
+                        assert!(size > 38);
+                        let mut packet = vec![0; size - 2];
+                        tcp.read_exact(&mut packet).await.unwrap();
+                        let key = stream_key(&[7;32], s.get("streamConnectionID").unwrap().as_int().unwrap() as u64);
+                        let end = packet.len() - 8;
+                        let counter = u64::from_le_bytes(packet[end..].try_into().unwrap());
+                        let au = crate::crypto::chacha_open(&key, &crate::crypto::nonce64(counter), &packet[12..end], &packet[4..12]).unwrap();
+                        assert!(!au.is_empty());
+                        assert_eq!(packet[8],23);
+                        let rtp = u32::from_be_bytes(packet[4..8].try_into().unwrap());
+                        let anchor = read_request(&mut peer).await;
+                        assert!(anchor.first_line.starts_with("GETANCHOR "));
+                        reply(&mut peer,&anchor,200,Value::dict(vec![
+                            ("networkTimeSecs",Value::int(43)),("networkTimeFrac",Value::int(0)),
+                            ("networkTimeTimelineID",Value::int(0)),("networkTimeFlags",Value::int(0)),
+                        ])).await;
+                        let start = read_request(&mut peer).await;
+                        assert!(start.first_line.starts_with("SETRATEANCHORTIME "));
+                        let body = bplist::parse(&start.body).unwrap();
+                        assert_eq!(body.get("rtpTime"),Some(&Value::int(i64::from(rtp))));
+                        assert_eq!(body.get("networkTimeSecs"),Some(&Value::int(43)));
+                        reply(&mut peer,&start,200,Value::dict(vec![])).await;
+                        let _ = play_tx.send(());
+                        let flush = read_request(&mut peer).await;
+                        assert!(flush.first_line.starts_with("FLUSHBUFFERED "));
+                        reply(&mut peer,&flush,200,Value::dict(vec![])).await;
+                        let pause = read_request(&mut peer).await;
+                        assert!(pause.first_line.starts_with("SETRATEANCHORTIME "));
+                        assert_eq!(bplist::parse(&pause.body).unwrap().get("rate"),Some(&Value::int(0)));
+                        reply(&mut peer,&pause,200,Value::dict(vec![])).await;
+                        let _ = pause_tx.send(());
+                    } else {
+                        let mut byte = [0;1];
+                        assert_eq!(tcp.read(&mut byte).await.unwrap(),0);
+                    }
+                }
+                if failure == "none" { return; }
+                if failure != "setup" {
+                    let cleanup = read_request(&mut peer).await;
+                    assert!(cleanup.first_line.starts_with("TEARDOWN "));
+                    assert_eq!(bplist::parse(&cleanup.body).unwrap(),streams(vec![("type",Value::int(103))]));
+                    reply(&mut peer,&cleanup,200,Value::dict(vec![])).await;
+                }
+                let fallback = read_request(&mut peer).await;
+                assert!(fallback.first_line.starts_with("SETUP "));
+                let root = bplist::parse(&fallback.body).unwrap();
+                assert_eq!(root.get("streams").unwrap().as_array().unwrap()[0].get("type"),Some(&Value::int(102)));
+                reply(&mut peer,&fallback,200,streams(vec![("type",Value::int(102)),("dataPort",Value::int(i64::from(port)))])).await;
+            });
+            let mut buffered = negotiate_audio(&channel, &factory, Some(&[7;32]), &p, false, &info, AudioCodec::BufferedAac).await;
+            assert_eq!(buffered.as_ref().map(AudioOut::stream_type), (failure == "none").then_some(103), "{failure}");
+            if let Some(output) = buffered.as_mut() {
+                p.pipeline.lock().observe_main_sender(Some(output));
+                let owned = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                output.set_ownership(owned.clone());
+                let pcm:Vec<i16> = (0..2048).map(|i| ((i as f32 * 0.0576).sin() * 6000.) as i16).collect();
+                for _ in 0..24 {
+                    output.send_pcm(&pcm).await.unwrap();
+                    if output.packets_sent() > 0 { break; }
+                    tokio::time::sleep(Duration::from_millis(22)).await;
+                }
+                assert!(output.packets_sent() > 0);
+                let sent = output.packets_sent();
+                tokio::time::timeout(Duration::from_secs(2),play_rx).await.unwrap().unwrap();
+                owned.store(false, Ordering::Release);
+                channel.buffered_ownership.publish(false);
+                output.send_pcm(&pcm).await.unwrap();
+                assert_eq!(output.packets_sent(),sent);
+                tokio::time::timeout(Duration::from_secs(2),pause_rx).await.unwrap().unwrap();
+                for stage in ["SCREEN_SETUP", "VIDEO_CHANNEL_READY"] {
+                    let snap = p.pipeline.lock().activation_snapshot(stage).unwrap();
+                    assert_eq!(serde_json::to_value(snap).unwrap()["main_audio_stream_type"], 103);
+                }
+            }
+            drop(buffered);
+            p.pipeline.lock().observe_main_sender(None);
+            assert!(p.pipeline.lock().activation_snapshot("SCREEN_SETUP").unwrap().main_audio_stream_type.is_none());
+            assert!(!channel.buffered_cleanup_pending.load(Ordering::Acquire));
+            if failure != "none" {
+                let udp = negotiate_audio(&channel, &factory, Some(&[7;32]), &p, false, &info, AudioCodec::Aac).await.unwrap();
+                assert_eq!(udp.stream_type(), 102);
+                p.pipeline.lock().observe_main_sender(Some(&udp));
+                for stage in ["SCREEN_SETUP", "VIDEO_CHANNEL_READY"] {
+                    let snap = p.pipeline.lock().activation_snapshot(stage).unwrap();
+                    assert_eq!(serde_json::to_value(snap).unwrap()["main_audio_stream_type"], 102);
+                }
+            }
+            assert_eq!(net.tcp_opens.load(Ordering::Relaxed), usize::from(!matches!(failure,"setup"|"wrong_stream")));
+            assert_eq!(net.udp_opens.load(Ordering::Relaxed), usize::from(failure!="none"));
+            server.await.unwrap();
+        }
     }
     #[tokio::test]
     async fn hevc_preference_never_retries_authorization_failures() {
@@ -971,7 +1225,7 @@ mod shutdown_tests {
                 peer.write_all(format!("RTSP/1.0 {status} Denied\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",request.cseq().unwrap()).as_bytes()).await.unwrap();
                 assert!(tokio::time::timeout(Duration::from_millis(50),peer.read(&mut [0u8;1])).await.is_err());
             });
-            assert!(setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,true,true,None,None).await.is_err());
+            assert!(setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,true,true,true,None,None).await.is_err());
             server.await.unwrap();
         }
     }
@@ -1035,7 +1289,7 @@ mod shutdown_tests {
         let c=control.clone();
         let task=crate::callback_context::spawn(async move {
             let mut cleanup=crate::negotiation_cleanup::NegotiationCleanup::new(c.clone(),true);
-            let result=setup_and_read_info(&c,"phone","name",1234,true,Value::dict(vec![]),false,true,false,false,false,Some(&mut cleanup),None).await;
+            let result=setup_and_read_info(&c,"phone","name",1234,true,Value::dict(vec![]),false,true,false,false,false,true,Some(&mut cleanup),None).await;
             cleanup.finish().await;result
         });
         let setup=read_request(&mut peer).await;assert!(setup.first_line.starts_with("SETUP "));
@@ -1196,6 +1450,73 @@ mod id9_tests {
         assert!(lines.contains("PCM48=false AAC44=false AAC48=true"));
         // This is a synthetic capability fixture, not evidence from a real MGU head unit.
     }
+    #[test]
+    fn buffered_priority_requires_id9_declared_media_output_and_classic_framing() {
+        let empty = Value::dict(vec![]);
+        let format = |kind, label, direction, bits, apap| Value::dict(vec![
+            ("type", Value::int(kind)), ("audioType", Value::str(label)), (direction, Value::int(bits)),
+            ("packetFormatAPAP", Value::bool(apap)),
+        ]);
+        let tcp = || format(103, "media", "audioOutputFormats", 1 << 23, false);
+        let udp = || format(102, "media", "audioOutputFormats", 1 << 23, false);
+        let plan = |formats, session: &Value| {
+            let info = Value::dict(vec![("audioFormats", Value::array(formats))]);
+            let mut plan = audio_candidates(&info, "auto", true);
+            prioritize_buffered_media(&info, session, &mut plan);
+            plan
+        };
+        let features = |names| Value::dict(vec![("enabledFeatures", Value::array(names))]);
+        assert_eq!(plan(vec![tcp(), udp()], &features(vec![Value::str("mainBuffered")])),
+            [AudioCodec::BufferedAac, AudioCodec::Aac]);
+        assert_eq!(plan(vec![tcp()], &empty), [AudioCodec::BufferedAac]);
+        assert_eq!(plan(vec![tcp(), udp()], &features(vec![])), [AudioCodec::BufferedAac, AudioCodec::Aac]);
+        for bad in [format(103,"media","audioInputFormats",1<<23,false),
+                    format(103,"media","audioOutputFormats",1<<22,false),
+                    format(103,"media","audioOutputFormats",-1,false),
+                    format(103,"media","audioOutputFormats",1<<23,true),
+                    format(103,"speechRecognition","audioOutputFormats",1<<23,false)] {
+            assert_eq!(plan(vec![bad, udp()], &empty), [AudioCodec::Aac]);
+        }
+        let mut p = buffered_profile_params_for_test();
+        assert!(p.offers_buffered_media(&empty));
+        p.head_unit_profile = "mercedes_mbux".into();
+        p.id9_screen_bootstrap = false;
+        p.mbux_media_compat = true;
+        assert!(!p.offers_buffered_media(&empty));
+        let identity = |model| Value::dict(vec![("model", Value::str(model))]);
+        assert!(p.offers_buffered_media(&identity("MB_E-P-4")));
+        p.receiver_model = Some("MB_E-P-4".into());
+        assert!(p.offers_buffered_media(&empty));
+        assert!(!p.offers_buffered_media(&identity("MB_E-P-40")));
+        p.audio_codec = "pcm".into();
+        assert!(!p.offers_buffered_media(&empty));
+        p.audio_codec = "aac".into();
+        p.desktop_receiver = true;
+        assert!(!p.offers_buffered_media(&empty));
+        p.desktop_receiver = false;
+        p.head_unit_profile = "bmw_id85".into();
+        assert!(!p.offers_buffered_media(&identity("MB_E-P-4")));
+    }
+
+    #[test]
+    fn buffered_response_rejects_invalid_echoes_endpoints_and_capacity() {
+        let response = |field, value| {
+            let mut fields = vec![("dataPort",Value::int(5555)),("audioBufferSize",Value::int(8388608))];
+            fields.retain(|(k,_)| *k != field);
+            fields.push((field,value));
+            Value::dict(fields)
+        };
+        assert_eq!(buffered_endpoints(&response("controlPort", Value::int(65000)), 42).unwrap(), (5555,8388608));
+        for (field, value) in [("dataPort",Value::int(-1)), ("dataPort", Value::int(65536)),
+            ("controlPort",Value::str("1234")), ("audioBufferSize",Value::int(0)),
+            ("audioBufferSize",Value::int(38)), ("audioBufferSize", Value::int(i64::MAX)),
+            ("input",Value::bool(true)), ("audioType",Value::str("default")), ("sr",Value::int(44100)),
+            ("status", Value::int(2)), ("audioFormat",Value::int(1<<22)), ("spf",Value::int(480)),
+            ("ct",Value::int(3)), ("streamConnectionID",Value::int(5)), ("packetFormatAPAP",Value::bool(true))] {
+            assert!(buffered_endpoints(&response(field, value), 42).is_err(), "{field}");
+        }
+    }
+
     #[test]
     fn aac_only_receiver_is_never_sent_unadvertised_pcm_media() {
         let fmt=|kind,typ:&str,bits| Value::dict(vec![("type",Value::int(kind)),("audioType",Value::str(typ)),("audioOutputFormats",Value::int(bits))]);
@@ -1690,7 +2011,7 @@ mod display_size_tests {
         let (read, write) = socket.into_split();
         let (channel, _) = RtspChannel::spawn(read, write, None);
         crate::auth_setup::run(&channel).await.unwrap();
-        let (_, info, _) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", "Test phone", 12345, true, Value::dict(vec![]), false, false, false, true, false, None, Some("06:12:34:56:78:90")).await.unwrap();
+        let (_, info, _, _) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", "Test phone", 12345, true, Value::dict(vec![]), false, false, false, true, false, false, None, Some("06:12:34:56:78:90")).await.unwrap();
         let display = &info.get("displays").unwrap().as_array().unwrap()[0];
         assert_eq!(uuid_text(display.get("uuid")).as_deref(), Some("actual-bmw-display"));
         assert_eq!(read_display_size(display), (2560, 744));
@@ -1950,7 +2271,7 @@ const CONTROLLER_FEATURES: &[&str] = &[
 
 fn session_features(mbux: bool, id9: bool, media_compat: bool) -> Vec<Value> {
     if mbux { return vec![Value::str("viewAreas")]; }
-    // Only type 100/102 UDP main audio is implemented.
+    // The authenticated session adds mainBuffered for eligible buffered media receivers.
     CONTROLLER_FEATURES.iter().filter(|f| !((id9 || media_compat) && **f == "hevc"))
         .map(|f| Value::str(f)).collect()
 }
@@ -2071,9 +2392,10 @@ fn valid_station_mac(value: &str) -> Option<String> {
 }
 
 async fn setup_and_read_info(
-    channel: &Arc<RtspChannel>, device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool, id9: bool, media_compat: bool, bmw: bool, prefer_hevc: bool, cleanup: Option<&mut crate::negotiation_cleanup::NegotiationCleanup>, network_mac: Option<&str>,
-) -> Result<(Value, Value, bool), String> {
+    channel: &Arc<RtspChannel>, device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool, id9: bool, media_compat: bool, bmw: bool, prefer_hevc: bool, propose_buffered: bool, cleanup: Option<&mut crate::negotiation_cleanup::NegotiationCleanup>, network_mac: Option<&str>,
+) -> Result<(Value, Value, bool, bool), String> {
     emit_log(&format!("AIRPLAY: session device name={device_name}"));
+    let mut buffered_offered = propose_buffered;
     let mut request = bplist::parse(&build_session_setup(device_id, device_name, timing_port, encrypted, mbux, id9, media_compat)).map_err(|e|e.to_string())?;
     if let Value::Dict(fields) = &mut request {
         if bmw && !id9 && !mbux && use_box_bootstrap(true, &previous_info) {
@@ -2085,12 +2407,16 @@ async fn setup_and_read_info(
             }
         }
         if let Some((_,features))=fields.iter_mut().find(|(key,_)|key.as_str()==Some("features")) {
-            *features=Value::array(video_session_features(mbux,id9,media_compat,bmw,prefer_hevc));
+            let mut offer = video_session_features(mbux,id9,media_compat,bmw,prefer_hevc);
+            if buffered_offered {
+                offer.push(Value::str("mainBuffered"));
+            }
+            *features=Value::array(offer);
         }
     }
     let body=bplist::encode(&request);
     if media_compat {
-        emit_log(&format!("MBUX-MEDIA: hevc_proposed={prefer_hevc} mainBuffered_proposed=false; implemented UDP audio; RECORD order unchanged"));
+        emit_log(&format!("MBUX-MEDIA: hevc_proposed={prefer_hevc} mainBuffered_proposed={buffered_offered}"));
     }
     if id9 {
         if let Some(sid) = request.get("sessionCorrelationUUID").and_then(Value::as_str) {
@@ -2104,16 +2430,17 @@ async fn setup_and_read_info(
     let mut reply = channel.request(
         "SETUP", "/setup", &body, "application/x-apple-binary-plist", &[], Duration::from_secs(10),
     ).await?;
-    // A definite rejection has not created a session. Retry once with only HEVC removed;
-    // authorization failures, timeouts and malformed accepted replies keep their original path.
-    if hevc_proposed && matches!(reply.status(),400|406|415|451|456|461) {
-        emit_log(&format!("VIDEO-CODEC: session HEVC proposal rejected status={}; retry once with H264 capability",reply.status()));
+    // An explicit rejection has not created a session. Withdraw each offered feature
+    // at most once, keeping the same URI and identity. Never replay an uncertain SETUP.
+    for (name, offered) in [("mainBuffered", &mut buffered_offered), ("hevc", &mut hevc_proposed)] {
+        if !*offered || !matches!(reply.status(),400|406|415|451|456|461) { continue; }
+        emit_log(&format!("AIRPLAY: session SETUP rejected status={}; retry without {name}",reply.status()));
         if let Value::Dict(fields)=&mut request {
-            if let Some((_,features))=fields.iter_mut().find(|(key,_)|key.as_str()==Some("features")) {
-                *features=Value::array(video_session_features(mbux,id9,media_compat,bmw,false));
+            if let Some((_,Value::Array(offer)))=fields.iter_mut().find(|(key,_)|key.as_str()==Some("features")) {
+                offer.retain(|f| f.as_str() != Some(name));
             }
         }
-        hevc_proposed=false;
+        *offered=false;
         reply=channel.request("SETUP","/setup",&bplist::encode(&request),"application/x-apple-binary-plist",&[],Duration::from_secs(10)).await?;
     }
     if reply.status() != 200 {
@@ -2132,15 +2459,17 @@ async fn setup_and_read_info(
         Ok(_) => {
             if let Some(trace) = channel.id9_trace.get() { emit_log(&format!("{trace} INFO_RESULT source=fallback_empty")); }
             emit_log("AIRPLAY: 会话内 /info 为空，保留先前能力或设置兜底");
+            buffered_offered = false;
             previous_info
         }
         Err(error) => {
             if let Some(trace) = channel.id9_trace.get() { emit_log(&format!("{trace} INFO_RESULT source=fallback_error error={error:?}")); }
             emit_log(&format!("AIRPLAY: 会话内 /info 仍不可用（{error}），保留先前能力或设置兜底"));
+            buffered_offered = false;
             previous_info
         }
     };
-    Ok((setup, info, hevc_proposed))
+    Ok((setup, info, hevc_proposed, buffered_offered))
 }
 
 pub(crate) fn build_screen_setup(conn_id: i64, uuid: &str) -> Vec<u8> {
@@ -2162,20 +2491,66 @@ pub(crate) fn build_screen_setup_with_latency(conn_id: i64, uuid: &str, latency_
 /// WinPlay treats zero latency as 1000 ms; 352-frame PCM then approaches its 128-packet limit.
 /// A positive 250 ms keeps its reorder queue below capacity without changing physical-car timing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-// type100 = Main; type102 = MainHigh (UDP). MainBuffered is type103 (TCP),
-// which this sender does not implement. The session feature is a separate capability.
-pub(crate) enum AudioCodec { Pcm, Pcm441, Aac, Aac441 }
+// Main and MainHigh use UDP. MainBuffered uses length-prefixed TCP.
+pub(crate) enum AudioCodec { Pcm, Pcm441, Aac, Aac441, BufferedAac }
 impl AudioCodec {
-    pub(crate) fn stream_type(self) -> i64 { if matches!(self, Self::Pcm | Self::Pcm441) {100} else {102} }
-    fn format(self) -> i64 { match self {Self::Pcm=>1<<15,Self::Pcm441=>1<<11,Self::Aac=>1<<23,Self::Aac441=>1<<22} }
+    pub(crate) fn stream_type(self) -> i64 { match self { Self::Pcm | Self::Pcm441 => 100, Self::BufferedAac => 103, Self::Aac | Self::Aac441 => 102 } }
+    fn format(self) -> i64 { match self {Self::Pcm=>1<<15,Self::Pcm441=>1<<11,Self::Aac | Self::BufferedAac=>1<<23,Self::Aac441=>1<<22} }
     fn rate(self) -> u32 { if matches!(self, Self::Aac441 | Self::Pcm441) {44100} else {48000} }
     fn spf(self) -> i64 { if matches!(self, Self::Pcm | Self::Pcm441) {352} else {1024} }
 }
-fn declares_media(info: &Value, codec: AudioCodec) -> bool {
+pub(crate) fn declares_media(info: &Value, codec: AudioCodec) -> bool {
     info.get("audioFormats").and_then(Value::as_array).into_iter().flatten().any(|f|
         f.get("type").and_then(Value::as_int)==Some(codec.stream_type()) &&
         f.get("audioType").and_then(Value::as_str)==Some("media") &&
-        f.get("audioOutputFormats").and_then(Value::as_int).is_some_and(|bits|bits & codec.format()!=0))
+        f.get("audioOutputFormats").and_then(Value::as_int).is_some_and(|bits| bits >= 0 && bits & codec.format()!=0)
+        && (codec != AudioCodec::BufferedAac || uses_classic_buffered_packets(f)))
+}
+
+impl AirplayParams {
+    fn offers_buffered_media(&self, info: &Value) -> bool {
+        let model = info.get("model").and_then(Value::as_str).filter(|s| !s.is_empty())
+            .or(self.receiver_model.as_deref());
+        self.enable_audio && !self.desktop_receiver && use_box_bootstrap(true, info) && self.audio_codec != "pcm"
+            && match self.head_unit_profile.as_str() {
+                "bmw_id9" => self.id9_screen_bootstrap,
+                "mercedes_mbux" => self.mbux_media_compat && model == Some("MB_E-P-4"),
+                _ => false,
+            }
+    }
+}
+
+#[cfg(test)]
+fn buffered_profile_params_for_test() -> AirplayParams {
+    AirplayParams {
+        car_ip:"127.0.0.1".into(), airplay_port:7000, device_id:String::new(), device_name:String::new(),
+        wifi_mac_address:None, identity_path:String::new(), receiver_id:None, receiver_model:None, receiver_previously_connected:true,
+        enable_audio:true, audio_codec:"auto".into(), video_codec:"h264".into(), bmw_capabilities:true,
+        microphone_probe:None, keep_alive_stats:false, bmw_box_bootstrap:true, head_unit_profile:"bmw_id9".into(),
+        mbux_screen_bootstrap:false, id9_screen_bootstrap:true, nbt_audio_first:false, mbux_media_compat:false,
+        desktop_receiver:false, width:1920, height:720, touch_display:None, touch_rect:None,
+        encoder_size:Arc::new(Mutex::new((1920,720))), touch_size:Arc::new(Mutex::new((1920,720))),
+        carwith_display:None, carwith_media_rate:None, carwith_stretch:false, screen_resource_lifecycle:true,
+        pipeline:Arc::new(Mutex::new(crate::pipeline::Pipeline::new())),
+    }
+}
+
+fn uses_classic_buffered_packets(value: &Value) -> bool {
+    value.get("packetFormatAPAP").is_none_or(|v| v.as_bool() == Some(false))
+}
+
+fn prioritize_buffered_media(info: &Value, session: &Value, candidates: &mut Vec<AudioCodec>) {
+    // /info declares the actual stream type, direction and format; the session's
+    // feature summary is logged separately. A scoped SETUP determines acceptance.
+    if !uses_classic_buffered_packets(info) || !uses_classic_buffered_packets(session)
+        || !declares_media(info, AudioCodec::BufferedAac) {
+        return;
+    }
+    if let Some(index) = candidates.iter().position(|codec| *codec == AudioCodec::Aac) {
+        candidates.remove(index);
+        candidates.insert(0, AudioCodec::Aac);
+    }
+    candidates.insert(0, AudioCodec::BufferedAac);
 }
 
 // Check the source at the point of SETUP, including a late INIT during screen negotiation.
@@ -2239,8 +2614,106 @@ fn build_audio_setup_for_codec(conn_id: i64, latency_ms: i64, codec: AudioCodec)
         ("spf", Value::int(codec.spf())),
     ];
     // Leave the validated PCM proposal unchanged. AAC explicitly describes compression/rate.
-    if codec.stream_type() == 102 { stream.extend([("ct",Value::int(4)),("sr",Value::int(codec.rate() as i64))]); }
+    if matches!(codec.stream_type(),102|103) { stream.extend([("ct",Value::int(4)),("sr",Value::int(codec.rate() as i64))]); }
     bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(stream)]))]))
+}
+
+/// Type 103 has a TCP data port. Its optional control port is separate from the RTSP anchor.
+fn buffered_endpoints(stream: &Value, connection_id: i64) -> Result<(u16, u32), String> {
+    for (field, expected) in [("status", 0), ("streamConnectionID", connection_id),
+        ("audioFormat", 1 << 23), ("sr", 48000), ("spf", 1024), ("ct", 4)] {
+        if stream.get(field).is_some_and(|v| v.as_int() != Some(expected)) {
+            return Err(format!("unexpected {field}"));
+        }
+    }
+    if stream.get("audioType").is_some_and(|v| v.as_str() != Some("media"))
+        || stream.get("input").is_some_and(|v| v.as_bool() != Some(false))
+        || !uses_classic_buffered_packets(stream) {
+        return Err("unsupported output direction, media type or packet format".into());
+    }
+    let valid_port = |v: &Value| v.as_int().and_then(|n| u16::try_from(n).ok()).filter(|n| *n != 0);
+    let data = stream.get("dataPort").and_then(valid_port).ok_or("invalid TCP dataPort")?;
+    if stream.get("controlPort").is_some_and(|v| valid_port(v).is_none()) {
+        return Err("invalid controlPort".into());
+    }
+    // Two-byte length, 12-byte header, tag, nonce and a nonempty AAC access unit.
+    let buffer = stream.get("audioBufferSize").and_then(Value::as_int)
+        .and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 38).ok_or("invalid audioBufferSize")?;
+    Ok((data, buffer))
+}
+
+pub(crate) async fn retire_buffered_audio(channel: &RtspChannel) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    let _ordered = channel.buffered_commands.lock().await;
+    channel.buffered_cleanup_pending.store(true, Ordering::Release);
+    let body = bplist::encode(&Value::dict(vec![("streams", Value::array(vec![
+        Value::dict(vec![("type", Value::int(103))])
+    ]))]));
+    let reply = channel.request("TEARDOWN", "/", &body, "application/x-apple-binary-plist",
+        &[], Duration::from_secs(2)).await?;
+    crate::resource_trace::validate_ack("BUFFERED_AUDIO_TEARDOWN", &reply)?;
+    channel.udp_media.set(103, false);
+    channel.buffered_cleanup_pending.store(false, Ordering::Release);
+    Ok(())
+}
+
+async fn negotiate_buffered_audio(channel: &Arc<RtspChannel>, factory: &Arc<dyn SocketProvider>,
+    shared: &[u8;32], host: &str, uri: String) -> Option<AudioOut> {
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+    let codec = AudioCodec::BufferedAac;
+    let encoder = match crate::aac::AacEncoder::at_rate(codec.rate()) {
+        Ok(encoder) => encoder,
+        Err(error) => { emit_log(&format!("BUFFERED-AUDIO: type103 encoder unavailable: {error}")); return None; }
+    };
+    let id = random_positive_i64();
+    let request = build_audio_setup_for_codec(id, 250, codec);
+    let started = Instant::now();
+    channel.buffered_cleanup_pending.store(true, Ordering::Release);
+    let accepted = channel.request("SETUP", &uri, &request, "application/x-apple-binary-plist",
+        &[], Duration::from_secs(8)).await;
+    let setup_ms = started.elapsed().as_millis();
+    let result: Result<AudioOut, String> = async {
+        let reply = accepted?;
+        if reply.status() != 200 {
+            channel.buffered_cleanup_pending.store(false, Ordering::Release);
+            return Err(format!("SETUP rejected RTSP={}", reply.status()));
+        }
+        crate::resource_trace::validate_ack("BUFFERED_AUDIO_SETUP", &reply)?;
+        let root = bplist::parse(&reply.body).map_err(|e| format!("invalid SETUP response: {e:?}"))?;
+        if !uses_classic_buffered_packets(&root) { return Err("unsupported SETUP packetFormatAPAP".into()); }
+        let stream = crate::screen_session::setup_stream::select(&root, 103, false)?;
+        let (data_port, buffer_bytes) = buffered_endpoints(stream, id)?;
+        let factory = factory.clone();
+        let host = host.to_owned();
+        let connect_started = Instant::now();
+        let connect = tokio::task::spawn_blocking(move || factory.open_tcp(&host, data_port, 2500));
+        let data = tokio::time::timeout(Duration::from_secs(3), connect).await
+            .map_err(|_| "TCP connect deadline")?.map_err(|e| e.to_string())?
+            .ok_or("network-bound TCP connection failed")?;
+        let connect_ms = connect_started.elapsed().as_millis();
+        let control = crate::buffered_control::BufferedControl::new(channel.clone(), uri, codec.rate(), codec.spf() as u32);
+        control.probe_anchor().await.map_err(|e| format!("GETANCHOR preflight: {e}"))?;
+        let out = AudioOut::new_buffered_aac(data, stream_key(shared, id as u64), encoder, control, buffer_bytes);
+        emit_log(&format!("BUFFERED-AUDIO: type103 SETUP accepted rtsp_ms={setup_ms} tcp_port={data_port} tcp_ms={connect_ms} audioBufferSize={buffer_bytes} anchor_preflight=ok elapsed_ms={} playback_unconfirmed",
+            started.elapsed().as_millis()));
+        Ok(out)
+    }.await;
+    match result {
+        Ok(out) => {
+            channel.udp_media.set(103, true);
+            channel.buffered_cleanup_pending.store(false, Ordering::Release);
+            Some(out)
+        }
+        Err(error) => {
+            emit_log(&format!("BUFFERED-AUDIO: type103 unusable reason={error} rtsp_ms={setup_ms} elapsed_ms={}", started.elapsed().as_millis()));
+            if channel.buffered_cleanup_pending.load(Ordering::Acquire) {
+                let cleanup = retire_buffered_audio(channel).await;
+                emit_log(&format!("BUFFERED-AUDIO: type103 partial SETUP cleanup={cleanup:?}"));
+            }
+            None
+        }
+    }
 }
 
 pub(crate) async fn negotiate_audio(
@@ -2249,8 +2722,20 @@ pub(crate) async fn negotiate_audio(
     shared: Option<&[u8; 32]>,
     p: &AirplayParams,
     desktop: bool,
+    info: &Value,
     codec: AudioCodec,
 ) -> Option<AudioOut> {
+    if channel.buffered_cleanup_pending.load(std::sync::atomic::Ordering::Acquire) {
+        if let Err(error) = retire_buffered_audio(channel).await {
+            emit_log(&format!("BUFFERED-AUDIO: defer {codec:?}, type103 cleanup pending: {error}"));
+            return None;
+        }
+    }
+    if codec == AudioCodec::BufferedAac {
+        if desktop || !p.offers_buffered_media(info) || !declares_media(info, codec) { return None; }
+        return negotiate_buffered_audio(channel, factory, shared?, &p.car_ip,
+            crate::rtsp_uri::audio_uri(&p.car_ip, p.airplay_port)).await;
+    }
     let encoder = if codec.stream_type() == 102 {
         match crate::aac::AacEncoder::at_rate(codec.rate()) {
             Ok(encoder) => { emit_log(&format!("AUDIO: AAC-LC encoder ready {}Hz stereo 256kbps raw/SPF1024",codec.rate())); Some(encoder) }

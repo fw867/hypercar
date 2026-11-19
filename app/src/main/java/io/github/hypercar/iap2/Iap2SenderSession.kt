@@ -83,7 +83,7 @@ class Iap2SenderSession(
         io.github.hypercar.headunit.HeadUnitProfiles.BMW_ID85,
     /** 单调时钟，可在时序回归测试中控制超时。 */
     private val nanoTime: () -> Long = System::nanoTime,
-    private val onIdentification: (String) -> Unit = {},
+    private val onIdentification: (Iap2Messages.Identification) -> Unit = {},
     /** Actual RFCOMM peer, rather than a mutable UI selection or phone MAC. */
     private val receiverAddress: String? = null,
     private val navigationEnabled: () -> Boolean = { false },
@@ -238,7 +238,7 @@ class Iap2SenderSession(
         peerIdentification = ident
         subscriptions.identify(ident.model, ident.manufacturer)
         media.identify(ident.hidComponents)
-        onIdentification(listOfNotNull(ident.name, ident.model, ident.manufacturer).joinToString(" "))
+        onIdentification(ident)
         logIdentification(ident, identFrame)
         logWirelessCarPlayProfile(ident)
         send(Iap2MessageIds.IDENTIFICATION_ACCEPTED)
@@ -686,7 +686,7 @@ class Iap2SenderSession(
         peerIdentification = ident
         subscriptions.identify(ident.model, ident.manufacturer)
         media.identify(ident.hidComponents)
-        onIdentification(listOfNotNull(ident.name, ident.model, ident.manufacturer).joinToString(" "))
+        onIdentification(ident)
         log(
             "iap2 rx=0x1d01（重新识别）name=${ident.name} 发送清单=${ident.sendIds?.sorted()?.joinToString { "0x%04x".format(it) }} " +
                 "可收清单=${ident.receiveIds?.sorted()?.joinToString { "0x%04x".format(it) }}",

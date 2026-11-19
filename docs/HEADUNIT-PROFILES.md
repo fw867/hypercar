@@ -58,7 +58,7 @@ useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关�
 
 ### 当前奔驰媒体提议校准
 
-`mbux_media_compat` 由奔驰档案 ID 派生，不作为任意远端档案开关。关闭当前发送端未实现的 hevc/mainBuffered 会话声明，保留 H.264 和实际实现的 type100/102 UDP 音频；仅使用车机明确声明的媒体输出格式。RECORD、屏幕参数和资源规则保持原有单次激活路径，未恢复旧屏幕前置实验。
+`mbux_media_compat` 由奔驰档案 ID 派生，不作为任意远端档案开关。593 对已识别的 MB_E-P-4 在自动或 AAC 优先时提议 mainBuffered。本轮会话内 /info 明确声明 103/media/AAC48 才尝试 TCP，失败时优先回退已声明的 type102。其他奔驰型号沿用原有 UDP 媒体协商。RECORD、屏幕参数和资源规则保持原有单次激活路径，未恢复旧屏幕前置实验。
 
 仅“初始媒体失败且发送时尚未READY”允许等待最多3秒，本轮传输就绪后对失败流重试一次；成功流不重建，不重复RECORD，不对初始已READY的拒绝循环重试。真实车机音画仍待验证。
 

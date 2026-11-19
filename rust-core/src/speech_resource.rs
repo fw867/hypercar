@@ -51,6 +51,7 @@ impl SpeechResource {
         let mut modes=self.modes.lock();
         let committed=modes.commit_aux(&proposal);
         self.owned.store(modes.audio_owned(),Ordering::Release);
+        self.control.buffered_ownership.publish(modes.audio_owned());
         crate::emit_log(&format!("SPEECH-RESOURCE: acknowledged committed={committed}; receiver audibility unconfirmed"));
         committed
     }

@@ -399,7 +399,7 @@ mod tests {
     #[test] fn reconnect_reuses_live_source_and_discards_historical_pcm() {
         let mut feed = Feed::default();
         feed.receive(CarLifeEvent::AudioInit{tts:false,rate:48000,channels:2});
-        feed.receive(CarLifeEvent::AudioData{tts:false,rate:48000,channels:2,data:vec![1;4096]});
+        feed.receive(CarLifeEvent::AudioData{received_at:std::time::Instant::now(),tts:false,rate:48000,channels:2,data:vec![1;4096]});
         feed.receive(video(0x65));
         let first = feed.attach(); drop(first);
         feed.receive(video(0x41));

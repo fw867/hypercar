@@ -24,9 +24,18 @@ object Iap2Peer {
 
     private var softwareIdentity: String? = null
 
+    private var model: String? = null
+
     @Synchronized
-    fun rememberIdentification(address: String?, identity: String) {
-        if (address != null && address.equals(this.address, ignoreCase = true)) softwareIdentity = identity
+    fun modelFor(address: String?): String? =
+        if (address != null && address.equals(this.address, ignoreCase = true)) model else null
+
+    @Synchronized
+    fun rememberIdentification(address: String?, identity: String, model: String? = null) {
+        if (address != null && address.equals(this.address, ignoreCase = true)) {
+            softwareIdentity = identity
+            this.model = model
+        }
     }
 
     @Synchronized
@@ -38,6 +47,7 @@ object Iap2Peer {
         val mac = address?.trim().orEmpty()
         if (mac.isEmpty()) return
         softwareIdentity = null
+        model = null
         this.address = mac
         this.name = name?.takeIf { it.isNotBlank() }
         at = System.currentTimeMillis()
@@ -46,6 +56,7 @@ object Iap2Peer {
     @Synchronized
     fun clear() {
         softwareIdentity = null
+        model = null
         address = null
         name = null
         at = 0L

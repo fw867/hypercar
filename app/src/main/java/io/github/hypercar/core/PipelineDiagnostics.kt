@@ -23,6 +23,7 @@ data class PipelineDiagnostics(
     val writtenFrames: Long = 0,
     val audioReady: Boolean = false,
     val audioCodec: String = "",
+    val mainAudioStreamType: Long? = null,
     val audioKbps: Long? = null,
     val audioPackets: Long = 0,
     val signalPackets: Long = 0,
@@ -39,7 +40,12 @@ data class PipelineDiagnostics(
     val timingReceiveErrors: Long = 0,
     val tcpState: Int? = null,
     val tcpInfoError: Long? = null,
+    val snapshotSequence: Long = 0,
 ) {
+    internal fun canReplace(previous: PipelineDiagnostics): Boolean =
+        generation > previous.generation || (generation == previous.generation &&
+            snapshotSequence >= previous.snapshotSequence)
+
     // Wi-Fi iAP2 is an independent observation; some receivers do not use it.
     // A sent frame never proves that a receiver has opened its CarPlay desktop.
     val activationLabel: String get() = when {
@@ -64,6 +70,11 @@ data class PipelineDiagnostics(
     val wifiStatus get() = status(wifiIap2 == "READY_TRANSPORT", wifiIap2 in setOf("FAILED", "STOPPED"))
     val videoStatus get() = status(videoStream == "READY", videoStream == "FAILED")
     val audioStatus get() = status(audioReady)
+    val audioChannelLabel get() = when {
+        !audioReady -> "未就绪"
+        active && mainAudioStreamType == 103L -> "通道就绪 · mainBuffered"
+        else -> "通道就绪"
+    }
     val timingStatus get() = status(timingRequests > 0 && timingReplies == timingRequests,
         timingSendErrors > 0 || timingReceiveErrors > 0)
     // Queue depth and cumulative retransmits are ordinary TCP observations, not proof of failure.
@@ -116,6 +127,7 @@ data class PipelineDiagnostics(
                 if (this == null || isNull(key)) null else optLong(key).takeIf { it >= 0 }
             PipelineDiagnostics(
                 generation = generation, active = true,
+                snapshotSequence = j.optLong("snapshot_sequence"),
                 recordAccepted = j.optBoolean("record_accepted"),
                 resourcesAccepted = j.optBoolean("resources_accepted"),
                 screenSetupAccepted = j.optBoolean("screen_setup_accepted"),
@@ -129,6 +141,7 @@ data class PipelineDiagnostics(
                 writtenFrames = j.optLong("video_frames_written").coerceAtLeast(0),
                 audioReady = j.optBoolean("audio_ready"), audioPackets = j.optLong("audio_packets_written").coerceAtLeast(0),
                 audioCodec = j.optString("audio_codec").takeIf { it in setOf("PCM", "AAC") }.orEmpty(),
+                mainAudioStreamType = j.number("main_audio_stream_type"),
                 audioKbps = j.number("audio_kbps"),
                 signalPackets = j.optLong("audio_signal_packets").coerceAtLeast(0),
                 uiRequests = j.optLong("ui_requests").coerceAtLeast(0), rebuilds = j.optLong("screen_rebuilds").coerceAtLeast(0),
