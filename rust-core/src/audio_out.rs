@@ -30,6 +30,7 @@ mod buffered;
 #[cfg(all(test, target_os = "android"))]
 pub(crate) use buffered::tests::{accept_start, control_pair};
 use crate::timing::ntp_be;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use tokio::net::{TcpStream, UdpSocket};
 
 /** 每包样本帧数 = AirPlay 标准 SPF 352（48000/352 ≈ 136 包/秒）。 */
@@ -49,6 +50,89 @@ enum AudioTransport {
     Buffered(buffered::BufferedTransport),
 }
 
+#[derive(Clone, Copy)]
+struct RtpHeader {
+    marker: bool,
+    seq: u16,
+    rtp_ts: u32,
+}
+
+#[derive(Clone, Copy)]
+struct SyncHeader {
+    seq: u16,
+    rtp_ts: u32,
+    ntp_nanos: u64,
+}
+
+struct AudioResumeTrace {
+    label: String,
+    unborrow: Arc<AtomicU64>,
+    observed: u64,
+    last_rtp: Option<RtpHeader>,
+    last_sync: Option<SyncHeader>,
+    first_rtp_pending: bool,
+    first_sync_pending: bool,
+    logged_sync_error: bool,
+}
+
+impl AudioResumeTrace {
+    fn emit(&self, fields: std::fmt::Arguments<'_>) {
+        crate::emit_log(&format!("AUDIO-RESUME: {} unborrow={} monoNs={} {fields}",
+            self.label, self.observed, crate::timing::monotonic_nanos()));
+    }
+
+    fn generation(&self) -> u64 {
+        self.unborrow.load(Ordering::Acquire)
+    }
+
+    fn observe_unborrow(&mut self, generation: u64, has_sync_socket: bool) {
+        if generation == self.observed { return; }
+        self.observed = generation;
+        self.first_rtp_pending = true;
+        self.first_sync_pending = has_sync_socket;
+        self.logged_sync_error = false;
+        if let Some(RtpHeader { marker, seq, rtp_ts }) = self.last_rtp {
+            self.emit(format_args!("phase=last_before_rtp written=true marker={marker} seq={seq} rtpTimestamp={rtp_ts}"));
+        } else {
+            self.emit(format_args!("phase=last_before_rtp written=false"));
+        }
+        if let Some(SyncHeader { seq, rtp_ts, ntp_nanos }) = self.last_sync {
+            self.emit(format_args!("phase=last_before_sync written=true syncSeq={seq} rtpTimestamp={rtp_ts} ntpMonoNs={ntp_nanos}"));
+        } else {
+            self.emit(format_args!("phase=last_before_sync written=false"));
+        }
+        if !has_sync_socket {
+            self.emit(format_args!("phase=first_after_sync written=false reason=no_control_socket"));
+        }
+    }
+
+    fn rtp_written(&mut self, packet: RtpHeader) {
+        if std::mem::take(&mut self.first_rtp_pending) {
+            let RtpHeader { marker, seq, rtp_ts } = packet;
+            self.emit(format_args!("phase=first_after_rtp written=true marker={marker} seq={seq} rtpTimestamp={rtp_ts}"));
+        }
+        self.last_rtp = Some(packet);
+    }
+
+    fn sync_result(&mut self, packet: SyncHeader, result: &std::io::Result<usize>) {
+        let SyncHeader { seq, rtp_ts, ntp_nanos } = packet;
+        match result {
+            Ok(_) => {
+                if std::mem::take(&mut self.first_sync_pending) {
+                    self.emit(format_args!("phase=first_after_sync written=true syncSeq={seq} rtpTimestamp={rtp_ts} ntpMonoNs={ntp_nanos}"));
+                }
+                self.last_sync = Some(packet);
+            }
+            Err(error) if self.first_sync_pending && !self.logged_sync_error => {
+                self.logged_sync_error = true;
+                self.emit(format_args!("phase=sync_after_unborrow_attempt written=false syncSeq={seq} errorKind={:?} osError={:?}",
+                    error.kind(), error.raw_os_error()));
+            }
+            Err(_) => {}
+        }
+    }
+}
+
 /// CarPlay 音频发送器。
 pub struct AudioOut {
     transport: AudioTransport,
@@ -56,6 +140,7 @@ pub struct AudioOut {
     sync: Option<std::sync::Arc<UdpSocket>>,
     control_observer: Option<crate::audio_diagnostics::ControlObserver>,
     pub(crate) pacing_id: Option<crate::audio_pacing::StreamId>,
+    resume_trace: Option<AudioResumeTrace>,
     /** 流密钥（pair-verify 派生，32 字节）。 */
     key: [u8; 32],
     /** RTP 序号（逐包 wrapping 递增）。 */
@@ -99,6 +184,7 @@ impl AudioOut {
             sync: sync.map(std::sync::Arc::new),
             control_observer: None,
             pacing_id: None,
+            resume_trace: None,
             key: stream_key,
             seq: 0,
             ts: 0,
@@ -161,6 +247,20 @@ impl AudioOut {
         }
     }
     pub fn sample_rate(&self) -> u32 { self.sample_rate }
+    pub(crate) fn observe_id9_resume(&mut self, unborrow: Arc<AtomicU64>) {
+        if self.pt != 102 { return; }
+        let Some(id) = self.pacing_id else { return; };
+        self.resume_trace = Some(AudioResumeTrace {
+            label: format!("RTSP#{} type=102 streamConnectionID={}", id.rtsp, id.stream_id),
+            observed: unborrow.load(Ordering::Acquire),
+            unborrow,
+            last_rtp: None,
+            last_sync: None,
+            first_rtp_pending: false,
+            first_sync_pending: false,
+            logged_sync_error: false,
+        });
+    }
     pub fn stream_type(&self) -> i64 { self.pt as i64 }
     fn is_aac(&self) -> bool { matches!(self.pt, 102 | 103) && self.opus.is_none() }
     pub fn codec_name(&self) -> &'static str { if self.opus.is_some() { "OPUS" } else if self.is_aac() { "AAC" } else if self.pt==100 { "PCM" } else { "" } }
@@ -283,6 +383,7 @@ impl AudioOut {
         header[1] = (self.pt & 0x7f) | if self.marker_pending { 0x80 } else { 0 };
         header[2..4].copy_from_slice(&self.seq.to_be_bytes());
         header[4..8].copy_from_slice(&self.ts.to_be_bytes());
+        let rtp = RtpHeader { marker: header[1] & 0x80 != 0, seq: self.seq, rtp_ts: self.ts };
         let sealed = chacha_seal(&self.key, &nonce64(self.nonce), payload, &header[4..12]);
         let mut wire = Vec::with_capacity(RTP_HEADER_LEN + sealed.len() + NONCE_TAIL_LEN);
         wire.extend_from_slice(&header);
@@ -297,6 +398,7 @@ impl AudioOut {
         let AudioTransport::Realtime(udp) = &self.transport else {
             return Err(std::io::Error::other("UDP payload on a buffered stream"));
         };
+        let generation = self.resume_trace.as_ref().map(AudioResumeTrace::generation);
         if let Err(error) = socket2::SockRef::from(udp).send_with_flags(&wire, libc::MSG_DONTWAIT) {
             if error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == Some(libc::ENOBUFS) {
                 self.congestion_drops = self.congestion_drops.saturating_add(1);
@@ -310,6 +412,10 @@ impl AudioOut {
         }
         self.packets = self.packets.wrapping_add(1);
         self.marker_pending = false;
+        if let (Some(trace), Some(generation)) = (&mut self.resume_trace, generation) {
+            trace.observe_unborrow(generation, self.sync.is_some());
+            trace.rtp_written(rtp);
+        }
         Ok(())
     }
 
@@ -318,11 +424,21 @@ impl AudioOut {
     /// `rtp_ts`：期望锚定的当前 RTP 时间戳；`ntp_nanos`：单调时钟纳秒——与
     /// TimingServer 应答给车机的是同一时间基，否则车机算出的锚点会整体偏移。
     pub async fn send_sync(&mut self, rtp_ts: u32, ntp_nanos: u64) -> std::io::Result<()> {
+        // Classify an in-flight write by the generation sampled before the send.
+        let generation = self.resume_trace.as_ref().map(AudioResumeTrace::generation);
         let Some(sync) = self.sync.as_ref() else {
+            if let (Some(trace), Some(generation)) = (&mut self.resume_trace, generation) {
+                trace.observe_unborrow(generation, false);
+            }
             return Ok(()); // 车机没下发 controlPort（旧车机）：只发音频
         };
         let packet = build_sync_packet_for_frames(self.sync_seq, rtp_ts, ntp_nanos, self.samples_per_packet() as u32);
-        sync.send(&packet).await?;
+        let result = sync.send(&packet).await;
+        if let (Some(trace), Some(generation)) = (&mut self.resume_trace, generation) {
+            trace.observe_unborrow(generation, true);
+            trace.sync_result(SyncHeader { seq: self.sync_seq, rtp_ts, ntp_nanos }, &result);
+        }
+        result?;
         self.sync_seq = self.sync_seq.wrapping_add(1);
         Ok(())
     }
@@ -542,6 +658,60 @@ mod ownership_tests {
         assert_eq!(sender.aac.as_ref().unwrap().sample_rate(),44100);
         assert!(sender.marker_pending);
     }
+    #[tokio::test]
+    async fn id9_resume_tracks_actual_rtp_and_sync_writes_on_the_same_stream() {
+        use std::sync::atomic::AtomicU64;
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sync_receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sync = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(receiver.local_addr().unwrap()).await.unwrap();
+        sync.connect(sync_receiver.local_addr().unwrap()).await.unwrap();
+        let owner = Arc::new(AtomicBool::new(true));
+        let unborrow = Arc::new(AtomicU64::new(0));
+        let mut audio = AudioOut::new(socket, Some(sync), [0; 32], 102);
+        audio.set_ownership(owner.clone());
+        audio.observe_main_stream(9, 23, 1, std::time::Instant::now());
+        audio.observe_id9_resume(unborrow.clone());
+        audio.seq = u16::MAX - 1;
+        audio.send_payload(&[1; 8], 1024).await.unwrap();
+        audio.send_payload(&[2; 8], 1024).await.unwrap();
+        owner.store(false, Ordering::Release);
+        audio.send_payload(&[3; 8], 1024).await.unwrap();
+        audio.send_sync_now(1_000_000_000).await.unwrap();
+        unborrow.store(1, Ordering::Release);
+        owner.store(true, Ordering::Release);
+        audio.send_sync_now(2_000_000_000).await.unwrap();
+        let trace = audio.resume_trace.as_ref().unwrap();
+        assert!(trace.first_rtp_pending);
+        assert!(!trace.first_sync_pending);
+        assert_eq!((trace.last_rtp.unwrap().marker, trace.last_rtp.unwrap().seq, trace.last_rtp.unwrap().rtp_ts), (false, u16::MAX, 1024));
+        audio.send_payload(&[4; 8], 1024).await.unwrap();
+        let trace = audio.resume_trace.as_ref().unwrap();
+        assert!(!trace.first_rtp_pending);
+        assert_eq!((trace.last_rtp.unwrap().marker, trace.last_rtp.unwrap().seq, trace.last_rtp.unwrap().rtp_ts), (true, 0, 2048));
+        let mut wire = [0; 256];
+        let timeout = std::time::Duration::from_secs(1);
+        for _ in 0..3 { tokio::time::timeout(timeout, receiver.recv(&mut wire)).await.unwrap().unwrap(); }
+        assert_eq!(&wire[..8], &[0x80, 0xe6, 0, 0, 0, 0, 8, 0]);
+        for ntp in [1_000_000_000, 2_000_000_000] {
+            assert_eq!(tokio::time::timeout(timeout, sync_receiver.recv(&mut wire)).await.unwrap().unwrap(), SYNC_PACKET_LEN);
+            assert_eq!(&wire[8..16], &ntp_be(ntp));
+        }
+        let new_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut replacement = AudioOut::new(new_socket, None, [0; 32], 102);
+        replacement.observe_main_stream(9, 24, 0, std::time::Instant::now());
+        replacement.observe_id9_resume(unborrow.clone());
+        replacement.send_sync_now(3_000_000_000).await.unwrap();
+        assert!(!replacement.resume_trace.as_ref().unwrap().first_rtp_pending);
+        unborrow.store(2, Ordering::Release);
+        replacement.send_sync_now(4_000_000_000).await.unwrap();
+        let replacement_trace = replacement.resume_trace.as_ref().unwrap();
+        assert!(replacement_trace.first_rtp_pending);
+        assert!(!replacement_trace.first_sync_pending);
+        assert!(replacement_trace.last_sync.is_none());
+    }
+
     #[tokio::test]
     async fn muted_owner_sends_no_udp_and_a_new_grant_resumes_with_marker() {
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();

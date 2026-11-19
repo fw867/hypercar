@@ -3,8 +3,8 @@ use std::{sync::{Arc, OnceLock}, time::Duration};
 use tokio::{sync::{Notify, watch}, time::Instant};
 use crate::{airplay::SocketProvider, emit_log};
 
-pub(crate) fn idle_only(profile: &str, id9: bool, mbux: bool, desktop: bool, model: &str) -> bool {
-    !desktop && (profile == "bmw_id85" || id9 || (mbux && model == "MB_E-P-4"))
+pub(crate) fn idle_only(profile: &str, id9: bool, mbux: bool, desktop: bool) -> bool {
+    !desktop && (profile == "bmw_id85" || id9 || mbux)
 }
 
 #[derive(Clone, Copy)]

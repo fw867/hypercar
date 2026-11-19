@@ -58,13 +58,13 @@ useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关�
 
 ### 当前奔驰媒体提议校准
 
-`mbux_media_compat` 由奔驰档案 ID 派生，不作为任意远端档案开关。593 对已识别的 MB_E-P-4 在自动或 AAC 优先时提议 mainBuffered。本轮会话内 /info 明确声明 103/media/AAC48 才尝试 TCP，失败时优先回退已声明的 type102。其他奔驰型号沿用原有 UDP 媒体协商。RECORD、屏幕参数和资源规则保持原有单次激活路径，未恢复旧屏幕前置实验。
+`mbux_media_compat` 由奔驰档案 ID 派生。所有 MBUX 在自动或 AAC 优先时均可提议 mainBuffered，会话 SETUP 明确拒绝后可撤回。仅在本轮会话内 /info 明确声明 103/media/AAC48 且封包兼容时尝试 TCP；103 失败时确认清理后回退可用的实时 AAC。整个会话只激活一次 RECORD。
 
-仅“初始媒体失败且发送时尚未READY”允许等待最多3秒，本轮传输就绪后对失败流重试一次；成功流不重建，不重复RECORD，不对初始已READY的拒绝循环重试。真实车机音画仍待验证。
+初始媒体失败且发送时尚未 READY，可等待最多 3 秒并在本轮传输就绪后对失败流重试一次。屏幕首次 SETUP、READY 重试和归还后重建共用同一个绝对会话 URI。UDP 保活立即发首包，空闲每 10 秒发送，有媒体流时停止计时。
 
 ## 旧奔驰 MBUX 实验记录
 
-以下为 MB_E-P-4 的失败实验历史。MB_E-P-4 没有独立现行路径，也没有成功样本；它与 MB_D-PP 共用上述奔驰档案。`mbuxScreenBootstrap` 固定关闭，远程配置或缓存不能重开；这些历史参数不代表当前流程。
+以下为 MB_E-P-4 的失败实验历史。后续 588 日志记录了该车型屏幕 SETUP 200、PCM48 SETUP 200 和持续媒体写出。该样本采用单次 RECORD、绝对会话 URI 和空闲 UDP 保活。`mbuxScreenBootstrap` 固定关闭，远程配置或缓存不能重开。
 
 11月9日14:29导出日志（版本524）头部五次尝试均报BSSID辅助读取正则异常，正文后两轮也复现；阶段止于IAP2_PARAMETERS，没有/auth-setup、屏幕SETUP或RECORD。蓝牙已给出热点与端点，后续RFCOMM local_cancel=true由本地失败清理造成，不是本轮车机拒绝媒体的证据。路径对应610新增复用检查。611去掉该路径正则，用ASCII/标签扫描解析并把辅助读取失败降级为正常入网；保留取消，不降低网络复用的身份/地址校验。
 

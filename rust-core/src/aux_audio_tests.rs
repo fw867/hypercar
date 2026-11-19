@@ -18,6 +18,7 @@ struct Fixture {
     controller:Controller,input:Arc<Input>,peer:TcpStream,data:UdpSocket,sync:UdpSocket,
     commands:mpsc::UnboundedReceiver<&'static str>,fallback:mpsc::UnboundedReceiver<crate::engine::SourceEvent>,
     command_task:tokio::task::JoinHandle<()>,buffer:Vec<u8>,order:Vec<String>,
+    shutdown:Arc<crate::shutdown::EngineShutdown>,
 }
 impl Drop for Fixture {fn drop(&mut self){self.command_task.abort();}}
 impl Fixture {
@@ -49,25 +50,33 @@ impl Fixture {
         let media=control.udp_media.subscribe();
         configure(&mut params, &mut info);
         let kinds = crate::airplay::independent_audio_kinds(&params, &info);
-        let session=Session{kinds,control,factory:Arc::new(Factory),params,shared:[9;32],info,resource,media_codec:Mutex::new(Some(codec))};
+        let realtime_media_rebuild = crate::airplay::supports_realtime_media_rebuild(&params, &info, params.desktop_receiver);
+        let session=Session{kinds,control,factory:Arc::new(Factory),params,shared:[9;32],info,resource,media_codec:Mutex::new(Some(codec)),receiver_audio_generation:Arc::default(),realtime_media_rebuild};
         let input=Arc::new(Input::default());let(command_tx,mut command_rx)=mpsc::unbounded_channel();
         let(event_tx,commands)=mpsc::unbounded_channel();let(fallback_tx,fallback)=mpsc::unbounded_channel();
         let command_task=tokio::spawn(async move {while let Some(command)=command_rx.recv().await {
             match command {
                 MainCommand::Pause(reply)=>{event_tx.send("pause").unwrap();let _=reply.send(());}
                 MainCommand::Install(out)=>{assert!(out.is_some(),"working PCM media must be restored");event_tx.send("install").unwrap();drop(out);}
+                MainCommand::ReplaceRealtime { output, reply, .. } => {
+                    assert_eq!(output.stream_type(), 102);
+                    event_tx.send("replace").unwrap();
+                    let _ = reply.send(());
+                }
             }
         }});
-        let controller=Controller::spawn(session,input.clone(),command_tx,fallback_tx);
-        Self{media,controller,input,peer,data:UdpSocket::bind("127.0.0.1:0").await.unwrap(),sync:UdpSocket::bind("127.0.0.1:0").await.unwrap(),commands,fallback,command_task,buffer:Vec::new(),order:Vec::new()}
+        let shutdown = Arc::new(crate::shutdown::EngineShutdown::new());
+        let controller=Controller::spawn(session,input.clone(),command_tx,fallback_tx,shutdown.clone());
+        Self{media,controller,input,peer,data:UdpSocket::bind("127.0.0.1:0").await.unwrap(),sync:UdpSocket::bind("127.0.0.1:0").await.unwrap(),commands,fallback,command_task,buffer:Vec::new(),order:Vec::new(),shutdown}
     }
     async fn request(&mut self,expected:&str)->(RtspMessage,Value){
         let message=tokio::time::timeout(Duration::from_secs(3),async {loop {
             if let Some(m)=crate::rtsp::parse_rtsp_messages(&mut self.buffer).unwrap().into_iter().next(){return m;}
             let mut bytes=[0;4096];let n=self.peer.read(&mut bytes).await.unwrap();assert!(n>0);self.buffer.extend_from_slice(&bytes[..n]);
         }}).await.unwrap();
-        let value=bplist::parse(&message.body).unwrap();
-        let actual=if message.first_line.starts_with("POST /command ") {value.get("type").and_then(Value::as_str).unwrap().to_string()} else {
+        let value=if message.body.is_empty() { Value::dict(vec![]) } else { bplist::parse(&message.body).unwrap() };
+        let actual=if message.first_line == "RECORD / RTSP/1.0" { "record".into() }
+        else if message.first_line.starts_with("POST /command ") {value.get("type").and_then(Value::as_str).unwrap().to_string()} else {
             let stream=&value.get("streams").unwrap().as_array().unwrap()[0];
             if message.first_line.starts_with("SETUP "){format!("setup:{}:{}",stream.get("type").unwrap().as_int().unwrap(),stream.get("audioType").unwrap().as_str().unwrap())}
             else {format!("teardown:{}",stream.get("type").unwrap().as_int().unwrap())}
@@ -102,6 +111,184 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn id9_unborrow_only_switches_after_usable_setup_and_then_records() {
+    use std::sync::atomic::Ordering;
+    let mut f = Fixture::with_codec(AudioCodec::Aac, |p, _| {
+        p.head_unit_profile = "bmw_id9".into();
+        p.pipeline.lock().main_audio_stream_type = Some(102);
+    }).await;
+    let control = f.controller.session.control.clone();
+    let trigger = |generation| {
+        control.audio_unborrow_generation.store(generation, Ordering::Release);
+        control.audio_unborrow_wake.notify_one();
+    };
+    trigger(1);
+    let (setup, _) = f.request("setup:102:media").await;
+    f.reject(&setup, 400).await;
+    trigger(2);
+    let (setup, _) = f.request("setup:102:media").await;
+    assert!(f.commands.try_recv().is_err());
+    // The 200 allocated a stream but its unusable body must not cause a type-wide TEARDOWN.
+    f.ack(&setup, None).await;
+    trigger(3);
+    let (setup, offer) = f.request("setup:102:media").await;
+    assert!(f.commands.try_recv().is_err());
+    f.setup_reply(&setup, &offer).await;
+    let (record, _) = f.request("record").await;
+    assert!(f.commands.try_recv().is_err());
+    f.ack(&record, None).await;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), f.commands.recv()).await.unwrap(), Some("replace"));
+    trigger(3);
+    let mut bytes = [0; 64];
+    assert!(tokio::time::timeout(Duration::from_millis(60), f.peer.read(&mut bytes)).await.is_err());
+}
+
+#[tokio::test]
+async fn id9_rejected_or_timed_out_record_keeps_old_sender_and_ignores_late_200() {
+    let mut f = id9_aac_fixture().await;
+    let rejected = pending_id9_record(&mut f, 1).await;
+    f.reject(&rejected, 455).await;
+    let expired = pending_id9_record(&mut f, 2).await;
+    // The peer uses real TCP sockets. Let the actual RECORD deadline expire.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let fresh = pending_id9_record(&mut f, 3).await;
+    f.ack(&expired, None).await;
+    assert!(tokio::time::timeout(Duration::from_millis(50), f.commands.recv()).await.is_err());
+    f.ack(&fresh, None).await;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), f.commands.recv()).await.unwrap(), Some("replace"));
+}
+
+async fn id9_aac_fixture() -> Fixture {
+    Fixture::with_codec(AudioCodec::Aac, |p, info| {
+        p.head_unit_profile = "bmw_id9".into();
+        p.pipeline.lock().main_audio_stream_type = Some(102);
+        let Value::Dict(fields) = info else { panic!("fixture /info must be a dictionary"); };
+        fields.push((Value::str("audioLatencies"), Value::array(vec![Value::dict(vec![
+            ("type", Value::int(102)), ("audioType", Value::str("media")),
+            ("outputLatencyMicros", Value::int(325_000)),
+        ])])));
+    }).await
+}
+
+async fn pending_id9_record(f: &mut Fixture, generation: u64) -> RtspMessage {
+    use std::sync::atomic::Ordering;
+    f.controller.session.control.audio_unborrow_generation.store(generation, Ordering::Release);
+    f.controller.session.control.audio_unborrow_wake.notify_one();
+    let (setup, offer) = f.request("setup:102:media").await;
+    let stream = &offer.get("streams").unwrap().as_array().unwrap()[0];
+    assert_eq!(stream.get("audioLatencyMs").and_then(Value::as_int), Some(325));
+    f.setup_reply(&setup, &offer).await;
+    let (record, _) = f.request("record").await;
+    assert!(f.commands.try_recv().is_err());
+    record
+}
+
+#[tokio::test]
+async fn non_id9_profiles_rebuild_realtime_audio_unless_receiver_uses_single_record() {
+    use std::sync::atomic::Ordering;
+    for (profile, model, manufacturer, can_rebuild) in [
+        ("bmw_id85", Some("MGU-55"), None, true),
+        ("mercedes_mbux", Some("MB_E-P-4"), None, false),
+        ("mercedes_mbux", Some("MB_D-PP-4"), None, false),
+        ("mercedes_mbux", Some("Future model"), None, false),
+        ("mercedes_mbux", None, None, false),
+        ("auto", Some("MB_E-P-4"), None, false),
+        ("auto", None, Some("Mercedes-Benz"), false),
+        ("auto", Some("Other car"), None, true),
+    ] {
+        let mut f = Fixture::with_codec(AudioCodec::Aac, |p, info| {
+            p.head_unit_profile = profile.into();
+            if let Value::Dict(fields) = info {
+                for (key, value) in [("model", model), ("manufacturer", manufacturer)] {
+                    if let Some(value) = value {
+                        fields.push((Value::str(key), Value::str(value)));
+                    }
+                }
+            }
+            p.pipeline.lock().main_audio_stream_type = Some(102);
+        }).await;
+        let control = f.controller.session.control.clone();
+        control.audio_unborrow_generation.store(1, Ordering::Release);
+        control.audio_unborrow_wake.notify_one();
+        if can_rebuild {
+            let (setup, offer) = f.request("setup:102:media").await;
+            f.setup_reply(&setup, &offer).await;
+            let (record, _) = f.request("record").await;
+            assert!(f.commands.try_recv().is_err());
+            f.ack(&record, None).await;
+            assert_eq!(tokio::time::timeout(Duration::from_secs(1), f.commands.recv()).await.unwrap(), Some("replace"));
+        } else {
+            assert!(tokio::time::timeout(Duration::from_millis(60), f.peer.read_u8()).await.is_err());
+        }
+        f.stopped().await;
+    }
+}
+
+#[tokio::test]
+async fn speech_lease_supersedes_pending_media_record() {
+    use std::sync::atomic::Ordering;
+    let mut f = Fixture::with_codec(AudioCodec::Aac, |p, _| {
+        p.head_unit_profile = "bmw_id85".into();
+        p.pipeline.lock().main_audio_stream_type = Some(102);
+    }).await;
+    let control = f.controller.session.control.clone();
+    control.audio_unborrow_generation.store(1, Ordering::Release);
+    control.audio_unborrow_wake.notify_one();
+    let (setup, offer) = f.request("setup:102:media").await;
+    f.setup_reply(&setup, &offer).await;
+    let (record, _) = f.request("record").await;
+    {
+        let mut modes = f.controller.session.resource.modes.lock();
+        let (speech, lease) = modes.speech_begin(false).unwrap();
+        assert!(modes.commit_aux(&speech));
+        let end = modes.speech_end(&lease).unwrap();
+        assert!(modes.commit_aux(&end));
+    }
+    f.ack(&record, None).await;
+    assert!(tokio::time::timeout(Duration::from_millis(60), f.commands.recv()).await.is_err());
+}
+
+#[tokio::test]
+async fn id9_take_then_return_discards_pending_record_even_when_phone_owns_audio_again() {
+    let mut f = id9_aac_fixture().await;
+    let old = pending_id9_record(&mut f, 1).await;
+    let session = &f.controller.session;
+    let mut modes = session.resource.modes.lock();
+    for transfer in [1, 2] {
+        let mut fields = vec![("resourceID", Value::int(2)), ("transferType", Value::int(transfer))];
+        if transfer == 1 {
+            fields.extend([("transferPriority", Value::int(500)), ("takeConstraint", Value::int(100)), ("borrowConstraint", Value::int(100))]);
+        }
+        let command = Value::dict(vec![("type", Value::str("changeModes")), ("params",
+            Value::dict(vec![("resources", Value::array(vec![Value::dict(fields)]))]))]);
+        modes.response(&command, &session.receiver_audio_generation).unwrap();
+        assert_eq!(modes.audio_owned(), transfer == 2);
+    }
+    drop(modes);
+    f.ack(&old, None).await;
+    assert!(tokio::time::timeout(Duration::from_millis(50), f.commands.recv()).await.is_err());
+    let fresh = pending_id9_record(&mut f, 2).await;
+    f.ack(&fresh, None).await;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), f.commands.recv()).await.unwrap(), Some("replace"));
+}
+
+#[tokio::test]
+async fn id9_same_address_reinvite_discards_old_record_even_with_matching_cseq() {
+    let mut old = id9_aac_fixture().await;
+    let old_record = pending_id9_record(&mut old, 1).await;
+    old.shutdown.request(false);
+    old.stopped().await;
+    let mut next = id9_aac_fixture().await;
+    let next_record = pending_id9_record(&mut next, 1).await;
+    assert_eq!(old_record.cseq(), next_record.cseq());
+    old.ack(&old_record, None).await;
+    assert!(old.commands.try_recv().is_err());
+    assert!(tokio::time::timeout(Duration::from_millis(50), next.commands.recv()).await.is_err());
+    next.ack(&next_record, None).await;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), next.commands.recv()).await.unwrap(), Some("replace"));
+}
+
+#[tokio::test]
 async fn failed_buffered_teardown_never_starts_a_second_main_stream() {
     let mut f = Fixture::with_codec(AudioCodec::BufferedAac, |params, _| {
         params.head_unit_profile = "bmw_id9".into();
@@ -109,9 +296,80 @@ async fn failed_buffered_teardown_never_starts_a_second_main_stream() {
     f.input.buffered_failed.notify_one();
     let (teardown, _) = f.request("teardown:103").await;
     f.reject(&teardown, 500).await;
+    let (retry, _) = f.request("teardown:103").await;
+    assert_ne!(teardown.cseq(), retry.cseq());
+    f.reject(&retry, 500).await;
     assert!(tokio::time::timeout(Duration::from_millis(80), f.peer.read_u8()).await.is_err());
     assert_eq!(f.controller.media_stream_type(), Some(103));
     f.stopped().await;
+}
+
+#[cfg(target_os="android")]
+async fn mbux_buffered_fixture() -> Fixture {
+    let f = Fixture::with_codec(AudioCodec::BufferedAac, |p, info| {
+        p.head_unit_profile = "mercedes_mbux".into();
+        p.mbux_media_compat = true;
+        *info = Value::dict(vec![("audioFormats", Value::array(vec![Value::dict(vec![
+            ("type", Value::int(102)), ("audioType", Value::str("media")),
+            ("audioOutputFormats", Value::int(1 << 23)),
+        ])]))]);
+    }).await;
+    let control = &f.controller.session.control;
+    control.udp_media.set(110, true);
+    control.udp_media.set(103, true);
+    f
+}
+
+#[cfg(target_os="android")]
+#[tokio::test]
+async fn buffered_cleanup_timeout_requires_new_ack_before_102_and_preserves_active_screen() {
+    let mut f = mbux_buffered_fixture().await;
+    f.input.buffered_failed.notify_one();
+    let (first, _) = f.request("teardown:103").await;
+    let (retry, _) = f.request("teardown:103").await;
+    assert_ne!(first.cseq(), retry.cseq());
+    f.ack(&first, None).await;
+    assert!(tokio::time::timeout(Duration::from_millis(60), f.peer.read_u8()).await.is_err());
+    assert!(f.controller.session.control.buffered_cleanup_pending.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(f.controller.media_stream_type(), Some(103));
+    f.ack(&retry, None).await;
+    let (setup, offer) = f.request("setup:102:media").await;
+    assert!(!f.media.borrow().idle(), "the screen remains an active media stream before 102 SETUP is acknowledged");
+    f.setup_reply(&setup, &offer).await;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), f.commands.recv()).await.unwrap(), Some("install"));
+    assert!(tokio::time::timeout(Duration::from_millis(60), f.peer.read_u8()).await.is_err());
+    f.stopped().await;
+}
+
+#[cfg(target_os="android")]
+#[tokio::test]
+async fn buffered_cleanup_retry_reply_stays_on_its_session_during_same_address_reinvite() {
+    let mut old = mbux_buffered_fixture().await;
+    old.input.buffered_failed.notify_one();
+    let (first, _) = old.request("teardown:103").await;
+    old.reject(&first, 500).await;
+    let (old_retry, _) = old.request("teardown:103").await;
+    old.shutdown.request(false);
+    old.ack(&old_retry, None).await;
+    old.stopped().await;
+    assert!(old.commands.try_recv().is_err());
+    assert!(tokio::time::timeout(Duration::from_millis(60), old.peer.read_u8()).await.is_err());
+
+    let mut next = mbux_buffered_fixture().await;
+    next.input.buffered_failed.notify_one();
+    let (first, _) = next.request("teardown:103").await;
+    next.reject(&first, 500).await;
+    let (next_retry, _) = next.request("teardown:103").await;
+    assert_eq!(old_retry.cseq(), next_retry.cseq());
+    old.ack(&old_retry, None).await;
+    assert!(tokio::time::timeout(Duration::from_millis(60), next.peer.read_u8()).await.is_err());
+    assert!(next.controller.session.control.buffered_cleanup_pending.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!next.media.borrow().idle());
+    next.ack(&next_retry, None).await;
+    let (setup, offer) = next.request("setup:102:media").await;
+    next.setup_reply(&setup, &offer).await;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), next.commands.recv()).await.unwrap(), Some("install"));
+    next.stopped().await;
 }
 
 #[cfg(target_os="android")]

@@ -33,10 +33,6 @@ pub struct ScreenSession {
 
 impl ScreenSession {
     pub async fn open(&self) -> Result<ScreenSender,String> {
-        self.open_screen(false).await
-    }
-
-    pub(crate) async fn open_screen(&self, literal_root: bool) -> Result<ScreenSender,String> {
         let conn_id=airplay::random_positive_i64();
         let body=if self.params.mbux_screen_bootstrap {
             airplay::build_screen_setup_with_latency(conn_id,&self.uuid,100)
@@ -49,8 +45,7 @@ impl ScreenSession {
             crate::emit_log("BMW-MGU: screen SETUP latencyMs=75 reference=box-firmware; vehicle validation pending");
             airplay::build_screen_setup_with_latency(conn_id,&self.uuid,75)
         } else { airplay::build_screen_setup(conn_id,&self.uuid) };
-        if literal_root { crate::emit_log("MBUX-MEDIA: MB_E-P-4 READY retry screen SETUP target=/"); }
-        let response=self.control.screen_setup(&body, literal_root).await?;
+        let response=self.control.screen_setup(&body).await?;
         if response.status()!=200 { return Err(format!("屏幕 SETUP 被拒 {}",response.first_line)); }
         crate::resource_trace::validate_ack("SCREEN_SETUP", &response)?;
         let root=bplist::parse(&response.body).map_err(|e|format!("屏幕 SETUP 解析失败 {e}"))?;

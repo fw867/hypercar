@@ -183,7 +183,7 @@ pub(super) mod tests {
         let (channel, _) = RtspChannel::spawn(read, write, None);
         channel.buffered_ownership.publish(true);
         (
-            BufferedControl::new(channel.clone(), "/".into(), rate, 1024),
+            BufferedControl::new(channel.clone(), "/".into(), None, rate, 1024),
             channel,
             peer,
         )

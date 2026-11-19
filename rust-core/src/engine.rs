@@ -471,7 +471,7 @@ pub async fn run_engine(
 
     drop(pending_cleanup); // The negotiated outcome now owns both channels.
     // Requests share the encrypted control channel, with their own CSeq; feedback continues independently.
-    let mut auxiliary=outcome.aux_audio.map(|session|crate::aux_audio::Controller::spawn(session,auxiliary_input,main_audio_tx,fallback_audio_tx));
+    let mut auxiliary=outcome.aux_audio.map(|session|crate::aux_audio::Controller::spawn(session,auxiliary_input,main_audio_tx,fallback_audio_tx,shutdown.clone()));
     let keepalive = outcome.keepalive;
     let mut teardown = outcome.teardown_streams;
     let resource_session = outcome.resource_session;
@@ -673,6 +673,19 @@ async fn audio_pump(
                     media_mix.clear(); media_remain.clear();
                     pipeline.lock().observe_main_sender(next.as_ref());
                     out=next; paused=false;
+                }
+                Some(MainCommand::ReplaceRealtime { output, grant, reply }) => {
+                    let modes = grant.modes.lock();
+                    let same_main_stream = out.as_ref().is_some_and(|old|
+                        old.stream_type() == 102 && old.sample_rate() == output.sample_rate()
+                        && old.owns_audio() && old.pacing_id.zip(output.pacing_id)
+                            .is_some_and(|(old, new)| old.rtsp == new.rtsp && old.stream_id != new.stream_id));
+                    if reply.is_closed() || !same_main_stream || !grant.is_current(&modes) {
+                        continue;
+                    }
+                    pipeline.lock().observe_main_sender(Some(&output));
+                    out = Some(output);
+                    let _ = reply.send(());
                 }
                 None => commands_open=false,
             },
@@ -1493,6 +1506,51 @@ mod main_audio_command_tests {
     fn test_pipeline() -> Arc<Mutex<crate::pipeline::Pipeline>> {
         Arc::new(Mutex::new(crate::pipeline::Pipeline::new()))
     }
+    #[tokio::test]
+    async fn realtime_replacement_rejects_stale_or_foreign_stream_before_dropping_old_sender() {
+        use std::sync::atomic::AtomicU64;
+        async fn realtime(rtsp: u64, stream: i64) -> (AudioOut, UdpSocket, std::net::SocketAddr) {
+            let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let local = tx.local_addr().unwrap();
+            tx.connect(peer.local_addr().unwrap()).await.unwrap();
+            let mut out = AudioOut::new(tx, None, [0; 32], 102);
+            out.observe_main_stream(rtsp, stream, 0, std::time::Instant::now());
+            (out, peer, local)
+        }
+        let (stop, stats) = (Arc::new(Notify::new()), Arc::new(Mutex::new(AudioPumpStat::default())));
+        let (claims, _) = mpsc::channel(4);
+        let (ready, rx) = tokio::sync::oneshot::channel();
+        let (_events, audio) = mpsc::unbounded_channel();
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        let pipeline = test_pipeline();
+        let worker = crate::callback_context::spawn(audio_pump(stop, stats, claims, rx, audio, command_rx,
+            Arc::new(crate::aux_audio::Input::default()), pipeline.clone()));
+        let (first, _first_peer, old_local) = realtime(4, 21).await;
+        assert!(ready.send(first).is_ok());
+        let timeout = Duration::from_secs(1);
+        tokio::time::timeout(timeout, async {
+            while pipeline.lock().main_audio_stream_type != Some(102) { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let resource_generation = Arc::new(AtomicU64::new(2));
+        let modes = Arc::new(Mutex::new(crate::modes::Modes::initial()));
+        let shutdown = Arc::new(crate::shutdown::EngineShutdown::new());
+        for (rtsp, generation, expected) in [(4, 1, false), (5, 2, false), (4, 2, true)] {
+            let (output, _peer, _local) = realtime(rtsp, 22).await;
+            let (reply, installed) = tokio::sync::oneshot::channel();
+            commands.send(MainCommand::ReplaceRealtime {
+                output, grant: crate::aux_audio::MainAudioGrant {
+                    modes: modes.clone(), generation: resource_generation.clone(), expected: generation,
+                    media_epoch: modes.lock().media_rebuild_epoch().unwrap(), shutdown: shutdown.clone(),
+                }, reply,
+            }).unwrap();
+            assert_eq!(tokio::time::timeout(timeout, installed).await.unwrap().is_ok(), expected);
+            assert_eq!(UdpSocket::bind(old_local).await.is_ok(), expected);
+        }
+        worker.abort();
+        let _ = worker.await;
+    }
+
     async fn output() -> (AudioOut,UdpSocket,std::net::SocketAddr) {
         let rx=UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let tx=UdpSocket::bind("127.0.0.1:0").await.unwrap();

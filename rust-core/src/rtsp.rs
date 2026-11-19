@@ -219,6 +219,8 @@ pub struct RtspChannel {
     pub(crate) nbt_recorded: tokio::sync::Mutex<bool>,
     pub(crate) udp_media: crate::udp_keepalive::MediaActivity,
     pub(crate) buffered_ownership: crate::buffered_ownership::BufferedOwnership,
+    pub(crate) audio_unborrow_generation: Arc<AtomicU64>,
+    pub(crate) audio_unborrow_wake: tokio::sync::Notify,
     pub(crate) buffered_cleanup_pending: AtomicBool,
     pub(crate) buffered_commands: tokio::sync::Mutex<()>,
     session_uri: Arc<std::sync::OnceLock<crate::rtsp_uri::SessionUri>>,
@@ -400,6 +402,8 @@ impl RtspChannel {
             nbt_recorded: tokio::sync::Mutex::new(false),
             udp_media: Default::default(),
             buffered_ownership: Default::default(),
+            audio_unborrow_generation: Default::default(),
+            audio_unborrow_wake: Default::default(),
             buffered_cleanup_pending: AtomicBool::new(false),
             buffered_commands: Default::default(),
             session_uri,
@@ -430,6 +434,9 @@ impl RtspChannel {
         self.session_uri.set(uri).map_err(|_|"session URI already belongs to this control channel".into())
     }
 
+    pub(crate) fn absolute_session_uri(&self) -> Option<&str> {
+        self.session_uri.get().map(crate::rtsp_uri::SessionUri::as_str)
+    }
 
     pub fn next_cseq(&self) -> i32 {
         let mut c = self.cseq.lock();
@@ -466,8 +473,8 @@ impl RtspChannel {
             Duration::from_secs(3), None, purpose).await
     }
 
-    pub(crate) async fn screen_setup(&self, body: &[u8], literal_root: bool) -> Result<RtspMessage, String> {
-        let path = if literal_root { "/" } else { self.session_uri.get().map_or("/", |uri| uri.as_str()) };
+    pub(crate) async fn screen_setup(&self, body: &[u8]) -> Result<RtspMessage, String> {
+        let path = self.session_uri.get().map_or("/", |uri| uri.as_str());
         self.request_resolved("SETUP", path, body, "application/x-apple-binary-plist", &[],
             Duration::from_secs(8), None, RequestPurpose::Ordinary).await.map_err(|error| error.to_string())
     }
@@ -563,6 +570,11 @@ impl RtspChannel {
         }
         if let Some(written) = written { let _ = written.send(()); }
 
+        if matches!(kind, Some("AUDIO_SETUP" | "MEDIA_SETUP")) {
+            for line in crate::resource_trace::media_setup_written_latency(self.trace_id, cseq, body) {
+                crate::emit_log(&line);
+            }
+        }
         if let Some(kind) = diagnostic_kind {
             crate::emit_log(&format!("{kind} RTSP#{} CSeq={cseq} TX_WRITTEN bytes={} elapsed={}ms; socket write is not receiver acceptance",
                 self.trace_id, head.len() + body.len(), started.elapsed().as_millis()));

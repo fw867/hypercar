@@ -18,6 +18,7 @@ struct Playback {
 struct Stream {
     channel: Arc<RtspChannel>,
     uri: String,
+    anchor_uri: Option<String>,
     sample_rate: u32,
     samples_per_packet: u32,
     ownership: watch::Receiver<Ownership>,
@@ -31,7 +32,8 @@ impl Stream {
         if *self.retired.borrow() {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "buffered stream retired"));
         }
-        let response = self.channel.request(method, &self.uri, &bplist::encode(&body),
+        let uri = if method == "GETANCHOR" { self.anchor_uri.as_deref().unwrap_or(&self.uri) } else { &self.uri };
+        let response = self.channel.request(method, uri, &bplist::encode(&body),
             "application/x-apple-binary-plist", &[], CONTROL_TIMEOUT).await.map_err(io::Error::other)?;
         let status = response.status();
         if status != 200 {
@@ -131,11 +133,11 @@ pub(crate) struct BufferedControl {
 }
 
 impl BufferedControl {
-    pub(crate) fn new(channel: Arc<RtspChannel>, uri: String, sample_rate: u32, samples_per_packet: u32) -> Self {
+    pub(crate) fn new(channel: Arc<RtspChannel>, uri: String, anchor_uri: Option<String>, sample_rate: u32, samples_per_packet: u32) -> Self {
         let mut changes = channel.buffered_ownership.subscribe();
         let losses = changes.borrow().losses;
         let (retire, mut retired) = watch::channel(false);
-        let stream = Arc::new(Stream { channel, uri, sample_rate, samples_per_packet,
+        let stream = Arc::new(Stream { channel, uri, anchor_uri, sample_rate, samples_per_packet,
             ownership: changes.clone(), retired: retired.clone(), failure: OnceLock::new(), playing_generation: Default::default() });
         let state = Arc::new(Mutex::new(Playback { losses, last_written: None, start_requested: false }));
         let observer = stream.clone();
@@ -223,7 +225,7 @@ mod tests {
         let (read, write) = client.into_split();
         let (channel, _) = RtspChannel::spawn(read, write, None);
         channel.buffered_ownership.publish(true);
-        (BufferedControl::new(channel.clone(), URI.into(), 48_000, 1024), channel, peer)
+        (BufferedControl::new(channel.clone(), URI.into(), None, 48_000, 1024), channel, peer)
     }
 
     async fn read_message(peer: &mut TcpStream) -> RtspMessage {

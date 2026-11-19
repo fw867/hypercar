@@ -93,6 +93,18 @@ pub(crate) fn outbound(kind: &str, id: u64, cseq: i32, packet: &[u8], body: &[u8
     lines
 }
 
+pub(crate) fn media_setup_written_latency(id: u64, cseq: i32, body: &[u8]) -> Vec<String> {
+    let Ok(value) = bplist::parse(body) else { return Vec::new(); };
+    value.get("streams").and_then(Value::as_array).into_iter().flatten().filter_map(|stream| {
+        let stream_type = stream.get("type")?.as_int()?;
+        if !matches!(stream_type, 100 | 102 | 103) || stream.get("audioType")?.as_str()? != "media" {
+            return None;
+        }
+        let latency = stream.get("audioLatencyMs")?.as_int()?;
+        Some(format!("AUDIO-LATENCY: RTSP#{id} CSeq={cseq} SETUP TX_WRITTEN type={stream_type} audioType=media audioLatencyMs={latency}"))
+    }).collect()
+}
+
 pub(crate) fn response(kind: &str, id: u64, cseq: i32, reply: &RtspMessage) -> Vec<String> {
     let parsed = if reply.body.is_empty() { None } else { Some(bplist::parse(&reply.body)) };
     let business = match parsed.as_ref() {
@@ -129,6 +141,23 @@ mod tests {
         }
         assert!(!is_resource_request("GET", "/command", &resource));
         assert!(!is_resource_request("POST", "/command", b"not plist"));
+    }
+
+    #[test]
+    fn written_latency_reports_the_serialized_main_media_values_only() {
+        let stream = |kind, role, latency| Value::dict(vec![
+            ("type", Value::int(kind)), ("audioType", Value::str(role)),
+            ("audioLatencyMs", Value::int(latency)),
+        ]);
+        let body = bplist::encode(&Value::dict(vec![("streams", Value::array(vec![
+            stream(100, "media", 250), stream(102, "media", 325), stream(103, "media", 410),
+            stream(100, "speechRecognition", 72), stream(101, "default", 98), stream(110, "media", 75),
+        ]))]));
+        assert_eq!(media_setup_written_latency(45, 17, &body), [
+            "AUDIO-LATENCY: RTSP#45 CSeq=17 SETUP TX_WRITTEN type=100 audioType=media audioLatencyMs=250",
+            "AUDIO-LATENCY: RTSP#45 CSeq=17 SETUP TX_WRITTEN type=102 audioType=media audioLatencyMs=325",
+            "AUDIO-LATENCY: RTSP#45 CSeq=17 SETUP TX_WRITTEN type=103 audioType=media audioLatencyMs=410",
+        ]);
     }
 
     #[test]

@@ -3,8 +3,32 @@ use std::{collections::VecDeque,sync::{Arc,atomic::{AtomicBool,AtomicU8,AtomicU6
 use parking_lot::Mutex;
 use tokio::sync::{mpsc,oneshot,Notify};
 use crate::{airplay::{AirplayParams,AudioCodec,SocketProvider},audio_out::AudioOut,aux_setup::Kind,bplist::Value,rtsp::RtspChannel,speech_resource::SpeechResource};
+use crate::shutdown::EngineShutdown;
 
-pub enum MainCommand { Pause(oneshot::Sender<()>), Install(Option<AudioOut>) }
+pub enum MainCommand {
+    Pause(oneshot::Sender<()>),
+    Install(Option<AudioOut>),
+    ReplaceRealtime {
+        output: AudioOut,
+        grant: MainAudioGrant,
+        reply: oneshot::Sender<()>,
+    },
+}
+
+pub struct MainAudioGrant {
+    pub modes: Arc<Mutex<crate::modes::Modes>>,
+    pub generation: Arc<AtomicU64>,
+    pub expected: u64,
+    pub media_epoch: u64,
+    pub shutdown: Arc<EngineShutdown>,
+}
+
+impl MainAudioGrant {
+    pub fn is_current(&self, modes: &crate::modes::Modes) -> bool {
+        !self.shutdown.requested() && modes.media_rebuild_epoch() == Some(self.media_epoch)
+            && self.generation.load(Ordering::Acquire) == self.expected
+    }
+}
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum Route {Mix,Independent,Drop}
 #[derive(Default)]
@@ -67,6 +91,8 @@ pub struct Session {
     pub kinds: &'static [Kind],
     pub control:Arc<RtspChannel>,pub factory:Arc<dyn SocketProvider>,pub params:AirplayParams,
     pub shared:[u8;32],pub info:Value,pub resource:Arc<SpeechResource>,pub media_codec:Mutex<Option<AudioCodec>>,
+    pub receiver_audio_generation: Arc<AtomicU64>,
+    pub realtime_media_rebuild: bool,
 }
 pub struct Controller {
     session: Arc<Session>,
@@ -81,7 +107,7 @@ impl Stop {
     }
 }
 impl Controller {
-    pub fn spawn(session:Session,input:Arc<Input>,commands:mpsc::UnboundedSender<MainCommand>,fallback:mpsc::UnboundedSender<crate::engine::SourceEvent>)->Self {
+    pub fn spawn(session:Session,input:Arc<Input>,commands:mpsc::UnboundedSender<MainCommand>,fallback:mpsc::UnboundedSender<crate::engine::SourceEvent>,shutdown:Arc<EngineShutdown>)->Self {
         input.configure(&session.info,session.kinds);
         let session=Arc::new(session);let stop=Arc::new(Stop::default());
         let allocated=Arc::new([AtomicBool::new(false),AtomicBool::new(false)]);
@@ -92,11 +118,29 @@ impl Controller {
             let _ = input.buffered_owner.set(session.control.buffered_ownership.subscribe());
             let recovery = session.clone();
             let stopping = stop.clone();
+            let commands = commands.clone();
+            let engine_shutdown = shutdown.clone();
             tasks.push(crate::callback_context::spawn(async move {
                 tokio::select! {
                     biased;
+                    _ = engine_shutdown.wait() => (),
                     _ = stopping.wait() => (),
-                    _ = input.buffered_failed.notified() => recovery.fallback_buffered(&commands, &stopping).await,
+                    _ = input.buffered_failed.notified() =>
+                        recovery.fallback_buffered(&commands, &stopping, &engine_shutdown).await,
+                }
+            }));
+        }
+        if session.realtime_media_rebuild && matches!(*session.media_codec.lock(),
+            Some(AudioCodec::Aac | AudioCodec::Aac441 | AudioCodec::BufferedAac)) {
+            let recovery = session.clone();
+            let stopping = stop.clone();
+            let commands = commands.clone();
+            tasks.push(crate::callback_context::spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => (),
+                    _ = stopping.wait() => (),
+                    _ = recovery.rebuild_on_unborrow(&commands, &shutdown) => (),
                 }
             }));
         }
@@ -134,17 +178,85 @@ impl Lease {
 struct Active { output:AudioOut,lease:Lease }
 enum StartError {Refused(String),Failed(String),AwaitNavigationCleanup(String)}
 impl Session {
-    // The ID9 buffered experiment owns only main media. Let the audio pump keep
-    // draining and servicing the independent navigation lane while RTSP waits.
-    async fn fallback_buffered(&self, commands:&mpsc::UnboundedSender<MainCommand>, stop:&Stop) {
+    async fn rebuild_on_unborrow(&self, commands: &mpsc::UnboundedSender<MainCommand>, shutdown: &Arc<EngineShutdown>) {
+        let unborrow = &self.control.audio_unborrow_generation;
+        let mut handled = 0;
+        loop {
+            self.control.audio_unborrow_wake.notified().await;
+            let generation = unborrow.load(Ordering::Acquire);
+            if generation == handled { continue; }
+            handled = generation;
+            let codec = *self.media_codec.lock();
+            let Some(codec @ (AudioCodec::Aac | AudioCodec::Aac441)) = codec else { continue; };
+            let grant = {
+                let modes = self.resource.modes.lock();
+                let Some(media_epoch) = modes.media_rebuild_epoch() else { continue; };
+                MainAudioGrant {
+                    modes: self.resource.modes.clone(),
+                    generation: self.receiver_audio_generation.clone(),
+                    expected: self.receiver_audio_generation.load(Ordering::Acquire),
+                    media_epoch,
+                    shutdown: shutdown.clone(),
+                }
+            };
+            if self.control.is_closed() || shutdown.requested()
+                || self.params.pipeline.lock().main_audio_stream_type != Some(102) {
+                continue;
+            }
+            let rtsp = self.control.trace_id();
+            crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} unborrow={generation} setup type=102 codec={codec:?}"));
+            let Some(mut output) = crate::airplay::negotiate_realtime_audio(
+                &self.control, &self.factory, Some(&self.shared), &self.params, false, &self.info, codec, true,
+            ).await else {
+                crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} unborrow={generation} setup unusable; retaining old sender"));
+                continue;
+            };
+            let stream = output.pacing_id.map(|id| id.stream_id);
+            if !grant.is_current(&grant.modes.lock()) { continue; }
+            let record = crate::airplay::record_session(&self.control).await;
+            if let Err(error) = record {
+                crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} unborrow={generation} streamConnectionID={stream:?} RECORD failed: {error}; retaining old sender"));
+                continue;
+            }
+            if !grant.is_current(&grant.modes.lock()) {
+                crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} unborrow={generation} streamConnectionID={stream:?} RECORD confirmed after grant changed; retaining old sender"));
+                continue;
+            }
+            output.set_ownership(self.resource.owned.clone());
+            let (reply, installed) = oneshot::channel();
+            if commands.send(MainCommand::ReplaceRealtime { output, grant, reply }).is_err() {
+                return;
+            }
+            if installed.await.is_err() {
+                crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} unborrow={generation} switch superseded"));
+                continue;
+            }
+            crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} unborrow={generation} streamConnectionID={stream:?} RECORD confirmed; sender switched"));
+        }
+    }
+
+    // The buffered stream owns only main media; independent audio keeps running.
+    async fn fallback_buffered(&self, commands:&mpsc::UnboundedSender<MainCommand>, stop:&Stop, shutdown:&EngineShutdown) {
         self.params.pipeline.lock().audio_ready = false;
-        if let Err(error) = crate::airplay::retire_buffered_audio(&self.control).await {
-            crate::emit_log(&format!("BUFFERED-AUDIO: type103 teardown unconfirmed: {error}; type102 deferred"));
-            return;
+        let rtsp = self.control.trace_id();
+        let stopped = || stop.requested.load(Ordering::Acquire) || shutdown.requested() || self.control.is_closed();
+        for attempt in 1..=2 {
+            if stopped() { return; }
+            match crate::airplay::retire_buffered_audio(&self.control).await {
+                Ok(()) => {
+                    crate::emit_log(&format!("BUFFERED-AUDIO: RTSP#{rtsp} type103 teardown confirmed attempt={attempt}"));
+                    break;
+                }
+                Err(error) => {
+                    let retry = attempt == 1 && !stopped();
+                    crate::emit_log(&format!("BUFFERED-AUDIO: RTSP#{rtsp} type103 teardown unconfirmed attempt={attempt} retry={retry}: {error}"));
+                    if !retry { return; }
+                }
+            }
         }
         *self.media_codec.lock() = None;
         for codec in [AudioCodec::Aac, AudioCodec::Aac441] {
-            if stop.requested.load(Ordering::Acquire) {return;}
+            if stopped() { return; }
             if !crate::airplay::declares_media(&self.info,codec) {continue;}
             // A stop can race the receiver allocating 102 before we read its reply.
             // Include that type in final TEARDOWN even if the recovery task is cancelled.
@@ -152,6 +264,7 @@ impl Session {
             if let Some(mut output) = crate::airplay::negotiate_audio(
                 &self.control,&self.factory,Some(&self.shared),&self.params,false,&self.info,codec
             ).await {
+                if stopped() { return; }
                 output.set_ownership(self.resource.owned.clone());
                 crate::emit_log("BUFFERED-AUDIO: type103 retired; type102 fallback ready");
                 self.params.pipeline.lock().audio_ready = commands.send(MainCommand::Install(Some(output))).is_ok();

@@ -98,6 +98,7 @@ pub struct ModeReply {
     pub body: Vec<u8>,
     /// A committed permanent Take (true) or its release (false). Borrows are transient.
     pub receiver_audio_take: Option<bool>,
+    pub audio_unborrowed: bool,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -188,6 +189,9 @@ impl Modes {
         value
     }
     pub fn audio_owned(&self) -> bool { self.resources[1].current == 1 }
+    pub(crate) fn media_rebuild_epoch(&self) -> Option<u64> {
+        (self.audio_owned() && !(self.apps[0] == 1 && self.speech == 1)).then_some(self.audio_borrow_epoch)
+    }
     pub fn audio_change_epoch(&self) -> u64 { self.audio_change_epoch }
     pub fn audio_claim(&self, user_initiated: bool) -> Option<(u64, Self)> {
         if !self.playback_enabled || self.audio_owned() || (self.receiver_audio_taken && !user_initiated) { return None; }
@@ -395,7 +399,8 @@ impl Modes {
     }
     pub fn response(&mut self, command: &Value, receiver_audio_generation: &std::sync::atomic::AtomicU64) -> Option<ModeReply> {
         if command.get("type").and_then(Value::as_str) != Some("changeModes") { return None; }
-        if let Some(resources) = command.get("params").and_then(|p| p.get("resources")).and_then(Value::as_array) {
+        let resources = command.get("params").and_then(|p| p.get("resources")).and_then(Value::as_array);
+        if let Some(resources) = resources {
             for r in resources.iter().take(8) {
                 crate::emit_log(&format!("MODES: request id={:?} transfer={:?} priority={:?} take={:?} borrow={:?} unborrow={:?}",
                     integer(r,"resourceID"), integer(r,"transferType"), integer(r,"transferPriority"),
@@ -403,8 +408,12 @@ impl Modes {
             }
         }
         let previous_audio_owner = self.resources[1].permanent;
+        let receiver_borrowed_audio = previous_audio_owner == 1 && self.resources[1].current == 2;
         let previous_audio_request = self.audio_borrow_epoch;
         let accepted = command.get("params").map(|p| self.change(p)).unwrap_or(false);
+        let audio_unborrowed = accepted && receiver_borrowed_audio && self.audio_owned()
+            && resources.is_some_and(|entries| entries.iter().any(|entry|
+                resource_id(entry) == Some(1) && integer(entry, "transferType") == Some(4)));
         // Only a committed receiver main-audio request (including an identical Take) advances this clock.
         if self.audio_borrow_epoch != previous_audio_request {
             receiver_audio_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -433,7 +442,7 @@ impl Modes {
                 _ => None,
             }
         } else { None };
-        Some(ModeReply { body, receiver_audio_take })
+        Some(ModeReply { body, receiver_audio_take, audio_unborrowed })
     }
     pub fn request_ui(&mut self) {
         let before=self.resources[0];
@@ -522,6 +531,23 @@ mod tests {
         Value::dict(fields)
     }
     fn change(id: i64, transfer: i64) -> Value { Value::dict(vec![("resources", Value::array(vec![resource(id, transfer)]))]) }
+    #[test]
+    fn only_effective_main_audio_unborrow_marks_a_resume() {
+        let mut modes = Modes::initial();
+        let generation = Default::default();
+        let mut apply = |id, transfer| {
+            let command = Value::dict(vec![("type", Value::str("changeModes")), ("params", change(id, transfer))]);
+            modes.response(&command, &generation).unwrap().audio_unborrowed
+        };
+        assert!(!apply(2, 3));
+        assert!(!apply(2, 3));
+        assert!(!apply(1, 4));
+        assert!(!apply(2, 4));
+        assert!(apply(2, 4));
+        assert!(!apply(2, 4));
+        assert!(!apply(2, 1));
+        assert!(!apply(2, 2));
+    }
     #[test]
     fn redundant_unborrow_preserves_queued_and_inflight_card_play() {
         use crate::audio_resource::PlaybackIntent;
