@@ -94,12 +94,19 @@ impl Resource {
     }
 }
 
+pub struct ModeReply {
+    pub body: Vec<u8>,
+    /// A committed permanent Take (true) or its release (false). Borrows are transient.
+    pub receiver_audio_take: Option<bool>,
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct Modes {
     resources: [Resource; 2],
     apps: [i64; 3],
     speech: i64,
     playback_enabled: bool,
+    receiver_audio_taken: bool,
     revision: u64,
     screen_grant_generation: u64,
     audio_epoch: u64,
@@ -183,7 +190,7 @@ impl Modes {
     pub fn audio_owned(&self) -> bool { self.resources[1].current == 1 }
     pub fn audio_change_epoch(&self) -> u64 { self.audio_change_epoch }
     pub fn audio_claim(&self, user_initiated: bool) -> Option<(u64, Self)> {
-        if !self.playback_enabled || self.audio_owned() { return None; }
+        if !self.playback_enabled || self.audio_owned() || (self.receiver_audio_taken && !user_initiated) { return None; }
         let mut next = self.clone();
         let priority = if user_initiated { USER_INITIATED } else { ANYTIME };
         if !next.resources[1].take_by(1, priority, ANYTIME, ANYTIME) { return None; }
@@ -192,6 +199,7 @@ impl Modes {
     pub fn commit_audio_claim(&mut self, epoch: u64, claim: &Self) -> bool {
         if self.audio_epoch != epoch { return false; }
         self.resources[1] = claim.resources[1];
+        self.receiver_audio_taken = false;
         self.audio_epoch = self.audio_epoch.wrapping_add(1);
         self.audio_borrow_epoch = self.audio_borrow_epoch.wrapping_add(1);
         true
@@ -324,6 +332,7 @@ impl Modes {
     pub fn change(&mut self, params: &Value) -> bool {
         let mut next = self.clone();
         let mut audio_request = false;
+        let mut resource_request = false;
         if params.as_dict().is_none() { return false; }
         // CatPlay ignores initialPermanentEntity in live requests. Only /info can set the base.
         if let Some(values) = params.get("resources") {
@@ -331,10 +340,21 @@ impl Modes {
             if values.len() > 8 { return false; }
             for v in values {
                 let Some(id) = resource_id(v) else { return false; };
-                audio_request |= id == 1;
                 let before = next.resources[id];
                 if !next.resources[id].request(v, 2) { return false; }
+                if id == 1 && integer(v, "transferType") == Some(4) && next.resources[id] == before {
+                    continue; // Acknowledge an idle Unborrow without invalidating playback.
+                }
+                resource_request = true;
+                audio_request |= id == 1;
                 if id == 0 { next.track_screen_change(before); }
+                if id == 1 {
+                    match integer(v, "transferType") {
+                        Some(1) => next.receiver_audio_taken = true,
+                        Some(2) => next.receiver_audio_taken = false,
+                        _ => {}
+                    }
+                }
             }
         }
         if !next.apply_apps(params) { return false; }
@@ -344,7 +364,9 @@ impl Modes {
         if requested_app(1) {next.speech_epoch=self.speech_epoch.wrapping_add(1);}
         if requested_app(3) {next.navigation_epoch=self.navigation_epoch.wrapping_add(1);}
         // Even an identical receiver take supersedes a pending local audio claim.
-        next.audio_epoch = self.audio_epoch.wrapping_add(1);
+        if resource_request || params.get("appStates").and_then(Value::as_array).is_some_and(|s| !s.is_empty()) {
+            next.audio_epoch = self.audio_epoch.wrapping_add(1);
+        }
         if audio_request || next.apps != self.apps || next.speech != self.speech {
             next.audio_change_epoch = self.audio_change_epoch.wrapping_add(1);
         }
@@ -371,7 +393,7 @@ impl Modes {
         }
         true
     }
-    pub fn response(&mut self, command: &Value) -> Option<Vec<u8>> {
+    pub fn response(&mut self, command: &Value, receiver_audio_generation: &std::sync::atomic::AtomicU64) -> Option<ModeReply> {
         if command.get("type").and_then(Value::as_str) != Some("changeModes") { return None; }
         if let Some(resources) = command.get("params").and_then(|p| p.get("resources")).and_then(Value::as_array) {
             for r in resources.iter().take(8) {
@@ -380,7 +402,13 @@ impl Modes {
                     integer(r,"takeConstraint"), integer(r,"borrowConstraint"), integer(r,"unborrowConstraint")));
             }
         }
+        let previous_audio_owner = self.resources[1].permanent;
+        let previous_audio_request = self.audio_borrow_epoch;
         let accepted = command.get("params").map(|p| self.change(p)).unwrap_or(false);
+        // Only a committed receiver main-audio request (including an identical Take) advances this clock.
+        if self.audio_borrow_epoch != previous_audio_request {
+            receiver_audio_generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
         crate::emit_log(&format!("MODES: changeModes accepted={accepted} screen={}/{} audio={}/{}",
             self.resources[0].current, self.resources[0].permanent, self.resources[1].current, self.resources[1].permanent));
         let mut response = vec![("status", Value::int(if accepted { 0 } else { 1 }))];
@@ -398,7 +426,14 @@ impl Modes {
             }
             self.track_screen_change(before);
         }
-        Some(body)
+        let receiver_audio_take = if accepted && self.playback_enabled {
+            match (previous_audio_owner, self.resources[1].permanent) {
+                (1, 2) => Some(true),
+                (2, 0 | 1) => Some(false),
+                _ => None,
+            }
+        } else { None };
+        Some(ModeReply { body, receiver_audio_take })
     }
     pub fn request_ui(&mut self) {
         let before=self.resources[0];
@@ -487,6 +522,65 @@ mod tests {
         Value::dict(fields)
     }
     fn change(id: i64, transfer: i64) -> Value { Value::dict(vec![("resources", Value::array(vec![resource(id, transfer)]))]) }
+    #[test]
+    fn redundant_unborrow_preserves_queued_and_inflight_card_play() {
+        use crate::audio_resource::PlaybackIntent;
+        let mut modes = Modes::initial();
+        let generation = Default::default();
+        let command = |t| Value::dict(vec![("type", Value::str("changeModes")), ("params", change(2, t))]);
+        modes.response(&command(1), &generation).unwrap();
+        let play = PlaybackIntent::play(&generation);
+        let (epoch, proposal) = modes.audio_claim(true).unwrap();
+        let reply = modes.response(&command(4), &generation).unwrap();
+        assert_eq!(bplist::parse(&reply.body).unwrap().get("status").and_then(Value::as_int), Some(0));
+        assert!(!modes.audio_owned());
+        assert!(play.is_current(&generation));
+        assert!(modes.commit_audio_claim(epoch, &proposal));
+
+        // Even the first return of a nested borrow changes the outstanding borrow count.
+        for transfer in [3, 3, 4, 4, 1, 1] {
+            let previous = PlaybackIntent::play(&generation);
+            modes.response(&command(transfer), &generation).unwrap();
+            assert!(!previous.is_current(&generation), "transfer {transfer}");
+        }
+    }
+    #[test]
+    fn media_init_cannot_reclaim_after_live_receiver_take() {
+        let mut m = Modes::box_initial();
+        assert!(m.audio_claim(false).is_some()); // Deferred startup before any receiver Take.
+        assert!(m.change(&change(2, 1)));
+        assert!(m.audio_claim(false).is_none());
+        let (epoch, claim) = m.audio_claim(true).unwrap();
+        assert!(m.change(&change(2, 1)));
+        assert!(!m.commit_audio_claim(epoch, &claim));
+        assert!(m.audio_claim(false).is_none());
+        let (epoch, claim) = m.audio_claim(true).unwrap();
+        assert!(m.commit_audio_claim(epoch, &claim));
+        assert!(m.audio_owned());
+        assert!(m.change(&change(2, 1)));
+        assert!(m.change(&change(2, 2)));
+        assert!(m.audio_claim(false).is_some());
+    }
+    #[test]
+    fn phone_music_pauses_only_on_committed_permanent_audio_take() {
+        fn event(m: &mut Modes, params: Value) -> Option<bool> {
+            m.response(&Value::dict(vec![("type", Value::str("changeModes")), ("params", params)]), &Default::default())
+                .unwrap().receiver_audio_take
+        }
+        let mut m = Modes::initial();
+        assert_eq!(event(&mut m, change(1, 1)), None);
+        assert_eq!(event(&mut m, change(2, 3)), None);
+        assert_eq!(event(&mut m, change(2, 4)), None);
+        let rejected = Value::dict(vec![("resources", Value::array(vec![resource(2,1), resource(9,1)]))]);
+        assert_eq!(event(&mut m, rejected), None);
+        assert_eq!(event(&mut m, change(2, 3)), None);
+        assert_eq!(event(&mut m, change(2, 1)), Some(true)); // Borrow upgraded to Take.
+        m.request_ui();
+        assert!(!m.audio_owned());
+        assert_eq!(event(&mut m, change(2, 1)), None);
+        assert_eq!(event(&mut m, change(2, 2)), Some(false));
+        assert_eq!(event(&mut m, change(2, 1)), Some(true));
+    }
     fn info_audio(constraint: i64, borrowed: bool) -> Value {
         Value::dict(vec![("modes", Value::dict(vec![
             ("initialPermanentEntity", Value::array(vec![Value::dict(vec![
@@ -572,12 +666,12 @@ mod tests {
     #[test] fn audio_release_is_acknowledged_then_local_playback_can_resume() {
         let mut m=Modes::initial(); assert!(m.change(&change(2,1)));
         let command=Value::dict(vec![("type",Value::str("changeModes")),("params",change(2,2))]);
-        let reply=bplist::parse(&m.response(&command).unwrap()).unwrap();
+        let reply=bplist::parse(&m.response(&command, &Default::default()).unwrap().body).unwrap();
         let audio=&reply.get("params").unwrap().get("resources").unwrap().as_array().unwrap()[1];
         assert_eq!(audio.get("entity").and_then(Value::as_int),Some(0));
         assert!(m.audio_owned()); // Subsequent modesChanged reports the local claim.
         let mut disabled=Modes::from_info(&info_audio(100,false),false,true);
-        disabled.response(&command); assert!(!disabled.audio_owned());
+        disabled.response(&command, &Default::default()); assert!(!disabled.audio_owned());
     }
 
     #[test] fn rejected_changes_are_atomic_and_have_no_success_snapshot() {
@@ -585,8 +679,8 @@ mod tests {
         let bad = Value::dict(vec![("resources",Value::array(vec![resource(1,3),resource(7,1)]))]);
         assert!(!m.change(&bad)); assert_eq!(before,m.snapshot());
         let malformed_take = Value::dict(vec![("resources",Value::array(vec![Value::dict(vec![("resourceID",Value::int(2)),("transferType",Value::int(1))])]))]);
-        let response = m.response(&Value::dict(vec![("type",Value::str("changeModes")),("params",malformed_take)])).unwrap();
-        let parsed = bplist::parse(&response).unwrap(); assert_eq!(parsed.get("status").and_then(Value::as_int),Some(1)); assert!(parsed.get("params").is_none());
+        let response = m.response(&Value::dict(vec![("type",Value::str("changeModes")),("params",malformed_take)]), &Default::default()).unwrap();
+        let parsed = bplist::parse(&response.body).unwrap(); assert_eq!(parsed.get("status").and_then(Value::as_int),Some(1)); assert!(parsed.get("params").is_none());
         assert_eq!(before,m.snapshot());
     }
 }

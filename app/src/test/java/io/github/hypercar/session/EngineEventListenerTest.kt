@@ -106,6 +106,7 @@ class EngineEventListenerTest {
         var starts = 0
         val received = mutableListOf<Long>()
         var stopped = false
+        val audioTakes = mutableListOf<Boolean>()
         var pending: (() -> Unit)? = null
         val target = object : RustCoreBridge.EventListener {
             override fun onState(state: String, detail: String) {
@@ -117,6 +118,7 @@ class EngineEventListenerTest {
                 }
                 if (state == "stopping") stopped = true
             }
+            override fun onReceiverAudioTake(taken: Boolean) { audioTakes += taken }
             override fun onLog(line: String) {}
             override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {}
             override fun onNightMode(night: Boolean) {}
@@ -143,6 +145,12 @@ class EngineEventListenerTest {
         activation = ProactiveActivation()
         val current = EngineEventListener(gate, gate.begin(), target)
         current.onIap2Start(12, "phone", "phone")
+        old.onReceiverAudioTake(true)
+        current.onReceiverAudioTake(true)
+        old.onReceiverAudioTake(false)
+        assertEquals(listOf(true), audioTakes)
+        current.onReceiverAudioTake(false)
+        assertEquals(listOf(true, false), audioTakes)
         old.onState("failed", "late panic watcher")
         old.onState("ended", "late EOF after reinvite")
         old.onState("stopping", "late cleanup")

@@ -132,6 +132,9 @@ object HyperCarRepo {
 
     private val videoCapabilityGeneration = java.util.concurrent.atomic.AtomicLong()
     private val engineCallbacks = EngineCallbackGate()
+    internal fun requestPlaybackAudio(owner: Long) = engineCallbacks.requestPlayback(owner) {
+        sessionLive.get() && RustCoreBridge.nativeRequestAudioOwnership()
+    }
 
     private suspend fun startNativeForSession(
         fd: Int, sockets: SessionSocketLease<Network>, attempt: Long, configure: () -> String,
@@ -153,6 +156,15 @@ object HyperCarRepo {
                 val videoGeneration = videoCapabilityGeneration.incrementAndGet()
                 SettingsStore.videoCapabilities.begin(videoGeneration)
                 RustCoreBridge.setListener(EngineEventListener(engineCallbacks, callbackOwner, object : RustCoreBridge.EventListener by rustListener {
+                    override fun onReceiverAudioTake(taken: Boolean) {
+                        val ticket = engineCallbacks.receiverAudioTake(callbackOwner, taken) ?: return
+                        appContext()?.let { context ->
+                            MusicBridge.onReceiverAudioTake(context, ticket) {
+                                sessionLive.get() && connectionAttemptId == attempt &&
+                                    sessionSockets === sockets && engineCallbacks.isCurrent(callbackOwner)
+                            }
+                        }
+                    }
                     override fun onVideoCapabilities(hevcAllowed: Boolean) {
                         if (!sessionLive.get() || connectionAttemptId != attempt || sessionSockets !== sockets ||
                             videoCapabilityGeneration.get() != videoGeneration) return
@@ -1501,7 +1513,7 @@ object HyperCarRepo {
         SettingsStore.videoCapabilities.clear()
         // 幂等：重复的断开事件（ACL 断开广播 + 引擎 ended + service 转交）只真正拆一次。
         // 但**状态必须回 Idle**——曾经这里直接 return，导致链路已断、界面还显示"已连接"。
-        if (!sessionLive.compareAndSet(true, false)) {
+        if (!engineCallbacks.endConnection { sessionLive.compareAndSet(true, false) }) {
             _snapshots.update { s ->
                 if (s.link is LinkState.Connected) {
                     s.copy(link = LinkState.Idle, pipeline = s.pipeline.copy(active = false))
@@ -2562,7 +2574,7 @@ object HyperCarRepo {
                     val diagnosticId = connectionAttemptId
                     connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.CONTROL_READY)
                     connectionDiagnostics.report().lastOrNull()?.let { log(it) }
-                    MusicBridge.onCarConnected()
+                    MusicBridge.onCarConnected(callbackOwner)
                     streaming = true
                     sessionHadLink = true
                     // 配对成功过 → 记一笔（设置页「目标车机」列表给它打「已配对」标记）。
@@ -3082,7 +3094,8 @@ object HyperCarRepo {
             autoConnectChanges.lock()
             try {
                 if (expectedEngine != null && !engineCallbacks.isCurrent(expectedEngine)) return@launch
-                if (expectedAttempt != connectionAttemptId || !sessionLive.compareAndSet(true, false)) return@launch
+                if (expectedAttempt != connectionAttemptId ||
+                    !engineCallbacks.endConnection { sessionLive.compareAndSet(true, false) }) return@launch
                 carWithEntries.retire(expectedAttempt)
                 val receiver = retryReceiver()
                 val hadLink = sessionHadLink

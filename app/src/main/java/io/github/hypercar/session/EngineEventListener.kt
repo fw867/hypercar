@@ -22,6 +22,11 @@ internal class EngineEventListener(
         deliver { target.onStats(fps, frames, kbps, audioPlaying, ducking) }
     override fun onNightMode(night: Boolean) = deliver { target.onNightMode(night) }
     override fun onMediaKey(usage: Int) = deliver { target.onMediaKey(usage) }
+    // Native holds its modes lock. The target orders this event with pause/retirement on the
+    // separate audio lock and rechecks owner there; never wait for general callback delivery here.
+    override fun onReceiverAudioTake(taken: Boolean) {
+        if (gate.isCurrent(owner)) target.onReceiverAudioTake(taken)
+    }
     override fun onVoiceAssistant() = deliver { target.onVoiceAssistant() }
     override fun onMicrophonePcm(owner: Long, token: Long, pcm: ByteArray, rate: Int, end: Boolean) {
         // End carries its own capture token; it must still close the old capture.

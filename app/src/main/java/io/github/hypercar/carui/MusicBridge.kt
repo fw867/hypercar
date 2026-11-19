@@ -3,8 +3,10 @@
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.media.MediaMetadata
+import android.media.AudioAttributes
 import android.media.Rating
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
@@ -13,14 +15,31 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
 import androidx.core.app.NotificationManagerCompat
 import io.github.hypercar.session.HyperCarRepo
+import io.github.hypercar.session.EngineCallbackGate
 import io.github.hypercar.shizuku.ShizukuTools
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.runBlocking
+
+internal class ReceiverPauseTarget<P, K>(val player: P, val token: K, val generation: Long, val switchRevision: Long) {
+    fun activeIn(sessions: List<P>, tokenOf: (P) -> K): P? = sessions.firstOrNull { tokenOf(it) == token }
+    fun matches(selected: K?, generation: Long, switchRevision: Long) =
+        token == selected && this.generation == generation && this.switchRevision == switchRevision
+}
+
+private fun MediaController.isPlayingPhoneMusic(context: Context, preferred: String?): Boolean {
+    if (playbackState?.state != PlaybackState.STATE_PLAYING) return false
+    val info = playbackInfo ?: return false
+    if (info.playbackType != MediaController.PlaybackInfo.PLAYBACK_TYPE_LOCAL) return false
+    return packageName == preferred || MusicApps.isKnownPlayer(packageName) ||
+        info.audioAttributes.contentType == AudioAttributes.CONTENT_TYPE_MUSIC ||
+        runCatching { context.packageManager.getApplicationInfo(packageName, 0).category }.getOrNull() == ApplicationInfo.CATEGORY_AUDIO
+}
 
 /**
  * 音乐卡片的数据源：NotificationListenerService 权限 + MediaSessionManager.getActiveSessions。
@@ -187,15 +206,27 @@ object MusicBridge {
     private var playback: PlaybackState? = null
     private var queueIds: List<Long>? = null
     private var ratingType = Rating.RATING_NONE
-    private var sessionGeneration = 0L
+    @Volatile private var sessionGeneration = 0L
     private val snapshotEpoch = MusicSnapshotEpoch()
     private var lastRefreshAt = 0L
     private var callback: MediaController.Callback? = null
+    private var callbackController: MediaController? = null
     private var callbackRegistered = false
     @Volatile internal var audioListenerSnapshot = "listener=false callback=false target=none state=null"
         private set
 
+    private var observedSelectionRevision = -1L
+    @Volatile private var observedPlaying: ReceiverPauseTarget<MediaController, android.media.session.MediaSession.Token>? = null
+
     private fun recordAudioListener(event: String, force: Boolean = false) {
+        val playing = controller?.takeIf { service != null && callbackRegistered && !permissionDenied &&
+            playback?.state == PlaybackState.STATE_PLAYING }
+        val revision = packageSwitchRevision.get()
+        val previous = observedPlaying
+        if (playing == null || revision != observedSelectionRevision) observedPlaying = null
+        else if (previous?.player !== playing || previous.switchRevision != revision) {
+            observedPlaying = ReceiverPauseTarget(playing, playing.sessionToken, sessionGeneration, revision)
+        }
         val snapshot = "listener=${service != null} callback=$callbackRegistered target=${controller?.packageName ?: "none"} state=${playback?.state} denied=$permissionDenied generation=$sessionGeneration"
         val changed = snapshot != audioListenerSnapshot
         audioListenerSnapshot = snapshot
@@ -214,7 +245,8 @@ object MusicBridge {
         kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO)
     private var permissionDenied = false
     private var resumePackage: String? = null
-    private var carConnected = false
+    private var playbackEngine = 0L
+    private val carConnected get() = playbackEngine != 0L
     private var carAudioReady = false
     private var playbackPrefs: android.content.SharedPreferences? = null
     private var manualPauseRequested = false
@@ -223,6 +255,51 @@ object MusicBridge {
     private val packageSwitchRevision = java.util.concurrent.atomic.AtomicLong()
     private var autoPlayPending = false
     private var autoPlayDeadline = 0L
+    private var receiverAudioTake: (() -> Boolean)? = null
+
+    /** A permanent receiver Take cancels pending connect autoplay, including a late audio-ready callback. */
+    internal fun onReceiverAudioTake(context: Context, ticket: EngineCallbackGate.AudioTake, connected: () -> Boolean) {
+        // Capture on receipt, before posting or querying Android. Never substitute a later session.
+        val locked = observedPlaying
+        val current = { ticket.isCurrent() && connected() }
+        onMusicThread(wait = false) {
+            if (!current()) return@onMusicThread
+            receiverAudioTake = current
+            autoPlayPending = false
+            autoPlayDeadline = 0L
+            resumePackage = null
+            context.getSharedPreferences("car_playback", Context.MODE_PRIVATE).edit().remove("resume_package").apply()
+            if (locked == null || observedPlaying !== locked || locked.switchRevision != packageSwitchRevision.get()) {
+                HyperCarRepo.log("AUDIO-PLAYER: receiverTake skipped; no confirmed playing session at Take")
+                return@onMusicThread
+            }
+            val preferred = preferredPackage
+            launchScope.launch {
+                val result = runCatching {
+                    val manager = context.getSystemService(MediaSessionManager::class.java)
+                    val sessions = manager.getActiveSessions(ComponentName(context, MusicNotificationListener::class.java))
+                    locked.activeIn(sessions) { it.sessionToken }?.isPlayingPhoneMusic(context, preferred) == true
+                }
+                withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    val outcome = when {
+                        result.isFailure -> "sessions unavailable: ${result.exceptionOrNull()?.javaClass?.simpleName}"
+                        result.getOrNull() != true -> "locked player inactive"
+                        else -> runCatching {
+                            val player = locked.player
+                            if (!player.isPlayingPhoneMusic(context, preferred)) return@runCatching "target no longer playing"
+                            val controls = player.transportControls
+                            val sent = ticket.dispatch(valid = {
+                                connected() && receiverAudioTake === current && observedPlaying === locked &&
+                                    locked.matches(controller?.sessionToken, sessionGeneration, packageSwitchRevision.get())
+                            }, pause = { controls.pause() })
+                            if (sent) "pause dispatched target=${player.packageName}" else "stale Take or player"
+                        }.getOrElse { "pause failed: ${it.javaClass.simpleName}" }
+                    }
+                    HyperCarRepo.log("AUDIO-PLAYER: receiverTake $outcome")
+                }
+            }
+        }
+    }
 
     /** Serialize MediaSession commands with metadata callbacks, before restoring the phone audio route. */
     private fun onMusicThread(wait: Boolean = true, action: () -> Unit) {
@@ -241,12 +318,21 @@ object MusicBridge {
         }
     }
 
-    fun onCarConnected() = onMusicThread {
-        carConnected = true
+    fun onCarConnected(owner: Long) = onMusicThread {
+        if (playbackEngine != owner) {
+            playbackEngine = owner
+            controller?.let { player ->
+                // A retained player token can span two car sessions. Seed the new listener
+                // from the player without interpreting its initial state as a play action.
+                playback = runCatching { player.playbackState }.getOrNull()
+                snapshotEpoch.playbackChanged()
+                registerPlayerCallback(player)
+            }
+        }
         recordAudioListener("connected", force = true)
         mediaDiagnosticCount = 0
         carAudioReady = false
-        autoPlayPending = CarUiSettings.autoPlayOnConnect
+        autoPlayPending = CarUiSettings.autoPlayOnConnect && receiverAudioTake?.invoke() != true
         autoPlayDeadline = 0L
     }
 
@@ -474,9 +560,10 @@ object MusicBridge {
     }
 
     fun onCarDisconnected() = onMusicThread {
+        receiverAudioTake = null
         packageSwitchRevision.incrementAndGet()
         if (!carConnected) return@onMusicThread
-        carConnected = false
+        playbackEngine = 0L
         carAudioReady = false
         autoPlayPending = false
         autoPlayDeadline = 0L
@@ -517,7 +604,7 @@ object MusicBridge {
     }
 
     private fun resumeAfterReconnect() {
-        if (!carConnected || !carAudioReady) return
+        if (!carConnected || !carAudioReady || receiverAudioTake?.invoke() == true) return
         if (autoPlayDeadline > 0 && SystemClock.elapsedRealtime() > autoPlayDeadline) {
             resumePackage = null
             autoPlayDeadline = 0L
@@ -539,35 +626,56 @@ object MusicBridge {
         }.onFailure { HyperCarRepo.log("MUSIC: 恢复播放失败 ${it.message}") }
     }
 
-    private fun sessionCallback(generation: Long) = object : MediaController.Callback() {
+    private fun registerPlayerCallback(player: MediaController) {
+        unregisterPlayerCallback()
+        val context = service ?: return
+        val listener = sessionCallback(playbackEngine)
+        callback = listener
+        // Each registration gets its own Binder callback endpoint even when the token is reused.
+        callbackRegistered = runCatching {
+            MediaController(context, player.sessionToken).also {
+                callbackController = it
+                it.registerCallback(listener, main)
+            }
+        }.isSuccess
+    }
+
+    private fun unregisterPlayerCallback() {
+        callback?.let { old -> runCatching { callbackController?.unregisterCallback(old) } }
+        callback = null
+        callbackController = null
+        callbackRegistered = false
+    }
+
+    private fun sessionCallback(owner: Long) = object : MediaController.Callback() {
         private val audioResume = PlaybackAudioResume(playback?.state)
         override fun onMetadataChanged(value: MediaMetadata?) {
-            if (generation != sessionGeneration) return
+            if (callback !== this) return
             snapshotEpoch.metadataChanged()
             metadata = value
             publish()
         }
         override fun onPlaybackStateChanged(value: PlaybackState?) {
-            if (generation != sessionGeneration) return
+            if (callback !== this) return
             snapshotEpoch.playbackChanged()
             val resumed = audioResume.onState(value?.state)
             playback = value
             recordAudioListener("stateCallback resumeIntent=$resumed", force = resumed)
-            if (resumed) requestPlaybackAudio("playerState")
+            if (resumed) requestPlaybackAudio("playerState", owner)
             if (value?.state == PlaybackState.STATE_PAUSED || value?.state == PlaybackState.STATE_STOPPED) {
                 manualPauseRequested = false
             }
             publish()
         }
         override fun onSessionDestroyed() {
-            if (generation != sessionGeneration) return
+            if (callback !== this) return
             clearController()
             recordAudioListener("sessionDestroyed")
             publish()
             choose()
         }
         override fun onQueueChanged(queue: MutableList<android.media.session.MediaSession.QueueItem>?) {
-            if (generation != sessionGeneration) return
+            if (callback !== this) return
             snapshotEpoch.queueChanged()
             queueIds = queue?.map { it.queueId }
             publish()
@@ -575,11 +683,10 @@ object MusicBridge {
     }
 
     private fun clearController() {
+        observedPlaying = null
         sessionGeneration++
         snapshotEpoch.sessionChanged()
-        callback?.let { old -> runCatching { controller?.unregisterCallback(old) } }
-        callback = null
-        callbackRegistered = false
+        unregisterPlayerCallback()
         controller = null
         metadata = null
         playback = null
@@ -722,6 +829,7 @@ object MusicBridge {
         val s = service ?: return
         lastRefreshAt = SystemClock.elapsedRealtime()
         val epoch = snapshotEpoch.capture()
+        val selectionRevision = packageSwitchRevision.get()
         val preferred = preferredPackage
         sessionQueries.submit({
             val msm = s.getSystemService(MediaSessionManager::class.java)
@@ -744,6 +852,7 @@ object MusicBridge {
                 runCatching { target?.queue?.map { it.queueId } }.getOrNull())
         }, { snapshot ->
             if (service !== s) return@submit
+            observedSelectionRevision = selectionRevision
             permissionDenied = snapshot.denied
             val target = snapshot.controller
             // Framework creates fresh wrappers for the same token; don't replace callbacks
@@ -755,12 +864,7 @@ object MusicBridge {
                 playback = snapshot.playback
                 queueIds = snapshot.queueIds
                 ratingType = snapshot.ratingType
-                if (target != null) {
-                    val generation = sessionGeneration
-                    callback = sessionCallback(generation).also {
-                        callbackRegistered = runCatching { target.registerCallback(it, main) }.isSuccess
-                    }
-                }
+                if (target != null) registerPlayerCallback(target)
                 val key = "${target?.packageName ?: "-"}|${snapshot.count}"
                 if (CarUiCaster.running && key != lastChoiceKey) {
                     lastChoiceKey = key
@@ -773,6 +877,7 @@ object MusicBridge {
                 if (snapshotEpoch.acceptsPlayback(epoch)) playback = snapshot.playback
                 if (snapshotEpoch.acceptsQueue(epoch)) queueIds = snapshot.queueIds
                 ratingType = snapshot.ratingType
+                if (!callbackRegistered) registerPlayerCallback(target)
             }
             recordAudioListener("sessionSnapshot")
             publish()
@@ -888,12 +993,12 @@ object MusicBridge {
         }
     }
 
-    private fun requestPlaybackAudio(source: String) {
+    private fun requestPlaybackAudio(source: String, owner: Long = playbackEngine) {
         if (!carConnected) {
             HyperCarRepo.log("AUDIO-PLAYER: claim source=$source skipped=disconnected $audioListenerSnapshot")
             return
         }
-        runCatching { io.github.hypercar.core.RustCoreBridge.nativeRequestAudioOwnership() }
+        runCatching { HyperCarRepo.requestPlaybackAudio(owner) }
             .onSuccess { HyperCarRepo.log("AUDIO-PLAYER: claim source=$source queued=$it $audioListenerSnapshot") }
             .onFailure { HyperCarRepo.log("AUDIO-PLAYER: claim source=$source failed=${it.javaClass.simpleName} $audioListenerSnapshot") }
     }
@@ -917,8 +1022,7 @@ object MusicBridge {
         autoPlayPending = false
         resumePackage = null
         playbackPrefs?.edit()?.remove("resume_package")?.apply()
-        if (usage == 0xB0 || usage == 0xCD && playback?.state != PlaybackState.STATE_PLAYING ||
-            (usage == 0xB5 || usage == 0xB6) && playback?.state == PlaybackState.STATE_PLAYING) requestPlaybackAudio("hid-0x${usage.toString(16)}")
+        if (CarMediaKeys.requestsPlayback(usage, playback?.state)) requestPlaybackAudio("hid-0x${usage.toString(16)}")
         runCatching {
             val target = controller
             val beforeMetadata = metadata

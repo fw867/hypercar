@@ -49,6 +49,7 @@ object RustCoreBridge {
         fun onNightMode(night: Boolean)
         /** Consumer media usage, or a CarConsoleKey event when the projected source is the local UI. */
         fun onMediaKey(usage: Int) {}
+        fun onReceiverAudioTake(taken: Boolean) {}
         /** Voice button routed to the phone assistant only for the self-rendered source. */
         fun onVoiceAssistant() {}
         /** Authenticated type107 PCM16 mono, scoped to one capture; empty/end closes its pipe. */

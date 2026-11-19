@@ -1,10 +1,19 @@
 package io.github.hypercar.carui
 
+import android.media.session.PlaybackState
 import android.view.KeyEvent
 import org.junit.Assert.*
 import org.junit.Test
 
 class CarMediaKeysTest {
+    @Test fun onlyExplicitPlayOrAKnownResumeToggleClaimsAudio() {
+        assertTrue(CarMediaKeys.requestsPlayback(0xB0, PlaybackState.STATE_PLAYING))
+        assertTrue(CarMediaKeys.requestsPlayback(0xCD, PlaybackState.STATE_PAUSED))
+        assertTrue(CarMediaKeys.requestsPlayback(0xCD, PlaybackState.STATE_STOPPED))
+        assertFalse(CarMediaKeys.requestsPlayback(0xCD, null))
+        for (usage in listOf(0xCD, 0xB1, 0xB5, 0xB6))
+            assertFalse(CarMediaKeys.requestsPlayback(usage, PlaybackState.STATE_PLAYING))
+    }
     @Test fun consoleControlsMoveFocusWithoutDispatchingPlayerCommands() {
         assertEquals(KeyEvent.KEYCODE_BACK, CarConsoleKey.fromInput(0x30001)?.keyCode)
         assertEquals(KeyEvent.KEYCODE_DPAD_CENTER, CarConsoleKey.fromInput(0x30002)?.keyCode)

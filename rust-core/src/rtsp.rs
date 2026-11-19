@@ -873,7 +873,7 @@ mod tests {
             let reply_modes=modes.clone();
             let reply=Arc::new(move |request: &RtspMessage| {
                 let command=crate::bplist::parse(&request.body).ok()?;
-                reply_modes.lock().response(&command)
+                reply_modes.lock().response(&command, &Default::default()).map(|reply| reply.body)
             });
             let (_channel,mut inbound)=RtspChannel::spawn_with_reply(r,w,encrypted.then(||ControlCipher::new([1;32],[2;32])),Some(reply),Default::default());
             let mut peer_cipher=ControlCipher::new([2;32],[1;32]);

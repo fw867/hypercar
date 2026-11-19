@@ -20,6 +20,7 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::airplay::{self, AirplayParams, SocketProvider, TouchInput};
 use crate::audio_out::AudioOut;
+use crate::audio_resource::PlaybackIntent;
 use crate::audio_resample::PcmToStereo;
 use crate::screen::ScreenSender;
 use crate::video_format::FrameOrigin;
@@ -32,7 +33,7 @@ pub enum SourceEvent {
     ResetVideoSource,
     RequestHostUi,
     CancelSelfAsr(u64),
-    RequestAudioOwnership,
+    RequestAudioOwnership(PlaybackIntent, std::time::Instant),
     /// 视频编码器产出一帧（H.264 Annex B，可能含 SPS/PPS/IDR）。
     VideoFrame { pts_us: u64, data: Vec<u8> },
     VideoFrameTagged { pts_us:u64, data:Vec<u8>, codec:crate::video_format::VideoCodec, origin:FrameOrigin },
@@ -173,6 +174,7 @@ pub async fn run_engine(
     mut source_rx: mpsc::UnboundedReceiver<SourceEvent>,
     shutdown: Arc<crate::shutdown::EngineShutdown>,
     touch_size: Arc<Mutex<(u32, u32)>>,
+    receiver_audio_generation: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<(), String> {
     let stop = shutdown.signal.clone();
     let mut tasks = EngineTasks::default();
@@ -183,7 +185,7 @@ pub async fn run_engine(
 
     // ---- 分发器：外部事件 → 视频泵 / 音频泵 ----
     let (host_ui_tx, mut host_ui_rx) = mpsc::channel::<()>(1);
-    let (audio_claim_tx, mut audio_claim_rx) = mpsc::channel::<(bool, std::time::Instant)>(4);
+    let (audio_claim_tx, mut audio_claim_rx) = mpsc::channel::<(PlaybackIntent, std::time::Instant)>(4);
     let (video_tx, video_rx) = mpsc::unbounded_channel::<SourceEvent>();
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<SourceEvent>();
     let fallback_audio_tx=audio_tx.clone();
@@ -319,8 +321,8 @@ pub async fn run_engine(
                             if let Some(mic)=&microphone_cancel {mic.cancel_asr(id);}
                         }
                         Some(SourceEvent::RequestHostUi) => { let _ = host_ui_tx.try_send(()); }
-                        Some(SourceEvent::RequestAudioOwnership) => {
-                            if let Err(error) = claims.try_send((true, std::time::Instant::now())) {
+                        Some(SourceEvent::RequestAudioOwnership(intent, at)) => {
+                            if let Err(error) = claims.try_send((intent, at)) {
                                 emit_log(&format!("AUDIO-RESOURCE: claim user=true queue rejected: {error}"));
                             }
                         }
@@ -461,6 +463,7 @@ pub async fn run_engine(
         stop.clone(),
         screen_ready_tx,
         &mut pending_cleanup,
+        receiver_audio_generation.clone(),
         ) => result?,
     };
 
@@ -480,17 +483,17 @@ pub async fn run_engine(
                 _ = stop_audio_claim.notified() => return,
                 request = audio_claim_rx.recv() => {
                     let Some(first) = request else { return; };
-                    let intent = fresh_audio_claim(first, &mut audio_claim_rx);
-                    if let Some(user) = intent.filter(|_| had_audio) {
+                    let intent = fresh_audio_claim(first, &mut audio_claim_rx, &receiver_audio_generation);
+                    if let Some(claim) = intent.filter(|_| had_audio) {
                         tokio::select! {
                             _ = stop_audio_claim.notified() => {
-                                emit_log(&format!("AUDIO-RESOURCE: claim user={user} cancelled by session stop"));
+                                emit_log(&format!("AUDIO-RESOURCE: claim {claim:?} cancelled by session stop"));
                                 return;
                             }
-                            _ = audio_resource.request(user) => {}
+                            _ = audio_resource.request(claim) => {}
                         }
-                    } else if let Some(user) = intent {
-                        emit_log(&format!("AUDIO-RESOURCE: claim user={user} skipped: no negotiated main audio"));
+                    } else if let Some(claim) = intent {
+                        emit_log(&format!("AUDIO-RESOURCE: claim {claim:?} skipped: no negotiated main audio"));
                     }
                 }
             }
@@ -580,7 +583,7 @@ fn merge_auxiliary_teardown(streams: &mut Vec<crate::bplist::Value>, pending: &[
 pub use crate::aux_audio::MainCommand;
 
 async fn audio_pump(
-    stop_a:Arc<Notify>, stats:Arc<Mutex<AudioPumpStat>>, claims:mpsc::Sender<(bool,std::time::Instant)>,
+    stop_a:Arc<Notify>, stats:Arc<Mutex<AudioPumpStat>>, claims:mpsc::Sender<(PlaybackIntent,std::time::Instant)>,
     audio_out_rx:tokio::sync::oneshot::Receiver<AudioOut>, audio_rx:mpsc::UnboundedReceiver<SourceEvent>,
     mut commands:mpsc::UnboundedReceiver<MainCommand>, auxiliary:Arc<crate::aux_audio::Input>,
 ) {
@@ -704,7 +707,7 @@ async fn audio_pump(
                     // continuous PCM never masquerade as a user-initiated media request.
                     if !tts {
                         auxiliary.media_restart();
-                        if let Err(error) = claims.try_send((false, std::time::Instant::now())) {
+                        if let Err(error) = claims.try_send((PlaybackIntent::MediaInit, std::time::Instant::now())) {
                             emit_log(&format!("AUDIO-RESOURCE: claim user=false queue rejected: {error}"));
                         }
                     }
@@ -1276,33 +1279,84 @@ pub enum CarLifeEvent {
     ClientLeft { video: bool },
 }
 
-fn fresh_audio_claim(first: (bool, std::time::Instant), pending: &mut mpsc::Receiver<(bool, std::time::Instant)>) -> Option<bool> {
-    let mut intent = None;
-    let mut next = Some(first);
-    while let Some((user, at)) = next {
-        if at.elapsed() < Duration::from_secs(2) { intent = Some(intent.unwrap_or(false) || user); }
-        else { emit_log(&format!("AUDIO-RESOURCE: claim user={user} expired before dispatch")); }
-        next = pending.try_recv().ok();
+fn fresh_audio_claim(
+    first: (PlaybackIntent, std::time::Instant),
+    pending: &mut mpsc::Receiver<(PlaybackIntent, std::time::Instant)>,
+    generation: &std::sync::atomic::AtomicU64,
+) -> Option<PlaybackIntent> {
+    let mut latest_play: Option<u64> = None;
+    let mut media_init = None;
+    for (intent, at) in std::iter::once(first).chain(std::iter::from_fn(|| pending.try_recv().ok())) {
+        if at.elapsed() >= Duration::from_secs(2) {
+            emit_log(&format!("AUDIO-RESOURCE: claim {intent:?} expired before dispatch"));
+            continue;
+        }
+        match intent {
+            PlaybackIntent::MediaInit => media_init = Some(intent),
+            PlaybackIntent::Play(epoch) => latest_play = Some(latest_play.map_or(epoch, |old| old.max(epoch))),
+        }
     }
-    intent
+    if let Some(play) = latest_play.map(PlaybackIntent::Play) {
+        if play.is_current(generation) { return Some(play); }
+        emit_log(&format!("AUDIO-RESOURCE: dropped superseded queued {play:?}"));
+    }
+    media_init
 }
 
 #[cfg(test)]
 mod audio_intent_tests {
     use super::*;
+    use crate::{bplist::Value, modes::Modes};
+
+    fn receiver_take() -> Value {
+        Value::dict(vec![("type", Value::str("changeModes")), ("params", Value::dict(vec![
+            ("resources", Value::array(vec![Value::dict(vec![
+                ("resourceID", Value::int(2)), ("transferType", Value::int(1)),
+                ("transferPriority", Value::int(500)), ("takeConstraint", Value::int(100)),
+                ("borrowConstraint", Value::int(100)),
+            ])])),
+        ]))])
+    }
+
+    #[test]
+    fn queued_card_play_before_retake_cannot_promote_media_init() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let generation = Default::default();
+        let mut modes = Modes::initial();
+        modes.response(&receiver_take(), &generation).unwrap();
+        let card = (PlaybackIntent::play(&generation), std::time::Instant::now());
+        modes.response(&receiver_take(), &generation).unwrap();
+        tx.try_send((PlaybackIntent::MediaInit, std::time::Instant::now())).unwrap();
+        assert_eq!(fresh_audio_claim(card, &mut rx, &generation), Some(PlaybackIntent::MediaInit));
+        assert!(modes.audio_claim(false).is_none());
+        assert_eq!(fresh_audio_claim(card, &mut rx, &generation), None);
+    }
+
+    #[test]
+    fn card_play_after_retake_survives_coalescing_and_can_claim() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let generation = Default::default();
+        let mut modes = Modes::initial();
+        modes.response(&receiver_take(), &generation).unwrap();
+        let old = PlaybackIntent::play(&generation);
+        modes.response(&receiver_take(), &generation).unwrap();
+        let card = PlaybackIntent::play(&generation);
+        for intent in [card, old] { tx.try_send((intent, std::time::Instant::now())).unwrap(); }
+        let first = (PlaybackIntent::MediaInit, std::time::Instant::now());
+        assert_eq!(fresh_audio_claim(first, &mut rx, &generation), Some(card));
+        let (epoch, claim) = modes.audio_claim(true).unwrap();
+        assert!(modes.commit_audio_claim(epoch, &claim));
+        assert!(modes.audio_owned());
+    }
+
     #[test]
     fn expired_user_action_cannot_promote_a_fresh_automatic_start() {
         let (tx, mut rx) = mpsc::channel(4);
-        tx.try_send((false, std::time::Instant::now())).unwrap();
-        assert_eq!(fresh_audio_claim((true, std::time::Instant::now()-Duration::from_secs(3)), &mut rx), Some(false));
-        assert_eq!(fresh_audio_claim((true, std::time::Instant::now()-Duration::from_secs(3)), &mut rx), None);
-    }
-    #[test]
-    fn coalescing_preserves_a_fresh_explicit_play_action() {
-        let (tx, mut rx) = mpsc::channel(4);
-        tx.try_send((true, std::time::Instant::now())).unwrap();
-        tx.try_send((false, std::time::Instant::now())).unwrap();
-        assert_eq!(fresh_audio_claim((false, std::time::Instant::now()), &mut rx), Some(true));
+        let generation = Default::default();
+        let expired = (PlaybackIntent::play(&generation), std::time::Instant::now() - Duration::from_secs(3));
+        tx.try_send((PlaybackIntent::MediaInit, std::time::Instant::now())).unwrap();
+        assert_eq!(fresh_audio_claim(expired, &mut rx, &generation), Some(PlaybackIntent::MediaInit));
+        assert_eq!(fresh_audio_claim(expired, &mut rx, &generation), None);
     }
 }
 

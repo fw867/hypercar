@@ -1,8 +1,12 @@
 package io.github.hypercar.carui
 
+import android.media.session.PlaybackState
 import android.view.KeyEvent
 
 internal object CarMediaKeys {
+    fun requestsPlayback(usage: Int, state: Int?): Boolean =
+        usage == 0xB0 || (usage == 0xCD && (state == PlaybackState.STATE_PAUSED || state == PlaybackState.STATE_STOPPED))
+
     fun keyCode(usage: Int): Int = when (usage) {
         0xB0 -> KeyEvent.KEYCODE_MEDIA_PLAY
         0xB1 -> KeyEvent.KEYCODE_MEDIA_PAUSE

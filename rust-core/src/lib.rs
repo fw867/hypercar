@@ -89,6 +89,7 @@ static TRANSCODER_BRIDGE: RwLock<Option<GlobalRef>> = RwLock::new(None);
 static TOUCH_LISTENER: RwLock<Option<GlobalRef>> = RwLock::new(None);
 
 struct EngineHandle {
+    receiver_audio_generation: Arc<std::sync::atomic::AtomicU64>,
     voice_input: voice_key::Input,
     shutdown: Arc<shutdown::EngineShutdown>,
     abort: tokio::task::AbortHandle,
@@ -174,7 +175,13 @@ pub(crate) fn emit_stats(
     });
 }
 
-/// Media usage or self-rendered console input, dispatched by the active Kotlin source.
+/// Notify Android after a permanent receiver main-audio ownership change.
+pub(crate) fn emit_receiver_audio_take(taken: bool) {
+    call_listener("onReceiverAudioTake", |env, obj| {
+        env.call_method(obj, "onReceiverAudioTake", "(Z)V", &[taken.into()]).map(|_| ())
+    });
+}
+
 pub(crate) fn emit_media_key(usage: u32) {
     call_listener("onMediaKey", |env, obj| {
         env.call_method(obj, "onMediaKey", "(I)V", &[(usage as jint).into()]).map(|_| ())
@@ -321,7 +328,7 @@ fn call_listener(method: &str, f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::err
         return;
     }
     // Engine state without an owner must never terminate whichever session happens to be current.
-    if method == "onState" { return; }
+    if matches!(method, "onState" | "onReceiverAudioTake") { return; }
     let guard = LISTENER.read();
     let Some(global) = guard.as_ref() else { return };
     let _ = with_env(|env| f(env, global.as_obj()));
@@ -625,6 +632,8 @@ fn native_start_impl(
         cfg.height.max(2),
     )));
     let touch_size_engine = touch_size.clone();
+    let receiver_audio_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let generation_for_engine = receiver_audio_generation.clone();
     let shutdown = Arc::new(shutdown::EngineShutdown::new());
 
     let stop_run = shutdown.clone();
@@ -644,6 +653,7 @@ fn native_start_impl(
             source_rx,
             stop_run,
             touch_size_engine,
+            generation_for_engine,
         )
         .await;
         if let Err(e) = &result {
@@ -665,6 +675,7 @@ fn native_start_impl(
     // 发送端留在句柄里（触摸/按键通道 P1 起接给自绘 UI）
     // 发送端留在句柄里，供 nativePushVideoFrame / nativePushAudioPcm 投喂数据
     *ENGINE.lock() = Some(EngineHandle {
+        receiver_audio_generation,
         voice_input,
         shutdown,
         abort,
@@ -868,7 +879,10 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeIsRunni
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeRequestAudioOwnership(
     _env: JNIEnv, _class: JClass,
 ) -> jboolean {
-    if ENGINE.lock().as_ref().map(|h| h.source_tx.send(engine::SourceEvent::RequestAudioOwnership).is_ok()).unwrap_or(false) {
+    if ENGINE.lock().as_ref().is_some_and(|h| {
+        let intent = audio_resource::PlaybackIntent::play(&h.receiver_audio_generation);
+        !h.shutdown.requested() && h.source_tx.send(engine::SourceEvent::RequestAudioOwnership(intent, std::time::Instant::now())).is_ok()
+    }) {
         JNI_TRUE
     } else { JNI_FALSE }
 }

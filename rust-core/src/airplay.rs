@@ -121,6 +121,7 @@ pub async fn negotiate(
     stop: Arc<Notify>,
     screen_ready: tokio::sync::mpsc::Sender<crate::screen_session::ScreenCommand>,
     pending_cleanup: &mut Option<crate::negotiation_cleanup::NegotiationCleanup>,
+    receiver_audio_generation: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<AirplayOutcome, String> {
     let mbux_media_compat = p.mbux_media_compat && !p.desktop_receiver;
     let spawn_control = |read, write| {
@@ -400,6 +401,7 @@ pub async fn negotiate(
     let screen_owned = Arc::new(std::sync::atomic::AtomicBool::new(modes.lock().screen_owned()));
     let audio_owned = Arc::new(std::sync::atomic::AtomicBool::new(modes.lock().audio_owned()));
     let reply_audio = audio_owned.clone();
+    let reply_audio_generation = receiver_audio_generation.clone();
     let reply_modes = modes.clone();
     let reply_owner = screen_owned.clone();
     let reply_pipeline=p.pipeline.clone();
@@ -409,7 +411,11 @@ pub async fn negotiate(
         let command = bplist::parse(&message.body).ok()?;
         let mut modes = reply_modes.lock();
         if command.get("type").and_then(Value::as_str) == Some("requestUI") { modes.request_ui(); }
-        let response = modes.response(&command);
+        let response = modes.response(&command, &reply_audio_generation);
+        // Publish the Take/return to the pause gate before another task can observe the new modes.
+        if let Some(taken) = response.as_ref().and_then(|reply| reply.receiver_audio_take) {
+            crate::emit_receiver_audio_take(taken);
+        }
         reply_owner.store(modes.screen_owned(), std::sync::atomic::Ordering::Release);
         reply_audio.store(modes.audio_owned(), std::sync::atomic::Ordering::Release);
         let mut health=reply_pipeline.lock();
@@ -419,9 +425,10 @@ pub async fn negotiate(
         if matches!(command.get("type").and_then(Value::as_str), Some("changeModes") | Some("requestUI")) {
             let prefix = event_trace.as_deref().unwrap_or("MODES:");
             emit_log(&format!("{prefix} event applied type={} {}; reply_bytes={}",
-                command.get("type").and_then(Value::as_str).unwrap_or("?"),modes.diagnostics(),response.as_ref().map(Vec::len).unwrap_or(0)));
+                command.get("type").and_then(Value::as_str).unwrap_or("?"),modes.diagnostics(),response.as_ref().map_or(0, |r| r.body.len())));
         }
-        response
+        drop(modes);
+        response.map(|reply| reply.body)
     })), channel.view_areas.clone());
 
     emit_log(&format!("AIRPLAY: 事件连接 RTSP#{} 建立，port={event_port}", event_channel.trace_id()));
@@ -615,7 +622,7 @@ pub async fn negotiate(
         })
     }else{None};
     Ok(AirplayOutcome {
-        audio_resource: crate::audio_resource::AudioResource { control: channel.clone(), modes, owned: audio_owned, serial:speech_resource.serial() },
+        audio_resource: crate::audio_resource::AudioResource { receiver_audio_generation, control: channel.clone(), modes, owned: audio_owned, serial:speech_resource.serial() },
         aux_audio,
         control: channel,
         event: event_channel,

@@ -32,6 +32,8 @@ object MusicApps {
         "com.huawei.music",         // 华为音乐
     )
 
+    internal fun isKnownPlayer(packageName: String) = packageName in CANDIDATES
+
     fun installed(context: Context): List<Entry> {
         val pm = context.packageManager
         return CANDIDATES.mapNotNull { pkg ->
