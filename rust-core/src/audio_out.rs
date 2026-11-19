@@ -27,6 +27,8 @@
 
 use crate::crypto::{chacha_seal, nonce64};
 mod buffered;
+#[cfg(all(test, target_os = "android"))]
+pub(crate) use buffered::tests::{accept_start, control_pair};
 use crate::timing::ntp_be;
 use tokio::net::{TcpStream, UdpSocket};
 
@@ -51,7 +53,9 @@ enum AudioTransport {
 pub struct AudioOut {
     transport: AudioTransport,
     /** 同步包套接字（调用方 connect 好到车机 controlPort；车机没下发时为 None）。 */
-    sync: Option<UdpSocket>,
+    sync: Option<std::sync::Arc<UdpSocket>>,
+    control_observer: Option<crate::audio_diagnostics::ControlObserver>,
+    pub(crate) pacing_id: Option<crate::audio_pacing::StreamId>,
     /** 流密钥（pair-verify 派生，32 字节）。 */
     key: [u8; 32],
     /** RTP 序号（逐包 wrapping 递增）。 */
@@ -92,7 +96,9 @@ impl AudioOut {
     fn with_transport(transport: AudioTransport, sync: Option<UdpSocket>, stream_key: [u8; 32], payload_type: u8) -> Self {
         Self {
             transport,
-            sync,
+            sync: sync.map(std::sync::Arc::new),
+            control_observer: None,
+            pacing_id: None,
             key: stream_key,
             seq: 0,
             ts: 0,
@@ -136,6 +142,23 @@ impl AudioOut {
         let encoder=crate::opus_encode::OpusEncoder::new(sample_rate,samples_per_packet)?;
         let mut output=Self::new(data,sync,key,stream_type);
         output.sample_rate=encoder.sample_rate();output.opus=Some(encoder);Ok(output)
+    }
+    pub(crate) fn observe_main_stream(&mut self, rtsp: u64, stream_id: i64, peer_port: u16, setup_accepted_at: std::time::Instant) {
+        self.pacing_id = Some(crate::audio_pacing::StreamId { rtsp, stream_id, setup_accepted_at });
+        let label = format!("RTSP#{rtsp} type={} streamConnectionID={stream_id} negotiatedHz={}", self.pt, self.sample_rate);
+        if self.pt == 103 {
+            crate::emit_log(&format!("AUDIO-RTCP: {label} observation inapplicable transport=TCP"));
+            return;
+        }
+        match &self.sync {
+            Some(socket) => {
+                self.control_observer = Some(crate::audio_diagnostics::ControlObserver::start(socket.clone(), label));
+            }
+            None => {
+                let reason = if peer_port == 0 { "no_control_port" } else { "socket_unavailable" };
+                crate::emit_log(&format!("AUDIO-RTCP: {label} observation unavailable reason={reason} peerControlPort={peer_port}"));
+            }
+        }
     }
     pub fn sample_rate(&self) -> u32 { self.sample_rate }
     pub fn stream_type(&self) -> i64 { self.pt as i64 }

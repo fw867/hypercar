@@ -613,8 +613,7 @@ async fn audio_pump(
     let mut duck_hold: u32 = 0;
     let mut last_audio_at: Option<std::time::Instant> = None;
     let mut gain: f32 = 1.0;
-    // Retain absolute pacing. A stalled worker skips expired source blocks and
-    // advances the RTP clock instead of flooding the receiver with catch-up audio.
+    // Skip elapsed send slots. Queued music is consumed one block per tick.
     let mut mix_rate = TARGET_RATE;
     let mut tick = crate::audio_pacing::interval(mix_rate);
     let mut sync_tick = tokio::time::interval(Duration::from_secs(1));
@@ -625,14 +624,14 @@ async fn audio_pump(
     let mut mixed_generation = None;
     let mut rate_mark = std::time::Instant::now();
     let mut mixed = vec![0i16; SPF * 2];
-    let mut pacing_recoveries=0u64;
-    let mut skipped_source_frames=0u64;
-    let mut dropped_media_frames=0u64;
-    let mut dropped_tts_frames=0u64;
-    let mut dropped_voice_frames=0u64;
-    let mut max_late_us=0u128;
-    let mut pacing_log=std::time::Instant::now();
+    let mut pacing = crate::audio_pacing::PacingTrace::new();
+    let mut media_queue_trace = crate::audio_pacing::MediaQueueTrace::default();
     loop {
+        let sender_id = out.as_ref().and_then(|a| a.pacing_id);
+        let rtsp = sender_id.map(|id| id.rtsp).or_else(|| pipeline.lock().control_trace_id);
+        if let Some(line) = pacing.select_stream(rtsp, sender_id.map(|id| id.stream_id)) {
+            emit_log(&line);
+        }
         if let Some(rate) = out.as_ref().map(AudioOut::sample_rate).filter(|&rate| rate != mix_rate) {
             mix_rate = rate;
             emit_log(&format!("AUDIO: mixer clock set to negotiated {rate}Hz"));
@@ -771,10 +770,19 @@ async fn audio_pump(
                         stats.lock().playing = true;
                         last_audio_at = Some(std::time::Instant::now());
                     }
+                    let queued_before = mix.len();
                     remain.push(&data, fmt.0, fmt.1, mix_rate, mix);
-                    // 缓冲上限 ~0.5s：过载丢旧（导航长语音不至于拖垮媒体）
+                    let appended = mix.len() - queued_before;
+                    // Half a second of interleaved stereo at the negotiated rate.
                     let cap = mix_rate as usize;
-                    while mix.len() > cap { mix.pop_front(); }
+                    let overflow = mix.len().saturating_sub(cap);
+                    if overflow > 0 {
+                        mix.drain(..overflow);
+                    }
+                    if !tts {
+                        media_queue_trace.observe_push(queued_before / 2, appended / 2, overflow / 2,
+                            received_at, sender_id.map(|id| id.setup_accepted_at), &mut pacing.dropped);
+                    }
                 }
                 Some(_) => {}
                 None => return,
@@ -793,25 +801,21 @@ async fn audio_pump(
             scheduled = tick.tick() => {
                 let now=tokio::time::Instant::now();
                 let skipped=crate::audio_pacing::missed_source_frames(scheduled,now,mix_rate);
-                max_late_us=max_late_us.max(now.saturating_duration_since(scheduled).as_micros());
+                pacing.max_late_us=pacing.max_late_us.max(now.saturating_duration_since(scheduled).as_micros());
                 if skipped>0 {
-                    pacing_recoveries+=1; skipped_source_frames=skipped_source_frames.saturating_add(skipped);
-                    let media_drop=((skipped as u128*2).min(media_mix.len() as u128)) as usize;
+                    pacing.recoveries+=1; pacing.skipped=pacing.skipped.saturating_add(skipped);
                     let tts_drop=((skipped as u128*2).min(tts_mix.len() as u128)) as usize;
-                    media_mix.drain(..media_drop); tts_mix.drain(..tts_drop);
-                    dropped_media_frames+=(media_drop/2) as u64; dropped_tts_frames+=(tts_drop/2) as u64;
+                    tts_mix.drain(..tts_drop);
+                    pacing.dropped.tts+=(tts_drop/2) as u64;
                     let voice_drop=((skipped as u128*2).min(voice.mix.len() as u128)) as usize;
-                    voice.mix.drain(..voice_drop); dropped_voice_frames+=(voice_drop/2) as u64;
-                    media_remain.clear(); tts_remain.clear(); voice.remain.clear();
+                    voice.mix.drain(..voice_drop); pacing.dropped.voice+=(voice_drop/2) as u64;
+                    tts_remain.clear(); voice.remain.clear();
                     if let Some(a)=out.as_mut() {
                         a.skip_source_frames(skipped);
                         let _=a.send_sync_now(crate::timing::monotonic_nanos()).await;
                     }
                 }
-                if pacing_log.elapsed()>=Duration::from_secs(5) {
-                    emit_log(&format!("AUDIO-PACING: recoveries={pacing_recoveries} skipped_source_frames={skipped_source_frames} dropped_media_frames={dropped_media_frames} dropped_tts_frames={dropped_tts_frames} dropped_voice_frames={dropped_voice_frames} max_late_us={max_late_us}; cumulative, no catch-up burst"));
-                    pacing_log=std::time::Instant::now();
-                }
+                if let Some(line) = pacing.periodic() { emit_log(&line); }
                 if duck_hold > 0 { duck_hold -= 1; }
                 if auxiliary.independent(crate::aux_setup::Kind::Navigation) {tts_mix.clear();tts_remain.clear();}
                 if auxiliary.independent(crate::aux_setup::Kind::Speech) {voice.mix.clear();voice.remain.clear();}
@@ -1033,7 +1037,7 @@ pub(crate) async fn video_pump(
                             video_pipeline.lock().video_stream="FAILED".into();
                             if resource_lifecycle {
                                 drop(sender.take());
-                                video_pipeline.lock().video_tcp=None;
+                                video_pipeline.lock().retire_video_tcp();
                                 emit_log("SCREEN-LIFECYCLE: video write failed; keep audio/control, await next allowed requestUI");
                                 continue;
                             }
@@ -1072,7 +1076,7 @@ pub(crate) async fn video_pump(
                         video_pipeline.lock().video_stream="FAILED".into();
                         if resource_lifecycle {
                             drop(sender.take());
-                            video_pipeline.lock().video_tcp=None;
+                            video_pipeline.lock().retire_video_tcp();
                             emit_log("SCREEN-LIFECYCLE: video keepAlive failed; preserve other channels");
                             continue;
                         }
@@ -1399,6 +1403,93 @@ mod audio_intent_tests {
 mod main_audio_command_tests {
     use super::*;
     use tokio::net::UdpSocket;
+    #[cfg(target_os = "android")]
+    mod media_pacing {
+        use super::*;
+        use tokio::net::{TcpListener, TcpStream};
+
+        async fn tcp_pair() -> (TcpStream, TcpStream) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            (client, listener.accept().await.unwrap().0)
+        }
+
+        async fn step_mixer(ticks: usize) {
+            for _ in 0..ticks {
+                // Drive virtual mixer time independently of the phone's asynchronous AAC codec.
+                std::thread::sleep(Duration::from_millis(2));
+                tokio::time::advance(Duration::from_millis(7)).await;
+                tokio::task::yield_now().await;
+            }
+        }
+
+        async fn exercise(buffered: bool, overflow: bool) {
+            let encoder = crate::aac::AacEncoder::at_rate(48000).unwrap();
+            let input = Arc::new(crate::aux_audio::Input::default());
+            let (_data_peer, _udp_peer);
+            let mut playback_started = None;
+            let sender = if buffered {
+                let (data, peer) = tcp_pair().await;
+                _data_peer = peer;
+                let (control, channel, peer) = crate::audio_out::control_pair(48000).await;
+                input.buffered_owner.set(channel.buffered_ownership.subscribe()).unwrap();
+                playback_started = Some(tokio::spawn(crate::audio_out::accept_start(peer)));
+                AudioOut::new_buffered_aac(data, [7;32], encoder, control, 1_000_000)
+            } else {
+                let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                socket.connect(peer.local_addr().unwrap()).await.unwrap();
+                _udp_peer = peer;
+                AudioOut::new_aac(socket, None, [7;32], encoder)
+            };
+            let stats = Arc::new(Mutex::new(AudioPumpStat::default()));
+            let (ready, rx) = tokio::sync::oneshot::channel();
+            let (events, audio) = mpsc::unbounded_channel();
+            let (_commands, commands) = mpsc::unbounded_channel();
+            let (claims, _) = mpsc::channel(4);
+            assert!(ready.send(sender).is_ok());
+            let worker = crate::callback_context::spawn(audio_pump(Arc::default(), stats.clone(),
+                claims, rx, audio, commands, input, test_pipeline()));
+            step_mixer(32).await;
+            assert!(stats.lock().packets > 0, "AAC transport must be live before injecting the stall");
+            if let Some(started) = playback_started { started.await.unwrap(); }
+
+            let mut data = 900i16.to_le_bytes().repeat(4800 * 2); // 100 ms of music
+            if overflow {
+                // 600 ms total. Only the oldest 100 ms should be evicted.
+                data.resize((4800 + 19200) * 4, 0);
+                data.extend(1200i16.to_le_bytes().repeat(4800 * 2));
+            }
+            events.send(SourceEvent::AudioData { received_at: std::time::Instant::now(),
+                tts: false, rate: 48000, channels: 2, data }).unwrap();
+            for _ in 0..32 {
+                if stats.lock().playing { break; }
+                tokio::task::yield_now().await;
+            }
+            assert!(stats.lock().playing, "PCM must be queued before advancing the clock");
+            tokio::time::advance(Duration::from_millis(if overflow { 650 } else { 120 })).await;
+            tokio::task::yield_now().await;
+            if overflow {
+                step_mixer(50).await; // within the retained 400 ms of silence
+                assert_eq!(stats.lock().signal_packets, 0, "expired head must be trimmed");
+                step_mixer(25).await;
+            } else {
+                step_mixer(15).await;
+            }
+            assert!(stats.lock().signal_packets > 0, "queued music must survive the late tick");
+            worker.abort();
+            let _ = worker.await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn type102_short_stall() { exercise(false, false).await; }
+        #[tokio::test(start_paused = true)]
+        async fn type103_short_stall() { exercise(true, false).await; }
+        #[tokio::test(start_paused = true)]
+        async fn type102_long_backlog() { exercise(false, true).await; }
+        #[tokio::test(start_paused = true)]
+        async fn type103_long_backlog() { exercise(true, true).await; }
+    }
     fn test_pipeline() -> Arc<Mutex<crate::pipeline::Pipeline>> {
         Arc::new(Mutex::new(crate::pipeline::Pipeline::new()))
     }

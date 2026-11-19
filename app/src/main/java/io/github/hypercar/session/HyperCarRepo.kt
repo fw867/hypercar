@@ -155,7 +155,10 @@ object HyperCarRepo {
                 val json = io.github.hypercar.navigation.CarWithNavigation.prepareConfig(config.toString())
                 val videoGeneration = videoCapabilityGeneration.incrementAndGet()
                 SettingsStore.videoCapabilities.begin(videoGeneration)
+                connectionDiagnostics.engineStarted(attempt, callbackOwner, sessionReceiverMac, SystemClock.uptimeMillis(), System.currentTimeMillis())
                 RustCoreBridge.setListener(EngineEventListener(engineCallbacks, callbackOwner, object : RustCoreBridge.EventListener by rustListener {
+                    override fun onEventChannel(rtsp: Long, uptime: Long, cause: String, videoTcp: String) =
+                        connectionDiagnostics.eventChannel(attempt, callbackOwner, rtsp, uptime, cause, videoTcp)
                     override fun onReceiverAudioTake(taken: Boolean) {
                         val ticket = engineCallbacks.receiverAudioTake(callbackOwner, taken) ?: return
                         appContext()?.let { context ->
@@ -575,7 +578,7 @@ object HyperCarRepo {
         connectionAttemptId = connectionDiagnostics.begin(source,
             "${profile.id} remote=${io.github.hypercar.headunit.RemoteProfiles.isRemote(profile.id)} " +
                 "activation=${profile.requireAirplayActivation} outbound=${profile.allowOutboundIap2} " +
-                "profileGuard=${profile.dropProfilesBeforeIap2}")
+                "profileGuard=${profile.dropProfilesBeforeIap2}", SystemClock.uptimeMillis())
         if (sessionCarWithMode) carWithEntries.begin(connectionAttemptId)
         sessionLive.set(true)
         standbyEndpoint.get()?.bluetoothHotspot?.let { announcedHotspot.compareAndSet(null, connectionAttemptId to it) }
@@ -818,6 +821,7 @@ object HyperCarRepo {
             deviceMacProvider = BluetoothMac::resolve,
             dropProfilesBeforeIap2 = profile.dropProfilesBeforeIap2,
             allowOutboundIap2 = profile.allowOutboundIap2,
+            onInboundSession = { peer, at -> connectionDiagnostics.rfcommAccepted(connectionAttemptId, peer, at) },
             log = ::log,
         ).also { iap2 = it }
     }
@@ -2523,6 +2527,7 @@ object HyperCarRepo {
                 else s.copy(pipeline = next)
             }
             if (_snapshots.value.pipeline == next) {
+                next.videoTcpEvidence?.let { connectionDiagnostics.videoSample(connectionAttemptId, engineCallbacks.current(), it) }
                 // Bounded observation only: no retry, ownership claim or success inference.
                 val key = "${next.activationLabel}/${next.wifiIap2}/${next.audioReady}"
                 if (activationGeneration != next.generation) {

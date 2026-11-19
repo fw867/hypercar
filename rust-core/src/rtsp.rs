@@ -95,6 +95,8 @@ impl ControlCipher {
 /// 一条已解析的 RTSP 消息（请求或应答）。
 #[derive(Debug, Clone)]
 pub struct RtspMessage {
+    /// Local monotonic time when the complete message was parsed, before CSeq dispatch.
+    pub received_at: std::time::Instant,
     /// 应答："RTSP/1.0 200 OK"；请求："POST /command RTSP/1.0"。
     pub first_line: String,
     pub headers: HashMap<String, String>,
@@ -177,6 +179,7 @@ fn parse_rtsp_messages_with<T>(buf: &mut Vec<u8>, mut collect: impl FnMut(RtspMe
         }
         let body = buf[head_end + 4..total].to_vec();
         let message = RtspMessage {
+            received_at: std::time::Instant::now(),
             first_line,
             headers,
             body,
@@ -202,6 +205,8 @@ fn find_head_separator(buf: &[u8]) -> Option<usize> {
 ///   `/command` 的 body 经 [RtspChannel::inbound] 交给上层分发。
 pub struct RtspChannel {
     trace_id: u64,
+    event_trace: Option<Arc<EventTrace>>,
+    session_end: Arc<SessionEnd>,
     /// 写半部：必须用 tokio Mutex——写+flush 是 await 点，parking_lot 的 guard
     /// 跨 await 会让 future 非 Send，tokio::spawn 拒收（CI 首编实证）。
     write: Arc<tokio::sync::Mutex<OwnedWriteHalf>>,
@@ -215,11 +220,52 @@ pub struct RtspChannel {
     pub(crate) buffered_ownership: crate::buffered_ownership::BufferedOwnership,
     pub(crate) buffered_cleanup_pending: AtomicBool,
     pub(crate) buffered_commands: tokio::sync::Mutex<()>,
-    session_uri: std::sync::OnceLock<crate::rtsp_uri::SessionUri>,
+    session_uri: Arc<std::sync::OnceLock<crate::rtsp_uri::SessionUri>>,
     mbux_session: MbuxSession,
     pub(crate) view_areas: SharedViewAreas,
     pub(crate) id9_trace: std::sync::OnceLock<String>,
     first_screen_cseq: std::sync::OnceLock<i32>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RtspEndCause { EventClosed, FeedbackFailed, PeerTeardown }
+
+// Each control connection and its event reader share only a diagnostic decision.
+// Session termination is still owned by the existing Wi-Fi iAP2 end gate.
+#[derive(Default)]
+struct SessionEnd {
+    uri: Arc<std::sync::OnceLock<crate::rtsp_uri::SessionUri>>,
+    mbux_session: MbuxSession,
+    cause: std::sync::OnceLock<RtspEndCause>,
+}
+
+impl SessionEnd {
+    fn observe_request(&self, msg: &RtspMessage) {
+        let Some(request) = msg.first_line.strip_prefix("TEARDOWN ") else { return; };
+        // A stream list (even an empty one) is distinct from our zero-body session TEARDOWN.
+        if !msg.body.is_empty() { return; }
+        let mut line = request.split_ascii_whitespace();
+        let (Some(target), Some("RTSP/1.0"), None) = (line.next(), line.next(), line.next()) else { return; };
+        if target != "/" && !self.uri.get().is_some_and(|uri| uri.as_str() == target) { return; }
+        if let (Some(raw), Some(store)) = (msg.headers.get("session"), self.mbux_session.get()) {
+            let received = raw.split(';').next().unwrap_or("").trim();
+            if store.lock().id.as_deref().is_some_and(|current| current != received) { return; }
+        }
+        let _ = self.cause.set(RtspEndCause::PeerTeardown);
+    }
+}
+
+#[derive(PartialEq)]
+enum RequestPurpose { Ordinary, SessionSetup, FeedbackAfterTimeout }
+
+impl RtspEndCause {
+    fn detail(self) -> &'static str {
+        match self {
+            Self::EventClosed => "事件通道关闭",
+            Self::FeedbackFailed => "控制保活失败",
+            Self::PeerTeardown => "车机主动结束",
+        }
+    }
 }
 
 #[derive(Default)]
@@ -232,17 +278,47 @@ struct MbuxHeaderState {
 type MbuxSession = Arc<std::sync::OnceLock<Mutex<MbuxHeaderState>>>;
 type SharedViewAreas = Arc<std::sync::OnceLock<crate::display_layout::ViewAreas>>;
 
+#[derive(Debug)]
+pub(crate) enum RequestError {
+    ReplyTimeout(String),
+    Other(String),
+}
+
+impl From<String> for RequestError {
+    fn from(detail: String) -> Self { Self::Other(detail) }
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self { Self::ReplyTimeout(detail) | Self::Other(detail) => f.write_str(detail) }
+    }
+}
+
 // Removal is also required when a request future is cancelled by its caller. A partially
 // written encrypted transaction cannot be resumed: its cipher counter has already advanced.
 struct TransactionGuard<'a> { channel: &'a RtspChannel, cseq: i32, writing: bool }
 impl Drop for TransactionGuard<'_> {
     fn drop(&mut self) {
         self.channel.pending.lock().remove(&self.cseq);
-        if self.writing { self.channel.close(); }
+        if self.writing {
+            self.channel.record_close("local_write_cancelled");
+            self.channel.close();
+        }
     }
 }
 
 impl RtspChannel {
+    pub(crate) fn end_detail(&self, fallback: RtspEndCause) -> &'static str {
+        self.session_end.cause.get().copied().unwrap_or(fallback).detail()
+    }
+
+    pub(crate) fn spawn_event(&self, read: OwnedReadHalf, write: OwnedWriteHalf,
+        reply: Option<CommandReply>, observer: EventObserver,
+    ) -> (Arc<Self>, mpsc::UnboundedReceiver<RtspMessage>) {
+        Self::spawn_with_reply(read, write, None, reply, self.view_areas.clone(),
+            Some((observer, self.session_end.clone())))
+    }
+
     pub async fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
         self.write.lock().await.local_addr()
     }
@@ -254,12 +330,13 @@ impl RtspChannel {
         write: OwnedWriteHalf,
         cipher: Option<ControlCipher>,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<RtspMessage>) {
-        Self::spawn_with_reply(read, write, cipher, None, Default::default())
+        Self::spawn_with_reply(read, write, cipher, None, Default::default(), None)
     }
 
-    pub fn spawn_with_reply(
+    fn spawn_with_reply(
         read: OwnedReadHalf, write: OwnedWriteHalf, cipher: Option<ControlCipher>,
         reply: Option<CommandReply>, view_areas: SharedViewAreas,
+        event: Option<(EventObserver, Arc<SessionEnd>)>,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<RtspMessage>) {
         let write = Arc::new(tokio::sync::Mutex::new(write));
         let cipher = Arc::new(Mutex::new(cipher));
@@ -267,7 +344,14 @@ impl RtspChannel {
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (inbound_tx, inbound) = mpsc::unbounded_channel();
         let trace_id = CHANNEL_IDS.fetch_add(1, Ordering::Relaxed);
-        let mbux_session = Arc::new(std::sync::OnceLock::new());
+        let session_uri = Arc::default();
+        let mbux_session = MbuxSession::default();
+        let session_end = event.as_ref().map(|(_, end)| end.clone())
+            .unwrap_or_else(|| Arc::new(SessionEnd { uri: Arc::clone(&session_uri), mbux_session: mbux_session.clone(), cause: Default::default() }));
+        let event_trace = event.map(|(observe, _)| {
+            observe(trace_id, "open");
+            Arc::new(EventTrace { id: trace_id, observe, closed: AtomicBool::new(false) })
+        });
 
         let reader = crate::callback_context::spawn(reader_loop(
             read,
@@ -279,10 +363,14 @@ impl RtspChannel {
             reply,
             mbux_session.clone(),
             view_areas.clone(),
+            event_trace.clone(),
+            session_end.clone(),
         ));
 
         let this = Arc::new(Self {
             trace_id,
+            event_trace,
+            session_end,
             write,
             cipher,
             cseq,
@@ -294,7 +382,7 @@ impl RtspChannel {
             buffered_ownership: Default::default(),
             buffered_cleanup_pending: AtomicBool::new(false),
             buffered_commands: Default::default(),
-            session_uri: std::sync::OnceLock::new(),
+            session_uri,
             mbux_session,
             view_areas,
             id9_trace: std::sync::OnceLock::new(),
@@ -346,21 +434,28 @@ impl RtspChannel {
         &self, method: &str, path: &str, body: &[u8], content_type: &str,
         extra_headers: &[(&str, String)], timeout: Duration, written: Option<oneshot::Sender<()>>,
     ) -> Result<RtspMessage, String> {
-        let session_setup = method == "SETUP" && path == "/setup";
+        let purpose = if method == "SETUP" && path == "/setup" { RequestPurpose::SessionSetup } else { RequestPurpose::Ordinary };
         let path=self.session_uri.get().map(|uri|uri.resolve(method,path)).unwrap_or(path);
-        self.request_resolved(method, path, body, content_type, extra_headers, timeout, written, session_setup).await
+        self.request_resolved(method, path, body, content_type, extra_headers, timeout, written, purpose).await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn request_feedback(&self, previous_timeout: bool) -> Result<RtspMessage, RequestError> {
+        let purpose = if previous_timeout { RequestPurpose::FeedbackAfterTimeout } else { RequestPurpose::Ordinary };
+        self.request_resolved("POST", "/feedback", &[], "application/octet-stream", &[],
+            Duration::from_secs(3), None, purpose).await
     }
 
     pub(crate) async fn screen_setup(&self, body: &[u8], literal_root: bool) -> Result<RtspMessage, String> {
         let path = if literal_root { "/" } else { self.session_uri.get().map_or("/", |uri| uri.as_str()) };
         self.request_resolved("SETUP", path, body, "application/x-apple-binary-plist", &[],
-            Duration::from_secs(8), None, false).await
+            Duration::from_secs(8), None, RequestPurpose::Ordinary).await.map_err(|error| error.to_string())
     }
 
     async fn request_resolved(&self, method: &str, path: &str, body: &[u8], content_type: &str,
         extra_headers: &[(&str, String)], timeout: Duration, written: Option<oneshot::Sender<()>>,
-        session_setup: bool) -> Result<RtspMessage, String> {
-        if self.is_closed() { return Err("控制通道已关闭".into()); }
+        purpose: RequestPurpose) -> Result<RtspMessage, RequestError> {
+        if self.is_closed() { return Err(RequestError::Other("控制通道已关闭".into())); }
         let deadline = tokio::time::Instant::now() + timeout;
         let cseq = self.next_cseq();
         let started = std::time::Instant::now();
@@ -368,7 +463,7 @@ impl RtspChannel {
         let kind = crate::resource_trace::trace_kind(method, path, body);
         let id9_kind = self.id9_trace.get().and_then(|session| {
             let stage = match kind {
-                _ if session_setup => "SESSION_SETUP",
+                _ if purpose == RequestPurpose::SessionSetup => "SESSION_SETUP",
                 Some("RESOURCE") => "RESOURCE",
                 Some("SCREEN_SETUP") if *self.first_screen_cseq.get_or_init(|| cseq) == cseq => "FIRST_SCREEN_SETUP",
                 _ => return None,
@@ -421,7 +516,7 @@ impl RtspChannel {
 
         {
             let mut w = match mbux_writer { Some(writer) => writer, None => lock_writer().await.map_err(lock_error)? };
-            if self.is_closed() { return Err("控制通道已关闭".into()); }
+            if self.is_closed() { return Err(RequestError::Other("控制通道已关闭".into())); }
             transaction.writing = true;
             // 心跳与 RECORD 可并发等待应答；加密 nonce 的分配顺序必须等于上线路序。
             let wire = {
@@ -434,11 +529,15 @@ impl RtspChannel {
             let written = tokio::time::timeout_at(deadline, async {
                 w.write_all(&wire).await?;
                 w.flush().await
-            }).await.map_err(|_| format!("RTSP 发送超时 CSeq={cseq} {method} {path}"))?;
+            }).await.map_err(|_| {
+                self.record_close("write_timeout");
+                format!("RTSP 发送超时 CSeq={cseq} {method} {path}")
+            })?;
             if let Err(error) = written {
+                if self.event_trace.is_some() { self.record_close(&io_close_reason("write_error", &error)); }
                 let detail = format!("RTSP#{} CSeq={cseq} {method} {path} 写失败: {error}", self.trace_id);
                 crate::emit_log(&detail);
-                return Err(detail);
+                return Err(detail.into());
             }
             transaction.writing = false;
         }
@@ -462,17 +561,20 @@ impl RtspChannel {
                 Ok(msg)
             }
             Ok(Err(_)) => {
-                Err(format!("控制通道已关闭（等待 CSeq={cseq} {method} {path}）"))
+                Err(format!("控制通道已关闭（等待 CSeq={cseq} {method} {path}）").into())
             }
             Err(_) => {
-                Err(format!("RTSP 超时（{timeout:?}，CSeq={cseq} {method} {path}）"))
+                if purpose == RequestPurpose::FeedbackAfterTimeout {
+                    let _ = self.session_end.cause.set(RtspEndCause::FeedbackFailed);
+                }
+                Err(RequestError::ReplyTimeout(format!("RTSP 超时（{timeout:?}，CSeq={cseq} {method} {path}）")))
             }
         };
         if path == "/info" || method == "RECORD" {
             if let Some(trace) = self.id9_trace.get() {
                 let outcome = match &result {
                     Ok(message) => format!("status={}", message.status()),
-                    Err(error) => format!("error={error:?}"),
+                    Err(error) => format!("error={:?}", error.to_string()),
                 };
                 crate::emit_log(&format!("{trace} RTSP#{} CSeq={cseq} {method} {path} {outcome}", self.trace_id));
             }
@@ -487,7 +589,7 @@ impl RtspChannel {
                 Ok(message) => for line in crate::resource_trace::response(kind, self.trace_id, cseq, message) {
                     crate::emit_log(&line);
                 },
-                Err(error) => crate::emit_log(&format!("{kind} RTSP#{} CSeq={cseq} RX_NONE rtsp_status=unavailable business_status=unavailable error={error:?}; no rejection code received", self.trace_id)),
+                Err(error) => crate::emit_log(&format!("{kind} RTSP#{} CSeq={cseq} RX_NONE rtsp_status=unavailable business_status=unavailable error={:?}; no rejection code received", self.trace_id, error.to_string())),
             }
         }
         result
@@ -534,13 +636,21 @@ impl RtspChannel {
         tokio::time::timeout_at(deadline, async {
             w.write_all(&wire).await?;
             w.flush().await
-        }).await.map_err(|_| "事件通道发送超时".to_string())?
-            .map_err(|e| format!("事件通道写失败: {e}"))?;
+        }).await.map_err(|_| { self.record_close("write_timeout"); "事件通道发送超时".to_string() })?
+            .map_err(|e| {
+                if self.event_trace.is_some() { self.record_close(&io_close_reason("write_error", &e)); }
+                format!("事件通道写失败: {e}")
+            })?;
         transaction.writing = false;
         Ok(cseq)
     }
 
+    fn record_close(&self, cause: &str) {
+        if let Some(trace) = &self.event_trace { trace.close(cause); }
+    }
+
     pub fn close(&self) {
+        self.record_close("local_close");
         self.closed.store(true, Ordering::Release);
         self.reader.abort();
         self.pending.lock().clear();
@@ -556,11 +666,27 @@ impl RtspChannel {
 
 impl Drop for RtspChannel {
     fn drop(&mut self) {
+        self.record_close("local_drop");
         self.reader.abort();
     }
 }
 
 pub type CommandReply = Arc<dyn Fn(&RtspMessage) -> Option<Vec<u8>> + Send + Sync>;
+pub type EventObserver = Arc<dyn Fn(u64, &str) + Send + Sync>;
+struct EventTrace {
+    id: u64,
+    observe: EventObserver,
+    closed: AtomicBool,
+}
+impl EventTrace {
+    fn close(&self, cause: &str) {
+        if !self.closed.swap(true, Ordering::AcqRel) { (self.observe)(self.id, cause); }
+    }
+}
+
+fn io_close_reason(operation: &str, error: &std::io::Error) -> String {
+    format!("{operation} kind={:?} errno={:?}", error.kind(), error.raw_os_error())
+}
 
 type SharedWrite = Arc<tokio::sync::Mutex<OwnedWriteHalf>>;
 type SharedCipher = Arc<Mutex<Option<ControlCipher>>>;
@@ -580,6 +706,8 @@ async fn reader_loop(
     reply: Option<CommandReply>,
     mbux_session: MbuxSession,
     view_areas: SharedViewAreas,
+    event_trace: Option<Arc<EventTrace>>,
+    session_end: Arc<SessionEnd>,
 ) {
     let mut raw: Vec<u8> = Vec::with_capacity(8192);
     let mut plain: Vec<u8> = Vec::with_capacity(8192);
@@ -592,11 +720,17 @@ async fn reader_loop(
     loop {
         let n = match read.read(&mut chunk).await {
             Ok(0) => {
+                if let Some(trace) = &event_trace {
+                    // Capture read order before diagnostics or queued event dispatch can yield.
+                    let _ = session_end.cause.set(RtspEndCause::EventClosed);
+                    trace.close("peer_eof");
+                }
                 crate::emit_log(&format!("RTSP#{trace_id}: 对端 EOF，未完成事务={}，残留密文={}B 明文={}B", pending.lock().len(), raw.len(), plain.len()));
                 break;
             }
             Ok(n) => n,
             Err(error) => {
+                if let Some(trace) = &event_trace { trace.close(&io_close_reason("read_error", &error)); }
                 crate::emit_log(&format!("RTSP#{trace_id}: 读取失败：{error}，未完成事务={}", pending.lock().len()));
                 break;
             }
@@ -613,6 +747,7 @@ async fn reader_loop(
                         Some(p)
                     }
                     Err(e) => {
+                        if let Some(trace) = &event_trace { trace.close("decrypt_error"); }
                         log::error!("EVENT/CTRL: {e}——关闭通道");
                         crate::emit_log(&format!("RTSP#{trace_id}: 本地解密失败：{e}，关闭通道，未完成事务={}", pending.lock().len()));
                         break;
@@ -630,12 +765,14 @@ async fn reader_loop(
 
         // 2) 切出完整 RTSP 消息并派发
         let messages = match parse_rtsp_messages_with(stream, |message, head| {
+            session_end.observe_request(&message);
             let capture = message.is_response() && message.cseq().is_some_and(|cseq|
                 pending.lock().get(&cseq).is_some_and(|p| p.trace_head));
             (message, capture.then(|| head.to_vec()))
         }) {
             Ok(messages) => messages,
             Err(error) => {
+                if let Some(trace) = &event_trace { trace.close(&format!("invalid_framing: {error}")); }
                 crate::emit_log(&format!("RTSP#{trace_id}: invalid framing: {error}; closing reader"));
                 break;
             }
@@ -752,6 +889,7 @@ mod ingress_metadata_tests {
     fn rejected_and_accepted_commands_have_metadata_without_private_bodies_or_urls() {
         for (kind,expected) in [("futureCommand",501),("iAPSendMessage",200)] {
             let message=RtspMessage {
+                received_at: std::time::Instant::now(),
                 first_line:"POST /command RTSP/1.0".into(),headers:HashMap::new(),
                 body:encode(&Value::dict(vec![("type",Value::str(kind)),("params",Value::dict(vec![
                     ("data",Value::Data(b"PRIVATE_PAYLOAD".to_vec())),("url",Value::str("scheme:PRIVATE_URL")),
@@ -765,7 +903,7 @@ mod ingress_metadata_tests {
             assert!(!note.contains("PRIVATE"));
             assert!(!note.contains("scheme:"));
         }
-        let message=RtspMessage {first_line:"POST /PRIVATE_URL?secret=PRIVATE RTSP/1.0".into(),headers:HashMap::new(),body:b"PRIVATE_BODY".to_vec()};
+        let message=RtspMessage {received_at: std::time::Instant::now(),first_line:"POST /PRIVATE_URL?secret=PRIVATE RTSP/1.0".into(),headers:HashMap::new(),body:b"PRIVATE_BODY".to_vec()};
         let note=inbound_command_metadata(&message);
         assert!(note.contains("target=other"));
         assert!(!note.contains("PRIVATE"));
@@ -854,7 +992,7 @@ mod tests {
             ("safeArea", rect(20, 650))]);
         let info = Value::dict(vec![("viewAreas", Value::array(vec![rect(0, 800), cropped]))]);
         let areas = ViewAreas::new(&info, 800, 480, Some("Main"));
-        let event = |uuid, index| RtspMessage { first_line: "POST /command RTSP/1.0".into(),
+        let event = |uuid, index| RtspMessage { received_at: std::time::Instant::now(), first_line: "POST /command RTSP/1.0".into(),
             headers: HashMap::new(), body: encode(&Value::dict(vec![("type", Value::str("updateViewArea")),
                 ("params", Value::dict(vec![("uuid", Value::str(uuid)), ("viewAreaIndex", Value::int(index))]))])) };
         let layout = validate_inbound_command(&event("main", 1), Some(&areas)).unwrap().unwrap();
@@ -881,7 +1019,7 @@ mod tests {
                 let command=crate::bplist::parse(&request.body).ok()?;
                 reply_modes.lock().response(&command, &Default::default()).map(|reply| reply.body)
             });
-            let (_channel,mut inbound)=RtspChannel::spawn_with_reply(r,w,encrypted.then(||ControlCipher::new([1;32],[2;32])),Some(reply),Default::default());
+            let (_channel,mut inbound)=RtspChannel::spawn_with_reply(r,w,encrypted.then(||ControlCipher::new([1;32],[2;32])),Some(reply),Default::default(),None);
             let mut peer_cipher=ControlCipher::new([2;32],[1;32]);
             for (index,kind) in kinds.iter().chain(std::iter::once(&"iAPSendMessage")).enumerate() {
                 let last=index==kinds.len();
@@ -1217,7 +1355,7 @@ mod tests {
         let (r,w) = phone.into_split();
         let body = crate::bplist::encode(&crate::bplist::Value::dict(vec![("status", crate::bplist::Value::int(0))]));
         let expected = body.clone();
-        let (_channel, mut inbound) = RtspChannel::spawn_with_reply(r,w,None,Some(Arc::new(move |_| Some(body.clone()))),Default::default());
+        let (_channel, mut inbound) = RtspChannel::spawn_with_reply(r,w,None,Some(Arc::new(move |_| Some(body.clone()))),Default::default(),None);
         let command = crate::bplist::encode(&crate::bplist::Value::dict(vec![("type",crate::bplist::Value::str("changeModes"))]));
         car.write_all(format!("POST /command RTSP/1.0\r\nCSeq: 19\r\nContent-Length: {}\r\n\r\n",command.len()).as_bytes()).await.unwrap();
         car.write_all(&command).await.unwrap();
@@ -1281,8 +1419,144 @@ mod cancellation_tests {
     use super::*;
     use tokio::net::{TcpListener, TcpStream};
 
+    async fn event_eof_with_queued_request(control: &RtspChannel) -> mpsc::UnboundedReceiver<RtspMessage> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let (r, w) = socket.into_split();
+        let (tx, mut observed) = mpsc::unbounded_channel();
+        let (_event, inbound) = control.spawn_event(r, w, None, Arc::new(move |_, cause| {
+            if cause == "peer_eof" { tx.send(()).unwrap(); }
+        }));
+        peer.write_all(b"OPTIONS / RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+        peer.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), observed.recv()).await.unwrap().unwrap();
+        assert_eq!(inbound.len(), 1, "EOF must be observable before dispatch drains the queue");
+        inbound
+    }
+
+    #[tokio::test]
+    async fn end_detail_event_eof_before_second_feedback_timeout() {
+        let (control, _peer) = pair().await;
+        assert!(matches!(control.request_feedback(false).await, Err(RequestError::ReplyTimeout(_))));
+        let _queued = event_eof_with_queued_request(&control).await;
+        assert!(matches!(control.request_feedback(true).await, Err(RequestError::ReplyTimeout(_))));
+        assert_eq!(control.end_detail(RtspEndCause::FeedbackFailed), "事件通道关闭");
+    }
+
+    #[tokio::test]
+    async fn end_detail_second_feedback_timeout_before_event_eof() {
+        let (control, _peer) = pair().await;
+        for retry in [false, true] {
+            assert!(matches!(control.request_feedback(retry).await, Err(RequestError::ReplyTimeout(_))));
+        }
+        let _queued = event_eof_with_queued_request(&control).await;
+        assert_eq!(control.end_detail(RtspEndCause::EventClosed), "控制保活失败");
+    }
+
+    #[tokio::test]
+    async fn end_detail_same_address_reinvite_ignores_late_old_observations() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (old, _old_peer) = pair_on(&listener).await;
+        let (new, _new_peer) = pair_on(&listener).await;
+        let _queued = event_eof_with_queued_request(&old).await;
+        assert_eq!(old.end_detail(RtspEndCause::FeedbackFailed), "事件通道关闭");
+        assert_eq!(new.end_detail(RtspEndCause::FeedbackFailed), "控制保活失败");
+        assert!(matches!(new.request_feedback(true).await, Err(RequestError::ReplyTimeout(_))));
+        assert_eq!(new.end_detail(RtspEndCause::EventClosed), "控制保活失败");
+        assert_eq!(old.end_detail(RtspEndCause::FeedbackFailed), "事件通道关闭");
+    }
+
+    async fn send_peer_teardown(peer: &mut TcpStream, target: &str, body: &[u8], seq: i32) {
+        let mut wire = format!("TEARDOWN {target} RTSP/1.0\r\nCSeq: {seq}\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        wire.extend_from_slice(body);
+        peer.write_all(&wire).await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), read_request(peer)).await.unwrap();
+        assert_eq!((reply.status(), reply.cseq()), (200, Some(seq)));
+    }
+
+    #[tokio::test]
+    async fn peer_teardown_on_control_survives_feedback_timeout_and_event_eof() {
+        let (control, mut peer) = pair().await;
+        control.set_session_uri(crate::rtsp_uri::SessionUri::new("127.0.0.1", 42).unwrap()).unwrap();
+        send_peer_teardown(&mut peer, "rtsp://127.0.0.1/42", &[], 10).await;
+        assert!(!control.is_closed());
+        assert!(matches!(control.request_feedback(true).await, Err(RequestError::ReplyTimeout(_))));
+        let _queued = event_eof_with_queued_request(&control).await;
+        assert_eq!(control.end_detail(RtspEndCause::FeedbackFailed), "车机主动结束");
+    }
+
+    #[tokio::test]
+    async fn peer_teardown_on_event_is_scoped_to_session_and_preserves_dispatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (old, _old_peer) = pair_on(&listener).await;
+        let (new, mut new_peer) = pair_on(&listener).await;
+        for (control, id) in [(&old, 41), (&new, 42)] {
+            control.set_session_uri(crate::rtsp_uri::SessionUri::new("127.0.0.1", id).unwrap()).unwrap();
+        }
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let (r, w) = socket.into_split();
+        let (_event, mut inbound) = old.spawn_event(r, w, None, Arc::new(|_, _| {}));
+        old.enable_mbux_session_header();
+        old.mbux_session.get().unwrap().lock().id = Some("current".into());
+        let stream = crate::bplist::Value::dict(vec![("type", crate::bplist::Value::int(110))]);
+        let body = crate::bplist::encode(&crate::bplist::Value::dict(vec![("streams", crate::bplist::Value::array(vec![stream]))]));
+        send_peer_teardown(&mut peer, "rtsp://127.0.0.1/41", &body, 1).await;
+        send_peer_teardown(&mut peer, "/stream/110", &[], 2).await;
+        peer.write_all(b"TEARDOWN / RTSP/1.0\r\nCSeq: 3\r\nSession: retired\r\n\r\n").await.unwrap();
+        assert_eq!(read_request(&mut peer).await.status(), 200);
+        assert_eq!(old.end_detail(RtspEndCause::EventClosed), "事件通道关闭");
+        send_peer_teardown(&mut peer, "rtsp://127.0.0.1/41", &[], 4).await;
+        peer.shutdown().await.unwrap();
+        for seq in 1..=4 { assert_eq!(inbound.recv().await.unwrap().cseq(), Some(seq)); }
+        assert!(inbound.recv().await.is_none());
+        assert_eq!(old.end_detail(RtspEndCause::EventClosed), "车机主动结束");
+        send_peer_teardown(&mut new_peer, "rtsp://127.0.0.1/41", &[], 4).await;
+        assert_eq!(new.end_detail(RtspEndCause::FeedbackFailed), "控制保活失败");
+        send_peer_teardown(&mut new_peer, "/", &[], 5).await;
+        assert_eq!(new.end_detail(RtspEndCause::EventClosed), "车机主动结束");
+    }
+
+    #[tokio::test]
+    async fn event_diagnostics_keep_first_close_cause_and_socket_id() {
+        for expected in ["peer_eof", "read_error", "decrypt_error", "invalid_framing", "local_close", "local_drop"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let (read, write) = client.into_split();
+            let (tx, mut events) = mpsc::unbounded_channel();
+            let cipher = (expected == "decrypt_error").then(|| ControlCipher::new([1;32], [2;32]));
+            let (channel, mut inbound) = RtspChannel::spawn_with_reply(read, write, cipher, None, Default::default(),
+                Some((Arc::new(move |id, cause| { tx.send((id, cause.to_owned())).unwrap(); }), Default::default())));
+            let id = channel.trace_id();
+            assert_eq!(events.recv().await.unwrap(), (id, "open".to_owned()));
+            match expected {
+                "peer_eof" => peer.shutdown().await.unwrap(),
+                "read_error" => { socket2::SockRef::from(&peer).set_linger(Some(std::time::Duration::ZERO)).unwrap(); drop(peer); }
+                "decrypt_error" => peer.write_all(&[0;18]).await.unwrap(),
+                "invalid_framing" => peer.write_all(b"POST /command RTSP/1.0\r\nContent-Length: invalid\r\n\r\n").await.unwrap(),
+                "local_close" => channel.close(),
+                _ => {}
+            }
+            if expected == "local_drop" { drop(channel); }
+            else {
+                assert!(tokio::time::timeout(std::time::Duration::from_secs(2), inbound.recv()).await.unwrap().is_none());
+                channel.close();
+            }
+            let (closed_id, cause) = events.recv().await.unwrap();
+            assert_eq!(closed_id, id);
+            assert!(cause.starts_with(expected), "{cause}");
+            if expected == "read_error" { assert!(cause.contains("ConnectionReset") && cause.contains("errno=Some("), "{cause}"); }
+            assert!(events.try_recv().is_err());
+        }
+    }
+
     async fn pair() -> (Arc<RtspChannel>, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        pair_on(&listener).await
+    }
+    async fn pair_on(listener: &TcpListener) -> (Arc<RtspChannel>, TcpStream) {
         let socket = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (peer, _) = listener.accept().await.unwrap();
         let (r,w) = socket.into_split();

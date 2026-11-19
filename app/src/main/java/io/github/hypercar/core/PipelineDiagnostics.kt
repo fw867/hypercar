@@ -41,6 +41,7 @@ data class PipelineDiagnostics(
     val tcpState: Int? = null,
     val tcpInfoError: Long? = null,
     val snapshotSequence: Long = 0,
+    val videoTcpEvidence: String? = null,
 ) {
     internal fun canReplace(previous: PipelineDiagnostics): Boolean =
         generation > previous.generation || (generation == previous.generation &&
@@ -128,6 +129,7 @@ data class PipelineDiagnostics(
             PipelineDiagnostics(
                 generation = generation, active = true,
                 snapshotSequence = j.optLong("snapshot_sequence"),
+                videoTcpEvidence = tcp?.toString(),
                 recordAccepted = j.optBoolean("record_accepted"),
                 resourcesAccepted = j.optBoolean("resources_accepted"),
                 screenSetupAccepted = j.optBoolean("screen_setup_accepted"),

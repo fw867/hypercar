@@ -38,6 +38,7 @@ object RustCoreBridge {
         fun onLog(line: String)
         fun onCarWithReopen(attempt: Long) {}
         fun onPipeline(json: String) {}
+        fun onEventChannel(rtsp: Long, uptime: Long, cause: String, videoTcp: String) {}
         fun onCarWithNavigation(token: Long, json: String) {
             io.github.hypercar.navigation.CarWithNavigation.receive(token, json)
         }

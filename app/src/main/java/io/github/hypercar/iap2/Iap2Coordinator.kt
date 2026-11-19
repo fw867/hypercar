@@ -62,6 +62,7 @@ class Iap2Coordinator(
     private val dropProfilesBeforeIap2: Boolean = true,
     private val allowOutboundIap2: Boolean = true,
     private val log: (String) -> Unit,
+    private val onInboundSession: (String?, Long) -> Unit = { _, _ -> },
 ) {
 
     private val appContext = context.applicationContext
@@ -133,6 +134,7 @@ class Iap2Coordinator(
                     allowOutboundIap2 = allowOutboundIap2,
                     log = log,
                     onEndpoint = { endpoint -> endpointCallback?.invoke(endpoint) },
+                    onInboundSession = onInboundSession,
                     onSessionEnded = { reason -> log("IAP2: 会话结束（$reason），继续监听/出站等待重连") },
                 )
             bluetooth = bt

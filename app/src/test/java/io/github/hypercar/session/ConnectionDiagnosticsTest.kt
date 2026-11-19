@@ -5,6 +5,63 @@ import org.junit.Test
 import io.github.hypercar.session.ConnectionDiagnostics.Stage
 
 class ConnectionDiagnosticsTest {
+    @Test fun lateTeardownEnrichesOnlyFinishedRowAndKeepsLastSampleWhenSocketAlreadyRetired() {
+        val journal = ConnectionDiagnostics { 0L }
+        val first = journal.begin("manual", "bmw_id85")
+        journal.engineStarted(first, 7, "AA", 90, 1500)
+        journal.eventChannel(first, 7, 20, 100, "open", "")
+        journal.videoSample(first, 7, "sampled_ms=150 rtt_us=4500")
+        journal.finish(first, "STOPPED", "user")
+        val next = journal.begin("retry", "bmw_id85")
+        journal.engineStarted(next, 8, "AA", 190, 1600)
+        journal.eventChannel(first, 7, 20, 200, "local_close", "")
+        journal.videoSample(next, 7, "stale_tcp")
+        val (old, fresh) = journal.report()
+        assertTrue(old.contains("event_close=[local_close]") && old.contains("reason=user"))
+        assertTrue(old.contains("sampled_ms=150"))
+        assertTrue(fresh.contains("video_tcp=[unknown]") && fresh.contains("event_close=[unknown]"))
+    }
+
+    @Test fun firstInboundIsNotReentryAndPreAirplayRepeatBelongsOnlyToThisAttemptAndPeer() {
+        val journal = ConnectionDiagnostics { 0L }
+        val id = journal.begin("retry", "bmw_id85", 100)
+        journal.rfcommAccepted(id, "AA", 98)
+        journal.rfcommAccepted(id, "AA", 120)
+        journal.rfcommAccepted(id, "BB", 125)
+        journal.rfcommAccepted(id, "AA", 135)
+        journal.engineStarted(id, 1, "AA", 150, 9000)
+        assertTrue(journal.report().single().contains("rfcomm_reentry_ms=135"))
+        journal.engineStarted(id, 2, "AA", 220, 9070)
+        journal.rfcommAccepted(id, "AA", 215)
+        journal.rfcommAccepted(id, "AA", 225)
+        assertTrue(journal.report().single().contains("rfcomm_reentry_ms=unknown"))
+    }
+
+    @Test fun disconnectEvidenceIsScopedToAttemptEnginePeerAndFirstClose() {
+        val journal = ConnectionDiagnostics { 0L }
+        val first = journal.begin("manual", "bmw_id85")
+        journal.engineStarted(first, 7, "AA", 90, 1500)
+        journal.eventChannel(first, 7, 20, 100, "open", "")
+        journal.rfcommAccepted(first, "BB", 130)
+        journal.rfcommAccepted(first, "aa", 99)
+        assertTrue(journal.report().single().contains("rfcomm_reentry_ms=unknown"))
+        journal.rfcommAccepted(first, "aa", 140)
+        journal.rfcommAccepted(first, "AA", 130)
+        journal.eventChannel(first, 7, 20, 155, "peer_eof", "sampled_ms=150 rtt_us=4500")
+        journal.finish(first, "STOPPED", "事件通道关闭")
+        val second = journal.begin("retry", "bmw_id85")
+        journal.engineStarted(second, 8, "AA", 90, 1500)
+        journal.eventChannel(first, 7, 20, 180, "local_close", "")
+        journal.eventChannel(second, 7, 20, 180, "local_close", "")
+        val (old, fresh) = journal.report()
+        for (field in listOf("event_rtsp=20","event_close_ms=155","peer_eof","sampled_ms=150","rfcomm_reentry_ms=140"))
+            assertTrue(old, old.contains(field))
+        assertFalse(fresh.contains("peer_eof"))
+        journal.engineStarted(second, 9, "AA", 90, 1500)
+        journal.eventChannel(second, 8, 21, 200, "read_error", "")
+        assertTrue(journal.report().last().contains("event_rtsp=unknown"))
+    }
+
     @Test fun recordAcceptedButResourceDeclarationClosedIsNotStreaming() {
         var now = 0L
         val journal = ConnectionDiagnostics { now }

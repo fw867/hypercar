@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, Notify};
 use crate::audio_out::AudioOut;
 use crate::bplist::{self, Value};
 use crate::pairing::{ControllerIdentity, PairSetupClient, PairVerifyClient, TlvTransport};
-use crate::rtsp::{ControlCipher, RtspChannel};
+use crate::rtsp::{ControlCipher, RtspChannel, RtspEndCause};
 use crate::timing::TimingServer;
 use crate::{emit_log, emit_state};
 
@@ -127,6 +127,7 @@ pub async fn negotiate(
     let mbux_media_compat = p.mbux_media_compat && !p.desktop_receiver;
     let spawn_control = |read, write| {
         let (control, inbound) = RtspChannel::spawn(read, write, None);
+        p.pipeline.lock().control_trace_id = Some(control.trace_id());
         if mbux_media_compat { control.enable_mbux_session_header(); }
         (control, inbound)
     };
@@ -410,7 +411,21 @@ pub async fn negotiate(
     let reply_owner = screen_owned.clone();
     let reply_pipeline=p.pipeline.clone();
     let event_trace = channel.id9_trace.get().cloned();
-    let (event_channel, event_rx) = RtspChannel::spawn_with_reply(ev_r, ev_w, None, Some(Arc::new(move |message| {
+    let event_health = p.pipeline.clone();
+    let event_owner = crate::callback_context::current();
+    let observe_event: crate::rtsp::EventObserver = Arc::new(move |id, cause| {
+        let (at, mut sample) = {
+            let health = event_health.lock();
+            (crate::timing::monotonic_nanos() / 1_000_000, health.last_video_tcp().cloned())
+        };
+        if let Some(tcp) = &mut sample { tcp.age_ms = at.saturating_sub(tcp.sampled_ms); }
+        if let Some(owner) = &event_owner {
+            crate::callback_context::sync_scope(owner.clone(), || {
+                crate::emit_event_channel(id, at, cause, sample.as_ref());
+            });
+        }
+    });
+    let (event_channel, event_rx) = channel.spawn_event(ev_r, ev_w, Some(Arc::new(move |message| {
         if !message.first_line.contains("/command") { return None; }
         let command = bplist::parse(&message.body).ok()?;
         let mut modes = reply_modes.lock();
@@ -434,7 +449,7 @@ pub async fn negotiate(
         }
         drop(modes);
         response.map(|reply| reply.body)
-    })), channel.view_areas.clone());
+    })), observe_event);
 
     emit_log(&format!("AIRPLAY: 事件连接 RTSP#{} 建立，port={event_port}", event_channel.trace_id()));
     if let Some(trace) = channel.id9_trace.get() {
@@ -961,7 +976,10 @@ mod shutdown_tests {
         }
     }
     async fn read_request(peer: &mut tokio::net::TcpStream) -> crate::rtsp::RtspMessage {
-        tokio::time::timeout(Duration::from_secs(1), async {
+        read_request_with_timeout(peer, Duration::from_secs(1)).await
+    }
+    async fn read_request_with_timeout(peer: &mut TcpStream, timeout: Duration) -> crate::rtsp::RtspMessage {
+        tokio::time::timeout(timeout, async {
             let mut data=Vec::new();
             loop {
                 let mut buf=[0;4096]; let n=peer.read(&mut buf).await.unwrap(); assert!(n>0);
@@ -969,6 +987,32 @@ mod shutdown_tests {
                 if let Some(msg)=crate::rtsp::parse_rtsp_messages(&mut data).unwrap().pop() { return msg; }
             }
         }).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn feedback_timeout_retries_with_new_cseq_and_ignores_late_ok() {
+        let (control, mut peer) = pair().await;
+        let mut tasks = spawn_keepalive_loops(
+            control, Arc::new(super::display_size_tests::LocalSockets), 0, "127.0.0.1".into(),
+            Arc::new(Notify::new()), None, false,
+        );
+        let mut previous = 0;
+        for attempt in 1..=4 {
+            let request = read_request_with_timeout(&mut peer, Duration::from_secs(6)).await;
+            assert_eq!(request.first_line, "POST /feedback RTSP/1.0");
+            let cseq = request.cseq().unwrap();
+            assert!(cseq > previous);
+            // A timely 200 on attempt 2 renews the allowance. On attempt 4 only
+            // the late response for attempt 3 arrives, so the worker must exit.
+            let response = match attempt { 2 => Some(cseq), 4 => Some(previous), _ => None };
+            if let Some(seq) = response {
+                peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {seq}\r\nContent-Length: 0\r\n\r\n").as_bytes())
+                    .await.unwrap();
+            }
+            previous = cseq;
+        }
+        tokio::time::timeout(Duration::from_secs(4), &mut tasks.0[0]).await
+            .expect("two consecutive unanswered feedback requests must end the worker").unwrap();
     }
     #[tokio::test]
     async fn rejected_hevc_session_retries_once_without_changing_other_fields() {
@@ -1098,12 +1142,15 @@ mod shutdown_tests {
             channel.buffered_ownership.publish(true);
             let (pause_tx,pause_rx) = tokio::sync::oneshot::channel();
             let (play_tx,play_rx) = tokio::sync::oneshot::channel();
+            let (wire_ids, mut proposed) = tokio::sync::mpsc::unbounded_channel();
+            let (anchor_time_tx, anchor_time_rx) = tokio::sync::oneshot::channel();
             let server = tokio::spawn(async move {
                 let streams = |fields| Value::dict(vec![("streams",Value::array(vec![Value::dict(fields)]))]);
                 let request = read_request(&mut peer).await;
                 assert_eq!(request.first_line, "SETUP rtsp://127.0.0.1:7000/ RTSP/1.0");
                 let root = bplist::parse(&request.body).unwrap();
                 let s = &root.get("streams").unwrap().as_array().unwrap()[0];
+                wire_ids.send(s.get("streamConnectionID").unwrap().as_int().unwrap()).unwrap();
                 for (k,v) in [("type",103),("audioFormat",1<<23),("spf",1024),("sr",48000),("ct",4)] {
                     assert_eq!(s.get(k).and_then(Value::as_int),Some(v),"{k}");
                 }
@@ -1118,6 +1165,7 @@ mod shutdown_tests {
                     let (mut tcp,_) = data.accept().await.unwrap();
                     let anchor = read_request(&mut peer).await;
                     assert!(anchor.first_line.starts_with("GETANCHOR "));
+                    anchor_time_tx.send(anchor.received_at).unwrap();
                     reply(&mut peer, &anchor, if failure == "anchor" {501} else {200}, Value::dict(vec![
                         ("networkTimeSecs",Value::int(42)),("networkTimeFrac",Value::int(0)),
                         ("networkTimeTimelineID",Value::int(0)),("networkTimeFlags",Value::int(0)),
@@ -1171,11 +1219,16 @@ mod shutdown_tests {
                 assert!(fallback.first_line.starts_with("SETUP "));
                 let root = bplist::parse(&fallback.body).unwrap();
                 assert_eq!(root.get("streams").unwrap().as_array().unwrap()[0].get("type"),Some(&Value::int(102)));
+                wire_ids.send(root.get("streams").unwrap().as_array().unwrap()[0].get("streamConnectionID").unwrap().as_int().unwrap()).unwrap();
                 reply(&mut peer,&fallback,200,streams(vec![("type",Value::int(102)),("dataPort",Value::int(i64::from(port)))])).await;
             });
             let mut buffered = negotiate_audio(&channel, &factory, Some(&[7;32]), &p, false, &info, AudioCodec::BufferedAac).await;
+            let buffered_id = proposed.try_recv().unwrap();
             assert_eq!(buffered.as_ref().map(AudioOut::stream_type), (failure == "none").then_some(103), "{failure}");
             if let Some(output) = buffered.as_mut() {
+                assert_eq!(output.pacing_id.map(|id| (id.rtsp, id.stream_id)), Some((channel.trace_id(), buffered_id)));
+                assert!(output.pacing_id.unwrap().setup_accepted_at <= anchor_time_rx.await.unwrap(),
+                    "classify from the SETUP response, before TCP/GETANCHOR finishes");
                 p.pipeline.lock().observe_main_sender(Some(output));
                 let owned = Arc::new(std::sync::atomic::AtomicBool::new(true));
                 output.set_ownership(owned.clone());
@@ -1204,6 +1257,8 @@ mod shutdown_tests {
             assert!(!channel.buffered_cleanup_pending.load(Ordering::Acquire));
             if failure != "none" {
                 let udp = negotiate_audio(&channel, &factory, Some(&[7;32]), &p, false, &info, AudioCodec::Aac).await.unwrap();
+                let udp_id = proposed.try_recv().unwrap();
+                assert_eq!(udp.pacing_id.map(|id| (id.rtsp, id.stream_id)), Some((channel.trace_id(), udp_id)));
                 assert_eq!(udp.stream_type(), 102);
                 p.pipeline.lock().observe_main_sender(Some(&udp));
                 for stage in ["SCREEN_SETUP", "VIDEO_CHANNEL_READY"] {
@@ -2020,7 +2075,7 @@ mod display_size_tests {
         assert_eq!(peer.await.unwrap().len(), 5);
     }
 
-    struct LocalSockets;
+    pub(super) struct LocalSockets;
     impl SocketProvider for LocalSockets {
         fn open_tcp(&self, _: &str, _: u16, _: u32) -> Option<TcpStream> { None }
         fn open_udp(&self, host: &str, port: u16) -> Option<UdpSocket> {
@@ -2694,7 +2749,8 @@ async fn negotiate_buffered_audio(channel: &Arc<RtspChannel>, factory: &Arc<dyn 
         let connect_ms = connect_started.elapsed().as_millis();
         let control = crate::buffered_control::BufferedControl::new(channel.clone(), uri, codec.rate(), codec.spf() as u32);
         control.probe_anchor().await.map_err(|e| format!("GETANCHOR preflight: {e}"))?;
-        let out = AudioOut::new_buffered_aac(data, stream_key(shared, id as u64), encoder, control, buffer_bytes);
+        let mut out = AudioOut::new_buffered_aac(data, stream_key(shared, id as u64), encoder, control, buffer_bytes);
+        out.observe_main_stream(channel.trace_id(), id, 0, reply.received_at);
         emit_log(&format!("BUFFERED-AUDIO: type103 SETUP accepted rtsp_ms={setup_ms} tcp_port={data_port} tcp_ms={connect_ms} audioBufferSize={buffer_bytes} anchor_preflight=ok elapsed_ms={} playback_unconfirmed",
             started.elapsed().as_millis()));
         Ok(out)
@@ -2808,7 +2864,9 @@ pub(crate) async fn negotiate_audio(
         emit_log(&format!(
             "AIRPLAY: ✓ 音频流就绪 data={data_port} control={control_port}（{codec:?} {}Hz/SPF{}）", codec.rate(), codec.spf()
         ));
-        Some(match encoder { Some(encoder) => AudioOut::new_aac(udp, sync, key, encoder), None => AudioOut::new_pcm(udp, sync, key, codec.rate()) })
+        let mut out = match encoder { Some(encoder) => AudioOut::new_aac(udp, sync, key, encoder), None => AudioOut::new_pcm(udp, sync, key, codec.rate()) };
+        out.observe_main_stream(channel.trace_id(), conn_id, control_port, resp.received_at);
+        Some(out)
     }.await;
     if result.is_none() {
         // SETUP 200 can allocate a stream even when ports are missing or local socket creation fails.
@@ -2858,27 +2916,36 @@ fn spawn_keepalive_loops(
 
     tasks.push(crate::callback_context::spawn(async move {
         let mut first_reply = true;
+        let mut previous_reply_timed_out = false;
+        let mut audio_trace = crate::audio_diagnostics::FeedbackTrace::default();
         loop {
             tokio::select! {
                 _ = stop.notified() => return,
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
-            match channel.request(
-                "POST", "/feedback", &[], "application/octet-stream", &[], Duration::from_secs(3),
-            ).await {
+            match channel.request_feedback(previous_reply_timed_out).await {
                 Ok(reply) => {
                     if let Some(id) = wifi_iap_id { crate::wifi_iap2::feedback(id, reply.status() == 200); }
                     if reply.status() != 200 { emit_log(&format!("AIRPLAY: feedback rejected status={}", reply.status())); return; }
+                    if let Some(line) = audio_trace.observe(channel.trace_id(), reply.cseq(), &reply.body) { emit_log(&line); }
+                    if previous_reply_timed_out {
+                        emit_log(&format!("AIRPLAY: feedback 应答恢复 CSeq={:?}", reply.cseq()));
+                        previous_reply_timed_out = false;
+                    }
                     if first_reply {
                         emit_log(&format!("AIRPLAY: feedback 首次应答 status={}", reply.status()));
                         first_reply = false;
                     }
                 }
+                Err(crate::rtsp::RequestError::ReplyTimeout(detail)) if !previous_reply_timed_out && !channel.is_closed() => {
+                    previous_reply_timed_out = true;
+                    emit_log(&format!("AIRPLAY: feedback 首次应答超时，下个周期使用新 CSeq 再发：{detail}"));
+                }
                 Err(error) => {
                     emit_log(&format!("AIRPLAY: feedback stopped: {error}"));
                     if let Some(id) = wifi_iap_id {
                         crate::wifi_iap2::feedback(id, false);
-                        if crate::wifi_iap2::take_rtsp_end(id) { emit_state("ended", "控制保活失败"); }
+                        if crate::wifi_iap2::take_rtsp_end(id) { emit_state("ended", channel.end_detail(RtspEndCause::FeedbackFailed)); }
                     }
                     return;
                 },
@@ -2919,7 +2986,7 @@ fn spawn_event_dispatcher(
                     Some(m) => m,
                     None => {
                         crate::wifi_iap2::mark_ready(wifi_iap_id, false);
-                        if crate::wifi_iap2::take_rtsp_end(wifi_iap_id) { emit_state("ended", "事件通道关闭"); }
+                        if crate::wifi_iap2::take_rtsp_end(wifi_iap_id) { emit_state("ended", control.end_detail(RtspEndCause::EventClosed)); }
                         return;
                     },
                 },

@@ -9,19 +9,71 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
         FIRST_VIDEO_FRAME, WAITING_INVITATION, UI_STARTED,
     }
     private data class Attempt(
-        val id: Long, val source: String, val profile: String, val started: Long,
+        val id: Long, val source: String, val profile: String, val started: Long, val startedUptime: Long,
         val reached: LinkedHashMap<Stage, Long> = linkedMapOf(),
         val notes: LinkedHashMap<Stage, String> = linkedMapOf(),
         var outcome: String = "WAITING", var reason: String = "", var ended: Long? = null,
+        var transport: Transport? = null,
+        val earlyInbound: ArrayDeque<Pair<String, Long>> = ArrayDeque(),
     )
+    private data class Transport(
+        val engine: Long, val peer: String?, val anchorUptime: Long, val anchorEpoch: Long,
+        var rtsp: Long? = null, var opened: Long? = null, var closed: Long? = null,
+        var closeReason: String? = null, var tcp: String? = null, var reentry: Long? = null,
+        var lastInbound: Long? = null,
+    ) {
+        fun accepted(at: Long) {
+            if (at <= (lastInbound ?: -1L)) return
+            if (lastInbound != null || opened?.let { at >= it } == true) reentry = at
+            lastInbound = at
+        }
+        fun summary() = "diag_clock=uptime_ms anchor_uptime_ms=$anchorUptime anchor_unix_ms=$anchorEpoch " +
+            "event_rtsp=${rtsp ?: "unknown"} event_open_ms=${opened ?: "unknown"} event_close_ms=${closed ?: "unknown"} " +
+            "event_close=[${closeReason ?: "unknown"}] video_tcp=[${tcp ?: "unknown"}] rfcomm_reentry_ms=${reentry ?: "unknown"}"
+    }
     private var serial = 0L
     private val history = ArrayDeque<Attempt>()
 
-    @Synchronized fun begin(source: String, profile: String): Long {
+    @Synchronized fun engineStarted(id: Long, engine: Long, peer: String?, uptime: Long, epoch: Long) {
+        val a = history.lastOrNull()?.takeIf { it.id == id && it.ended == null } ?: return
+        val t = Transport(engine, peer, uptime, epoch)
+        for ((address, at) in a.earlyInbound) if (address.equals(peer, true)) t.accepted(at)
+        a.earlyInbound.clear()
+        a.transport = t
+    }
+
+    @Synchronized fun eventChannel(id: Long, engine: Long, rtsp: Long, at: Long, cause: String, tcp: String) {
+        // Teardown can finish after a new invitation. Enrich only the original engine's row.
+        val t = history.find { it.id == id }?.transport?.takeIf { it.engine == engine } ?: return
+        if (t.closed != null || (t.rtsp != null && t.rtsp != rtsp)) return
+        t.rtsp = rtsp
+        if (cause == "open") t.opened = at else {
+            t.closed = at
+            t.closeReason = clean(cause)
+            if (tcp.isNotEmpty()) t.tcp = tcp
+        }
+    }
+
+    @Synchronized fun rfcommAccepted(id: Long, peer: String?, at: Long) {
+        val a = history.lastOrNull()?.takeIf { it.id == id && it.ended == null && at >= it.startedUptime } ?: return
+        if (peer == null) return
+        val t = a.transport
+        if (t == null) {
+            a.earlyInbound.addLast(peer to at)
+            if (a.earlyInbound.size > 16) a.earlyInbound.removeFirst()
+        } else if (at >= t.anchorUptime && peer.equals(t.peer, true)) t.accepted(at)
+    }
+
+    @Synchronized fun videoSample(id: Long, engine: Long, sample: String) {
+        val t = history.lastOrNull()?.takeIf { it.id == id && it.ended == null }?.transport ?: return
+        if (t.engine == engine && t.closed == null) t.tcp = sample
+    }
+
+    @Synchronized fun begin(source: String, profile: String, startedUptime: Long = clockMillis()): Long {
         history.lastOrNull()?.takeIf { it.ended == null }?.let {
             it.outcome = "SUPERSEDED"; it.ended = clockMillis()
         }
-        val attempt = Attempt(++serial, clean(source), clean(profile), clockMillis())
+        val attempt = Attempt(++serial, clean(source), clean(profile), clockMillis(), startedUptime)
         attempt.reached[Stage.REQUESTED] = 0L
         history.addLast(attempt)
         while (history.size > 8) history.removeFirst()
@@ -51,7 +103,8 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
             "record=${Stage.RECORD in a.reached} invite=${Stage.CTRL_INVITED in a.reached} " +
             "classic_iap2_started=${Stage.IAP2_STARTED in a.reached} iap2_parameters=${Stage.IAP2_PARAMETERS in a.reached} " +
             "receiver_display=unknown receiver_audio=unknown " +
-            "last=${a.reached.keys.last()} milestones=[$milestones] notes=[$notes] reason=${a.reason}"
+            "last=${a.reached.keys.last()} milestones=[$milestones] notes=[$notes] " +
+            (a.transport?.let { it.summary() + " " } ?: "") + "reason=${a.reason}"
     }
 
     private fun clean(value: String): String = value.replace(Regex("[\\r\\n\\t]"), " ").take(300)

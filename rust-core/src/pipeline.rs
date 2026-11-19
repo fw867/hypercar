@@ -16,6 +16,8 @@ pub struct Pipeline {
     pub generation: u64,
     pub snapshot_sequence: u64,
     pub control_ready: bool,
+    #[serde(skip)]
+    pub control_trace_id: Option<u64>,
     pub record_accepted: bool,
     pub resources_accepted: bool,
     pub screen_setup_accepted: bool,
@@ -36,8 +38,17 @@ pub struct Pipeline {
     pub screen_rebuilds: u64,
     pub timing: crate::timing::TimingDiagnostics,
     pub video_tcp: Option<crate::tcp_diagnostics::TcpSnapshot>,
+    #[serde(skip)]
+    retired_video_tcp: Option<crate::tcp_diagnostics::TcpSnapshot>,
 }
 impl Pipeline {
+    pub(crate) fn retire_video_tcp(&mut self) {
+        if let Some(sample) = self.video_tcp.take() { self.retired_video_tcp = Some(sample); }
+    }
+
+    pub(crate) fn last_video_tcp(&self) -> Option<&crate::tcp_diagnostics::TcpSnapshot> {
+        self.video_tcp.as_ref().or(self.retired_video_tcp.as_ref())
+    }
     pub(crate) fn observe_main_sender(&mut self, sender: Option<&crate::audio_out::AudioOut>) {
         self.main_audio_stream_type = sender.map(crate::audio_out::AudioOut::stream_type);
         self.audio_codec = sender.map(crate::audio_out::AudioOut::codec_name).unwrap_or("").into();
@@ -75,11 +86,11 @@ impl Pipeline {
         if gaps.is_empty(){"none_observed_receiver_presentation_unconfirmed".into()}else{gaps.join(",")}
     }
     pub fn new() -> Self {
-        Self { display_size:None, video_format:None, screen_config_size:None, generation: NEXT.fetch_add(1,Ordering::Relaxed), snapshot_sequence:0, control_ready:false, record_accepted:false, resources_accepted:false,
+        Self { display_size:None, video_format:None, screen_config_size:None, generation: NEXT.fetch_add(1,Ordering::Relaxed), snapshot_sequence:0, control_ready:false, control_trace_id:None, record_accepted:false, resources_accepted:false,
             screen_setup_accepted:false,video_channel_ready:false,wifi_id:0,
             wifi_iap2:"WAIT_SESSION".into(),screen_owned:None,video_stream:"WAIT_SETUP".into(),
             video_source_units:0,video_frames_written:0,audio_ready:false,audio_codec:String::new(),main_audio_stream_type:None,audio_kbps:0,audio_packets_written:0,
-            audio_signal_packets:0,ui_requests:0,screen_rebuilds:0,timing:Default::default(),video_tcp:None }
+            audio_signal_packets:0,ui_requests:0,screen_rebuilds:0,timing:Default::default(),video_tcp:None,retired_video_tcp:None }
     }
     pub fn summary(&self) -> String {
         format!("PIPELINE#{}: control={} record={} resources={} screen_setup={} video_tcp_ready={} wifi_iap2={} screen_phone={:?} video={} source_units={} tcp_frames={} audio_ready={} audio_codec={} audio_kbps={} rtp_packets={} signal_packets={} requestUI={} rebuilds={} timing=[{}] tcp=[{}] activation_gaps=[{}] receiver_display=unknown receiver_audio=unknown",
@@ -97,6 +108,19 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disconnect_keeps_latest_video_sample_after_screen_retirement_only_in_this_engine() {
+        let mut p = Pipeline::new();
+        p.video_tcp = Some(crate::tcp_diagnostics::TcpSnapshot { connection_id: 9, sampled_ms: 123, ..Default::default() });
+        p.retire_video_tcp();
+        p.retire_video_tcp();
+        assert!(p.video_tcp.is_none());
+        assert_eq!(p.last_video_tcp().unwrap().sampled_ms, 123);
+        p.video_tcp = Some(crate::tcp_diagnostics::TcpSnapshot { connection_id: 10, sampled_ms: 145, ..Default::default() });
+        assert_eq!(p.last_video_tcp().unwrap().connection_id, 10);
+        assert!(Pipeline::new().last_video_tcp().is_none());
+    }
 
     #[test]
     fn periodic_and_immediate_snapshots_share_an_order_per_engine() {

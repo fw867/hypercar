@@ -66,6 +66,7 @@ class Iap2Bluetooth(
     private val onEndpoint: (CarPlayEndpoint) -> Unit,
     /** 会话结束（拿到端点后链路断开，或中途失败）——上层用来收尾/重排。 */
     private val onSessionEnded: (String) -> Unit,
+    private val onInboundSession: (String?, Long) -> Unit = { _, _ -> },
 ) {
     companion object {
         private val HANDSHAKE_IDS = java.util.concurrent.atomic.AtomicLong(0)
@@ -161,10 +162,11 @@ class Iap2Bluetooth(
 
     /** This runs before the admission monitor, so a blocked handler is observable too. */
     private fun acceptSocket(socket: BluetoothSocket, epoch: Long, tag: String) {
+        val acceptedAt = SystemClock.uptimeMillis()
         acceptedSockets.incrementAndGet()
         lastAcceptAt = SystemClock.elapsedRealtime()
         log("BT-ACCEPT: entry=$tag listenerGeneration=$epoch peer=${safeAddress(socket.remoteDevice)} ${diagnosticSummary()}")
-        handleIncomingSocket(socket, epoch, tag)
+        handleIncomingSocket(socket, epoch, tag, acceptedAt)
     }
 
     @Synchronized fun setSessionEnabled(enabled: Boolean, reason: String = "caller", closeCurrent: Boolean = true) {
@@ -384,7 +386,7 @@ class Iap2Bluetooth(
     }
 
     @SuppressLint("MissingPermission")
-    @Synchronized private fun handleIncomingSocket(socket: BluetoothSocket, myGeneration: Long, tag: String) {
+    @Synchronized private fun handleIncomingSocket(socket: BluetoothSocket, myGeneration: Long, tag: String, acceptedAt: Long) {
         if (!running || generation.get() != myGeneration) {
             rejectSocket(socket, tag, "stale-listener-generation")
             return
@@ -438,7 +440,7 @@ class Iap2Bluetooth(
         log("$tag: 车机已连入 name=$peerName，开始 iAP2 发送端会话")
         Thread({
             if (!running || generation.get() != myGeneration) rejectSocket(socket, tag, "stale-worker-generation")
-            else runSession(socket, tag, ticket)
+            else runSession(socket, tag, ticket, acceptedAt)
         }, "iap2-bt-session").apply {
             isDaemon = true
             start()
@@ -681,6 +683,7 @@ class Iap2Bluetooth(
         socket: BluetoothSocket,
         tag: String,
         ticket: Long,
+        inboundAt: Long? = null,
     ) {
         // Publish the socket atomically with the pause check, so pausing can always close it.
         synchronized(this) {
@@ -700,6 +703,7 @@ class Iap2Bluetooth(
             sessionProductive = false
             currentSocket.set(socket)
         }
+        inboundAt?.let { onInboundSession(safeAddress(socket.remoteDevice), it) }
         val handshakeId = HANDSHAKE_IDS.incrementAndGet()
         val started = SystemClock.elapsedRealtime()
         val sessionLog: (String) -> Unit = { line -> log("HS#$handshakeId +${SystemClock.elapsedRealtime() - started}ms $line") }

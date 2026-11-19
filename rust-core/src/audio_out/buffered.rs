@@ -163,7 +163,7 @@ fn frame(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::{
         bplist::{self, Value},
@@ -173,7 +173,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
-    async fn control_pair(rate: u32) -> (BufferedControl, Arc<RtspChannel>, TcpStream) {
+    pub(crate) async fn control_pair(rate: u32) -> (BufferedControl, Arc<RtspChannel>, TcpStream) {
         let rtsp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let controller = TcpStream::connect(rtsp.local_addr().unwrap())
             .await
@@ -189,7 +189,7 @@ mod tests {
         )
     }
 
-    async fn accept_start(mut peer: TcpStream) {
+    pub(crate) async fn accept_start(mut peer: TcpStream) {
         let mut input = Vec::new();
         for method in ["GETANCHOR", "SETRATEANCHORTIME"] {
             let request = loop {

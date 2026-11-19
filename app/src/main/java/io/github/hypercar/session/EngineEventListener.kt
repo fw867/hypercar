@@ -17,6 +17,9 @@ internal class EngineEventListener(
     override fun onLog(line: String) = target.onLog(line) // Keep old cleanup diagnostics.
     override fun onCarWithReopen(attempt: Long) = target.onCarWithReopen(attempt) // The source belongs to the connection attempt.
     override fun onPipeline(json: String) = deliver { target.onPipeline(json) }
+    // The journal checks the captured attempt and engine, including during late teardown.
+    override fun onEventChannel(rtsp: Long, uptime: Long, cause: String, videoTcp: String) =
+        target.onEventChannel(rtsp, uptime, cause, videoTcp)
     override fun onCarWithNavigation(token: Long, json: String) = deliver { target.onCarWithNavigation(token, json) }
     override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) =
         deliver { target.onStats(fps, frames, kbps, audioPlaying, ducking) }

@@ -12,6 +12,7 @@ mod airplay;
 mod nbt;
 mod negotiation_cleanup;
 mod audio_out;
+mod audio_diagnostics;
 mod audio_pacing;
 mod audio_resample;
 mod aac;
@@ -130,6 +131,16 @@ pub(crate) fn emit_pipeline(json: &str) {
     call_listener("onPipeline", |env,obj| {
         let data=env.new_string(json)?;
         env.call_method(obj,"onPipeline","(Ljava/lang/String;)V",&[(&data).into()]).map(|_| ())
+    });
+}
+
+pub(crate) fn emit_event_channel(id: u64, at: u64, cause: &str, sample: Option<&tcp_diagnostics::TcpSnapshot>) {
+    let tcp = sample.and_then(|s| serde_json::to_string(s).ok()).unwrap_or_default();
+    call_listener("onEventChannel", |env,obj| {
+        let cause = env.new_string(cause)?;
+        let tcp = env.new_string(tcp)?;
+        env.call_method(obj, "onEventChannel", "(JJLjava/lang/String;Ljava/lang/String;)V",
+            &[(id as jlong).into(), (at as jlong).into(), (&cause).into(), (&tcp).into()]).map(|_| ())
     });
 }
 

@@ -141,7 +141,7 @@ impl ScreenSession {
             released.await.map_err(|_| "video pause not acknowledged")
         }).await.map_err(|_| "视频释放超时".to_string())?.map_err(str::to_string)?;
         // Pump acknowledgement follows socket drop. Never retain stale TCP samples as live facts.
-        self.params.pipeline.lock().video_tcp = None;
+        self.params.pipeline.lock().retire_video_tcp();
         state.revision = None;
         if state.negotiated {
             let body = bplist::encode(&Value::dict(vec![("streams", Value::array(vec![Value::dict(vec![
