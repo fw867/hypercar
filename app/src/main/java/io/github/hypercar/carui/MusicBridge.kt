@@ -251,7 +251,11 @@ object MusicBridge {
     private var playbackPrefs: android.content.SharedPreferences? = null
     private var manualPauseRequested = false
     /** 用户在音乐卡片里选定的 App；有它的会话时优先显示它，而不是按“正在播放”抢焦点。 */
-    private var preferredPackage: String? = null
+    private val _preferredPlayer = MutableStateFlow<String?>(null)
+    internal val preferredPlayer: StateFlow<String?> = _preferredPlayer
+    private var preferredPackage: String?
+        get() = _preferredPlayer.value
+        set(value) { _preferredPlayer.value = value }
     private val packageSwitchRevision = java.util.concurrent.atomic.AtomicLong()
     private var autoPlayPending = false
     private var autoPlayDeadline = 0L

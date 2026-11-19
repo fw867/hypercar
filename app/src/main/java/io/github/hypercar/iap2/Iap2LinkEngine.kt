@@ -119,7 +119,28 @@ class Iap2LinkEngine(
         val awaitAck: Boolean = true,
         val sessionId: Int? = null,
         val optional: Boolean = false,
+        val hudMessageId: Int = 0,
+        var hudSerial: Long = 0,
     )
+
+    internal data class HudFrame(val offset: Int, val messageId: Int, val sequence: Int, val serial: Long) {
+        val label get() = "id=0x${messageId.toString(16)} seq=$sequence hud_serial=$serial"
+    }
+
+    private val hudOutput = mutableListOf<HudFrame>()
+    private val hudAwaitingAck = linkedMapOf<Int, HudFrame>()
+    private var nextHudSerial = 0L
+    private var hudAckWatermark: Int? = null
+    internal var hudLog: ((String) -> Unit)? = null
+
+    internal fun takeHudOutput(): List<HudFrame> = hudOutput.toList().also { hudOutput.clear() }
+
+    internal fun endHudTrace(reason: String) {
+        hudAwaitingAck.values.forEach { hudLog?.invoke("HUD LINK ${it.label} ack=unconfirmed reason=$reason") }
+        hudAwaitingAck.clear()
+        hudOutput.clear()
+        hudAckWatermark = null
+    }
 
     var state: State = State.IDLE
         private set
@@ -303,6 +324,7 @@ class Iap2LinkEngine(
         bytes: ByteArray,
         nowMillis: Long,
         awaitAck: Boolean = true,
+        hudMessageId: Int = 0,
     ): Boolean {
         if (state == State.DEAD) return false
         val limit = (peerSynchronization?.maxLength ?: 0xFFFF) - HEADER_BYTES - 1
@@ -310,7 +332,7 @@ class Iap2LinkEngine(
             die("control payload ${bytes.size} exceeds negotiated limit $limit")
             return false
         }
-        sendBacklog += Packet(0, bytes.copyOf(), awaitAck = awaitAck)
+        sendBacklog += Packet(0, bytes.copyOf(), awaitAck = awaitAck, hudMessageId = hudMessageId)
         drainSendWindow(nowMillis)
         return true
     }
@@ -395,6 +417,7 @@ class Iap2LinkEngine(
         adoptedSynchronization = null
         adoptedPeerControlSessionId = null
         sentSequence = INITIAL_SEQUENCE
+        endHudTrace("link_reset")
         lastSentAcknowledged = null
         lastReceivedInOrder = 0
         lastEchoPeerSequence = null
@@ -532,6 +555,20 @@ class Iap2LinkEngine(
         nowMillis: Long,
     ) {
         completeNegotiationIfPending(nowMillis)
+        if (hudAwaitingAck.isNotEmpty()) {
+            val previous = hudAckWatermark
+            if (previous != null) {
+                val advance = sequenceDistance(acknowledgement, previous)
+                if (advance in 1..127 && advance <= sequenceDistance(sentSequence, previous)) {
+                    hudAwaitingAck.values.removeAll { frame ->
+                        val covered = sequenceDistance(frame.sequence, previous) in 1..advance
+                        if (covered) hudLog?.invoke("HUD LINK ${frame.label} peer_ack=$acknowledgement covered=true")
+                        covered
+                    }
+                    hudAckWatermark = acknowledgement
+                }
+            }
+        }
         lastSentAcknowledged = acknowledgement
         val window = (peerSynchronization?.maxOutgoing ?: maxOutgoing) + ACK_SLACK
         unacknowledged.removeAll { sequenceDistance(it.sequence, acknowledgement) !in 1..window }
@@ -581,7 +618,19 @@ class Iap2LinkEngine(
             sentSequence = nextSequence(sentSequence)
             packet.sequence = sentSequence
             packet.deadlineMillis = nowMillis + retransmissionTimeoutMillis
-            writePacket(packet.payload, packet.sequence, CONTROL_ACKNOWLEDGEMENT, packet.sessionId ?: controlSessionId())
+            if (hudAwaitingAck.isNotEmpty()) {
+                hudAwaitingAck.values.removeAll { frame ->
+                    val expired = sequenceDistance(sentSequence, frame.sequence) >= 127 || frame.sequence == sentSequence
+                    if (expired) hudLog?.invoke("HUD LINK ${frame.label} ack=unconfirmed reason=sequence_window")
+                    expired
+                }
+            }
+            if (packet.hudMessageId != 0) {
+                packet.hudSerial = ++nextHudSerial
+                if (hudAwaitingAck.isEmpty()) hudAckWatermark = lastSentAcknowledged
+                hudAwaitingAck[packet.sequence] = HudFrame(0, packet.hudMessageId, packet.sequence, packet.hudSerial)
+            }
+            writeDataPacket(packet)
             if (!packet.awaitAck) continue // 发后不管：不追踪、不重传（见 sendControl 注释）
             if (peer == null || peer.maxRetransmissions > 0) {
                 unacknowledged += packet
@@ -609,7 +658,7 @@ class Iap2LinkEngine(
             die("packet ${next.sequence} not acknowledged")
             return
         }
-        writePacket(next.payload, next.sequence, CONTROL_ACKNOWLEDGEMENT, next.sessionId ?: controlSessionId())
+        writeDataPacket(next)
         retransmitDeadline = unacknowledged.minOfOrNull { it.deadlineMillis }
     }
 
@@ -684,6 +733,13 @@ class Iap2LinkEngine(
         appendOutput(frame)
     }
 
+    private fun writeDataPacket(packet: Packet) {
+        if (state != State.DEAD && packet.hudMessageId != 0) {
+            hudOutput += HudFrame(output.size(), packet.hudMessageId, packet.sequence, packet.hudSerial)
+        }
+        writePacket(packet.payload, packet.sequence, CONTROL_ACKNOWLEDGEMENT, packet.sessionId ?: controlSessionId())
+    }
+
     /** 单调时钟基准（与调用方喂进 feed/advanceTime 的 nowMillis 同源）。 */
     private fun now(): Long = System.nanoTime() / 1_000_000L
 
@@ -694,6 +750,7 @@ class Iap2LinkEngine(
         syncDeadline = null
         retransmitDeadline = null
         output.reset()
+        endHudTrace("link_ended")
         pendingEvents.clear()
         sendBacklog.clear()
         pendingReliableAck = false

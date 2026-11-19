@@ -80,6 +80,7 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
             .requiredSize(rect.width.toDp(), rect.height.toDp()).clipToBounds()
     }
     val music by MusicBridge.state.collectAsStateWithLifecycle()
+    val selectedPlayer by MusicBridge.preferredPlayer.collectAsStateWithLifecycle()
     var time by remember { mutableStateOf(LocalTime.now()) }
     var apps by remember { mutableStateOf(false) }
     var settings by remember { mutableStateOf(false) }
@@ -102,6 +103,19 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
         MapController.requestEnter()
     }
     val context = LocalContext.current
+    var musicApps by remember(context, apps) { mutableStateOf(MusicApps.installed(context)) }
+    val idlePlayer = MusicApps.idlePlayer(musicApps.map { it.packageName }, selectedPlayer, CarUiSettings.defaultMusicPackage)
+    val displayedPackage = music.packageName.ifBlank { idlePlayer.orEmpty() }
+    val displayedApp = musicApps.firstOrNull { it.packageName == displayedPackage }
+    val musicLabel = music.appLabel.ifBlank { displayedApp?.label ?: "音乐" }
+    val musicIcon = displayedApp?.icon ?: remember(context, displayedPackage) {
+        MusicApps.iconFor(context, displayedPackage)
+    }
+    var musicPicker by remember { mutableStateOf(false) }
+    fun openMusicPicker() {
+        musicApps = MusicApps.installed(context)
+        musicPicker = true
+    }
     var battery by remember { mutableIntStateOf(0) }
     var charging by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
@@ -228,18 +242,25 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
                     val mapIcon = remember(mapProvider?.packageName) {
                         mapProvider?.let { MusicApps.iconFor(context, it.packageName) }
                     }
-                    val musicIcon = remember(music.packageName) {
-                        music.packageName.takeIf { it.isNotBlank() }
-                            ?.let { MusicApps.iconFor(context, it) }
-                    }
                     DockButton(Icons.Rounded.Navigation, mapProvider?.label ?: "地图",
                         if (CarThemeState.dark) Color(0xFF12B5D2) else CarAccent,
                         buttonSize = 68, bitmap = mapIcon) { enterMap() }
-                    DockButton(Icons.Rounded.MusicNote, "音乐", Color(0xFF7B51EB),
+                    DockButton(Icons.Rounded.MusicNote, musicLabel, Color(0xFF7B51EB),
                         buttonSize = 68, bitmap = musicIcon) {
-                        // Dock 音乐按钮 = 在音乐卡里打开当前音乐 App（2026-11-01）
-                        MusicUiState.appView = music.packageName.isNotBlank()
-                        if (music.packageName.isBlank()) launchMusic(context, music)
+                        apps = false
+                        settings = false
+                        about = false
+                        when {
+                            music.packageName.isNotBlank() -> {
+                                musicPicker = false
+                                MusicUiState.appView = true
+                            }
+                            idlePlayer != null -> MusicBridge.selectPackage(context, idlePlayer)
+                            else -> {
+                                MusicUiState.appView = false
+                                openMusicPicker()
+                            }
+                        }
                     }
                     DockButton(Icons.Rounded.Settings, "设置", Color(0xFF5B5675), buttonSize = 68) {
                         settings = true
@@ -277,13 +298,15 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
                 } else if (about) {
                     CarAboutPage(Modifier.weight(1f)) { about = false }
                 } else if (apps) {
-                    AppsPage(Modifier.weight(1f), music, { settings = true }, { about = true }) {
+                    AppsPage(Modifier.weight(1f), musicApps, { settings = true }, { about = true }) {
                         apps = false
                     }
                 } else {
                     Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
                         MapCard(Modifier.weight(1f).fillMaxHeight())
-                        MusicCard(music, Modifier.width(musicCardWidth).fillMaxHeight())
+                        MusicCard(music, musicApps, displayedPackage, musicLabel, musicIcon,
+                            Modifier.width(musicCardWidth).fillMaxHeight(), musicPicker, ::openMusicPicker,
+                            onClosePicker = { musicPicker = false })
                     }
                 }
                 Row(Modifier.fillMaxWidth().height(15.dp), horizontalArrangement = Arrangement.Center,
@@ -459,19 +482,26 @@ private fun mapLaneSymbol(action: Int): String = when (action) {
 
 @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
-private fun MusicCard(music: NowPlaying, modifier: Modifier) {
+private fun MusicCard(
+    music: NowPlaying,
+    installed: List<MusicApps.Entry>,
+    displayedPackage: String,
+    appLabel: String,
+    appIcon: android.graphics.Bitmap?,
+    modifier: Modifier,
+    picker: Boolean,
+    onOpenPicker: () -> Unit,
+    onClosePicker: () -> Unit,
+) {
     val context = LocalContext.current
-    val installed = remember(context) { MusicApps.installed(context) }
-    var picker by remember { mutableStateOf(false) }
     val pickerButton = remember { FocusRequester() }
     val inputMode = LocalInputModeManager.current
     val closePicker = {
-        picker = false
+        onClosePicker()
         if (inputMode.inputMode == InputMode.Keyboard) pickerButton.requestFocus()
         Unit
     }
     androidx.activity.compose.BackHandler(enabled = picker, onBack = closePicker)
-    val currentIcon = remember(music.packageName) { MusicApps.iconFor(context, music.packageName) }
     val dark = CarThemeState.dark
     val ink = if (dark) White else Color(0xFF1B1730)
     val sub = if (dark) White.copy(alpha = .65f) else Color(0xFF5F5870)
@@ -520,22 +550,23 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
                     // 只让"图标 + 应用名"这一小段可点（原来整行/整条顶部都能点，容易误触）
                     .widthIn(max = 150.dp)
                     .focusRequester(pickerButton)
-                    .clickable(enabled = installed.isNotEmpty()) { picker = true }
+                    .clickable(onClickLabel = "切换音乐应用", onClick = onOpenPicker)
                     .padding(horizontal = 4.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Box(Modifier.size(28.dp).clip(CircleShape).background(White.copy(alpha = .92f)),
                     contentAlignment = Alignment.Center) {
-                    if (currentIcon != null) {
-                        Image(currentIcon.asImageBitmap(), null, Modifier.fillMaxSize().clip(CircleShape),
+                    if (appIcon != null) {
+                        Image(appIcon.asImageBitmap(), null, Modifier.fillMaxSize().clip(CircleShape),
                             contentScale = ContentScale.Crop)
                     } else {
                         Icon(Icons.Rounded.MusicNote, null, tint = Color(0xFF7461D9), modifier = Modifier.size(18.dp))
                     }
                 }
                 Spacer(Modifier.width(8.dp))
-                Text(music.appLabel.ifBlank { "音乐" }, color = ink.copy(alpha = .85f), fontSize = 12.sp)
-                Spacer(Modifier.weight(1f))
+                Text(appLabel, color = ink.copy(alpha = .85f), fontSize = 12.sp,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                Icon(Icons.Rounded.ExpandMore, null, tint = ink.copy(alpha = .85f), modifier = Modifier.size(18.dp))
                 if (music.playing) Icon(Icons.Rounded.GraphicEq, "正在播放", tint = ink, modifier = Modifier.size(22.dp))
             }
             Spacer(Modifier.weight(1f))
@@ -574,18 +605,20 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
                     PlayerButton(Icons.Rounded.SkipNext, "下一首", 31, ink, touchSize = 44) { MusicBridge.next() }
                 }
             } else {
-                Text("在手机上播放音乐，即可在这里控制", color = sub, fontSize = 12.sp)
+                val hint = if (MusicBridge.hasAccess(context)) "在手机上播放音乐，即可在这里控制"
+                    else "请在手机的 HyperCar 设置中开启通知使用权"
+                Text(hint, color = sub, fontSize = 12.sp)
                 Spacer(Modifier.height(12.dp))
-                TextButton(onClick = { MusicBridge.openAccessSettings(context) }) {
-                    Text("连接音乐", color = ink, fontSize = 15.sp)
+                TextButton(onClick = onOpenPicker) {
+                    Text("选择音乐应用", color = ink, fontSize = 15.sp)
                 }
             }
         }
         if (picker) {
             val choices = remember(installed) { installed.map { FocusRequester() } }
-            LaunchedEffect(inputMode.inputMode) {
+            LaunchedEffect(inputMode.inputMode, choices) {
                 if (inputMode.inputMode == InputMode.Keyboard) {
-                    val selected = installed.indexOfFirst { it.packageName == music.packageName }
+                    val selected = installed.indexOfFirst { it.packageName == displayedPackage }
                     choices.getOrNull(selected.coerceAtLeast(0))?.requestFocus()
                 }
             }
@@ -604,10 +637,15 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(18.dp))
                     .background(pickerBg)
+                    .verticalScroll(rememberScrollState())
                     .padding(vertical = 8.dp),
             ) {
                 Text("切换音乐应用", color = sub, fontSize = 12.sp,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+                if (installed.isEmpty()) {
+                    Text("未发现可切换的音乐应用", color = sub, fontSize = 13.sp,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp))
+                }
                 installed.forEachIndexed { index, app ->
                     Row(
                         Modifier
@@ -636,7 +674,7 @@ private fun MusicCard(music: NowPlaying, modifier: Modifier) {
                         }
                         Spacer(Modifier.width(12.dp))
                         Text(app.label, color = ink, fontSize = 15.sp, modifier = Modifier.weight(1f))
-                        if (app.packageName == music.packageName) {
+                        if (app.packageName == displayedPackage) {
                             Icon(Icons.Rounded.Check, "当前", tint = Color(0xFF6EE7B7), modifier = Modifier.size(18.dp))
                         }
                     }
@@ -661,24 +699,16 @@ private fun PlayerButton(
     }
 }
 
-private fun launchMusic(context: android.content.Context, music: NowPlaying) {
-    // **在手机屏幕上打开当前音乐 App**（2026-10-31）：自动播放把它放在不可见虚显上，
-    // 用户要调整播放器/音效时必须能把它调回手机；走 MusicBridge.openOnPhone()，
-    // 它会 force-stop 虚显上的实例再在默认屏启动（单纯 am start --display 0 不一定能迁 task）。
-    if (music.packageName.isNotBlank() &&
-        context.packageManager.getLaunchIntentForPackage(music.packageName) != null
-    ) {
-        MusicBridge.openOnPhone(music.packageName)
-        return
-    }
-    MusicBridge.openAccessSettings(context)
-}
-
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun AppsPage(modifier: Modifier, music: NowPlaying, onSettings: () -> Unit = {}, onAbout: () -> Unit = {}, onMapSelected: () -> Unit = {}) {
+private fun AppsPage(
+    modifier: Modifier,
+    musicApps: List<MusicApps.Entry>,
+    onSettings: () -> Unit = {},
+    onAbout: () -> Unit = {},
+    onMapSelected: () -> Unit = {},
+) {
     val context = LocalContext.current
-    val musicApps = remember(context) { MusicApps.installed(context) }
     val mapLabel = MapApps.selected(context)?.label ?: "地图"
     Box(modifier.fillMaxWidth().clip(CardShape).background(CarPanel)) {
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(28.dp)) {

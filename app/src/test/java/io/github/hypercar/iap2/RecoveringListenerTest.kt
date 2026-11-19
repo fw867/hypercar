@@ -59,6 +59,52 @@ class RecoveringListenerTest {
         assertTrue(replacement.closed)
     }
 
+    @Test fun bluetoothServiceRuntimeFailureDoesNotExitTheAcceptLoop() {
+        val stale = Resource()
+        val replacement = Resource()
+        val incoming = Resource()
+        var opens = 0
+        var retries = 0
+        val loop = RecoveringListener(
+            ownerAlive = { true },
+            open = { if (++opens == 1) stale else replacement },
+            accept = { server -> if (server === stale) throw IllegalStateException("Bluetooth service restarted") else incoming },
+            onFailure = { assertTrue(stale.closed) },
+            awaitRetry = { retries++ },
+        )
+        assertSame(incoming, loop.acceptNext())
+        assertEquals(1, retries)
+        assertFalse(replacement.closed)
+        loop.close()
+    }
+
+    @Test fun failedPhoneMarkerReopensWhilePrimaryAndDiscoveryRemainRegistered() {
+        val primary = Resource()
+        val discovery = Resource()
+        val stale = Resource()
+        val recovered = Resource()
+        var opens = 0
+        val loop = RecoveringListener(
+            ownerAlive = { true },
+            open = { if (++opens == 1) stale else recovered },
+            accept = { server ->
+                if (server === stale) throw IllegalStateException("Phone marker socket lost")
+                Resource()
+            },
+            onFailure = {
+                assertTrue(stale.closed)
+                assertFalse(primary.closed)
+                assertFalse(discovery.closed)
+            },
+            awaitRetry = {},
+        )
+        assertNotNull(loop.acceptNext())
+        assertEquals(2, opens)
+        assertFalse(primary.closed)
+        assertFalse(discovery.closed)
+        loop.close()
+    }
+
     @Test fun stoppingDuringRegistrationDoesNotLeakALateSocket() {
         val server = Resource()
         lateinit var loop: RecoveringListener<Resource, Resource>

@@ -1,5 +1,17 @@
 # 宝马盒子流程证据
 
+## ID8.5 二次上车前的 SDP 串口声明（2026-11-19，MGU-55）
+
+iPhone 和盒子的 `Wireless iAP` 服务在**同一条 SDP 记录**中用 `0x0001`（ServiceClassIDList）声明 `00000000-deca-fade-deca-deafdecacafe`，用 `0x0009`（BluetoothProfileDescriptorList）声明串口配置 SPP 1.2。后者的两项值为串口 UUID `0x1101` 和版本 `0x0102`。RFCOMM 通道号由另一属性 `0x0004` 给出。
+
+| 来源 | 可复核的证据 |
+|---|---|
+| iPhone 实车 HCI，11 月 11 日二次上车 | 19:51:12.720 宝马先定向查 `…cafe` 并取得 RFCOMM 通道 1。19:51:12.982 手机应答后续通用浏览时，`…cafe` 条目里可见 `09 00 09 35 08 35 06 19 11 01 09 01 02`。 |
+| 盒子固件 | `fscsdkbw123` 的文件偏移 `0x84930` 是该条目的 `0x0001`，`0x84995` 是相同的 `0x0009` 字节。此项依据是固件记录模板，盒子成功日志未保留该笔 SDP 应答的完整载荷。 |
+| HyperCar 594 实车 HCI，11 月 19 日 | 保留配对失败时（18:04:43.155）与互删重配成功时（18:06:29.443），宝马均以 `0x0100` 搜索并请求 `0x0001`、`0x0009`。两次返回的 486 字节服务列表相同，`…cafe` 条目只返回 `0x0001`。成功轮早在 18:06:29.291 就已定向查 `…cafe`，请求 `0x0004` 并取得通道 15。 |
+
+这些记录能确认服务描述有差异。宝马是否在首次配对时据此记住手机的 CarPlay 能力，仍缺车端证据。595 调整的是宝马档案的 EIR 标记顺序；验证 SPP 1.2 要看手机对 SDP 查询的实际应答，确认 `0x0009` 出现在 `…cafe` 条目内。另行注册标准 SPP 服务会产生独立条目。[AOSP 自定义 UUID 记录](https://android.googlesource.com/platform/packages/modules/Bluetooth/+/android-16.0.0_r1/system/btif/src/btif_sock_sdp.cc#157) · [AOSP 标准 SPP 记录](https://android.googlesource.com/platform/packages/modules/Bluetooth/+/android-16.0.0_r1/system/btif/src/btif_sock_sdp.cc#355)
+
 ## 已配对 ID8.5 在热点已连接时等待邀请（2026-11-17）
 
 盒子二次上车摘要的蓝牙 CSM 为识别、认证、4E0C/4E0D/4E0A/4E09/4E0B、三条 AE01、5702/5703。AA05 到 5702 约 100 ms。两轮成功摘要在提供凭据的蓝牙链路上也是这一顺序，邀请前未记录 EA00。另有早期蓝牙链路只交换普通业务。摘要未显示车机内部的邀请判定。

@@ -54,6 +54,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import io.github.hypercar.iap2.BmwCaffProbe
 
 /**
  * 会话总管：上车秒连的完整链路。
@@ -117,7 +118,7 @@ object HyperCarRepo {
      * `_carplay-ctrl._tcp` 广播器（真车邀请驱动流程的核心：车机在 WiFi 上发现它才下发
      * 0x4301）。生命周期与本会话一致：拿到 0x5703 → 绑网 → 注册；拆除时注销。
      */
-    private var ctrlAdvertiser: CarPlayCtrlAdvertiser? = null
+    @Volatile private var ctrlAdvertiser: CarPlayCtrlAdvertiser? = null
 
     /** 本轮已经静默加入过的车机热点（避免「先拿凭据入网」与「端点到了再入网」重复连接）。 */
     @Volatile
@@ -285,8 +286,18 @@ object HyperCarRepo {
     private val sessionLive = AtomicBoolean(false)
 
     /** 持有移交 Rust 的网络句柄（推流期间不能释放）。 */
+    private val ctrlNetworkLock = Any()
     @Volatile
     private var boundNetwork: Network? = null
+        set(value) = synchronized(ctrlNetworkLock) {
+            if (field != value) {
+                val advertiser = ctrlAdvertiser
+                if (advertiser == null) field = value else synchronized(advertiser) {
+                    field = value
+                    advertiser.selectNetwork(value)
+                }
+            }
+        }
 
     fun init(context: Context) {
         if (initialized) return
@@ -672,7 +683,10 @@ object HyperCarRepo {
         // Invalidate on the tap, before the asynchronous stop can wait on the previous connect job.
         when (ConnectionStopPolicy.decide(true, expectedAttempt, connectionAttemptId, hasCurrentSession,
                 _snapshots.value.link, SettingsStore.autoConnect)) {
-            ConnectionStopPolicy.Decision.STOP, ConnectionStopPolicy.Decision.STOP_AND_PAUSE -> carWithEntries.retire(expectedAttempt)
+            ConnectionStopPolicy.Decision.STOP, ConnectionStopPolicy.Decision.STOP_AND_PAUSE -> {
+                iap2?.retireCafeHandoff(expectedAttempt, "pause")
+                carWithEntries.retire(expectedAttempt)
+            }
             else -> Unit
         }
         disconnect(userInitiated = true, expectedAttempt = expectedAttempt, reason = "用户断开当前会话")
@@ -777,7 +791,7 @@ object HyperCarRepo {
                     return@launch
                 }
                 if (SettingsStore.autoConnect) {
-                    val issues = StartupRequirements.read(context).automaticIssues
+                    val issues = StartupRequirements.read(context).automaticStandbyIssues
                     if (issues.isNotEmpty()) {
                         stopStandbyListening(standbyReady = false)
                         log("STARTUP: 自动上车连接等待启动条件：${issues.joinToString("；")}")
@@ -821,6 +835,7 @@ object HyperCarRepo {
             deviceMacProvider = BluetoothMac::resolve,
             dropProfilesBeforeIap2 = profile.dropProfilesBeforeIap2,
             allowOutboundIap2 = profile.allowOutboundIap2,
+            profileId = profile.id,
             onInboundSession = { peer, at -> connectionDiagnostics.rfcommAccepted(connectionAttemptId, peer, at) },
             log = ::log,
         ).also { iap2 = it }
@@ -830,7 +845,7 @@ object HyperCarRepo {
         if (!automaticConnectionAllowed || hasCurrentSession) return
         appContext()?.let { io.github.hypercar.carui.MusicNotificationListener.sync(it) }
         val context = appContext() ?: return
-        if (!StartupRequirements.read(context).automaticReady) {
+        if (StartupRequirements.read(context).automaticStandbyIssues.isNotEmpty()) {
             startAutomaticListening(context)
             return
         }
@@ -1035,6 +1050,12 @@ object HyperCarRepo {
             }
             override fun onLinkPropertiesChanged(network: Network, properties: android.net.LinkProperties) {
                 if (network != expected || sessionNetworkMonitor !== this) return
+                ctrlAdvertiser?.let { advertiser ->
+                    synchronized(advertiser) {
+                        if (sessionNetworkMonitor === this && boundNetwork == network && ctrlAdvertiser === advertiser)
+                            advertiser.networkAddresses(network, properties.linkAddresses.map { it.address }.toSet())
+                    }
+                }
                 val state = "if=${properties.interfaceName} addresses=${properties.linkAddresses} routes=${properties.routes}"
                 if (state != lastLink) { lastLink = state; log("NET-WATCH: network=#$network $state") }
             }
@@ -1138,6 +1159,22 @@ object HyperCarRepo {
         connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.DEPENDENCIES_CHECKED, preflight)
         log("PREFLIGHT: $preflight；${findings.joinToString("；").ifBlank { "依赖检查通过" }}")
         var discoveryJob: Job? = null
+        val caffSince = SystemClock.uptimeMillis()
+        val caffBaseline = roundSessionBaseline
+        val caffProbe = BmwCaffProbe(diagnosticId)
+        var caffJob: Job? = null
+        val invited = java.util.concurrent.atomic.AtomicBoolean(false)
+        val caffTarget = SettingsStore.targetCarMac
+        val caffDevice = if (headUnitProfile.id == "bmw_id85" && !headUnitProfile.allowOutboundIap2) runCatching {
+            val devices = context.getSystemService(android.bluetooth.BluetoothManager::class.java).adapter.bondedDevices
+            val bonded = devices.map { it.address }.toSet()
+            val knownBmw = devices.filter {
+                io.github.hypercar.bluetooth.CarTargetPolicy.acceptsAcl(
+                    null, it.address, it.name.orEmpty(), knownCar = false, hasIap2 = false)
+            }.map { it.address }.toSet()
+            val mac = BmwCaffProbe.target("bmw_id85", caffTarget, wakePeer ?: aclCarMac, bonded, knownBmw)
+            devices.firstOrNull { it.address == mac }
+        }.getOrNull() else null
         try {
             if (!precheckDegradedMode(context)) return
             // Shizuku 从「必须」降级为「可选增强」：没有它照样能连，只是两条路径降级——
@@ -1195,12 +1232,45 @@ object HyperCarRepo {
             val controlServiceName = io.github.hypercar.net.ControlServiceName.forProfile(
                 p.id, io.github.hypercar.bluetooth.LocalDeviceName.snapshot())
             val advertiser = CarPlayCtrlAdvertiser(context, { deviceMac }, ::log, onDiagnostic = { event ->
+                if (event == CarPlayCtrlAdvertiser.Event.INVITED && invited.compareAndSet(false, true)) {
+                    caffProbe.cancel()
+                    if (caffProbe.attempted) log("BT-CAFF#$diagnosticId: ctrl invitation received")
+                }
                 connectionDiagnostics.mark(diagnosticId, when (event) {
                     CarPlayCtrlAdvertiser.Event.REGISTERED -> ConnectionDiagnostics.Stage.CTRL_REGISTERED
                     CarPlayCtrlAdvertiser.Event.INVITED -> ConnectionDiagnostics.Stage.CTRL_INVITED
                 })
-            }, serviceNameProvider = { controlServiceName })
-            ctrlAdvertiser = advertiser
+            }, serviceNameProvider = { controlServiceName }, onNetworkInvitation = { source, network, stillCurrent ->
+                if (p.id == "bmw_id85" && sessionLive.get() && connectionAttemptId == diagnosticId &&
+                    ctrlAdvertiser === source && iap2 === coordinator && network == boundNetwork) {
+                    coordinator.retireCafeHandoff(diagnosticId, "ctrl-invite", stillCurrent)
+                }
+            })
+            synchronized(ctrlNetworkLock) {
+                if (!sessionLive.get() || connectionAttemptId != diagnosticId) return
+                ctrlAdvertiser?.stop()
+                advertiser.selectNetwork(boundNetwork)
+                ctrlAdvertiser = advertiser
+            }
+            if (caffDevice != null) {
+                fun waiting() = connectionAttemptId == diagnosticId && sessionLive.get() && !userDisconnectRequested &&
+                    headUnitProfile.id == "bmw_id85" && SettingsStore.targetCarMac == caffTarget &&
+                    iap2 === coordinator && coordinator.sessionStartCount == caffBaseline &&
+                    !invited.get() && !hasAirPlayTransport
+                caffJob = CoroutineScope(kotlinx.coroutines.currentCoroutineContext()).launch {
+                    try {
+                        while (waiting() && !caffProbe.finished && !caffProbe.attempted) {
+                            if (caffDevice.bondState != android.bluetooth.BluetoothDevice.BOND_BONDED) break
+                            coordinator.pollBmwProbe(caffProbe, caffDevice, caffSince, ::waiting)
+                            delay(300)
+                        }
+                    } catch (cancelled: CancellationException) { throw cancelled }
+                    catch (e: Exception) {
+                        caffProbe.cancel()
+                        log("BT-CAFF#$diagnosticId: probe failed=${e.message}")
+                    }
+                }
+            }
             val lastSeen = AtomicReference<CarPlayEndpoint?>(null)
             val baselineSessions = coordinator.sessionStartCount
             roundSessionBaseline = baselineSessions
@@ -1496,6 +1566,9 @@ object HyperCarRepo {
         } catch (t: Throwable) {
             fail("会话异常: ${t.message}")
         } finally {
+            caffProbe.cancel()
+            caffJob?.cancel()
+            if (caffProbe.attempted && !invited.get()) log("BT-CAFF#$diagnosticId: wait ended without ctrl invitation")
             discoveryJob?.cancel()
             if (connectionAttemptId == diagnosticId) connecting = false
             appContext()?.let { io.github.hypercar.carui.MusicNotificationListener.sync(it) }
@@ -1625,8 +1698,10 @@ object HyperCarRepo {
             iap2 = null
             standbyEndpoint.set(null)
         }
-        runCatching { ctrlAdvertiser?.stop() }
-        ctrlAdvertiser = null
+        synchronized(ctrlNetworkLock) {
+            runCatching { ctrlAdvertiser?.stop() }
+            ctrlAdvertiser = null
+        }
         val cm = appContext()?.getSystemService(ConnectivityManager::class.java)
         sessionNetworkMonitor?.let { runCatching { cm?.unregisterNetworkCallback(it) } }
         sessionNetworkMonitor = null

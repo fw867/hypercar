@@ -66,8 +66,10 @@ object BtProfiles {
     fun connectedNames(
         context: Context,
         address: String,
+        classicOnly: Boolean = false,
     ): List<String> =
         profiles.mapNotNull { id ->
+            if (classicOnly && id == BluetoothProfile.LE_AUDIO) return@mapNotNull null
             val p = proxy(context, id) ?: return@mapNotNull null
             val connected =
                 try {

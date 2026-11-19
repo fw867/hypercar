@@ -260,11 +260,11 @@ pub(crate) fn emit_iap2_stop(id: u64) {
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendIap2(
-    env: JNIEnv, _class: JClass, id: jlong, bytes: JByteArray,
+    env: JNIEnv, _class: JClass, id: jlong, bytes: JByteArray, hud_message_id: jint, hud_serial: jlong,
 ) -> jboolean {
     if id <= 0 { return JNI_FALSE; }
     match env.convert_byte_array(&bytes) {
-        Ok(data) => if wifi_iap2::send(id as u64, data) { JNI_TRUE } else { JNI_FALSE },
+        Ok(data) => if wifi_iap2::send(id as u64, data, hud_message_id, hud_serial) { JNI_TRUE } else { JNI_FALSE },
         _ => JNI_FALSE,
     }
 }

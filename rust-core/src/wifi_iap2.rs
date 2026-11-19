@@ -180,14 +180,20 @@ fn frame_diagnostic(data: &[u8]) -> String {
     } else { "none".into() };
     format!("seq={} ack={} session={} csm={csm}",data[5],data[6],data[7])
 }
-enum Outbound { Frame(Vec<u8>), Ready(u64) }
+enum Outbound { Frame(Vec<u8>, Option<crate::rtsp::HudPostTrace>), Ready(u64) }
 static OUTPUT: Lazy<Mutex<Option<(u64, mpsc::Sender<Outbound>)>>> = Lazy::new(|| Mutex::new(None));
 
-pub fn send(id: u64, data: Vec<u8>) -> bool {
+pub fn send(id: u64, data: Vec<u8>, hud_message_id: i32, hud_serial: i64) -> bool {
     if data.is_empty() || data.len() > 65535 { return false; }
+    let hud = match (hud_message_id, data.get(5)) {
+        (0x5201 | 0x5202, Some(&seq)) if hud_serial > 0 => Some(crate::rtsp::HudPostTrace {
+            link_id: id, message_id: hud_message_id as u16, seq, serial: hud_serial as u64,
+        }),
+        _ => None,
+    };
     let output = OUTPUT.lock();
     output.as_ref().filter(|(current, _)| *current == id)
-        .map(|(_, tx)| tx.try_send(Outbound::Frame(data)).is_ok()).unwrap_or(false)
+        .map(|(_, tx)| tx.try_send(Outbound::Frame(data, hud)).is_ok()).unwrap_or(false)
 }
 
 pub struct WifiIap2 {
@@ -209,8 +215,8 @@ impl WifiIap2 {
                     _ = stop.notified() => break,
                     bytes = rx.recv() => match bytes { Some(b) => b, None => break },
                 };
-                let data = match data {
-                    Outbound::Frame(data) => data,
+                let (data, hud) = match data {
+                    Outbound::Frame(data, hud) => (data, hud),
                     Outbound::Ready(token) => { ready_written(id,token); continue; }
                 };
                 let frame_bytes = data.len();
@@ -221,8 +227,8 @@ impl WifiIap2 {
                 ]));
                 // Link ACKs arrive independently on the event socket. Do not block all SYN/CSM
                 // output waiting for a separate RTSP response to the previous iAP packet.
-                match tokio::time::timeout(Duration::from_secs(3), channel.post_fire_and_forget(
-                    "/command", &body, "application/x-apple-binary-plist",
+                match tokio::time::timeout(Duration::from_secs(3), channel.post_traced(
+                    "/command", &body, "application/x-apple-binary-plist", hud,
                 )).await {
                     Ok(Ok(cseq)) => {
                         sent += 1;
@@ -230,6 +236,9 @@ impl WifiIap2 {
                         if sent <= 128 || sent % 50 == 0 { crate::emit_log(&format!("WIFI-IAP#{id}: control POST written {last_written} frameBytes={frame_bytes} count={sent}; RTSP reply and link ACK separate")); }
                     }
                     other => {
+                        if let Some(hud) = hud {
+                            crate::emit_log(&format!("HUD {hud} RTSP#{} write_failed", channel.trace_id()));
+                        }
                         crate::emit_log(&format!("WIFI-IAP#{id}: control transport failed {}", match other {
                             Ok(Err(error)) => error, Err(_) => "write timeout".to_string(),
                             Ok(Ok(_)) => unreachable!(),
@@ -343,8 +352,8 @@ mod tests {
         let (r,w) = phone.into_split();
         let (channel, _) = RtspChannel::spawn(r,w,None);
         let guard = WifiIap2::start(channel, "unit-test", "Test phone", Arc::new(Notify::new()));
-        assert!(send(guard.id, vec![1,2,3]));
-        assert!(send(guard.id, vec![4,5,6]));
+        assert!(send(guard.id, vec![1,2,3], 0, 0));
+        assert!(send(guard.id, vec![4,5,6], 0, 0));
         let requests = tokio::time::timeout(Duration::from_secs(1), async {
             let mut buffer = Vec::new(); let mut chunk = [0;4096]; let mut requests = Vec::new();
             while requests.len() < 2 {
@@ -360,7 +369,7 @@ mod tests {
         }
         let id = guard.id;
         drop(guard);
-        assert!(!send(id, vec![7]));
+        assert!(!send(id, vec![7], 0, 0));
     }
 
     #[tokio::test]
@@ -383,9 +392,9 @@ mod tests {
         *HANDOFF.lock() = Handoff { id: 77, ..Handoff::default() };
         assert!(!can_keep_session()); feedback(77, true); assert!(!can_keep_session());
         mark_ready(76, true); assert!(!can_keep_session());
-        assert!(send(77,vec![1,2,3]));
+        assert!(send(77, vec![1,2,3], 0, 0));
         mark_ready(77, true); assert!(!can_keep_session());
-        match rx.try_recv().unwrap() { Outbound::Frame(data)=>assert_eq!(data,vec![1,2,3]), _=>panic!("barrier overtook frame") }
+        match rx.try_recv().unwrap() { Outbound::Frame(data, None)=>assert_eq!(data,vec![1,2,3]), _=>panic!("barrier overtook frame") }
         let token=match rx.try_recv().unwrap() { Outbound::Ready(t)=>t, _=>panic!("expected barrier") };
         ready_written(77,token);
         assert!(can_keep_generation(77)); assert!(!can_keep_generation(76));
@@ -401,10 +410,10 @@ mod tests {
     fn stale_generation_and_queue_overflow_are_rejected() {
         let (tx, _rx) = mpsc::channel(1);
         *OUTPUT.lock() = Some((999, tx));
-        assert!(!send(998, vec![1]));
-        assert!(send(999, vec![1]));
-        assert!(!send(999, vec![2]));
-        assert!(!send(999, vec![0; 65536]));
+        assert!(!send(998, vec![1], 0, 0));
+        assert!(send(999, vec![1], 0, 0));
+        assert!(!send(999, vec![2], 0, 0));
+        assert!(!send(999, vec![0; 65536], 0, 0));
         *OUTPUT.lock() = None;
     }
 }

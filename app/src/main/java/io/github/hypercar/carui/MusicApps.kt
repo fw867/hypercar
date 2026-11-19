@@ -34,6 +34,9 @@ object MusicApps {
 
     internal fun isKnownPlayer(packageName: String) = packageName in CANDIDATES
 
+    internal fun idlePlayer(installed: List<String>, selected: String?, default: String): String? =
+        selected?.takeIf { it in installed } ?: default.takeIf { it in installed } ?: installed.singleOrNull()
+
     fun installed(context: Context): List<Entry> {
         val pm = context.packageManager
         return CANDIDATES.mapNotNull { pkg ->

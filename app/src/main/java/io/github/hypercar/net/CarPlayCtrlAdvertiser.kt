@@ -1,6 +1,7 @@
 package io.github.hypercar.net
 
 import android.content.Context
+import android.net.ConnectivityManager
 import android.net.Network
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
@@ -9,6 +10,8 @@ import android.os.Build
 import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 
@@ -39,6 +42,7 @@ class CarPlayCtrlAdvertiser(
     private val log: (String) -> Unit,
     private val onDiagnostic: (Event) -> Unit = {},
     private val serviceNameProvider: () -> String = { "sender" },
+    private val onNetworkInvitation: (CarPlayCtrlAdvertiser, Network, () -> Boolean) -> Unit = { _, _, _ -> },
 ) {
     enum class Event { REGISTERED, INVITED }
     companion object {
@@ -48,12 +52,19 @@ class CarPlayCtrlAdvertiser(
         private const val MAX_HEAD_BYTES = 16 * 1024
         private const val PLACEHOLDER_MAC = "02:00:00:00:00:00"
         private const val REGISTRATION_TIMEOUT_MILLIS = 10_000L
+
+        internal fun isConnectRequest(line: String): Boolean {
+            val fields = line.split(' ', limit = 3)
+            return fields.size == 3 && fields[0] == "GET" &&
+                fields[1].substringBefore('?') == "/ctrl-int/1/connect" && fields[2].startsWith("HTTP/")
+        }
     }
 
     private val appContext = context.applicationContext
     private val nsdManager = appContext.getSystemService(Context.NSD_SERVICE) as NsdManager
 
     private var serverSocket: ServerSocket? = null
+    private var previousPort = 0
     private var acceptThread: Thread? = null
     private var registrationListener: NsdManager.RegistrationListener? = null
 
@@ -61,7 +72,7 @@ class CarPlayCtrlAdvertiser(
     val isAdvertising: Boolean get() = registration.ready
 
     private var registeredSsid: String? = null
-    private var registeredNetwork: Network? = null
+    @Volatile private var registeredNetwork: Network? = null
     private var registeredAtMillis = 0L
     private var registeredMac: String? = null
     private var registeredName: String? = null
@@ -79,11 +90,42 @@ class CarPlayCtrlAdvertiser(
      * 但它会主动来 `GET /ctrl-int/1/connect` 邀请手机，TCP 对端地址就是车机自己。
      * 于是把「邀请方 IP + 7000」当 AirPlay 端点，是这条链路上唯一可靠的来源。
      */
-    internal class Invitation(val host: String, val receivedAtMillis: Long, val network: Network?)
-    private val invitations = PendingInvitation<Invitation>()
-    internal val lastInvitation: Invitation? get() = invitations.get()
+    internal class Invitation(val host: String, val receivedAtMillis: Long, val network: Network, val receiverId: String?)
+    private val invites = CtrlInvitationInbox<Network, InetAddress, Invitation> { epoch, invite ->
+        inviteCount++
+        runCatching { onNetworkInvitation(this, epoch.network, epoch::isCurrent) }
+        runCatching { onDiagnostic(Event.INVITED) }
+        log("$TAG: ✓ 车机 ctrl 邀请（第 $inviteCount 次，receiver=${invite.receiverId ?: "?"} network=#${epoch.network}）——AirPlay 窗口已开启")
+    }
+    internal val lastInvitation: Invitation? @Synchronized get() = invites.latest.get()
     val lastInvitePeerIp: String? get() = lastInvitation?.host
-    internal fun discardInvitation(expected: Invitation): Boolean = invitations.discard(expected)
+    internal fun discardInvitation(expected: Invitation): Boolean = invites.latest.discard(expected)
+
+    /** A client accepted on A always carries A's listener epoch, even if B reuses both IPs. */
+    @Synchronized internal fun selectNetwork(network: Network?) {
+        if (invites.current?.network == network) return
+        invites.select(network)
+        registeredNetwork = null
+        serverSocket?.let {
+            previousPort = it.localPort
+            runCatching { it.close() }
+        }
+        serverSocket = null
+        acceptThread = null
+        if (previousPort != 0 && network != null) openListener()
+    }
+
+    @Synchronized internal fun networkAddresses(network: Network, addresses: Set<InetAddress>) {
+        val epoch = invites.current ?: return
+        if (epoch.network == network) invites.addresses(epoch, addresses)
+    }
+
+    private fun refreshAddresses(epoch: CtrlInvitationInbox.Epoch<Network>) {
+        val link = runCatching {
+            appContext.getSystemService(ConnectivityManager::class.java)?.getLinkProperties(epoch.network)
+        }.getOrNull()
+        if (link != null) invites.addresses(epoch, link.linkAddresses.map { it.address }.toSet())
+    }
 
     /** 已注册的端口（-1 = 未启动）。 */
     val port: Int get() = serverSocket?.localPort ?: -1
@@ -92,6 +134,9 @@ class CarPlayCtrlAdvertiser(
     @Synchronized
     fun ensureForNetwork(ssid: String, network: Network? = null): Boolean {
         val effectiveNetwork = network ?: registeredNetwork
+        val epoch = invites.current ?: return false
+        if (epoch.network != effectiveNetwork) return false
+        if (invites.awaitingConfirmation) refreshAddresses(epoch)
         val currentMac = bluetoothMacProvider()
         val currentName = serviceNameProvider()
         val same = registeredSsid == ssid && registeredNetwork == effectiveNetwork &&
@@ -99,10 +144,10 @@ class CarPlayCtrlAdvertiser(
         val age = SystemClock.uptimeMillis() - registeredAtMillis
         val socket = serverSocket?.takeUnless { it.isClosed }
         if (socket != null && registration.canReuse(same, age, REGISTRATION_TIMEOUT_MILLIS)) {
-            ensureAcceptThread(socket)
+            ensureAcceptThread(socket, epoch)
+            invites.advertise(epoch)
             return true
         }
-        if (registeredNetwork != effectiveNetwork) invitations.set(null)
         if (registrationListener != null) {
             log("$TAG: 更新 mDNS 注册 reason=${if (!same) "network/identity changed" else "registration/listener unavailable"} network=$effectiveNetwork port=$port")
             unregisterMdns()
@@ -110,7 +155,7 @@ class CarPlayCtrlAdvertiser(
         registeredSsid = ssid
         registeredNetwork = effectiveNetwork
         // A rejected request is retried by the existing wait loop, without blocking or withdrawing a healthy service.
-        return start()
+        return start().also { if (it) invites.advertise(epoch) }
     }
 
     /** Bluetooth is an independent transport: its edges must not withdraw a healthy Wi-Fi service. */
@@ -125,29 +170,42 @@ class CarPlayCtrlAdvertiser(
         return ensured
     }
 
-    private fun ensureAcceptThread(socket: ServerSocket) {
+    private fun ensureAcceptThread(socket: ServerSocket, epoch: CtrlInvitationInbox.Epoch<Network>) {
         if (acceptThread?.isAlive != true) {
-            acceptThread = Thread({ acceptLoop(socket) }, "carplay-ctrl-accept").apply {
+            acceptThread = Thread({ acceptLoop(socket, epoch) }, "carplay-ctrl-accept").apply {
                 isDaemon = true
                 start()
             }
         }
     }
 
-    @Synchronized
-    fun start(): Boolean {
-        // socket 与 accept 线程**只在第一次创建**，之后重注册一直复用（端口稳定）
-        val socket =
-            serverSocket?.takeUnless { it.isClosed }
-                ?: try {
-                    ServerSocket(0).also {
-                        serverSocket = it
-                    }
-                } catch (error: Exception) {
-                    log("$TAG: 监听端口创建失败 - ${error.message}")
-                    return false
-                }
-        ensureAcceptThread(socket)
+    private fun openListener(): ServerSocket? {
+        val epoch = invites.current ?: return null
+        fun listen(port: Int): ServerSocket = ServerSocket().apply {
+            try {
+                reuseAddress = true
+                bind(InetSocketAddress(port))
+            } catch (error: IOException) {
+                close()
+                throw error
+            }
+        }
+        val socket = try {
+            serverSocket ?: try { listen(previousPort) } catch (busy: java.net.BindException) {
+                if (previousPort == 0) throw busy
+                listen(0)
+            }
+        } catch (error: IOException) {
+            log("$TAG: 监听端口创建失败 - ${error.message}")
+            return null
+        }
+        serverSocket = socket
+        ensureAcceptThread(socket, epoch)
+        return socket
+    }
+
+    private fun start(): Boolean {
+        val socket = openListener() ?: return false
         if (registration.ready || registration.pending) return true
         val token = registration.begin()
         return try {
@@ -230,7 +288,7 @@ class CarPlayCtrlAdvertiser(
         previous?.let { runCatching { nsdManager.unregisterService(it) } }
     }
 
-    private fun acceptLoop(socket: ServerSocket) {
+    private fun acceptLoop(socket: ServerSocket, epoch: CtrlInvitationInbox.Epoch<Network>) {
         // 循环条件不能绑 `registered`：重注册期间 registered 会短暂为 false，
         // 旧实现会让 accept 线程退出、之后再也没人接车机的 ctrl 邀请
         while (!socket.isClosed) {
@@ -240,7 +298,12 @@ class CarPlayCtrlAdvertiser(
                 } catch (_: Exception) {
                     break
                 }
-            Thread({ handleClient(client) }, "carplay-ctrl-client").apply {
+            val receipt = synchronized(this) { invites.accept(epoch) }
+            if (receipt == null) {
+                runCatching { client.close() }
+                continue
+            }
+            Thread({ handleClient(client, receipt) }, "carplay-ctrl-client").apply {
                 isDaemon = true
                 start()
             }
@@ -252,7 +315,7 @@ class CarPlayCtrlAdvertiser(
      * `GET /ctrl-int/1/connect` 是「车机已发现手机、AirPlay 窗口已开」的权威信号，
      * 记进日志并计数（上层据此判断是否该立刻去连 AirPlay）。
      */
-    private fun handleClient(client: Socket) {
+    private fun handleClient(client: Socket, receipt: CtrlInvitationInbox.Receipt<Network>) {
         val peer = runCatching { client.inetAddress?.hostAddress }.getOrNull() ?: "?"
         try {
             client.soTimeout = 10_000
@@ -269,19 +332,19 @@ class CarPlayCtrlAdvertiser(
                     .filter { it.contains(':') }
                     .joinToString("; ") { it.trim() }
             log("$TAG: $peer -> [$requestLine] $headers")
-            if (requestLine.startsWith("GET /ctrl-int/1/connect")) {
-                val receiverId =
-                    head.lineSequence()
-                        .firstOrNull {
-                            it.substringBefore(':').trim().equals("AirPlay-Receiver-Device-ID", ignoreCase = true)
-                        }?.substringAfter(':')
-                        ?.trim()
-                inviteCount++
-                runCatching { onDiagnostic(Event.INVITED) }
+            if (isConnectRequest(requestLine)) {
                 EndpointScope.invitationHost(peer)?.let { host ->
-                    invitations.set(Invitation(host, SystemClock.elapsedRealtime(), registeredNetwork))
+                    val receiverId = head.lineSequence().firstOrNull {
+                        it.substringBefore(':').trim().equals("AirPlay-Receiver-Device-ID", ignoreCase = true)
+                    }?.substringAfter(':')?.trim()
+                    synchronized(this) {
+                        if (invites.current === receipt.epoch) {
+                            refreshAddresses(receipt.epoch)
+                            invites.offer(receipt, client.localAddress,
+                                Invitation(host, SystemClock.elapsedRealtime(), receipt.epoch.network, receiverId))
+                        }
+                    }
                 }
-                log("$TAG: ✓ 车机 ctrl 邀请（第 $inviteCount 次，receiver=${receiverId ?: "?"}）——AirPlay 窗口已开启")
             }
             val response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             // 只 write+flush，**不要 close**：Socket 的输出流一关，后面的读就直接 EOF，
@@ -336,6 +399,8 @@ class CarPlayCtrlAdvertiser(
 
     @Synchronized
     fun stop() {
+        invites.select(null)
+        previousPort = 0
         unregisterMdns()
         registeredSsid = null
         registeredNetwork = null

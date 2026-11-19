@@ -26,6 +26,9 @@ interface Iap2LinkChannel {
         awaitAck: Boolean = true,
     ): Boolean
 
+    fun sendHudControl(bytes: ByteArray, awaitAck: Boolean, messageId: Int): Boolean =
+        sendControl(bytes, awaitAck)
+
     /** 取下一个控制载荷；空数组表示同一传输上的链路重建边界，null 表示超时或结束。 */
     fun recvControl(timeoutMillis: Long): ByteArray?
 
@@ -1122,7 +1125,11 @@ class Iap2SenderSession(
         var offset = 0
         while (offset < frame.size) {
             val end = minOf(offset + limit, frame.size)
-            if (!channel.sendControl(frame.copyOfRange(offset, end), awaitAck)) {
+            val part = frame.copyOfRange(offset, end)
+            val sent = if (messageId == 0x5201 || messageId == 0x5202) {
+                channel.sendHudControl(part, awaitAck, messageId)
+            } else channel.sendControl(part, awaitAck)
+            if (!sent) {
                 throw IOException("iAP2 链路在发送 0x${messageId.toString(16)} 时关闭")
             }
             offset = end

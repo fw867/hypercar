@@ -272,6 +272,28 @@ class WifiIap2ProtocolTest {
     }
 
     private val vehicleMessages = Iap2Csm.u16(6, 0xa101) + Iap2Csm.u16(7, 0xa100)
+
+    @Test fun hudDiagnosticsMatchOutputAndOnlyLogNewCumulativeCoverage() {
+        val car = Car()
+        car.ready()
+        car.navigationAllowed = true
+        car.navigationCue = io.github.hypercar.navigation.NavigationCue("右转", 2, 100)
+        val previousAck = car.ack
+        assertEquals(listOf(0x5202, 0x5201), car.message(0x5200, Iap2Csm.u16(0, 1)).map { it.messageId })
+        val frames = car.protocol.takeHudOutput()
+        assertEquals(listOf(0x5202, 0x5201), frames.map { it.messageId })
+        assertEquals(0, frames[0].offset)
+        assertTrue(frames[1].offset > 0)
+        assertTrue(frames[0].serial < frames[1].serial)
+        assertTrue(car.protocol.takeHudOutput().isEmpty())
+
+        car.feed(packet(0x40, car.sequence, previousAck))
+        assertFalse(car.logs.any { "covered=true" in it })
+        val cumulativeAck = frames.last().sequence
+        repeat(2) { car.feed(packet(0x40, car.sequence, cumulativeAck)) }
+        assertEquals(frames.map { "HUD LINK ${it.label} peer_ack=$cumulativeAck covered=true" },
+            car.logs.filter { "covered=true" in it })
+    }
     private fun vehicleComponent(vararg flags: Int) = Iap2Csm.group(21,
         Iap2Csm.u16(0, 1), Iap2Csm.string(1, "VehicleStatus"),
         *flags.map { Iap2Csm.param(it, byteArrayOf()) }.toTypedArray())

@@ -71,9 +71,13 @@ object WifiIap2Bridge {
                     // takeOutput batches several complete packets (ACK + identification + certificate).
                     // The box sends each separately; don't rely on BMW consuming concatenated frames.
                     val frames = WifiIap2Framing.split(output)
+                    val hudFrames = protocol.takeHudOutput()
+                    var offset = 0
                     if (frames.size > 1) HyperCarRepo.log("WIFI-IAP#$id: split output into ${frames.size} commands bytes=${frames.joinToString { it.size.toString() }}")
                     if (frames.any {
-                        val accepted = RustCoreBridge.nativeSendIap2(id, it)
+                        val hud = hudFrames.firstOrNull { frame -> frame.offset == offset }
+                        offset += it.size
+                        val accepted = RustCoreBridge.nativeSendIap2(id, it, hud?.messageId ?: 0, hud?.serial ?: 0)
                         if (accepted) { queuedFrames++; queuedBytes += it.size }
                         !accepted
                     }) {
@@ -91,6 +95,7 @@ object WifiIap2Bridge {
                 HyperCarRepo.log("WIFI-IAP#$id: ${error.javaClass.simpleName}: ${error.message}")
             } finally {
                 closed = true
+                protocol.endHudTrace()
                 clearVehicle(this)
                 HyperCarRepo.log("WIFI-IAP#$id: END ${protocol.diagnosticSummary} native_queued_frames=$queuedFrames native_queued_bytes=$queuedBytes input_pending=${input.size}")
                 RustCoreBridge.nativeMarkWifiIap2Ready(id, false)

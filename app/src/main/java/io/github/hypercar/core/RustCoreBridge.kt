@@ -121,7 +121,7 @@ object RustCoreBridge {
     external fun nativeMarkWifiIap2Ready(id: Long, ready: Boolean)
     external fun nativeSetWifiIap2Phase(id: Long, phase: String)
     external fun nativeCanKeepWifiSession(): Boolean
-    external fun nativeSendIap2(id: Long, bytes: ByteArray): Boolean
+    external fun nativeSendIap2(id: Long, bytes: ByteArray, hudMessageId: Int, hudSerial: Long): Boolean
 
     /** Request native head-unit UI without tearing down CarPlay or its audio route. */
     external fun nativeRequestHostUi(): Boolean

@@ -59,6 +59,7 @@ internal class WifiIap2Protocol(
         private set
 
     init {
+        engine.hudLog = log
         engine.onDetectionRestart = {
             log("LINK DETECT restart phase=$phase; reset old CSM/auth/subscriptions, retain AirPlay transport")
             parser = Iap2Csm.Parser()
@@ -82,6 +83,10 @@ internal class WifiIap2Protocol(
             log("LINK sessions=${sync.sessions.joinToString { "${it.id}/${it.kind}/${it.version}" }} peerWindow=${sync.maxOutgoing} localWindow=32 maxLength=${sync.maxLength} retry=${sync.retransmissionTimeoutMillis} maxRetries=${sync.maxRetransmissions} ack=${sync.acknowledgementTimeoutMillis} maxCumAck=${sync.maxAcknowledgements}")
         }
     }
+
+    fun takeHudOutput() = engine.takeHudOutput()
+
+    fun endHudTrace() = engine.endHudTrace("transport_ended")
 
     fun feed(bytes: ByteArray, nowMillis: Long): ByteArray {
         if (failed) return ByteArray(0)
@@ -250,7 +255,10 @@ internal class WifiIap2Protocol(
         var offset = 0
         while (offset < frame.size && !failed) {
             val end = minOf(frame.size, offset + limit)
-            if (!engine.sendControl(frame.copyOfRange(offset, end), now)) fail("link refused id=0x${id.toString(16)}")
+            val hudMessageId = if (id == 0x5201 || id == 0x5202) id else 0
+            if (!engine.sendControl(frame.copyOfRange(offset, end), now, hudMessageId = hudMessageId)) {
+                fail("link refused id=0x${id.toString(16)}")
+            }
             offset = end
         }
         if (!failed) {

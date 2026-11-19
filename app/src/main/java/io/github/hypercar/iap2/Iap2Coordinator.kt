@@ -61,6 +61,7 @@ class Iap2Coordinator(
     /** 车机档案：发 iAP2 前是否主动断开该车机的 HFP/A2DP（宝马=false，奥迪=true）。 */
     private val dropProfilesBeforeIap2: Boolean = true,
     private val allowOutboundIap2: Boolean = true,
+    private val profileId: String = "",
     private val log: (String) -> Unit,
     private val onInboundSession: (String?, Long) -> Unit = { _, _ -> },
 ) {
@@ -89,6 +90,10 @@ class Iap2Coordinator(
 
     fun onTargetChanged() = bluetooth?.onTargetChanged()
 
+    internal fun retireCafeHandoff(attempt: Long, reason: String, networkCurrent: (() -> Boolean)? = null) {
+        bluetooth?.retireCafeHandoff(attempt, reason, networkCurrent)
+    }
+
     /**
      * 开始监听/出站；拿到或更新端点即回调（可能多次：0x5703 凭据一次、
      * 0x4301 端点一次、保活期重发再回调）。
@@ -100,6 +105,11 @@ class Iap2Coordinator(
     fun keepIdentityOnly() = startTransport(false, null)
 
     fun diagnosticSummary(): String = bluetooth?.diagnosticSummary() ?: "transport=not-created"
+
+    internal fun pollBmwProbe(probe: BmwCaffProbe, device: android.bluetooth.BluetoothDevice,
+                             since: Long, valid: () -> Boolean) {
+        bluetooth?.pollBmwProbe(probe, device, since, valid)
+    }
 
     fun pauseSessions(closeCurrent: Boolean = true) {
         bluetooth?.setSessionEnabled(false, "pauseSessions", closeCurrent)
@@ -132,6 +142,7 @@ class Iap2Coordinator(
                     bluetoothMacProvider = ::currentBluetoothMac,
                     dropProfilesBeforeIap2 = dropProfilesBeforeIap2,
                     allowOutboundIap2 = allowOutboundIap2,
+                    profileId = profileId,
                     log = log,
                     onEndpoint = { endpoint -> endpointCallback?.invoke(endpoint) },
                     onInboundSession = onInboundSession,

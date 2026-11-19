@@ -40,6 +40,14 @@ class StartupReadinessTest {
         assertFalse(ready.copy(locationEnabled = false).manualReady)
     }
 
+    @Test fun coldStandbyCanWaitForBluetoothButStillChecksOtherRequirements() {
+        val radioOff = ready.copy(bluetoothEnabled = false)
+        assertTrue(radioOff.automaticStandbyIssues.isEmpty())
+        assertFalse(radioOff.automaticReady)
+        assertFalse(radioOff.copy(missingPermissions = listOf("附近设备")).automaticStandbyIssues.isEmpty())
+        assertFalse(radioOff.copy(wifiEnabled = false).automaticStandbyIssues.isEmpty())
+    }
+
     @Test fun missingOverlayBlocksAutomaticOnly() {
         val foregroundOnly = ready.copy(overlayAllowed = false)
         assertTrue(foregroundOnly.manualReady)

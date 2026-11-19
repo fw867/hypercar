@@ -213,6 +213,7 @@ pub struct RtspChannel {
     cipher: Arc<Mutex<Option<ControlCipher>>>,
     cseq: Arc<Mutex<i32>>,
     pending: PendingMap,
+    hud_replies: HudReplies,
     reader: tokio::task::JoinHandle<()>,
     closed: AtomicBool,
     pub(crate) nbt_recorded: tokio::sync::Mutex<bool>,
@@ -276,6 +277,22 @@ struct MbuxHeaderState {
     async_cseqs: VecDeque<i32>,
 }
 type MbuxSession = Arc<std::sync::OnceLock<Mutex<MbuxHeaderState>>>;
+type HudReplies = Arc<Mutex<VecDeque<(i32, HudPostTrace)>>>;
+
+#[derive(Clone, Copy)]
+pub(crate) struct HudPostTrace {
+    pub link_id: u64,
+    pub message_id: u16,
+    pub seq: u8,
+    pub serial: u64,
+}
+
+impl std::fmt::Display for HudPostTrace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WIFI-IAP#{} id=0x{:04x} seq={} hud_serial={}",
+            self.link_id, self.message_id, self.seq, self.serial)
+    }
+}
 type SharedViewAreas = Arc<std::sync::OnceLock<crate::display_layout::ViewAreas>>;
 
 #[derive(Debug)]
@@ -342,6 +359,7 @@ impl RtspChannel {
         let cipher = Arc::new(Mutex::new(cipher));
         let cseq = Arc::new(Mutex::new(0));
         let pending = Arc::new(Mutex::new(HashMap::new()));
+        let hud_replies: HudReplies = Arc::default();
         let (inbound_tx, inbound) = mpsc::unbounded_channel();
         let trace_id = CHANNEL_IDS.fetch_add(1, Ordering::Relaxed);
         let session_uri = Arc::default();
@@ -358,6 +376,7 @@ impl RtspChannel {
             write.clone(),
             cipher.clone(),
             pending.clone(),
+            hud_replies.clone(),
             inbound_tx,
             trace_id,
             reply,
@@ -375,6 +394,7 @@ impl RtspChannel {
             cipher,
             cseq,
             pending,
+            hud_replies,
             reader,
             closed: AtomicBool::new(false),
             nbt_recorded: tokio::sync::Mutex::new(false),
@@ -602,6 +622,12 @@ impl RtspChannel {
         body: &[u8],
         content_type: &str,
     ) -> Result<i32, String> {
+        self.post_traced(path, body, content_type, None).await
+    }
+
+    pub(crate) async fn post_traced(
+        &self, path: &str, body: &[u8], content_type: &str, hud: Option<HudPostTrace>,
+    ) -> Result<i32, String> {
         if self.is_closed() { return Err("控制通道已关闭".into()); }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         let cseq = self.next_cseq();
@@ -609,6 +635,12 @@ impl RtspChannel {
         let mut w = tokio::time::timeout_at(deadline, self.write.lock()).await
             .map_err(|_| "事件通道等待写锁超时".to_string())?;
         if self.is_closed() { return Err("控制通道已关闭".into()); }
+        // Register before writing so a reply racing flush still has its CSeq metadata.
+        if let Some(hud) = hud {
+            let mut replies = self.hud_replies.lock();
+            if replies.len() >= 256 { replies.pop_front(); }
+            replies.push_back((cseq, hud));
+        }
         if let Some(store) = self.mbux_session.get() {
             let mut state = store.lock();
             if state.async_cseqs.len() >= 128 { state.async_cseqs.pop_front(); }
@@ -642,6 +674,9 @@ impl RtspChannel {
                 format!("事件通道写失败: {e}")
             })?;
         transaction.writing = false;
+        if let Some(hud) = hud {
+            crate::emit_log(&format!("HUD {hud} RTSP#{} CSeq={cseq} written", self.trace_id));
+        }
         Ok(cseq)
     }
 
@@ -701,6 +736,7 @@ async fn reader_loop(
     write: SharedWrite,
     cipher: SharedCipher,
     pending: PendingMap,
+    hud_replies: HudReplies,
     inbound_tx: mpsc::UnboundedSender<RtspMessage>,
     trace_id: u64,
     reply: Option<CommandReply>,
@@ -802,7 +838,15 @@ async fn reader_loop(
                         unsolicited_responses += 1;
                         let business_status = crate::bplist::parse(&msg.body).ok()
                             .and_then(|v| v.get("status").and_then(crate::bplist::Value::as_int));
-                        if msg.status() != 200 || business_status.is_some_and(|s|s != 0) || unsolicited_responses <= 128 {
+                        let hud = {
+                            let mut replies = hud_replies.lock();
+                            replies.iter().position(|(seq, _)| *seq == c)
+                                .and_then(|index| replies.remove(index)).map(|(_, trace)| trace)
+                        };
+                        if let Some(hud) = hud {
+                            crate::emit_log(&format!("HUD {hud} RTSP#{trace_id} CSeq={c} response status={} business_status={business_status:?} body={}B",
+                                msg.status(), msg.body.len()));
+                        } else if msg.status() != 200 || business_status.is_some_and(|s|s != 0) || unsolicited_responses <= 128 {
                             crate::emit_log(&format!("RTSP#{trace_id} async RX CSeq={c} status={} business_status={business_status:?} body={}B; link ACK separate", msg.status(), msg.body.len()));
                         }
                     }
@@ -1573,6 +1617,30 @@ mod cancellation_tests {
             bytes.extend_from_slice(&chunk[..n]);
             if let Some(message) = parse_rtsp_messages(&mut bytes).unwrap().pop() { return message; }
         }
+    }
+
+    #[tokio::test]
+    async fn hud_post_does_not_wait_and_only_matching_cseq_consumes_its_trace() {
+        let (channel, mut peer) = pair().await;
+        let message = HudPostTrace { link_id: 7, message_id: 0x5201, seq: 255, serial: 3 };
+        let cseq = channel.post_traced("/command", b"hud", "application/octet-stream", Some(message)).await.unwrap();
+        let request = read_request(&mut peer).await;
+        assert_eq!(request.cseq(), Some(cseq));
+        assert_eq!(request.body, b"hud");
+        let next = channel.post_traced("/command", b"turn", "application/octet-stream",
+            Some(HudPostTrace { message_id: 0x5202, seq: 0, serial: 4, ..message })).await.unwrap();
+        assert_eq!(read_request(&mut peer).await.cseq(), Some(next));
+        let body = crate::bplist::encode(&crate::bplist::Value::dict(vec![
+            ("status", crate::bplist::Value::Int(-10)),
+        ]));
+        peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {next}\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+        peer.write_all(&body).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while channel.hud_replies.lock().len() != 1 {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert_eq!(channel.hud_replies.lock().front().map(|(seq, trace)| (*seq, trace.serial)), Some((cseq, 3)));
     }
 
     #[tokio::test]

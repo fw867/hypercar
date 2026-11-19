@@ -49,14 +49,16 @@ class HyperCarService : Service() {
             }
         }
         identityOnly = requestedIdentity && paused
-        if (automatic && autoEnabled && !identityOnly && !io.github.hypercar.session.HyperCarRepo.hasCurrentSession &&
-            !io.github.hypercar.session.StartupRequirements.read(this).automaticReady) {
-            io.github.hypercar.session.HyperCarRepo.setAutoConnect(this, false)
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            releaseLocks()
-            isRunning = false
-            stopSelf()
-            return START_NOT_STICKY
+        if (automatic && autoEnabled && !identityOnly && !io.github.hypercar.session.HyperCarRepo.hasCurrentSession) {
+            val readiness = io.github.hypercar.session.StartupRequirements.read(this)
+            if (readiness.automaticStandbyIssues.isNotEmpty()) {
+                if (readiness.bluetoothEnabled) io.github.hypercar.session.HyperCarRepo.setAutoConnect(this, false)
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                releaseLocks()
+                isRunning = false
+                stopSelf()
+                return START_NOT_STICKY
+            }
         }
         if (intent?.action == ACTION_COMPANION && !CompanionWakePolicy.accepts(
                 autoEnabled, io.github.hypercar.settings.SettingsStore.targetCarMac, intent.getStringExtra(EXTRA_ADDRESS),

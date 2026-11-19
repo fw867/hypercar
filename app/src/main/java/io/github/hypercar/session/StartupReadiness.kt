@@ -26,4 +26,7 @@ data class StartupReadiness(
         if (overlayAllowed) emptyList() else listOf("允许悬浮窗权限，以便上车自动唤醒")
     val manualReady: Boolean get() = manualIssues.isEmpty()
     val automaticReady: Boolean get() = automaticIssues.isEmpty()
+    /** The standby listener can wait for the Bluetooth adapter to turn on. */
+    val automaticStandbyIssues: List<String> get() =
+        if (bluetoothEnabled) automaticIssues else copy(bluetoothEnabled = true).automaticIssues
 }

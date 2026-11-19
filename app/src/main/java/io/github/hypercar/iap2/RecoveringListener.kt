@@ -21,7 +21,7 @@ internal class RecoveringListener<S : Closeable, C : Closeable>(
     fun acceptNext(): C? {
         while (active()) {
             try {
-                val listener = socket.get() ?: open().let { created ->
+                val listener = socket.get() ?: socketOperation(open).let { created ->
                     if (!active()) { runCatching { created.close() }; return null }
                     if (socket.compareAndSet(null, created)) {
                         if (!active()) { close(); return null }
@@ -30,7 +30,7 @@ internal class RecoveringListener<S : Closeable, C : Closeable>(
                     socket.get()
                 } ?: continue
                 if (!active()) { close(); return null }
-                val connection = accept(listener)
+                val connection = socketOperation { accept(listener) }
                 if (!active()) { runCatching { connection.close() }; close(); return null }
                 return connection
             } catch (error: IOException) {
@@ -42,6 +42,12 @@ internal class RecoveringListener<S : Closeable, C : Closeable>(
         }
         close()
         return null
+    }
+
+    private inline fun <T> socketOperation(operation: () -> T): T = try {
+        operation()
+    } catch (error: RuntimeException) {
+        throw IOException("蓝牙监听 socket 操作失败：${error.javaClass.simpleName}", error)
     }
 
     override fun close() {
