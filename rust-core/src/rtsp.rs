@@ -640,6 +640,14 @@ impl RtspChannel {
     pub(crate) async fn post_traced(
         &self, path: &str, body: &[u8], content_type: &str, hud: Option<HudPostTrace>,
     ) -> Result<i32, String> {
+        self.post_traced_if(path, body, content_type, hud, || true).await
+            .map(|cseq| cseq.expect("unconditional RTSP write"))
+    }
+
+    pub(crate) async fn post_traced_if(
+        &self, path: &str, body: &[u8], content_type: &str, hud: Option<HudPostTrace>,
+        should_write: impl FnOnce() -> bool,
+    ) -> Result<Option<i32>, String> {
         if self.is_closed() { return Err("控制通道已关闭".into()); }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         let cseq = self.next_cseq();
@@ -647,6 +655,7 @@ impl RtspChannel {
         let mut w = tokio::time::timeout_at(deadline, self.write.lock()).await
             .map_err(|_| "事件通道等待写锁超时".to_string())?;
         if self.is_closed() { return Err("控制通道已关闭".into()); }
+        if !should_write() { return Ok(None); }
         // Register before writing so a reply racing flush still has its CSeq metadata.
         if let Some(hud) = hud {
             let mut replies = self.hud_replies.lock();
@@ -689,7 +698,7 @@ impl RtspChannel {
         if let Some(hud) = hud {
             crate::emit_log(&format!("HUD {hud} RTSP#{} CSeq={cseq} written", self.trace_id));
         }
-        Ok(cseq)
+        Ok(Some(cseq))
     }
 
     fn record_close(&self, cause: &str) {

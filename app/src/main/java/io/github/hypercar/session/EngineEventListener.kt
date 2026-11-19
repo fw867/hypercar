@@ -44,8 +44,10 @@ internal class EngineEventListener(
         target.onDisplayLayout(width, height, viewX, viewY, viewWidth, viewHeight,
             safeX, safeY, safeWidth, safeHeight, drawOutside)
     }
-    override fun onIap2Start(id: Long, deviceId: String, deviceName: String) = deliver { target.onIap2Start(id, deviceId, deviceName) }
+    override fun onIap2Start(id: Long, deviceId: String, deviceName: String, profileId: String) =
+        deliver { target.onIap2Start(id, deviceId, deviceName, profileId) }
     override fun onIap2Bytes(id: Long, bytes: ByteArray) = deliver { target.onIap2Bytes(id, bytes) }
+    override fun onIap2ScreenSetupAccepted(id: Long) = deliver { target.onIap2ScreenSetupAccepted(id) }
     // Stop is already scoped by the Wi-Fi iAP2 ID. Retire the old worker even while waiting.
     override fun onIap2Stop(id: Long) = target.onIap2Stop(id)
 }

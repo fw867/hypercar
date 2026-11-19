@@ -237,11 +237,13 @@ pub(crate) fn emit_carwith_navigation(token:u64, update:Option<&carlife::navigat
     });
 }
 
-pub(crate) fn emit_iap2_start(id: u64, device: &str, device_name: &str) {
+pub(crate) fn emit_iap2_start(id: u64, device: &str, device_name: &str, profile_id: &str) {
     call_listener("onIap2Start", |env, obj| {
         let name = env.new_string(device)?;
         let display_name = env.new_string(device_name)?;
-        env.call_method(obj, "onIap2Start", "(JLjava/lang/String;Ljava/lang/String;)V", &[(id as jlong).into(), (&name).into(), (&display_name).into()]).map(|_| ())
+        let profile = env.new_string(profile_id)?;
+        env.call_method(obj, "onIap2Start", "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            &[(id as jlong).into(), (&name).into(), (&display_name).into(), (&profile).into()]).map(|_| ())
     });
 }
 
@@ -256,6 +258,26 @@ pub(crate) fn emit_iap2_stop(id: u64) {
     call_listener("onIap2Stop", |env, obj| {
         env.call_method(obj, "onIap2Stop", "(J)V", &[(id as jlong).into()]).map(|_| ())
     });
+}
+
+pub(crate) fn emit_iap2_screen_setup_accepted(id: u64) {
+    call_listener("onIap2ScreenSetupAccepted", |env, obj| {
+        env.call_method(obj, "onIap2ScreenSetupAccepted", "(J)V", &[(id as jlong).into()]).map(|_| ())
+    });
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeWifiIap2PeerSyn(
+    _env: JNIEnv, _class: JClass, id: jlong,
+) {
+    wifi_iap2::peer_syn_accepted(id as u64);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendWifiIap2Detect(
+    _env: JNIEnv, _class: JClass, id: jlong,
+) -> jboolean {
+    if wifi_iap2::queue_startup_detect(id as u64) { JNI_TRUE } else { JNI_FALSE }
 }
 
 #[no_mangle]

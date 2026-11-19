@@ -218,7 +218,7 @@ class WifiIap2ProtocolTest {
         return frames.filter { it.session != 0 }.flatMap { parsers.getOrPut(it.session){Iap2Csm.Parser()}.offer(it.body) }
     }
 
-    private inner class Car(val window: Int = 32, val controlSession: Int = 1, val deviceName: String = "HyperCar", val packetLength:Int = 65535) {
+    private inner class Car(val window: Int = 32, val controlSession: Int = 1, val deviceName: String = "HyperCar", val packetLength:Int = 65535, profileId: String = "") {
         val logs = mutableListOf<String>()
         val mediaKeys = mutableListOf<Int>()
         var authenticationOutput = emptyList<Iap2Csm.Frame>()
@@ -226,9 +226,9 @@ class WifiIap2ProtocolTest {
         val vehicleUpdates = mutableListOf<Iap2VehicleStatus>()
         var navigationAllowed = false
         var navigationCue: io.github.hypercar.navigation.NavigationCue? = null
-        val protocol = WifiIap2Protocol("test-device", { logs += it }, { ByteArray(32) { 7 } },
+        val protocol = WifiIap2Protocol("test-device", { logs += it }, { size -> ByteArray(size) { 7 } },
             navigationEnabled = { navigationAllowed }, navigationCue = { navigationCue }, deviceName = deviceName, onMediaKey = mediaKeys::add,
-            nowPlayingProvider = { nowPlaying }, onVehicleStatus = vehicleUpdates::add)
+            nowPlayingProvider = { nowPlaying }, onVehicleStatus = vehicleUpdates::add, profileId = profileId)
         var sequence = 86
         var ack = 0
         var time = 1L
@@ -239,7 +239,8 @@ class WifiIap2ProtocolTest {
             return commands.flatMap { split(it) }.also { out -> out.lastOrNull()?.let { ack=it.seq } }
         }
         fun start(configure: (Iap2LinkEngine.SynchronizationPayload) -> Iap2LinkEngine.SynchronizationPayload = { it }): List<Iap2Csm.Frame> {
-            assertArrayEquals(Iap2LinkEngine.MARKER, protocol.feed(Iap2LinkEngine.MARKER, time++))
+            val echo = protocol.feed(Iap2LinkEngine.MARKER, time++)
+            assertArrayEquals(if (audi) byteArrayOf() else Iap2LinkEngine.MARKER, echo)
             val sync = Iap2LinkEngine.SynchronizationPayload(window, packetLength, 0, 0, 0, 0,
                 listOf(Iap2LinkEngine.SessionDescriptor(controlSession, 0, 2), Iap2LinkEngine.SessionDescriptor(2, 1, 2)))
             val syn = packet(0x80, sequence, 0, body = configure(sync).encode())
@@ -249,6 +250,7 @@ class WifiIap2ProtocolTest {
             assertEquals(32, answer.body[1].toInt())
             return messages(feed(packet(0x40, sequence, ack)))
         }
+        private val audi = profileId == "audi_mib3"
         fun message(id: Int, body: ByteArray = byteArrayOf()): List<Iap2Csm.Frame> =
             messages(feed(packet(0x40, ++sequence, ack, controlSession, Iap2Csm.encode(id, body))))
         fun ready(identificationBody: ByteArray = byteArrayOf(), beforeIdentification: () -> Unit = {}) {
@@ -269,6 +271,86 @@ class WifiIap2ProtocolTest {
             assertEquals(deviceName, name.asStringOrNull())
             assertFalse(protocol.failed)
         }
+    }
+
+    @Test fun audiMib3ChallengeUses20BytesAndSeparatelyTracksAckAndResponse() {
+        val car = Car(profileId = "audi_mib3")
+        car.start()
+        car.message(0x1d01)
+        val previousAck = car.ack
+        val challenge = car.message(0xaa01, Iap2Csm.param(0, byteArrayOf(1))).single()
+        assertEquals(0xaa02, challenge.messageId)
+        assertArrayEquals(ByteArray(20) { 7 }, Iap2Csm.parseParams(challenge.body).single().value)
+        val challengeSequence = car.ack
+        car.feed(packet(0x40, car.sequence, previousAck))
+        car.feed(packet(0x40, car.sequence, (challengeSequence + 1) and 255))
+        assertTrue(car.protocol.diagnosticSummary.contains("aa02_ack=false aa03_rx=false"))
+        repeat(2) { car.feed(packet(0x40, car.sequence, challengeSequence)) }
+        assertTrue(car.protocol.diagnosticSummary.contains("aa02_ack=true aa03_rx=false"))
+        assertEquals(1, car.logs.count { "AUTH AA02 cumulative ACK" in it })
+        val output = car.message(0xaa03, Iap2Csm.param(0, ByteArray(128)))
+        assertEquals(0xaa05, output.first().messageId)
+        assertTrue(car.protocol.diagnosticSummary.contains("aa02_ack=true aa03_rx=true"))
+    }
+
+    @Test fun otherWifiProfilesRetain32ByteChallenge() {
+        for (profile in listOf("", "bmw_id85", "bmw_id9", "mercedes_mbux", "volkswagen_mib")) {
+            Car(profileId = profile).ready()
+        }
+    }
+
+    @Test fun audiMib3DetectWaitsForFirstScreenSetupAndDoesNotRepeatOnRebuild() {
+        val car = Car(profileId = "audi_mib3")
+        assertTrue(car.protocol.feed(Iap2LinkEngine.MARKER, car.time++).isEmpty())
+        assertFalse(car.protocol.takeStartupDetect())
+        car.protocol.screenSetupAccepted()
+        assertTrue(car.protocol.takeStartupDetect())
+        assertTrue(car.protocol.feed(Iap2LinkEngine.MARKER, car.time++).isEmpty())
+        car.protocol.screenSetupAccepted()
+        assertFalse(car.protocol.takeStartupDetect())
+        val reinvited = Car(profileId = "audi_mib3")
+        assertFalse(reinvited.protocol.takeStartupDetect())
+        reinvited.protocol.screenSetupAccepted()
+        assertTrue(reinvited.protocol.takeStartupDetect())
+    }
+
+    @Test fun audiMib3KeepsAnEarlySynSplitAcrossScreenSetupWithoutSendingDetect() {
+        val car = Car(profileId = "audi_mib3")
+        val sync = Iap2LinkEngine.SynchronizationPayload(5, 2048, 3000, 30, 700, 3,
+            listOf(Iap2LinkEngine.SessionDescriptor(car.controlSession, 0, 2)))
+        val syn = packet(0x80, car.sequence, 0, body = sync.encode())
+        assertTrue(car.feed(syn.copyOfRange(0, 6)).isEmpty())
+        car.protocol.screenSetupAccepted()
+        assertFalse(car.protocol.takeStartupDetect())
+        val response = car.feed(syn.copyOfRange(6, syn.size)).single()
+        assertEquals(0xc0, response.control)
+        assertFalse(car.protocol.takeStartupDetect())
+        assertEquals(listOf(0x1d00), messages(car.feed(packet(0x40, car.sequence, response.seq))).map { it.messageId })
+        car.protocol.screenSetupAccepted()
+        assertFalse(car.protocol.takeStartupDetect())
+    }
+
+    @Test fun audiMib3ProcessesDetectAndSynFromTheSameReadBeforeScreenSetup() {
+        val car = Car(profileId = "audi_mib3")
+        val sync = Iap2LinkEngine.SynchronizationPayload(5, 2048, 3000, 30, 700, 3,
+            listOf(Iap2LinkEngine.SessionDescriptor(car.controlSession, 0, 2)))
+        val syn = packet(0x80, car.sequence, 0, body = sync.encode())
+        val response = car.feed(Iap2LinkEngine.MARKER + syn).single()
+        assertEquals(0xc0, response.control)
+        car.protocol.screenSetupAccepted()
+        assertFalse(car.protocol.takeStartupDetect())
+    }
+
+    @Test fun audiMib3RecordsResponseEvenWhenItDoesNotCoverChallengeSequence() {
+        val car = Car(profileId = "audi_mib3")
+        car.start()
+        car.message(0x1d01)
+        val previousAck = car.ack
+        car.message(0xaa01, Iap2Csm.param(0, byteArrayOf(1)))
+        val signed = Iap2Csm.encode(0xaa03, Iap2Csm.param(0, ByteArray(128)))
+        val response = car.feed(packet(0x40, ++car.sequence, previousAck, car.controlSession, signed))
+        assertEquals(0xaa05, messages(response).first().messageId)
+        assertTrue(car.protocol.diagnosticSummary.contains("aa02_ack=false aa03_rx=true"))
     }
 
     private val vehicleMessages = Iap2Csm.u16(6, 0xa101) + Iap2Csm.u16(7, 0xa100)

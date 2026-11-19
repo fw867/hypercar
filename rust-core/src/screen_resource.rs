@@ -290,7 +290,7 @@ mod tests {
             let (commands,rx)=mpsc::channel(2);let (source,video_rx)=mpsc::unbounded_channel();
             let pump=tokio::spawn(video_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(PumpStat::default())),true,pipeline,rx,video_rx,None,30,None));
             let owned=Arc::new(AtomicBool::new(modes.screen_owned()));
-            let session=Arc::new(ScreenSession {control,factory:Arc::new(Factory),params,shared:Some([9;32]),uuid:"screen-test".into(),
+            let session=Arc::new(ScreenSession {control,wifi_iap_id:0,factory:Arc::new(Factory),params,shared:Some([9;32]),uuid:"screen-test".into(),
                 hevc_allowed:false,keep_stats:false,software_receiver:false,display:(1920,720),owned,commands,bootstrap_event:None,bootstrap_hids:Vec::new(),activated:AtomicBool::new(!mbux),resource_state:tokio::sync::Mutex::new(Default::default())});
             Self {session,modes:Arc::new(Mutex::new(modes)),car,video,source,pump}
         }

@@ -7,14 +7,18 @@ import java.util.TimeZone
 internal class WifiIap2Protocol(
     private val deviceId: String,
     private val log: (String) -> Unit,
-    private val nonce: () -> ByteArray = { ByteArray(32).also(SecureRandom()::nextBytes) },
+    private val nonce: (Int) -> ByteArray = { size -> ByteArray(size).also(SecureRandom()::nextBytes) },
     private val navigationEnabled: () -> Boolean = { false },
     private val navigationCue: () -> io.github.hypercar.navigation.NavigationCue? = { null },
     private val deviceName: String = "HyperCar",
     private val onMediaKey: (Int) -> Unit = {},
     private val nowPlayingProvider: () -> Iap2NowPlaying = { Iap2NowPlaying() },
     onVehicleStatus: (Iap2VehicleStatus) -> Unit = {},
+    profileId: String = "",
+    private val onPeerSynAccepted: () -> Unit = {},
 ) {
+    private val audiMib3 = profileId == "audi_mib3"
+    private val challengeSize = if (audiMib3) 20 else 32
     private val engine = Iap2LinkEngine(reliableTransport = true, declaredWindow = 32)
     private var parser = Iap2Csm.Parser()
     private val media = Iap2MediaSession(log, onMediaKey)
@@ -37,11 +41,20 @@ internal class WifiIap2Protocol(
     private var lastQueuedMessage: Int? = null
     private var receivedNowPlayingStarts = 0L
     private var queuedNowPlayingUpdates = 0L
+    private var challengeSequence: Int? = null
+    private var challengeAcknowledged = false
+    private var challengeResponseReceived = false
+    private var screenSetupSeen = false
+    private var startupDetectTaken = false
+    private var peerSynSeen = false
+    private val challengeDiagnostic: String get() =
+        "aa02_seq=${challengeSequence ?: "none"} aa02_ack=$challengeAcknowledged aa03_rx=$challengeResponseReceived"
     val diagnosticSummary: String get() = "phase=$diagnosticPhase pending=${engine.queuedControlPackets} outstanding=${engine.outstandingPackets} " +
         "rx_frames=$receivedFrames tx_frames=$sentFrames $lastRx $lastTx " +
         "${media.diagnosticSummary} rx_5000=$receivedNowPlayingStarts queued_5001=$queuedNowPlayingUpdates " +
         "last_rx_csm=${lastReceivedMessage?.let { "0x${it.toString(16)}" } ?: "none"} " +
-        "last_queued_csm=${lastQueuedMessage?.let { "0x${it.toString(16)}" } ?: "none"}; link output/queue only, RTSP acceptance separate"
+        "last_queued_csm=${lastQueuedMessage?.let { "0x${it.toString(16)}" } ?: "none"}" +
+        (if (audiMib3) " $challengeDiagnostic" else "") + "; link output/queue only, RTSP acceptance separate"
     private var now = 0L
     private var peerWaitSince: Long? = null
     private var nextPeerWaitLog = 0L
@@ -60,7 +73,26 @@ internal class WifiIap2Protocol(
 
     init {
         engine.hudLog = log
+        engine.deferInitialDetectEcho = audiMib3
+        if (audiMib3) {
+            engine.onPeerAcknowledgement = { ack, lastSent ->
+                val sequence = challengeSequence
+                if (sequence != null && !challengeAcknowledged) {
+                    // Accept only cumulative ACKs that cover AA02 without acknowledging unsent bytes.
+                    val distanceToLastSent = (lastSent - sequence) and 255
+                    val distanceToAck = (ack - sequence) and 255
+                    if (distanceToLastSent < 128 && distanceToAck <= distanceToLastSent) {
+                        challengeAcknowledged = true
+                        log("AUTH AA02 cumulative ACK seq=$sequence peer_ack=$ack")
+                    }
+                }
+            }
+        }
         engine.onDetectionRestart = {
+            if (challengeSequence != null) log("AUTH LINK reset $challengeDiagnostic")
+            challengeSequence = null
+            challengeAcknowledged = false
+            challengeResponseReceived = false
             log("LINK DETECT restart phase=$phase; reset old CSM/auth/subscriptions, retain AirPlay transport")
             parser = Iap2Csm.Parser()
             media.reset()
@@ -80,8 +112,22 @@ internal class WifiIap2Protocol(
         engine.onFrameReceived = { ctl, seq, ack, session, size -> trace("RX", ctl, seq, ack, session, size) }
         engine.onFrameSent = { ctl, seq, ack, session, size -> trace("TX", ctl, seq, ack, session, size) }
         engine.onPeerSynchronizationAdopted = { sync ->
+            peerSynSeen = true
+            if (audiMib3) onPeerSynAccepted()
             log("LINK sessions=${sync.sessions.joinToString { "${it.id}/${it.kind}/${it.version}" }} peerWindow=${sync.maxOutgoing} localWindow=32 maxLength=${sync.maxLength} retry=${sync.retransmissionTimeoutMillis} maxRetries=${sync.maxRetransmissions} ack=${sync.acknowledgementTimeoutMillis} maxCumAck=${sync.maxAcknowledgements}")
         }
+    }
+
+    fun screenSetupAccepted() {
+        if (!audiMib3 || screenSetupSeen) return
+        screenSetupSeen = true
+        if (peerSynSeen) log("LINK startup DETECT skipped: peer SYN already accepted")
+    }
+
+    fun takeStartupDetect(): Boolean {
+        if (!screenSetupSeen || startupDetectTaken || peerSynSeen || engine.hasPartialInput || failed) return false
+        startupDetectTaken = true
+        return true
     }
 
     fun takeHudOutput() = engine.takeHudOutput()
@@ -96,7 +142,8 @@ internal class WifiIap2Protocol(
             started = true
             deadline = now + 15_000
             engine.start(now, passive = true)
-            log("LINK peer bytes=${bytes.size}; reply DETECT, await peer SYN")
+            log("LINK peer bytes=${bytes.size}; " +
+                if (audiMib3) "parse immediately; startup DETECT gated on screen SETUP" else "reply DETECT, await peer SYN")
         }
         engine.feed(bytes, now)
         return advance(now)
@@ -205,11 +252,15 @@ internal class WifiIap2Protocol(
                 phase = "CHALLENGE"
                 deadline = now + 10_000
                 nextWaitLog = now + 2_000
-                val challenge = nonce()
-                require(challenge.size == 32)
+                val challenge = nonce(challengeSize)
+                require(challenge.size == challengeSize)
                 send(0xaa02, Iap2Csm.param(0, challenge))
             }
             0xaa03 -> if (phase == "CHALLENGE") {
+                if (audiMib3) {
+                    challengeResponseReceived = true
+                    log("AUTH AA03 received $challengeDiagnostic")
+                }
                 if (!Iap2Csm.hasNonEmptyParameter(frame.body, 0)) {
                     fail("empty challenge response")
                     return
@@ -256,7 +307,15 @@ internal class WifiIap2Protocol(
         while (offset < frame.size && !failed) {
             val end = minOf(frame.size, offset + limit)
             val hudMessageId = if (id == 0x5201 || id == 0x5202) id else 0
-            if (!engine.sendControl(frame.copyOfRange(offset, end), now, hudMessageId = hudMessageId)) {
+            val onSequenceAssigned: ((Int) -> Unit)? =
+                if (audiMib3 && id == 0xaa02 && end == frame.size) {
+                    { sequence ->
+                        challengeSequence = sequence
+                        log("AUTH AA02 challengeBytes=$challengeSize final_seq=$sequence")
+                    }
+                } else null
+            if (!engine.sendControl(frame.copyOfRange(offset, end), now, hudMessageId = hudMessageId,
+                    onSequenceAssigned = onSequenceAssigned)) {
                 fail("link refused id=0x${id.toString(16)}")
             }
             offset = end

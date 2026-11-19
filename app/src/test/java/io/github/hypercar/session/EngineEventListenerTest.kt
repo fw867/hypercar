@@ -46,6 +46,7 @@ class EngineEventListenerTest {
     @Test fun oldSamePeerCallbacksCannotConsumeOrResetNewFirstMediaDefaults() {
         val gate = EngineCallbackGate()
         var linkId = 0L
+        var linkProfile = ""
         var state = Iap2NowPlaying(title="real")
         var session: Iap2NowPlayingSession? = null
         val target = object : RustCoreBridge.EventListener {
@@ -53,8 +54,9 @@ class EngineEventListenerTest {
             override fun onLog(line: String) {}
             override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {}
             override fun onNightMode(night: Boolean) {}
-            override fun onIap2Start(id: Long, deviceId: String, deviceName: String) {
+            override fun onIap2Start(id: Long, deviceId: String, deviceName: String, profileId: String) {
                 linkId = id
+                linkProfile = profileId
                 session = Iap2NowPlayingSession({ state }).also { it.authenticated() }
             }
             // Model the bridge's ID gates. The protocol tests separately exercise actual link framing.
@@ -70,17 +72,18 @@ class EngineEventListenerTest {
         fun fields(now: Long) = Iap2Csm.parseParams(Iap2Csm.parseParams(updates(now).single().body).single().value)
             .associateBy { it.id }
         val old = EngineEventListener(gate,gate.begin(),target)
-        old.onIap2Start(11,"same-peer","phone"); old.onIap2Bytes(11,start)
+        old.onIap2Start(11,"same-peer","phone", "audi_mib3"); old.onIap2Bytes(11,start)
         assertTrue(fields(0).containsKey(0))
         val current = EngineEventListener(gate,gate.begin(),target)
-        current.onIap2Start(12,"same-peer","phone")
+        current.onIap2Start(12,"same-peer","phone", "bmw_id85")
         old.onIap2Bytes(11,start); old.onIap2Bytes(12,start)
         current.onIap2Bytes(11,start)
         old.onIap2Stop(11)
         assertTrue(updates(1).isEmpty()) // Old subscriptions cannot consume new initialization.
         current.onIap2Bytes(12,start)
         assertTrue(fields(2).containsKey(0))
-        old.onIap2Start(11,"same-peer","phone")
+        old.onIap2Start(11,"same-peer","phone", "audi_mib3")
+        assertEquals("bmw_id85", linkProfile)
         old.onIap2Bytes(12,Iap2Csm.encode(0x5002)); old.onIap2Stop(11)
         state = state.copy(title="latest")
         val changed = fields(102)
@@ -99,7 +102,7 @@ class EngineEventListenerTest {
             override fun onLog(line: String) {}
             override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {}
             override fun onNightMode(night: Boolean) {}
-            override fun onIap2Start(id: Long, deviceId: String, deviceName: String) {
+            override fun onIap2Start(id: Long, deviceId: String, deviceName: String, profileId: String) {
                 linkId=id
                 session=io.github.hypercar.iap2.Iap2NowPlayingSession(initializeArtworkWithEmptyFile=true).also {
                     it.authenticated();it.handle(io.github.hypercar.iap2.Iap2Csm.Frame(0x5000,byteArrayOf()))
@@ -112,10 +115,10 @@ class EngineEventListenerTest {
         fun files(now: Long)=session!!.poll(now,2048,true)
             .filterIsInstance<io.github.hypercar.iap2.Iap2NowPlayingSession.Output.File>().map { it.bytes }
         val old=EngineEventListener(gate,gate.begin(),target)
-        old.onIap2Start(11,"same-device","phone")
+        old.onIap2Start(11,"same-device","phone", "audi_mib3")
         assertEquals(0x80.toByte(),files(0).single()[0])
         val current=EngineEventListener(gate,gate.begin(),target)
-        current.onIap2Start(12,"same-device","phone")
+        current.onIap2Start(12,"same-device","phone", "audi_mib3")
         assertEquals(0x80.toByte(),files(0).single()[0])
         for(command in listOf(1,5)) {
             val reply=byteArrayOf(0x80.toByte(),command.toByte())
@@ -138,6 +141,7 @@ class EngineEventListenerTest {
         var wifiId = 0L
         var starts = 0
         val received = mutableListOf<Long>()
+        val screenSetupAccepted = mutableListOf<Long>()
         var stopped = false
         val audioTakes = mutableListOf<Boolean>()
         var pending: (() -> Unit)? = null
@@ -155,8 +159,9 @@ class EngineEventListenerTest {
             override fun onLog(line: String) {}
             override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {}
             override fun onNightMode(night: Boolean) {}
-            override fun onIap2Start(id: Long, deviceId: String, deviceName: String) { wifiId = id; starts++ }
+            override fun onIap2Start(id: Long, deviceId: String, deviceName: String, profileId: String) { wifiId = id; starts++ }
             override fun onIap2Bytes(id: Long, bytes: ByteArray) { if (wifiId == id) received += id }
+            override fun onIap2ScreenSetupAccepted(id: Long) { if (wifiId == id) screenSetupAccepted += id }
             override fun onIap2Stop(id: Long) { if (wifiId == id) wifiId = 0 }
         }
         class Invite(val host: String)
@@ -164,7 +169,7 @@ class EngineEventListenerTest {
         val firstInvite = Invite("172.16.222.97")
         invites.set(firstInvite)
         val old = EngineEventListener(gate, gate.begin(), target)
-        old.onIap2Start(11, "phone", "phone")
+        old.onIap2Start(11, "phone", "phone", "audi_mib3")
         old.onState("failed", "SETUP 400")
         assertTrue(activation.rejected)
         val nextInvite = Invite(firstInvite.host)
@@ -177,7 +182,7 @@ class EngineEventListenerTest {
         assertEquals(0L, wifiId)
         activation = ProactiveActivation()
         val current = EngineEventListener(gate, gate.begin(), target)
-        current.onIap2Start(12, "phone", "phone")
+        current.onIap2Start(12, "phone", "phone", "audi_mib3")
         old.onReceiverAudioTake(true)
         current.onReceiverAudioTake(true)
         old.onReceiverAudioTake(false)
@@ -187,7 +192,7 @@ class EngineEventListenerTest {
         old.onState("failed", "late panic watcher")
         old.onState("ended", "late EOF after reinvite")
         old.onState("stopping", "late cleanup")
-        old.onIap2Start(11, "phone", "phone")
+        old.onIap2Start(11, "phone", "phone", "audi_mib3")
         old.onIap2Stop(11)
         val lateConfiguration = io.github.hypercar.iap2.Iap2Csm.encode(0x5703)
         old.onIap2Bytes(11, lateConfiguration)
@@ -197,6 +202,12 @@ class EngineEventListenerTest {
         assertTrue(received.isEmpty())
         current.onIap2Bytes(12, lateConfiguration)
         assertEquals(listOf(12L), received)
+        old.onIap2ScreenSetupAccepted(11)
+        old.onIap2ScreenSetupAccepted(12)
+        current.onIap2ScreenSetupAccepted(11)
+        assertTrue(screenSetupAccepted.isEmpty())
+        current.onIap2ScreenSetupAccepted(12)
+        assertEquals(listOf(12L), screenSetupAccepted)
         assertFalse(activation.rejected)
         assertFalse(stopped)
         assertEquals(12L, wifiId)

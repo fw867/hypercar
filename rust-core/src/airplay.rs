@@ -473,14 +473,14 @@ pub async fn negotiate(
     let mut keepalive = KeepaliveTasks(Vec::new(), None, None);
     // Both rollback and manual pause keep the event socket until control teardown finishes.
     cleanup.event = Some(event_channel.clone());
-    let wifi_iap = crate::wifi_iap2::WifiIap2::start(channel.clone(), &p.device_id, &p.device_name, stop.clone());
+    let wifi_iap = crate::wifi_iap2::WifiIap2::start(channel.clone(), &p.device_id, &p.device_name, &p.head_unit_profile, stop.clone());
     let wifi_iap_id = wifi_iap.id;
     p.pipeline.lock().wifi_id=wifi_iap_id;
     keepalive.0.push(crate::wifi_iap2::spawn_control_ingress(control_inbound, wifi_iap_id, stop.clone()));
     let initially_owned=modes.lock().screen_owned();
     p.pipeline.lock().screen_owned=Some(initially_owned);
     let screen_session=Arc::new(crate::screen_session::ScreenSession {
-        control:channel.clone(), factory:factory.clone(), params:p.clone(), shared:shared_secret,
+        control:channel.clone(), wifi_iap_id, factory:factory.clone(), params:p.clone(), shared:shared_secret,
         software_receiver:p.desktop_receiver || !use_box_bootstrap(true, &info),
         uuid:display_uuid.clone().unwrap_or_else(|| "6E4E3B31-0E5B-4A8F-9F1B-2C5D7E9A0C11".into()),
         hevc_allowed, keep_stats:keep_alive_stats, display:(disp_w,disp_h), owned:screen_owned.clone(),

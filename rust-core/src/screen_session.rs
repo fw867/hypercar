@@ -15,6 +15,7 @@ pub enum ScreenCommand {
 
 pub struct ScreenSession {
     pub control: Arc<RtspChannel>,
+    pub wifi_iap_id: u64,
     pub factory: Arc<dyn SocketProvider>,
     pub params: AirplayParams,
     pub software_receiver: bool,
@@ -55,6 +56,7 @@ impl ScreenSession {
         if port==0 { return Err("屏幕 SETUP 没有 dataPort".into()); }
         self.control.udp_media.set(110, true);
         crate::pipeline::activation(&self.params.pipeline, "SCREEN_SETUP");
+        crate::wifi_iap2::screen_setup_accepted(self.wifi_iap_id);
         let cipher=match &self.shared {
             Some(shared)=>ScreenCipher::ChaCha(airplay::stream_key(shared,conn_id as u64)),
             None=>{let (key,iv)=airplay::aes_stream_keys_zero(conn_id as u64);ScreenCipher::AesCtr(crate::crypto::Aes128CtrStream::new(&key,&iv))},

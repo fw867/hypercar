@@ -64,10 +64,11 @@ object RustCoreBridge {
         fun onDisplaySize(width: Int, height: Int) {}
         fun onDisplayLayout(width: Int, height: Int, viewX: Int, viewY: Int, viewWidth: Int, viewHeight: Int,
                             safeX: Int, safeY: Int, safeWidth: Int, safeHeight: Int, drawOutside: Boolean) {}
-        fun onIap2Start(id: Long, deviceId: String, deviceName: String) {
-            io.github.hypercar.iap2.WifiIap2Bridge.start(id, deviceId, deviceName)
+        fun onIap2Start(id: Long, deviceId: String, deviceName: String, profileId: String) {
+            io.github.hypercar.iap2.WifiIap2Bridge.start(id, deviceId, deviceName, profileId)
         }
         fun onIap2Bytes(id: Long, bytes: ByteArray) { io.github.hypercar.iap2.WifiIap2Bridge.receive(id, bytes) }
+        fun onIap2ScreenSetupAccepted(id: Long) { io.github.hypercar.iap2.WifiIap2Bridge.screenSetupAccepted(id) }
         fun onIap2Stop(id: Long) { io.github.hypercar.iap2.WifiIap2Bridge.stop(id) }
     }
 
@@ -122,6 +123,8 @@ object RustCoreBridge {
     external fun nativeSetWifiIap2Phase(id: Long, phase: String)
     external fun nativeCanKeepWifiSession(): Boolean
     external fun nativeSendIap2(id: Long, bytes: ByteArray, hudMessageId: Int, hudSerial: Long): Boolean
+    external fun nativeWifiIap2PeerSyn(id: Long)
+    external fun nativeSendWifiIap2Detect(id: Long): Boolean
 
     /** Request native head-unit UI without tearing down CarPlay or its audio route. */
     external fun nativeRequestHostUi(): Boolean

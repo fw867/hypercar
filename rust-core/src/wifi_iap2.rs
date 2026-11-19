@@ -12,6 +12,13 @@ struct Handoff {
     id: u64, ready: bool, health: Option<std::time::Instant>, ready_token: u64, phase: String,
     event_packets: u64, event_bytes: u64, control_packets: u64, control_bytes: u64,
     rtsp_owner: Option<u64>,
+    startup_detect: Option<StartupDetect>,
+}
+#[derive(Default)]
+struct StartupDetect {
+    screen_setup_seen: bool,
+    peer_syn_seen: bool,
+    queued: bool,
 }
 impl Handoff {
     fn new_session(id: u64) -> Self {
@@ -180,8 +187,43 @@ fn frame_diagnostic(data: &[u8]) -> String {
     } else { "none".into() };
     format!("seq={} ack={} session={} csm={csm}",data[5],data[6],data[7])
 }
-enum Outbound { Frame(Vec<u8>, Option<crate::rtsp::HudPostTrace>), Ready(u64) }
+enum Outbound { Frame(Vec<u8>, Option<crate::rtsp::HudPostTrace>), Ready(u64), StartupDetect }
 static OUTPUT: Lazy<Mutex<Option<(u64, mpsc::Sender<Outbound>)>>> = Lazy::new(|| Mutex::new(None));
+const DETECT: [u8; 6] = [0xff, 0x55, 0x02, 0x00, 0xee, 0x10];
+
+impl Handoff {
+    fn startup_detect_for(&mut self, id: u64) -> Option<&mut StartupDetect> {
+        if self.id != id { return None; }
+        self.startup_detect.as_mut()
+    }
+}
+
+pub fn screen_setup_accepted(id: u64) {
+    {
+        let mut handoff = HANDOFF.lock();
+        let Some(detect) = handoff.startup_detect_for(id) else { return; };
+        if detect.screen_setup_seen { return; }
+        detect.screen_setup_seen = true;
+    }
+    crate::emit_iap2_screen_setup_accepted(id);
+}
+
+pub fn peer_syn_accepted(id: u64) {
+    if let Some(detect) = HANDOFF.lock().startup_detect_for(id) {
+        detect.peer_syn_seen = true;
+    }
+}
+
+pub fn queue_startup_detect(id: u64) -> bool {
+    {
+        let mut handoff = HANDOFF.lock();
+        let Some(detect) = handoff.startup_detect_for(id) else { return false; };
+        if !detect.screen_setup_seen || detect.peer_syn_seen || detect.queued { return false; }
+        detect.queued = true;
+    }
+    OUTPUT.lock().as_ref().filter(|(current, _)| *current == id)
+        .is_some_and(|(_, tx)| tx.try_send(Outbound::StartupDetect).is_ok())
+}
 
 pub fn send(id: u64, data: Vec<u8>, hud_message_id: i32, hud_serial: i64) -> bool {
     if data.is_empty() || data.len() > 65535 { return false; }
@@ -202,11 +244,13 @@ pub struct WifiIap2 {
 }
 
 impl WifiIap2 {
-    pub fn start(channel: Arc<RtspChannel>, device: &str, device_name: &str, stop: Arc<Notify>) -> Self {
+    pub fn start(channel: Arc<RtspChannel>, device: &str, device_name: &str, profile_id: &str, stop: Arc<Notify>) -> Self {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::channel::<Outbound>(64);
         *OUTPUT.lock() = Some((id, tx));
-        *HANDOFF.lock() = Handoff::new_session(id);
+        let mut handoff = Handoff::new_session(id);
+        if profile_id == "audi_mib3" { handoff.startup_detect = Some(StartupDetect::default()); }
+        *HANDOFF.lock() = handoff;
         let task = crate::callback_context::spawn(async move {
             let mut sent = 0u64;
             let mut last_written = String::from("none");
@@ -215,26 +259,31 @@ impl WifiIap2 {
                     _ = stop.notified() => break,
                     bytes = rx.recv() => match bytes { Some(b) => b, None => break },
                 };
-                let (data, hud) = match data {
-                    Outbound::Frame(data, hud) => (data, hud),
+                let (data, hud, startup_detect) = match data {
+                    Outbound::Frame(data, hud) => (data, hud, false),
                     Outbound::Ready(token) => { ready_written(id,token); continue; }
+                    Outbound::StartupDetect => (DETECT.to_vec(), None, true),
                 };
                 let frame_bytes = data.len();
-                let metadata = frame_diagnostic(&data);
+                let metadata = if startup_detect { "link=startup_detect_after_screen_setup".into() } else { frame_diagnostic(&data) };
                 let body = bplist::encode(&Value::dict(vec![
                     ("type", Value::str("iAPSendMessage")),
                     ("params", Value::dict(vec![("data", Value::Data(data))])),
                 ]));
                 // Link ACKs arrive independently on the event socket. Do not block all SYN/CSM
                 // output waiting for a separate RTSP response to the previous iAP packet.
-                match tokio::time::timeout(Duration::from_secs(3), channel.post_traced(
-                    "/command", &body, "application/x-apple-binary-plist", hud,
+                match tokio::time::timeout(Duration::from_secs(3), channel.post_traced_if(
+                    "/command", &body, "application/x-apple-binary-plist", hud, || {
+                        !startup_detect || HANDOFF.lock().startup_detect_for(id)
+                            .is_some_and(|detect| !detect.peer_syn_seen)
+                    },
                 )).await {
-                    Ok(Ok(cseq)) => {
+                    Ok(Ok(Some(cseq))) => {
                         sent += 1;
                         last_written = format!("CSeq={cseq} {metadata}");
                         if sent <= 128 || sent % 50 == 0 { crate::emit_log(&format!("WIFI-IAP#{id}: control POST written {last_written} frameBytes={frame_bytes} count={sent}; RTSP reply and link ACK separate")); }
                     }
+                    Ok(Ok(None)) => crate::emit_log(&format!("WIFI-IAP#{id}: queued startup DETECT skipped: peer SYN accepted or session retired")),
                     other => {
                         if let Some(hud) = hud {
                             crate::emit_log(&format!("HUD {hud} RTSP#{} write_failed", channel.trace_id()));
@@ -255,7 +304,7 @@ impl WifiIap2 {
             clear_handoff(id);
             crate::emit_iap2_stop(id);
         });
-        crate::emit_iap2_start(id, device, device_name);
+        crate::emit_iap2_start(id, device, device_name, profile_id);
         Self { id, task }
     }
 }
@@ -351,7 +400,7 @@ mod tests {
         let (mut car, _) = listener.accept().await.unwrap();
         let (r,w) = phone.into_split();
         let (channel, _) = RtspChannel::spawn(r,w,None);
-        let guard = WifiIap2::start(channel, "unit-test", "Test phone", Arc::new(Notify::new()));
+        let guard = WifiIap2::start(channel, "unit-test", "Test phone", "", Arc::new(Notify::new()));
         assert!(send(guard.id, vec![1,2,3], 0, 0));
         assert!(send(guard.id, vec![4,5,6], 0, 0));
         let requests = tokio::time::timeout(Duration::from_secs(1), async {
@@ -370,6 +419,57 @@ mod tests {
         let id = guard.id;
         drop(guard);
         assert!(!send(id, vec![7], 0, 0));
+    }
+
+    #[tokio::test]
+    async fn audi_startup_detect_is_single_use_and_old_or_syn_ready_writes_are_skipped() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let phone = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut car, _) = listener.accept().await.unwrap();
+        let (r, w) = phone.into_split();
+        let (channel, _rx) = RtspChannel::spawn(r, w, None);
+        let start = || WifiIap2::start(channel.clone(), "phone", "Test phone", "audi_mib3", Arc::new(Notify::new()));
+        let old = start();
+        let old_id = old.id;
+        assert!(!queue_startup_detect(old.id));
+        screen_setup_accepted(old.id);
+        assert!(queue_startup_detect(old.id));
+        peer_syn_accepted(old.id);
+        assert!(!queue_startup_detect(old.id));
+        // Use the same control socket to expose any late writes from the retired writer.
+        let current = start();
+        drop(old);
+        screen_setup_accepted(old_id);
+        peer_syn_accepted(old_id);
+        assert!(!queue_startup_detect(current.id));
+        screen_setup_accepted(current.id);
+        assert!(queue_startup_detect(current.id));
+        screen_setup_accepted(current.id);
+        assert!(!queue_startup_detect(current.id));
+
+        let request = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut buffer = Vec::new();
+            loop {
+                let n = car.read_buf(&mut buffer).await.unwrap();
+                assert!(n > 0);
+                let messages = crate::rtsp::parse_rtsp_messages(&mut buffer).unwrap();
+                if !messages.is_empty() {
+                    assert_eq!(messages.len(), 1);
+                    return messages.into_iter().next().unwrap();
+                }
+            }
+        }).await.unwrap();
+        assert_eq!(command_bytes(&bplist::parse(&request.body).unwrap()), Some(DETECT.as_slice()));
+
+        // A SYN adopted after queueing but before the write must suppress the marker too.
+        let next = start();
+        drop(current);
+        screen_setup_accepted(next.id);
+        assert!(queue_startup_detect(next.id));
+        peer_syn_accepted(next.id);
+        let mut extra = [0u8; 1];
+        assert!(tokio::time::timeout(Duration::from_millis(60), car.read(&mut extra)).await.is_err());
     }
 
     #[tokio::test]

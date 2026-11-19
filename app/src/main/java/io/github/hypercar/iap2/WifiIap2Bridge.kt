@@ -13,16 +13,24 @@ object WifiIap2Bridge {
     private val liveVehicleStatus = MutableStateFlow(Iap2VehicleStatus())
     val vehicleStatus = liveVehicleStatus.asStateFlow()
 
-    @Synchronized fun start(id: Long, deviceId: String, deviceName: String) {
+    @Synchronized fun start(id: Long, deviceId: String, deviceName: String, profileId: String) {
         active?.close()
-        active = Worker(id, deviceId, deviceName).also { it.thread.start() }
+        active = Worker(id, deviceId, deviceName, profileId).also { it.thread.start() }
     }
 
     @Synchronized fun receive(id: Long, bytes: ByteArray) {
         active?.takeIf { it.id == id }?.let {
-            if (bytes.size > 65535 || !it.input.offer(bytes)) {
+            if (bytes.size > 65535 || it.input.remainingCapacity() <= 1 || !it.input.offer(Input.Bytes(bytes))) {
                 HyperCarRepo.log("WIFI-IAP#$id: inbound queue overflow; stopping this link")
                 it.close()
+            }
+        }
+    }
+
+    @Synchronized fun screenSetupAccepted(id: Long) {
+        active?.takeIf { it.id == id && !it.closed }?.let {
+            if (!it.input.offer(Input.ScreenSetupAccepted)) {
+                HyperCarRepo.log("WIFI-IAP#$id: screen SETUP signal skipped: inbound queue full")
             }
         }
     }
@@ -43,8 +51,14 @@ object WifiIap2Bridge {
         if (active === worker) liveVehicleStatus.value = Iap2VehicleStatus()
     }
 
-    private class Worker(val id: Long, deviceId: String, deviceName: String) {
-        val input = ArrayBlockingQueue<ByteArray>(64)
+    private sealed interface Input {
+        class Bytes(val data: ByteArray) : Input
+        data object ScreenSetupAccepted : Input
+    }
+
+    private class Worker(val id: Long, deviceId: String, deviceName: String, profileId: String) {
+        // Reserve one slot for the ordered screen SETUP signal.
+        val input = ArrayBlockingQueue<Input>(65)
         @Volatile var closed = false
         private val protocol = WifiIap2Protocol(deviceId, { HyperCarRepo.log("WIFI-IAP#$id: $it") },
             navigationEnabled = { HyperCarRepo.hudNavigationAllowed },
@@ -52,7 +66,8 @@ object WifiIap2Bridge {
             deviceName = deviceName,
             nowPlayingProvider = Iap2NowPlayingSource::snapshot,
             onVehicleStatus = { publishVehicle(this, it) },
-            onMediaKey = { usage -> HyperCarRepo.onIap2MediaKey(usage) { isCurrent(id) } })
+            onMediaKey = { usage -> HyperCarRepo.onIap2MediaKey(usage) { isCurrent(id) } },
+            profileId = profileId, onPeerSynAccepted = { RustCoreBridge.nativeWifiIap2PeerSyn(id) })
         val thread = Thread({
             var readyReported = false
             var lastPhase = ""
@@ -60,9 +75,16 @@ object WifiIap2Bridge {
             var queuedBytes = 0L
             try {
                 while (!closed && !protocol.failed) {
-                    val bytes = input.poll(20, TimeUnit.MILLISECONDS)
+                    val event = input.poll(20, TimeUnit.MILLISECONDS)
                     val now = System.nanoTime() / 1_000_000
-                    val output = if (bytes == null) protocol.advance(now) else protocol.feed(bytes, now)
+                    val output = when (event) {
+                        is Input.Bytes -> protocol.feed(event.data, now)
+                        Input.ScreenSetupAccepted -> {
+                            protocol.screenSetupAccepted()
+                            protocol.advance(now)
+                        }
+                        null -> protocol.advance(now)
+                    }
                     if (protocol.diagnosticPhase != lastPhase) {
                         lastPhase = protocol.diagnosticPhase
                         RustCoreBridge.nativeSetWifiIap2Phase(id, lastPhase)
@@ -87,6 +109,9 @@ object WifiIap2Bridge {
                     if (protocol.ready && !readyReported) {
                         readyReported = true
                         RustCoreBridge.nativeMarkWifiIap2Ready(id, true)
+                    }
+                    if (input.isEmpty() && protocol.takeStartupDetect() && !RustCoreBridge.nativeSendWifiIap2Detect(id)) {
+                        HyperCarRepo.log("WIFI-IAP#$id: startup DETECT could not be queued")
                     }
                 }
             } catch (_: InterruptedException) {

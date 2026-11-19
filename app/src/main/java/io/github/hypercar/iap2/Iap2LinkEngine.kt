@@ -121,6 +121,7 @@ class Iap2LinkEngine(
         val optional: Boolean = false,
         val hudMessageId: Int = 0,
         var hudSerial: Long = 0,
+        val onSequenceAssigned: ((Int) -> Unit)? = null,
     )
 
     internal data class HudFrame(val offset: Int, val messageId: Int, val sequence: Int, val serial: Long) {
@@ -132,6 +133,7 @@ class Iap2LinkEngine(
     private var nextHudSerial = 0L
     private var hudAckWatermark: Int? = null
     internal var hudLog: ((String) -> Unit)? = null
+    internal var onPeerAcknowledgement: ((ack: Int, lastSent: Int) -> Unit)? = null
 
     internal fun takeHudOutput(): List<HudFrame> = hudOutput.toList().also { hudOutput.clear() }
 
@@ -209,6 +211,10 @@ class Iap2LinkEngine(
     private var lastOutputMillis: Long = 0
     private var passiveNegotiation = false
     private var lastMarkerEchoMillis: Long? = null
+    internal var deferInitialDetectEcho = false
+    private var previouslyNegotiated = false
+    internal val hasPartialInput: Boolean get() =
+        receive.size > 1 || (receive.size == 1 && receive[0] == 0xff.toByte())
 
     /** Same-transport detection restart: consumers must discard partial CSMs from the old link. */
     var onDetectionRestart: (() -> Unit)? = null
@@ -325,6 +331,7 @@ class Iap2LinkEngine(
         nowMillis: Long,
         awaitAck: Boolean = true,
         hudMessageId: Int = 0,
+        onSequenceAssigned: ((Int) -> Unit)? = null,
     ): Boolean {
         if (state == State.DEAD) return false
         val limit = (peerSynchronization?.maxLength ?: 0xFFFF) - HEADER_BYTES - 1
@@ -332,7 +339,8 @@ class Iap2LinkEngine(
             die("control payload ${bytes.size} exceeds negotiated limit $limit")
             return false
         }
-        sendBacklog += Packet(0, bytes.copyOf(), awaitAck = awaitAck, hudMessageId = hudMessageId)
+        sendBacklog += Packet(0, bytes.copyOf(), awaitAck = awaitAck, hudMessageId = hudMessageId,
+            onSequenceAssigned = onSequenceAssigned)
         drainSendWindow(nowMillis)
         return true
     }
@@ -363,6 +371,7 @@ class Iap2LinkEngine(
                 if (receive.size < MARKER.size) return false
                 if (receive.peek(MARKER.size).contentEquals(MARKER)) {
                     receive.discard(MARKER.size)
+                    if (deferInitialDetectEcho && !previouslyNegotiated) return true
                     if (state == State.NORMAL) restartDetection(nowMillis)
                     // A reflected echo must not create a tight DETECT ping-pong. Real peer
                     // retries (typically one second) still get a reply if the first is lost.
@@ -508,6 +517,7 @@ class Iap2LinkEngine(
     private fun completeNegotiationIfPending(nowMillis: Long) {
         if (state == State.NEGOTIATING && peerSynchronization != null) {
             state = State.NORMAL
+            previouslyNegotiated = true
             markerDeadline = null
             syncDeadline = null
             lastOutputMillis = nowMillis
@@ -554,6 +564,7 @@ class Iap2LinkEngine(
         acknowledgement: Int,
         nowMillis: Long,
     ) {
+        onPeerAcknowledgement?.invoke(acknowledgement, sentSequence)
         completeNegotiationIfPending(nowMillis)
         if (hudAwaitingAck.isNotEmpty()) {
             val previous = hudAckWatermark
@@ -617,6 +628,7 @@ class Iap2LinkEngine(
             val packet = sendBacklog.removeFirst()
             sentSequence = nextSequence(sentSequence)
             packet.sequence = sentSequence
+            packet.onSequenceAssigned?.invoke(packet.sequence)
             packet.deadlineMillis = nowMillis + retransmissionTimeoutMillis
             if (hudAwaitingAck.isNotEmpty()) {
                 hudAwaitingAck.values.removeAll { frame ->
