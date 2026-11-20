@@ -426,17 +426,25 @@ private fun MapCard(modifier: Modifier) {
 @Composable
 private fun MapGuidanceOverlay(cue: io.github.hypercar.navigation.NavigationCue, modifier: Modifier) {
     val panel = Color(0xEB152131)
-    Box(modifier.padding(14.dp)) {
-        // Leave the native map's top-left speed badge visible.
-        Column(Modifier.align(Alignment.TopStart).padding(start = 80.dp).widthIn(max = 290.dp)
-            .clip(RoundedCornerShape(18.dp)).background(panel).padding(horizontal = 16.dp, vertical = 12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text(when (cue.maneuver) {
+    BoxWithConstraints(modifier) {
+        val layout = MapGuidanceLayout.forCard(maxWidth.value, maxHeight.value)
+        val compact = layout.compact
+        Column(Modifier.align(Alignment.TopStart).padding(start = layout.start.dp, top = layout.edge.dp, end = layout.edge.dp)
+            .widthIn(max = layout.maxPanelWidth.dp)
+            .clip(RoundedCornerShape(if (compact) 12.dp else 18.dp)).background(panel)
+            .padding(horizontal = if (compact) 8.dp else 16.dp, vertical = if (compact) 6.dp else 12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 12.dp)) {
+                val arrow = when (cue.maneuver) {
                     1 -> "↰"; 2 -> "↱"; 3 -> "↑"; 4 -> "↶"
                     13, 49 -> "↖"; 14, 50 -> "↗"; 47 -> "↙"; 48 -> "↘"
                     else -> ""
-                }, color = White, fontSize = 38.sp, fontWeight = FontWeight.Bold)
-                Column {
+                }
+                if (layout.showArrow && arrow.isNotEmpty()) {
+                    Text(arrow, color = White, fontSize = if (compact) 26.sp else 38.sp,
+                        fontWeight = FontWeight.Bold, maxLines = 1)
+                }
+                Column(Modifier.weight(1f, fill = false)) {
                     cue.distanceMeters?.let { Text(formatMapDistance(it), color = White,
                         fontSize = 25.sp, fontWeight = FontWeight.Bold, maxLines = 1) }
                     Text(cue.instruction.ifBlank { cue.nextRoad }, color = White, fontSize = 15.sp,
@@ -444,14 +452,18 @@ private fun MapGuidanceOverlay(cue: io.github.hypercar.navigation.NavigationCue,
                 }
             }
             if (cue.lanes.isNotEmpty()) {
-                Spacer(Modifier.height(8.dp))
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                Spacer(Modifier.height(if (compact) 4.dp else 8.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(if (compact) 2.dp else 4.dp)) {
                     cue.lanes.forEach { lane ->
                         val symbol = mapLaneSymbol(lane.foregroundDirection ?: lane.direction)
                         Text(symbol, color = if (lane.recommended) Color(0xFF73E8B4) else White.copy(alpha = .4f),
-                            modifier = Modifier.weight(1f), maxLines = 1,
+                            modifier = Modifier.weight(1f), maxLines = 1, softWrap = !compact,
                             textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                            fontSize = if (cue.lanes.size > 6) 12.sp else if (symbol.length > 1) 17.sp else 23.sp,
+                            fontSize = when {
+                                cue.lanes.size > 6 -> 12.sp
+                                symbol.length > 1 -> if (compact) 14.sp else 17.sp
+                                else -> if (compact) 18.sp else 23.sp
+                            },
                             fontWeight = FontWeight.Bold)
                     }
                 }
@@ -465,6 +477,7 @@ private fun MapGuidanceOverlay(cue: io.github.hypercar.navigation.NavigationCue,
                 if (minutes >= 60) "${minutes / 60}小时${minutes % 60}分" else "${minutes.coerceAtLeast(1)}分钟"
             })
         if (trip.isNotEmpty()) Text(trip.joinToString(" · "), Modifier.align(Alignment.BottomCenter)
+            .padding(start = 14.dp, end = 14.dp, bottom = 14.dp)
             .clip(RoundedCornerShape(14.dp)).background(panel).padding(horizontal = 16.dp, vertical = 9.dp),
             color = White, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
