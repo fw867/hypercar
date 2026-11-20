@@ -14,6 +14,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * 手机侧（iPhone 角色）的 `_carplay-ctrl._tcp` 控制服务：mDNS 广播 + HTTP 应答。
@@ -49,7 +50,6 @@ class CarPlayCtrlAdvertiser(
         const val SERVICE_TYPE = "_carplay-ctrl._tcp"
         private const val SRCVERS = "770.8.1"
         private const val TAG = "CTRL"
-        private const val MAX_HEAD_BYTES = 16 * 1024
         private const val PLACEHOLDER_MAC = "02:00:00:00:00:00"
         private const val REGISTRATION_TIMEOUT_MILLIS = 10_000L
 
@@ -76,6 +76,27 @@ class CarPlayCtrlAdvertiser(
     private var registeredAtMillis = 0L
     private var registeredMac: String? = null
     private var registeredName: String? = null
+    private var mdnsObserver: CtrlMdnsObserver? = null
+    private var observationGeneration = 0L
+    private var observationAttempts = 0
+    private val tcpAccepted = AtomicLong()
+    private val httpHeads = AtomicLong()
+    private val httpResponses = AtomicLong()
+    @Volatile private var lastTcpAt = 0L
+
+    /** Registration is local state; only MDNS-OBS describes datagrams actually delivered to us. */
+    @Synchronized fun diagnosticSummary(): String {
+        val network = invites.current?.network
+        val cm = appContext.getSystemService(ConnectivityManager::class.java)
+        val link = network?.let { runCatching { cm?.getLinkProperties(it) }.getOrNull() }
+        return "obs=$observationGeneration network=$network default=${cm?.activeNetwork} " +
+            "if=${link?.interfaceName} addresses=${link?.linkAddresses} port=$port " +
+            "listenerClosed=${serverSocket?.isClosed} acceptAlive=${acceptThread?.isAlive == true} " +
+            "registration=${registration.currentGeneration} ready=${registration.ready} pending=${registration.pending} " +
+            "registrationAgeMs=${SystemClock.uptimeMillis() - registeredAtMillis} " +
+            "tcp=${tcpAccepted.get()} heads=${httpHeads.get()} responses=${httpResponses.get()} invites=$inviteCount " +
+            "lastTcpAgeMs=${if (lastTcpAt == 0L) "none" else SystemClock.elapsedRealtime() - lastTcpAt}"
+    }
 
     /** 车机 ctrl 邀请计数（每收到一次 `GET /ctrl-int/1/connect` 加一）。 */
     @Volatile
@@ -104,6 +125,10 @@ class CarPlayCtrlAdvertiser(
     /** A client accepted on A always carries A's listener epoch, even if B reuses both IPs. */
     @Synchronized internal fun selectNetwork(network: Network?) {
         if (invites.current?.network == network) return
+        log("CTRL-DIAG: network-change old=${invites.current?.network} new=$network oldPort=$port")
+        mdnsObserver?.close()
+        mdnsObserver = null
+        observationAttempts = 0
         invites.select(network)
         registeredNetwork = null
         serverSocket?.let {
@@ -136,6 +161,14 @@ class CarPlayCtrlAdvertiser(
         val effectiveNetwork = network ?: registeredNetwork
         val epoch = invites.current ?: return false
         if (epoch.network != effectiveNetwork) return false
+        if (mdnsObserver?.retryDue() == true && observationAttempts < 3) {
+            mdnsObserver?.close()
+            mdnsObserver = null
+        }
+        if (mdnsObserver == null && observationAttempts < 3) {
+            observationAttempts++
+            mdnsObserver = CtrlMdnsObserver(appContext, epoch.network, ++observationGeneration, log).also { it.start() }
+        }
         if (invites.awaitingConfirmation) refreshAddresses(epoch)
         val currentMac = bluetoothMacProvider()
         val currentName = serviceNameProvider()
@@ -235,6 +268,8 @@ class CarPlayCtrlAdvertiser(
                             registeredAtMillis = SystemClock.uptimeMillis()
                             runCatching { onDiagnostic(Event.REGISTERED) }
                             log("$TAG: mDNS 注册成功 ${serviceInfo.serviceName} network=$registeredNetwork port=$port")
+                            log("CTRL-DIAG: NSD registered token=$token requested=$name actual=${serviceInfo.serviceName} " +
+                                "type=${serviceInfo.serviceType} callbackPort=${serviceInfo.port} ${diagnosticSummary()}")
                         }
                     }
 
@@ -257,7 +292,7 @@ class CarPlayCtrlAdvertiser(
                     override fun onUnregistrationFailed(
                         serviceInfo: NsdServiceInfo,
                         errorCode: Int,
-                    ) = Unit
+                    ) { log("CTRL-DIAG: NSD unregister-failed token=$token error=$errorCode current=${registration.currentGeneration}") }
                 }
             registrationListener = listener
             nsdManager.registerService(info, NsdManager.PROTOCOL_DNS_SD, listener)
@@ -280,6 +315,7 @@ class CarPlayCtrlAdvertiser(
     /** 只注销 mDNS 注册（保留 socket 与 accept 线程，端口不变）。 */
     @Synchronized
     private fun unregisterMdns() {
+        log("CTRL-DIAG: NSD unregister token=${registration.currentGeneration} network=$registeredNetwork port=$port")
         registration.invalidate()
         val previous = registrationListener
         registrationListener = null
@@ -295,15 +331,21 @@ class CarPlayCtrlAdvertiser(
             val client =
                 try {
                     socket.accept()
-                } catch (_: Exception) {
+                } catch (error: Exception) {
+                    log("CTRL-TCP: accept-end network=${epoch.network} current=${epoch.isCurrent} closed=${socket.isClosed} error=${error.javaClass.simpleName}:${error.message}")
                     break
                 }
+            val connection = tcpAccepted.incrementAndGet()
+            lastTcpAt = SystemClock.elapsedRealtime()
+            log("CTRL-TCP: accept connection=$connection network=${epoch.network} current=${epoch.isCurrent} " +
+                "peer=${client.remoteSocketAddress} local=${client.localSocketAddress}")
             val receipt = synchronized(this) { invites.accept(epoch) }
             if (receipt == null) {
+                log("CTRL-TCP: reject connection=$connection reason=stale-network")
                 runCatching { client.close() }
                 continue
             }
-            Thread({ handleClient(client, receipt) }, "carplay-ctrl-client").apply {
+            Thread({ handleClient(client, receipt, connection) }, "carplay-ctrl-client").apply {
                 isDaemon = true
                 start()
             }
@@ -315,23 +357,32 @@ class CarPlayCtrlAdvertiser(
      * `GET /ctrl-int/1/connect` 是「车机已发现手机、AirPlay 窗口已开」的权威信号，
      * 记进日志并计数（上层据此判断是否该立刻去连 AirPlay）。
      */
-    private fun handleClient(client: Socket, receipt: CtrlInvitationInbox.Receipt<Network>) {
+    private fun handleClient(client: Socket, receipt: CtrlInvitationInbox.Receipt<Network>, connection: Long) {
         val peer = runCatching { client.inetAddress?.hostAddress }.getOrNull() ?: "?"
+        val started = SystemClock.elapsedRealtime()
         try {
             client.soTimeout = 10_000
             val input = BufferedInputStream(client.getInputStream())
-            val head = readUntilHeaderEnd(input)
+            val read = CtrlHttpHead.read(input)
+            val head = read.text
+            log("CTRL-TCP: read connection=$connection termination=${read.termination} bytes=${head.length} " +
+                "elapsedMs=${SystemClock.elapsedRealtime() - started}")
             if (head.isEmpty()) {
-                log("$TAG: $peer 连入但无请求（EOF）")
+                log("$TAG: $peer 连入但无请求（${read.termination}）")
+                log("CTRL-TCP: head-empty connection=$connection elapsedMs=${SystemClock.elapsedRealtime() - started}")
                 return
             }
+            httpHeads.incrementAndGet()
             val requestLine = head.lineSequence().firstOrNull() ?: ""
             val headers =
                 head.substringAfter("\r\n", "")
                     .lineSequence()
-                    .filter { it.contains(':') }
-                    .joinToString("; ") { it.trim() }
-            log("$TAG: $peer -> [$requestLine] $headers")
+                    .filter { it.substringBefore(':').trim().lowercase() in setOf("host", "user-agent", "airplay-receiver-device-id") }
+                    .joinToString("; ") { it.trim().take(256) }
+            val safeRequest = requestLine.substringBefore('?').take(256)
+            log("$TAG: $peer -> [$safeRequest] $headers")
+            log("CTRL-TCP: head connection=$connection bytes=${head.length} complete=${head.contains("\r\n\r\n")} " +
+                "connect=${isConnectRequest(requestLine)} elapsedMs=${SystemClock.elapsedRealtime() - started}")
             if (isConnectRequest(requestLine)) {
                 EndpointScope.invitationHost(peer)?.let { host ->
                     val receiverId = head.lineSequence().firstOrNull {
@@ -340,8 +391,13 @@ class CarPlayCtrlAdvertiser(
                     synchronized(this) {
                         if (invites.current === receipt.epoch) {
                             refreshAddresses(receipt.epoch)
-                            invites.offer(receipt, client.localAddress,
-                                Invitation(host, SystemClock.elapsedRealtime(), receipt.epoch.network, receiverId))
+                            val invite = Invitation(host, SystemClock.elapsedRealtime(), receipt.epoch.network, receiverId)
+                            invites.offer(receipt, client.localAddress, invite)
+                            log("CTRL-TCP: invitation connection=$connection network=${receipt.epoch.network} " +
+                                "local=${client.localAddress.hostAddress} published=${invites.latest.get() === invite} " +
+                                "awaitingAddress=${invites.awaitingConfirmation}")
+                        } else {
+                            log("CTRL-TCP: invitation-rejected connection=$connection reason=stale-network")
                         }
                     }
                 }
@@ -352,6 +408,8 @@ class CarPlayCtrlAdvertiser(
             val output = client.getOutputStream()
             output.write(response.toByteArray(Charsets.US_ASCII))
             output.flush()
+            httpResponses.incrementAndGet()
+            log("CTRL-TCP: response connection=$connection status=200 elapsedMs=${SystemClock.elapsedRealtime() - started}")
             // 应答后车机可能继续发隧道数据（后续按需实现），先转储前 64 字节便于定谳
             client.soTimeout = 3_000
             val rest = ByteArrayOutputStream()
@@ -368,37 +426,23 @@ class CarPlayCtrlAdvertiser(
             }
             if (rest.size() > 0) {
                 log(
-                    "$TAG: 应答后收到 ${rest.size()} 字节：" +
-                        rest.toByteArray().take(64).joinToString(" ") { "%02x".format(it.toInt() and 0xFF) },
+                    "$TAG: 应答后收到 ${rest.size()} 字节（仅统计，不转储内容）",
                 )
             }
         } catch (error: IOException) {
             log("$TAG: $peer 连接异常 - ${error.message}")
+            log("CTRL-TCP: error connection=$connection kind=${error.javaClass.simpleName} elapsedMs=${SystemClock.elapsedRealtime() - started}")
         } finally {
             runCatching { client.close() }
+            log("CTRL-TCP: closed connection=$connection elapsedMs=${SystemClock.elapsedRealtime() - started}")
         }
-    }
-
-    private fun readUntilHeaderEnd(input: BufferedInputStream): String {
-        val buffer = ByteArrayOutputStream()
-        val chunk = ByteArray(2048)
-        while (buffer.size() < MAX_HEAD_BYTES) {
-            val count =
-                try {
-                    input.read(chunk)
-                } catch (_: IOException) {
-                    break
-                }
-            if (count < 0) break
-            buffer.write(chunk, 0, count)
-            val text = buffer.toString("ISO-8859-1")
-            if (text.contains("\r\n\r\n")) return text
-        }
-        return buffer.toString("ISO-8859-1")
     }
 
     @Synchronized
     fun stop() {
+        log("CTRL-DIAG: stop ${diagnosticSummary()}")
+        mdnsObserver?.close()
+        mdnsObserver = null
         invites.select(null)
         previousPort = 0
         unregisterMdns()

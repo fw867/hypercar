@@ -3060,6 +3060,7 @@ object HyperCarRepo {
                     // ② 每 15s 报一次进度（tick 是 5s，探测要跟得上换网速度）
                     if (ticks % TICKS_PER_PROGRESS == 0) {
                         log("BT-HEALTH: attempt=$diagnosticId ${coordinator.diagnosticSummary()}")
+                        log("CTRL-DIAG: attempt=$diagnosticId ${advertiser.diagnosticSummary()}")
                         connectionDiagnostics.report().lastOrNull()?.let { log(it) }
                         val seen = lastSeen.get()
                         val waited = ticks * ENDPOINT_TICK_MILLIS / 1000
