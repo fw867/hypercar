@@ -1,5 +1,13 @@
 # 验证记录与边界
 
+## 2026-11-20 宝马 ID9 缓冲音频起播实验（599）
+
+仅在 `bmw_id9` 的 type103 已建 TCP 且 GETANCHOR 预检收到 RTSP 501 时采用 `ID9_SETRATE`。`playback_unconfirmed` 表示仍在等首包，不是已播放。首个 AAC 包写完后才发 `SETRATE rate=1`；`receiver_mapping=validated` 表示车机返回的时钟和媒体时间与该包匹配，`mode=ID9_SETRATE playing=true` 表示当前控制代次确认起播，两者均不能证明扬声器已出声。现有 GETANCHOR 成功路径和其他车机策略不变。
+
+上车验证：放音乐确认能听到；切到车机原生音源再切回，确认旧音不重放、音乐能恢复。日志核对让出时的 `FLUSHBUFFERED` / `pause_method=SETRATE rate=0` 和归还后新代次的 `playing=true`。若车机拒绝或未返回有效映射，检查 `type103 teardown confirmed` 后是否出现 `type103 retired; type102 fallback ready`，不要把回退后出声算作 type103 成功。
+
+本地模拟控制测试 9 项通过，Release JVM 720 项通过。Linux Rust 全量的 6 个辅助音频超时在未修改的 598 源码也全部复现。Android 专属 MediaCodec 集成用例已交叉编译，未在手机或实车执行。
+
 ## 2026-11-20 二次上车 mDNS / 邀请诊断（598）
 
 保留原有蓝牙/AirPlay配对及握手策略，为已选择车机网络增加双栈被动组播诊断、NSD实际实例名/端口/网络快照和邀请TCP阶段日志。DNS解析防压缩循环、越界/截断，整包失败不发布部分结果，TXT仅允许id/srcvers；日志限速且保留累计计数。具体组播目的地址绑定避免与NSD争抢单播；换网/停止关闭socket和多播锁，双族失败释放锁，同网络最多3次启动且至少间隔15秒。诊断socket构造也纳入异常保护。HTTP读头保留既有部分头/回应语义，额外区分COMPLETE、EOF、TIMEOUT、IO、LIMIT。

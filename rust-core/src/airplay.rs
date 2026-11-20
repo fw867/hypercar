@@ -1142,8 +1142,10 @@ mod shutdown_tests {
             Value::dict(vec![("type", Value::int(103)), ("audioType", Value::str("media")), ("audioOutputFormats", Value::int(0xc00000))])
         ]))]);
         let cases = ["bmw_id9", "mercedes_mbux"].into_iter().flat_map(|profile|
-            ["setup", "wrong_stream", "tcp", "anchor", "none"].map(|failure| (profile, failure)));
+            ["setup", "wrong_stream", "tcp", "anchor501", "anchor500", "anchor_missing", "none"].map(|failure| (profile, failure)));
         for (profile, failure) in cases {
+            let deferred = profile == "bmw_id9" && failure == "anchor501";
+            let stays_buffered = failure == "none" || deferred;
             p.head_unit_profile = profile.into();
             p.id9_screen_bootstrap = profile == "bmw_id9";
             p.mbux_media_compat = profile == "mercedes_mbux";
@@ -1160,6 +1162,7 @@ mod shutdown_tests {
             let (pause_tx,pause_rx) = tokio::sync::oneshot::channel();
             let (play_tx,play_rx) = tokio::sync::oneshot::channel();
             let (wire_ids, mut proposed) = tokio::sync::mpsc::unbounded_channel();
+            let (idle_tx, idle_rx) = tokio::sync::oneshot::channel();
             let (anchor_time_tx, anchor_time_rx) = tokio::sync::oneshot::channel();
             let server = tokio::spawn(async move {
                 let streams = |fields| Value::dict(vec![("streams",Value::array(vec![Value::dict(fields)]))]);
@@ -1181,17 +1184,30 @@ mod shutdown_tests {
                     ("type",Value::int(selected)), ("dataPort",Value::int(i64::from(port))),
                     ("audioBufferSize",Value::int(8388608))
                 ])).await;
-                if matches!(failure, "anchor" | "none") {
+                if matches!(failure, "anchor501" | "anchor500" | "anchor_missing" | "none") {
                     let (mut tcp,_) = data.accept().await.unwrap();
                     let anchor = read_request(&mut peer).await;
                     assert_eq!(anchor.first_line, format!("GETANCHOR {anchor_uri} RTSP/1.0"));
                     assert_eq!(bplist::parse(&anchor.body).unwrap(), Value::dict(vec![("rate", Value::int(1))]));
                     anchor_time_tx.send(anchor.received_at).unwrap();
-                    reply(&mut peer, &anchor, if failure == "anchor" {501} else {200}, Value::dict(vec![
-                        ("networkTimeSecs",Value::int(42)),("networkTimeFrac",Value::int(0)),
-                        ("networkTimeTimelineID",Value::int(0)),("networkTimeFlags",Value::int(0)),
-                    ])).await;
-                    if failure == "none" {
+                    let status = match failure { "anchor501" => 501, "anchor500" => 500, _ => 200 };
+                    if status != 200 {
+                        peer.write_all(format!("RTSP/1.0 {status} Error\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",
+                            anchor.cseq().unwrap()).as_bytes()).await.unwrap();
+                    } else {
+                        let clock = if failure == "anchor_missing" { vec![] } else { vec![
+                            ("networkTimeSecs",Value::int(42)),("networkTimeFrac",Value::int(0)),
+                            ("networkTimeTimelineID",Value::int(0)),("networkTimeFlags",Value::int(0)),
+                        ] };
+                        reply(&mut peer, &anchor, status, Value::dict(clock)).await;
+                    }
+                    if stays_buffered {
+                        // The client withholds PCM until this gate. Don't accidentally allow
+                        // a SETRATE queued during preflight to pass as post-write control.
+                        if deferred {
+                            assert!(tokio::time::timeout(Duration::from_millis(50),peer.read(&mut [0u8;1])).await.is_err());
+                            idle_tx.send(()).unwrap();
+                        }
                         let size = usize::from(tcp.read_u16().await.unwrap());
                         assert!(size > 38);
                         let mut packet = vec![0; size - 2];
@@ -1203,25 +1219,41 @@ mod shutdown_tests {
                         assert!(!au.is_empty());
                         assert_eq!(packet[8],23);
                         let rtp = u32::from_be_bytes(packet[4..8].try_into().unwrap());
-                        let anchor = read_request(&mut peer).await;
-                        assert_eq!(anchor.first_line, format!("GETANCHOR {anchor_uri} RTSP/1.0"));
-                        assert_eq!(bplist::parse(&anchor.body).unwrap(), Value::dict(vec![("rate", Value::int(1))]));
-                        reply(&mut peer,&anchor,200,Value::dict(vec![
-                            ("networkTimeSecs",Value::int(43)),("networkTimeFrac",Value::int(0)),
-                            ("networkTimeTimelineID",Value::int(0)),("networkTimeFlags",Value::int(0)),
-                        ])).await;
-                        let start = read_request(&mut peer).await;
-                        assert_eq!(start.first_line, format!("SETRATEANCHORTIME {audio_uri} RTSP/1.0"));
-                        let body = bplist::parse(&start.body).unwrap();
-                        assert_eq!(body.get("rtpTime"),Some(&Value::int(i64::from(rtp))));
-                        assert_eq!(body.get("networkTimeSecs"),Some(&Value::int(43)));
-                        reply(&mut peer,&start,200,Value::dict(vec![])).await;
+                        if deferred {
+                            let start = read_request(&mut peer).await;
+                            assert_eq!(start.first_line, format!("SETRATE {audio_uri} RTSP/1.0"));
+                            let body = bplist::parse(&start.body).unwrap();
+                            assert_eq!(body.as_dict().unwrap().len(), 3);
+                            for (key, n) in [("rate",1),("mediaTimeValue",i64::from(rtp)),("mediaTimeScale",48_000)] {
+                                assert_eq!(body.get(key).and_then(Value::as_int), Some(n));
+                            }
+                            reply(&mut peer,&start,200,Value::dict(vec![
+                                ("mediaTimeValue", Value::int(i64::from(rtp))), ("mediaTimeScale", Value::int(48_000)),
+                                ("networkTimeSecs",Value::int(43)),("networkTimeFrac",Value::int(0)),
+                                ("networkTimeTimelineID",Value::int(0)),("networkTimeFlags",Value::int(0)),
+                            ])).await;
+                        } else {
+                            let anchor = read_request(&mut peer).await;
+                            assert_eq!(anchor.first_line, format!("GETANCHOR {anchor_uri} RTSP/1.0"));
+                            assert_eq!(bplist::parse(&anchor.body).unwrap(), Value::dict(vec![("rate", Value::int(1))]));
+                            reply(&mut peer,&anchor,200,Value::dict(vec![
+                                ("networkTimeSecs",Value::int(43)),("networkTimeFrac",Value::int(0)),
+                                ("networkTimeTimelineID",Value::int(0)),("networkTimeFlags",Value::int(0)),
+                            ])).await;
+                            let start = read_request(&mut peer).await;
+                            assert_eq!(start.first_line, format!("SETRATEANCHORTIME {audio_uri} RTSP/1.0"));
+                            let body = bplist::parse(&start.body).unwrap();
+                            assert_eq!(body.get("rtpTime"),Some(&Value::int(i64::from(rtp))));
+                            assert_eq!(body.get("networkTimeSecs"),Some(&Value::int(43)));
+                            reply(&mut peer,&start,200,Value::dict(vec![])).await;
+                        }
                         let _ = play_tx.send(());
                         let flush = read_request(&mut peer).await;
                         assert_eq!(flush.first_line, format!("FLUSHBUFFERED {audio_uri} RTSP/1.0"));
                         reply(&mut peer,&flush,200,Value::dict(vec![])).await;
                         let pause = read_request(&mut peer).await;
-                        assert_eq!(pause.first_line, format!("SETRATEANCHORTIME {audio_uri} RTSP/1.0"));
+                        let pause_method = if deferred { "SETRATE" } else { "SETRATEANCHORTIME" };
+                        assert_eq!(pause.first_line, format!("{pause_method} {audio_uri} RTSP/1.0"));
                         assert_eq!(bplist::parse(&pause.body).unwrap().get("rate"),Some(&Value::int(0)));
                         reply(&mut peer,&pause,200,Value::dict(vec![])).await;
                         let _ = pause_tx.send(());
@@ -1230,7 +1262,7 @@ mod shutdown_tests {
                         assert_eq!(tcp.read(&mut byte).await.unwrap(),0);
                     }
                 }
-                if failure == "none" { return; }
+                if stays_buffered { return; }
                 if failure != "setup" {
                     let cleanup = read_request(&mut peer).await;
                     assert_eq!(cleanup.first_line, format!("TEARDOWN {session_uri} RTSP/1.0"));
@@ -1247,7 +1279,7 @@ mod shutdown_tests {
             record_session(&channel).await.unwrap();
             let mut buffered = negotiate_audio(&channel, &factory, Some(&[7;32]), &p, false, &info, AudioCodec::BufferedAac).await;
             let buffered_id = proposed.try_recv().unwrap();
-            assert_eq!(buffered.as_ref().map(AudioOut::stream_type), (failure == "none").then_some(103), "{failure}");
+            assert_eq!(buffered.as_ref().map(AudioOut::stream_type), stays_buffered.then_some(103), "{profile}: {failure}");
             if let Some(output) = buffered.as_mut() {
                 assert_eq!(output.pacing_id.map(|id| (id.rtsp, id.stream_id)), Some((channel.trace_id(), buffered_id)));
                 assert!(output.pacing_id.unwrap().setup_accepted_at <= anchor_time_rx.await.unwrap(),
@@ -1255,6 +1287,7 @@ mod shutdown_tests {
                 p.pipeline.lock().observe_main_sender(Some(output));
                 let owned = Arc::new(std::sync::atomic::AtomicBool::new(true));
                 output.set_ownership(owned.clone());
+                if deferred { tokio::time::timeout(Duration::from_secs(2), idle_rx).await.unwrap().unwrap(); }
                 let pcm:Vec<i16> = (0..2048).map(|i| ((i as f32 * 0.0576).sin() * 6000.) as i16).collect();
                 for _ in 0..24 {
                     output.send_pcm(&pcm).await.unwrap();
@@ -1278,7 +1311,7 @@ mod shutdown_tests {
             p.pipeline.lock().observe_main_sender(None);
             assert!(p.pipeline.lock().activation_snapshot("SCREEN_SETUP").unwrap().main_audio_stream_type.is_none());
             assert!(!channel.buffered_cleanup_pending.load(Ordering::Acquire));
-            if failure != "none" {
+            if !stays_buffered {
                 let udp = negotiate_audio(&channel, &factory, Some(&[7;32]), &p, false, &info, AudioCodec::Aac).await.unwrap();
                 let udp_id = proposed.try_recv().unwrap();
                 assert_eq!(udp.pacing_id.map(|id| (id.rtsp, id.stream_id)), Some((channel.trace_id(), udp_id)));
@@ -1290,7 +1323,7 @@ mod shutdown_tests {
                 }
             }
             assert_eq!(net.tcp_opens.load(Ordering::Relaxed), usize::from(!matches!(failure,"setup"|"wrong_stream")));
-            assert_eq!(net.udp_opens.load(Ordering::Relaxed), usize::from(failure!="none"));
+            assert_eq!(net.udp_opens.load(Ordering::Relaxed), usize::from(!stays_buffered));
             server.await.unwrap();
         }
     }
@@ -2805,9 +2838,12 @@ pub(crate) async fn retire_buffered_audio(channel: &RtspChannel) -> Result<(), S
 }
 
 async fn negotiate_buffered_audio(channel: &Arc<RtspChannel>, factory: &Arc<dyn SocketProvider>,
-    shared: &[u8;32], host: &str, uri: String, anchor_uri: Option<String>, info: &Value) -> Option<AudioOut> {
+    shared: &[u8;32], p: &AirplayParams, info: &Value) -> Option<AudioOut> {
     use std::sync::atomic::Ordering;
     use std::time::Instant;
+    let allow_id9_setrate = p.head_unit_profile == "bmw_id9";
+    let uri = crate::rtsp_uri::audio_uri(&p.car_ip, p.airplay_port);
+    let anchor_uri = if allow_id9_setrate { channel.absolute_session_uri().map(str::to_owned) } else { None };
     let codec = AudioCodec::BufferedAac;
     let encoder = match crate::aac::AacEncoder::at_rate(codec.rate()) {
         Ok(encoder) => encoder,
@@ -2834,7 +2870,7 @@ async fn negotiate_buffered_audio(channel: &Arc<RtspChannel>, factory: &Arc<dyn 
         let stream = crate::screen_session::setup_stream::select(&root, 103, false)?;
         let (data_port, buffer_bytes) = buffered_endpoints(stream, id)?;
         let factory = factory.clone();
-        let host = host.to_owned();
+        let host = p.car_ip.clone();
         let connect_started = Instant::now();
         let connect = tokio::task::spawn_blocking(move || factory.open_tcp(&host, data_port, 2500));
         let data = tokio::time::timeout(Duration::from_secs(3), connect).await
@@ -2842,10 +2878,11 @@ async fn negotiate_buffered_audio(channel: &Arc<RtspChannel>, factory: &Arc<dyn 
             .ok_or("network-bound TCP connection failed")?;
         let connect_ms = connect_started.elapsed().as_millis();
         let control = crate::buffered_control::BufferedControl::new(channel.clone(), uri, anchor_uri, codec.rate(), codec.spf() as u32);
-        control.probe_anchor().await.map_err(|e| format!("GETANCHOR preflight: {e}"))?;
+        control.probe_anchor_for_profile(allow_id9_setrate).await.map_err(|e| format!("GETANCHOR preflight: {e}"))?;
+        let control_mode = control.control_mode();
         let mut out = AudioOut::new_buffered_aac(data, stream_key(shared, id as u64), encoder, control, buffer_bytes);
         out.observe_main_stream(channel.trace_id(), id, 0, reply.received_at);
-        emit_log(&format!("BUFFERED-AUDIO: type103 SETUP accepted rtsp_ms={setup_ms} tcp_port={data_port} tcp_ms={connect_ms} audioBufferSize={buffer_bytes} anchor_preflight=ok elapsed_ms={} playback_unconfirmed",
+        emit_log(&format!("BUFFERED-AUDIO: type103 SETUP accepted rtsp_ms={setup_ms} tcp_port={data_port} tcp_ms={connect_ms} audioBufferSize={buffer_bytes} control_mode={control_mode} elapsed_ms={} playback_unconfirmed",
             started.elapsed().as_millis()));
         Ok(out)
     }.await;
@@ -2883,13 +2920,7 @@ pub(crate) async fn negotiate_audio(
     }
     if codec == AudioCodec::BufferedAac {
         if desktop || !p.offers_buffered_media(info) || !declares_media(info, codec) { return None; }
-        let anchor_uri = if p.head_unit_profile == "bmw_id9" {
-            channel.absolute_session_uri().map(str::to_owned)
-        } else {
-            None
-        };
-        return negotiate_buffered_audio(channel, factory, shared?, &p.car_ip,
-            crate::rtsp_uri::audio_uri(&p.car_ip, p.airplay_port), anchor_uri, info).await;
+        return negotiate_buffered_audio(channel, factory, shared?, p, info).await;
     }
     negotiate_realtime_audio(channel, factory, shared, p, desktop, info, codec, false).await
 }
