@@ -269,6 +269,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
     #[cfg(test)]
     { state.lock().probe_reset = Some(reset_request.clone()); }
     let mut navigation_diagnostics = super::navigation::Diagnostics::default();
+    let mut rx_log = super::log_sampling::CommandRx::default();
     loop {
         let started=state.lock().started;
         // An already initialized handset can ACK another INIT with its old size.
@@ -321,7 +322,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
             if matches!(kind, super::navigation::NEXT_TURN | super::navigation::ASSISTANT) {
                 let trace=navigation_diagnostics.observe("CMD",kind,consumed-8,Some(payload.len()));
                 dispatch_navigation(kind,&payload,&state,&events,trace);
-            } else {
+            } else if rx_log.due(kind, payload.len(), status == (true,true,true), std::time::Instant::now()) {
                 emit_log(&format!("CARWITH-HS: RX 0x{kind:x} {}B proof={} admitted={} encrypted={}",payload.len(),status.0,status.1,status.2));
             }
             if kind==CMD_VIDEO_ENCODER_INIT_DONE {

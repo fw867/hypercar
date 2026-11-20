@@ -51,11 +51,12 @@ pub(super) async fn run(stream:TcpStream,state:session::Shared,control:Arc<crate
     let mut previous=0;let mut packets=0u64;
     let mut receiver=voice_audio::Receiver::default();
     let mut stats=channel_diagnostics::Stats::default();
+    let mut periodic=super::log_sampling::Repeats::default();
     let mut diagnostics=tokio::time::interval(Duration::from_secs(5));
     diagnostics.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {tokio::select! {biased;
         _=stop.notified()=>{emit_log(&stats.report("VR","stopped",receiver.pending()));control.request(false);return;},
-        _=diagnostics.tick()=>emit_log(&stats.report("VR","periodic",receiver.pending())),
+        _=diagnostics.tick()=>periodic.periodic(stats.report("VR","periodic",receiver.pending()), |line| emit_log(line)),
         received=rd.read(&mut discard)=>{match received {
             Ok(n) if n>0=>receiver.push(&discard[..n],&mut stats,&state,&events),
             result=>{emit_log(&stats.report("VR",if matches!(result,Ok(0)){"eof"}else{"ioError"},receiver.pending()));control.request(false);return;}

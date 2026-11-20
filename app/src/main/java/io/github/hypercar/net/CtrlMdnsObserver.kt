@@ -21,7 +21,9 @@ internal class CtrlMdnsObserver(
     private val network: Network,
     private val generation: Long,
     private val log: (String) -> Unit,
+    private val attemptId: Long = 0,
 ) : Closeable {
+    private val prefix = "attempt=$attemptId gen=$generation network=$network"
     @Volatile private var closed = false
     private val sockets = mutableListOf<MulticastSocket>()
     private var lock: WifiManager.MulticastLock? = null
@@ -34,16 +36,16 @@ internal class CtrlMdnsObserver(
         val link = context.getSystemService(ConnectivityManager::class.java)?.getLinkProperties(network)
         val nif = runCatching { link?.interfaceName?.let(NetworkInterface::getByName) }.getOrNull()
         if (nif == null) {
-            log("MDNS-OBS: gen=$generation network=$network unavailable=no-interface; no default-network fallback")
+            log("MDNS-OBS: $prefix unavailable=no-interface; no default-network fallback")
             return
         }
         try {
             lock = context.getSystemService(WifiManager::class.java)?.createMulticastLock("hypercar-ctrl-diag")
                 ?.apply { setReferenceCounted(false); acquire() }
         } catch (e: Exception) {
-            log("MDNS-OBS: gen=$generation multicast-lock=${e.javaClass.simpleName}")
+            log("MDNS-OBS: $prefix multicast-lock=${e.javaClass.simpleName}")
         }
-        log("MDNS-OBS: start gen=$generation network=$network if=${nif.name} index=${nif.index} " +
+        log("MDNS-OBS: start $prefix if=${nif.name} index=${nif.index} " +
             "addresses=${link?.linkAddresses} passive=true; multicast-visible-only, no TCP-SYN/old-port/unicast guarantee")
         workers.set(2)
         for (family in listOf(4, 6)) Thread({ receive(family, nif) }, "ctrl-mdns-v$family").apply {
@@ -55,7 +57,7 @@ internal class CtrlMdnsObserver(
         var opened: MulticastSocket? = null
         var received = 0L; var relevant = 0L; var malformed = 0L; var suppressed = 0L
         var window = SystemClock.elapsedRealtime(); var emitted = 0
-        val label = "gen=$generation network=$network if=${nif.name} IPv$family"
+        val label = "$prefix if=${nif.name} IPv$family"
         try {
             val socket = MulticastSocket(null)
             opened = socket

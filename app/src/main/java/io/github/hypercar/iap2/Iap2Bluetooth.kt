@@ -67,7 +67,8 @@ class Iap2Bluetooth(
     private val onEndpoint: (CarPlayEndpoint) -> Unit,
     /** 会话结束（拿到端点后链路断开，或中途失败）——上层用来收尾/重排。 */
     private val onSessionEnded: (String) -> Unit,
-    private val onInboundSession: (String?, Long) -> Unit = { _, _ -> },
+    private val onInboundSession: (Long, String?, Long) -> Unit = { _, _, _ -> },
+    private val diagnosticAttempt: () -> Long = { 0L },
 ) {
     companion object {
         private val HANDSHAKE_IDS = java.util.concurrent.atomic.AtomicLong(0)
@@ -176,7 +177,8 @@ class Iap2Bluetooth(
         }
         acceptedSockets.incrementAndGet()
         lastAcceptAt = SystemClock.elapsedRealtime()
-        log("BT-ACCEPT: entry=$tag listenerGeneration=$epoch peer=${safeAddress(socket.remoteDevice)} ${diagnosticSummary()}")
+        log("BT-ACCEPT: entry=$tag attempt=${diagnosticAttempt()} acceptedUptimeMs=$acceptedAt " +
+            "listenerGeneration=$epoch peer=${safeAddress(socket.remoteDevice)} ${diagnosticSummary()}")
         handleIncomingSocket(socket, epoch, tag, acceptedAt)
     }
 
@@ -530,7 +532,8 @@ class Iap2Bluetooth(
 
     /** Called on the attempt's IO job. The Bluetooth accept thread remains available during SDP/connect. */
     @SuppressLint("MissingPermission")
-    internal fun pollBmwProbe(probe: BmwCaffProbe, device: BluetoothDevice, since: Long, valid: () -> Boolean) {
+    internal fun pollBmwProbe(probe: BmwCaffProbe, device: BluetoothDevice, since: Long, ctrlReady: Boolean,
+                              valid: () -> Boolean) {
         val ticket = sessions.ticket() ?: return
         fun eligible() = running && isListening && sessions.allowsOutbound(ticket) && valid() &&
             !probe.finished && !sessionActive.get() && lastInboundAdmission < since &&
@@ -543,12 +546,21 @@ class Iap2Bluetooth(
                 cancelBmwProbe("new attempt")
                 bmwProbe = probe
             }
-            if (!probe.due(device.address.takeIf { profiles.isNotEmpty() }, SystemClock.uptimeMillis())) return
+            when (probe.poll(device.address.takeIf { profiles.isNotEmpty() }, SystemClock.uptimeMillis(), ctrlReady)) {
+                BmwCaffProbe.Decision.WAIT -> return
+                BmwCaffProbe.Decision.ENTER_CTRL_GRACE -> {
+                    log("BT-CAFF#${probe.attempt}: 本车 Wi-Fi ctrl 已注册并监听；普通配置文件连续在线 ${BmwCaffProbe.CTRL_GRACE_MS}ms 前优先等 …cafe/ctrl（尚未收到邀请）")
+                    return
+                }
+                BmwCaffProbe.Decision.DIAL -> Unit
+            }
         }
         val tag = "BT-CAFF#${probe.attempt}"
-        log("$tag: SDP start peer=${device.address} profiles=$profiles graceMs=3000")
-        val service = freshIap2Service(device, ::eligible)
-        log("$tag: SDP result=$service")
+        // A cached UUID only saves the broad fetch. It never supplies an RFCOMM channel:
+        // the secure UUID socket still resolves its service on the target, or fails closed.
+        val cacheHit = device.uuids?.any { it.uuid == ACCESSORY_IAP2_UUID } == true
+        val service = if (cacheHit) "present" else freshIap2Service(device, ::eligible)
+        log("$tag: SDP result=$service source=${if (cacheHit) "uuid-cache" else "uuid-fetch"} profiles=$profiles")
         if (!probe.recordSdp(service == "present")) return
         if (!eligible() || BtProfiles.connectedNames(appContext, device.address, classicOnly = true).isEmpty()) {
             log("$tag: RFCOMM skipped; attempt superseded or classic profiles offline")
@@ -875,13 +887,15 @@ class Iap2Bluetooth(
             sessionProductive = false
             currentSocket.set(socket)
         }
-        inboundAt?.let { onInboundSession(safeAddress(socket.remoteDevice), it) }
+        val attempt = caffAttempt.takeIf { it != 0L } ?: diagnosticAttempt()
+        inboundAt?.let { onInboundSession(attempt, safeAddress(socket.remoteDevice), it) }
         val handshakeId = HANDSHAKE_IDS.incrementAndGet()
         val started = SystemClock.elapsedRealtime()
-        val sessionLog: (String) -> Unit = { line -> log("HS#$handshakeId +${SystemClock.elapsedRealtime() - started}ms $line") }
+        val sessionLog: (String) -> Unit = { line -> log("HS#$handshakeId +${SystemClock.elapsedRealtime() - started}ms attempt=$attempt $line") }
         var channel: RfcommLinkChannel? = null
         try {
-            log("BT-WORKER: entry=$tag ticket=$ticket peer=${safeAddress(socket.remoteDevice)} ${diagnosticSummary()}")
+            log("BT-WORKER: entry=$tag attempt=$attempt handshake=$handshakeId acceptedUptimeMs=${inboundAt ?: "none"} " +
+                "ticket=$ticket peer=${safeAddress(socket.remoteDevice)} ${diagnosticSummary()}")
             // 记住本轮对端车机（ACL 广播可能没收到，记录「已配对车机」要靠它拿 MAC）
             runCatching { Iap2Peer.remember(safeAddress(socket.remoteDevice), safeName(socket.remoteDevice)) }
             val evidence = io.github.hypercar.session.PairingEvidence.read(appContext.filesDir, safeAddress(socket.remoteDevice))

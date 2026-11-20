@@ -836,7 +836,8 @@ object HyperCarRepo {
             dropProfilesBeforeIap2 = profile.dropProfilesBeforeIap2,
             allowOutboundIap2 = profile.allowOutboundIap2,
             profileId = profile.id,
-            onInboundSession = { peer, at -> connectionDiagnostics.rfcommAccepted(connectionAttemptId, peer, at) },
+            onInboundSession = { attempt, peer, at -> connectionDiagnostics.rfcommAccepted(attempt, peer, at) },
+            diagnosticAttempt = { connectionAttemptId.takeIf { sessionLive.get() } ?: 0L },
             log = ::log,
         ).also { iap2 = it }
     }
@@ -1238,9 +1239,12 @@ object HyperCarRepo {
                 }
                 connectionDiagnostics.mark(diagnosticId, when (event) {
                     CarPlayCtrlAdvertiser.Event.REGISTERED -> ConnectionDiagnostics.Stage.CTRL_REGISTERED
+                    CarPlayCtrlAdvertiser.Event.TCP_ACCEPTED -> ConnectionDiagnostics.Stage.CTRL_TCP_ACCEPTED
+                    CarPlayCtrlAdvertiser.Event.INVITE_HEAD -> ConnectionDiagnostics.Stage.CTRL_INVITE_HEAD
+                    CarPlayCtrlAdvertiser.Event.INVITE_ACK -> ConnectionDiagnostics.Stage.CTRL_INVITE_ACK
                     CarPlayCtrlAdvertiser.Event.INVITED -> ConnectionDiagnostics.Stage.CTRL_INVITED
                 })
-            }, serviceNameProvider = { controlServiceName }, onNetworkInvitation = { source, network, stillCurrent ->
+            }, serviceNameProvider = { controlServiceName }, attemptId = diagnosticId, onNetworkInvitation = { source, network, stillCurrent ->
                 if (p.id == "bmw_id85" && sessionLive.get() && connectionAttemptId == diagnosticId &&
                     ctrlAdvertiser === source && iap2 === coordinator && network == boundNetwork) {
                     coordinator.retireCafeHandoff(diagnosticId, "ctrl-invite", stillCurrent)
@@ -1261,7 +1265,10 @@ object HyperCarRepo {
                     try {
                         while (waiting() && !caffProbe.finished && !caffProbe.attempted) {
                             if (caffDevice.bondState != android.bluetooth.BluetoothDevice.BOND_BONDED) break
-                            coordinator.pollBmwProbe(caffProbe, caffDevice, caffSince, ::waiting)
+                            val network = boundNetwork
+                            val ctrlReady = network != null && ctrlAdvertiser === advertiser &&
+                                caffDevice.address.equals(wifiReceiverMac, ignoreCase = true) && advertiser.listeningOn(network)
+                            coordinator.pollBmwProbe(caffProbe, caffDevice, caffSince, ctrlReady, ::waiting)
                             delay(300)
                         }
                     } catch (cancelled: CancellationException) { throw cancelled }

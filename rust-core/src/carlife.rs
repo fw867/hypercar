@@ -6,6 +6,7 @@
 
 pub(crate) mod navigation;
 mod session;
+mod log_sampling;
 mod video;
 pub(crate) mod microphone;
 pub(super) mod channel_diagnostics;
@@ -621,6 +622,7 @@ async fn handle_media_client(
     let mut hb = tokio::time::interval(Duration::from_secs(1));
     hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut hb_sent: u64 = 0;
+    let mut periodic = log_sampling::Repeats::default();
     let mut channel_stats = channel_diagnostics::Stats::default();
     let mut diagnostics = tokio::time::interval(Duration::from_secs(5));
     diagnostics.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -631,7 +633,7 @@ async fn handle_media_client(
         let socket_read = video_probe.read_until_deadline(socket_read);
         let read = tokio::select! {
             _ = diagnostics.tick(), if !is_video => {
-                emit_log(&channel_stats.report(label,"periodic",buf.len()));
+                periodic.periodic(channel_stats.report(label,"periodic",buf.len()), |line| emit_log(line));
                 continue;
             }
             _ = hb.tick(), if is_video => {
@@ -639,11 +641,12 @@ async fn handle_media_client(
                     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as u32
                 } else { now_ms() };
                 let frame = build_media_frame(VIDEO_HEARTBEAT, timestamp, &[]);
-                if wr.write_all(&frame).await.is_err() {
+                if let Err(error) = wr.write_all(&frame).await {
+                    emit_log(&format!("CARLIFE: VIDEO heartbeat write failed after {hb_sent} successful sends: {error}"));
                     return;
                 }
                 hb_sent += 1;
-                if hb_sent <= 3 || hb_sent % 30 == 0 {
+                if log_sampling::heartbeat_sample(hb_sent) {
                     emit_log(&format!("CARLIFE: → VIDEO 心跳 #{hb_sent}（0x20002）"));
                 }
                 continue;
@@ -981,11 +984,12 @@ async fn drain_stream(mut stream: TcpStream, state:session::Shared, events:mpsc:
     let mut buf = [0u8; 2048];
     let mut receiver=voice_audio::Receiver::default();
     let mut stats=channel_diagnostics::Stats::default();
+    let mut periodic=log_sampling::Repeats::default();
     let mut diagnostics=tokio::time::interval(Duration::from_secs(5));
     diagnostics.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            _=diagnostics.tick()=>emit_log(&stats.report("VR/noCapture","periodic",receiver.pending())),
+            _=diagnostics.tick()=>periodic.periodic(stats.report("VR/noCapture","periodic",receiver.pending()), |line| emit_log(line)),
             received=stream.read(&mut buf)=>match received {
                 Ok(0)=>{emit_log(&stats.report("VR/noCapture","eof",receiver.pending()));return;},
                 Ok(n)=>receiver.push(&buf[..n],&mut stats,&state,&events),

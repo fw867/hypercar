@@ -98,6 +98,23 @@ class ConnectionDiagnosticsTest {
         assertEquals(1, Regex("CTRL_INVITED@").findAll(report).count())
     }
 
+    @Test fun tcpHeadAndAckDoNotImplyInvitationAndStaleCallbacksDoNotFillNewRound() {
+        var now = 100L
+        val journal = ConnectionDiagnostics { now }
+        val old = journal.begin("known-wifi", "bmw_id85", 90)
+        now += 5; journal.rfcommAccepted(old, "AA", 91)
+        now += 5; journal.mark(old, Stage.CTRL_TCP_ACCEPTED)
+        now += 5; journal.mark(old, Stage.CTRL_INVITE_HEAD)
+        now += 5; journal.mark(old, Stage.CTRL_INVITE_ACK)
+        val active = journal.begin("retry", "bmw_id85", 112)
+        journal.mark(old, Stage.CTRL_INVITED)
+        journal.rfcommAccepted(active, "AA", 91)
+        val (first, second) = journal.report()
+        assertTrue(first, first.contains("BT_INBOUND_ADMITTED@5ms,CTRL_TCP_ACCEPTED@10ms,CTRL_INVITE_HEAD@15ms,CTRL_INVITE_ACK@20ms"))
+        assertTrue(first.contains("invite=false"))
+        assertTrue(second.contains("milestones=[REQUESTED@0ms]"))
+    }
+
     @Test fun staleCallbacksAndDuplicateFinishCannotChangeNewRound() {
         var now = 0L
         val j = ConnectionDiagnostics { now }

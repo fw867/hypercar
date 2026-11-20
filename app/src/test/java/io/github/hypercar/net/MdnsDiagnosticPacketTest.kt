@@ -9,11 +9,17 @@ class MdnsDiagnosticPacketTest {
     private fun name(s: String) = ByteArrayOutputStream().apply {
         s.split('.').forEach { val b = it.toByteArray(); write(b.size); write(b) }; write(0)
     }.toByteArray()
-    private fun packet(flags: Int = 0x8400, questions: Int = 0, answers: Int = 0, body: ByteArray) =
-        ByteArrayOutputStream().apply {
-            val out = DataOutputStream(this)
-            listOf(0, flags, questions, answers, 0, 0).forEach(out::writeShort); write(body)
-        }.toByteArray()
+    private fun packet(
+        flags: Int = 0x8400,
+        questions: Int = 0,
+        answers: Int = 0,
+        authority: Int = 0,
+        additional: Int = 0,
+        body: ByteArray,
+    ) = ByteArrayOutputStream().apply {
+        val out = DataOutputStream(this)
+        listOf(0, flags, questions, answers, authority, additional).forEach(out::writeShort); write(body)
+    }.toByteArray()
     private fun rr(owner: ByteArray, type: Int, data: ByteArray, ttl: Int = 120) =
         ByteArrayOutputStream().apply {
             val out = DataOutputStream(this); write(owner); out.writeShort(type); out.writeShort(0x8001)
@@ -25,8 +31,42 @@ class MdnsDiagnosticPacketTest {
             body = name("_carplay-ctrl._tcp.local") + byteArrayOf(0, 12, 0x80.toByte(), 1))
         val decoded = MdnsDiagnosticPacket.decode(p)!!
         assertFalse(decoded.response)
+        assertTrue(decoded.details.single().startsWith("Q section=question "))
         assertTrue(decoded.details.any { it.contains("_carplay-ctrl._tcp.local") && it.contains("QU=true") })
     }
+
+    @Test fun distinguishesKnownAnswersProbeAuthorityAndAdditionalInOneQuery() {
+        val service = name("_carplay-ctrl._tcp.local")
+        val owner = name("phone._carplay-ctrl._tcp.local")
+        val question = service + byteArrayOf(0, 12, 0, 1)
+        val ptr = rr(service, 12, owner)
+        val srv = rr(owner, 33, byteArrayOf(0, 0, 0, 0, 0x83.toByte(), 0xd5.toByte()) + name("phone.local"))
+        val addr = rr(name("phone.local"), 1, byteArrayOf(10, 0, 0, 1))
+        val p = packet(flags = 0, questions = 1, answers = 1, authority = 1, additional = 1,
+            body = question + ptr + srv + addr)
+        val decoded = MdnsDiagnosticPacket.decode(p)!!
+        assertFalse(decoded.response)
+        assertEquals(listOf("question", "known-answer", "probe-authority", "additional"), sections(decoded))
+        assertTrue(decoded.details[1].contains("target=phone._carplay-ctrl._tcp.local"))
+        assertTrue(decoded.details[2].contains("port=33749"))
+        assertTrue(decoded.details[3].contains("address=10.0.0.1"))
+    }
+
+    @Test fun responseSectionsStayDistinctEvenWhenFilteredRecordsPrecedeThem() {
+        val unrelated = rr(name("printer._ipp._tcp.local"), 16, byteArrayOf(0))
+        val service = name("_carplay-ctrl._tcp.local")
+        val owner = name("phone._carplay-ctrl._tcp.local")
+        val ptr = rr(service, 12, owner)
+        val addr = rr(name("phone.local"), 1, byteArrayOf(10, 0, 0, 1))
+        val p = packet(answers = 2, authority = 1, additional = 1, body = unrelated + ptr + ptr + addr)
+        val decoded = MdnsDiagnosticPacket.decode(p)!!
+        assertTrue(decoded.response)
+        assertEquals(listOf("response-answer", "response-authority", "additional"), sections(decoded))
+        assertNull(MdnsDiagnosticPacket.decode(p.copyOf(p.size - 1)))
+    }
+
+    private fun sections(decoded: MdnsDiagnosticPacket): List<String> =
+        decoded.details.map { it.substringAfter("section=").substringBefore(' ') }
 
     @Test fun compressedSrvIncludesPortHostFlushAndGoodbye() {
         val owner = name("phone._carplay-ctrl._tcp.local")

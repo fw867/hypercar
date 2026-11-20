@@ -63,7 +63,8 @@ class Iap2Coordinator(
     private val allowOutboundIap2: Boolean = true,
     private val profileId: String = "",
     private val log: (String) -> Unit,
-    private val onInboundSession: (String?, Long) -> Unit = { _, _ -> },
+    private val onInboundSession: (Long, String?, Long) -> Unit = { _, _, _ -> },
+    private val diagnosticAttempt: () -> Long = { 0L },
 ) {
 
     private val appContext = context.applicationContext
@@ -107,8 +108,8 @@ class Iap2Coordinator(
     fun diagnosticSummary(): String = bluetooth?.diagnosticSummary() ?: "transport=not-created"
 
     internal fun pollBmwProbe(probe: BmwCaffProbe, device: android.bluetooth.BluetoothDevice,
-                             since: Long, valid: () -> Boolean) {
-        bluetooth?.pollBmwProbe(probe, device, since, valid)
+                             since: Long, ctrlReady: Boolean, valid: () -> Boolean) {
+        bluetooth?.pollBmwProbe(probe, device, since, ctrlReady, valid)
     }
 
     fun pauseSessions(closeCurrent: Boolean = true) {
@@ -146,6 +147,7 @@ class Iap2Coordinator(
                     log = log,
                     onEndpoint = { endpoint -> endpointCallback?.invoke(endpoint) },
                     onInboundSession = onInboundSession,
+                    diagnosticAttempt = diagnosticAttempt,
                     onSessionEnded = { reason -> log("IAP2: 会话结束（$reason），继续监听/出站等待重连") },
                 )
             bluetooth = bt

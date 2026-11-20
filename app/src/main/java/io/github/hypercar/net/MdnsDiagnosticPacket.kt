@@ -34,7 +34,11 @@ internal data class MdnsDiagnosticPacket(val response: Boolean, val details: Lis
             }
             val flags = u16(2)
             require(flags and 0x780f == 0)
-            val questions = u16(4); val records = u16(6) + u16(8) + u16(10)
+            val response = flags and 0x8000 != 0
+            val questions = u16(4)
+            val answers = u16(6)
+            val authorityEnd = answers + u16(8)
+            val records = authorityEnd + u16(10)
             require(questions <= 64 && records <= 128)
             var pos = 12
             val details = mutableListOf<String>()
@@ -43,9 +47,15 @@ internal data class MdnsDiagnosticPacket(val response: Boolean, val details: Lis
                 val type = u16(pos); val cls = u16(pos + 2); pos += 4
                 if (cls and 0x7fff == 1 && (service(owner) || owner == "_services._dns-sd._udp.local" ||
                         (type in listOf(1, 28, 255) && owner.endsWith(".local"))))
-                    details += "Q name=$owner type=$type QU=${cls and 0x8000 != 0}"
+                    details += "Q section=question name=$owner type=$type QU=${cls and 0x8000 != 0}"
             }
-            repeat(records) {
+            repeat(records) { index ->
+                // mDNS queries carry cached answers in Answer and proposed records in Authority.
+                val section = when {
+                    index < answers -> if (response) "response-answer" else "known-answer"
+                    index < authorityEnd -> if (response) "response-authority" else "probe-authority"
+                    else -> "additional"
+                }
                 val (owner, end) = name(pos); pos = end
                 val type = u16(pos); val cls = u16(pos + 2)
                 val ttl = (u16(pos + 4).toLong() shl 16) or u16(pos + 6).toLong()
@@ -77,9 +87,9 @@ internal data class MdnsDiagnosticPacket(val response: Boolean, val details: Lis
                     }
                     else -> null
                 }
-                if (value != null) details += "RR name=$owner type=$type ttl=$ttl flush=${cls and 0x8000 != 0} $value"
+                if (value != null) details += "RR section=$section name=$owner type=$type ttl=$ttl flush=${cls and 0x8000 != 0} $value"
             }
-            MdnsDiagnosticPacket(flags and 0x8000 != 0, details)
+            MdnsDiagnosticPacket(response, details)
         }.getOrNull()
     }
 }

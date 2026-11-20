@@ -7,6 +7,7 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
         IAP2_PARAMETERS, WIFI_BOUND, CTRL_REGISTERED, CTRL_INVITED, AIRPLAY_START,
         RECORD, RESOURCES_ACCEPTED, CONTROL_READY, SCREEN_SETUP, VIDEO_CHANNEL_READY,
         FIRST_VIDEO_FRAME, WAITING_INVITATION, UI_STARTED,
+        BT_INBOUND_ADMITTED, CTRL_TCP_ACCEPTED, CTRL_INVITE_HEAD, CTRL_INVITE_ACK,
     }
     private data class Attempt(
         val id: Long, val source: String, val profile: String, val started: Long, val startedUptime: Long,
@@ -57,6 +58,8 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
     @Synchronized fun rfcommAccepted(id: Long, peer: String?, at: Long) {
         val a = history.lastOrNull()?.takeIf { it.id == id && it.ended == null && at >= it.startedUptime } ?: return
         if (peer == null) return
+        // Raw accepts are logged separately; only sockets admitted to an iAP2 worker reach this stage.
+        a.reached.putIfAbsent(Stage.BT_INBOUND_ADMITTED, (clockMillis() - a.started).coerceAtLeast(0))
         val t = a.transport
         if (t == null) {
             a.earlyInbound.addLast(peer to at)

@@ -24,6 +24,22 @@ class CtrlInvitationInboxTest {
         assertEquals("B invite", inbox.latest.get())
     }
 
+    @Test fun validAckPendingAddressIsDiscardedIfEpochChangesBeforeConfirmation() {
+        val a = inbox.select("A")!!
+        inbox.advertise(a)
+        inbox.offer(inbox.accept(a)!!, "local", "ACKed on A")
+        assertTrue(inbox.awaitingConfirmation)
+        assertTrue(events.isEmpty())
+
+        val b = inbox.select("B")!!
+        inbox.advertise(b)
+        inbox.addresses(b, setOf("local"))
+        inbox.addresses(a, setOf("local"))
+        assertFalse(inbox.awaitingConfirmation)
+        assertNull(inbox.latest.get())
+        assertTrue(events.isEmpty())
+    }
+
     @Test fun earlyBAwaitsBothAdvertisementAndLocalAddressInEitherOrder() {
         for (linksFirst in listOf(true, false)) {
             inbox.select(null)

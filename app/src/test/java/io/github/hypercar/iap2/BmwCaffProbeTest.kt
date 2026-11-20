@@ -4,6 +4,43 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class BmwCaffProbeTest {
+    private fun BmwCaffProbe.due(peer: String?, now: Long) = poll(peer, now, false) == BmwCaffProbe.Decision.DIAL
+    private val wait = BmwCaffProbe.Decision.WAIT
+    private val extended = BmwCaffProbe.Decision.ENTER_CTRL_GRACE
+    private val dial = BmwCaffProbe.Decision.DIAL
+
+    @Test fun healthyCtrlLetsRepeatedShortClassicWindowsPassWithoutConsumingDial() {
+        val p = BmwCaffProbe(1)
+        assertEquals(extended, p.poll("BMW", 0, true))
+        assertEquals(wait, p.poll("BMW", 10_000, true))
+        assertEquals(wait, p.poll(null, 11_000, true))
+        assertEquals(extended, p.poll("BMW", 18_000, true))
+        assertEquals(wait, p.poll("BMW", 32_999, true))
+        assertFalse(p.attempted)
+        assertEquals(dial, p.poll("BMW", 33_000, true))
+        assertEquals(wait, p.poll("BMW", 60_000, false))
+    }
+
+    @Test fun lostCtrlRestoresOrdinaryGraceAndNetworkChurnCannotStarvePersistentPeer() {
+        val p = BmwCaffProbe(1)
+        p.poll("BMW", 0, true)
+        assertEquals(wait, p.poll("BMW", 5_000, false))
+        assertEquals(wait, p.poll("BMW", 7_999, false))
+        assertEquals(dial, p.poll("BMW", 8_000, false))
+        val q = BmwCaffProbe(2)
+        q.poll("BMW", 0, false)
+        assertEquals(extended, q.poll("BMW", 2_999, true))
+        assertEquals(wait, q.poll("BMW", 14_999, false))
+        assertEquals(dial, q.poll("BMW", 15_000, true))
+    }
+
+    @Test fun realInviteOrInboundCancelsEvenBeforeExtendedGraceExpires() {
+        val p = BmwCaffProbe(1)
+        assertEquals(extended, p.poll("BMW", 0, true))
+        p.cancel()
+        assertEquals(wait, p.poll("BMW", 20_000, false))
+        assertFalse(p.attempted)
+    }
     @Test fun onlyAnAlreadyBondedId85TargetCanBeSelected() {
         val bonded = setOf("CAR", "BMW2", "HEADSET")
         val cars = setOf("CAR", "BMW2", "OLD")

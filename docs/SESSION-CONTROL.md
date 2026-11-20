@@ -18,6 +18,20 @@ BMW默认不主动拨iAP2、不主动断HFP/A2DP。其它档案依赖自身策�
 
 已配对宝马二次上车常见顺序：手机先自动连上车机 Wi-Fi，经典蓝牙只出现短暂 ACL 窗口随后退场，会话应走 Wi-Fi 上的 `_carplay-ctrl._tcp` 邀请；`accepted=0` 或 ACL 很快断开本身不等于失败。不要把持续蓝牙 iAP2 会话当成二次上车前提。这台 MGU 的实车前提是：ctrl 已经在广播时，邀请仍要等车机自己打开经典 iAP2，打开之后才到；短 ACL 退场不表示邀请已经在路上。
 
+### BMW ID8.5 二次上车复测（保留旧配对）
+
+2026-11-20 的 HCI 对照中，手机查宝马的 `…CAFF` 时，车机返回了两个相同 UUID 的记录：第一条没有 `ProtocolDescriptorList`，第二条有 RFCOMM 通道。Android 报 `SDP_SUCCESS`、`scn:0`，当时并未向第二条记录的通道发起 RFCOMM 连接。不要固定使用当日的通道号，也不要把这次出站失败等同于车机拒绝连接。
+
+从 0.1.0.600 起，同一目标宝马的 Wi-Fi 已绑定、当前网络的 ctrl 广播和 TCP 监听都就绪时，给车机 15 秒主动连入的机会，避免手机在短 ACL 窗口内发起另一轮 SDP 或 RFCOMM。计时以目标 HFP/A2DP 连续在线为准，掉线重算；持续在线但无入站或邀请时仍保留一次标准 CAFF 出站。这是应用层的避让策略，不是对系统 SDP 双记录解析的修复。
+
+复测时保留手机和车机原有配对及 Wi-Fi 配置，记下车机弹窗的时间。按 `attempt` 对齐以下证据：
+
+- `BT-CAFF` 是手机主动出站；`BT-ACCEPT: entry=BT-S` 是车机主动入站。用 `acceptedUptimeMs` 关联接管该 socket 的 `BT-WORKER`，再按 `handshake` 对照 `HS#` 的 iAP2 时序。仅有 SDP UUID 或 socket accept 不等于进入 iAP2。
+- `CTRL-DIAG` 记本地监听与 NSD 回调；`MDNS-OBS` 的 `known-answer` 是查询携带的已知记录，不是新响应，也不等于完成 SRV/TXT/地址解析。观察器只收多播，不能排除单播应答或 TCP SYN；需要链路抓包才能区分未发 SYN、旧地址/端口、与当前端口握手未成。
+- `CTRL_TCP_ACCEPTED` 是应用收到已建连 socket，`CTRL_INVITE_HEAD` 是完整有效的邀请请求头，`CTRL_INVITE_ACK` 是应用写出邀请的 HTTP 200，`CTRL_INVITED` 才是邀请已发布给会话层；前一阶段不能代替后一阶段。
+
+如有移除配对再测试的操作，应单列：同一个应用 attempt 能跨过系统解绑/重配，不是旧配对回连成功的证据。
+
 ## Wi-Fi 与车机邀请
 
 “上车自动连接”位于设置 → 我的车机，继续控制待机监听、系统唤醒和自动连接入口。“已配对车机 Wi-Fi 主动连接”和“车机 Wi-Fi 中断恢复”两项实验功能已删除，升级时清理对应的保存值。网络稳定 10 秒主动拨号、120 秒恢复许可、失败后的候选端口定时重放及 ACL 状态变化恢复均不再启用。
