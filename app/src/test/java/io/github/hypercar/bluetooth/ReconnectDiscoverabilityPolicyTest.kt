@@ -1,5 +1,6 @@
 package io.github.hypercar.bluetooth
 
+import io.github.hypercar.headunit.HeadUnitProfiles
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -42,7 +43,7 @@ class ReconnectDiscoverabilityPolicyTest {
 
     @Test fun coldBmwPreparationDoesNotNeedWifiAndSurvivesWifiArrival() {
         val p = ReconnectDiscoverabilityPolicy()
-        val prep = ReconnectDiscoverability.bmwPreparationKey("bmw_id85", "AA:BB:CC:DD:EE:FF", true, true, true)
+        val prep = ReconnectDiscoverability.preparationKey("bmw_id85", false, bmw, true, true, emptySet()) { "" }
         assertNotNull(prep)
         assertFalse(p.shouldAttempt(true, null, false, false, 0, prep))
         assertTrue(p.shouldAttempt(true, "new wifi", false, false, 5_000, prep))
@@ -51,18 +52,81 @@ class ReconnectDiscoverabilityPolicyTest {
         assertTrue(p.shouldAttempt(true, "new wifi", true, false, 11_000, prep))
     }
 
+    @Test fun systemConfirmationOnlyBacksUpPreparedManualStartInForeground() {
+        assertEquals(DiscoverabilityRoute.SYSTEM_CONFIRMATION, discoverabilityRoute(false, true, true, true))
+        assertEquals(DiscoverabilityRoute.SHELL, discoverabilityRoute(true, true, true, true))
+        assertEquals(DiscoverabilityRoute.SHELL, discoverabilityRoute(true, false, false, false))
+        assertEquals(DiscoverabilityRoute.SKIP, discoverabilityRoute(false, false, true, true))
+        assertEquals(DiscoverabilityRoute.SKIP, discoverabilityRoute(false, true, false, true))
+        assertEquals(DiscoverabilityRoute.SKIP, discoverabilityRoute(false, true, true, false))
+    }
+
+    @Test fun manualStartOpensOnFirstReadyCheckForEveryProfileAndDoesNotRearm() {
+        for (profile in HeadUnitProfiles.builtin) {
+            val p = ReconnectDiscoverabilityPolicy(immediatePreparation = true)
+            val prep = ReconnectDiscoverability.preparationKey(profile.id, true, bmw, true, true, emptySet()) { "" }
+            assertEquals(profile.id, "bt:$bmw", prep)
+            assertFalse(p.shouldAttempt(true, null, false, false, 0))
+            assertTrue(p.shouldAttempt(true, null, false, false, 1, prep))
+            assertFalse(p.armForWake())
+            assertFalse(p.shouldAttempt(true, "car", true, false, 40_000, prep))
+            assertFalse(p.shouldAttempt(true, "car", true, false, 80_000))
+        }
+    }
+
+    @Test fun manualCannotOpenIfDisabledOrSessionAlreadyClaimed() {
+        val p = ReconnectDiscoverabilityPolicy(immediatePreparation = true)
+        val prep = ReconnectDiscoverability.preparationKey("generic", true, bmw, true, true, emptySet()) { "" }
+        assertFalse(p.shouldAttempt(false, null, false, false, 0, prep))
+        assertFalse(p.shouldAttempt(true, null, false, true, 1, prep))
+        assertFalse(p.shouldAttempt(true, null, false, false, 2, prep))
+    }
+
+    @Test fun manualWithoutPairedPreparationKeepsNetworkGrace() {
+        val p = ReconnectDiscoverabilityPolicy(immediatePreparation = true)
+        assertFalse(p.shouldAttempt(true, "car", true, false, 0))
+        assertFalse(p.shouldAttempt(true, "car", true, false, 4_999))
+        assertTrue(p.shouldAttempt(true, "car", true, false, 5_000))
+    }
+
     @Test fun coldPreparationRequiresPairedTargetListeningAndAuthorizedAttempt() {
-        fun key(profile: String = "bmw_id85", mac: String? = "AA:BB:CC:DD:EE:FF",
-                paired: Boolean = true, listening: Boolean = true, allowed: Boolean = true) =
-            ReconnectDiscoverability.bmwPreparationKey(profile, mac, paired, listening, allowed)
-        assertNull(key(profile = "bmw_id9"))
-        assertNull(key(profile = "generic"))
+        fun key(mac: String? = bmw, paired: Boolean = true, listening: Boolean = true, allowed: Boolean = true) =
+            ReconnectDiscoverability.preparationKey("generic", true, mac, listening, allowed, emptySet()) {
+                if (paired && it == bmw) "" else null
+            }
         assertNull(key(mac = null))
         assertNull(key(mac = "not a MAC"))
         assertNull(key(paired = false))
         assertNull(key(listening = false))
         assertNull(key(allowed = false))
-        assertEquals(key(), key(mac = "aa:bb:cc:dd:ee:ff"))
+        assertEquals(key(), key(mac = bmw.lowercase()))
+    }
+
+    @Test fun manualAutomaticTargetRequiresUniqueBondedHistoryOutsideBmwFallback() {
+        val history = setOf("${second.lowercase()}|车机|20", "$second|旧名称|1", "$bmw|宝马|10")
+        fun key(target: String? = null, bonded: Set<String> = setOf(second, desktop)) =
+            ReconnectDiscoverability.preparationKey("generic", true, target, true, true, history) {
+                if (it in bonded) "" else null
+            }
+        assertEquals("bt:$second", key())
+        assertNull(key(bonded = setOf(second, bmw)))
+        assertNull(key(target = bmw)) // A missing explicit target cannot be silently replaced.
+        assertNull(key(bonded = setOf(desktop)))
+    }
+
+    @Test fun automaticEarlyPreparationRemainsLimitedToId85() {
+        for (profile in HeadUnitProfiles.builtin) {
+            val history = setOf("$bmw|BMW|10")
+            val explicit = ReconnectDiscoverability.preparationKey(profile.id, false, bmw, true, true, history) { "BMW" }
+            val automatic = ReconnectDiscoverability.preparationKey(profile.id, false, null, true, true, history) { "BMW" }
+            if (profile == HeadUnitProfiles.BMW_ID85) {
+                assertEquals("bt:$bmw", explicit)
+                assertEquals(automaticKey(mapOf(bmw to "BMW"), history), automatic)
+            } else {
+                assertNull(explicit)
+                assertNull(automatic)
+            }
+        }
     }
 
     @Test fun disabledOrClaimedColdPreparationCannotOpenWindow() {

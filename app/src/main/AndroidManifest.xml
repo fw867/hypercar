@@ -28,6 +28,8 @@
     <uses-permission android:name="android.permission.BLUETOOTH" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- 手动连接无 Shizuku 时才按需请求；不列入启动必需权限。 -->
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
     <uses-permission
         android:name="android.permission.BLUETOOTH_SCAN"
         android:usesPermissionFlags="neverForLocation"

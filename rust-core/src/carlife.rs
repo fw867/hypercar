@@ -162,12 +162,14 @@ pub type DisplayRequest = tokio::sync::watch::Sender<(u32, u32)>;
 pub(crate) struct DialStop {
     retired: Mutex<bool>,
     signal: Arc<Notify>,
+    diagnostic_phase: Arc<DiagnosticPhase>,
 }
 impl DialStop {
     pub(crate) fn cancel(&self) {
         *self.retired.lock() = true;
         self.signal.notify_waiters();
     }
+    pub(crate) fn diagnostic_phase(&self) -> Arc<DiagnosticPhase> { self.diagnostic_phase.clone() }
     fn is_retired(&self) -> bool { *self.retired.lock() }
     async fn cancelled(&self) {
         let notified = self.signal.notified();
@@ -188,6 +190,32 @@ impl DialStop {
             }) => result,
         }
     }
+}
+
+/// Diagnostic metadata only. The video pump opens the gate after writing a real frame.
+#[derive(Default)]
+pub(crate) struct DiagnosticPhase(std::sync::atomic::AtomicBool);
+impl DiagnosticPhase {
+    pub(crate) fn set_streaming(&self, active: bool) {
+        self.0.store(active, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(crate) fn streaming(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn inspect_video_unit(&self, units: u64) -> bool { units == 1 || self.streaming() }
+}
+
+#[cfg(test)]
+#[test]
+fn carwith_preflight_logs_only_first_access_unit_until_streaming() {
+    let phase = DiagnosticPhase::default();
+    assert!(phase.inspect_video_unit(1));
+    assert!(!phase.inspect_video_unit(2));
+    assert!(!phase.inspect_video_unit(1000));
+    phase.set_streaming(true);
+    assert!(phase.inspect_video_unit(1001));
+    phase.set_streaming(false);
+    assert!(!phase.inspect_video_unit(1002));
 }
 
 // All CarWith entries share the same local ports. Each task joins its predecessor, including
@@ -284,13 +312,13 @@ impl CarLifeHub {
                     (sockets.next().unwrap(),MediaKind::Media,"MEDIA"),
                     (sockets.next().unwrap(),MediaKind::Tts,"TTS"),
                 ] {
-                    children.spawn(handle_media_client(stream,events_task.clone(),kind,label,Some(state.clone())));
+                    children.spawn(handle_media_client(stream,events_task.clone(),kind,label,Some(state.clone()),stop.diagnostic_phase()));
                 }
                 let vr = sockets.next().unwrap();
                 if let Some(mic) = config.microphone.clone() {
                     mic.request(false);
-                    children.spawn(microphone::run(vr, state.clone(), mic, stop.signal.clone(), events_task.clone()));
-                } else { children.spawn(drain_stream(vr, state.clone(), events_task.clone())); }
+                    children.spawn(microphone::run(vr, state.clone(), mic, stop.signal.clone(), events_task.clone(), stop.diagnostic_phase()));
+                } else { children.spawn(drain_stream(vr, state.clone(), events_task.clone(), stop.diagnostic_phase())); }
                 let ctrl=sockets.next().unwrap(); let q=queue.clone(); let cipher=state.clone(); let stop_ctrl=stop.signal.clone();
                 children.spawn(async move { session::control(ctrl,q,cipher,stop_ctrl).await; });
                 children.spawn(session::data(sockets.next().unwrap(),state.clone(),events_task.clone()));
@@ -600,6 +628,7 @@ async fn handle_media_client(
     kind: MediaKind,
     label: &'static str,
     encryption: Option<session::Shared>,
+    diagnostic_phase: Arc<DiagnosticPhase>,
 ) {
     let (mut rd, mut wr) = stream.into_split();
     let is_video = matches!(kind, MediaKind::Video);
@@ -633,7 +662,9 @@ async fn handle_media_client(
         let socket_read = video_probe.read_until_deadline(socket_read);
         let read = tokio::select! {
             _ = diagnostics.tick(), if !is_video => {
-                periodic.periodic(channel_stats.report(label,"periodic",buf.len()), |line| emit_log(line));
+                if diagnostic_phase.streaming() {
+                    periodic.periodic(channel_stats.report(label,"periodic",buf.len()), |line| emit_log(line));
+                }
                 continue;
             }
             _ = hb.tick(), if is_video => {
@@ -752,10 +783,12 @@ async fn handle_media_client(
                                     #[cfg(test)]
                                     if !video_probe.accept_unit(&data, codec).await { continue; }
                                     access_units += 1;
-                                    let types: Vec<_> = crate::screen::annexb_nals(&data).iter().map(|n|
-                                        if codec == crate::video_format::VideoCodec::Hevc { (n[0]>>1)&63 } else { n[0]&31 }).collect();
-                                    if access_units == 1 || types.iter().any(|kind| if codec == crate::video_format::VideoCodec::Hevc { matches!(kind,19..=21) } else { *kind==5 }) {
-                                        emit_log(&format!("CARWITH-VIDEO: AU#{access_units} codec={} bytes={} nals={types:?} sourceUnixSeconds={ts_ms}; AirPlay PTS=monotonic",codec.as_str(),data.len()));
+                                    if diagnostic_phase.inspect_video_unit(access_units) {
+                                        let types: Vec<_> = crate::screen::annexb_nals(&data).iter().map(|n|
+                                            if codec == crate::video_format::VideoCodec::Hevc { (n[0]>>1)&63 } else { n[0]&31 }).collect();
+                                        if access_units == 1 || types.iter().any(|kind| if codec == crate::video_format::VideoCodec::Hevc { matches!(kind,19..=21) } else { *kind==5 }) {
+                                            emit_log(&format!("CARWITH-VIDEO: AU#{access_units} codec={} bytes={} nals={types:?} sourceUnixSeconds={ts_ms}; AirPlay PTS=monotonic",codec.as_str(),data.len()));
+                                        }
                                     }
                                     let _ = events.send(CarLifeEvent::VideoFrameTagged {
                                         pts_us: crate::timing::monotonic_nanos() / 1000, data, codec,
@@ -980,7 +1013,8 @@ async fn dial(host: &str, port: u16) -> Result<TcpStream, std::io::Error> {
 }
 
 /// VR playback remains available when car microphone capture is disabled.
-async fn drain_stream(mut stream: TcpStream, state:session::Shared, events:mpsc::UnboundedSender<CarLifeEvent>) {
+async fn drain_stream(mut stream: TcpStream, state:session::Shared, events:mpsc::UnboundedSender<CarLifeEvent>,
+                      diagnostic_phase: Arc<DiagnosticPhase>) {
     let mut buf = [0u8; 2048];
     let mut receiver=voice_audio::Receiver::default();
     let mut stats=channel_diagnostics::Stats::default();
@@ -989,7 +1023,7 @@ async fn drain_stream(mut stream: TcpStream, state:session::Shared, events:mpsc:
     diagnostics.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            _=diagnostics.tick()=>periodic.periodic(stats.report("VR/noCapture","periodic",receiver.pending()), |line| emit_log(line)),
+            _=diagnostics.tick()=>{if diagnostic_phase.streaming() {periodic.periodic(stats.report("VR/noCapture","periodic",receiver.pending()), |line| emit_log(line));}},
             received=stream.read(&mut buf)=>match received {
                 Ok(0)=>{emit_log(&stats.report("VR/noCapture","eof",receiver.pending()));return;},
                 Ok(n)=>receiver.push(&buf[..n],&mut stats,&state,&events),
@@ -1015,8 +1049,8 @@ mod voice_downlink_tests {
         let control=Arc::new(crate::mic_probe::ProbeControl::for_carwith());
         if capture { control.arm_test(); control.request(true); }
         let generation=control.generation();
-        let worker=if capture { tokio::spawn(microphone::run(client,state.clone(),control.clone(),Arc::new(Notify::new()),tx)) }
-            else {tokio::spawn(drain_stream(client,state.clone(),tx))};
+        let worker=if capture { tokio::spawn(microphone::run(client,state.clone(),control.clone(),Arc::new(Notify::new()),tx,Arc::default())) }
+            else {tokio::spawn(drain_stream(client,state.clone(),tx,Arc::default()))};
         let init=state.lock().encrypt(&[8,128,125,16,1,24,16]).unwrap();
         let pcm=state.lock().encrypt(&[1,0,254,255]).unwrap();
         let wire=[build_media_frame(0x50002,0,&init),build_media_frame(0x50003,0,&pcm),build_media_frame(0x50004,0,&[])].concat();
@@ -1052,7 +1086,7 @@ mod media_tts_downlink_tests {
         let client=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let(mut peer,_)=listener.accept().await.unwrap();peer.set_nodelay(true).unwrap();
         let state=session::microphone_test_session();let(tx,mut rx)=mpsc::unbounded_channel();
-        let worker=tokio::spawn(handle_media_client(client,tx,kind,if tts {"TTS"}else{"MEDIA"},Some(state.clone())));
+        let worker=tokio::spawn(handle_media_client(client,tx,kind,if tts {"TTS"}else{"MEDIA"},Some(state.clone()),Arc::default()));
         let encrypted_init=state.lock().encrypt(init).unwrap();
         // The first twelve PCM bytes resemble an outer header. They remain samples;
         // a second header strip or incorrect MEDIA decryption must fail this assertion.

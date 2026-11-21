@@ -914,6 +914,7 @@ pub(crate) async fn video_pump(
     video_rx: mpsc::UnboundedReceiver<SourceEvent>,
     carwith_profile: Option<String>, fps:u32, source_owner:Option<u64>,
 ) {
+    let diagnostic_phase = VideoLogLease(source_owner.and_then(crate::carwith_source::diagnostic_phase));
     let transcode = carwith_profile.is_some();
     let mut converter=crate::video_transcode::Router::new(transcode,fps,crate::video_transcode::hardware_factory());
     converter.fit_oversize_display = carwith_profile.as_deref() == Some("bmw_id9");
@@ -934,6 +935,7 @@ pub(crate) async fn video_pump(
             _ = stop_v.notified() => return,
             command = screen_ready_rx.recv(), if commands_open => match command {
                 Some(crate::screen_session::ScreenCommand::Install(mut s)) => {
+                    diagnostic_phase.set_streaming(false);
                     converter.set_target(s.receiver_size());
                     converted.clear();
                     if let Some((w, h)) = pending_size.take() {
@@ -948,6 +950,7 @@ pub(crate) async fn video_pump(
                     let accepted = {
                         let state = modes.lock();
                         if state.can_restore_screen(revision) {
+                            diagnostic_phase.set_streaming(false);
                             converter.set_target(next.receiver_size());
                             converted.clear();
                             next.set_resource_grant(modes.clone(),revision);
@@ -965,6 +968,7 @@ pub(crate) async fn video_pump(
                     }
                 }
                 Some(crate::screen_session::ScreenCommand::Pause(reply)) => {
+                    diagnostic_phase.set_streaming(false);
                     converter.pause(); converted.clear();
                     drop(sender.take());
                     let _=reply.send(());
@@ -1049,6 +1053,7 @@ pub(crate) async fn video_pump(
                             emit_log(&format!("VIDEO: write failed: {error}; {}; tcp_at_failure=[{}]", s.diagnostics(),s.transport_diagnostics()));
                             video_pipeline.lock().video_stream="FAILED".into();
                             if resource_lifecycle {
+                                diagnostic_phase.set_streaming(false);
                                 drop(sender.take());
                                 video_pipeline.lock().retire_video_tcp();
                                 emit_log("SCREEN-LIFECYCLE: video write failed; keep audio/control, await next allowed requestUI");
@@ -1057,8 +1062,10 @@ pub(crate) async fn video_pump(
                             emit_state("ended", "屏幕流写失败（请检查网络及车机会话）");
                             return;
                         }
+                        let written_frames = s.frames_sent() - before_frames;
+                        if written_frames > 0 { diagnostic_phase.set_streaming(true); }
                         let mut st = stats.lock();
-                        st.frames += s.frames_sent() - before_frames;
+                        st.frames += written_frames;
                         st.bytes += s.bytes_per_second() - before_bytes;
                     } else {
                         before_ready_units += 1;
@@ -1088,6 +1095,7 @@ pub(crate) async fn video_pump(
                         emit_log(&format!("VIDEO: keepAlive failed: {error}; {}; tcp_at_failure=[{}]", s.diagnostics(),s.transport_diagnostics()));
                         video_pipeline.lock().video_stream="FAILED".into();
                         if resource_lifecycle {
+                            diagnostic_phase.set_streaming(false);
                             drop(sender.take());
                             video_pipeline.lock().retire_video_tcp();
                             emit_log("SCREEN-LIFECYCLE: video keepAlive failed; preserve other channels");
@@ -1102,8 +1110,32 @@ pub(crate) async fn video_pump(
     }
 }
 
+struct VideoLogLease(Option<Arc<crate::carlife::DiagnosticPhase>>);
+impl VideoLogLease {
+    fn set_streaming(&self, active: bool) {
+        if let Some(phase) = &self.0 { phase.set_streaming(active); }
+    }
+}
+impl Drop for VideoLogLease {
+    fn drop(&mut self) { self.set_streaming(false); }
+}
+
 #[cfg(test)]
 mod video_pump_tests {
+    #[test]
+    fn carwith_log_phase_quiets_on_pause_and_when_video_pump_exits() {
+        let phase = Arc::new(crate::carlife::DiagnosticPhase::default());
+        let lease = VideoLogLease(Some(phase.clone()));
+        assert!(!phase.streaming());
+        lease.set_streaming(true);
+        assert!(phase.streaming());
+        lease.set_streaming(false);
+        assert!(!phase.streaming());
+        lease.set_streaming(true);
+        drop(lease);
+        assert!(!phase.streaming());
+    }
+
     use super::*;
     #[test]
     fn obsolete_recovery_flags_do_not_enable_the_new_experiment() {

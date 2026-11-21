@@ -1,7 +1,10 @@
 ﻿@file:Suppress("DEPRECATION")   // 平台 API / 旧图标名已废弃但当前无替代，统一在此抑制
 package io.github.hypercar.ui
 
+import android.Manifest
+import android.bluetooth.BluetoothAdapter
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -50,6 +53,8 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.repeatOnLifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.withResumed
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -63,6 +68,8 @@ import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import io.github.hypercar.bluetooth.DISCOVERABLE_WINDOW_SECONDS
+import io.github.hypercar.bluetooth.SystemDiscoverabilityPrompt
 import io.github.hypercar.core.LinkState
 import io.github.hypercar.core.SessionSnapshot
 import io.github.hypercar.perm.AppPermissions
@@ -71,7 +78,10 @@ import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.session.StartupRequirements
 import io.github.hypercar.settings.SettingsRevision
 import io.github.hypercar.settings.SettingsStore
+import java.lang.ref.WeakReference
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import io.github.hypercar.ui.screens.AboutScreen
 import io.github.hypercar.ui.screens.DiagnosticsScreen
@@ -94,6 +104,58 @@ import io.github.hypercar.ui.theme.TextSecondary
 
 /** 单 Activity：底部三 Tab（主页 / 设置 / 诊断），state-based 切换，无需 navigation-compose。 */
 class MainActivity : ComponentActivity() {
+    private class DiscoverabilityRequest(val stillWaiting: () -> Boolean) {
+        val result = CompletableDeferred<Int?>()
+    }
+
+    private var pendingDiscoverability: DiscoverabilityRequest? = null
+    private val discoverabilityLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        pendingDiscoverability?.let { finishDiscoverability(it, result.resultCode.coerceAtLeast(0)) }
+    }
+    private val advertisePermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val request = pendingDiscoverability ?: return@registerForActivityResult
+        if (!granted) finishDiscoverability(request, 0)
+        else lifecycleScope.launch { lifecycle.withResumed { launchDiscoverability(request) } }
+    }
+
+    private fun finishDiscoverability(request: DiscoverabilityRequest, seconds: Int?) {
+        if (pendingDiscoverability === request) pendingDiscoverability = null
+        request.result.complete(seconds)
+    }
+
+    private fun launchDiscoverability(request: DiscoverabilityRequest) {
+        if (!request.stillWaiting() || isFinishing) {
+            finishDiscoverability(request, null)
+            return
+        }
+        runCatching {
+            discoverabilityLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
+                .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, DISCOVERABLE_WINDOW_SECONDS))
+        }.onFailure {
+            HyperCarRepo.log("BT-DISCOVERY: 系统可发现确认无法启动：${it.javaClass.simpleName}")
+            finishDiscoverability(request, null)
+        }
+    }
+
+    private suspend fun requestDiscoverability(stillWaiting: () -> Boolean): Int? = withContext(Dispatchers.Main.immediate) {
+        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) || isFinishing ||
+            pendingDiscoverability != null || !stillWaiting()) return@withContext null
+        val request = DiscoverabilityRequest(stillWaiting)
+        pendingDiscoverability = request
+        if (checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED) {
+            launchDiscoverability(request)
+        } else {
+            runCatching { advertisePermissionLauncher.launch(Manifest.permission.BLUETOOTH_ADVERTISE) }
+                .onFailure { finishDiscoverability(request, null) }
+        }
+        // 保留正在显示的系统请求，直到它返回；旧结果不能落到新的连接轮次。
+        request.result.await()
+    }
+
+    override fun onDestroy() {
+        pendingDiscoverability?.let { finishDiscoverability(it, null) }
+        super.onDestroy()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -106,6 +168,10 @@ class MainActivity : ComponentActivity() {
             isAppearanceLightNavigationBars = false
         }
 
+        val host = WeakReference(this)
+        val systemPrompt: SystemDiscoverabilityPrompt = { stillWaiting ->
+            host.get()?.requestDiscoverability(stillWaiting)
+        }
         setContent {
             val themeMode = remember(SettingsRevision.value) { SettingsStore.appThemeMode }
             HyperCarTheme(mode = themeMode) {
@@ -118,7 +184,7 @@ class MainActivity : ComponentActivity() {
                         isAppearanceLightNavigationBars = !dark
                     }
                 }
-                MainContent()
+                MainContent(onStart = { HyperCarRepo.connect(applicationContext, systemPrompt) })
             }
         }
     }
@@ -132,7 +198,7 @@ private enum class AppTab(val title: String, val icon: ImageVector) {
 }
 
 @Composable
-private fun MainContent() {
+private fun MainContent(onStart: () -> Unit) {
     val snapshot by HyperCarRepo.snapshots.collectAsStateWithLifecycle()
     val visibleConnectionAttempt = snapshot.connectionAttemptId
     val context = LocalContext.current
@@ -310,7 +376,7 @@ private fun MainContent() {
                         startup = startup,
                         onRefreshSetup = { permVersion++ },
                         snapshot = snapshot,
-                        onStart = { HyperCarRepo.connect(context) },
+                        onStart = onStart,
                         onStop = { HyperCarRepo.disconnect(visibleConnectionAttempt) },
                         onToggleAutoConnect = { HyperCarRepo.setAutoConnect(context, it) },
                         onRequestDegradedPermission = {

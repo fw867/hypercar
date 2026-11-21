@@ -151,6 +151,10 @@ pub(crate) fn stop(owner:u64) {
     slot.newest = slot.newest.max(owner);
     if slot.current.as_ref().is_some_and(|s|s.owner==owner) {slot.current=None;}
 }
+pub(crate) fn diagnostic_phase(owner: u64) -> Option<Arc<crate::carlife::DiagnosticPhase>> {
+    SOURCE.lock().current.as_ref().filter(|source| source.owner == owner)
+        .map(|source| source.stop.diagnostic_phase())
+}
 pub(crate) fn replay(owner:u64) {
     let slot=SOURCE.lock();
     if let Some(source)=slot.current.as_ref().filter(|s|s.owner==owner) {

@@ -8,12 +8,26 @@ import io.github.hypercar.spike.SpikeShell
 import java.util.UUID
 import kotlinx.coroutines.*
 
+internal const val DISCOVERABLE_WINDOW_SECONDS = 30
+
+/** null = 无法请求，0 = 未同意，正数 = 系统返回的实际秒数。 */
+internal typealias SystemDiscoverabilityPrompt = suspend (() -> Boolean) -> Int?
+
+internal enum class DiscoverabilityRoute { SHELL, SYSTEM_CONFIRMATION, SKIP }
+
+internal fun discoverabilityRoute(shizukuReady: Boolean, immediatePreparation: Boolean,
+                                  prepared: Boolean, hasForegroundPrompt: Boolean): DiscoverabilityRoute = when {
+    shizukuReady -> DiscoverabilityRoute.SHELL
+    immediatePreparation && prepared && hasForegroundPrompt -> DiscoverabilityRoute.SYSTEM_CONFIRMATION
+    else -> DiscoverabilityRoute.SKIP
+}
+
 private const val AUTO_BMW_KEY_PREFIX = "bt:auto:"
 private val bluetoothAddress = Regex("(?:[0-9A-F]{2}:){5}[0-9A-F]{2}")
 private val bmwName = Regex("""(?:^|[^a-z])bmw(?![a-z])|宝马""", RegexOption.IGNORE_CASE)
 
-/** 每轮连接只消费一次机会，网络/服务未就绪时不启动宽限计时；ACL 唤醒可再给一次。 */
-internal class ReconnectDiscoverabilityPolicy {
+/** 手动启动在目标已配对且蓝牙监听就绪后直接开一轮；自动重连沿用原窗口策略。 */
+internal class ReconnectDiscoverabilityPolicy(private val immediatePreparation: Boolean = false) {
     private var key: String? = null
     private var readyAt = 0L
     private var attempted = false
@@ -33,6 +47,10 @@ internal class ReconnectDiscoverabilityPolicy {
         if (sessionClaimed) return false
         val readyKey = preparationKey ?: networkKey?.takeIf { servicesReady }
         if (!enabled || readyKey == null) { key = null; return false }
+        if (immediatePreparation && preparationKey != null && !attempted) {
+            attempted = true
+            return true
+        }
         if (wakeArmed) {
             wakeArmed = false
             if (readyKey.startsWith(AUTO_BMW_KEY_PREFIX)) return false
@@ -51,7 +69,7 @@ internal class ReconnectDiscoverabilityPolicy {
     /** Car ACL while still waiting for invite/iAP2: allow one extra discoverable window. */
     @Synchronized
     fun armForWake(): Boolean {
-        if (sessionClaimed || !attempted || wakeArmed) return false
+        if (sessionClaimed || !attempted || immediatePreparation || wakeArmed) return false
         wakeArmed = true
         return true
     }
@@ -65,7 +83,7 @@ internal suspend fun runDiscoverableWindow(
 ) {
     try {
         if (!start()) return
-        withTimeoutOrNull(30_000) {
+        withTimeoutOrNull(DISCOVERABLE_WINDOW_SECONDS * 1_000L) {
             while (keepOpen()) delay(250)
         }
     } finally {
@@ -89,12 +107,25 @@ internal object ReconnectDiscoverability {
     }
 
     /** 仅准备被动接受蓝牙连接；不授权主动拨号、Wi-Fi 入网或 RTSP 建链。 */
-    fun bmwPreparationKey(profileId: String, targetMac: String?, isBonded: Boolean,
-                          listening: Boolean, connectionAllowed: Boolean): String? {
-        if (profileId != "bmw_id85" || !isBonded || !listening || !connectionAllowed) return null
-        val mac = targetMac?.trim()?.uppercase(java.util.Locale.ROOT) ?: return null
-        if (!bluetoothAddress.matches(mac)) return null
-        return "bt:$mac"
+    fun preparationKey(
+        profileId: String, manual: Boolean, targetMac: String?, listening: Boolean,
+        connectionAllowed: Boolean, successfulCars: Set<String>, bondedName: (String) -> String?,
+    ): String? {
+        if (!listening || !connectionAllowed || (!manual && profileId != "bmw_id85")) return null
+        if (!targetMac.isNullOrBlank()) {
+            val mac = targetMac.trim().uppercase(java.util.Locale.ROOT)
+            return if (bluetoothAddress.matches(mac) && bondedName(mac) != null) "bt:$mac" else null
+        }
+        if (manual) {
+            // “自动识别”只在历史成功车机中有唯一仍配对的候选时通用，不猜测其他蓝牙设备。
+            val mac = successfulCars.asSequence()
+                .map { it.substringBefore('|').trim().uppercase(java.util.Locale.ROOT) }
+                .distinct()
+                .filter { bluetoothAddress.matches(it) && bondedName(it) != null }
+                .singleOrNull()
+            if (mac != null) return "bt:$mac"
+        }
+        return automaticBmwPreparationKey(profileId, listening, connectionAllowed, successfulCars, bondedName)
     }
 
     @Volatile private var activePolicy: ReconnectDiscoverabilityPolicy? = null
@@ -112,9 +143,11 @@ internal object ReconnectDiscoverability {
         sessionStarted: () -> Boolean,
         log: (String) -> Unit,
         preparationKey: () -> String? = { null },
+        immediatePreparation: Boolean = false,
+        systemPrompt: SystemDiscoverabilityPrompt? = null,
     ) {
         firstWindowFinished = false
-        val policy = ReconnectDiscoverabilityPolicy()
+        val policy = ReconnectDiscoverabilityPolicy(immediatePreparation)
         activePolicy = policy
         try {
             while (currentCoroutineContext().isActive) {
@@ -127,8 +160,33 @@ internal object ReconnectDiscoverability {
                 if (policy.shouldAttempt(true, network, servicesReady(), false,
                         SystemClock.elapsedRealtime(), preparation)) {
                     try {
-                        if (!ShizukuTools.isReady) { log("BT-DISCOVERY: 跳过短暂可发现，Shizuku 未就绪"); return }
+                        when (discoverabilityRoute(ShizukuTools.isReady, immediatePreparation,
+                                preparation != null, systemPrompt != null)) {
+                            DiscoverabilityRoute.SKIP -> {
+                                log("BT-DISCOVERY: 跳过短暂可发现，Shizuku 未就绪")
+                                return
+                            }
+                            DiscoverabilityRoute.SYSTEM_CONFIRMATION -> {
+                                val job = currentCoroutineContext().job
+                                val seconds = systemPrompt?.invoke {
+                                    job.isActive && !ShizukuTools.isReady && !sessionStarted() && readyForWindow()
+                                }
+                                when {
+                                    seconds == null -> log("BT-DISCOVERY: 未弹出系统可发现确认，继续等待车机")
+                                    seconds <= 0 -> log("BT-DISCOVERY: 未同意系统可发现请求，继续等待车机")
+                                    else -> {
+                                        log("BT-DISCOVERY: 系统已允许蓝牙可发现 ${seconds}s，由系统到时关闭")
+                                        withTimeoutOrNull(seconds * 1_000L) {
+                                            while (!sessionStarted() && readyForWindow()) delay(250)
+                                        }
+                                    }
+                                }
+                                return
+                            }
+                            DiscoverabilityRoute.SHELL -> Unit
+                        }
                         val bind = SpikeShell.connect(context)
+                        currentCoroutineContext().ensureActive()
                         // 绑定 shell 可能花数秒，期间车机可能已建立会话或换网。
                         if (sessionStarted() || !readyForWindow()) return
                         if (!SpikeShell.isConnected()) { log("BT-DISCOVERY: shell 绑定未完成：$bind"); return }
@@ -137,13 +195,16 @@ internal object ReconnectDiscoverability {
                         var started = false
                         runDiscoverableWindow(
                             start = {
-                                val result = SpikeShell.startBluetoothDiscoverable(owner, token, 30)
+                                val result = SpikeShell.startBluetoothDiscoverable(owner, token, DISCOVERABLE_WINDOW_SECONDS)
                                 val source = when {
-                                    preparation?.startsWith(AUTO_BMW_KEY_PREFIX) == true -> "ID8.5 自动匹配唯一已连接宝马/蓝牙监听"
-                                    preparation != null -> "ID8.5 已配对目标/蓝牙监听"
+                                    preparation?.startsWith(AUTO_BMW_KEY_PREFIX) == true -> "ID8.5 匹配唯一已配对历史宝马/蓝牙监听"
+                                    preparation != null -> "已配对目标/蓝牙监听"
                                     else -> "已配对车机 Wi-Fi/广播/监听"
                                 }
-                                log("BT-DISCOVERY: ${source}就绪 5s 后：$result")
+                                val trigger = if (immediatePreparation && preparation != null) {
+                                    "手动启动，${source}就绪即开"
+                                } else "${source}就绪后"
+                                log("BT-DISCOVERY: $trigger：$result")
                                 result.startsWith("OK").also { started = it }
                             },
                             keepOpen = {

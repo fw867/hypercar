@@ -15,6 +15,7 @@ import android.os.SystemClock
 import io.github.hypercar.autowake.AutoStart
 import io.github.hypercar.bluetooth.CarProfileGuard
 import io.github.hypercar.bluetooth.ReconnectDiscoverability
+import io.github.hypercar.bluetooth.SystemDiscoverabilityPrompt
 import io.github.hypercar.autowake.HyperCarService
 import io.github.hypercar.carui.CarUiCaster
 import io.github.hypercar.carui.MusicBridge
@@ -434,7 +435,8 @@ object HyperCarRepo {
     internal val mapNavigationAllowed: Boolean get() = hasCurrentSession && !sessionCarWithMode &&
         !SettingsStore.carWithMode && io.github.hypercar.carui.CarUiSettings.defaultMap == io.github.hypercar.carui.MapProvider.AMAP
 
-    fun connect(context: Context) = requestConnect(context, manual = true, source = "manual")
+    internal fun connect(context: Context, systemPrompt: SystemDiscoverabilityPrompt? = null) =
+        requestConnect(context, manual = true, source = "manual", systemPrompt = systemPrompt)
 
     private fun connectAutomatically(context: Context, source: String = "acl", wakePeer: String? = null) =
         requestConnect(context, manual = false, source = source, wakePeer = wakePeer)
@@ -498,7 +500,8 @@ object HyperCarRepo {
             }))
     }
 
-    private fun requestConnect(context: Context, manual: Boolean, source: String, wakePeer: String? = null) {
+    private fun requestConnect(context: Context, manual: Boolean, source: String, wakePeer: String? = null,
+                               systemPrompt: SystemDiscoverabilityPrompt? = null) {
         init(context)
         scope.launch {
             autoConnectChanges.lock()
@@ -523,10 +526,12 @@ object HyperCarRepo {
                 }
                 if (WaitingInvitationRetryPolicy.shouldSoftRestart(manual, awaitingCarInvitation,
                         hasCurrentSession, streaming)) {
-                    softRestartInvitationWait(context)
+                    softRestartInvitationWait(context, systemPrompt)
                     return@launch
                 }
-                if (AutomaticConnectionPolicy.mayStart(manual, SettingsStore.autoConnect, automaticPauseRemaining > 0)) beginConnect(context, source, wakePeer)
+                if (AutomaticConnectionPolicy.mayStart(manual, SettingsStore.autoConnect, automaticPauseRemaining > 0)) {
+                    beginConnect(context, source, manual, wakePeer, systemPrompt)
+                }
             } finally { autoConnectChanges.unlock() }
         }
     }
@@ -536,7 +541,7 @@ object HyperCarRepo {
      * tap/ACL path could not open a fresh attempt. Manual retry ends the wait without the
      * ten-minute pause, then starts a new attempt with listening restored.
      */
-    private suspend fun softRestartInvitationWait(context: Context) {
+    private suspend fun softRestartInvitationWait(context: Context, systemPrompt: SystemDiscoverabilityPrompt?) {
         val attempt = connectionAttemptId
         log("CONNECT: 等待邀请中手动重试——结束 attempt=$attempt 后重新开始，不创建10分钟暂停")
         carWithEntries.retire(attempt)
@@ -556,11 +561,12 @@ object HyperCarRepo {
         reconnectJob = null
         connecting = false
         if (AutomaticConnectionPolicy.mayStart(true, SettingsStore.autoConnect, automaticPauseRemaining > 0)) {
-            beginConnect(context, "manual-retry")
+            beginConnect(context, "manual-retry", manual = true, systemPrompt = systemPrompt)
         }
     }
 
-    private fun beginConnect(context: Context, source: String, wakePeer: String? = null) {
+    private fun beginConnect(context: Context, source: String, manual: Boolean, wakePeer: String? = null,
+                             systemPrompt: SystemDiscoverabilityPrompt?) {
         init(context)
         if (sessionLive.get() || connecting || streaming) {
             log("CONNECT: 已在连接/已连接，忽略重复触发")
@@ -602,7 +608,7 @@ object HyperCarRepo {
         push(link = LinkState.Negotiating("检查 Shizuku"))
         connectJob?.cancel()
         val attempt = connectionAttemptId
-        connectJob = scope.launch { runConnect(context.applicationContext, attempt, wakePeer) }
+        connectJob = scope.launch { runConnect(context.applicationContext, attempt, wakePeer, manual, systemPrompt) }
     }
 
     /**
@@ -1138,7 +1144,8 @@ object HyperCarRepo {
 
     // ---------------------------------------------------------------- 连接主流程
 
-    private suspend fun runConnect(context: Context, diagnosticId: Long, wakePeer: String?) {
+    private suspend fun runConnect(context: Context, diagnosticId: Long, wakePeer: String?, manual: Boolean,
+                                   systemPrompt: SystemDiscoverabilityPrompt?) {
         if (!sessionLive.get() || connectionAttemptId != diagnosticId) return
         fun fail(reason: String) = HyperCarRepo.fail(reason, diagnosticId)
         val startupIssues = StartupRequirements.read(context).manualIssues
@@ -1293,23 +1300,23 @@ object HyperCarRepo {
                             (target.isNullOrBlank() || target.equals(mac, ignoreCase = true))) "$network|$ssid|$mac" else null
                     },
                     servicesReady = { coordinator.isListening && advertiser.isAdvertising },
-                    sessionStarted = { coordinator.isSessionActive || coordinator.sessionStartCount > baselineSessions ||
-                        advertiser.lastInvitePeerIp != null || streaming },
+                    sessionStarted = { !sessionLive.get() || connectionAttemptId != discoveryAttempt || userDisconnectRequested ||
+                        coordinator.isSessionActive || coordinator.sessionStartCount > baselineSessions ||
+                        invited.get() || advertiser.lastInvitePeerIp != null || streaming },
+                    immediatePreparation = manual,
+                    systemPrompt = systemPrompt,
                     preparationKey = preparation@{
-                        if (p.id != "bmw_id85") return@preparation null
+                        if (!manual && p.id != "bmw_id85") return@preparation null
                         val target = SettingsStore.targetCarMac
                         val allowed = sessionLive.get() && connectionAttemptId == discoveryAttempt && !userDisconnectRequested
                         val listening = coordinator.isListening
-                        if (!allowed || !listening || (target.isNullOrBlank() && boundNetwork != null)) return@preparation null
+                        if (!allowed || !listening || (!manual && target.isNullOrBlank() && boundNetwork != null)) return@preparation null
                         runCatching {
                             val devices = android.bluetooth.BluetoothAdapter.getDefaultAdapter()?.bondedDevices.orEmpty()
-                            if (target.isNullOrBlank()) {
-                                ReconnectDiscoverability.automaticBmwPreparationKey(p.id, listening, allowed, SettingsStore.pairedCars) { mac ->
-                                    devices.firstOrNull { it.address.equals(mac, ignoreCase = true) }?.name
+                            ReconnectDiscoverability.preparationKey(p.id, manual, target, listening, allowed, SettingsStore.pairedCars) { mac ->
+                                devices.firstOrNull { it.address.equals(mac, ignoreCase = true) }?.let { device ->
+                                    runCatching { device.name }.getOrNull().orEmpty()
                                 }
-                            } else {
-                                ReconnectDiscoverability.bmwPreparationKey(p.id, target,
-                                    devices.any { it.address.equals(target, ignoreCase = true) }, listening, allowed)
                             }
                         }.getOrNull()
                     },
