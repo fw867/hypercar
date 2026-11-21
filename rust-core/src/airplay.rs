@@ -321,12 +321,12 @@ pub async fn negotiate(
     let control_local = channel.local_addr().await.map_err(|e| format!("读取控制连接本地地址失败: {e}"))?;
     let timing = TimingServer::start(control_local, |socket| factory.bind_timing_network(socket), p.pipeline.clone())
         .map_err(|e| format!("计时服务启动失败 ({control_local}): {e}"))?;
-    let propose_buffered = p.offers_buffered_media(&info);
+    let propose_buffered = p.proposes_buffered_media(shared_secret.is_some(), &info);
     let (root, session_info, hevc_proposed, buffered_offered) = setup_and_read_info(
         &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap, p.id9_screen_bootstrap, mbux_media_compat, p.bmw_capabilities, p.video_codec == "hevc", propose_buffered, Some(&mut *cleanup), p.wifi_mac_address.as_deref(),
     ).await?;
     info = session_info;
-    let desktop = p.desktop_receiver || !use_box_bootstrap(true, &info);
+    let desktop = effective_desktop(p, &info);
     let id9_modes = p.id9_screen_bootstrap.then(|| {
         crate::modes::Modes::id9_initial(&info, p.enable_audio,
             channel.id9_trace.get().map(String::as_str).unwrap_or("ID9"))
@@ -335,7 +335,7 @@ pub async fn negotiate(
     crate::emit_video_capabilities(hevc_allowed);
     emit_log(&format!("VIDEO-CODEC: preferred={} hevc_proposed={hevc_proposed} hevc_accepted={hevc_allowed}",p.video_codec));
     for line in audio_capability_lines(&info) { emit_log(&line); }
-    let nbt_mode = p.nbt_audio_first && !p.desktop_receiver && use_box_bootstrap(true, &info);
+    let nbt_mode = p.nbt_audio_first && !desktop;
     if nbt_mode && !crate::nbt::matches(&info) {
         return Err("ID6 profile requires NBT Evo receiver identity; select the MGU/IDC23 profile for those platforms".into());
     }
@@ -602,7 +602,7 @@ pub async fn negotiate(
     emit_log(&format!("AUDIO: enabled={} preference={} owner_controller={}", p.enable_audio, p.audio_codec, modes.lock().audio_owned()));
     if p.enable_audio && !nbt_mode {
         let mut candidates = media_plan().await;
-        if buffered_offered && !desktop && p.offers_buffered_media(&info) {
+        if buffered_offered {
             prioritize_buffered_media(&info, &root, &mut candidates);
             emit_log(&format!("BUFFERED-AUDIO: session_features={:?} type103_media_output_aac48={} candidates={candidates:?}",
                 root.get("enabledFeatures"), declares_media(&info, AudioCodec::BufferedAac)));
@@ -1054,7 +1054,13 @@ mod shutdown_tests {
         assert!(result.is_ok(),"{result:?}");assert!(!result.unwrap().2);server.await.unwrap();
     }
     #[tokio::test]
-    async fn mb_ep4_session_setup_includes_buffered_offer_before_reading_formats() {
+    async fn session_setup_offers_buffered_even_if_early_info_says_realtime_only() {
+        let early_info = Value::dict(vec![("audioFormats", Value::array(vec![Value::dict(vec![
+            ("type", Value::int(102)), ("audioType", Value::str("media")), ("audioOutputFormats", Value::int(1 << 23)),
+        ])]))]);
+        let p = buffered_profile_params_for_test();
+        let offer = p.proposes_buffered_media(true, &early_info);
+        assert!(offer);
         let (channel, mut peer) = pair().await;
         let receiver = tokio::spawn(async move {
             for stage in ["SETUP", "GET"] {
@@ -1064,16 +1070,21 @@ mod shutdown_tests {
                     let body = bplist::parse(&msg.body).unwrap();
                     assert!(body.get("features").unwrap().as_array().unwrap().contains(&Value::str("mainBuffered")));
                 }
-                let body = bplist::encode(&Value::dict(vec![("model", Value::str("MB_E-P-4"))]));
+                let body = bplist::encode(&Value::dict(vec![("audioFormats", Value::array(vec![Value::dict(vec![
+                    ("type", Value::int(103)), ("audioType", Value::str("media")), ("audioOutputFormats", Value::int(1 << 23)),
+                ])]))]));
                 peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: {}\r\n\r\n",
                     msg.cseq().unwrap(), body.len()).as_bytes()).await.unwrap();
                 peer.write_all(&body).await.unwrap();
             }
         });
-        let outcome = setup_and_read_info(&channel,"phone","name",1234,true,Value::dict(vec![]),
-            false,false,true,false,false,true,None,None).await;
+        let (setup, info, _, offered) = setup_and_read_info(&channel,"phone","name",1234,true,early_info,
+            false,false,true,false,false,offer,None,None).await.unwrap();
         receiver.await.unwrap();
-        assert!(outcome.unwrap().3);
+        assert!(offered);
+        let mut candidates = vec![AudioCodec::Aac];
+        prioritize_buffered_media(&info, &setup, &mut candidates);
+        assert_eq!(candidates, [AudioCodec::BufferedAac, AudioCodec::Aac]);
     }
 
     #[tokio::test]
@@ -1174,7 +1185,7 @@ mod shutdown_tests {
                 let root = bplist::parse(&request.body).unwrap();
                 let s = &root.get("streams").unwrap().as_array().unwrap()[0];
                 wire_ids.send(s.get("streamConnectionID").unwrap().as_int().unwrap()).unwrap();
-                for (k,v) in [("type",103),("audioFormat",1<<23),("spf",1024),("sr",48000),("ct",4)] {
+                for (k,v) in [("type",103),("audioFormat",1<<23),("spf",1024),("sr",48000),("ct",4),("audioLatencyMs",1000)] {
                     assert_eq!(s.get(k).and_then(Value::as_int),Some(v),"{k}");
                 }
                 assert_eq!(s.get("input"), Some(&Value::bool(false)));
@@ -1591,25 +1602,37 @@ mod id9_tests {
                     format(103,"speechRecognition","audioOutputFormats",1<<23,false)] {
             assert_eq!(plan(vec![bad, udp()], &empty), [AudioCodec::Aac]);
         }
+    }
+
+    #[test]
+    fn buffered_offer_respects_audio_encryption_and_nbt_path() {
+        let empty = Value::dict(vec![]);
+        let diplay = Value::dict(vec![("model", Value::str("DiPlay"))]);
         let mut p = buffered_profile_params_for_test();
-        assert!(p.offers_buffered_media(&empty));
-        p.head_unit_profile = "mercedes_mbux".into();
-        p.id9_screen_bootstrap = false;
-        p.mbux_media_compat = true;
-        let identity = |model| Value::dict(vec![("model", Value::str(model))]);
-        assert!(p.offers_buffered_media(&empty));
-        for model in ["MB_E-P-4", "MB_D-PP-4", "Unknown MBUX"] {
-            assert!(p.offers_buffered_media(&identity(model)));
-        }
-        assert!(!p.offers_buffered_media(&identity("WinPlay")));
+        assert!(p.proposes_buffered_media(true, &empty));
+        assert!(!p.proposes_buffered_media(false, &empty));
+        p.nbt_audio_first = true;
+        assert!(!p.proposes_buffered_media(true, &empty));
+        assert!(effective_desktop(&p, &diplay));
+        assert!(p.proposes_buffered_media(true, &diplay));
         p.audio_codec = "pcm".into();
-        assert!(!p.offers_buffered_media(&empty));
-        p.audio_codec = "aac".into();
-        p.desktop_receiver = true;
-        assert!(!p.offers_buffered_media(&empty));
-        p.desktop_receiver = false;
-        p.head_unit_profile = "bmw_id85".into();
-        assert!(!p.offers_buffered_media(&identity("MB_E-P-4")));
+        assert!(!p.proposes_buffered_media(true, &diplay));
+        p.audio_codec = "auto".into();
+        p.enable_audio = false;
+        assert!(!p.proposes_buffered_media(true, &diplay));
+    }
+
+    #[test]
+    fn buffered_setup_sends_the_stream_key_and_realtime_aac_does_not() {
+        let id = 42;
+        let key = stream_key(&[9; 32], id as u64);
+        let buffered = bplist::parse(&build_audio_setup_request(id, 250, AudioCodec::BufferedAac, Some(&key))).unwrap();
+        let stream = &buffered.get("streams").unwrap().as_array().unwrap()[0];
+        assert_eq!(stream.get("shk").and_then(Value::as_bytes), Some(key.as_slice()));
+        assert_eq!(stream.get("ct").and_then(Value::as_int), Some(4));
+        assert_eq!(stream.get("spf").and_then(Value::as_int), Some(1024));
+        let realtime = bplist::parse(&build_audio_setup_for_codec(id, 250, AudioCodec::Aac)).unwrap();
+        assert!(realtime.get("streams").unwrap().as_array().unwrap()[0].get("shk").is_none());
     }
 
     #[test]
@@ -1872,7 +1895,7 @@ mod display_size_tests {
     }
 
     #[test]
-    fn main_media_setup_matches_declared_output_latency_and_floors_at_250_ms() {
+    fn media_setup_uses_300_ms_for_realtime_and_1000_ms_for_buffered_tcp() {
         let entry = |kind, role, micros| Value::dict(vec![
             ("type", Value::int(kind)), ("audioType", Value::str(role)),
             ("outputLatencyMicros", Value::int(micros)),
@@ -1884,18 +1907,19 @@ mod display_size_tests {
             entry(102, "media", 35_000),
             entry(103, "media", 410_000),
         ]))]);
-        for (codec, expected) in [
-            (AudioCodec::Aac, 250), (AudioCodec::Aac441, 250),
-            (AudioCodec::Pcm, 350), (AudioCodec::Pcm441, 350), (AudioCodec::BufferedAac, 410),
-        ] {
+        use AudioCodec::*;
+        for (codec, expected, default_ms) in [(Aac, 300, 300), (Aac441, 300, 300),
+            (Pcm, 350, 300), (Pcm441, 350, 300), (BufferedAac, 1000, 1000)] {
             let body = bplist::parse(&build_audio_setup_for_codec(42, media_latency_ms(&info, codec), codec)).unwrap();
             let stream = &body.get("streams").unwrap().as_array().unwrap()[0];
             assert_eq!(stream.get("audioLatencyMs").and_then(Value::as_int), Some(expected), "{codec:?}");
             assert_eq!(stream.get("audioType").and_then(Value::as_str), Some("media"));
-            assert_eq!(media_latency_ms(&Value::dict(vec![]), codec), 250);
+            assert_eq!(media_latency_ms(&Value::dict(vec![]), codec), default_ms);
         }
+        let larger = Value::dict(vec![("audioLatencies", Value::array(vec![entry(103, "media", 1_500_000)]))]);
+        assert_eq!(media_latency_ms(&larger, AudioCodec::BufferedAac), 1500);
         let invalid = Value::dict(vec![("audioLatencies", Value::array(vec![entry(100, "media", -500_000)]))]);
-        assert_eq!(media_latency_ms(&invalid, AudioCodec::Pcm), 250);
+        assert_eq!(media_latency_ms(&invalid, AudioCodec::Pcm), 300);
     }
 
     #[test]
@@ -1903,7 +1927,7 @@ mod display_size_tests {
         let codec = AudioCodec::Pcm;
         let body = bplist::parse(&build_audio_setup_for_codec(42, media_latency_ms(&Value::dict(vec![]), codec), codec)).unwrap();
         let stream = &body.get("streams").unwrap().as_array().unwrap()[0];
-        assert_eq!(stream.get("audioLatencyMs").and_then(Value::as_int), Some(250));
+        assert_eq!(stream.get("audioLatencyMs").and_then(Value::as_int), Some(300));
         assert_eq!(stream.get("spf").and_then(Value::as_int), Some(352));
         assert_eq!(stream.get("audioFormat").and_then(Value::as_int), Some(1 << 15));
         assert_eq!(stream.get("streamConnectionID").and_then(Value::as_int), Some(42));
@@ -2415,7 +2439,7 @@ const CONTROLLER_FEATURES: &[&str] = &[
 
 fn session_features(mbux: bool, id9: bool, media_compat: bool) -> Vec<Value> {
     if mbux { return vec![Value::str("viewAreas")]; }
-    // The authenticated session adds mainBuffered for eligible buffered media receivers.
+    // mainBuffered is added separately when the receiver declaration allows buffered media.
     CONTROLLER_FEATURES.iter().filter(|f| !((id9 || media_compat) && **f == "hevc"))
         .map(|f| Value::str(f)).collect()
 }
@@ -2647,7 +2671,7 @@ pub(crate) fn build_screen_setup_with_latency(conn_id: i64, uuid: &str, latency_
 }
 
 /// WinPlay treats zero latency as 1000 ms; 352-frame PCM then approaches its 128-packet limit.
-/// A positive 250 ms keeps its reorder queue below capacity without changing physical-car timing.
+/// At 48 kHz, 300 ms corresponds to about 41 PCM packets rather than 136.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 // Main and MainHigh use UDP. MainBuffered uses length-prefixed TCP.
 pub(crate) enum AudioCodec { Pcm, Pcm441, Aac, Aac441, BufferedAac }
@@ -2665,14 +2689,20 @@ pub(crate) fn declares_media(info: &Value, codec: AudioCodec) -> bool {
         && (codec != AudioCodec::BufferedAac || uses_classic_buffered_packets(f)))
 }
 
+pub(crate) fn effective_desktop(p: &AirplayParams, info: &Value) -> bool {
+    p.desktop_receiver || !use_box_bootstrap(true, info)
+}
+
 impl AirplayParams {
-    fn offers_buffered_media(&self, info: &Value) -> bool {
-        self.enable_audio && !self.desktop_receiver && use_box_bootstrap(true, info) && self.audio_codec != "pcm"
-            && match self.head_unit_profile.as_str() {
-                "bmw_id9" => self.id9_screen_bootstrap,
-                "mercedes_mbux" => self.mbux_media_compat,
-                _ => false,
-            }
+    fn allows_buffered_media(&self) -> bool {
+        self.enable_audio && self.audio_codec != "pcm"
+    }
+
+    /// The pre-SETUP /info may omit type 103 even if it lists other formats.
+    /// Propose here, but select type 103 only from fresh session capabilities.
+    fn proposes_buffered_media(&self, encrypted: bool, info: &Value) -> bool {
+        self.allows_buffered_media() && encrypted
+            && (!self.nbt_audio_first || effective_desktop(self, info))
     }
 }
 
@@ -2702,11 +2732,29 @@ fn prioritize_buffered_media(info: &Value, session: &Value, candidates: &mut Vec
         || !declares_media(info, AudioCodec::BufferedAac) {
         return;
     }
-    if let Some(index) = candidates.iter().position(|codec| *codec == AudioCodec::Aac) {
-        candidates.remove(index);
-        candidates.insert(0, AudioCodec::Aac);
-    }
+    prioritize_realtime_aac(candidates);
     candidates.insert(0, AudioCodec::BufferedAac);
+}
+
+fn prioritize_realtime_aac(candidates: &mut [AudioCodec]) {
+    if let Some(index) = candidates.iter().position(|codec| *codec == AudioCodec::Aac) {
+        candidates[..=index].rotate_right(1);
+    }
+}
+
+pub(crate) async fn buffered_fallback_candidates(p: &AirplayParams, info: &Value) -> Vec<AudioCodec> {
+    let strict = p.id9_screen_bootstrap || (p.mbux_media_compat && !p.desktop_receiver);
+    let mut candidates = media_setup_candidates(info, &p.audio_codec, false, strict, p.carwith_media_rate.as_ref()).await;
+    candidates.retain(|codec| declares_media(info, *codec));
+    // A receiver can declare only a 44.1 kHz fallback, even without a CarWith source.
+    for codec in [AudioCodec::Aac441, AudioCodec::Pcm441] {
+        if (p.audio_codec != "pcm" || codec.stream_type() == 100) && declares_media(info, codec)
+            && !candidates.contains(&codec) {
+            candidates.push(codec);
+        }
+    }
+    prioritize_realtime_aac(&mut candidates);
+    candidates
 }
 
 // Check the source at the point of SETUP, including a late INIT during screen negotiation.
@@ -2776,13 +2824,19 @@ fn media_info_latency_lines(rtsp: u64, source: &str, info: &Value) -> [String; 3
 }
 
 fn media_latency_ms(info: &Value, codec: AudioCodec) -> i64 {
-    const MIN_MEDIA_LATENCY_MS: i64 = 250;
+    // DiPlay's recommended extra headroom is for buffered TCP. Do not inflate
+    // the real-time UDP queues (WinPlay PCM in particular has a packet limit).
+    let floor_ms = if codec == AudioCodec::BufferedAac { 1000 } else { 300 };
     let declared_micros = media_latency_entries(info, codec.stream_type()).find_map(|entry|
         entry.get("outputLatencyMicros").and_then(Value::as_int).filter(|&micros| micros > 0));
-    declared_micros.map_or(MIN_MEDIA_LATENCY_MS, |micros| (micros / 1000).max(MIN_MEDIA_LATENCY_MS))
+    declared_micros.map_or(floor_ms, |micros| (micros / 1000).max(floor_ms))
 }
 
 fn build_audio_setup_for_codec(conn_id: i64, latency_ms: i64, codec: AudioCodec) -> Vec<u8> {
+    build_audio_setup_request(conn_id, latency_ms, codec, None)
+}
+
+fn build_audio_setup_request(conn_id: i64, latency_ms: i64, codec: AudioCodec, shk: Option<&[u8; 32]>) -> Vec<u8> {
     let mut stream = vec![
         ("type", Value::int(codec.stream_type())),
         ("streamConnectionID", Value::int(conn_id)),
@@ -2795,6 +2849,8 @@ fn build_audio_setup_for_codec(conn_id: i64, latency_ms: i64, codec: AudioCodec)
     ];
     // Leave the validated PCM proposal unchanged. AAC explicitly describes compression/rate.
     if matches!(codec.stream_type(),102|103) { stream.extend([("ct",Value::int(4)),("sr",Value::int(codec.rate() as i64))]); }
+    // DiPlay decrypts type 103 with this key directly and drops the stream when it is absent.
+    if let Some(key) = shk { stream.push(("shk", Value::Data(key.to_vec()))); }
     bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(stream)]))]))
 }
 
@@ -2838,7 +2894,7 @@ pub(crate) async fn retire_buffered_audio(channel: &RtspChannel) -> Result<(), S
 }
 
 async fn negotiate_buffered_audio(channel: &Arc<RtspChannel>, factory: &Arc<dyn SocketProvider>,
-    shared: &[u8;32], p: &AirplayParams, info: &Value) -> Option<AudioOut> {
+    shared: &[u8;32], p: &AirplayParams, desktop: bool, info: &Value) -> Option<AudioOut> {
     use std::sync::atomic::Ordering;
     use std::time::Instant;
     let allow_id9_setrate = p.head_unit_profile == "bmw_id9";
@@ -2851,8 +2907,9 @@ async fn negotiate_buffered_audio(channel: &Arc<RtspChannel>, factory: &Arc<dyn 
     };
     let id = random_positive_i64();
     let latency_ms = media_latency_ms(info, codec);
-    let request = build_audio_setup_for_codec(id, latency_ms, codec);
-    emit_log(&format!("BUFFERED-AUDIO: type103 SETUP latencyMs={latency_ms}"));
+    let key = stream_key(shared, id as u64);
+    let request = build_audio_setup_request(id, latency_ms, codec, Some(&key));
+    emit_log(&format!("BUFFERED-AUDIO: type103 SETUP latencyMs={latency_ms} shk_bytes={}", key.len()));
     let started = Instant::now();
     channel.buffered_cleanup_pending.store(true, Ordering::Release);
     let accepted = channel.request("SETUP", &uri, &request, "application/x-apple-binary-plist",
@@ -2878,9 +2935,9 @@ async fn negotiate_buffered_audio(channel: &Arc<RtspChannel>, factory: &Arc<dyn 
             .ok_or("network-bound TCP connection failed")?;
         let connect_ms = connect_started.elapsed().as_millis();
         let control = crate::buffered_control::BufferedControl::new(channel.clone(), uri, anchor_uri, codec.rate(), codec.spf() as u32);
-        control.probe_anchor_for_profile(allow_id9_setrate).await.map_err(|e| format!("GETANCHOR preflight: {e}"))?;
+        control.probe_anchor_for_profile(allow_id9_setrate, desktop).await.map_err(|e| format!("GETANCHOR preflight: {e}"))?;
         let control_mode = control.control_mode();
-        let mut out = AudioOut::new_buffered_aac(data, stream_key(shared, id as u64), encoder, control, buffer_bytes);
+        let mut out = AudioOut::new_buffered_aac(data, key, encoder, control, buffer_bytes);
         out.observe_main_stream(channel.trace_id(), id, 0, reply.received_at);
         emit_log(&format!("BUFFERED-AUDIO: type103 SETUP accepted rtsp_ms={setup_ms} tcp_port={data_port} tcp_ms={connect_ms} audioBufferSize={buffer_bytes} control_mode={control_mode} elapsed_ms={} playback_unconfirmed",
             started.elapsed().as_millis()));
@@ -2919,8 +2976,8 @@ pub(crate) async fn negotiate_audio(
         }
     }
     if codec == AudioCodec::BufferedAac {
-        if desktop || !p.offers_buffered_media(info) || !declares_media(info, codec) { return None; }
-        return negotiate_buffered_audio(channel, factory, shared?, p, info).await;
+        if !p.allows_buffered_media() || !declares_media(info, codec) { return None; }
+        return negotiate_buffered_audio(channel, factory, shared?, p, desktop, info).await;
     }
     negotiate_realtime_audio(channel, factory, shared, p, desktop, info, codec, false).await
 }

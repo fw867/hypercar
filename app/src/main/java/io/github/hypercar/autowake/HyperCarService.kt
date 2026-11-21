@@ -81,7 +81,10 @@ class HyperCarService : Service() {
         isRunning = true
         val device = deviceOf(intent)
         if (intent?.action == ACTION_START && device != null) {
-            runCatching { AutoStart.handler?.invoke(applicationContext, device, true) }
+            runCatching {
+                val observedAt = intent.getLongExtra(EXTRA_ACL_OBSERVED_AT, android.os.SystemClock.elapsedRealtime())
+                AutoStart.handler?.invoke(applicationContext, device, true, true, observedAt)
+            }
                 .onFailure { Log.e(TAG, "触发会话失败", it) }
         } else if (intent?.action == ACTION_COMPANION) {
             intent.getStringExtra(EXTRA_ADDRESS)?.let {
@@ -241,10 +244,13 @@ class HyperCarService : Service() {
         fun companionIntent(context: Context, address: String): Intent =
             Intent(context, HyperCarService::class.java).setAction(ACTION_COMPANION).putExtra(EXTRA_ADDRESS, address)
 
-        fun startIntent(context: Context, device: BluetoothDevice): Intent =
+        private const val EXTRA_ACL_OBSERVED_AT = "io.github.hypercar.extra.ACL_OBSERVED_AT"
+
+        fun startIntent(context: Context, device: BluetoothDevice, observedAt: Long): Intent =
             Intent(context, HyperCarService::class.java)
                 .setAction(ACTION_START)
                 .putExtra(EXTRA_DEVICE, device)
+                .putExtra(EXTRA_ACL_OBSERVED_AT, observedAt)
 
         fun stopIntent(context: Context, device: BluetoothDevice?): Intent =
             Intent(context, HyperCarService::class.java)

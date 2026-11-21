@@ -108,8 +108,8 @@ class Iap2Coordinator(
     fun diagnosticSummary(): String = bluetooth?.diagnosticSummary() ?: "transport=not-created"
 
     internal fun pollBmwProbe(probe: BmwCaffProbe, device: android.bluetooth.BluetoothDevice,
-                             since: Long, ctrlReady: Boolean, valid: () -> Boolean) {
-        bluetooth?.pollBmwProbe(probe, device, since, ctrlReady, valid)
+                             since: Long, ctrlReady: Boolean, manual: Boolean = false, valid: () -> Boolean) {
+        bluetooth?.pollBmwProbe(probe, device, since, ctrlReady, manual, valid)
     }
 
     fun pauseSessions(closeCurrent: Boolean = true) {

@@ -1,6 +1,7 @@
 //! Resource and SETUP diagnostics. ID9 session SETUP is selected at the control connection.
 use crate::{bplist::{self, Value}, rtsp::RtspMessage};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 
 /// Transport ACK only. Empty bodies are legal, but never confirm resource ownership.
 pub(crate) fn validate_ack(stage:&str, reply:&RtspMessage)->Result<(),String> {
@@ -88,9 +89,49 @@ pub(crate) fn info_modes(prefix: &str, value: Option<&Value>) {
 
 pub(crate) fn outbound(kind: &str, id: u64, cseq: i32, packet: &[u8], body: &[u8]) -> Vec<String> {
     let prefix = format!("{kind} RTSP#{id} CSeq={cseq}");
-    let mut lines = bytes_lines(&format!("{prefix} TX_PREPARED_PLAINTEXT"), packet);
-    lines.extend(plist_lines(&format!("{prefix} TX_PLIST"), body));
+    let keys = bplist::parse(body).ok().map(|value| stream_key_material(&value)).unwrap_or_default();
+    let packet = redact_stream_keys(packet, &keys);
+    let body = redact_stream_keys(body, &keys);
+    let mut lines = bytes_lines(&format!("{prefix} TX_PREPARED_PLAINTEXT"), &packet);
+    lines.extend(plist_lines(&format!("{prefix} TX_PLIST"), &body));
     lines
+}
+
+/// Type 103 SETUP carries the stream key in `shk`. Diagnostic reconstruction keeps the packet
+/// shape, but not those 32 bytes. Only the diagnostic copy is changed.
+fn redact_stream_keys<'a>(bytes: &'a [u8], keys: &[Vec<u8>]) -> Cow<'a, [u8]> {
+    if keys.is_empty() { return Cow::Borrowed(bytes); }
+    let mut redacted = bytes.to_vec();
+    for key in keys {
+        // Search the original so a previous match cannot hide another overlapping match.
+        for (offset, window) in bytes.windows(key.len()).enumerate() {
+            if window == key.as_slice() { redacted[offset..offset + key.len()].fill(0); }
+        }
+    }
+    Cow::Owned(redacted)
+}
+
+fn stream_key_material(value: &Value) -> Vec<Vec<u8>> {
+    let mut keys = Vec::new();
+    collect_stream_keys(value, &mut keys);
+    keys
+}
+
+fn collect_stream_keys(value: &Value, keys: &mut Vec<Vec<u8>>) {
+    match value {
+        Value::Dict(pairs) => {
+            for (name, child) in pairs {
+                if name.as_str() == Some("shk") {
+                    if let Some(bytes) = child.as_bytes().filter(|bytes| bytes.len() == 32 && bytes.iter().any(|b| *b != 0)) {
+                        keys.push(bytes.to_vec());
+                    }
+                }
+                collect_stream_keys(child, keys);
+            }
+        }
+        Value::Array(items) => { for item in items { collect_stream_keys(item, keys); } }
+        _ => {}
+    }
 }
 
 pub(crate) fn media_setup_written_latency(id: u64, cseq: i32, body: &[u8]) -> Vec<String> {
@@ -118,8 +159,18 @@ pub(crate) fn response(kind: &str, id: u64, cseq: i32, reply: &RtspMessage) -> V
     };
     let prefix = format!("{kind} RTSP#{id} CSeq={cseq}");
     let mut lines = vec![format!("{prefix} RX rtsp_status={} business_status={business} first_line={:?}; absent status is not business success", reply.status(), reply.first_line)];
-    lines.extend(bytes_lines(&format!("{prefix} RX_BODY"), &reply.body));
-    if !reply.body.is_empty() { lines.extend(plist_lines(&format!("{prefix} RX_PLIST"), &reply.body)); }
+    if matches!(kind, "AUDIO_SETUP" | "MEDIA_SETUP") && matches!(parsed.as_ref(), Some(Err(_))) {
+        // A malformed SETUP reply can still contain a key, but has no reliably parsed field to redact.
+        lines.push(format!("{prefix} RX_BODY bytes={} omitted=unparseable_audio_setup", reply.body.len()));
+    } else {
+        let keys = match parsed.as_ref() {
+            Some(Ok(value)) => stream_key_material(value),
+            _ => Vec::new(),
+        };
+        let body = redact_stream_keys(&reply.body, &keys);
+        lines.extend(bytes_lines(&format!("{prefix} RX_BODY"), &body));
+        if !body.is_empty() { lines.extend(plist_lines(&format!("{prefix} RX_PLIST"), &body)); }
+    }
     lines
 }
 
@@ -235,6 +286,67 @@ mod tests {
         assert_eq!(reconstructed, packet);
         let body = crate::modes::Modes::initial().declaration();
         assert!(outbound("RESOURCE", 9, 10, &packet, &body).iter().all(|s| s.starts_with("RESOURCE RTSP#9 CSeq=10")));
+    }
+
+    #[test]
+    fn outbound_trace_keeps_type103_shape_without_printing_shk() {
+        let key = [0xA5u8; 32];
+        let body = crate::bplist::encode(&Value::dict(vec![("streams", Value::array(vec![Value::dict(vec![
+            ("type", Value::int(103)),
+            ("shk", Value::Data(key.to_vec())),
+        ])]))]));
+        let mut packet = b"SETUP ".to_vec();
+        packet.extend_from_slice(&body);
+        let joined = outbound("AUDIO_SETUP", 3, 10, &packet, &body).join("\n");
+        let secret = key.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        assert!(!joined.contains(&secret));
+        assert!(!joined.contains("165, 165"));
+        assert!(joined.contains("Data([0, 0, 0"));
+        assert!(joined.contains("Int(103)"));
+    }
+
+    #[test]
+    fn received_stream_keys_are_removed_from_hex_and_plist_without_mutating_reply() {
+        let key = [0xa5; 32];
+        let original = bplist::encode(&Value::dict(vec![
+            ("status", Value::int(0)),
+            ("streams", Value::array(vec![Value::dict(vec![
+                ("type", Value::int(103)), ("dataPort", Value::int(7001)),
+                ("shk", Value::Data(key.to_vec())),
+            ])])),
+        ]));
+        let reply = reply(200, original.clone());
+        let lines = response("AUDIO_SETUP", 1, 10, &reply);
+        let mut reconstructed = Vec::new();
+        for hex in lines.iter().filter(|line| line.contains(" RX_BODY offset="))
+            .filter_map(|line| line.split_once("hex=").map(|(_, hex)| hex)) {
+            for i in (0..hex.len()).step_by(2) {
+                reconstructed.push(u8::from_str_radix(&hex[i..i + 2], 16).unwrap());
+            }
+        }
+        let joined = lines.join("\n");
+        assert_eq!(reconstructed.len(), original.len());
+        assert!(!reconstructed.windows(key.len()).any(|window| window == key.as_slice()));
+        assert!(!joined.contains(&format!("sha256={:x}", Sha256::digest(&original))));
+        assert!(joined.contains(&format!("sha256={:x}", Sha256::digest(&reconstructed))));
+        assert!(!joined.contains("165, 165"));
+        assert!(joined.contains("Data([0, 0, 0"));
+        let plist = bplist::parse(&reconstructed).unwrap();
+        let stream = &plist.get("streams").unwrap().as_array().unwrap()[0];
+        assert_eq!(stream.get("shk"), Some(&Value::Data(vec![0; 32])));
+        assert_eq!(stream.get("dataPort"), Some(&Value::int(7001)));
+        assert_eq!(reply.body, original);
+    }
+
+    #[test]
+    fn unparseable_audio_setup_replies_do_not_dump_raw_bytes() {
+        let body = vec![0xa5; 80];
+        for kind in ["AUDIO_SETUP", "MEDIA_SETUP"] {
+            let lines = response(kind, 1, 10, &reply(200, body.clone()));
+            assert!(lines[0].contains("business_status=unparseable_body"));
+            assert!(lines[1].contains("bytes=80 omitted=unparseable_audio_setup"));
+            assert_eq!(lines.len(), 2);
+        }
     }
 
     fn reply(status: u16, body: Vec<u8>) -> RtspMessage {

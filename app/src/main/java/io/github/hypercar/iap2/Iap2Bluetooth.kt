@@ -533,7 +533,7 @@ class Iap2Bluetooth(
     /** Called on the attempt's IO job. The Bluetooth accept thread remains available during SDP/connect. */
     @SuppressLint("MissingPermission")
     internal fun pollBmwProbe(probe: BmwCaffProbe, device: BluetoothDevice, since: Long, ctrlReady: Boolean,
-                              valid: () -> Boolean) {
+                              manual: Boolean, valid: () -> Boolean) {
         val ticket = sessions.ticket() ?: return
         fun eligible() = running && isListening && sessions.allowsOutbound(ticket) && valid() &&
             !probe.finished && !sessionActive.get() && lastInboundAdmission < since &&
@@ -546,13 +546,16 @@ class Iap2Bluetooth(
                 cancelBmwProbe("new attempt")
                 bmwProbe = probe
             }
-            when (probe.poll(device.address.takeIf { profiles.isNotEmpty() }, SystemClock.uptimeMillis(), ctrlReady)) {
+            when (probe.poll(device.address.takeIf { profiles.isNotEmpty() }, SystemClock.uptimeMillis(), ctrlReady, manual)) {
                 BmwCaffProbe.Decision.WAIT -> return
                 BmwCaffProbe.Decision.ENTER_CTRL_GRACE -> {
                     log("BT-CAFF#${probe.attempt}: 本车 Wi-Fi ctrl 已注册并监听；普通配置文件连续在线 ${BmwCaffProbe.CTRL_GRACE_MS}ms 前优先等 …cafe/ctrl（尚未收到邀请）")
                     return
                 }
-                BmwCaffProbe.Decision.DIAL -> Unit
+                BmwCaffProbe.Decision.DIAL -> {
+                    if (manual) log("BT-CAFF#${probe.attempt}: manual probe started")
+                    Unit
+                }
             }
         }
         val tag = "BT-CAFF#${probe.attempt}"

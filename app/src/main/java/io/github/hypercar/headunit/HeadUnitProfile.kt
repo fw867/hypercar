@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.headunit
+package io.github.hypercar.headunit
 
 import io.github.hypercar.settings.SettingsStore
 
@@ -119,7 +119,7 @@ object HeadUnitProfiles {
     val BMW_ID85 = HeadUnitProfile(
         id = "bmw_id85",
         label = "BMW",
-        model = "ID7-ID9",
+        model = "ID7-ID8.5",
         notes = "兼容 MGU-86 / MGU-55；由车机发起 CarPlay，保留系统蓝牙音频连接。首次连接请在 iDrive 确认授权。",
         validatesDeviceId = false,
         // ↓ 这三项 2026-10-25 现场 A/B 恢复为 0.27 值：0.27 有 CarPlay 图标，停发后图标消失

@@ -15,6 +15,9 @@ import android.os.SystemClock
 import io.github.hypercar.autowake.AutoStart
 import io.github.hypercar.bluetooth.CarProfileGuard
 import io.github.hypercar.bluetooth.ReconnectDiscoverability
+import io.github.hypercar.bluetooth.knownBondedCar
+import io.github.hypercar.bluetooth.shouldDiscoverForCarAcl
+import io.github.hypercar.bluetooth.DiscoverabilityHandoff
 import io.github.hypercar.bluetooth.SystemDiscoverabilityPrompt
 import io.github.hypercar.autowake.HyperCarService
 import io.github.hypercar.carui.CarUiCaster
@@ -121,6 +124,11 @@ object HyperCarRepo {
      */
     @Volatile private var ctrlAdvertiser: CarPlayCtrlAdvertiser? = null
 
+    private class ManualCaffAction(val attempt: Long, val dial: () -> String)
+    private val manualCaffAction = AtomicReference<ManualCaffAction?>(null)
+    private val caffExperiment = BmwCaffExperiment()
+    internal val armedBmwCaffExperiment = caffExperiment.armedTarget
+
     /** 本轮已经静默加入过的车机热点（避免「先拿凭据入网」与「端点到了再入网」重复连接）。 */
     @Volatile
     private var joinedSsid: String? = null
@@ -221,6 +229,10 @@ object HyperCarRepo {
      */
     @Volatile
     private var aclCarMac: String? = null
+    private class AclDiscoverabilityEdge(val device: BluetoothDevice, val ticket: AclDiscoverabilityTicket)
+    private val aclDiscoverabilityEdge = AtomicReference<AclDiscoverabilityEdge?>(null)
+    // Only a manual retry may keep an already-open shell window across attempt teardown.
+    @Volatile private var discoveryHandoff: DiscoverabilityHandoff? = null
 
     /** Identity pinned to a known Wi-Fi resume; never reuse another receiver's Bluetooth identity. */
     @Volatile private var wifiReceiverMac: String? = null
@@ -323,11 +335,16 @@ object HyperCarRepo {
             scope.launch { captureCrashArtifacts() }
             // ACL 广播唤醒入口（receiver → handler）：优先经 FGS 拿前台豁免与持锁，
             // 服务起来后再触发真正会话（handler 幂等，service 二次进入走直连分支）
-            AutoStart.handler = handler@{ ctx, device, connected ->
+            AutoStart.handler = handler@{ ctx, device, connected, forwarded, observedAt ->
                 val app = ctx.applicationContext
+                if (!forwarded && hasCurrentSession) recordAclObservation(connectionAttemptId, connected, observedAt)
                 if (!connected) {
-                    val cleanup = runCatching { device.address }.getOrNull()
-                        ?.let { iap2?.captureBluetoothLost(it) }
+                    val cleanup = runCatching { device.address }.getOrNull()?.let { address ->
+                        aclDiscoverabilityEdge.updateAndGet { edge ->
+                            edge?.takeUnless { it.ticket.peer.equals(address, ignoreCase = true) }
+                        }
+                        iap2?.captureBluetoothLost(address)
+                    }
                     if (cleanup != null) scope.launch { cleanup() }
                 }
                 if (!SettingsStore.autoConnect && (connected || !hasCurrentSession)) return@handler
@@ -354,19 +371,25 @@ object HyperCarRepo {
                         updateCarProfileGuard(app)
                         CarProfileGuard.onCarConnected(app, device, address)
                     }
+                    val edge = captureAclDiscoverability(device, forwarded)
                     if (hasCurrentSession) {
-                        // Already waiting for invite/iAP2: refresh discovery on ACL, do not start AirPlay.
-                        scope.launch { nudgeInvitationDiscovery(app, "ACL 连上") }
+                        // A genuine ACL edge may queue discoverability; it never starts AirPlay here.
+                        val attempt = connectionAttemptId
+                        if (sessionLive.get() && attempt == connectionAttemptId) edge?.ticket?.assign(attempt)
+                        scope.launch {
+                            nudgeInvitationDiscovery(app, "ACL 连上", expectedAttempt = attempt,
+                                discoverableArmed = edge?.ticket?.pendingFor(attempt) == true)
+                        }
                     } else if (!HyperCarService.isRunning) {
                         runCatching {
-                            app.startForegroundService(HyperCarService.startIntent(app, device))
+                            app.startForegroundService(HyperCarService.startIntent(app, device, observedAt))
                         }.onFailure {
                             // FGS 被系统拦（未授悬浮窗等）：降级直接连接（进程可能被回收）
                             log("AUTO: FGS 启动被拦（${it.message}）——降级直接拉起会话")
-                            connectAutomatically(app)
+                            connectAutomatically(app, aclEdge = edge, aclObservedAt = observedAt)
                         }
                     } else {
-                        connectAutomatically(app)
+                        connectAutomatically(app, aclEdge = edge, aclObservedAt = observedAt)
                     }
                 } else {
                     // An ACL broadcast has no connection generation. The RFCOMM reader,
@@ -416,6 +439,11 @@ object HyperCarRepo {
         log("AUTO: 车机蓝牙 ${if (connected) "连上" else "断开"}（$name）")
     }
 
+    private fun recordAclObservation(attempt: Long, connected: Boolean, at: Long) {
+        connectionDiagnostics.observe(attempt,
+            if (connected) ConnectionDiagnostics.Observation.ACL_UP else ConnectionDiagnostics.Observation.ACL_DOWN, at = at)
+    }
+
     /** handler 只在主线程（receiver/service 都是主线程）调用，无需加锁。 */
     private var lastAclEventKey: String? = null
     private var lastAclEventAt = 0L
@@ -436,10 +464,86 @@ object HyperCarRepo {
         !SettingsStore.carWithMode && io.github.hypercar.carui.CarUiSettings.defaultMap == io.github.hypercar.carui.MapProvider.AMAP
 
     internal fun connect(context: Context, systemPrompt: SystemDiscoverabilityPrompt? = null) =
-        requestConnect(context, manual = true, source = "manual", systemPrompt = systemPrompt)
+        requestConnect(context, manual = true, source = "manual", systemPrompt = systemPrompt,
+            suppressManualWindow = ReconnectDiscoverability.windowOpenAtManualClick())
 
-    private fun connectAutomatically(context: Context, source: String = "acl", wakePeer: String? = null) =
-        requestConnect(context, manual = false, source = source, wakePeer = wakePeer)
+    internal enum class ExperimentMarker(val observation: ConnectionDiagnostics.Observation) {
+        CARD_UNLOCKED(ConnectionDiagnostics.Observation.CARD_UNLOCKED),
+        ABOUT_TO_SELECT_CARPLAY(ConnectionDiagnostics.Observation.ABOUT_TO_SELECT_CARPLAY),
+    }
+
+    internal fun markConnectionExperiment(marker: ExperimentMarker): String {
+        val attempt = connectionAttemptId
+        val recorded = connectionDiagnostics.observe(attempt, marker.observation)
+        val recording = logRecording
+        log("DEV-MARK: attempt=${if (recorded) attempt.toString() else "none"} ${marker.observation.name} ${marker.observation.label}")
+        return when {
+            recording -> "已打点：${marker.observation.label}（已写入诊断日志）"
+            recorded -> "已打点：${marker.observation.label}（仅本轮快照，诊断日志已关闭）"
+            else -> "诊断日志已关闭，且没有进行中的连接；请先开启日志记录"
+        }
+    }
+
+    internal suspend fun latestConnectionSnapshot(): String? = withContext(Dispatchers.IO) {
+        val attempt = connectionAttemptId
+        val advertiser = ctrlAdvertiser
+        if (advertiser == null) connectionDiagnostics.connectionSnapshot(attempt, null)
+        else advertiser.withListeningPortFor(attempt) { port -> connectionDiagnostics.connectionSnapshot(attempt, port) }
+    }
+
+    private val developerConnectionAction = kotlinx.coroutines.sync.Mutex()
+
+    private inline fun runDeveloperConnectionAction(action: () -> String): String {
+        if (!developerConnectionAction.tryLock()) return "另一项连接实验仍在进行，请稍后再试"
+        return try { action() } finally { developerConnectionAction.unlock() }
+    }
+
+    /** Manual single-variable diagnostic: reuse only the current Wi-Fi listener and service identity. */
+    internal suspend fun resendCtrlMdnsAnnouncement(): String = withContext(Dispatchers.IO) {
+        if (!SettingsStore.developerMenuVisible) return@withContext "请先显示开发者菜单"
+        if (streaming) return@withContext "CarPlay 已连接，无需重发"
+        if (hasAirPlayTransport) return@withContext "本轮正在处理连接，暂不重发"
+        val attempt = connectionAttemptId
+        val advertiser = ctrlAdvertiser
+        val network = boundNetwork
+        if (!sessionLive.get() || advertiser == null || network == null)
+            return@withContext "请先连接车机 Wi-Fi，并让 HyperCar 等待车机邀请"
+        runDeveloperConnectionAction {
+            advertiser.resendAnnouncement(network) {
+                connectionAttemptId == attempt && sessionLive.get() && !userDisconnectRequested &&
+                    ctrlAdvertiser === advertiser && boundNetwork == network && !streaming && !hasAirPlayTransport
+            }
+        }
+    }
+
+    private fun bmwCaffExperimentTarget(): String? = SettingsStore.targetCarMac?.takeIf {
+        headUnitProfile.id == "bmw_id85" && !headUnitProfile.allowOutboundIap2 && !SettingsStore.carWithMode
+    }
+
+    internal fun disarmBmwCaffExperiment() = caffExperiment.clear()
+
+    internal fun armBmwCaffExperiment(): String? {
+        if (!SettingsStore.developerMenuVisible) return "请先显示开发者菜单"
+        val target = bmwCaffExperimentTarget() ?: return "请选择宝马 iD8.5 档案和已配对的目标车机（非 CarWith 模式）"
+        caffExperiment.arm(target)
+        return null
+    }
+
+    internal suspend fun dialBmwCaffManually(): String = withContext(Dispatchers.IO) {
+        if (!SettingsStore.developerMenuVisible) return@withContext "请先显示开发者菜单"
+        if (headUnitProfile.id != "bmw_id85") return@withContext "仅支持宝马 iD8.5 档案"
+        if (!sessionLive.get()) return@withContext "请先准备实验，再到首页手动连接"
+        if (streaming) return@withContext "CarPlay 已连接，无需拨号"
+        if (hasAirPlayTransport) return@withContext "本轮正在处理连接，暂不拨号"
+        val action = manualCaffAction.get()?.takeIf { it.attempt == connectionAttemptId }
+            ?: return@withContext "本轮不是已就绪的手动实验；请确认目标已配对，准备实验后从首页发起新一轮连接"
+        runDeveloperConnectionAction { action.dial() }
+    }
+
+    private fun connectAutomatically(context: Context, source: String = "acl", wakePeer: String? = null,
+                                     aclEdge: AclDiscoverabilityEdge? = null, aclObservedAt: Long? = null) =
+        requestConnect(context, manual = false, source = source, wakePeer = wakePeer, aclEdge = aclEdge,
+            aclObservedAt = aclObservedAt)
 
     fun connectFromCompanion(context: Context, address: String) {
         if (!io.github.hypercar.autowake.CompanionWakePolicy.accepts(
@@ -453,16 +557,42 @@ object HyperCarRepo {
         connectAutomatically(context, "companion", address)
     }
 
-    /**
-     * Known-Wi-Fi invite wait: ACL is often only a short BMW wake window before Wi-Fi takes
-     * over. Preserve `_carplay-ctrl._tcp` while waiting for activation; a lasting BT iAP2
-     * session is not required for the head unit's Wi-Fi invitation.
-     */
+    private fun captureAclDiscoverability(device: BluetoothDevice, forwarded: Boolean): AclDiscoverabilityEdge? {
+        val peer = runCatching { device.address }.getOrNull() ?: return null
+        // A foreground-service round trip is not a new ACL; preserve the original age and ownership.
+        if (forwarded) return aclDiscoverabilityEdge.get()?.takeIf { it.ticket.peer.equals(peer, ignoreCase = true) }
+        val coordinator = iap2
+        val iap2Started = streaming || hasAirPlayTransport || coordinator?.isSessionActive == true ||
+            (sessionLive.get() && (coordinator?.sessionStartCount ?: 0) > roundSessionBaseline)
+        val target = SettingsStore.targetCarMac
+        if (!shouldDiscoverForCarAcl(SettingsStore.autoConnect, knownAclCar(device, peer, target), iap2Started,
+                ReconnectDiscoverability.discoverableWindowOpen())) return null
+        val edge = AclDiscoverabilityEdge(device,
+            AclDiscoverabilityTicket(peer, SystemClock.elapsedRealtime(), target, headUnitProfile.id, automaticModeRequest.get()))
+        aclDiscoverabilityEdge.set(edge)
+        return edge
+    }
+
+    private fun knownAclCar(device: BluetoothDevice, peer: String, target: String?): Boolean = knownBondedCar(
+        runCatching { device.bondState == BluetoothDevice.BOND_BONDED }.getOrDefault(false),
+        peer, target, SettingsStore.isCarPaired(peer), wifiReceiverMac,
+    )
+
+    private fun aclDiscoverabilityStillValid(edge: AclDiscoverabilityEdge, attempt: Long): Boolean {
+        val target = SettingsStore.targetCarMac
+        return aclDiscoverabilityEdge.get() === edge && edge.ticket.peer.equals(aclCarMac, ignoreCase = true) &&
+            sessionLive.get() && connectionAttemptId == attempt && !userDisconnectRequested &&
+            automaticConnectionAllowed && !streaming && !hasAirPlayTransport &&
+            edge.ticket.isFresh(SystemClock.elapsedRealtime(), target, headUnitProfile.id, automaticModeRequest.get()) &&
+            knownAclCar(edge.device, edge.ticket.peer, target)
+    }
+
     private suspend fun nudgeInvitationDiscovery(
         context: Context,
         reason: String,
         handoffToWifi: Boolean = false,
         expectedAttempt: Long = connectionAttemptId,
+        discoverableArmed: Boolean = false,
     ) {
         val advertiser = ctrlAdvertiser
         val now = SystemClock.elapsedRealtime()
@@ -480,8 +610,12 @@ object HyperCarRepo {
         if (stamped != anchor) {
             if (handoffToWifi) lastHandoffInviteNudgeAt = stamped else lastConnectInviteNudgeAt = stamped
         }
-        val armed = InviteWakeNudge.armDiscoverable(handoffToWifi) &&
-            ReconnectDiscoverability.armForWake()
+        val armed = when {
+            handoffToWifi -> false
+            reason == "ACL 连上" -> discoverableArmed
+            else -> InviteWakeNudge.armDiscoverable(handoffToWifi) &&
+                ReconnectDiscoverability.armForWake()
+        }
         log("INVITE-WAKE: $reason；ctrl监听=${if (ensured) "保持/修复" else "未变"} 可发现再开=${if (armed) "是" else "否"}；" +
             "继续等车机 Wi-Fi ctrl 邀请（宝马二次上车蓝牙短窗口后常退场，不触发主动建链）")
         val waitingForCarIap2 = KnownWifiWaitCopy.awaitingHeadUnitIap2(
@@ -501,7 +635,8 @@ object HyperCarRepo {
     }
 
     private fun requestConnect(context: Context, manual: Boolean, source: String, wakePeer: String? = null,
-                               systemPrompt: SystemDiscoverabilityPrompt? = null) {
+                               systemPrompt: SystemDiscoverabilityPrompt? = null,
+                               suppressManualWindow: Boolean = false, aclEdge: AclDiscoverabilityEdge? = null, aclObservedAt: Long? = null) {
         init(context)
         scope.launch {
             autoConnectChanges.lock()
@@ -526,11 +661,20 @@ object HyperCarRepo {
                 }
                 if (WaitingInvitationRetryPolicy.shouldSoftRestart(manual, awaitingCarInvitation,
                         hasCurrentSession, streaming)) {
-                    softRestartInvitationWait(context, systemPrompt)
+                    val attempt = connectionAttemptId
+                    val previous = discoveryHandoff
+                    val origin = previous?.takeIf { it.successor == attempt }?.origin ?: attempt
+                    val moving = DiscoverabilityHandoff(origin).takeIf { ReconnectDiscoverability.windowOpenAtManualClick() }
+                    discoveryHandoff = moving
+                    try {
+                        softRestartInvitationWait(context, systemPrompt, suppressManualWindow)
+                    } finally {
+                        if (discoveryHandoff === moving) discoveryHandoff = null
+                    }
                     return@launch
                 }
                 if (AutomaticConnectionPolicy.mayStart(manual, SettingsStore.autoConnect, automaticPauseRemaining > 0)) {
-                    beginConnect(context, source, manual, wakePeer, systemPrompt)
+                    beginConnect(context, source, manual, wakePeer, systemPrompt, suppressManualWindow, aclEdge, aclObservedAt)
                 }
             } finally { autoConnectChanges.unlock() }
         }
@@ -541,7 +685,8 @@ object HyperCarRepo {
      * tap/ACL path could not open a fresh attempt. Manual retry ends the wait without the
      * ten-minute pause, then starts a new attempt with listening restored.
      */
-    private suspend fun softRestartInvitationWait(context: Context, systemPrompt: SystemDiscoverabilityPrompt?) {
+    private suspend fun softRestartInvitationWait(context: Context, systemPrompt: SystemDiscoverabilityPrompt?,
+                                                  suppressManualWindow: Boolean) {
         val attempt = connectionAttemptId
         log("CONNECT: 等待邀请中手动重试——结束 attempt=$attempt 后重新开始，不创建10分钟暂停")
         carWithEntries.retire(attempt)
@@ -561,14 +706,20 @@ object HyperCarRepo {
         reconnectJob = null
         connecting = false
         if (AutomaticConnectionPolicy.mayStart(true, SettingsStore.autoConnect, automaticPauseRemaining > 0)) {
-            beginConnect(context, "manual-retry", manual = true, systemPrompt = systemPrompt)
+            beginConnect(context, "manual-retry", manual = true, systemPrompt = systemPrompt,
+                suppressManualWindow = suppressManualWindow)
         }
     }
 
     private fun beginConnect(context: Context, source: String, manual: Boolean, wakePeer: String? = null,
-                             systemPrompt: SystemDiscoverabilityPrompt?) {
+                             systemPrompt: SystemDiscoverabilityPrompt?,
+                             suppressManualWindow: Boolean = false, aclEdge: AclDiscoverabilityEdge? = null, aclObservedAt: Long? = null) {
         init(context)
         if (sessionLive.get() || connecting || streaming) {
+            if (sessionLive.get()) {
+                aclEdge?.ticket?.assign(connectionAttemptId)
+                aclObservedAt?.let { recordAclObservation(connectionAttemptId, true, it) }
+            }
             log("CONNECT: 已在连接/已连接，忽略重复触发")
             return
         }
@@ -596,8 +747,13 @@ object HyperCarRepo {
             "${profile.id} remote=${io.github.hypercar.headunit.RemoteProfiles.isRemote(profile.id)} " +
                 "activation=${profile.requireAirplayActivation} outbound=${profile.allowOutboundIap2} " +
                 "profileGuard=${profile.dropProfilesBeforeIap2}", SystemClock.uptimeMillis())
+        aclObservedAt?.let { recordAclObservation(connectionAttemptId, true, it) }
+        val moving = discoveryHandoff?.takeIf { source == "manual-retry" && it.successor == null }
+        aclEdge?.ticket?.assign(connectionAttemptId)
         if (sessionCarWithMode) carWithEntries.begin(connectionAttemptId)
         sessionLive.set(true)
+        // Readers that observe the published successor must also see its live flag and ID.
+        discoveryHandoff = moving?.let { DiscoverabilityHandoff(it.origin, connectionAttemptId) }
         standbyEndpoint.get()?.bluetoothHotspot?.let { announcedHotspot.compareAndSet(null, connectionAttemptId to it) }
         log(connectionDiagnostics.report().last())
         updateCarProfileGuard(context)
@@ -608,7 +764,12 @@ object HyperCarRepo {
         push(link = LinkState.Negotiating("检查 Shizuku"))
         connectJob?.cancel()
         val attempt = connectionAttemptId
-        connectJob = scope.launch { runConnect(context.applicationContext, attempt, wakePeer, manual, systemPrompt) }
+        // Consume only an explicit opt-in on a newly admitted manual round. Menu visibility
+        // is presentation only, and retries/wakeups keep the production probe policy.
+        val experimentTarget = caffExperiment.takeForRound(manual, if (manual) bmwCaffExperimentTarget() else null)
+        connectJob = scope.launch {
+            runConnect(context.applicationContext, attempt, wakePeer, manual, systemPrompt, experimentTarget, suppressManualWindow)
+        }
     }
 
     /**
@@ -729,6 +890,7 @@ object HyperCarRepo {
                     log("SESSION-CONTROL: 忽略停止请求 decision=$decision user=$userInitiated expected=$attempt current=$connectionAttemptId state=${_snapshots.value.link.javaClass.simpleName}")
                     return@launch
                 }
+                if (userInitiated) aclDiscoverabilityEdge.set(null)
                 carWithEntries.retire(attempt)
                 if (decision == ConnectionStopPolicy.Decision.STOP_AND_PAUSE) {
                     reconnectBudget.clear()
@@ -1145,7 +1307,8 @@ object HyperCarRepo {
     // ---------------------------------------------------------------- 连接主流程
 
     private suspend fun runConnect(context: Context, diagnosticId: Long, wakePeer: String?, manual: Boolean,
-                                   systemPrompt: SystemDiscoverabilityPrompt?) {
+                                   systemPrompt: SystemDiscoverabilityPrompt?, experimentTarget: String?,
+                                   suppressManualWindow: Boolean) {
         if (!sessionLive.get() || connectionAttemptId != diagnosticId) return
         fun fail(reason: String) = HyperCarRepo.fail(reason, diagnosticId)
         val startupIssues = StartupRequirements.read(context).manualIssues
@@ -1170,6 +1333,7 @@ object HyperCarRepo {
         val caffSince = SystemClock.uptimeMillis()
         val caffBaseline = roundSessionBaseline
         val caffProbe = BmwCaffProbe(diagnosticId)
+        var caffAction: ManualCaffAction? = null
         var caffJob: Job? = null
         val invited = java.util.concurrent.atomic.AtomicBoolean(false)
         val caffTarget = SettingsStore.targetCarMac
@@ -1239,7 +1403,7 @@ object HyperCarRepo {
             // 若等 0x4301 才去入网，双方互等（旧实现就是这样，真车上永远拿不到端点）。
             val controlServiceName = io.github.hypercar.net.ControlServiceName.forProfile(
                 p.id, io.github.hypercar.bluetooth.LocalDeviceName.snapshot())
-            val advertiser = CarPlayCtrlAdvertiser(context, { deviceMac }, ::log, onDiagnostic = { event ->
+            val advertiser = CarPlayCtrlAdvertiser(context, { deviceMac }, ::log, onDiagnostic = { event, port ->
                 if (event == CarPlayCtrlAdvertiser.Event.INVITED && invited.compareAndSet(false, true)) {
                     caffProbe.cancel()
                     if (caffProbe.attempted) log("BT-CAFF#$diagnosticId: ctrl invitation received")
@@ -1250,8 +1414,14 @@ object HyperCarRepo {
                     CarPlayCtrlAdvertiser.Event.INVITE_HEAD -> ConnectionDiagnostics.Stage.CTRL_INVITE_HEAD
                     CarPlayCtrlAdvertiser.Event.INVITE_ACK -> ConnectionDiagnostics.Stage.CTRL_INVITE_ACK
                     CarPlayCtrlAdvertiser.Event.INVITED -> ConnectionDiagnostics.Stage.CTRL_INVITED
-                })
-            }, serviceNameProvider = { controlServiceName }, attemptId = diagnosticId, onNetworkInvitation = { source, network, stillCurrent ->
+                }, detail = if (event == CarPlayCtrlAdvertiser.Event.REGISTERED) port.toString() else "")
+            }, serviceNameProvider = { controlServiceName }, attemptId = diagnosticId,
+                onCtrlEpochChanged = { connectionDiagnostics.newCtrlEpoch(diagnosticId) }, onMdnsObservation = { family, port ->
+                connectionDiagnostics.observe(diagnosticId,
+                    if (port != null) ConnectionDiagnostics.Observation.MDNS_LOCAL_ANNOUNCEMENT
+                    else ConnectionDiagnostics.Observation.MDNS_PEER_QUERY,
+                    if (port != null) "IPv$family port=$port" else "IPv$family")
+            }, onNetworkInvitation = { source, network, stillCurrent ->
                 if (p.id == "bmw_id85" && sessionLive.get() && connectionAttemptId == diagnosticId &&
                     ctrlAdvertiser === source && iap2 === coordinator && network == boundNetwork) {
                     coordinator.retireCafeHandoff(diagnosticId, "ctrl-invite", stillCurrent)
@@ -1268,20 +1438,54 @@ object HyperCarRepo {
                     headUnitProfile.id == "bmw_id85" && SettingsStore.targetCarMac == caffTarget &&
                     iap2 === coordinator && coordinator.sessionStartCount == caffBaseline &&
                     !invited.get() && !hasAirPlayTransport
-                caffJob = CoroutineScope(kotlinx.coroutines.currentCoroutineContext()).launch {
-                    try {
-                        while (waiting() && !caffProbe.finished && !caffProbe.attempted) {
-                            if (caffDevice.bondState != android.bluetooth.BluetoothDevice.BOND_BONDED) break
-                            val network = boundNetwork
-                            val ctrlReady = network != null && ctrlAdvertiser === advertiser &&
-                                caffDevice.address.equals(wifiReceiverMac, ignoreCase = true) && advertiser.listeningOn(network)
-                            coordinator.pollBmwProbe(caffProbe, caffDevice, caffSince, ctrlReady, ::waiting)
-                            delay(300)
+                if (experimentTarget != null && experimentTarget.equals(caffTarget, ignoreCase = true) && !sessionCarWithMode) {
+                    val requesting = java.util.concurrent.atomic.AtomicBoolean(false)
+                    fun manualWaiting() = waiting() && ctrlAdvertiser === advertiser && !advertiser.hasUnresolvedOrPublishedInvite
+                    val action = ManualCaffAction(diagnosticId) dial@{
+                        if (!requesting.compareAndSet(false, true)) return@dial "已有 …caff 探测正在进行"
+                        try {
+                            if (caffProbe.attempted) return@dial "本轮已尝试过 …caff，不重复拨号"
+                            if (!manualWaiting() || caffProbe.finished)
+                                return@dial "本轮不再等待车机，未拨号"
+                            log("BT-CAFF#$diagnosticId: manual probe requested")
+                            coordinator.pollBmwProbe(caffProbe, caffDevice, caffSince, ctrlReady = false,
+                                manual = true, valid = ::manualWaiting)
+                            when {
+                                caffProbe.attempted -> "已执行一次 …caff 探测，请查看日志中的 SDP / RFCOMM 结果"
+                                !manualWaiting() || caffProbe.finished -> "本轮已收到车机响应或不再等待，未拨号"
+                                else -> "未拨号：请确认 App 正在监听，且目标车机的经典蓝牙已连接"
+                            }
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (e: Exception) {
+                            if (caffProbe.attempted) caffProbe.cancel()
+                            log("BT-CAFF#$diagnosticId: manual probe failed=${e.message}")
+                            "…caff 探测出错，请查看诊断日志"
+                        } finally {
+                            requesting.set(false)
                         }
-                    } catch (cancelled: CancellationException) { throw cancelled }
-                    catch (e: Exception) {
-                        caffProbe.cancel()
-                        log("BT-CAFF#$diagnosticId: probe failed=${e.message}")
+                    }
+                    caffAction = action
+                    manualCaffAction.updateAndGet { current ->
+                        if (connectionAttemptId == diagnosticId && sessionLive.get()) action else current
+                    }
+                    log("BT-CAFF#$diagnosticId: developer experiment; automatic probe disabled for this round")
+                } else {
+                    caffJob = CoroutineScope(kotlinx.coroutines.currentCoroutineContext()).launch {
+                        try {
+                            while (waiting() && !caffProbe.finished && !caffProbe.attempted) {
+                                if (caffDevice.bondState != android.bluetooth.BluetoothDevice.BOND_BONDED) break
+                                val network = boundNetwork
+                                val ctrlReady = network != null && ctrlAdvertiser === advertiser &&
+                                    caffDevice.address.equals(wifiReceiverMac, ignoreCase = true) && advertiser.listeningOn(network)
+                                coordinator.pollBmwProbe(caffProbe, caffDevice, caffSince, ctrlReady, valid = ::waiting)
+                                delay(300)
+                            }
+                        } catch (cancelled: CancellationException) { throw cancelled }
+                        catch (e: Exception) {
+                            caffProbe.cancel()
+                            log("BT-CAFF#$diagnosticId: probe failed=${e.message}")
+                        }
                     }
                 }
             }
@@ -1290,7 +1494,11 @@ object HyperCarRepo {
             roundSessionBaseline = baselineSessions
             val discoveryAttempt = connectionAttemptId
             discoveryJob = CoroutineScope(kotlinx.coroutines.currentCoroutineContext()).launch {
-                try { io.github.hypercar.bluetooth.ReconnectDiscoverability.watch(context,
+                var pickedAcl: AclDiscoverabilityEdge? = null
+                fun aclListenerReady() = iap2 === coordinator && coordinator.isListening &&
+                    !coordinator.isSessionActive && coordinator.sessionStartCount <= baselineSessions &&
+                    !invited.get() && advertiser.lastInvitePeerIp == null
+                try { ReconnectDiscoverability.watch(context,
                     networkKey = {
                         val mac = wifiReceiverMac
                         val network = boundNetwork
@@ -1305,6 +1513,40 @@ object HyperCarRepo {
                         invited.get() || advertiser.lastInvitePeerIp != null || streaming },
                     immediatePreparation = manual,
                     systemPrompt = systemPrompt,
+                    suppressManualWindow = suppressManualWindow,
+                    takeAclPreparationKey = take@{
+                        val edge = aclDiscoverabilityEdge.get() ?: return@take null
+                        if (!edge.ticket.pendingFor(discoveryAttempt) || !aclListenerReady() ||
+                            !aclDiscoverabilityStillValid(edge, discoveryAttempt) || !edge.ticket.take(discoveryAttempt)) return@take null
+                        pickedAcl = edge
+                        edge.ticket.peer
+                    },
+                    aclPreparationStillValid = { peer ->
+                        val edge = pickedAcl
+                        edge != null && edge.ticket.peer == peer && edge.ticket.takenBy(discoveryAttempt) && aclListenerReady() &&
+                            aclDiscoverabilityStillValid(edge, discoveryAttempt)
+                    },
+                    discoverableStillUseful = {
+                        var handoff: DiscoverabilityHandoff?
+                        var live: Boolean
+                        var liveAttempt: Long
+                        do {
+                            handoff = discoveryHandoff
+                            live = sessionLive.get()
+                            liveAttempt = connectionAttemptId
+                            // If teardown or successor publication changed the handoff during
+                            // these reads, don't use the mixed snapshot to close the window.
+                        } while (handoff !== discoveryHandoff)
+                        val sameRound = live && liveAttempt == discoveryAttempt
+                        val manualHandoff = handoff?.keepsWindow(discoveryAttempt, liveAttempt, live) == true
+                        !streaming && !hasAirPlayTransport && !userDisconnectRequested && when {
+                            sameRound -> !coordinator.isSessionActive && coordinator.sessionStartCount <= baselineSessions &&
+                                !invited.get() && advertiser.lastInvitePeerIp == null
+                            manualHandoff -> iap2?.isSessionActive != true &&
+                                (iap2?.sessionStartCount ?: 0) <= roundSessionBaseline && ctrlAdvertiser?.lastInvitePeerIp == null
+                            else -> false
+                        }
+                    },
                     preparationKey = preparation@{
                         if (!manual && p.id != "bmw_id85") return@preparation null
                         val target = SettingsStore.targetCarMac
@@ -1581,6 +1823,7 @@ object HyperCarRepo {
             fail("会话异常: ${t.message}")
         } finally {
             caffProbe.cancel()
+            caffAction?.let { manualCaffAction.compareAndSet(it, null) }
             caffJob?.cancel()
             if (caffProbe.attempted && !invited.get()) log("BT-CAFF#$diagnosticId: wait ended without ctrl invitation")
             discoveryJob?.cancel()

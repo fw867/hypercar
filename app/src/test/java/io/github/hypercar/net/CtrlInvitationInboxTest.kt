@@ -50,11 +50,13 @@ class CtrlInvitationInboxTest {
             val previous = events.size
             if (linksFirst) inbox.addresses(b, setOf("local")) else inbox.advertise(b)
             assertNull(inbox.latest.get())
+            assertTrue(inbox.awaitingConfirmation)
             if (linksFirst) inbox.advertise(b) else inbox.addresses(b, setOf("local"))
             inbox.advertise(b)
             inbox.addresses(b, setOf("local"))
             assertEquals(previous + 1, events.size)
             assertEquals("early", inbox.latest.get())
+            assertFalse(inbox.awaitingConfirmation)
         }
     }
 

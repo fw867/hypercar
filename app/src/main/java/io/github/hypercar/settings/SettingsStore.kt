@@ -86,6 +86,23 @@ object SettingsStore {
         p().edit().remove("listening_disabled").apply()
     }
 
+    val developerModeEnabled: Boolean
+        get() = p().getBoolean("developer_mode_enabled", false)
+
+    fun enableDeveloperMode() {
+        if (developerModeEnabled) return
+        p().edit().putBoolean("developer_mode_enabled", true).apply()
+        SettingsRevision.bump()
+    }
+
+    var developerMenuVisible: Boolean
+        get() = developerModeEnabled && p().getBoolean("developer_menu_visible", true)
+        set(value) {
+            if (!developerModeEnabled) return
+            p().edit().putBoolean("developer_menu_visible", value).apply()
+            SettingsRevision.bump()
+        }
+
     var appThemeMode: AppThemeMode
         get() = AppThemeMode.fromValue(p().getString("app_theme_mode", "dark"))
         set(value) {

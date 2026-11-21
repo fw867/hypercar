@@ -13,15 +13,17 @@ import java.net.InetSocketAddress
 import java.net.MulticastSocket
 import java.net.NetworkInterface
 import java.net.SocketTimeoutException
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
-/** No queries, announcements or connections: observe multicast delivered on the selected car network. */
+/** Passively observe multicast on the selected car network; explicit developer replay is opt-in. */
 internal class CtrlMdnsObserver(
     private val context: Context,
     private val network: Network,
     private val generation: Long,
     private val log: (String) -> Unit,
     private val attemptId: Long = 0,
+    private val onObservation: (family: Int, localAnnouncementPort: Int?) -> Unit = { _, _ -> },
 ) : Closeable {
     private val prefix = "attempt=$attemptId gen=$generation network=$network"
     @Volatile private var closed = false
@@ -29,6 +31,61 @@ internal class CtrlMdnsObserver(
     private var lock: WifiManager.MulticastLock? = null
     private val workers = AtomicInteger()
     private val startedAt = SystemClock.elapsedRealtime()
+    private data class LocalAnnouncement(
+        val bytes: ByteArray, val metadata: MdnsDiagnosticPacket.Announcement,
+        val source: InetAddress, val seenAt: Long,
+    )
+    private val localAnnouncements = ConcurrentHashMap<Int, LocalAnnouncement>(2)
+    private fun linkProperties() = context.getSystemService(ConnectivityManager::class.java)?.getLinkProperties(network)
+    // Both receive workers share the same short-lived view; replay deliberately bypasses it.
+    private val localAddresses = MdnsLocalAddressCache(SystemClock::elapsedRealtime) {
+        runCatching { linkProperties()?.linkAddresses?.map { it.address }?.toSet() }.getOrNull()
+    }
+
+    private fun multicastGroup(family: Int, nif: NetworkInterface): InetAddress =
+        if (family == 4) InetAddress.getByAddress(byteArrayOf(224.toByte(), 0, 0, 251.toByte()))
+        else Inet6Address.getByAddress(null,
+            byteArrayOf(0xff.toByte(), 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xfb.toByte()), nif.index)
+
+    /** null = no eligible packet; a nonnegative result is the number of successful family sends. */
+    fun resend(
+        name: String, port: Int, mac: String, version: String, registrationStartedAt: Long, canSend: () -> Boolean,
+    ): Int? {
+        if (closed) return null
+        val link = linkProperties() ?: return null
+        val nif = link.interfaceName?.let(NetworkInterface::getByName) ?: return null
+        val addresses = link.linkAddresses.map { it.address }.toSet()
+        val eligible = localAnnouncements.entries.filter { (_, packet) ->
+            packet.seenAt >= registrationStartedAt && packet.source in addresses &&
+                packet.source in packet.metadata.addresses && packet.metadata.matches(name, port, mac, version, addresses)
+        }
+        if (eligible.isEmpty()) return null
+        var sent = 0
+        for ((family, packet) in eligible) {
+            if (closed || !canSend()) break
+            try {
+                val group = multicastGroup(family, nif)
+                val source = if (packet.source is Inet6Address && packet.source.isLinkLocalAddress)
+                    Inet6Address.getByAddress(null, packet.source.address, nif.index) else packet.source
+                val datagram = DatagramPacket(packet.bytes, packet.bytes.size, group, 5353)
+                MulticastSocket(null).use { socket ->
+                    socket.reuseAddress = true
+                    network.bindSocket(socket)
+                    // Bind to our source address, not a wildcard :5353 listener; close immediately after send.
+                    socket.bind(InetSocketAddress(source, 5353))
+                    socket.networkInterface = nif
+                    socket.timeToLive = 255
+                    if (!canSend() || closed) return sent
+                    socket.send(datagram)
+                    sent++
+                }
+                log("MDNS-RESEND: $prefix if=${nif.name} IPv$family host=${packet.metadata.host} port=$port bytes=${packet.bytes.size}")
+            } catch (e: Exception) {
+                log("MDNS-RESEND: $prefix if=${nif.name} IPv$family failed=${e.javaClass.simpleName}:${e.message}")
+            }
+        }
+        return sent
+    }
 
     fun retryDue(): Boolean = !closed && workers.get() == 0 && SystemClock.elapsedRealtime() - startedAt >= 15_000
 
@@ -57,6 +114,7 @@ internal class CtrlMdnsObserver(
         var opened: MulticastSocket? = null
         var received = 0L; var relevant = 0L; var malformed = 0L; var suppressed = 0L
         var window = SystemClock.elapsedRealtime(); var emitted = 0
+        var lastPeerQueryAt: Long? = null
         val label = "$prefix if=${nif.name} IPv$family"
         try {
             val socket = MulticastSocket(null)
@@ -66,9 +124,7 @@ internal class CtrlMdnsObserver(
                 sockets += socket
             }
             socket.reuseAddress = true
-            val group = if (family == 4) InetAddress.getByAddress(byteArrayOf(224.toByte(), 0, 0, 251.toByte()))
-                else Inet6Address.getByAddress(null,
-                    byteArrayOf(0xff.toByte(), 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xfb.toByte()), nif.index)
+            val group = multicastGroup(family, nif)
             // A wildcard :5353 listener could steal NSD's unicast traffic (RFC 6762 §15.1).
             // Binding the multicast destination also makes the observation boundary explicit.
             socket.bind(InetSocketAddress(group, 5353))
@@ -87,8 +143,27 @@ internal class CtrlMdnsObserver(
                 val packet = DatagramPacket(bytes, bytes.size)
                 try { socket.receive(packet) } catch (_: SocketTimeoutException) { continue }
                 received++
-                val decoded = MdnsDiagnosticPacket.decode(bytes.copyOf(packet.length))
+                val wire = bytes.copyOf(packet.length)
+                val decoded = MdnsDiagnosticPacket.decode(wire)
                 if (decoded == null) { malformed++; continue }
+                if (decoded.announcement != null || decoded.ctrlQuestion) {
+                    val addresses = localAddresses.current()
+                    if (!closed && addresses != null) {
+                        val local = packet.address in addresses
+                        val announcement = decoded.announcement
+                        if (announcement != null && local && packet.port == 5353 && packet.address in announcement.addresses) {
+                            localAnnouncements[family] = LocalAnnouncement(wire, announcement, packet.address, SystemClock.elapsedRealtime())
+                            onObservation(family, announcement.port)
+                        } else if (decoded.ctrlQuestion && !local && !packet.address.isAnyLocalAddress &&
+                            !packet.address.isMulticastAddress) {
+                            val observedAt = SystemClock.elapsedRealtime()
+                            if (lastPeerQueryAt?.let { observedAt - it < 1_000L } != true) {
+                                lastPeerQueryAt = observedAt
+                                onObservation(family, null)
+                            }
+                        }
+                    }
+                }
                 if (decoded.details.isEmpty()) continue
                 relevant++
                 if (emitted >= 24) { suppressed++; continue }

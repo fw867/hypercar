@@ -16,6 +16,9 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
         var outcome: String = "WAITING", var reason: String = "", var ended: Long? = null,
         var transport: Transport? = null,
         val earlyInbound: ArrayDeque<Pair<String, Long>> = ArrayDeque(),
+        val observations: MutableMap<Observation, Pair<Long, String>> = mutableMapOf(),
+        val ctrlReached: MutableMap<Stage, Long> = mutableMapOf(),
+        var ctrlPort: String? = null,
     )
     private data class Transport(
         val engine: Long, val peer: String?, val anchorUptime: Long, val anchorEpoch: Long,
@@ -34,6 +37,8 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
     }
     private var serial = 0L
     private val history = ArrayDeque<Attempt>()
+    private val ctrlStages = setOf(Stage.CTRL_REGISTERED, Stage.CTRL_TCP_ACCEPTED, Stage.CTRL_INVITE_HEAD,
+        Stage.CTRL_INVITE_ACK, Stage.CTRL_INVITED)
 
     @Synchronized fun engineStarted(id: Long, engine: Long, peer: String?, uptime: Long, epoch: Long) {
         val a = history.lastOrNull()?.takeIf { it.id == id && it.ended == null } ?: return
@@ -85,7 +90,10 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
 
     @Synchronized fun mark(id: Long, stage: Stage, detail: String = "") {
         val a = history.lastOrNull()?.takeIf { it.id == id && it.ended == null } ?: return
-        a.reached.putIfAbsent(stage, (clockMillis() - a.started).coerceAtLeast(0))
+        val elapsed = (clockMillis() - a.started).coerceAtLeast(0)
+        a.reached.putIfAbsent(stage, elapsed)
+        if (stage in ctrlStages) a.ctrlReached.putIfAbsent(stage, elapsed)
+        if (stage == Stage.CTRL_REGISTERED) a.ctrlPort = detail.takeIf { it.isNotBlank() }?.let(::clean)
         if (stage == Stage.RECORD) a.outcome = "ACTIVATING"
         if (stage == Stage.CONTROL_READY && Stage.FIRST_VIDEO_FRAME !in a.reached) a.outcome = "CONTROL_READY"
         if (stage == Stage.FIRST_VIDEO_FRAME) a.outcome = "VIDEO_WRITING"
@@ -108,6 +116,56 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
             "receiver_display=unknown receiver_audio=unknown " +
             "last=${a.reached.keys.last()} milestones=[$milestones] notes=[$notes] " +
             (a.transport?.let { it.summary() + " " } ?: "") + "reason=${a.reason}"
+    }
+
+    internal enum class Observation(val label: String) {
+        CARD_UNLOCKED("已刷卡"), ABOUT_TO_SELECT_CARPLAY("即将点旧设备 CarPlay"),
+        ACL_UP("车机蓝牙 ACL 连上"), ACL_DOWN("车机蓝牙 ACL 断开"),
+        MDNS_LOCAL_ANNOUNCEMENT("本机完整 mDNS 通告（最近观察）"),
+        MDNS_PEER_QUERY("对端 CarPlay ctrl mDNS 查询（最近观察）"),
+    }
+
+    /** Latest occurrence per kind; the full timeline remains in the normal session log. */
+    @Synchronized internal fun observe(id: Long, kind: Observation, detail: String = "", at: Long = clockMillis()): Boolean {
+        val attempt = history.lastOrNull()?.takeIf { it.id == id && it.ended == null } ?: return false
+        val offset = at - attempt.started
+        if (offset >= (attempt.observations[kind]?.first ?: Long.MIN_VALUE)) {
+            attempt.observations[kind] = offset to clean(detail)
+        }
+        return true
+    }
+
+    /** Keep the attempt-wide report, but do not mix ctrl evidence from different listeners. */
+    @Synchronized internal fun newCtrlEpoch(id: Long) {
+        val a = history.lastOrNull()?.takeIf { it.id == id && it.ended == null } ?: return
+        a.ctrlReached.clear()
+        a.ctrlPort = null
+        a.observations.remove(Observation.MDNS_LOCAL_ANNOUNCEMENT)
+        a.observations.remove(Observation.MDNS_PEER_QUERY)
+    }
+
+    @Synchronized internal fun connectionSnapshot(id: Long, listeningPort: Int?): String? {
+        val a = history.lastOrNull()?.takeIf { it.id == id } ?: return null
+        return buildString {
+            appendLine("HyperCar 连接快照 · #${a.id} · ${if (a.ended == null) "进行中" else "最近已结束"}")
+            appendLine("来源=${a.source} 档案=${a.profile} 状态=${a.outcome}；时间以本轮开始为 0 ms，负值表示本轮开始前")
+            appendLine("当前 ctrl 端口：${listeningPort ?: "未监听"}；最近一段 ctrl 监听的注册端口：${a.ctrlPort ?: "未记录"}")
+            for (kind in Observation.entries) {
+                val event = a.observations[kind]
+                val detail = event?.second.orEmpty()
+                appendLine("${kind.label}：${event?.let { "${if (it.first >= 0) "+" else ""}${it.first} ms" } ?: "未记录"}${if (detail.isBlank()) "" else "（$detail）"}")
+            }
+            fun stage(label: String, stage: Stage) {
+                val at = if (stage in ctrlStages) a.ctrlReached[stage] else a.reached[stage]
+                appendLine("$label：${at?.let { "+$it ms" } ?: "未记录"}")
+            }
+            stage("绑定车机 Wi-Fi", Stage.WIFI_BOUND)
+            stage("蓝牙 …cafe 入站交给 iAP2", Stage.BT_INBOUND_ADMITTED)
+            stage("App 接收 ctrl TCP", Stage.CTRL_TCP_ACCEPTED)
+            stage("读取 HTTP 邀请请求头", Stage.CTRL_INVITE_HEAD)
+            stage("收到有效 HTTP 邀请", Stage.CTRL_INVITED)
+            append("未记录不代表未发生；App 未接收 TCP 不代表车机没发 SYN。")
+        }
     }
 
     private fun clean(value: String): String = value.replace(Regex("[\\r\\n\\t]"), " ").take(300)

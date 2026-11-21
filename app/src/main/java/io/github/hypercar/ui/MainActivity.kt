@@ -70,6 +70,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.hypercar.bluetooth.DISCOVERABLE_WINDOW_SECONDS
 import io.github.hypercar.bluetooth.SystemDiscoverabilityPrompt
+import io.github.hypercar.bluetooth.SystemDiscoverabilityRequest
 import io.github.hypercar.core.LinkState
 import io.github.hypercar.core.SessionSnapshot
 import io.github.hypercar.perm.AppPermissions
@@ -79,7 +80,6 @@ import io.github.hypercar.session.StartupRequirements
 import io.github.hypercar.settings.SettingsRevision
 import io.github.hypercar.settings.SettingsStore
 import java.lang.ref.WeakReference
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -104,23 +104,40 @@ import io.github.hypercar.ui.theme.TextSecondary
 
 /** 单 Activity：底部三 Tab（主页 / 设置 / 诊断），state-based 切换，无需 navigation-compose。 */
 class MainActivity : ComponentActivity() {
-    private class DiscoverabilityRequest(val stillWaiting: () -> Boolean) {
-        val result = CompletableDeferred<Int?>()
+    private enum class DiscoverabilityPhase { PERMISSION, READY, DIALOG }
+    private class DiscoverabilityRequest(val stillWaiting: () -> Boolean, val state: SystemDiscoverabilityRequest) {
+        var phase = DiscoverabilityPhase.PERMISSION
     }
 
     private var pendingDiscoverability: DiscoverabilityRequest? = null
     private val discoverabilityLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-        pendingDiscoverability?.let { finishDiscoverability(it, result.resultCode.coerceAtLeast(0)) }
+        pendingDiscoverability?.takeIf { it.phase == DiscoverabilityPhase.DIALOG }
+            ?.let { finishDiscoverability(it, result.resultCode.coerceAtLeast(0)) }
     }
     private val advertisePermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        val request = pendingDiscoverability ?: return@registerForActivityResult
+        val request = pendingDiscoverability?.takeIf { it.phase == DiscoverabilityPhase.PERMISSION }
+            ?: return@registerForActivityResult
         if (!granted) finishDiscoverability(request, 0)
-        else lifecycleScope.launch { lifecycle.withResumed { launchDiscoverability(request) } }
+        else {
+            request.phase = DiscoverabilityPhase.READY
+            launchDiscoverabilityWhenResumed(request)
+        }
+    }
+
+    private fun launchDiscoverabilityWhenResumed(request: DiscoverabilityRequest) {
+        lifecycleScope.launch {
+            lifecycle.withResumed {
+                if (pendingDiscoverability === request && request.phase == DiscoverabilityPhase.READY) {
+                    launchDiscoverability(request)
+                }
+            }
+        }
     }
 
     private fun finishDiscoverability(request: DiscoverabilityRequest, seconds: Int?) {
-        if (pendingDiscoverability === request) pendingDiscoverability = null
-        request.result.complete(seconds)
+        if (pendingDiscoverability !== request) return
+        pendingDiscoverability = null
+        request.state.finish(seconds)
     }
 
     private fun launchDiscoverability(request: DiscoverabilityRequest) {
@@ -128,6 +145,7 @@ class MainActivity : ComponentActivity() {
             finishDiscoverability(request, null)
             return
         }
+        request.phase = DiscoverabilityPhase.DIALOG
         runCatching {
             discoverabilityLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
                 .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, DISCOVERABLE_WINDOW_SECONDS))
@@ -137,28 +155,35 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private suspend fun requestDiscoverability(stillWaiting: () -> Boolean): Int? = withContext(Dispatchers.Main.immediate) {
-        if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) || isFinishing ||
-            pendingDiscoverability != null || !stillWaiting()) return@withContext null
-        val request = DiscoverabilityRequest(stillWaiting)
-        pendingDiscoverability = request
-        if (checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED) {
-            launchDiscoverability(request)
-        } else {
-            runCatching { advertisePermissionLauncher.launch(Manifest.permission.BLUETOOTH_ADVERTISE) }
-                .onFailure { finishDiscoverability(request, null) }
+    private suspend fun requestDiscoverability(stillWaiting: () -> Boolean, state: SystemDiscoverabilityRequest) =
+        withContext(Dispatchers.Main.immediate) {
+            if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) || isFinishing ||
+                pendingDiscoverability != null || !stillWaiting() || !state.takeOwnership()) return@withContext
+            val request = DiscoverabilityRequest(stillWaiting, state)
+            pendingDiscoverability = request
+            if (checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED) {
+                launchDiscoverability(request)
+            } else {
+                runCatching { advertisePermissionLauncher.launch(Manifest.permission.BLUETOOTH_ADVERTISE) }
+                    .onFailure { finishDiscoverability(request, null) }
+            }
         }
-        // 保留正在显示的系统请求，直到它返回；旧结果不能落到新的连接轮次。
-        request.result.await()
-    }
+
+    @Suppress("DEPRECATION")
+    override fun onRetainCustomNonConfigurationInstance(): Any? = pendingDiscoverability
 
     override fun onDestroy() {
-        pendingDiscoverability?.let { finishDiscoverability(it, null) }
+        if (!isChangingConfigurations) pendingDiscoverability?.let { finishDiscoverability(it, null) }
+        pendingDiscoverability = null
         super.onDestroy()
     }
 
+    @Suppress("DEPRECATION")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // ActivityResultRegistry restores the in-flight result with these same launchers.
+        pendingDiscoverability = lastCustomNonConfigurationInstance as? DiscoverabilityRequest
+        pendingDiscoverability?.takeIf { it.phase == DiscoverabilityPhase.READY }?.let(::launchDiscoverabilityWhenResumed)
         // 沉浸式：edge-to-edge + 透明状态栏，深空背景直铺到系统栏后面
         WindowCompat.setDecorFitsSystemWindows(window, false)
         window.statusBarColor = android.graphics.Color.TRANSPARENT
@@ -169,8 +194,8 @@ class MainActivity : ComponentActivity() {
         }
 
         val host = WeakReference(this)
-        val systemPrompt: SystemDiscoverabilityPrompt = { stillWaiting ->
-            host.get()?.requestDiscoverability(stillWaiting)
+        val systemPrompt: SystemDiscoverabilityPrompt = { stillWaiting, request ->
+            host.get()?.requestDiscoverability(stillWaiting, request)
         }
         setContent {
             val themeMode = remember(SettingsRevision.value) { SettingsStore.appThemeMode }

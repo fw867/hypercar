@@ -5,6 +5,77 @@ import org.junit.Test
 import io.github.hypercar.session.ConnectionDiagnostics.Stage
 
 class ConnectionDiagnosticsTest {
+    @Test fun developerSnapshotKeepsLatestObservationsAndDoesNotBorrowFromOtherAttempts() {
+        var now = 100L
+        val journal = ConnectionDiagnostics { now }
+        val first = journal.begin("manual", "bmw_id85")
+        val mdns = ConnectionDiagnostics.Observation.MDNS_LOCAL_ANNOUNCEMENT
+        val marker = ConnectionDiagnostics.Observation.CARD_UNLOCKED
+        now = 110; assertTrue(journal.observe(first, mdns, "IPv4 port=12345"))
+        now = 120; assertTrue(journal.observe(first, marker))
+        now = 130; journal.observe(first, mdns, "IPv6 port=12345")
+        journal.mark(first, Stage.CTRL_REGISTERED, "12345")
+        journal.mark(first, Stage.CTRL_TCP_ACCEPTED)
+        journal.finish(first, "FAILED", "timeout")
+        assertFalse(journal.observe(first, marker))
+        val ended = journal.connectionSnapshot(first, null)!!
+        assertTrue(ended.contains("最近已结束"))
+        assertTrue(ended.contains("最近一段 ctrl 监听的注册端口：12345"))
+        assertTrue(ended.contains("已刷卡：+20 ms"))
+        assertTrue(ended.contains("+30 ms（IPv6 port=12345）"))
+        assertTrue(ended.contains("App 接收 ctrl TCP：+30 ms"))
+        assertTrue(ended.contains("收到有效 HTTP 邀请：未记录"))
+        assertFalse(ended.contains("IPv4"))
+        val next = journal.begin("retry", "bmw_id85")
+        assertFalse(journal.observe(first, mdns))
+        assertNull(journal.connectionSnapshot(first, null))
+        val live = journal.connectionSnapshot(next, 54321)!!
+        assertTrue(live.contains("当前 ctrl 端口：54321"))
+        assertTrue(live.contains("已刷卡：未记录"))
+        assertFalse(live.contains("12345"))
+    }
+
+    @Test fun aclTriggerKeepsPreAttemptTimeAndDelayedForwardCannotOverwriteNewerEdge() {
+        var now = 100L
+        val journal = ConnectionDiagnostics { now }
+        val up = ConnectionDiagnostics.Observation.ACL_UP
+        val down = ConnectionDiagnostics.Observation.ACL_DOWN
+        val attempt = journal.begin("acl", "bmw_id85")
+        journal.observe(attempt, up, at = 80L)
+        assertTrue(journal.connectionSnapshot(attempt, null)!!.contains("车机蓝牙 ACL 连上：-20 ms"))
+        now = 140L
+        journal.observe(attempt, down)
+        now = 150L
+        journal.observe(attempt, up)
+        journal.observe(attempt, up, at = 80L)
+        val snapshot = journal.connectionSnapshot(attempt, null)!!
+        assertTrue(snapshot.contains("车机蓝牙 ACL 断开：+40 ms"))
+        assertTrue(snapshot.contains("车机蓝牙 ACL 连上：+50 ms"))
+    }
+
+    @Test fun newCtrlListenerDoesNotBorrowOldNetworkEvidence() {
+        var now = 100L
+        val journal = ConnectionDiagnostics { now }
+        val attempt = journal.begin("manual", "bmw_id85")
+        val mdns = ConnectionDiagnostics.Observation.MDNS_LOCAL_ANNOUNCEMENT
+        now = 110
+        journal.observe(attempt, ConnectionDiagnostics.Observation.CARD_UNLOCKED)
+        journal.observe(attempt, mdns, "IPv4 port=12345")
+        journal.mark(attempt, Stage.CTRL_REGISTERED, "12345")
+        journal.mark(attempt, Stage.CTRL_INVITED)
+        now = 130
+        journal.newCtrlEpoch(attempt)
+        journal.mark(attempt, Stage.CTRL_REGISTERED, "54321")
+        val switched = journal.connectionSnapshot(attempt, 54321)!!
+        assertFalse(switched.contains("12345"))
+        assertTrue(switched.contains("收到有效 HTTP 邀请：未记录"))
+        assertTrue(switched.contains("已刷卡：+10 ms"))
+        assertTrue(journal.report().single().contains("invite=true"))
+        now = 140
+        journal.mark(attempt, Stage.CTRL_INVITED)
+        assertTrue(journal.connectionSnapshot(attempt, 54321)!!.contains("收到有效 HTTP 邀请：+40 ms"))
+    }
+
     @Test fun lateTeardownEnrichesOnlyFinishedRowAndKeepsLastSampleWhenSocketAlreadyRetired() {
         val journal = ConnectionDiagnostics { 0L }
         val first = journal.begin("manual", "bmw_id85")

@@ -28,7 +28,7 @@ internal class BmwCaffProbe(val attempt: Long) {
 
     /** A healthy local listener is not an invite: prefer inbound on brief profile windows,
      * but never starve the one UUID-based dial when the same peer stays online. */
-    @Synchronized fun poll(connectedPeer: String?, now: Long, ctrlReady: Boolean): Decision {
+    @Synchronized fun poll(connectedPeer: String?, now: Long, ctrlReady: Boolean, manual: Boolean = false): Decision {
         if (finished || attempted) return Decision.WAIT
         if (peer != connectedPeer) {
             peer = connectedPeer
@@ -40,7 +40,7 @@ internal class BmwCaffProbe(val attempt: Long) {
         val enteringCtrl = ctrlReady && !ctrlReadyLast
         if (!ctrlReady && ctrlReadyLast) ordinarySince = now
         ctrlReadyLast = ctrlReady
-        if (now - connectedSince < CTRL_GRACE_MS && (ctrlReady || now - ordinarySince < NORMAL_GRACE_MS)) {
+        if (!manual && now - connectedSince < CTRL_GRACE_MS && (ctrlReady || now - ordinarySince < NORMAL_GRACE_MS)) {
             return if (enteringCtrl) Decision.ENTER_CTRL_GRACE else Decision.WAIT
         }
         attempted = true

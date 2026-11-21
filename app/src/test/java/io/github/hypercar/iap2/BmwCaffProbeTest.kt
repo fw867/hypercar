@@ -34,6 +34,23 @@ class BmwCaffProbeTest {
         assertEquals(dial, q.poll("BMW", 15_000, true))
     }
 
+    @Test fun manualDialSkipsGraceButStillRequiresOnlinePeerAndConsumesOneOpportunity() {
+        val p = BmwCaffProbe(1)
+        assertEquals(wait, p.poll(null, 100, ctrlReady = true, manual = true))
+        assertFalse(p.attempted)
+        assertEquals(dial, p.poll("BMW", 101, ctrlReady = true, manual = true))
+        assertTrue(p.attempted)
+        assertEquals(wait, p.poll("BMW", 102, ctrlReady = true, manual = true))
+        assertEquals(wait, p.poll("BMW", 20_000, ctrlReady = false))
+    }
+
+    @Test fun cancelledProbeCannotBeStartedManually() {
+        val p = BmwCaffProbe(1)
+        p.cancel()
+        assertEquals(wait, p.poll("BMW", 101, ctrlReady = false, manual = true))
+        assertFalse(p.attempted)
+    }
+
     @Test fun realInviteOrInboundCancelsEvenBeforeExtendedGraceExpires() {
         val p = BmwCaffProbe(1)
         assertEquals(extended, p.poll("BMW", 0, true))

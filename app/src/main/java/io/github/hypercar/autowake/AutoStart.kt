@@ -21,5 +21,6 @@ import android.content.Context
  */
 object AutoStart {
     @Volatile
-    var handler: ((Context, BluetoothDevice, Boolean) -> Unit)? = null
+    // The service handoff preserves the original edge timestamp.
+    var handler: ((Context, BluetoothDevice, Boolean, Boolean, Long) -> Unit)? = null
 }

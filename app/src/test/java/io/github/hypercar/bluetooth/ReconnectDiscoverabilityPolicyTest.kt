@@ -1,6 +1,10 @@
 package io.github.hypercar.bluetooth
 
 import io.github.hypercar.headunit.HeadUnitProfiles
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -17,6 +21,70 @@ class ReconnectDiscoverabilityPolicyTest {
         allowed: Boolean = true,
     ) = ReconnectDiscoverability.automaticBmwPreparationKey(profile, listening, allowed, history) { bonded[it] }
 
+    @Test fun handoffKeepsWindowDuringTeardownAndOnlyForPublishedLiveSuccessor() {
+        val moving = DiscoverabilityHandoff(origin = 42)
+        assertTrue(moving.keepsWindow(42, 42, live = false))
+        assertTrue(moving.keepsWindow(42, 43, live = false))
+        assertFalse(moving.keepsWindow(41, 43, live = true))
+
+        val successor = DiscoverabilityHandoff(origin = 42, successor = 43)
+        assertTrue(successor.keepsWindow(42, 43, live = true))
+        assertFalse(successor.keepsWindow(42, 43, live = false))
+        assertFalse(successor.keepsWindow(42, 44, live = true))
+    }
+
+    @Test fun activityGrantStillCommitsOnceAfterWaitingWatchIsCancelled() = runBlocking {
+        val reservation = DiscoverabilityReservation()
+        assertTrue(reservation.acquire())
+        val recorded = mutableListOf<Int?>()
+        val request = SystemDiscoverabilityRequest {
+            recorded.add(it)
+            reservation.start()
+        }
+        assertTrue(request.takeOwnership())
+        val waiting = launch(start = CoroutineStart.UNDISPATCHED) { request.await() }
+        waiting.cancelAndJoin()
+        request.abandonIfUnowned()
+        assertEquals(DiscoverabilityReservation.Phase.RESERVED, reservation.phase)
+        assertFalse(reservation.acquire())
+        request.finish(30)
+        assertEquals(DiscoverabilityReservation.Phase.STARTED, reservation.phase)
+        request.finish(null)
+        request.finish(30)
+        assertEquals(listOf<Int?>(30), recorded)
+        assertEquals(30, request.await())
+    }
+
+    @Test fun permissionRefusalAndActivityDestructionReleaseExactlyOnce() = runBlocking {
+        for (result in listOf(0, null)) {
+            val reservation = DiscoverabilityReservation()
+            assertTrue(reservation.acquire())
+            val recorded = mutableListOf<Int?>()
+            val request = SystemDiscoverabilityRequest {
+                recorded.add(it)
+                reservation.release()
+            }
+            assertTrue(request.takeOwnership())
+            request.finish(result)
+            assertEquals(result, request.await())
+            assertTrue(reservation.acquire())
+            request.finish(30)
+            request.abandonIfUnowned()
+            assertEquals(listOf(result), recorded)
+            assertEquals(DiscoverabilityReservation.Phase.RESERVED, reservation.phase)
+        }
+    }
+
+    @Test fun watchMayAbandonBeforeTheActivityAcceptsOwnership() = runBlocking {
+        val recorded = mutableListOf<Int?>()
+        val request = SystemDiscoverabilityRequest { recorded.add(it) }
+        request.abandonIfUnowned()
+        assertFalse(request.takeOwnership())
+        request.finish(30)
+        assertNull(request.await())
+        assertEquals(listOf<Int?>(null), recorded)
+    }
+
     @Test fun automaticUsesOnlyTheUniqueCurrentlyBondedSuccessfulBmw() {
         val bonded = mapOf(bmw to "BMW 53636", second to "BMW 12345", desktop to "ZS1-PC")
         val history = setOf("${bmw.lowercase()}|车机|10", "$desktop|BMW|20")
@@ -31,13 +99,13 @@ class ReconnectDiscoverabilityPolicyTest {
         assertNull(automaticKey(bonded, history, allowed = false))
     }
 
-    @Test fun automaticOpensOnceBeforeWifiEvenIfAclWakesAgain() {
+    @Test fun automaticBmwOpensOnceBeforeWifiAndIgnoresCompanionRearm() {
         val key = automaticKey(mapOf(bmw to "BMW 53636"), setOf("$bmw|BMW 53636|10"))
         val p = ReconnectDiscoverabilityPolicy()
         assertFalse(p.shouldAttempt(true, null, false, false, 0, key))
         assertFalse(p.shouldAttempt(true, null, false, false, 4_999, key))
         assertTrue(p.shouldAttempt(true, null, false, false, 5_000, key))
-        p.armForWake()
+        assertFalse(p.armForWake())
         assertFalse(p.shouldAttempt(true, null, false, false, 40_000, key))
     }
 
@@ -48,8 +116,9 @@ class ReconnectDiscoverabilityPolicyTest {
         assertFalse(p.shouldAttempt(true, null, false, false, 0, prep))
         assertTrue(p.shouldAttempt(true, "new wifi", false, false, 5_000, prep))
         assertFalse(p.shouldAttempt(true, "new wifi", true, false, 10_000, prep))
-        assertTrue(p.armForWake())
-        assertTrue(p.shouldAttempt(true, "new wifi", true, false, 11_000, prep))
+        assertFalse(p.armForWake())
+        p.noteWindowClosed()
+        assertTrue(p.shouldAttempt(true, "new wifi", true, false, 11_000, prep, aclPreparationKey = bmw))
     }
 
     @Test fun systemConfirmationOnlyBacksUpPreparedManualStartInForeground() {
@@ -72,6 +141,28 @@ class ReconnectDiscoverabilityPolicyTest {
             assertFalse(p.shouldAttempt(true, "car", true, false, 40_000, prep))
             assertFalse(p.shouldAttempt(true, "car", true, false, 80_000))
         }
+    }
+
+    @Test fun manualClickWhileWindowOpenDoesNotOpenAnotherAndClickOutsideStillDoes() {
+        val prep = ReconnectDiscoverability.preparationKey("bmw_id85", true, bmw, true, true, emptySet()) { "" }
+        val during = ReconnectDiscoverabilityPolicy(immediatePreparation = true)
+        assertFalse(during.shouldAttempt(true, null, false, false, 1, prep, leaseOpen = true))
+        assertFalse(during.shouldAttempt(true, null, false, false, 2, prep, leaseOpen = false))
+        assertFalse(during.shouldAttempt(true, "car", true, false, 40_000, prep, leaseOpen = false))
+
+        val fresh = ReconnectDiscoverabilityPolicy(immediatePreparation = true)
+        assertTrue(fresh.shouldAttempt(true, null, false, false, 1, prep, leaseOpen = false))
+    }
+
+    @Test fun manualClickSuppressionSurvivesWindowExpirationDuringRestartButAllowsNewAcl() {
+        val p = ReconnectDiscoverabilityPolicy(immediatePreparation = true, suppressManualWindow = true)
+        // The old window is already gone by the time this new watch even starts.
+        assertFalse(p.shouldAttempt(true, null, false, false, 0))
+        assertFalse(p.shouldAttempt(true, null, false, false, 10_000, "bt:$bmw"))
+        assertFalse(p.shouldAttempt(true, "car", true, false, 30_000))
+        assertTrue(p.shouldAttempt(true, null, false, false, 30_500, aclPreparationKey = bmw))
+        p.noteWindowClosed()
+        assertFalse(p.shouldAttempt(true, "car", true, false, 61_000, "bt:$bmw"))
     }
 
     @Test fun manualCannotOpenIfDisabledOrSessionAlreadyClaimed() {
@@ -174,15 +265,94 @@ class ReconnectDiscoverabilityPolicyTest {
         assertFalse(p.armForWake())
     }
 
-    @Test fun aclWakeCanArmOneExtraWindowAfterTheInitialAttempt() {
+    @Test fun companionWakeCanArmOneExtraWindowAfterTheInitialAttempt() {
         val p = ReconnectDiscoverabilityPolicy()
         assertFalse(p.armForWake())
         assertFalse(p.shouldAttempt(true, "car", true, false, 0))
         assertTrue(p.shouldAttempt(true, "car", true, false, 5_000))
+        assertFalse(p.armForWake())
+        assertFalse(p.shouldAttempt(true, null, false, false, 5_500, aclPreparationKey = bmw))
+        p.noteWindowClosed()
         assertTrue(p.armForWake())
-        assertFalse(p.armForWake()) // already armed
+        assertFalse(p.armForWake())
         assertTrue(p.shouldAttempt(true, "car", true, false, 6_000))
+        assertFalse(p.shouldAttempt(true, null, false, false, 6_500, aclPreparationKey = bmw))
+        p.noteWindowClosed()
         assertFalse(p.shouldAttempt(true, "car", true, false, 7_000))
-        assertTrue(p.armForWake())
+        assertTrue(p.shouldAttempt(true, null, false, false, 7_500, aclPreparationKey = bmw))
+    }
+
+    @Test fun knownCarAclRequiresAutomaticModeBondAndNoActiveIap2OrWindow() {
+        assertFalse(knownBondedCar(false, bmw, bmw, true, null))
+        assertFalse(knownBondedCar(true, "", bmw, true, null))
+        assertFalse(knownBondedCar(true, second, bmw, true, bmw))
+        assertTrue(knownBondedCar(true, bmw, bmw, false, null))
+        assertTrue(knownBondedCar(true, bmw, null, true, null))
+        assertTrue(knownBondedCar(true, bmw, null, false, bmw))
+        assertFalse(knownBondedCar(true, second, null, false, null))
+        assertFalse(shouldDiscoverForCarAcl(autoConnect = false, knownBonded = true, iap2Started = false, discoverableAlreadyOn = false))
+        assertFalse(shouldDiscoverForCarAcl(autoConnect = true, knownBonded = false, iap2Started = false, discoverableAlreadyOn = false))
+        assertFalse(shouldDiscoverForCarAcl(autoConnect = true, knownBonded = true, iap2Started = true, discoverableAlreadyOn = false))
+        assertFalse(shouldDiscoverForCarAcl(autoConnect = true, knownBonded = true, iap2Started = false, discoverableAlreadyOn = true))
+        assertTrue(shouldDiscoverForCarAcl(autoConnect = true, knownBonded = true, iap2Started = false, discoverableAlreadyOn = false))
+    }
+
+    @Test fun singleAclEdgeWorksWithoutWifiAndCannotReopenAfterCompletionOrFailure() {
+        val p = ReconnectDiscoverabilityPolicy()
+        assertFalse(p.shouldAttempt(true, null, false, false, 0))
+        assertTrue(p.shouldAttempt(true, null, false, false, 100, aclPreparationKey = bmw))
+        assertTrue(p.discoverableWindowOpen())
+        assertFalse(p.shouldAttempt(true, "car", true, false, 1_000, aclPreparationKey = bmw))
+        p.noteWindowClosed()
+        assertFalse(p.discoverableWindowOpen())
+        assertFalse(p.shouldAttempt(true, "car", true, false, 2_000))
+        assertFalse(p.shouldAttempt(true, "car", true, false, 32_000))
+        assertTrue(p.shouldAttempt(true, null, false, false, 33_000, aclPreparationKey = bmw))
+        p.noteWindowClosed() // A failed shell start/bind uses the same state transition.
+        assertFalse(p.shouldAttempt(true, null, false, false, 33_001))
+        assertFalse(p.shouldAttempt(true, "car", true, true, 34_000, aclPreparationKey = bmw))
+        assertFalse(p.shouldAttempt(true, null, false, false, 35_000, aclPreparationKey = bmw))
+    }
+
+    @Test fun staleAclBeforeBinderDoesNotUseUpTheOrdinaryManualWindow() {
+        val prep = "bt:$bmw"
+        val manual = ReconnectDiscoverabilityPolicy(immediatePreparation = true)
+        assertTrue(manual.shouldAttempt(true, null, false, false, 0, prep, aclPreparationKey = bmw))
+        manual.noteWindowClosed(staleAclBeforeStart = true)
+        assertTrue(manual.shouldAttempt(true, null, false, false, 500, prep))
+        manual.noteWindowClosed()
+        assertFalse(manual.shouldAttempt(true, null, false, false, 31_000, prep))
+
+        val suppressed = ReconnectDiscoverabilityPolicy(immediatePreparation = true, suppressManualWindow = true)
+        assertTrue(suppressed.shouldAttempt(true, null, false, false, 0, prep, aclPreparationKey = bmw))
+        suppressed.noteWindowClosed(staleAclBeforeStart = true)
+        assertFalse(suppressed.shouldAttempt(true, null, false, false, 500, prep))
+
+        val started = ReconnectDiscoverabilityPolicy(immediatePreparation = true)
+        assertTrue(started.shouldAttempt(true, null, false, false, 0, prep, aclPreparationKey = bmw))
+        started.noteWindowClosed()
+        assertFalse(started.shouldAttempt(true, null, false, false, 500, prep))
+    }
+
+    @Test fun reservationCannotSuppressClickUntilStartIsCommitted() {
+        val reservation = DiscoverabilityReservation()
+        assertTrue(reservation.acquire())
+        assertEquals(DiscoverabilityReservation.Phase.RESERVED, reservation.phase)
+        assertFalse(reservation.acquire())
+        reservation.release() // Old watch cancelled while binding; the new one is free to start.
+        assertEquals(DiscoverabilityReservation.Phase.IDLE, reservation.phase)
+        assertTrue(reservation.acquire())
+        reservation.start()
+        assertEquals(DiscoverabilityReservation.Phase.STARTED, reservation.phase)
+        assertFalse(reservation.acquire())
+        reservation.release()
+        assertEquals(DiscoverabilityReservation.Phase.IDLE, reservation.phase)
+    }
+
+    @Test fun aclObservedDuringPriorLeaseIsNotDeferredUntilThatLeaseEnds() {
+        val p = ReconnectDiscoverabilityPolicy()
+        assertFalse(p.shouldAttempt(true, null, false, false, 100, leaseOpen = true, aclPreparationKey = bmw))
+        assertFalse(p.shouldAttempt(true, null, false, false, 31_000))
+        assertTrue(p.shouldAttempt(true, null, false, false, 32_000, aclPreparationKey = bmw))
     }
 }

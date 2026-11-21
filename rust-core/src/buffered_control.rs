@@ -16,11 +16,15 @@ struct Playback {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode { GetAnchor, Id9SetRate }
+enum Mode { GetAnchor, DeferredAnchor, Id9SetRate }
 
 impl Mode {
     fn name(self) -> &'static str {
-        match self { Self::GetAnchor => "GETANCHOR", Self::Id9SetRate => "ID9_SETRATE" }
+        match self {
+            Self::GetAnchor => "GETANCHOR",
+            Self::DeferredAnchor => "DEFERRED_ANCHOR",
+            Self::Id9SetRate => "ID9_SETRATE",
+        }
     }
 }
 
@@ -58,13 +62,13 @@ impl Stream {
         let response = self.channel.request(method, uri, &bplist::encode(&body),
             "application/x-apple-binary-plist", &[], CONTROL_TIMEOUT).await.map_err(io::Error::other)?;
         let status = response.status();
-        if status != 200 {
-            // The shared channel can also parse HTTP replies. Only an RTSP
-            // response is evidence for the GETANCHOR method fallback below.
-            if response.first_line.starts_with("RTSP/") {
-                return Err(io::Error::other(RtspStatus { method, code: status }));
-            }
+        // The shared channel can also parse HTTP replies. Only RTSP is evidence
+        // for either an accepted control command or the GETANCHOR 501 fallback.
+        if !response.first_line.starts_with("RTSP/") {
             return Err(io::Error::other(format!("type103 {method} non-RTSP status {status}")));
+        }
+        if status != 200 {
+            return Err(io::Error::other(RtspStatus { method, code: status }));
         }
         if response.body.is_empty() { return Ok(None); }
         let plist = bplist::parse(&response.body).map_err(io::Error::other)?;
@@ -83,14 +87,14 @@ impl Stream {
     // session clock (including its chosen scheduling lead). Keep all four integers
     // unchanged, including signed NTP seconds, fractional bits and a zero NTP
     // timeline ID. A PTP grandmaster or synthesized local wall time is unnecessary.
-    async fn clock(&self) -> io::Result<Vec<(&'static str, Value)>> {
-        let reply = self.request("GETANCHOR", rate(1)).await?
-            .ok_or_else(|| io::Error::other("type103 GETANCHOR returned no session clock"))?;
-        ["networkTimeSecs", "networkTimeFrac", "networkTimeTimelineID", "networkTimeFlags"]
+    async fn clock(&self) -> io::Result<Option<Vec<(&'static str, Value)>>> {
+        let Some(reply) = self.request("GETANCHOR", rate(1)).await? else { return Ok(None); };
+        let fields = ["networkTimeSecs", "networkTimeFrac", "networkTimeTimelineID", "networkTimeFlags"]
             .into_iter().map(|key| {
                 reply.get(key).and_then(Value::as_int).map(|n| (key, Value::int(n)))
                     .ok_or_else(|| io::Error::other(format!("type103 GETANCHOR missing {key}")))
-            }).collect()
+            }).collect::<io::Result<_>>()?;
+        Ok(Some(fields))
     }
 
     async fn start(&self, generation: u64, ts: u32) -> io::Result<()> {
@@ -98,7 +102,9 @@ impl Stream {
         if !self.permits(generation) { return Ok(()); }
         match self.mode() {
             Mode::GetAnchor => {
-                let mut fields = self.clock().await?;
+                let Some(mut fields) = self.clock().await? else {
+                    return Err(io::Error::other("type103 GETANCHOR returned no session clock"));
+                };
                 if !self.permits(generation) { return Ok(()); }
                 for (key, value) in [
                     ("rate", 1), ("rtpTime", ts), ("mediaTimeValue", ts), ("mediaTimeScale", self.sample_rate),
@@ -108,6 +114,11 @@ impl Stream {
                     fields.push((key, Value::int(value.into())));
                 }
                 self.request("SETRATEANCHORTIME", Value::dict(fields)).await?;
+            }
+            // DiPlay's GETANCHOR is null until the first SETRATE. The rate command itself
+            // creates the anchor from rtpTime and the receiver clock.
+            Mode::DeferredAnchor => {
+                self.request("SETRATEANCHORTIME", audible_rate(1, ts, self.sample_rate)).await?;
             }
             Mode::Id9SetRate => {
                 let reply = self.request("SETRATE", Value::dict(vec![
@@ -147,7 +158,7 @@ impl Stream {
         ])).await;
         let flush_ms = started.elapsed().as_millis();
         let mode = self.mode();
-        let pause_method = match mode { Mode::Id9SetRate => "SETRATE", Mode::GetAnchor => "SETRATEANCHORTIME" };
+        let pause_method = match mode { Mode::Id9SetRate => "SETRATE", Mode::GetAnchor | Mode::DeferredAnchor => "SETRATEANCHORTIME" };
         let pause = self.request(pause_method, rate(0)).await;
         let pause_ms = started.elapsed().as_millis();
         // Even a rejected flush should still attempt to stop playback.
@@ -180,6 +191,15 @@ fn setrate_anchor(reply: &Value, ts: u32, sample_rate: u32) -> io::Result<[i64; 
 
 fn rate(value: i64) -> Value {
     Value::dict(vec![("rate", Value::int(value))])
+}
+
+fn audible_rate(value: i64, ts: u32, sample_rate: u32) -> Value {
+    Value::dict(vec![
+        ("rate", Value::int(value)), ("rtpTime", Value::int(ts.into())),
+        ("mediaTimeValue", Value::int(ts.into())), ("mediaTimeScale", Value::int(sample_rate.into())),
+        ("firstAudibleRTPTime", Value::int(ts.into())), ("firstAudibleMediaTimeValue", Value::int(ts.into())),
+        ("firstAudibleMediaTimeScale", Value::int(sample_rate.into())),
+    ])
 }
 
 pub(crate) struct BufferedControl {
@@ -227,11 +247,16 @@ impl BufferedControl {
 
     pub(crate) fn control_mode(&self) -> &'static str { self.stream.mode().name() }
 
-    pub(crate) async fn probe_anchor_for_profile(&self, allow_id9_setrate: bool) -> io::Result<()> {
+    pub(crate) async fn probe_anchor_for_profile(&self, allow_id9_setrate: bool, defer_empty_anchor: bool) -> io::Result<()> {
         let _ordered = self.stream.channel.buffered_commands.lock().await;
         if self.stream.mode.get().is_some() { return Ok(()); }
         let mode = match self.stream.clock().await {
-            Ok(_) => Mode::GetAnchor,
+            Ok(Some(_)) => Mode::GetAnchor,
+            Ok(None) if defer_empty_anchor => {
+                crate::emit_log("BUFFERED-AUDIO: type103 GETANCHOR preflight empty mode=DEFERRED_ANCHOR until SETRATEANCHORTIME playback_unconfirmed");
+                Mode::DeferredAnchor
+            }
+            Ok(None) => return Err(io::Error::other("type103 GETANCHOR returned no session clock")),
             Err(err) if allow_id9_setrate && matches!(err.get_ref().and_then(|e| e.downcast_ref::<RtspStatus>()),
                 Some(RtspStatus { method: "GETANCHOR", code: 501 })) => {
                 crate::emit_log("BUFFERED-AUDIO: type103 GETANCHOR preflight RTSP 501 mode=ID9_SETRATE deferred_until_packet_written playback_unconfirmed");
@@ -332,6 +357,11 @@ mod tests {
         peer.write_all(&text).await.unwrap();
     }
 
+    async fn http_reply(peer: &mut TcpStream, message: &RtspMessage, status: u16) {
+        let text = format!("HTTP/1.1 {status} Reply\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n", message.cseq().unwrap());
+        peer.write_all(text.as_bytes()).await.unwrap();
+    }
+
     fn clock(seconds: i64) -> Value {
         Value::dict(vec![("status", Value::int(0)), ("networkTimeSecs", Value::int(seconds)),
             ("networkTimeFrac", Value::int(i64::MIN)), ("networkTimeTimelineID", Value::int(0)),
@@ -386,7 +416,7 @@ mod tests {
             (Value::dict(vec![("status", Value::int(-6718))]), 200),
             (Value::dict(vec![("status", Value::str("invalid"))]), 200)] {
             let (control, _, mut peer) = pair().await;
-            let (result, ()) = tokio::join!(control.probe_anchor_for_profile(false), async {
+            let (result, ()) = tokio::join!(control.probe_anchor_for_profile(false, false), async {
                 let (get, _) = request(&mut peer, "GETANCHOR").await;
                 reply(&mut peer, &get, status, Some(reply_body)).await;
             });
@@ -394,7 +424,7 @@ mod tests {
         }
     }
     async fn probe(control: &BufferedControl, peer: &mut TcpStream, allow: bool, code: u16, body: Option<Value>) -> io::Result<()> {
-        let (result, ()) = tokio::join!(control.probe_anchor_for_profile(allow), async {
+        let (result, ()) = tokio::join!(control.probe_anchor_for_profile(allow, false), async {
             let (get, _) = request(peer, "GETANCHOR").await;
             reply(peer, &get, code, body).await;
         });
@@ -430,14 +460,15 @@ mod tests {
             assert!(probe(&control, &mut peer, true, code, body).await.is_err());
             assert_eq!(control.control_mode(), "GETANCHOR");
         }
-        let (control, _, mut peer) = pair().await;
-        let (result, ()) = tokio::join!(control.probe_anchor_for_profile(true), async {
-            let (get, _) = request(&mut peer, "GETANCHOR").await;
-            let reply = format!("HTTP/1.1 501 Not Implemented\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n", get.cseq().unwrap());
-            peer.write_all(reply.as_bytes()).await.unwrap();
-        });
-        assert!(result.is_err());
-        assert_eq!(control.control_mode(), "GETANCHOR");
+        for status in [200, 501] {
+            let (control, _, mut peer) = pair().await;
+            let (result, ()) = tokio::join!(control.probe_anchor_for_profile(true, true), async {
+                let (get, _) = request(&mut peer, "GETANCHOR").await;
+                http_reply(&mut peer, &get, status).await;
+            });
+            assert!(result.unwrap_err().to_string().contains("non-RTSP"));
+            assert_eq!(control.control_mode(), "GETANCHOR");
+        }
         let (mut control, _, mut peer) = pair().await;
         probe(&control, &mut peer, true, 200, Some(clock(12))).await.unwrap();
         assert!(control.prepare_packet(1, 10, control.loss_generation()).await.unwrap());
@@ -447,6 +478,43 @@ mod tests {
         until(|| control.failed()).await;
         assert!(!control.playing());
         assert_eq!(control.control_mode(), "GETANCHOR");
+    }
+
+    #[tokio::test]
+    async fn empty_getanchor_on_a_desktop_receiver_starts_from_setrateanchortime() {
+        let (mut control, _, mut peer) = pair().await;
+        let (result, ()) = tokio::join!(control.probe_anchor_for_profile(true, true), async {
+            let (get, body) = request(&mut peer, "GETANCHOR").await;
+            assert_eq!(body.get("rate"), Some(&Value::int(1)));
+            reply(&mut peer, &get, 200, None).await;
+        });
+        result.unwrap();
+        assert_eq!(control.control_mode(), "DEFERRED_ANCHOR");
+        let generation = control.loss_generation();
+        assert!(control.prepare_packet(3, 2048, generation).await.unwrap());
+        control.packet_written(3, 2048).await.unwrap();
+        let (play, body) = request(&mut peer, "SETRATEANCHORTIME").await;
+        assert_eq!(body.get("rtpTime"), Some(&Value::int(2048)));
+        assert_eq!(body.get("rate"), Some(&Value::int(1)));
+        assert!(body.get("networkTimeSecs").is_none());
+        reply(&mut peer, &play, 200, None).await;
+        until(|| control.playing()).await;
+    }
+
+    #[tokio::test]
+    async fn http_200_does_not_acknowledge_deferred_playback() {
+        let (mut control, _, mut peer) = pair().await;
+        let (result, ()) = tokio::join!(control.probe_anchor_for_profile(false, true), async {
+            let (get, _) = request(&mut peer, "GETANCHOR").await;
+            reply(&mut peer, &get, 200, None).await;
+        });
+        result.unwrap();
+        assert!(control.prepare_packet(3, 2048, control.loss_generation()).await.unwrap());
+        control.packet_written(3, 2048).await.unwrap();
+        let (play, _) = request(&mut peer, "SETRATEANCHORTIME").await;
+        http_reply(&mut peer, &play, 200).await;
+        until(|| control.failed()).await;
+        assert!(!control.playing());
     }
 
     #[tokio::test]

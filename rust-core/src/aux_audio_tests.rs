@@ -91,8 +91,12 @@ impl Fixture {
         self.peer.write_all(format!("RTSP/1.0 {status} Rejected\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",message.cseq().unwrap()).as_bytes()).await.unwrap();
     }
     async fn setup_reply(&mut self,message:&RtspMessage,value:&Value){
+        self.setup_reply_with_type(message,value,true).await;
+    }
+    async fn setup_reply_with_type(&mut self,message:&RtspMessage,value:&Value,include_type:bool){
         let request=&value.get("streams").unwrap().as_array().unwrap()[0];
-        let mut fields=vec![("type",request.get("type").unwrap().clone()),("dataPort",Value::int(self.data.local_addr().unwrap().port() as i64)),("controlPort",Value::int(self.sync.local_addr().unwrap().port() as i64))];
+        let mut fields=vec![("dataPort",Value::int(self.data.local_addr().unwrap().port() as i64)),("controlPort",Value::int(self.sync.local_addr().unwrap().port() as i64))];
+        if include_type { fields.push(("type",request.get("type").unwrap().clone())); }
         for field in ["streamConnectionID","audioFormat","audioType"]{if let Some(value)=request.get(field){fields.push((field,value.clone()));}}
         self.ack(message,Some(Value::dict(vec![("streams",Value::array(vec![Value::dict(fields)]))]))).await;
     }
@@ -292,6 +296,7 @@ async fn id9_same_address_reinvite_discards_old_record_even_with_matching_cseq()
 async fn failed_buffered_teardown_never_starts_a_second_main_stream() {
     let mut f = Fixture::with_codec(AudioCodec::BufferedAac, |params, _| {
         params.head_unit_profile = "bmw_id9".into();
+        params.audio_codec = "auto".into();
     }).await;
     f.input.buffered_failed.notify_one();
     let (teardown, _) = f.request("teardown:103").await;
@@ -309,6 +314,7 @@ async fn mbux_buffered_fixture() -> Fixture {
     let f = Fixture::with_codec(AudioCodec::BufferedAac, |p, info| {
         p.head_unit_profile = "mercedes_mbux".into();
         p.mbux_media_compat = true;
+        p.audio_codec = "auto".into();
         *info = Value::dict(vec![("audioFormats", Value::array(vec![Value::dict(vec![
             ("type", Value::int(102)), ("audioType", Value::str("media")),
             ("audioOutputFormats", Value::int(1 << 23)),
@@ -377,6 +383,7 @@ async fn buffered_cleanup_retry_reply_stays_on_its_session_during_same_address_r
 async fn failed_buffered_playback_recovers_only_main_audio_with_aac_102() {
     let mut f = Fixture::with_codec(AudioCodec::BufferedAac, |params, info| {
         params.head_unit_profile = "bmw_id9".into();
+        params.audio_codec = "auto".into();
         *info = Value::dict(vec![("audioFormats", Value::array(vec![Value::dict(vec![
             ("type", Value::int(102)), ("audioType", Value::str("media")),
             ("audioOutputFormats", Value::int(1 << 23)),
@@ -389,6 +396,52 @@ async fn failed_buffered_playback_recovers_only_main_audio_with_aac_102() {
     f.setup_reply(&setup, &request).await;
     assert_eq!(f.commands.recv().await, Some("install"));
     assert_eq!(f.controller.media_stream_type(), Some(102));
+    f.stopped().await;
+}
+
+#[tokio::test]
+async fn failed_buffered_playback_uses_declared_pcm_when_no_aac_is_declared() {
+    let mut f = Fixture::with_codec(AudioCodec::BufferedAac, |params, _| {
+        params.audio_codec = "auto".into();
+    }).await;
+    f.input.buffered_failed.notify_one();
+    let (teardown, _) = f.request("teardown:103").await;
+    assert!(f.commands.try_recv().is_err());
+    f.ack(&teardown, None).await;
+    let (setup, offer) = f.request("setup:100:media").await;
+    assert!(f.commands.try_recv().is_err());
+    f.setup_reply(&setup, &offer).await;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), f.commands.recv()).await.unwrap(), Some("install"));
+    assert_eq!(f.controller.media_stream_type(), Some(100));
+    assert!(tokio::time::timeout(Duration::from_millis(60), f.peer.read_u8()).await.is_err(), "fallback must not send another RECORD");
+    f.stopped().await;
+}
+
+#[cfg(target_os="android")]
+#[tokio::test]
+async fn failed_buffered_playback_tries_preferred_aac_then_accepts_untyped_pcm_for_detected_diplay() {
+    let media_format = |kind, bits| Value::dict(vec![
+        ("type", Value::int(kind)), ("audioType", Value::str("media")),
+        ("audioOutputFormats", Value::int(bits)),
+    ]);
+    let mut f = Fixture::with_codec(AudioCodec::BufferedAac, |params, info| {
+        params.audio_codec = "aac".into();
+        assert!(!params.desktop_receiver, "software receiver should be detected from /info only");
+        *info = Value::dict(vec![
+            ("name", Value::str("DiPlay")),
+            ("audioFormats", Value::array(vec![media_format(100, 1 << 15), media_format(102, 1 << 23)])),
+        ]);
+    }).await;
+    f.input.buffered_failed.notify_one();
+    let (teardown, _) = f.request("teardown:103").await;
+    f.ack(&teardown, None).await;
+    let (aac, _) = f.request("setup:102:media").await;
+    f.reject(&aac, 400).await;
+    let (pcm, offer) = f.request("setup:100:media").await;
+    f.setup_reply_with_type(&pcm, &offer, false).await;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), f.commands.recv()).await.unwrap(), Some("install"));
+    assert_eq!(f.controller.media_stream_type(), Some(100));
+    assert!(tokio::time::timeout(Duration::from_millis(60), f.peer.read_u8()).await.is_err(), "fallback must not send another RECORD");
     f.stopped().await;
 }
 

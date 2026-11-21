@@ -255,23 +255,25 @@ impl Session {
             }
         }
         *self.media_codec.lock() = None;
-        for codec in [AudioCodec::Aac, AudioCodec::Aac441] {
+        if stopped() { return; }
+        let desktop = crate::airplay::effective_desktop(&self.params, &self.info);
+        for codec in crate::airplay::buffered_fallback_candidates(&self.params, &self.info).await {
             if stopped() { return; }
-            if !crate::airplay::declares_media(&self.info,codec) {continue;}
-            // A stop can race the receiver allocating 102 before we read its reply.
+            let stream_type = codec.stream_type();
+            // A stop can race the receiver allocating the stream before we read its reply.
             // Include that type in final TEARDOWN even if the recovery task is cancelled.
             *self.media_codec.lock() = Some(codec);
             if let Some(mut output) = crate::airplay::negotiate_audio(
-                &self.control,&self.factory,Some(&self.shared),&self.params,false,&self.info,codec
+                &self.control,&self.factory,Some(&self.shared),&self.params,desktop,&self.info,codec
             ).await {
                 if stopped() { return; }
                 output.set_ownership(self.resource.owned.clone());
-                crate::emit_log("BUFFERED-AUDIO: type103 retired; type102 fallback ready");
+                crate::emit_log(&format!("BUFFERED-AUDIO: type103 retired; type{stream_type} {codec:?} fallback ready"));
                 self.params.pipeline.lock().audio_ready = commands.send(MainCommand::Install(Some(output))).is_ok();
                 return;
             }
         }
-        crate::emit_log("BUFFERED-AUDIO: no usable type102 fallback; video and independent audio continue");
+        crate::emit_log("BUFFERED-AUDIO: no usable declared realtime fallback; video and independent audio continue");
     }
     async fn retire_media(&self)->Result<(),String> {
         let Some(codec)=*self.media_codec.lock() else {return Ok(());};
@@ -282,9 +284,10 @@ impl Session {
     }
     async fn restore_media(&self,commands:&mpsc::UnboundedSender<MainCommand>)->bool {
         let Some(codec)=*self.media_codec.lock() else {let _=commands.send(MainCommand::Install(None));return true;};
+        let desktop = crate::airplay::effective_desktop(&self.params, &self.info);
         for attempt in 0..2 {
             if attempt>0 {tokio::time::sleep(Duration::from_millis(100)).await;}
-            let output=crate::airplay::negotiate_audio(&self.control,&self.factory,Some(&self.shared),&self.params,self.params.desktop_receiver,&self.info,codec).await;
+            let output=crate::airplay::negotiate_audio(&self.control,&self.factory,Some(&self.shared),&self.params,desktop,&self.info,codec).await;
             if let Some(mut output)=output {
                 output.set_ownership(self.resource.owned.clone());
                 crate::emit_log(&format!("AUX-AUDIO: media restored attempt={} owner_phone={}",attempt+1,self.resource.owned.load(Ordering::Acquire)));

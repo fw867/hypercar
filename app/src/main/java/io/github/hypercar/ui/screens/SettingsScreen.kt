@@ -1,4 +1,4 @@
-﻿@file:Suppress("DEPRECATION")   // 平台 API / 旧图标名已废弃但当前无替代，统一在此抑制
+@file:Suppress("DEPRECATION")   // 平台 API / 旧图标名已废弃但当前无替代，统一在此抑制
 package io.github.hypercar.ui.screens
 
 import androidx.activity.compose.BackHandler
@@ -63,7 +63,9 @@ import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.content.pm.PackageManager
 import androidx.core.content.ContextCompat
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
@@ -74,8 +76,10 @@ import kotlinx.coroutines.launch
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.hypercar.perm.AppPermissions
 import io.github.hypercar.session.HyperCarRepo
+import io.github.hypercar.settings.SettingsRevision
 import io.github.hypercar.settings.SettingsStore
 import io.github.hypercar.shizuku.ShizukuState
 import io.github.hypercar.shizuku.ShizukuTools
@@ -105,7 +109,8 @@ private enum class SettingsPage(val title: String) {
     Display("画面与声音"),
     Permissions("权限与后台"),
     Advanced("高级设置"),
-    Appearance("主题与外观");
+    Appearance("主题与外观"),
+    Developer("开发者菜单");
 
     val parent: SettingsPage get() = Main
 }
@@ -119,7 +124,10 @@ fun SettingsScreen(
     linkConnected: Boolean = false,
 ) {
     var pageName by rememberSaveable { mutableStateOf(SettingsPage.Main.name) }
-    val page = SettingsPage.entries.firstOrNull { it.name == pageName } ?: SettingsPage.Main
+    val developerMode = remember(SettingsRevision.value) { SettingsStore.developerModeEnabled }
+    val showDeveloperMenu = remember(SettingsRevision.value) { SettingsStore.developerMenuVisible }
+    val page = SettingsPage.entries.firstOrNull { it.name == pageName }
+        ?.takeUnless { it == SettingsPage.Developer && !showDeveloperMenu } ?: SettingsPage.Main
     fun open(destination: SettingsPage) { pageName = destination.name }
     BackHandler(enabled = page != SettingsPage.Main) { open(page.parent) }
 
@@ -151,6 +159,10 @@ fun SettingsScreen(
                             SettingsMenuItem("权限与后台", "系统权限、后台运行与 Shizuku 授权") { open(SettingsPage.Permissions) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
                             SettingsMenuItem("高级设置", "手动蓝牙地址与清除全部配对身份") { open(SettingsPage.Advanced) }
+                            if (showDeveloperMenu) {
+                                HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+                                SettingsMenuItem("开发者菜单", "连接诊断工具") { open(SettingsPage.Developer) }
+                            }
                         }
                     }
                     SettingsPage.Car -> {
@@ -173,10 +185,128 @@ fun SettingsScreen(
                     SettingsPage.Advanced -> {
                         IdentitySection()
                         ResetPairingSection()
+                        if (developerMode) DeveloperModeSection(showDeveloperMenu)
                     }
+                    SettingsPage.Developer -> DeveloperMenuSection()
                 }
                 Spacer(Modifier.height(8.dp))
             }
+        }
+    }
+}
+
+@Composable
+private fun DeveloperModeSection(menuVisible: Boolean) {
+    SectionLabel("开发者模式")
+    GlassPanel(contentPadding = PaddingValues(16.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("显示开发者菜单", color = TextPrimary, style = MaterialTheme.typography.bodyLarge)
+                Text("在设置首页显示开发者菜单", color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+            }
+            Switch(checked = menuVisible, onCheckedChange = {
+                if (!it) HyperCarRepo.disarmBmwCaffExperiment()
+                SettingsStore.developerMenuVisible = it
+            })
+        }
+    }
+}
+
+@Composable
+private fun DeveloperMenuSection() {
+    val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboardManager.current
+    var copying by remember { mutableStateOf(false) }
+    var experimentResult by rememberSaveable { mutableStateOf<String?>(null) }
+    var sending by remember { mutableStateOf(false) }
+    var result by rememberSaveable { mutableStateOf<String?>(null) }
+    val armedTarget by HyperCarRepo.armedBmwCaffExperiment.collectAsStateWithLifecycle()
+    var armError by remember { mutableStateOf<String?>(null) }
+    var dialing by remember { mutableStateOf(false) }
+    var dialResult by rememberSaveable { mutableStateOf<String?>(null) }
+    SectionLabel("车机发现诊断")
+    GlassPanel(contentPadding = PaddingValues(16.dp)) {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("等待车机邀请时，手动补发当前服务的通告。不重新注册服务，也不更换端口。",
+                color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+            CapsuleButton(if (sending) "发送中…" else "重发 mDNS 通告", enabled = !sending && !dialing, onClick = send@{
+                if (sending || dialing) return@send
+                sending = true
+                result = null
+                scope.launch {
+                    try {
+                        result = HyperCarRepo.resendCtrlMdnsAnnouncement()
+                    } finally {
+                        sending = false
+                    }
+                }
+            })
+            result?.let { Text(it, color = TextPrimary, style = MaterialTheme.typography.bodySmall) }
+        }
+    }
+    SectionLabel("宝马 iD8.5 主动拨号实验")
+    GlassPanel(contentPadding = PaddingValues(16.dp)) {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("显示菜单不改变正常连接。准备实验后，在首页手动发起的新一轮才会暂停自动 …caff，自动上车和自动重连不受影响。",
+                color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+            CapsuleButton(if (armedTarget != null) "取消准备" else "准备下一轮手动实验", enabled = !dialing && !sending, onClick = {
+                dialResult = null
+                armError = if (armedTarget == null) HyperCarRepo.armBmwCaffExperiment() else {
+                    HyperCarRepo.disarmBmwCaffExperiment()
+                    null
+                }
+            })
+            if (armedTarget != null) {
+                Text("已准备：到首页手动发起连接；隐藏菜单会取消尚未开始的实验。",
+                    color = TextPrimary, style = MaterialTheme.typography.bodySmall)
+            }
+            armError?.let { Text(it, color = TextPrimary, style = MaterialTheme.typography.bodySmall) }
+            Text("实验开始后，可以先重发 mDNS。重发与拨号不能同时进行；车机邀请已应答但仍在等 Wi-Fi 地址确认时，不拨号，也不消耗机会。只有目标车机的经典蓝牙仍在线时才能拨号，本轮最多一次。离开本页不会中断已经开始的拨号，可在诊断日志查看结果。",
+                color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+            CapsuleButton(if (dialing) "探测中…" else "主动拨号 …caff", enabled = !dialing && !sending, onClick = dial@{
+                if (dialing || sending) return@dial
+                dialing = true
+                dialResult = null
+                scope.launch {
+                    try {
+                        dialResult = HyperCarRepo.dialBmwCaffManually()
+                    } finally {
+                        dialing = false
+                    }
+                }
+            })
+            dialResult?.let { Text(it, color = TextPrimary, style = MaterialTheme.typography.bodySmall) }
+        }
+    }
+    SectionLabel("连接实验")
+    GlassPanel(contentPadding = PaddingValues(16.dp)) {
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("刷卡解锁后和点旧设备 CarPlay 前分别打点。打开诊断日志记录后，打点会写入导出的日志。",
+                color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+            CapsuleButton("已刷卡", onClick = {
+                experimentResult = HyperCarRepo.markConnectionExperiment(HyperCarRepo.ExperimentMarker.CARD_UNLOCKED)
+            })
+            CapsuleButton("即将点旧设备 CarPlay", onClick = {
+                experimentResult = HyperCarRepo.markConnectionExperiment(HyperCarRepo.ExperimentMarker.ABOUT_TO_SELECT_CARPLAY)
+            })
+            CapsuleButton("复制本轮连接快照", enabled = !copying, onClick = copy@{
+                if (copying) return@copy
+                copying = true
+                scope.launch {
+                    try {
+                        val snapshot = HyperCarRepo.latestConnectionSnapshot()
+                        experimentResult = if (snapshot == null) {
+                            "暂无连接快照，请先发起一次连接"
+                        } else {
+                            clipboard.setText(AnnotatedString(snapshot))
+                            "已复制本轮连接快照"
+                        }
+                    } finally {
+                        copying = false
+                    }
+                }
+            })
+            experimentResult?.let { Text(it, color = TextPrimary, style = MaterialTheme.typography.bodySmall) }
         }
     }
 }
@@ -1475,7 +1605,7 @@ private fun HeadUnitSection(connected: Boolean = false) {
                                         text = buildString {
                                             append(profile.model)
                                             if (io.github.hypercar.headunit.RemoteProfiles.isRemote(profile.id)) append(" · 远程")
-                                            if (!profile.verified) append(" · 未实测")
+                                            if (!profile.verified) append(" · 待实车复核")
                                         },
                                         style = MaterialTheme.typography.labelSmall,
                                         color = TextSecondary,
@@ -1611,7 +1741,7 @@ fun CarSourceSection(
                 Spacer(Modifier.height(8.dp))
                 Text(when {
                     connected -> "断开连接后可切换画面来源。"
-                    current == "carwith" -> "CarWith 的画面尺寸请在系统 CarWith 页面设置。"
+                    current == "carwith" -> "CarWith 画面按车机屏幕自动换算并按需拉伸，源画面最高 2560×2560，无需手动设置。"
                     !startup.shizukuReady -> "自绘 UI 需先在「权限与后台」完成 Shizuku 授权。"
                     else -> "自绘 UI 使用下方显示设置。"
                 }, color = TextSecondary, style = MaterialTheme.typography.bodySmall)
@@ -1671,7 +1801,7 @@ fun CarSourceSection(
             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
             Spacer(Modifier.height(16.dp))
             Text("CarWith 模式", color = TextPrimary, style = MaterialTheme.typography.titleSmall)
-            Text(if (startup.carWithInstalled) "已检测到系统 CarWith，无需 Shizuku。画面尺寸请在 CarWith 中设置。"
+            Text(if (startup.carWithInstalled) "已检测到系统 CarWith，无需 Shizuku。未授权 Shizuku 时，入网或蓝牙可发现可能需要按系统提示确认。"
                 else "未检测到可用的系统 CarWith（com.miui.carlink），当前设备无法选择此模式。",
                 color = if (startup.carWithInstalled) TextSecondary else AmberWarning,
                 style = MaterialTheme.typography.bodySmall)

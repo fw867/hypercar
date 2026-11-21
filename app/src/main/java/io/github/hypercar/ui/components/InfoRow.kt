@@ -16,15 +16,24 @@ import io.github.hypercar.ui.theme.TextPrimary
 import io.github.hypercar.ui.theme.TextSecondary
 
 /**
- * 「标签 — 值」行：左侧次级色标签、右侧主色值；传 [onClick] 时整行可点且值变强调色。
+ * 「标签 — 值」行：左侧次级色标签、右侧主色值；传 [onClick] 时整行可点；[emphasizeClick] 控制强调色和点击反馈。
  * 设置页与关于页共用。
  */
 @Composable
-fun InfoRow(label: String, value: String, onClick: (() -> Unit)? = null) {
+fun InfoRow(
+    label: String,
+    value: String,
+    emphasizeClick: Boolean = true,
+    onClick: (() -> Unit)? = null,
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+            .then(when {
+                onClick == null -> Modifier
+                emphasizeClick -> Modifier.clickable(onClick = onClick)
+                else -> Modifier.clickable(interactionSource = null, indication = null, onClick = onClick)
+            })
             .heightIn(min = 36.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -37,7 +46,7 @@ fun InfoRow(label: String, value: String, onClick: (() -> Unit)? = null) {
         Text(
             text = value,
             style = MaterialTheme.typography.bodySmall,
-            color = if (onClick != null) ElectricCyan else TextPrimary,
+            color = if (onClick != null && emphasizeClick) ElectricCyan else TextPrimary,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )

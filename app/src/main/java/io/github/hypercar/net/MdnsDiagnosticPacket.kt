@@ -3,8 +3,46 @@ package io.github.hypercar.net
 import java.net.InetAddress
 
 /** Read-only DNS metadata. Never publishes a partial/malformed datagram or arbitrary TXT values. */
-internal data class MdnsDiagnosticPacket(val response: Boolean, val details: List<String>) {
+internal data class MdnsDiagnosticPacket(
+    val response: Boolean,
+    val details: List<String>,
+    val announcement: Announcement? = null,
+    val ctrlQuestion: Boolean = false,
+) {
+    data class Announcement(val instance: String, val host: String, val port: Int, val txt: Set<String>, val addresses: Set<InetAddress>) {
+        fun matches(name: String, port: Int, mac: String, version: String, linkAddresses: Set<InetAddress>): Boolean =
+            instance == "${name.lowercase()}.$CTRL" && this.port == port &&
+                txt == setOf("id=${mac.lowercase()}", "srcvers=$version") && linkAddresses.containsAll(addresses)
+    }
+
+    private data class Record(val owner: String, val type: Int, val ttl: Long, val target: String? = null,
+        val port: Int = 0, val txt: Set<String> = emptySet(), val address: InetAddress? = null)
+
     companion object {
+        private const val CTRL = "_carplay-ctrl._tcp.local"
+        private const val SERVICES = "_services._dns-sd._udp.local"
+
+        private fun completeAnnouncement(records: List<Record>): Announcement? {
+            if (records.any { it.ttl == 0L }) return null
+            val ptr = records.singleOrNull { it.type == 12 && it.owner == CTRL } ?: return null
+            val instance = ptr.target?.takeIf { it.endsWith(".$CTRL") } ?: return null
+            val srv = records.singleOrNull { it.type == 33 && it.owner == instance && it.port != 0 } ?: return null
+            val host = srv.target?.takeIf { it.endsWith(".local") } ?: return null
+            val txt = records.singleOrNull { it.type == 16 && it.owner == instance && it.txt.size == 2 } ?: return null
+            val addresses = records.filter { it.owner == host }.mapNotNull { it.address }.toSet()
+            if (addresses.isEmpty() || records.any {
+                when (it.type) {
+                    1, 28 -> it.owner != host
+                    12 -> it != ptr && !(it.owner == SERVICES && it.target == CTRL)
+                    16 -> it != txt
+                    33 -> it != srv
+                    47 -> it.owner !in setOf(host, instance)
+                    else -> true
+                }
+            }) return null
+            return Announcement(instance, host, srv.port, txt.txt, addresses)
+        }
+
         fun decode(bytes: ByteArray): MdnsDiagnosticPacket? = runCatching {
             require(bytes.size in 12..9000)
             fun u16(i: Int): Int {
@@ -42,9 +80,13 @@ internal data class MdnsDiagnosticPacket(val response: Boolean, val details: Lis
             require(questions <= 64 && records <= 128)
             var pos = 12
             val details = mutableListOf<String>()
+            var ctrlQuestion = false
+            val replayRecords = if (flags == 0x8400 && u16(0) == 0 && questions == 0 && answers > 0 && authorityEnd == answers)
+                mutableListOf<Record>() else null
             repeat(questions) {
                 val (owner, end) = name(pos); pos = end
                 val type = u16(pos); val cls = u16(pos + 2); pos += 4
+                if (!response && cls and 0x7fff == 1 && (owner == CTRL || owner.endsWith(".$CTRL"))) ctrlQuestion = true
                 if (cls and 0x7fff == 1 && (service(owner) || owner == "_services._dns-sd._udp.local" ||
                         (type in listOf(1, 28, 255) && owner.endsWith(".local"))))
                     details += "Q section=question name=$owner type=$type QU=${cls and 0x8000 != 0}"
@@ -61,35 +103,50 @@ internal data class MdnsDiagnosticPacket(val response: Boolean, val details: Lis
                 val ttl = (u16(pos + 4).toLong() shl 16) or u16(pos + 6).toLong()
                 val n = u16(pos + 8); val start = pos + 10; pos = start + n
                 require(pos <= bytes.size)
-                if (cls and 0x7fff != 1) return@repeat
+                if (cls and 0x7fff != 1) {
+                    replayRecords?.add(Record(owner, -1, ttl))
+                    return@repeat
+                }
+                var replay = Record(owner, type, ttl)
                 val value: String? = when (type) {
                     12 -> {
-                        val (target, next) = name(start); require(next <= pos)
+                        val (target, next) = name(start); require(next == pos)
+                        replay = replay.copy(target = target)
                         if (service(owner) || service(target)) "target=$target" else null
                     }
                     33 -> {
                         require(n >= 7)
-                        val (target, next) = name(start + 6); require(next <= pos)
+                        val (target, next) = name(start + 6); require(next == pos)
+                        replay = replay.copy(target = target, port = u16(start + 4))
                         if (service(owner)) "port=${u16(start + 4)} host=$target" else null
                     }
                     16 -> {
-                        var i = start; val allowed = mutableListOf<String>()
+                        var i = start
+                        val allowed = mutableListOf<String>()
+                        var count = 0
                         while (i < pos) {
                             val len = bytes[i++].toInt() and 255; require(i + len <= pos)
                             val txt = String(bytes, i, len, Charsets.UTF_8); i += len
+                            count++
                             if (txt.substringBefore('=').lowercase() in listOf("id", "srcvers")) allowed += safe(txt)
                         }
+                        // Do not retain unknown TXT fields or replay packets that contain any.
+                        replay = replay.copy(txt = allowed.map { it.lowercase() }.toSet().takeIf { it.size == count }.orEmpty())
                         if (service(owner)) "txt=[${allowed.joinToString(",")}]" else null
                     }
                     1, 28 -> {
                         require(n == if (type == 1) 4 else 16)
-                        if (owner.endsWith(".local")) "address=${InetAddress.getByAddress(bytes.copyOfRange(start, pos)).hostAddress}" else null
+                        val address = InetAddress.getByAddress(bytes.copyOfRange(start, pos))
+                        replay = replay.copy(address = address)
+                        if (owner.endsWith(".local")) "address=${address.hostAddress}" else null
                     }
                     else -> null
                 }
+                replayRecords?.add(replay)
                 if (value != null) details += "RR section=$section name=$owner type=$type ttl=$ttl flush=${cls and 0x8000 != 0} $value"
             }
-            MdnsDiagnosticPacket(response, details)
+            val announcement = replayRecords?.takeIf { pos == bytes.size }?.let(::completeAnnouncement)
+            MdnsDiagnosticPacket(response, details, announcement, ctrlQuestion)
         }.getOrNull()
     }
 }

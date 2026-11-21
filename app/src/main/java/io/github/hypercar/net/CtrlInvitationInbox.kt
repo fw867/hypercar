@@ -17,7 +17,8 @@ internal class CtrlInvitationInbox<N : Any, A : Any, V : Any>(private val publis
     private var sequence = 0L
     private var published = 0L
     private val waiting = mutableMapOf<A, Candidate<V>>()
-    val awaitingConfirmation: Boolean get() = waiting.isNotEmpty()
+    @Volatile var awaitingConfirmation: Boolean = false
+        private set
 
     fun select(network: N?): Epoch<N>? {
         if (current?.network == network) return current
@@ -26,6 +27,7 @@ internal class CtrlInvitationInbox<N : Any, A : Any, V : Any>(private val publis
         advertised = false
         localAddresses = emptySet()
         waiting.clear()
+        awaitingConfirmation = false
         latest.set(null)
         return current
     }
@@ -37,6 +39,7 @@ internal class CtrlInvitationInbox<N : Any, A : Any, V : Any>(private val publis
         if (current !== receipt.epoch || receipt.sequence <= published) return
         val previous = waiting[local]
         if (previous != null && previous.sequence >= receipt.sequence) return
+        awaitingConfirmation = true
         waiting[local] = Candidate(receipt.sequence, value)
         flush(receipt.epoch)
     }
@@ -59,6 +62,7 @@ internal class CtrlInvitationInbox<N : Any, A : Any, V : Any>(private val publis
         published = next.sequence
         waiting.entries.removeAll { it.value.sequence <= published }
         latest.set(next.value)
+        awaitingConfirmation = waiting.isNotEmpty()
         publish(epoch, next.value)
     }
 }

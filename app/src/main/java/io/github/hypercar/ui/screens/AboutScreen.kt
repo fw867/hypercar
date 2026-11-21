@@ -2,6 +2,8 @@ package io.github.hypercar.ui.screens
 
 import android.content.Intent
 import android.net.Uri
+import android.os.SystemClock
+import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -23,7 +25,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -36,6 +42,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.hypercar.R
+import io.github.hypercar.settings.SettingsStore
 import io.github.hypercar.ui.components.CapsuleButton
 import io.github.hypercar.ui.components.GlassPanel
 import io.github.hypercar.ui.components.InfoRow
@@ -60,6 +67,8 @@ fun AboutScreen(modifier: Modifier = Modifier) {
     val scope = rememberCoroutineScope()
     val state by UpdateCenter.state.collectAsStateWithLifecycle()
     val checking = state is UpdateUiState.Checking
+    var versionTaps by remember { mutableIntStateOf(0) }
+    var lastVersionTap by remember { mutableLongStateOf(0L) }
 
     Column(
         modifier = modifier
@@ -105,7 +114,18 @@ fun AboutScreen(modifier: Modifier = Modifier) {
             SectionLabel(text = "版本")
             GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
                 InfoRow(label = "当前版本", value = UpdateCenter.currentVersion)
-                InfoRow(label = "versionCode", value = UpdateCenter.currentBuild.toString())
+                InfoRow("versionCode", UpdateCenter.currentBuild.toString(), emphasizeClick = false) {
+                    if (!SettingsStore.developerModeEnabled) {
+                        val now = SystemClock.uptimeMillis()
+                        if (now - lastVersionTap > 2_000L) versionTaps = 0
+                        lastVersionTap = now
+                        versionTaps++
+                        if (versionTaps == 10) {
+                            SettingsStore.enableDeveloperMode()
+                            Toast.makeText(context, "开发者模式已开启", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
                 InfoRow(label = "核心层", value = "Rust · arm64-v8a")
             }
         }

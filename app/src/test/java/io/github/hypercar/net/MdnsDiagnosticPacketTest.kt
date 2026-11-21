@@ -31,6 +31,11 @@ class MdnsDiagnosticPacketTest {
             body = name("_carplay-ctrl._tcp.local") + byteArrayOf(0, 12, 0x80.toByte(), 1))
         val decoded = MdnsDiagnosticPacket.decode(p)!!
         assertFalse(decoded.response)
+        assertTrue(decoded.ctrlQuestion)
+        val airplay = packet(flags = 0, questions = 1,
+            body = name("_airplay._tcp.local") + byteArrayOf(0, 12, 0, 1))
+        assertFalse(MdnsDiagnosticPacket.decode(airplay)!!.ctrlQuestion)
+        assertFalse(MdnsDiagnosticPacket.decode(p.copyOf().apply { this[2] = 0x84.toByte() })!!.ctrlQuestion)
         assertTrue(decoded.details.single().startsWith("Q section=question "))
         assertTrue(decoded.details.any { it.contains("_carplay-ctrl._tcp.local") && it.contains("QU=true") })
     }
@@ -93,6 +98,33 @@ class MdnsDiagnosticPacketTest {
         assertNull(MdnsDiagnosticPacket.decode(packet(questions = 1, body = byteArrayOf(0xc0.toByte(), 12, 0, 12, 0, 1))))
         val valid = packet(answers = 1, body = good)
         for (n in 0 until valid.size) assertNull("truncation at $n", MdnsDiagnosticPacket.decode(valid.copyOf(n)))
+    }
+
+    @Test fun onlyCompleteCurrentPositiveTtlAnnouncementIsReplayable() {
+        val service = name("_carplay-ctrl._tcp.local")
+        val owner = name("phone._carplay-ctrl._tcp.local")
+        val host = name("phone.local")
+        val ptr = rr(service, 12, owner)
+        val srv = rr(owner, 33, byteArrayOf(0, 0, 0, 0, 0x83.toByte(), 0xd5.toByte()) + host)
+        val mac = "84:AE:DE:56:D3:76"
+        val version = "770.8.1"
+        val txt = listOf("id=$mac", "srcvers=$version").flatMap { listOf(it.length.toByte()) + it.toByteArray().toList() }.toByteArray()
+        val body = ptr + srv + rr(owner, 16, txt)
+        val ip = byteArrayOf(10, 0, 0, 1)
+        val addr = rr(host, 1, ip)
+        val addresses = setOf(java.net.InetAddress.getByAddress(ip))
+        val decoded = MdnsDiagnosticPacket.decode(packet(answers = 3, additional = 1, body = body + addr))!!
+        val announcement = decoded.announcement!!
+        assertEquals("phone.local", announcement.host)
+        assertTrue(announcement.matches("Phone", 33749, mac, version, addresses))
+        assertFalse(announcement.matches("Phone", 33750, mac, version, addresses))
+        assertFalse(announcement.matches("Phone", 33749, mac, version, emptySet()))
+        for (p in listOf(
+            packet(flags = 0, answers = 4, body = body + addr),
+            packet(answers = 3, body = body),
+            packet(answers = 4, body = body + rr(host, 1, ip, ttl = 0)),
+            packet(answers = 5, body = body + addr + rr(name("other.local"), 1, ip)),
+        )) assertNull(MdnsDiagnosticPacket.decode(p)?.announcement)
     }
 
     @Test fun retainsIpv4AndIpv6AndSkipsUnrelatedTxt() {
