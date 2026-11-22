@@ -27,6 +27,7 @@ use crate::{emit_log, emit_state};
 /// Rust 需要新 socket 时回调 Kotlin（必须绑定车机网络，否则流量走手机）。
 pub trait SocketProvider: Send + Sync {
     fn open_tcp(&self, host: &str, port: u16, timeout_ms: u32) -> Option<TcpStream>;
+    // Port zero binds an ephemeral local port without connecting to a remote port.
     fn open_udp(&self, host: &str, port: u16) -> Option<UdpSocket>;
     fn bind_timing_network(&self, _socket: &std::net::UdpSocket) -> std::io::Result<()> {
         Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "timing network binding unavailable"))
@@ -1137,7 +1138,7 @@ mod shutdown_tests {
             fn open_udp(&self, host: &str, port: u16) -> Option<UdpSocket> {
                 self.udp_opens.fetch_add(1, Ordering::Relaxed);
                 let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-                udp.connect((host, port)).unwrap();
+                if port != 0 { udp.connect((host, port)).unwrap(); }
                 udp.set_nonblocking(true).unwrap();
                 Some(UdpSocket::from_std(udp).unwrap())
             }
@@ -1283,8 +1284,10 @@ mod shutdown_tests {
                 let fallback = read_request(&mut peer).await;
                 assert_eq!(fallback.first_line, format!("SETUP {audio_uri} RTSP/1.0"));
                 let root = bplist::parse(&fallback.body).unwrap();
-                assert_eq!(root.get("streams").unwrap().as_array().unwrap()[0].get("type"),Some(&Value::int(102)));
-                wire_ids.send(root.get("streams").unwrap().as_array().unwrap()[0].get("streamConnectionID").unwrap().as_int().unwrap()).unwrap();
+                let stream = &root.get("streams").unwrap().as_array().unwrap()[0];
+                assert_eq!(stream.get("type"), Some(&Value::int(102)));
+                assert_ne!(port_of(stream.get("controlPort")), 0);
+                wire_ids.send(stream.get("streamConnectionID").unwrap().as_int().unwrap()).unwrap();
                 reply(&mut peer,&fallback,200,streams(vec![("type",Value::int(102)),("dataPort",Value::int(i64::from(port)))])).await;
             });
             record_session(&channel).await.unwrap();
@@ -1334,7 +1337,7 @@ mod shutdown_tests {
                 }
             }
             assert_eq!(net.tcp_opens.load(Ordering::Relaxed), usize::from(!matches!(failure,"setup"|"wrong_stream")));
-            assert_eq!(net.udp_opens.load(Ordering::Relaxed), usize::from(!stays_buffered));
+            assert_eq!(net.udp_opens.load(Ordering::Relaxed), 2 * usize::from(!stays_buffered));
             server.await.unwrap();
         }
     }
@@ -1626,7 +1629,7 @@ mod id9_tests {
     fn buffered_setup_sends_the_stream_key_and_realtime_aac_does_not() {
         let id = 42;
         let key = stream_key(&[9; 32], id as u64);
-        let buffered = bplist::parse(&build_audio_setup_request(id, 250, AudioCodec::BufferedAac, Some(&key))).unwrap();
+        let buffered = bplist::parse(&build_audio_setup_request(id, 250, AudioCodec::BufferedAac, Some(&key), None)).unwrap();
         let stream = &buffered.get("streams").unwrap().as_array().unwrap()[0];
         assert_eq!(stream.get("shk").and_then(Value::as_bytes), Some(key.as_slice()));
         assert_eq!(stream.get("ct").and_then(Value::as_int), Some(4));
@@ -2196,9 +2199,41 @@ mod display_size_tests {
         fn open_tcp(&self, _: &str, _: u16, _: u32) -> Option<TcpStream> { None }
         fn open_udp(&self, host: &str, port: u16) -> Option<UdpSocket> {
             let socket = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
-            socket.connect((host, port)).ok()?;
+            if port != 0 { socket.connect((host, port)).ok()?; }
             socket.set_nonblocking(true).ok()?;
             UdpSocket::from_std(socket).ok()
+        }
+    }
+
+    #[tokio::test]
+    async fn realtime_media_advertises_its_actual_control_listener() {
+        let factory = LocalSockets;
+        let car = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let car_addr = car.local_addr().unwrap();
+        for (codec, expected) in [
+            (AudioCodec::Aac, true),
+            (AudioCodec::Aac441, true),
+            (AudioCodec::Pcm, true),
+            (AudioCodec::Pcm441, true),
+            (AudioCodec::BufferedAac, false),
+        ] {
+            let control = bind_main_audio_control(&factory, "127.0.0.1", codec);
+            let port = control.as_ref().map(|s| s.local_addr().unwrap().port());
+            let body = bplist::parse(&build_audio_setup_request(42, 300, codec, None, port)).unwrap();
+            let stream = &body.get("streams").unwrap().as_array().unwrap()[0];
+            assert_eq!(stream.get("controlPort").and_then(Value::as_int), port.map(i64::from));
+            assert_eq!(control.is_some(), expected, "{codec:?}");
+            if let Some(socket) = control {
+                let local = socket.local_addr().unwrap();
+                socket.connect(car_addr).await.unwrap();
+                car.send_to(&[0x80, 0xd5, 0, 1, 0, 2, 0, 1], local).await.unwrap();
+                let mut packet = [0u8; 8];
+                let size = tokio::time::timeout(Duration::from_secs(1), socket.recv(&mut packet)).await.unwrap().unwrap();
+                assert_eq!(&packet[..size], &[0x80, 0xd5, 0, 1, 0, 2, 0, 1]);
+                socket.send(&[0x80, 0xd4]).await.unwrap();
+                let (_, source) = car.recv_from(&mut packet).await.unwrap();
+                assert_eq!(source.port(), port.unwrap());
+            }
         }
     }
 
@@ -2832,11 +2867,22 @@ fn media_latency_ms(info: &Value, codec: AudioCodec) -> i64 {
     declared_micros.map_or(floor_ms, |micros| (micros / 1000).max(floor_ms))
 }
 
+#[cfg(test)]
 fn build_audio_setup_for_codec(conn_id: i64, latency_ms: i64, codec: AudioCodec) -> Vec<u8> {
-    build_audio_setup_request(conn_id, latency_ms, codec, None)
+    build_audio_setup_request(conn_id, latency_ms, codec, None, None)
 }
 
-fn build_audio_setup_request(conn_id: i64, latency_ms: i64, codec: AudioCodec, shk: Option<&[u8; 32]>) -> Vec<u8> {
+fn bind_main_audio_control(factory: &dyn SocketProvider, host: &str, codec: AudioCodec) -> Option<UdpSocket> {
+    if !matches!(codec.stream_type(), 100 | 102) { return None; }
+    let socket = factory.open_udp(host, 0).filter(|socket|
+        socket.local_addr().is_ok_and(|addr| addr.port() != 0));
+    if socket.is_none() {
+        emit_log(&format!("AUDIO-RTCP: type={} local bind failed; using existing SETUP", codec.stream_type()));
+    }
+    socket
+}
+
+fn build_audio_setup_request(conn_id: i64, latency_ms: i64, codec: AudioCodec, shk: Option<&[u8; 32]>, control_port: Option<u16>) -> Vec<u8> {
     let mut stream = vec![
         ("type", Value::int(codec.stream_type())),
         ("streamConnectionID", Value::int(conn_id)),
@@ -2849,6 +2895,7 @@ fn build_audio_setup_request(conn_id: i64, latency_ms: i64, codec: AudioCodec, s
     ];
     // Leave the validated PCM proposal unchanged. AAC explicitly describes compression/rate.
     if matches!(codec.stream_type(),102|103) { stream.extend([("ct",Value::int(4)),("sr",Value::int(codec.rate() as i64))]); }
+    if let Some(port) = control_port { stream.push(("controlPort", Value::int(i64::from(port)))); }
     // DiPlay decrypts type 103 with this key directly and drops the stream when it is absent.
     if let Some(key) = shk { stream.push(("shk", Value::Data(key.to_vec()))); }
     bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(stream)]))]))
@@ -2908,7 +2955,7 @@ async fn negotiate_buffered_audio(channel: &Arc<RtspChannel>, factory: &Arc<dyn 
     let id = random_positive_i64();
     let latency_ms = media_latency_ms(info, codec);
     let key = stream_key(shared, id as u64);
-    let request = build_audio_setup_request(id, latency_ms, codec, Some(&key));
+    let request = build_audio_setup_request(id, latency_ms, codec, Some(&key), None);
     emit_log(&format!("BUFFERED-AUDIO: type103 SETUP latencyMs={latency_ms} shk_bytes={}", key.len()));
     let started = Instant::now();
     channel.buffered_cleanup_pending.store(true, Ordering::Release);
@@ -2938,7 +2985,8 @@ async fn negotiate_buffered_audio(channel: &Arc<RtspChannel>, factory: &Arc<dyn 
         control.probe_anchor_for_profile(allow_id9_setrate, desktop).await.map_err(|e| format!("GETANCHOR preflight: {e}"))?;
         let control_mode = control.control_mode();
         let mut out = AudioOut::new_buffered_aac(data, key, encoder, control, buffer_bytes);
-        out.observe_main_stream(channel.trace_id(), id, 0, reply.received_at);
+        out.offload_aac(&channel.buffered_ownership).map_err(|error| format!("AAC worker: {error}"))?;
+        out.observe_main_stream(channel.trace_id(), id, 0, reply.received_at, &channel.buffered_ownership, None);
         emit_log(&format!("BUFFERED-AUDIO: type103 SETUP accepted rtsp_ms={setup_ms} tcp_port={data_port} tcp_ms={connect_ms} audioBufferSize={buffer_bytes} control_mode={control_mode} elapsed_ms={} playback_unconfirmed",
             started.elapsed().as_millis()));
         Ok(out)
@@ -3000,26 +3048,29 @@ pub(crate) async fn negotiate_realtime_audio(
     } else { None };
     let conn_id = random_positive_i64();
     let latency_ms = media_latency_ms(info, codec);
-    let body = build_audio_setup_for_codec(conn_id, latency_ms, codec);
+    let mut local_control = bind_main_audio_control(factory.as_ref(), &p.car_ip, codec);
+    let advertised_port = local_control.as_ref().and_then(|socket| socket.local_addr().ok()).map(|addr| addr.port());
+    if let Some(port) = advertised_port {
+        emit_log(&format!("AUDIO-RTCP: RTSP#{} type={} streamConnectionID={conn_id} SETUP advertisedControlPort={port}", channel.trace_id(), codec.stream_type()));
+    }
     emit_log(&format!("AUDIO: SETUP {codec:?} {}Hz stereo SPF{} desktop={desktop} latencyMs={latency_ms}", codec.rate(), codec.spf()));
     // 音频 SETUP 必须用**绝对 URI**（cardeck runAudioStream 同款：`rtsp://host:port/`）；
     // 屏幕流与初始 SETUP 才用相对路径。URI 用反会 400/404。
     let audio_uri = crate::rtsp_uri::audio_uri(&p.car_ip, p.airplay_port);
-    let resp = match channel
-        .request(
-            "SETUP",
-            &audio_uri,
-            &body,
-            "application/x-apple-binary-plist",
-            &[],
-            Duration::from_secs(8),
-        )
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            emit_log(&format!("AIRPLAY: 音频 SETUP 失败 - {e}"));
-            return None;
+    let mut offer_port = advertised_port;
+    let resp = loop {
+        let body = build_audio_setup_request(conn_id, latency_ms, codec, None, offer_port);
+        match channel.request("SETUP", &audio_uri, &body, "application/x-apple-binary-plist", &[], Duration::from_secs(8)).await {
+            Ok(reply) if codec.stream_type() == 100 && offer_port.is_some() && matches!(reply.status(), 400 | 451 | 461) => {
+                emit_log(&format!("AUDIO-RTCP: type=100 controlPort SETUP rejected status={}; retrying PCM without a local port", reply.status()));
+                offer_port = None;
+                local_control = None;
+            }
+            Ok(reply) => break reply,
+            Err(error) => {
+                emit_log(&format!("AIRPLAY: 音频 SETUP 失败 - {error}"));
+                return None;
+            }
         }
     };
     if resp.status() != 200 {
@@ -3060,7 +3111,32 @@ pub(crate) async fn negotiate_realtime_audio(
             }
         };
         let udp = factory.open_udp(&p.car_ip, data_port)?;
-        let sync = if control_port != 0 {
+        let mut listening = None;
+        let sync = if let Some(socket) = local_control {
+            match udp.peer_addr() {
+                Ok(peer) if control_port == 0 => {
+                    emit_log(&format!("AUDIO-RTCP: RTSP#{} type={} streamConnectionID={conn_id} advertisedControlPort={offer_port:?} peer returned no controlPort", channel.trace_id(), codec.stream_type()));
+                    listening = Some((socket, peer.ip()));
+                    None
+                }
+                Ok(mut peer) => {
+                    // Preserve the resolved address family and any IPv6 scope from the data socket.
+                    peer.set_port(control_port);
+                    match socket.connect(peer).await {
+                        Ok(()) => Some(socket),
+                        Err(error) => {
+                            emit_log(&format!("AUDIO-RTCP: RTSP#{} type={} streamConnectionID={conn_id} advertisedControlPort={offer_port:?} peerControlPort={control_port} connect failed: {error}", channel.trace_id(), codec.stream_type()));
+                            listening = Some((socket, peer.ip()));
+                            None
+                        }
+                    }
+                }
+                Err(error) => {
+                    emit_log(&format!("AUDIO-RTCP: RTSP#{} streamConnectionID={conn_id} missing data socket peer: {error}", channel.trace_id()));
+                    None
+                }
+            }
+        } else if control_port != 0 {
             factory.open_udp(&p.car_ip, control_port)
         } else {
             None
@@ -3069,7 +3145,11 @@ pub(crate) async fn negotiate_realtime_audio(
             "AIRPLAY: ✓ 音频流就绪 data={data_port} control={control_port}（{codec:?} {}Hz/SPF{}）", codec.rate(), codec.spf()
         ));
         let mut out = match encoder { Some(encoder) => AudioOut::new_aac(udp, sync, key, encoder), None => AudioOut::new_pcm(udp, sync, key, codec.rate()) };
-        out.observe_main_stream(channel.trace_id(), conn_id, control_port, resp.received_at);
+        if let Err(error) = out.offload_aac(&channel.buffered_ownership) {
+            emit_log(&format!("AUDIO: AAC worker unavailable: {error}"));
+            return None;
+        }
+        out.observe_main_stream(channel.trace_id(), conn_id, control_port, resp.received_at, &channel.buffered_ownership, listening);
         if p.head_unit_profile == "bmw_id9" {
             out.observe_id9_resume(channel.audio_unborrow_generation.clone());
         }

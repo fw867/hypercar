@@ -17,9 +17,21 @@
 
 `audioLatencyMs` 下限仅对 type103 设为 1000 ms，给支持该参数的接收端留出抗短时无线抖动的余量。实时主媒体 type100/102 下限为 300 ms；接收端声明更大的对应输出延迟时，仍采用声明值。增大缓冲不是抗干扰或断线重连机制，也可能增加听感延迟；道闸、地库等场景需实测。
 
+`AUDIO-PACING` 每个统计窗口记录各阶段最长的一次，格式为 `起始单调纳秒,结束单调纳秒,Android线程ID`。`wake` 对应节拍期限到音频任务实际执行，`pcmDispatch` 对应 PCM 到达至音频任务取出，`pcmEnqueue` 含重采样、入队和淘汰旧帧，`mix` 是混音，`aac` 是编码调用，`udp` 是主音频 RTP 的非阻塞 socket 写入。`NA` 表示窗口内未执行该阶段。各阶段最大值可以来自不同时刻。若调度轨迹用 BOOTTIME，按 `clockAnchorMonoBootNs` 中的 `bootNs - monoNs` 将日志时间换算到轨迹时钟，再按线程 ID 核对。
+
+主音频泵使用专用线程 `hypercar-audio`，AAC 编码交给 `hypercar-aac`。编码输入和完成队列各有八项上限，实时 AAC 每个混音节拍最多发一个已完成的 AU。编码输入队列满时累计 `aac_queue_dropped_frames` 并推进采样时钟，音频资源转交后淘汰上一次授权的输入和结果。测试时可用 `AUDIO-THREAD` 和 `AUDIO-PACING` 的线程 ID 核对混音、发包与编码是否已分开。
+
+实时 PCM/type100 和 AAC/type102 在只漏一个 352 帧节拍、且媒体队列同时有补拍和当前拍时，最多追回一个块并保留原 RTP 采样位置。补拍以原节拍起算，最长允许 60 ms。这是发送端的保守期限，车机可有自己的播放截止时间。AAC 结果用提交时的采样位置，含过期补拍的整个 1024 帧 AU 会丢弃，后续 AU 仍使用各自原有时间戳。日志 `recovered_source_frames` 统计从 PCM 队列纳入恢复的帧，`expired_media_frames` 和 `expired_aac_frames` 分别统计淘汰的 PCM 和已编码 AAC 帧。
+
+`AUDIO-PACING` 的 `firstMediaMonoNs` 标记当前流首次有媒体 PCM 在混音队列中的时间。此前的漏拍记入 `startup_silence_recoveries`、`startup_silence_skipped_frames` 和 `startup_max_late_us`。此后的漏拍继续用 `recoveries`、`skipped_source_frames` 和 `max_late_us`，即使播放中途队列变空。`wake` 仍保留整个统计窗口的原始唤醒峰值。
+
 设置「画面与声音 → 音频格式」提供自动、PCM、AAC优先，下次连接生效。自动保持旧车型的PCM48k首选；ID9只尝试/info明确声明的媒体输出格式，PCM48不可用但声明AAC48时用AAC。AAC优先只在type102/media/output声明AAC48时尝试，否则保留可用PCM路径；仅AAC44的车机本次仍不支持。DiPlay已实测AAC协商成功、约47包/秒，用户确认出声；不等于ID9实车验证。参考[CarPToCarL](https://github.com/jjuugk/CarPToCarL)的AAC裸帧和RTP约定，编码/发送实现位于Rust核心。
 
 AirPlay PCM 使用 SPF352，约 136.36 包/秒，16-bit 大端样本。TTS 参与闪避混音；持续全零样本不会一直保持“播放中”。
+
+实时主媒体 PCM/type100 和 AAC/type102 在 SETUP 前于会话网络绑定 UDP 端口，并写入 `streams[].controlPort`。车机返回控制端口后，沿用同一个 socket 收 RTCP 和发同步包。车机省略控制端口时，仍保留通告的监听端口，只接收来自本轮数据端点 IP 的请求，回包发往请求源端口。PCM SETUP 遇到 400、451 或 461 时去掉本地端口重试一次。对照日志按 `streamConnectionID` 核对 `advertisedControlPort`、`localPort` 和 `peerControlPort`。支持 8 字节和附带 NTP 时间戳的 16 字节 `0xD5`，长度字段分别为 1 和 3。Apple 接收端参考代码的主动重传路径在 MainHighAudio/type102。PCM/type100 是否会请求补发，仍取决于车机实现。
+
+HyperCar 收到有效 `0xD5` 后，以 16 位 RTP 序号查找本流最近 500 ms 内成功发出的包，最多保留 PCM 72 包或 AAC 32 包。命中时回 `0xD6`，4 字节头后附上原 RTP 数据（含密文、认证标签及原 nonce）；未命中时按盒子 `xiap2` 的 `_audioReceiveRTCP`（0x40500）回八字节的未命中响应，携带原序号。头部长度使用盒子的小端字节数。每请求最多处理 16 个序号，每秒最多尝试回复 32 次。只有当前会话和当前音频授权的有效缓存会用于补发。`AUDIO-RTCP` 的 `d6Sent` 统计实际补发，`d6FutileSent` 统计短回应，两者均不计入正常发包率和码率。
 
 571音频节拍：绝对周期不变，漏拍时跳过已过期的352帧时段，丢弃混音队列中对应旧样本并推进RTP时间戳；不再Burst集中追发。恢复首包置marker并重新发送时间同步，包序号及AEAD nonce不重置。AAC保留编码器半帧和重采样相位，避免每次漏拍同步重建编码器导致持续饥饿；音频资源被接管时仍按原策略清理编码器。`AUDIO-PACING`每5秒累计报告恢复次数、跳过源帧数、丢弃队列帧数和最大延迟。该策略修复本地突发补拍，不表示已消除车机端网络抖动或UDP丢包。
 

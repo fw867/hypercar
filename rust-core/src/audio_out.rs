@@ -27,6 +27,7 @@
 
 use crate::crypto::{chacha_seal, nonce64};
 mod buffered;
+mod aac_worker;
 #[cfg(all(test, target_os = "android"))]
 pub(crate) use buffered::tests::{accept_start, control_pair};
 use crate::timing::ntp_be;
@@ -140,6 +141,7 @@ pub struct AudioOut {
     sync: Option<std::sync::Arc<UdpSocket>>,
     control_observer: Option<crate::audio_diagnostics::ControlObserver>,
     pub(crate) pacing_id: Option<crate::audio_pacing::StreamId>,
+    pub(crate) io_costs: Option<crate::audio_pacing::AudioIoCosts>,
     resume_trace: Option<AudioResumeTrace>,
     /** 流密钥（pair-verify 派生，32 字节）。 */
     key: [u8; 32],
@@ -162,6 +164,11 @@ pub struct AudioOut {
     ownership: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     blocked_samples: u64,
     aac: Option<crate::aac::AacEncoder>,
+    aac_worker: Option<aac_worker::AacWorker>,
+    aac_input_ts: u32,
+    pub(crate) expired_aac_frames: u64,
+    pub(crate) expired_pcm_frames: u64,
+    pub(crate) aac_queue_dropped_frames: u64,
     opus: Option<crate::opus_encode::OpusEncoder>,
     aac_needs_reset: bool,
     sample_rate: u32,
@@ -184,6 +191,7 @@ impl AudioOut {
             sync: sync.map(std::sync::Arc::new),
             control_observer: None,
             pacing_id: None,
+            io_costs: None,
             resume_trace: None,
             key: stream_key,
             seq: 0,
@@ -198,6 +206,11 @@ impl AudioOut {
             ownership: None,
             blocked_samples: 0,
             aac: None,
+            aac_worker: None,
+            aac_input_ts: 0,
+            expired_aac_frames: 0,
+            expired_pcm_frames: 0,
+            aac_queue_dropped_frames: 0,
             opus: None,
             aac_needs_reset: false,
             sample_rate: 48000,
@@ -229,18 +242,34 @@ impl AudioOut {
         let mut output=Self::new(data,sync,key,stream_type);
         output.sample_rate=encoder.sample_rate();output.opus=Some(encoder);Ok(output)
     }
-    pub(crate) fn observe_main_stream(&mut self, rtsp: u64, stream_id: i64, peer_port: u16, setup_accepted_at: std::time::Instant) {
+    pub(crate) fn offload_aac(&mut self, ownership: &crate::buffered_ownership::BufferedOwnership) -> std::io::Result<()> {
+        if let Some(encoder) = self.aac.take() {
+            self.aac_input_ts = self.ts;
+            self.aac_worker = Some(aac_worker::AacWorker::start(encoder, ownership.subscribe())?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn observe_main_stream(&mut self, rtsp: u64, stream_id: i64, peer_port: u16,
+        setup_accepted_at: std::time::Instant, ownership: &crate::buffered_ownership::BufferedOwnership,
+        listening: Option<(UdpSocket, std::net::IpAddr)>) {
         self.pacing_id = Some(crate::audio_pacing::StreamId { rtsp, stream_id, setup_accepted_at });
         let label = format!("RTSP#{rtsp} type={} streamConnectionID={stream_id} negotiatedHz={}", self.pt, self.sample_rate);
         if self.pt == 103 {
             crate::emit_log(&format!("AUDIO-RTCP: {label} observation inapplicable transport=TCP"));
             return;
         }
-        match &self.sync {
-            Some(socket) => {
-                self.control_observer = Some(crate::audio_diagnostics::ControlObserver::start(socket.clone(), label));
+        if !matches!(self.pt, 100 | 102) { return; }
+        match (&self.sync, listening) {
+            (Some(socket), _) => {
+                self.control_observer = Some(crate::audio_diagnostics::ControlObserver::start(
+                    socket.clone(), label, ownership.subscribe(), self.pt == 100, None));
             }
-            None => {
+            (None, Some((socket, peer))) => {
+                self.control_observer = Some(crate::audio_diagnostics::ControlObserver::start(
+                    Arc::new(socket), label, ownership.subscribe(), self.pt == 100, Some(peer)));
+            }
+            (None, None) => {
                 let reason = if peer_port == 0 { "no_control_port" } else { "socket_unavailable" };
                 crate::emit_log(&format!("AUDIO-RTCP: {label} observation unavailable reason={reason} peerControlPort={peer_port}"));
             }
@@ -296,8 +325,14 @@ impl AudioOut {
 
     /// Retire elapsed source time without sending late packets. Sequence and AEAD nonce
     /// count transmitted attempts only; the sample clock advances across the discontinuity.
-    pub(crate) fn skip_source_frames(&mut self, source_frames: u64) {
-        if source_frames == 0 { return; }
+    /// Returns whether the wire timestamp moved immediately. Offloaded AAC
+    /// keeps in-flight AUs on their original clock and moves only its input cursor.
+    pub(crate) fn skip_source_frames(&mut self, source_frames: u64) -> bool {
+        if source_frames == 0 { return false; }
+        if self.aac_worker.is_some() {
+            self.aac_input_ts = self.aac_input_ts.wrapping_add(source_frames as u32);
+            return false;
+        }
         // Independent Opus takes 48 kHz input. Main media takes mixer frames at its RTP rate.
         let frames = if self.opus.is_some() {
             (u128::from(source_frames) * u128::from(self.sample_rate) / 48_000) as u32
@@ -307,6 +342,7 @@ impl AudioOut {
         // Retain the codec's partial frame. stop/create/start here
         // can itself miss the next deadline and repeatedly starve AAC before 1024 frames.
         // Expired PCM is retired in the mix queues; no elapsed ticks enter this encoder.
+        true
     }
 
     pub async fn send_pcm(&mut self, frames: &[i16]) -> std::io::Result<()> {
@@ -314,6 +350,11 @@ impl AudioOut {
     }
 
     pub async fn send_pcm_for_generation(&mut self, frames: &[i16], expected_generation: Option<u64>) -> std::io::Result<()> {
+        self.send_pcm_recovering(frames, expected_generation, None).await
+    }
+
+    pub(crate) async fn send_pcm_recovering(&mut self, mut frames: &[i16], expected_generation: Option<u64>,
+        recover_until: Option<std::time::Instant>) -> std::io::Result<()> {
         let mut fresh = true;
         if let AudioTransport::Buffered(link) = &mut self.transport {
             let generation = link.generation().ok_or_else(buffered::closed)?;
@@ -330,6 +371,9 @@ impl AudioOut {
             if let Some(encoder)=self.opus.as_mut() { encoder.reset()?; }
             return Ok(());
         }
+        if self.aac_worker.is_some() {
+            return self.pump_encoded_aac(frames, expected_generation, recover_until).await;
+        }
         if let Some(encoder)=self.opus.as_mut() {
             let sample_frames=encoder.samples_per_packet() as u32;
             let encoded=encoder.encode(frames)?;
@@ -339,28 +383,24 @@ impl AudioOut {
                 self.aac_needs_reset = false;
                 self.aac = Some(crate::aac::AacEncoder::at_rate(self.sample_rate)?);
             }
-            let encoded = self.aac.as_mut().ok_or_else(|| std::io::Error::other("AAC encoder stopped"))?.encode(frames);
+            let encoder = self.aac.as_mut().ok_or_else(|| std::io::Error::other("AAC encoder stopped"))?;
+            let started = self.io_costs.as_ref().map(|_| crate::timing::monotonic_nanos());
+            let encoded = encoder.encode(frames);
+            if let (Some(costs), Some(started)) = (&mut self.io_costs, started) {
+                costs.aac.observe(crate::audio_pacing::StageSpan::since(started));
+            }
             let encoded = match encoded { Ok(frames) => frames, Err(error) => { self.aac.take(); return Err(error); } };
             for payload in encoded {
-                if let AudioTransport::Buffered(link) = &mut self.transport {
-                    let generation = expected_generation.ok_or_else(buffered::closed)?;
-                    if !link.send(&self.key, &payload, self.ts, self.sample_rate, generation).await? {
-                        // A full receiver buffer can suppress a write during priming.
-                        // Only an ownership change invalidates remaining codec input.
-                        if link.generation() != Some(generation) {
-                            self.aac.take();
-                            self.aac_needs_reset = true;
-                            break;
-                        }
-                    }
-                    // Suppressed priming AUs still occupied this interval on the
-                    // source timeline. Wire sequence and nonce count only writes.
-                    self.ts = self.ts.wrapping_add(crate::aac::FRAMES as u32);
-                } else {
-                    self.send_payload(&payload, crate::aac::FRAMES as u32).await?;
-                }
+                if !self.write_aac_frame(&payload, expected_generation).await? { break; }
             }
         } else {
+            if frames.len() >= SAMPLES_PER_PACKET * CHANNELS
+                && recover_until.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                self.expired_pcm_frames += SAMPLES_PER_PACKET as u64;
+                self.skip_source_frames(SAMPLES_PER_PACKET as u64);
+                frames = &frames[SAMPLES_PER_PACKET * CHANNELS..];
+            }
             for chunk in frames.chunks_exact(SAMPLES_PER_PACKET * CHANNELS) {
                 let mut payload = Vec::with_capacity(chunk.len() * 2);
                 for sample in chunk { payload.extend_from_slice(&sample.to_be_bytes()); }
@@ -368,6 +408,67 @@ impl AudioOut {
             }
         }
         Ok(())
+    }
+
+    async fn pump_encoded_aac(&mut self, frames: &[i16], expected_generation: Option<u64>,
+        recover_until: Option<std::time::Instant>) -> std::io::Result<()> {
+        let Some(generation) = self.aac_worker.as_ref().unwrap().generation() else { return Ok(()); };
+        for _ in 0..aac_worker::QUEUED_BLOCKS {
+            let Some(output) = self.aac_worker.as_ref().unwrap().try_output()? else { break; };
+            if output.generation != generation { continue; }
+            if self.aac_worker.as_ref().unwrap().generation() != Some(generation) { return Ok(()); }
+            if let Some(costs) = self.io_costs.as_mut() { costs.aac.observe(output.encode_span); }
+            if let Some(payload) = output.payload? {
+                if let Some(timing) = output.timing {
+                    if timing.recover_until.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                        self.expired_aac_frames += crate::aac::FRAMES as u64;
+                        continue;
+                    }
+                    if timing.ts != self.ts {
+                        self.ts = timing.ts;
+                        self.marker_pending = true;
+                        if self.pt == 102 {
+                            let _ = self.send_sync_now(crate::timing::monotonic_nanos()).await;
+                        }
+                    }
+                }
+                if self.aac_worker.as_ref().unwrap().generation() != Some(generation)
+                    || !self.write_aac_frame(&payload, expected_generation).await? { return Ok(()); }
+                // At most one realtime AU per mixer tick even if MediaCodec
+                // returns a batch. The buffered TCP stream can drain the batch.
+                if self.pt == 102 { break; }
+            }
+        }
+        if frames.is_empty() { return Ok(()); }
+        let frames_count = (frames.len() / CHANNELS) as u32;
+        let timing = aac_worker::AacTiming {
+            ts: self.aac_input_ts,
+            recover_until: if self.pt == 102 { recover_until } else { None },
+        };
+        let accepted = self.aac_worker.as_ref().unwrap().submit(generation, frames, timing)?;
+        self.aac_input_ts = self.aac_input_ts.wrapping_add(frames_count);
+        if !accepted {
+            self.aac_queue_dropped_frames = self.aac_queue_dropped_frames.saturating_add(u64::from(frames_count));
+        }
+        Ok(())
+    }
+
+    async fn write_aac_frame(&mut self, payload: &[u8], expected_generation: Option<u64>) -> std::io::Result<bool> {
+        if let AudioTransport::Buffered(link) = &mut self.transport {
+            let generation = expected_generation.ok_or_else(buffered::closed)?;
+            if !link.send(&self.key, payload, self.ts, self.sample_rate, generation).await?
+                && link.generation() != Some(generation)
+            {
+                self.aac.take();
+                self.aac_needs_reset = true;
+                return Ok(false);
+            }
+            // Priming can suppress a packet. The AU still occupies source time.
+            self.ts = self.ts.wrapping_add(crate::aac::FRAMES as u32);
+        } else {
+            self.send_payload(payload, crate::aac::FRAMES as u32).await?;
+        }
+        Ok(true)
     }
 
     async fn send_payload(&mut self, payload: &[u8], sample_frames: u32) -> std::io::Result<()> {
@@ -399,7 +500,13 @@ impl AudioOut {
             return Err(std::io::Error::other("UDP payload on a buffered stream"));
         };
         let generation = self.resume_trace.as_ref().map(AudioResumeTrace::generation);
-        if let Err(error) = socket2::SockRef::from(udp).send_with_flags(&wire, libc::MSG_DONTWAIT) {
+        let resend_generation = self.control_observer.as_ref().and_then(|observer| observer.generation());
+        let started = self.io_costs.as_ref().map(|_| crate::timing::monotonic_nanos());
+        let sent = socket2::SockRef::from(udp).send_with_flags(&wire, libc::MSG_DONTWAIT);
+        if let (Some(costs), Some(started)) = (&mut self.io_costs, started) {
+            costs.udp.observe(crate::audio_pacing::StageSpan::since(started));
+        }
+        if let Err(error) = sent {
             if error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == Some(libc::ENOBUFS) {
                 self.congestion_drops = self.congestion_drops.saturating_add(1);
                 return Ok(());
@@ -407,6 +514,9 @@ impl AudioOut {
             return Err(error);
         }
         self.payload_bytes = self.payload_bytes.saturating_add(payload.len() as u64);
+        if let (Some(observer), Some(generation)) = (&self.control_observer, resend_generation) {
+            observer.remember_sent(rtp.seq, generation, wire);
+        }
         if self.packets == 0 && self.pt == 102 {
             crate::emit_log(&format!("AUDIO: first AAC RTP type=102 SPF=1024 raw_bytes={}", payload.len()));
         }
@@ -538,6 +648,63 @@ fn build_sync_packet_for_frames(seq: u16, rtp_ts: u32, ntp_nanos: u64, sample_fr
 mod ownership_tests {
     use super::*;
     use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+
+    #[tokio::test]
+    async fn buffered_aac_queue_full_preserves_pending_packet_timestamps() {
+        use std::{sync::mpsc, time::Duration};
+        use tokio::{io::AsyncReadExt, net::TcpListener, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut receiver, _) = listener.accept().await.unwrap();
+        let (control, channel, peer) = control_pair(48000).await;
+        let control_peer = tokio::spawn(accept_start(peer));
+        let transport = buffered::BufferedTransport::new(data, control, 100_000);
+        let mut sender = AudioOut::with_transport(AudioTransport::Buffered(transport), None, [7; 32], 103);
+        let (started, begun) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let mut first = true;
+        sender.aac_worker = Some(aac_worker::AacWorker::spawn(channel.buffered_ownership.subscribe(), move |_, pcm| {
+            if std::mem::take(&mut first) {
+                started.send(()).unwrap();
+                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            Ok(pcm.chunks_exact(crate::aac::FRAMES * CHANNELS).map(|_| vec![42]).collect())
+        }).unwrap());
+
+        let block = [1; crate::aac::FRAMES * CHANNELS];
+        sender.send_pcm(&block).await.unwrap();
+        begun.recv_timeout(Duration::from_secs(2)).unwrap();
+        for _ in 0..aac_worker::QUEUED_BLOCKS {
+            sender.send_pcm(&block).await.unwrap();
+        }
+        sender.send_pcm(&block).await.unwrap();
+        assert_eq!(sender.aac_queue_dropped_frames, crate::aac::FRAMES as u64);
+        assert_eq!(sender.ts, 0);
+        release.send(()).unwrap();
+
+        let queued = aac_worker::QUEUED_BLOCKS + 1;
+        timeout(Duration::from_secs(2), async {
+            while sender.packets_sent() < queued as u64 {
+                sender.send_pcm(&[]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            sender.send_pcm(&block).await.unwrap();
+            while sender.packets_sent() < (queued + 1) as u64 {
+                sender.send_pcm(&[]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            for index in (0..queued).chain(std::iter::once(queued + 1)) {
+                let len = receiver.read_u16().await.unwrap();
+                let mut record = vec![0; usize::from(len) - 2];
+                receiver.read_exact(&mut record).await.unwrap();
+                let ts = u32::from_be_bytes(record[4..8].try_into().unwrap());
+                assert_eq!(ts, (index * crate::aac::FRAMES) as u32);
+            }
+            control_peer.await.unwrap();
+        }).await.unwrap();
+    }
+
     #[tokio::test]
     async fn missed_pcm_time_is_skipped_without_sending_or_reusing_nonce() {
         let receiver=UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -575,6 +742,70 @@ mod ownership_tests {
             assert!(sender.marker_pending);
         });
     }
+    #[tokio::test]
+    async fn pcm_recovers_only_fresh_block_without_changing_its_rtp_timestamp() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(peer.local_addr().unwrap()).await.unwrap();
+        let mut out = AudioOut::new_pcm(socket, None, [1; 32], 48000);
+        let pcm = [42; SAMPLES_PER_PACKET * CHANNELS * 2];
+        let now = std::time::Instant::now();
+        out.send_pcm_recovering(&pcm, None, Some(now + std::time::Duration::from_secs(1))).await.unwrap();
+        out.send_pcm_recovering(&pcm, None, Some(now)).await.unwrap();
+        let mut buf = [0; 2048];
+        for (seq, expected) in [0u32, 352, 1056].into_iter().enumerate() {
+            let size = tokio::time::timeout(std::time::Duration::from_secs(1), peer.recv(&mut buf)).await.unwrap().unwrap();
+            assert!(size >= 12);
+            assert_eq!(u16::from_be_bytes(buf[2..4].try_into().unwrap()), seq as u16);
+            assert_eq!(u32::from_be_bytes(buf[4..8].try_into().unwrap()), expected);
+        }
+        assert_eq!(out.packets_sent(), 3);
+        assert_eq!(out.expired_pcm_frames, 352);
+    }
+
+    #[tokio::test]
+    async fn aac_d5_replays_cached_encrypted_rtp_in_order_across_sequence_wrap() {
+        use crate::buffered_ownership::BufferedOwnership;
+        let data_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let control_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let data = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sync = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let control_addr = sync.local_addr().unwrap();
+        data.connect(data_peer.local_addr().unwrap()).await.unwrap();
+        sync.connect(control_peer.local_addr().unwrap()).await.unwrap();
+        let ownership = BufferedOwnership::default();
+        ownership.publish(true);
+        let mut audio = AudioOut::new(data, Some(sync), [7; 32], 102);
+        audio.seq = u16::MAX;
+        audio.observe_main_stream(9, 23, control_peer.local_addr().unwrap().port(), std::time::Instant::now(), &ownership, None);
+
+        let mut packet = [0u8; 256];
+        let mut originals = Vec::new();
+        for payload in [&[1, 2, 3][..], &[4, 5, 6, 7][..]] {
+            audio.send_payload(payload, 1024).await.unwrap();
+            let n = data_peer.recv(&mut packet).await.unwrap();
+            originals.push(packet[..n].to_vec());
+        }
+        control_peer.send_to(&[0x80, 0xd5, 0, 1, 0xff, 0xff, 0, 3], control_addr).await.unwrap();
+        for original in &originals {
+            let (n, source) = tokio::time::timeout(std::time::Duration::from_secs(1),
+                control_peer.recv_from(&mut packet)).await.unwrap().unwrap();
+            assert_eq!(source, control_addr);
+            assert_eq!(&packet[..2], &[0x80, 0xd6]);
+            assert_eq!(&packet[2..4], &(original.len() as u16).to_le_bytes());
+            assert_eq!(&packet[4..n], original);
+        }
+        assert_eq!((audio.seq, audio.ts, audio.nonce, audio.packets_sent()), (1, 2048, 2, 2));
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), control_peer.recv(&mut packet)).await.unwrap().unwrap();
+        assert_eq!(&packet[..n], &[0x80, 0xd6, 4, 0, 0, 1, 0, 0]);
+
+        ownership.publish(false);
+        ownership.publish(true);
+        control_peer.send_to(&[0x80, 0xd5, 0, 1, 0xff, 0xff, 0, 1], control_addr).await.unwrap();
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), control_peer.recv(&mut packet)).await.unwrap().unwrap();
+        assert_eq!(&packet[..n], &[0x80, 0xd6, 4, 0, 0xff, 0xff, 0, 0]);
+    }
+
     #[tokio::test]
     async fn aac_rtp_preserves_raw_payload_and_advances_1024_with_unique_nonces() {
         let receiver=UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -660,6 +891,39 @@ mod ownership_tests {
         assert!(sender.marker_pending);
     }
     #[tokio::test]
+    async fn pcm_sync_and_d5_use_the_same_control_socket() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = receiver.local_addr().unwrap();
+        let data = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sync = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        data.connect(peer).await.unwrap();
+        sync.connect(peer).await.unwrap();
+        let sync_local = sync.local_addr().unwrap();
+        let mut audio = AudioOut::new_pcm(data, Some(sync), [0; 32], 48000);
+        let ownership = crate::buffered_ownership::BufferedOwnership::default();
+        ownership.publish(true);
+        audio.observe_main_stream(9, 23, peer.port(), std::time::Instant::now(), &ownership, None);
+        assert!(audio.control_observer.is_some());
+        assert!(audio.pacing_id.is_some());
+        audio.send_sync_now(1_000_000_000).await.unwrap();
+        let mut packet = [0; 64];
+        let (len, source) = receiver.recv_from(&mut packet).await.unwrap();
+        assert!(len > 2);
+        assert_eq!(packet[1] & 0x7f, 84);
+        assert_eq!(source, sync_local);
+        audio.send_pcm(&[23; SAMPLES_PER_PACKET * CHANNELS]).await.unwrap();
+        let mut media = [0u8; 1600];
+        let len = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv(&mut media)).await.unwrap().unwrap();
+        let seq = [media[2], media[3]];
+        receiver.send_to(&[0x80, 0xd5, 0, 1, seq[0], seq[1], 0, 1], sync_local).await.unwrap();
+        let mut resent = [0u8; 1600];
+        let (n, from) = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv_from(&mut resent)).await.unwrap().unwrap();
+        assert_eq!(from, sync_local);
+        assert_eq!(&resent[..4], &[0x80, 0xd6, len as u8, (len >> 8) as u8]);
+        assert_eq!(&resent[4..n], &media[..len]);
+    }
+
+    #[tokio::test]
     async fn id9_resume_tracks_actual_rtp_and_sync_writes_on_the_same_stream() {
         use std::sync::atomic::AtomicU64;
         let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -672,7 +936,8 @@ mod ownership_tests {
         let unborrow = Arc::new(AtomicU64::new(0));
         let mut audio = AudioOut::new(socket, Some(sync), [0; 32], 102);
         audio.set_ownership(owner.clone());
-        audio.observe_main_stream(9, 23, 1, std::time::Instant::now());
+        audio.observe_main_stream(9, 23, 1, std::time::Instant::now(), &Default::default(), None);
+        assert!(audio.control_observer.is_some());
         audio.observe_id9_resume(unborrow.clone());
         audio.seq = u16::MAX - 1;
         audio.send_payload(&[1; 8], 1024).await.unwrap();
@@ -701,7 +966,7 @@ mod ownership_tests {
         }
         let new_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut replacement = AudioOut::new(new_socket, None, [0; 32], 102);
-        replacement.observe_main_stream(9, 24, 0, std::time::Instant::now());
+        replacement.observe_main_stream(9, 24, 0, std::time::Instant::now(), &Default::default(), None);
         replacement.observe_id9_resume(unborrow.clone());
         replacement.send_sync_now(3_000_000_000).await.unwrap();
         assert!(!replacement.resume_trace.as_ref().unwrap().first_rtp_pending);

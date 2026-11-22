@@ -62,9 +62,12 @@ impl MediaQueueTrace {
 pub(crate) struct PacingTrace {
     stream_id: Option<i64>,
     rtsp: Option<u64>,
-    pub recoveries: u64,
-    pub skipped: u64,
-    pub max_late_us: u128,
+    first_media_mono_ns: Option<u64>,
+    startup: MissedTicks,
+    playback: MissedTicks,
+    pub recovered: u64,
+    pub expired_media: u64,
+    pub expired_aac: u64,
     pub costs: WindowCosts,
     pub dropped: DroppedFrames,
     previous: DroppedFrames,
@@ -73,15 +76,99 @@ pub(crate) struct PacingTrace {
 }
 
 #[derive(Default)]
+struct MissedTicks {
+    recoveries: u64,
+    skipped: u64,
+    max_late_us: u128,
+}
+
+#[derive(Default)]
 pub(crate) struct WindowCosts {
     pub sync_us: u128,
     pub mix_us: u128,
     pub send_us: u128,
+    pub wake: StagePeak,
+    pub pcm_dispatch: StagePeak,
+    pub pcm_enqueue: StagePeak,
+    pub mix: StagePeak,
+    pub aac: StagePeak,
+    pub udp: StagePeak,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct StageSpan {
+    start_ns: u64,
+    end_ns: u64,
+    tid: i32,
+}
+
+impl StageSpan {
+    pub fn from_end(end_ns: u64, elapsed_ns: u128, tid: i32) -> Self {
+        Self { start_ns: end_ns.saturating_sub(u64::try_from(elapsed_ns).unwrap_or(u64::MAX)), end_ns, tid }
+    }
+
+    pub fn since(start_ns: u64) -> Self {
+        Self { start_ns, end_ns: crate::timing::monotonic_nanos().max(start_ns), tid: thread_id() }
+    }
+
+    pub fn duration_ns(self) -> u64 { self.end_ns - self.start_ns }
+}
+
+pub(crate) fn thread_id() -> i32 {
+    #[cfg(target_os = "android")]
+    { unsafe { libc::gettid() } }
+    #[cfg(not(target_os = "android"))]
+    { 0 }
+}
+
+#[derive(Default)]
+pub(crate) struct StagePeak(Option<StageSpan>);
+
+impl StagePeak {
+    pub fn observe(&mut self, span: StageSpan) {
+        if self.0.is_none_or(|previous| span.duration_ns() > previous.duration_ns()) {
+            self.0 = Some(span);
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        if let Some(span) = other.0 { self.observe(span); }
+    }
+}
+
+impl std::fmt::Display for StagePeak {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(span) => write!(f, "{},{},{}", span.start_ns, span.end_ns, span.tid),
+            None => f.write_str("NA"),
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct AudioIoCosts {
+    pub aac: StagePeak,
+    pub udp: StagePeak,
+}
+
+fn boot_clock_anchor() -> Option<(u64, u64)> {
+    #[cfg(target_os = "android")]
+    {
+        let before = crate::timing::monotonic_nanos();
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } != 0 { return None; }
+        let after = crate::timing::monotonic_nanos();
+        Some((before + after.saturating_sub(before) / 2, ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64))
+    }
+    #[cfg(not(target_os = "android"))]
+    { None }
 }
 
 impl PacingTrace {
     pub fn new() -> Self {
-        Self { stream_id: None, rtsp: None, recoveries: 0, skipped: 0, max_late_us: 0,
+        Self { stream_id: None, rtsp: None, first_media_mono_ns: None,
+            startup: MissedTicks::default(), playback: MissedTicks::default(),
+            recovered: 0, expired_media: 0, expired_aac: 0,
             costs: WindowCosts::default(), dropped: Default::default(), previous: Default::default(),
             last_report: Instant::now(), window_start_ns: crate::timing::monotonic_nanos() }
     }
@@ -92,9 +179,12 @@ impl PacingTrace {
         let tail = self.final_sample(now);
         self.rtsp = rtsp;
         self.stream_id = stream_id;
-        self.recoveries = 0;
-        self.skipped = 0;
-        self.max_late_us = 0;
+        self.first_media_mono_ns = None;
+        self.startup = MissedTicks::default();
+        self.playback = MissedTicks::default();
+        self.recovered = 0;
+        self.expired_media = 0;
+        self.expired_aac = 0;
         self.costs = WindowCosts::default();
         self.dropped = DroppedFrames::default();
         self.previous = DroppedFrames::default();
@@ -103,13 +193,25 @@ impl PacingTrace {
         tail
     }
 
+    pub fn note_media_queued(&mut self) {
+        self.first_media_mono_ns.get_or_insert_with(crate::timing::monotonic_nanos);
+    }
+
+    pub fn observe_tick(&mut self, missed: u64, skipped: u64, late: Duration) {
+        let counters = if self.first_media_mono_ns.is_some() { &mut self.playback } else { &mut self.startup };
+        counters.max_late_us = counters.max_late_us.max(late.as_micros());
+        counters.recoveries += u64::from(missed > 0);
+        counters.skipped = counters.skipped.saturating_add(skipped);
+    }
+
     pub fn periodic(&mut self) -> Option<String> {
         (self.last_report.elapsed() >= Duration::from_secs(5))
             .then(|| self.sample("periodic", crate::timing::monotonic_nanos()))
     }
 
     fn final_sample(&mut self, now: u64) -> Option<String> {
-        (self.stream_id.is_some() || self.recoveries > 0 || self.dropped != DroppedFrames::default())
+        (self.stream_id.is_some() || self.startup.recoveries > 0 || self.playback.recoveries > 0
+            || self.dropped != DroppedFrames::default())
             .then(|| self.sample("retired", now))
     }
 
@@ -123,16 +225,23 @@ impl PacingTrace {
         let media_delta = self.dropped.media - previous.media;
         let pre = self.dropped.media_pre_setup - previous.media_pre_setup;
         let post = self.dropped.media_post_setup - previous.media_post_setup;
+        let anchor = boot_clock_anchor().map_or_else(|| "NA".into(), |(mono, boot)| format!("{mono},{boot}"));
+        let first_media = self.first_media_mono_ns.map_or_else(|| "NA".into(), |ns| ns.to_string());
         self.last_report = Instant::now();
         format!(concat!("AUDIO-PACING: {} monoNs={} windowStartMonoNs={} reason={} recoveries={} ",
             "skipped_source_frames={} dropped_media_frames={} dropped_tts_frames={} dropped_voice_frames={} ",
+            "recovered_source_frames={} expired_media_frames={} expired_aac_frames={} ",
             "max_late_us={} dropped_media_frames_delta={} dropped_tts_frames_delta={} dropped_voice_frames_delta={} ",
             "media_pre_setup_delta={} media_post_setup_delta={} media_setup_unknown_delta={} ",
-            "window_max_sync_us={} window_max_mix_us={} window_max_send_us={}"),
-            label, now, start, reason, self.recoveries, self.skipped, self.dropped.media, self.dropped.tts,
-            self.dropped.voice, self.max_late_us, media_delta,
+            "window_max_sync_us={} window_max_mix_us={} window_max_send_us={} ",
+            "startup_silence_recoveries={} startup_silence_skipped_frames={} startup_max_late_us={} firstMediaMonoNs={} ",
+            "clockAnchorMonoBootNs={} wake={} pcmDispatch={} pcmEnqueue={} mix={} aac={} udp={}"),
+            label, now, start, reason, self.playback.recoveries, self.playback.skipped, self.dropped.media, self.dropped.tts,
+            self.dropped.voice, self.recovered, self.expired_media, self.expired_aac, self.playback.max_late_us, media_delta,
             self.dropped.tts - previous.tts, self.dropped.voice - previous.voice, pre, post, media_delta - pre - post,
-            costs.sync_us, costs.mix_us, costs.send_us)
+            costs.sync_us, costs.mix_us, costs.send_us, self.startup.recoveries, self.startup.skipped,
+            self.startup.max_late_us, first_media, anchor,
+            costs.wake, costs.pcm_dispatch, costs.pcm_enqueue, costs.mix, costs.aac, costs.udp)
     }
 }
 
@@ -143,6 +252,14 @@ impl Drop for PacingTrace {
 }
 
 fn period(rate: u32) -> Duration { Duration::from_nanos(352 * 1_000_000_000 / u64::from(rate)) }
+
+pub(crate) const RECOVERY_DEADLINE: Duration = Duration::from_millis(60);
+
+/// Preserve one missed block and the current block when both already exist.
+pub(crate) fn recoverable_source_frames(late: Duration, rate: u32, queued: usize) -> u64 {
+    let slot = period(rate);
+    if late >= slot && late < slot * 2 && queued >= 704 { 352 } else { 0 }
+}
 
 pub(crate) fn interval(rate: u32) -> tokio::time::Interval {
     let mut tick = tokio::time::interval(period(rate));
@@ -162,9 +279,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn startup_silence_is_counted_separately_and_resets_on_stream_replacement() {
+        let mut trace = PacingTrace::new();
+        trace.select_stream(Some(7), Some(8));
+        trace.observe_tick(352, 352, Duration::from_millis(11));
+        let startup = trace.sample("periodic", 20_000);
+        assert!(startup.contains("reason=periodic recoveries=0 skipped_source_frames=0 "));
+        assert!(startup.contains("startup_silence_recoveries=1 startup_silence_skipped_frames=352 startup_max_late_us=11000"));
+        assert!(startup.contains(" max_late_us=0 "));
+
+        trace.note_media_queued();
+        trace.observe_tick(352, 0, Duration::from_millis(8));
+        trace.observe_tick(704, 704, Duration::from_millis(18));
+        let retired = trace.select_stream(Some(7), Some(9)).unwrap();
+        assert!(retired.contains("reason=retired recoveries=2 skipped_source_frames=704 "));
+        assert!(retired.contains("startup_silence_recoveries=1 startup_silence_skipped_frames=352"));
+        assert!(retired.contains(" max_late_us=18000 "));
+
+        trace.observe_tick(352, 352, Duration::from_millis(9));
+        let replacement = trace.sample("periodic", 40_000);
+        assert!(replacement.contains("reason=periodic recoveries=0 skipped_source_frames=0 "));
+        assert!(replacement.contains("startup_silence_recoveries=1 startup_silence_skipped_frames=352 startup_max_late_us=9000"));
+    }
+
+    #[test]
+    fn short_recovery_requires_one_missed_slot_and_two_ready_blocks() {
+        let rate = 48_000;
+        let slot = period(rate);
+        assert_eq!(recoverable_source_frames(slot, rate, 704), 352);
+        assert_eq!(recoverable_source_frames(slot * 2 - Duration::from_nanos(1), rate, 704), 352);
+        for (late, queued) in [(slot - Duration::from_nanos(1), 704), (slot, 703), (slot * 2, 704), (slot * 5, 4096)] {
+            assert_eq!(recoverable_source_frames(late, rate, queued), 0);
+        }
+    }
+
+    #[test]
+    fn stage_peaks_keep_their_original_timestamp_and_reset_per_window() {
+        let mut trace = PacingTrace::new();
+        trace.costs.aac.observe(StageSpan::from_end(10_000, 3_000, 42));
+        trace.costs.aac.observe(StageSpan::from_end(20_000, 1_000, 43));
+        trace.costs.wake.observe(StageSpan::from_end(30_000, 8_000, 44));
+        let first = trace.sample("periodic", 40_000);
+        assert!(first.contains("aac=7000,10000,42"));
+        assert!(first.contains("wake=22000,30000,44"));
+        let next = trace.sample("periodic", 50_000);
+        assert!(next.contains("aac=NA") && next.contains("wake=NA"));
+    }
+
+    #[test]
     fn stage_costs_reset_after_each_report() {
         let mut trace = PacingTrace::new();
-        trace.costs = WindowCosts { sync_us: 15, mix_us: 37, send_us: 120 };
+        trace.costs = WindowCosts { sync_us: 15, mix_us: 37, send_us: 120, ..Default::default() };
         let first = trace.sample("periodic", 1);
         assert!(first.contains("window_max_sync_us=15 window_max_mix_us=37 window_max_send_us=120"));
         let next = trace.sample("periodic", 2);

@@ -1,5 +1,5 @@
 //! 停止请求持久化，并确认旧引擎已退出后才开始下一代；Notify 本身不记忆广播。
-use std::{sync::atomic::{AtomicBool, Ordering}, time::{Duration, Instant}};
+use std::{sync::{Arc, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
 use parking_lot::{Condvar, Mutex};
 use tokio::sync::Notify;
 
@@ -7,13 +7,24 @@ pub struct EngineShutdown {
     pub signal: std::sync::Arc<Notify>,
     requested: AtomicBool,
     graceful: AtomicBool,
-    done: Mutex<bool>,
+    completion: Mutex<Completion>,
     completed: Condvar,
 }
+
+#[derive(Default)]
+struct Completion {
+    engine_done: bool,
+    audio_threads: usize,
+}
+
+impl Completion {
+    fn done(&self) -> bool { self.engine_done && self.audio_threads == 0 }
+}
+
 impl EngineShutdown {
     pub fn new() -> Self {
         Self { signal: std::sync::Arc::new(Notify::new()), requested: AtomicBool::new(false),
-            graceful: AtomicBool::new(false), done: Mutex::new(false), completed: Condvar::new() }
+            graceful: AtomicBool::new(false), completion: Mutex::new(Completion::default()), completed: Condvar::new() }
     }
     pub fn request(&self, graceful: bool) {
         self.graceful.store(graceful, Ordering::Release);
@@ -28,19 +39,34 @@ impl EngineShutdown {
         notified.as_mut().enable();
         if !self.requested() { notified.await; }
     }
-    pub fn finish(&self) { *self.done.lock() = true; self.completed.notify_all(); }
+    pub fn finish(&self) {
+        self.completion.lock().engine_done = true;
+        self.completed.notify_all();
+    }
+    pub fn track_audio_thread(self: &Arc<Self>) -> AudioThreadGuard {
+        self.completion.lock().audio_threads += 1;
+        AudioThreadGuard(self.clone())
+    }
     pub fn wait_done(&self, budget: Duration) -> bool {
         let deadline = Instant::now() + budget;
-        let mut done = self.done.lock();
-        while !*done {
+        let mut completion = self.completion.lock();
+        while !completion.done() {
             let Some(left) = deadline.checked_duration_since(Instant::now()) else { break };
-            self.completed.wait_for(&mut done, left);
+            self.completed.wait_for(&mut completion, left);
         }
-        *done
+        completion.done()
     }
 }
 pub struct CompletionGuard(pub std::sync::Arc<EngineShutdown>);
 impl Drop for CompletionGuard { fn drop(&mut self) { self.0.finish(); } }
+
+pub struct AudioThreadGuard(Arc<EngineShutdown>);
+impl Drop for AudioThreadGuard {
+    fn drop(&mut self) {
+        self.0.completion.lock().audio_threads -= 1;
+        self.0.completed.notify_all();
+    }
+}
 
 /// Caller serializes start/stop. Timeout must leave the old owner available to the next stop.
 pub fn stop_retaining<T>(slot: &Mutex<Option<T>>, stop: impl FnOnce(&T) -> bool) -> bool {

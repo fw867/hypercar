@@ -363,7 +363,9 @@ pub async fn run_engine(
     let (audio_out_tx, audio_out_rx) = tokio::sync::oneshot::channel::<AudioOut>();
     let audio_stats = Arc::new(Mutex::new(AudioPumpStat::default()));
     let (main_audio_tx, main_audio_rx) = mpsc::unbounded_channel();
-    tasks.spawn(audio_pump(stop.clone(),audio_stats.clone(),audio_claim_tx.clone(),audio_out_rx,audio_rx,main_audio_rx,auxiliary_input.clone(),pipeline.clone()));
+    let audio_task = AudioPumpThread::start(shutdown.clone(), audio_pump(stop.clone(), audio_stats.clone(), audio_claim_tx.clone(),
+        audio_out_rx, audio_rx, main_audio_rx, auxiliary_input.clone(), pipeline.clone()))
+        .await.map_err(|error| format!("audio pump thread: {error}"))?;
 
     // ---- AirPlay 协商（控制 FD 已连接车机端口）----
     {
@@ -450,6 +452,7 @@ pub async fn run_engine(
     let outcome = tokio::select! {
         biased;
         _ = shutdown.wait() => {
+            audio_task.stop().await;
             if let Some(mut cleanup) = pending_cleanup {
                 cleanup.stop(shutdown.graceful()).await;
             }
@@ -466,7 +469,13 @@ pub async fn run_engine(
         screen_ready_tx,
         &mut pending_cleanup,
         receiver_audio_generation.clone(),
-        ) => result?,
+        ) => match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                audio_task.stop().await;
+                return Err(error);
+            }
+        },
     };
 
     drop(pending_cleanup); // The negotiated outcome now owns both channels.
@@ -565,6 +574,7 @@ pub async fn run_engine(
         teardown.retain(|entry| entry.get("type").and_then(crate::bplist::Value::as_int) != audio_stream_type);
         if let Some(kind) = final_audio_type { merge_auxiliary_teardown(&mut teardown, &[kind]); }
     }
+    audio_task.stop().await;
     tasks.shutdown().await;
     drop(keepalive);
     if let Some(session) = resource_session {
@@ -623,7 +633,7 @@ async fn audio_pump(
     let mut audio_errors: u64 = 0;
     let mut mixed_generation = None;
     let mut rate_mark = std::time::Instant::now();
-    let mut mixed = vec![0i16; SPF * 2];
+    let mut mixed = [0i16; SPF * 4];
     let mut pacing = crate::audio_pacing::PacingTrace::new();
     let mut media_queue_trace = crate::audio_pacing::MediaQueueTrace::default();
     loop {
@@ -651,6 +661,8 @@ async fn audio_pump(
             media_remain.clear();
             mixed_generation = generation;
         }
+        // An installed stream can inherit PCM already queued at the same mixer rate.
+        if !media_mix.is_empty() { pacing.note_media_queued(); }
         tokio::select! {
             _ = stop_a.notified() => return,
             command = commands.recv(), if commands_open => match command {
@@ -763,6 +775,8 @@ async fn audio_pump(
                     }
                 }
                 Some(SourceEvent::AudioData { tts, rate, channels, data, received_at }) => {
+                    let intake = std::time::Instant::now();
+                    let intake_ns = crate::timing::monotonic_nanos();
                     if tts {
                         let route=auxiliary.push(crate::aux_setup::Kind::Navigation,rate,channels,&data);
                         if route!=crate::aux_audio::Route::Drop && pcm_has_signal(&data) {
@@ -795,6 +809,11 @@ async fn audio_pump(
                     if !tts {
                         media_queue_trace.observe_push(queued_before / 2, appended / 2, overflow / 2,
                             received_at, sender_id.map(|id| id.setup_accepted_at), &mut pacing.dropped);
+                        let span = crate::audio_pacing::StageSpan::since(intake_ns);
+                        pacing.costs.pcm_enqueue.observe(span);
+                        pacing.costs.pcm_dispatch.observe(crate::audio_pacing::StageSpan::from_end(
+                            intake_ns, intake.saturating_duration_since(received_at).as_nanos(),
+                            crate::audio_pacing::thread_id()));
                     }
                 }
                 Some(_) => {}
@@ -815,10 +834,26 @@ async fn audio_pump(
             }
             scheduled = tick.tick() => {
                 let now=tokio::time::Instant::now();
-                let skipped=crate::audio_pacing::missed_source_frames(scheduled,now,mix_rate);
-                pacing.max_late_us=pacing.max_late_us.max(now.saturating_duration_since(scheduled).as_micros());
+                let wake_ns = crate::timing::monotonic_nanos();
+                let missed=crate::audio_pacing::missed_source_frames(scheduled,now,mix_rate);
+                let late = now.saturating_duration_since(scheduled);
+                let realtime = out.as_ref().is_some_and(|a| matches!(a.stream_type(), 100 | 102));
+                let recovered = if realtime && out.as_ref().is_some_and(AudioOut::owns_audio) {
+                    crate::audio_pacing::recoverable_source_frames(late, mix_rate, media_mix.len() / 2)
+                } else { 0 };
+                let skipped = missed - recovered;
+                let recovery_deadline = (recovered != 0).then(||
+                    scheduled.into_std() + crate::audio_pacing::RECOVERY_DEADLINE);
+                pacing.observe_tick(missed, skipped, late);
+                pacing.costs.wake.observe(crate::audio_pacing::StageSpan::from_end(
+                    wake_ns, late.as_nanos(), crate::audio_pacing::thread_id()));
+                pacing.recovered += recovered;
                 if skipped>0 {
-                    pacing.recoveries+=1; pacing.skipped=pacing.skipped.saturating_add(skipped);
+                    if realtime {
+                        let expired = ((skipped as u128 * 2).min(media_mix.len() as u128)) as usize;
+                        media_mix.drain(..expired);
+                        pacing.expired_media += (expired / 2) as u64;
+                    }
                     let tts_drop=((skipped as u128*2).min(tts_mix.len() as u128)) as usize;
                     tts_mix.drain(..tts_drop);
                     pacing.dropped.tts+=(tts_drop/2) as u64;
@@ -826,13 +861,14 @@ async fn audio_pump(
                     voice.mix.drain(..voice_drop); pacing.dropped.voice+=(voice_drop/2) as u64;
                     tts_remain.clear(); voice.remain.clear();
                     if let Some(a)=out.as_mut() {
-                        a.skip_source_frames(skipped);
-                        let started = std::time::Instant::now();
-                        let _ = a.send_sync_now(crate::timing::monotonic_nanos()).await;
-                        pacing.costs.sync_us = pacing.costs.sync_us.max(started.elapsed().as_micros());
+                        if a.skip_source_frames(skipped) {
+                            let started = std::time::Instant::now();
+                            let _ = a.send_sync_now(crate::timing::monotonic_nanos()).await;
+                            pacing.costs.sync_us = pacing.costs.sync_us.max(started.elapsed().as_micros());
+                        }
                     }
                 }
-                let mix_started = std::time::Instant::now();
+                let mix_started = crate::timing::monotonic_nanos();
                 if duck_hold > 0 { duck_hold -= 1; }
                 if auxiliary.independent(crate::aux_setup::Kind::Navigation) {tts_mix.clear();tts_remain.clear();}
                 if auxiliary.independent(crate::aux_setup::Kind::Speech) {voice.mix.clear();voice.remain.clear();}
@@ -841,7 +877,8 @@ async fn audio_pump(
                 let target = if duck_hold > 0 { 0.25f32 } else { 1.0f32 };
                 gain += (target - gain) * 0.15;
 
-                for i in 0..SPF {
+                let mixed = &mut mixed[..(SPF + recovered as usize) * 2];
+                for i in 0..mixed.len() / 2 {
                     // 混音队列里是**交错立体声**（每帧含 L、R 两个样本）。
                     // 之前每帧只取一个样本再左右都填它——只消费了一半数据、还把立体声
                     // 压成单声道，听感就是沙沙声 + 断续（现场 2026-10-23 23:10 定位）。
@@ -855,17 +892,26 @@ async fn audio_pump(
                     mixed[i * 2 + 1] = mix_audio_sample(mr,tr,vr,gain);
                 }
                 stats.lock().ducking = duck_hold > 0;
-                pacing.costs.mix_us = pacing.costs.mix_us.max(mix_started.elapsed().as_micros());
+                let mix = crate::audio_pacing::StageSpan::since(mix_started);
+                pacing.costs.mix_us = pacing.costs.mix_us.max(u128::from(mix.duration_ns() / 1_000));
+                pacing.costs.mix.observe(mix);
                 if let Some(a) = out.as_mut() {
                     // 静音时也发包：保持 RTP 时钟连续（车机按包排播）
                     let before = a.packets_sent();
                     let send_started = std::time::Instant::now();
+                    a.io_costs = Some(Default::default());
                     let result = if a.buffered_failed() {
                         Err(std::io::Error::other("buffered playback control failed"))
                     } else {
-                        a.send_pcm_for_generation(&mixed, generation).await
+                        a.send_pcm_recovering(mixed, generation, recovery_deadline).await
                     };
                     pacing.costs.send_us = pacing.costs.send_us.max(send_started.elapsed().as_micros());
+                    if let Some(costs) = a.io_costs.take() {
+                        pacing.costs.aac.merge(costs.aac);
+                        pacing.costs.udp.merge(costs.udp);
+                    }
+                    pacing.expired_aac += std::mem::take(&mut a.expired_aac_frames);
+                    pacing.expired_media += std::mem::take(&mut a.expired_pcm_frames);
                     if let Err(error)=result {
                         if a.stream_type() == 103 {
                             emit_log(&format!("BUFFERED-AUDIO: type103 sender retired error={error}; requesting type102 fallback"));
@@ -893,7 +939,7 @@ async fn audio_pump(
                 if rate_mark.elapsed() >= Duration::from_secs(1) {
                     let secs = rate_mark.elapsed().as_secs_f64().max(0.001);
                     emit_log(&format!(
-                        "AUDIO: 发包 {:.0}/s（应 {:.0}/s） 队列 media={}ms tts={}ms vr={}ms owner_phone={} blocked_samples={} udp_congestion_drops={}",
+                        "AUDIO: 发包 {:.0}/s（应 {:.0}/s） 队列 media={}ms tts={}ms vr={}ms owner_phone={} blocked_samples={} udp_congestion_drops={} aac_queue_dropped_frames={}",
                         sent_packets as f64 / secs,
                         out.as_ref().map_or(mix_rate as f64 / SPF as f64, |a| a.sample_rate() as f64 / a.samples_per_packet() as f64),
                         media_mix.len() * 1000 / (mix_rate as usize).max(1) / 2,
@@ -901,7 +947,8 @@ async fn audio_pump(
                         voice.mix.len() * 1000 / mix_rate as usize / 2,
                         out.as_ref().map(|a| a.owns_audio()).unwrap_or(false),
                         out.as_ref().map(|a| a.blocked_samples()).unwrap_or(0),
-                        out.as_ref().map_or(0, |a| a.congestion_drops)
+                        out.as_ref().map_or(0, |a| a.congestion_drops),
+                        out.as_ref().map_or(0, |a| a.aac_queue_dropped_frames)
                     ));
                     sent_packets = 0;
                     rate_mark = std::time::Instant::now();
@@ -1213,6 +1260,96 @@ mod video_pump_tests {
 
 #[derive(Default)]
 struct EngineTasks(Vec<tokio::task::JoinHandle<()>>);
+
+struct AudioPumpThread {
+    cancel: tokio::sync::oneshot::Sender<()>,
+    done: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl AudioPumpThread {
+    async fn start(shutdown: Arc<crate::shutdown::EngineShutdown>,
+        pump: impl std::future::Future<Output = ()> + Send + 'static) -> std::io::Result<Self> {
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let (complete, done) = tokio::sync::oneshot::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let pump = crate::callback_context::inherit(async move {
+            emit_log(&format!("AUDIO-THREAD: dedicated pump tid={}", crate::audio_pacing::thread_id()));
+            tokio::select! { biased; _ = cancelled => {}, _ = pump => {} }
+        });
+        let audio_guard = shutdown.track_audio_thread();
+        std::thread::Builder::new().name("hypercar-audio".into()).spawn(move || {
+            let audio_guard = audio_guard;
+            match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(runtime) => {
+                    if started.send(Ok(())).is_ok() {
+                        runtime.block_on(pump);
+                    } else {
+                        drop(pump);
+                    }
+                }
+                Err(error) => {
+                    drop(pump);
+                    let _ = started.send(Err(error));
+                }
+            }
+            drop(audio_guard);
+            let _ = complete.send(());
+        })?;
+        ready.await.map_err(|_| std::io::Error::other("audio thread exited during startup"))??;
+        Ok(Self { cancel, done })
+    }
+
+    async fn stop(self) {
+        drop(self.cancel);
+        let _ = self.done.await;
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn audio_pump_thread_owns_its_timer_and_stops_before_returning() {
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (stopped, done) = tokio::sync::oneshot::channel::<()>();
+    let caller = std::thread::current().id();
+    let pump = AudioPumpThread::start(Arc::new(crate::shutdown::EngineShutdown::new()), async move {
+        let _stopped_on_drop = stopped;
+        let first = std::thread::current().id();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let _ = started.send((first, std::thread::current().id()));
+        std::future::pending::<()>().await;
+    }).await.unwrap();
+    let (before, after) = ready.await.unwrap();
+    assert_ne!(caller, before);
+    assert_eq!(before, after);
+    pump.stop().await;
+    assert!(done.await.is_err());
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn forced_engine_abort_keeps_completion_pending_until_audio_thread_exits() {
+    let shutdown = Arc::new(crate::shutdown::EngineShutdown::new());
+    let guard = crate::shutdown::CompletionGuard(shutdown.clone());
+    let audio_shutdown = shutdown.clone();
+    let (blocking, blocked) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let engine = tokio::spawn(async move {
+        let _guard = guard;
+        let _pump = AudioPumpThread::start(audio_shutdown, async move {
+            let _ = blocking.send(());
+            wait.recv_timeout(Duration::from_secs(2)).unwrap();
+        }).await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    blocked.await.unwrap();
+    engine.abort();
+    assert!(engine.await.unwrap_err().is_cancelled());
+    let premature = shutdown.wait_done(Duration::ZERO);
+    release.send(()).unwrap();
+    assert!(!premature, "the old audio thread can still own its sockets");
+    assert!(shutdown.wait_done(Duration::from_secs(1)));
+}
+
 impl EngineTasks {
     fn spawn(&mut self, future: impl std::future::Future<Output = ()> + Send + 'static) {
         self.0.push(crate::callback_context::spawn(future));
@@ -1530,13 +1667,17 @@ mod main_audio_command_tests {
             } else {
                 step_mixer(15).await;
             }
-            assert!(stats.lock().signal_packets > 0, "queued music must survive the late tick");
+            if buffered {
+                assert!(stats.lock().signal_packets > 0, "buffered audio retains queued music after a late tick");
+            } else {
+                assert_eq!(stats.lock().signal_packets, 0, "realtime music older than the recovery deadline must be retired");
+            }
             worker.abort();
             let _ = worker.await;
         }
 
         #[tokio::test(start_paused = true)]
-        async fn type102_short_stall() { exercise(false, false).await; }
+        async fn type102_stall_beyond_recovery_deadline() { exercise(false, false).await; }
         #[tokio::test(start_paused = true)]
         async fn type103_short_stall() { exercise(true, false).await; }
         #[tokio::test(start_paused = true)]
@@ -1556,7 +1697,7 @@ mod main_audio_command_tests {
             let local = tx.local_addr().unwrap();
             tx.connect(peer.local_addr().unwrap()).await.unwrap();
             let mut out = AudioOut::new(tx, None, [0; 32], 102);
-            out.observe_main_stream(rtsp, stream, 0, std::time::Instant::now());
+            out.observe_main_stream(rtsp, stream, 0, std::time::Instant::now(), &Default::default(), None);
             (out, peer, local)
         }
         let (stop, stats) = (Arc::new(Notify::new()), Arc::new(Mutex::new(AudioPumpStat::default())));
