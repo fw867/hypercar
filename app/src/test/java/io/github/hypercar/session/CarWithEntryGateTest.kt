@@ -18,6 +18,12 @@ class CarWithEntryGateTest {
         assertFalse(gate.claimReopen(1, startup = true))
         gate.begin(2)
         assertTrue(gate.claimReopen(2, startup = true))
+        gate.begin(3)
+        assertTrue(gate.claimReopen(3))
+        assertTrue(gate.claimReopen(3, startup = true))
+        assertFalse(gate.claimReopen(3))
+        assertFalse(gate.claimReopen(3, startup = true))
+        assertFalse(gate.claimReopen(2, startup = true))
     }
 
     @Test fun pauseDuringShizukuFailureDiscardsFallbackEvenAfterSameAddressReinvites() = runBlocking {
