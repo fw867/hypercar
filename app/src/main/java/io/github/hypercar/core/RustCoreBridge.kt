@@ -36,7 +36,7 @@ object RustCoreBridge {
         fun onState(state: String, detail: String)
 
         fun onLog(line: String)
-        fun onCarWithReopen(attempt: Long) {}
+        fun onCarWithReopen(attempt: Long, startup: Boolean) {}
         fun onPipeline(json: String) {}
         fun onEventChannel(rtsp: Long, uptime: Long, cause: String, videoTcp: String) {}
         fun onCarWithNavigation(token: Long, json: String) {

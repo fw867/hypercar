@@ -7,6 +7,19 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CarWithEntryGateTest {
+    @Test fun startupRetryIsBoundedAndIndependentOfCanvasReopen() {
+        val gate = CarWithEntryGate {}
+        gate.begin(1)
+        assertTrue(gate.claimReopen(1, startup = true))
+        assertFalse(gate.claimReopen(1, startup = true))
+        assertTrue(gate.claimReopen(1))
+        assertFalse(gate.claimReopen(1))
+        gate.retire(1)
+        assertFalse(gate.claimReopen(1, startup = true))
+        gate.begin(2)
+        assertTrue(gate.claimReopen(2, startup = true))
+    }
+
     @Test fun pauseDuringShizukuFailureDiscardsFallbackEvenAfterSameAddressReinvites() = runBlocking {
         for (reinvite in listOf(false, true)) {
             val stopped = mutableListOf<Long>()

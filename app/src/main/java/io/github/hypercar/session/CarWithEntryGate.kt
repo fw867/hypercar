@@ -4,10 +4,12 @@ package io.github.hypercar.session
 internal class CarWithEntryGate(private val stopDialer: (Long) -> Unit) {
     private var owner = 0L
     private var reopenClaimed = false
+    private var startupRetryClaimed = false
 
     @Synchronized fun begin(attempt: Long) {
         owner = attempt
         reopenClaimed = false
+        startupRetryClaimed = false
     }
 
     fun retire(attempt: Long) {
@@ -20,9 +22,15 @@ internal class CarWithEntryGate(private val stopDialer: (Long) -> Unit) {
 
     @Synchronized fun current(attempt: Long) = attempt > 0 && owner == attempt
 
-    @Synchronized fun claimReopen(attempt: Long): Boolean {
-        if (!current(attempt) || reopenClaimed) return false
-        reopenClaimed = true
+    @Synchronized fun claimReopen(attempt: Long, startup: Boolean = false): Boolean {
+        if (!current(attempt)) return false
+        if (startup) {
+            if (startupRetryClaimed) return false
+            startupRetryClaimed = true
+        } else {
+            if (reopenClaimed) return false
+            reopenClaimed = true
+        }
         return true
     }
 

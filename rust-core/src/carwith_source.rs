@@ -123,7 +123,7 @@ pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
     let config=CarLifeConfig{width:cfg.width,height:cfg.height,fps:cfg.carwith_fps(),bt_address:cfg.device_id.clone(),
         bt_name:"HyperCar".into(),navigation_updates:cfg.carwith_navigation_enabled,microphone:microphone.clone()};
     let (hub,mut events)=CarLifeHub::connect(config,"127.0.0.1".into(),stop.clone(),Some(display.clone()),
-        move || crate::reopen_carwith_entry(owner))?;
+        move |startup| crate::reopen_carwith_entry(owner, startup))?;
     let feed=Arc::new(Mutex::new(Feed::default()));let sink=feed.clone();
     let task=tokio::spawn(async move {while let Some(event)=events.recv().await {sink.lock().receive(event);}});
     slot.current=Some(Prepared{owner,hub:Arc::new(hub),feed,display,microphone,stop,task});
