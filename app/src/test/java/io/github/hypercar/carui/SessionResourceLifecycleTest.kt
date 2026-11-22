@@ -9,6 +9,36 @@ import org.junit.Test
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class SessionResourceLifecycleTest {
+    @Test fun restartReplacesDisplayUnderTheSameSessionTicket() = runTest {
+        val lifecycle = SessionResourceLifecycle()
+        val ticket = lifecycle.ticket()
+        var display = 0
+        val cleanup: suspend () -> Unit = { display = 0 }
+        lifecycle.start(ticket, { true }, cleanup) { display = 17 }
+        lifecycle.restart(ticket, { true }, cleanup) {
+            assertEquals(0, display)
+            display = 18
+        }
+        assertEquals(18, display)
+        assertTrue(lifecycle.isCurrent(ticket))
+    }
+
+    @Test fun retiredSessionCannotFinishDisplayRestartAfterCleanupSuspends() = runTest {
+        val lifecycle = SessionResourceLifecycle()
+        val ticket = lifecycle.ticket()
+        var display = 0
+        val detached = CompletableDeferred<Unit>()
+        lifecycle.start(ticket, { true }, {}) { display = 17 }
+        val recovery = async {
+            lifecycle.restart(ticket, { true }, { detached.await(); display = 0 }) { display = 18 }
+        }
+        runCurrent()
+        lifecycle.retire()
+        detached.complete(Unit)
+        assertNull(recovery.await())
+        assertEquals(0, display)
+    }
+
     @Test fun reconnectWaitsForMapSurfaceDetachmentBeforeStartingNewEncoder() = runTest {
         val lifecycle = SessionResourceLifecycle()
         lifecycle.start(lifecycle.ticket(), { true }, {}) { Unit }

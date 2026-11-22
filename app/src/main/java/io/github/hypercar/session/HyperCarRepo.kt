@@ -3054,7 +3054,8 @@ object HyperCarRepo {
                     if (ctx != null && !sessionCarWithMode) {
                         sessionUiJob?.cancel()
                         sessionUiJob = scope.launch {
-                            fun current() = sessionLive.get() && streaming && connectionAttemptId == diagnosticId
+                            fun current() = sessionLive.get() && streaming && connectionAttemptId == diagnosticId &&
+                                engineCallbacks.current() == callbackOwner
                             if (!current()) return@launch
                             val result = runCatching { CarUiCaster.start(ctx, ::current) }
                                 .getOrElse { "启动失败: ${it.javaClass.simpleName}: ${it.message}" }
@@ -3062,6 +3063,7 @@ object HyperCarRepo {
                             if (CarUiCaster.running) {
                                 connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.UI_STARTED)
                                 io.github.hypercar.navigation.AmapLinkProbe.start(ctx)
+                                CarUiCaster.monitor(ctx, diagnosticId, callbackOwner, ::current)
                             }
                         }
                     }

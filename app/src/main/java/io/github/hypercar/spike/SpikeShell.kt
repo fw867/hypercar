@@ -26,13 +26,15 @@ object SpikeShell {
     @Volatile
     private var service: ISpikeShell? = null
 
-    private var connection: ServiceConnection? = null
+    @Volatile private var connection: ServiceConnection? = null
     private var args: Shizuku.UserServiceArgs? = null
     private val bindMutex = Mutex()
     @Volatile var isBinding: Boolean = false
         private set
 
-    fun isConnected(): Boolean = service?.asBinder()?.isBinderAlive == true
+    internal val userServiceBinder: IBinder? get() = service?.asBinder()?.takeIf { it.isBinderAlive }
+
+    fun isConnected(): Boolean = userServiceBinder != null
 
     fun startAudioCapture(owner: IBinder): android.os.ParcelFileDescriptor? = service?.startAudioCapture(owner)
     fun startSplitAudioCapture(owner: IBinder, navigationUid: Int): Array<android.os.ParcelFileDescriptor>? =
@@ -72,6 +74,7 @@ object SpikeShell {
         val deferred = CompletableDeferred<String>()
         val conn = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+                if (connection !== this) return
                 if (binder == null) {
                     deferred.complete("onServiceConnected binder=null")
                     return
@@ -81,6 +84,7 @@ object SpikeShell {
             }
 
             override fun onServiceDisconnected(name: ComponentName?) {
+                if (connection !== this) return
                 service = null
                 SpikeReport.add("SHELL", "user service 断开")
             }

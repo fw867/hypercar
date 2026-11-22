@@ -32,6 +32,12 @@ internal class SessionResourceLifecycle {
             }
         }
 
+    suspend fun <T> restart(ticket: Long, current: () -> Boolean, cleanup: suspend () -> Unit,
+        create: suspend () -> T): T? = start(ticket, current, cleanup) {
+        cleanup()
+        if (isCurrent(ticket) && current()) create() else null
+    }
+
     suspend fun stop(retired: Long, cleanup: suspend () -> Unit) = changes.withLock {
         // A newer start can acquire the mutex before a queued stop. Never tear it down.
         if (owner < retired) { cleanup(); owner = -1L }
