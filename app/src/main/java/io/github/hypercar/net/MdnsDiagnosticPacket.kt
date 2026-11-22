@@ -8,7 +8,11 @@ internal data class MdnsDiagnosticPacket(
     val details: List<String>,
     val announcement: Announcement? = null,
     val ctrlQuestion: Boolean = false,
+    val carPlaySources: List<CarPlaySource> = emptyList(),
 ) {
+    /** 网络中广播的 CarPlay 源（实例名不含 _carplay-ctrl._tcp.local 后缀）。 */
+    data class CarPlaySource(val instance: String, val host: String, val port: Int,
+        val txt: Set<String>, val addresses: Set<InetAddress>)
     data class Announcement(val instance: String, val host: String, val port: Int, val txt: Set<String>, val addresses: Set<InetAddress>) {
         fun matches(name: String, port: Int, mac: String, version: String, linkAddresses: Set<InetAddress>): Boolean =
             instance == "${name.lowercase()}.$CTRL" && this.port == port &&
@@ -81,6 +85,10 @@ internal data class MdnsDiagnosticPacket(
             var pos = 12
             val details = mutableListOf<String>()
             var ctrlQuestion = false
+            val srcServices = mutableMapOf<String, Pair<String, Int>>()
+            val withdrawnSources = mutableSetOf<String>()
+            val srcTxts = mutableMapOf<String, Set<String>>()
+            val srcAddresses = mutableMapOf<String, MutableSet<InetAddress>>()
             val replayRecords = if (flags == 0x8400 && u16(0) == 0 && questions == 0 && answers > 0 && authorityEnd == answers)
                 mutableListOf<Record>() else null
             repeat(questions) {
@@ -118,6 +126,11 @@ internal data class MdnsDiagnosticPacket(
                         require(n >= 7)
                         val (target, next) = name(start + 6); require(next == pos)
                         replay = replay.copy(target = target, port = u16(start + 4))
+                        if (response && owner.endsWith(".$CTRL")) {
+                            val port = u16(start + 4)
+                            if (ttl > 0 && port > 0 && target.isNotBlank()) srcServices[owner] = target to port
+                            else withdrawnSources.add(owner)
+                        }
                         if (service(owner)) "port=${u16(start + 4)} host=$target" else null
                     }
                     16 -> {
@@ -132,11 +145,14 @@ internal data class MdnsDiagnosticPacket(
                         }
                         // Do not retain unknown TXT fields or replay packets that contain any.
                         replay = replay.copy(txt = allowed.map { it.lowercase() }.toSet().takeIf { it.size == count }.orEmpty())
+                        if (response && ttl > 0 && owner.endsWith(".$CTRL") && allowed.isNotEmpty())
+                            srcTxts[owner] = allowed.map { it.lowercase() }.toSet()
                         if (service(owner)) "txt=[${allowed.joinToString(",")}]" else null
                     }
                     1, 28 -> {
                         require(n == if (type == 1) 4 else 16)
                         val address = InetAddress.getByAddress(bytes.copyOfRange(start, pos))
+                        if (response && ttl > 0) srcAddresses.getOrPut(owner) { mutableSetOf() }.add(address)
                         replay = replay.copy(address = address)
                         if (owner.endsWith(".local")) "address=${address.hostAddress}" else null
                     }
@@ -146,7 +162,12 @@ internal data class MdnsDiagnosticPacket(
                 if (value != null) details += "RR section=$section name=$owner type=$type ttl=$ttl flush=${cls and 0x8000 != 0} $value"
             }
             val announcement = replayRecords?.takeIf { pos == bytes.size }?.let(::completeAnnouncement)
-            MdnsDiagnosticPacket(response, details, announcement, ctrlQuestion)
+            val carPlaySources = srcServices
+                .filterKeys { it !in withdrawnSources }
+                .map { (inst, service) -> CarPlaySource(inst.removeSuffix(".$CTRL"), service.first, service.second,
+                    srcTxts[inst].orEmpty(), srcAddresses[service.first].orEmpty().toSet()) }
+                .distinct()
+            MdnsDiagnosticPacket(response, details, announcement, ctrlQuestion, carPlaySources)
         }.getOrNull()
     }
 }

@@ -52,6 +52,7 @@ class MdnsDiagnosticPacketTest {
         val decoded = MdnsDiagnosticPacket.decode(p)!!
         assertFalse(decoded.response)
         assertEquals(listOf("question", "known-answer", "probe-authority", "additional"), sections(decoded))
+        assertTrue(decoded.carPlaySources.isEmpty())
         assertTrue(decoded.details[1].contains("target=phone._carplay-ctrl._tcp.local"))
         assertTrue(decoded.details[2].contains("port=33749"))
         assertTrue(decoded.details[3].contains("address=10.0.0.1"))
@@ -80,6 +81,28 @@ class MdnsDiagnosticPacketTest {
         val decoded = MdnsDiagnosticPacket.decode(p)!!
         assertTrue(decoded.response)
         assertTrue(decoded.details.any { it.contains("33749") && it.contains("phone.local") && it.contains("ttl=0") && it.contains("flush=true") })
+        assertTrue(decoded.carPlaySources.isEmpty())
+    }
+
+    @Test fun onlyLiveResponseSourcesExposeTheirSrvTargetWithoutUsingThePacketSender() {
+        val owner = name("other._carplay-ctrl._tcp.local")
+        val host = name("actual-phone.local")
+        fun srv(port: Int, ttl: Int) = rr(owner, 33,
+            byteArrayOf(0, 0, 0, 0, (port shr 8).toByte(), port.toByte()) + host, ttl)
+        for (flags in listOf(0, 0x8400)) for (ttl in listOf(0, 120)) for (port in listOf(0, 33749)) {
+            val p = packet(flags = flags, answers = 1, additional = 1,
+                body = srv(port, ttl) + rr(host, 1, byteArrayOf(10, 0, 0, 42)))
+            val sources = MdnsDiagnosticPacket.decode(p)!!.carPlaySources
+            assertEquals("flags=$flags ttl=$ttl port=$port", flags == 0x8400 && ttl > 0 && port > 0, sources.isNotEmpty())
+            if (sources.isNotEmpty()) {
+                assertEquals("actual-phone.local", sources.single().host)
+                assertEquals(setOf(java.net.InetAddress.getByAddress(byteArrayOf(10, 0, 0, 42))), sources.single().addresses)
+            }
+        }
+        val withdrawal = packet(answers = 2, body = srv(33749, 120) + srv(33749, 0))
+        assertTrue(MdnsDiagnosticPacket.decode(withdrawal)!!.carPlaySources.isEmpty())
+        val unavailable = rr(owner, 33, byteArrayOf(0, 0, 0, 0, 0x83.toByte(), 0xd5.toByte(), 0))
+        assertTrue(MdnsDiagnosticPacket.decode(packet(answers = 1, body = unavailable))!!.carPlaySources.isEmpty())
     }
 
     @Test fun txtOnlyAllowsIdentityAndVersionNeverCredentialsOrUnknownValues() {

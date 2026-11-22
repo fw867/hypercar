@@ -36,6 +36,8 @@ internal class CtrlMdnsObserver(
         val source: InetAddress, val seenAt: Long,
     )
     private val localAnnouncements = ConcurrentHashMap<Int, LocalAnnouncement>(2)
+    // Bound both history and logging across the two receive workers.
+    private val foreignCarPlaySources = MdnsSourceLogGate(SystemClock::elapsedRealtime)
     private fun linkProperties() = context.getSystemService(ConnectivityManager::class.java)?.getLinkProperties(network)
     // Both receive workers share the same short-lived view; replay deliberately bypasses it.
     private val localAddresses = MdnsLocalAddressCache(SystemClock::elapsedRealtime) {
@@ -137,7 +139,7 @@ internal class CtrlMdnsObserver(
             while (!closed) {
                 val now = SystemClock.elapsedRealtime()
                 if (now - window >= 15_000) {
-                    log("MDNS-OBS: stats $label received=$received relevant=$relevant malformed=$malformed suppressed=$suppressed")
+                    log("MDNS-OBS: stats $label received=$received relevant=$relevant malformed=$malformed suppressed=$suppressed ${foreignCarPlaySources.summary()}")
                     window = now; emitted = 0
                 }
                 val packet = DatagramPacket(bytes, bytes.size)
@@ -146,6 +148,18 @@ internal class CtrlMdnsObserver(
                 val wire = bytes.copyOf(packet.length)
                 val decoded = MdnsDiagnosticPacket.decode(wire)
                 if (decoded == null) { malformed++; continue }
+                val addrs = localAddresses.current()
+                if (addrs != null && !(packet.address in addrs) && decoded.carPlaySources.isNotEmpty()) {
+                    for (src in decoded.carPlaySources) {
+                        if (src.addresses.any { it in addrs }) continue
+                        val key = "${src.instance}@${src.host}:${src.port}"
+                        if (!closed && foreignCarPlaySources.admit(key)) {
+                            log("MDNS-OBS: $prefix remote-service instance=${src.instance} sender=${packet.address.hostAddress} " +
+                                "host=${src.host} port=${src.port} addresses=${src.addresses.map { it.hostAddress }} " +
+                                "txt=[${src.txt.joinToString(",")}]；仅证明观察到服务记录，不代表车机已选择该设备")
+                        }
+                    }
+                }
                 if (decoded.announcement != null || decoded.ctrlQuestion) {
                     val addresses = localAddresses.current()
                     if (!closed && addresses != null) {
