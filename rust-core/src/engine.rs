@@ -808,7 +808,9 @@ async fn audio_pump(
                 // RTP↔NTP 同步包（每秒；缺它车机照收 UDP 但喇叭无声）。
                 // 时间基与 TimingServer 的 timesync 应答同源（进程级单调钟）。
                 if let Some(a) = out.as_mut() {
+                    let started = std::time::Instant::now();
                     let _ = a.send_sync_now(crate::timing::monotonic_nanos()).await;
+                    pacing.costs.sync_us = pacing.costs.sync_us.max(started.elapsed().as_micros());
                 }
             }
             scheduled = tick.tick() => {
@@ -825,10 +827,12 @@ async fn audio_pump(
                     tts_remain.clear(); voice.remain.clear();
                     if let Some(a)=out.as_mut() {
                         a.skip_source_frames(skipped);
-                        let _=a.send_sync_now(crate::timing::monotonic_nanos()).await;
+                        let started = std::time::Instant::now();
+                        let _ = a.send_sync_now(crate::timing::monotonic_nanos()).await;
+                        pacing.costs.sync_us = pacing.costs.sync_us.max(started.elapsed().as_micros());
                     }
                 }
-                if let Some(line) = pacing.periodic() { emit_log(&line); }
+                let mix_started = std::time::Instant::now();
                 if duck_hold > 0 { duck_hold -= 1; }
                 if auxiliary.independent(crate::aux_setup::Kind::Navigation) {tts_mix.clear();tts_remain.clear();}
                 if auxiliary.independent(crate::aux_setup::Kind::Speech) {voice.mix.clear();voice.remain.clear();}
@@ -851,14 +855,17 @@ async fn audio_pump(
                     mixed[i * 2 + 1] = mix_audio_sample(mr,tr,vr,gain);
                 }
                 stats.lock().ducking = duck_hold > 0;
+                pacing.costs.mix_us = pacing.costs.mix_us.max(mix_started.elapsed().as_micros());
                 if let Some(a) = out.as_mut() {
                     // 静音时也发包：保持 RTP 时钟连续（车机按包排播）
                     let before = a.packets_sent();
+                    let send_started = std::time::Instant::now();
                     let result = if a.buffered_failed() {
                         Err(std::io::Error::other("buffered playback control failed"))
                     } else {
                         a.send_pcm_for_generation(&mixed, generation).await
                     };
+                    pacing.costs.send_us = pacing.costs.send_us.max(send_started.elapsed().as_micros());
                     if let Err(error)=result {
                         if a.stream_type() == 103 {
                             emit_log(&format!("BUFFERED-AUDIO: type103 sender retired error={error}; requesting type102 fallback"));
@@ -880,6 +887,7 @@ async fn audio_pump(
                     counters.payload_bytes = a.payload_bytes_sent();
                     if mixed.iter().any(|s| *s != 0) { counters.signal_packets += written; }
                 }
+                if let Some(line) = pacing.periodic() { emit_log(&line); }
                 // 每秒报一次实际发包速率：48000/352 ≈ 136/s。低于它就是漏拍，
                 // 接收端会表现为 late/discontinuity 增长、听感断续。
                 if rate_mark.elapsed() >= Duration::from_secs(1) {
