@@ -433,7 +433,8 @@ impl AudioOut {
             return Ok(()); // 车机没下发 controlPort（旧车机）：只发音频
         };
         let packet = build_sync_packet_for_frames(self.sync_seq, rtp_ts, ntp_nanos, self.samples_per_packet() as u32);
-        let result = sync.send(&packet).await;
+        // Sync shares the audio pump with media. A full socket must not stall the next tick.
+        let result = socket2::SockRef::from(sync).send_with_flags(&packet, libc::MSG_DONTWAIT);
         if let (Some(trace), Some(generation)) = (&mut self.resume_trace, generation) {
             trace.observe_unborrow(generation, true);
             trace.sync_result(SyncHeader { seq: self.sync_seq, rtp_ts, ntp_nanos }, &result);

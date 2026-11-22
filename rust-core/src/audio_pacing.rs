@@ -65,16 +65,24 @@ pub(crate) struct PacingTrace {
     pub recoveries: u64,
     pub skipped: u64,
     pub max_late_us: u128,
+    pub costs: WindowCosts,
     pub dropped: DroppedFrames,
     previous: DroppedFrames,
     last_report: Instant,
     window_start_ns: u64,
 }
 
+#[derive(Default)]
+pub(crate) struct WindowCosts {
+    pub sync_us: u128,
+    pub mix_us: u128,
+    pub send_us: u128,
+}
+
 impl PacingTrace {
     pub fn new() -> Self {
         Self { stream_id: None, rtsp: None, recoveries: 0, skipped: 0, max_late_us: 0,
-            dropped: Default::default(), previous: Default::default(),
+            costs: WindowCosts::default(), dropped: Default::default(), previous: Default::default(),
             last_report: Instant::now(), window_start_ns: crate::timing::monotonic_nanos() }
     }
 
@@ -87,6 +95,7 @@ impl PacingTrace {
         self.recoveries = 0;
         self.skipped = 0;
         self.max_late_us = 0;
+        self.costs = WindowCosts::default();
         self.dropped = DroppedFrames::default();
         self.previous = DroppedFrames::default();
         self.last_report = Instant::now();
@@ -110,6 +119,7 @@ impl PacingTrace {
         let label = format!("RTSP#{rtsp} streamConnectionID={stream_id}");
         let start = std::mem::replace(&mut self.window_start_ns, now);
         let previous = std::mem::replace(&mut self.previous, self.dropped);
+        let costs = std::mem::take(&mut self.costs);
         let media_delta = self.dropped.media - previous.media;
         let pre = self.dropped.media_pre_setup - previous.media_pre_setup;
         let post = self.dropped.media_post_setup - previous.media_post_setup;
@@ -117,10 +127,12 @@ impl PacingTrace {
         format!(concat!("AUDIO-PACING: {} monoNs={} windowStartMonoNs={} reason={} recoveries={} ",
             "skipped_source_frames={} dropped_media_frames={} dropped_tts_frames={} dropped_voice_frames={} ",
             "max_late_us={} dropped_media_frames_delta={} dropped_tts_frames_delta={} dropped_voice_frames_delta={} ",
-            "media_pre_setup_delta={} media_post_setup_delta={} media_setup_unknown_delta={}"),
+            "media_pre_setup_delta={} media_post_setup_delta={} media_setup_unknown_delta={} ",
+            "window_max_sync_us={} window_max_mix_us={} window_max_send_us={}"),
             label, now, start, reason, self.recoveries, self.skipped, self.dropped.media, self.dropped.tts,
             self.dropped.voice, self.max_late_us, media_delta,
-            self.dropped.tts - previous.tts, self.dropped.voice - previous.voice, pre, post, media_delta - pre - post)
+            self.dropped.tts - previous.tts, self.dropped.voice - previous.voice, pre, post, media_delta - pre - post,
+            costs.sync_us, costs.mix_us, costs.send_us)
     }
 }
 
@@ -148,6 +160,16 @@ pub(crate) fn missed_source_frames(scheduled: tokio::time::Instant, now: tokio::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_costs_reset_after_each_report() {
+        let mut trace = PacingTrace::new();
+        trace.costs = WindowCosts { sync_us: 15, mix_us: 37, send_us: 120 };
+        let first = trace.sample("periodic", 1);
+        assert!(first.contains("window_max_sync_us=15 window_max_mix_us=37 window_max_send_us=120"));
+        let next = trace.sample("periodic", 2);
+        assert!(next.contains("window_max_sync_us=0 window_max_mix_us=0 window_max_send_us=0"));
+    }
 
     #[test]
     fn resampled_44100_to_48000_boundary_frame_counts_only_in_post_setup_tail() {
