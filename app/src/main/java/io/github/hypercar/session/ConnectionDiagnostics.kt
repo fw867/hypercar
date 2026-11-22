@@ -144,6 +144,11 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
         a.observations.remove(Observation.MDNS_PEER_QUERY)
     }
 
+    @Synchronized internal fun isWaitingForCtrlTcp(id: Long): Boolean {
+        val current = history.lastOrNull()?.takeIf { it.id == id && it.ended == null } ?: return false
+        return Stage.CTRL_REGISTERED in current.ctrlReached && Stage.CTRL_TCP_ACCEPTED !in current.ctrlReached
+    }
+
     @Synchronized internal fun connectionSnapshot(id: Long, listeningPort: Int?): String? {
         val a = history.lastOrNull()?.takeIf { it.id == id } ?: return null
         return buildString {

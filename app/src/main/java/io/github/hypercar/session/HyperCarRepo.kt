@@ -1369,7 +1369,8 @@ object HyperCarRepo {
             val coordinator = coordinatorFor(context)
             val phoneIdentity = coordinator.identityForSession()
             val deviceMac = phoneIdentity.address
-            fallbackToRemember = phoneIdentity.takeIf { SettingsStore.manualBtMac == null && deviceMac == SettingsStore.stableDeviceId }
+            val usesFallbackPhoneIdentity = deviceMac == SettingsStore.stableDeviceId
+            fallbackToRemember = phoneIdentity.takeIf { SettingsStore.manualBtMac == null && usesFallbackPhoneIdentity }
             if (sessionCarWithMode && !prepareCarWithSource(context, diagnosticId, deviceMac, wakePeer)) {
                 if (carWithEntries.current(diagnosticId)) fail("CarWith 源端守候服务准备失败")
                 return
@@ -1604,7 +1605,9 @@ object HyperCarRepo {
                 var waitRounds = 0
                 while (endpoint == null) {
                     endpoint =
-                        awaitUsableEndpoint(context, coordinator, lastSeen, advertiser, invitationOnly)
+                        awaitUsableEndpoint(
+                            context, coordinator, lastSeen, advertiser, invitationOnly, usesFallbackPhoneIdentity,
+                        )
                             ?: if (invitationOnly) null else gatewayFallbackEndpoint(context, lastSeen.get())
                     if (endpoint == null) {
                         waitRounds++
@@ -3184,7 +3187,8 @@ object HyperCarRepo {
         coordinator: Iap2Coordinator,
         lastSeen: AtomicReference<CarPlayEndpoint?>,
         advertiser: CarPlayCtrlAdvertiser,
-        invitationOnly: Boolean = false,
+        invitationOnly: Boolean,
+        usesFallbackPhoneIdentity: Boolean,
     ): CarPlayEndpoint? = withTimeoutOrNull(ENDPOINT_TIMEOUT_MILLIS) {
         val diagnosticId = connectionAttemptId
         // BMW's second-entry box trace still obtains Bluetooth credentials and a fresh ctrl invite.
@@ -3330,6 +3334,18 @@ object HyperCarRepo {
                             val waitingForCarIap2 = KnownWifiWaitCopy.awaitingHeadUnitIap2(
                                 wifiBound, coordinator.sessionStartCount, roundSessionBaseline,
                                 ReconnectDiscoverability.firstWindowOver())
+                            val network = boundNetwork
+                            val previousLink = _snapshots.value.link
+                            val identityHint = LinkState.Negotiating("未收到车机邀请，请在高级设置填写本机蓝牙 MAC 后重连")
+                            val showIdentityHint = headUnitProfile.id == "bmw_id85" && usesFallbackPhoneIdentity &&
+                                sessionsThisRound > 0 && network != null && advertiser.listeningOn(network) &&
+                                connectionDiagnostics.isWaitingForCtrlTcp(diagnosticId)
+                            if (showIdentityHint && previousLink != identityHint) {
+                                push(link = identityHint)
+                                log("SESSION: 已入车机 Wi-Fi，ctrl 未收到 TCP；本轮使用备用蓝牙标识，可填写本机真实蓝牙 MAC 后重试")
+                            } else if (!showIdentityHint && previousLink == identityHint) {
+                                push(link = LinkState.Negotiating("等待车机开启 CarPlay"))
+                            }
                             if (wifiBound) {
                                 val step = KnownWifiWaitCopy.boundNegotiatingStep(
                                     headUnitProfile.id, waitingForCarIap2)
