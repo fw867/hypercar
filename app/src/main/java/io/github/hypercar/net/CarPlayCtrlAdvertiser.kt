@@ -351,7 +351,8 @@ class CarPlayCtrlAdvertiser(
                             }
                             registeredAtMillis = SystemClock.uptimeMillis()
                             actualRegisteredName = serviceInfo.serviceName
-                            runCatching { onDiagnostic(Event.REGISTERED, serviceInfo.port) }
+                            // Android may return only the registered service name in this callback.
+                            runCatching { onDiagnostic(Event.REGISTERED, socket.localPort) }
                             logCtrl("$TAG: mDNS 注册成功 ${serviceInfo.serviceName} network=$registeredNetwork port=$port")
                             logCtrl("CTRL-DIAG: NSD registered token=$token requested=$name actual=${serviceInfo.serviceName} " +
                                 "type=${serviceInfo.serviceType} callbackPort=${serviceInfo.port} ${diagnosticSummary()}")

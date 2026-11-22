@@ -495,9 +495,8 @@ private fun ShizukuState.hint(): String = when (this) {
  * 本机蓝牙 MAC：免 Shizuku 的手动入口。
  *
  * Android 6.0+ 应用层拿不到本机蓝牙地址，读 `settings/secure` 又要 Shizuku/root。
- * 宝马 iD8.5 不校验这个值（稳定伪 ID 即可），但 WinPlay / 部分奥迪会按
- * bluetoothTransportIdentifier 严格过滤并 403——那种接收端下可以用 PC 跑一次
- * `adb shell settings get secure bluetooth_address`，把真值填在这里。
+ * 部分接收端会核对 iAP2、mDNS 上报的身份与蓝牙配对地址。
+ * 未收到车机邀请时，可填写本机真实蓝牙地址后重新连接。
  */
 @Composable
 private fun IdentitySection() {
@@ -614,9 +613,9 @@ private fun ManualBtMacDialog(
                     color = TextPrimary,
                 )
                 Text(
-                    text = "用 PC 执行一次即可获取：\n" +
+                    text = "填写手机本机的蓝牙地址。可在手机状态信息中查看，或用电脑执行：\n" +
                         "adb shell settings get secure bluetooth_address\n" +
-                        "留空并清除则恢复自动（Shizuku / 稳定伪 ID）。",
+                        "清除后恢复自动获取，改动在下次连接生效。",
                     style = MaterialTheme.typography.bodySmall,
                     color = TextSecondary,
                     modifier = Modifier.padding(top = 6.dp, bottom = 16.dp),

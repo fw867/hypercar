@@ -186,6 +186,24 @@ class ConnectionDiagnosticsTest {
         assertTrue(second.contains("milestones=[REQUESTED@0ms]"))
     }
 
+    @Test fun waitingForCtrlTcpTracksOnlyTheCurrentListenerAndAttempt() {
+        val journal = ConnectionDiagnostics { 0L }
+        val id = journal.begin("manual", "bmw_id85")
+        assertFalse(journal.isWaitingForCtrlTcp(id))
+
+        journal.mark(id, Stage.CTRL_REGISTERED, "36037")
+        assertTrue(journal.isWaitingForCtrlTcp(id))
+        journal.mark(id, Stage.CTRL_TCP_ACCEPTED)
+        assertFalse(journal.isWaitingForCtrlTcp(id))
+
+        journal.newCtrlEpoch(id)
+        assertFalse(journal.isWaitingForCtrlTcp(id))
+        journal.mark(id, Stage.CTRL_REGISTERED, "38919")
+        assertTrue(journal.isWaitingForCtrlTcp(id))
+        journal.finish(id, "STOPPED", "user")
+        assertFalse(journal.isWaitingForCtrlTcp(id))
+    }
+
     @Test fun staleCallbacksAndDuplicateFinishCannotChangeNewRound() {
         var now = 0L
         val j = ConnectionDiagnostics { now }
