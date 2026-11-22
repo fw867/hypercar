@@ -574,7 +574,14 @@ object HyperCarRepo {
     }
 
     private fun knownAclCar(device: BluetoothDevice, peer: String, target: String?): Boolean = knownBondedCar(
-        runCatching { device.bondState == BluetoothDevice.BOND_BONDED }.getOrDefault(false),
+        try {
+            device.bondState == BluetoothDevice.BOND_BONDED
+        } catch (_: SecurityException) {
+            // BLUETOOTH_CONNECT may be revoked between receiving the ACL and inspecting it.
+            false
+        } catch (_: RuntimeException) {
+            false
+        },
         peer, target, SettingsStore.isCarPaired(peer), wifiReceiverMac,
     )
 

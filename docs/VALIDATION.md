@@ -1,5 +1,15 @@
 # 验证记录与边界
 
+## 2026-11-22 所有档案的 CarWith 超宽原生尺寸输出（604 同批）
+
+审查并rebase合并PR #64（a16da48），其原修改只把ID9的超宽策略扩展到ID8.5。随后将Router::for_carwith_profile的适用条件统一为profile.is_some()：所有本地或动态车机档案在CarWith模式均使用同一规则，主屏任一边>2560时即使源比例接近也尝试按主屏真实尺寸转码。<=2560仍沿用3%比例差规则；None自绘不启用CarWith转码。源端请求上限、源画布、触摸映射、失败锁存回源及资源释放保持现有路径。
+
+先在手机用PR原条件运行新增通用断言：18通过、2失败，证明非宝马未进入原生尺寸转码。通用化后21项转码测试通过，覆盖8个本地档案及未知档案、横/竖超宽、2560边界、H.264转码入口、None自绘隔离、创建和运行失败后的原流回退。测试在Android运行实际Rust Router，编码器使用可控模拟实现，不能据此证明Android硬件编码器支持每块超宽屏。
+
+手机完整Android原生测试466通过、0失败、4项需人工开启CarWith入口的现场测试忽略；Release JVM763通过，完整lint0错误/76警告；Rust原生库及正式签名Release重新构建通过。上轮蓝牙配对状态读取已改为显式捕获SecurityException，本批一并保留该修复。
+
+沿用未提交批次604/10700，不重复升级。新包含本次Rust库，库SHA256 bf565f3ea8fffd3ab69f94c475b309ad293eeefe9197e0af7a3148f7cfbfb6e3。已install -r保留数据覆盖安装，手机base.apk与构建产物SHA256同为fedb17b12a8c998b917a1a4cd141b2829928485a8a5f6bb29250f31574505207；核实604版本、启动和进程存活，9个系统配对记录及Bond Events未变。仍需实车确认各车机全屏显示、四角触摸和重连，未宣称所有车型完成实测。
+
 ## 2026-11-20 宝马 ID9 缓冲音频起播实验（599）
 
 仅在 `bmw_id9` 的 type103 已建 TCP 且 GETANCHOR 预检收到 RTSP 501 时采用 `ID9_SETRATE`。`playback_unconfirmed` 表示仍在等首包，不是已播放。首个 AAC 包写完后才发 `SETRATE rate=1`；`receiver_mapping=validated` 表示车机返回的时钟和媒体时间与该包匹配，`mode=ID9_SETRATE playing=true` 表示当前控制代次确认起播，两者均不能证明扬声器已出声。现有 GETANCHOR 成功路径和其他车机策略不变。
