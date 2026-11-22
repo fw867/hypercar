@@ -17,6 +17,10 @@ internal class AmapLinkNavigationState {
         if (source == 0L || source != token) return false
         val next = when (type) {
             4 -> {
+                // Link may deliver a final guidance sample after the end event. Keep the
+                // terminal cue long enough for the iAP2 worker to publish it.
+                val previousState = cue?.state
+                if ((previousState == 0 || previousState == 2) && now - updated in 0 until END_SETTLE_MS) return false
                 val info = data ?: return false
                 val maneuver = integer(info.opt("curManeuverID"), 65535)?.toInt() ?: return false
                 // segmentRemainDist is metres to the current segment end. routeRemainDist is NOT this distance.
@@ -60,8 +64,17 @@ internal class AmapLinkNavigationState {
                     // A new direction can arrive before its segment info. Never reuse the old road/distance.
                     NavigationCue(action?.second.orEmpty(), action?.first, null)
             }
-            100 -> { rawManeuver = null; initialLanes = null; NavigationCue("", null, null, state = 0) }
-            200 -> { rawManeuver = null; initialLanes = null; NavigationCue("已到达目的地", null, null, state = 2) }
+            100, 200 -> {
+                rawManeuver = null
+                initialLanes = null
+                val stopped = NavigationCue("", null, null, state = 0)
+                when (type) {
+                    100 -> cue?.takeIf { it.state == 2 } ?: stopped
+                    // Link also sends type 200 on manual exit (action=0, isArrived=false).
+                    else -> if (data?.optBoolean("isArrived", false) == true)
+                        NavigationCue("已到达目的地", null, null, state = 2) else stopped
+                }
+            }
             else -> return false
         }
         cue = next; updated = now
@@ -79,6 +92,8 @@ internal class AmapLinkNavigationState {
         return value.toLong().takeIf { d.isFinite() && d == it.toDouble() && it in 0..maximum }
     }
     private companion object {
+        const val END_SETTLE_MS = 2_000L
+
         // AMap AutoSDK ManeuverIconID -> CP maneuver type. Unknowns intentionally have no arrow.
         val maneuvers = mapOf(
             2 to (1 to "左转"), 3 to (2 to "右转"), 4 to (49 to "向左前方行驶"),

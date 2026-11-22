@@ -31,6 +31,8 @@ data class CarPlayEndpoint(
     /** Cached/discovered endpoint used without this round's activation invitation. */
     val proactive: Boolean = false,
     val bluetoothHotspot: BluetoothHotspot? = null,
+    /** Received directly in 0x5703 from a DENSO Outback in this handshake. */
+    val densoOutbackWifi: Boolean = false,
 ) {
     /** Only this peer's current Wi-Fi parameters can start or replace an Android request. */
     internal fun canRequestHotspot(current: BluetoothHotspot?): Boolean =

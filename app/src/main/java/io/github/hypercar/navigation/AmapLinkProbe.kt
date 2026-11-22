@@ -239,7 +239,17 @@ internal object AmapLinkProbe {
                     val item = items.optJSONObject(i) ?: continue
                     val value = item.opt("data")
                     val data = value as? JSONObject ?: (value as? String)?.let { LinkJson.objectValue(it) }
-                    changed = AmapLinkNavigation.accept(navigationToken, item.optInt("type", -1), data, now) || changed
+                    val type = item.optInt("type", -1)
+                    val accepted = AmapLinkNavigation.accept(navigationToken, type, data, now)
+                    if (accepted && type == 200) {
+                        val action = data?.opt("action")?.toString()
+                            ?.takeIf { it.length in 1..32 && it.all { c -> c.isLetterOrDigit() || c == '_' || c == '-' } }
+                        val arrived = data?.opt("isArrived")?.toString()?.takeIf {
+                            it.equals("true", true) || it.equals("false", true) || it == "0" || it == "1"
+                        }
+                        log("navigation end type=200 action=${action ?: "unknown"} isArrived=${arrived ?: "unknown"} state=${AmapLinkNavigation.snapshot()?.state}")
+                    }
+                    changed = accepted || changed
                 }
                 if (changed && now >= nextGuidanceLogAt) {
                     nextGuidanceLogAt = now + 5000

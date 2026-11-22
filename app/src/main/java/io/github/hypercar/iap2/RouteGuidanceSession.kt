@@ -11,8 +11,21 @@ internal class RouteGuidanceSession(private val log: (String) -> Unit) {
     private val publishedComponents = mutableSetOf<Int>()
     private var previousEnabled = false
     private var nextUpdate = 0L
+    private var nextHeartbeat = 0L
     private var dirty = false
     private var diagnostic: String? = null
+    private var receiveSupport: Boolean? = null
+
+    fun declareReceiveSupport(supported: Boolean?) {
+        if (receiveSupport == supported) return
+        if (receiveSupport == false || supported == false) {
+            // Freshly permitted consumers need the maneuver again before any reference.
+            dirty = true
+            nextUpdate = 0
+        }
+        receiveSupport = supported
+        log("HUD: 0x1d01 receive_52xx=${supported?.toString() ?: "unknown"}")
+    }
 
     private fun concat(vararg parts: ByteArray): ByteArray = parts.fold(byteArrayOf()) { a, b -> a + b }
 
@@ -41,6 +54,7 @@ internal class RouteGuidanceSession(private val log: (String) -> Unit) {
 
     fun updates(now: Long, enabled: Boolean, cue: NavigationCue?): List<Iap2Csm.Frame> {
         val status = when {
+            receiveSupport == false -> "blocked_by_receive_declaration"
             !enabled -> "disabled"
             subscribers.isEmpty() && cue?.state == 1 -> "source_ready_wait_subscription"
             subscribers.isEmpty() -> "wait_source_and_subscription"
@@ -53,18 +67,21 @@ internal class RouteGuidanceSession(private val log: (String) -> Unit) {
             diagnostic = status
             log("HUD: status=$status subscribers=${subscribers.size}; source readiness is separate from vehicle subscription and display")
         }
+        if (receiveSupport == false) return emptyList()
         if (subscribers.isEmpty()) { published = false; previous = null; publishedComponents.clear(); return emptyList() }
         val current = cue.takeIf { enabled }
         // Box 0x6317c..0x6323c stores the subscription without inventing an initial
         // navigation state. Still clear a route once when a previously published source ends.
         if (current == null && publishedComponents.isEmpty()) return emptyList()
         // When scope/source disappears send one no-route update to clear the old arrow.
-        if (now < nextUpdate || (!dirty && published && current == previous && enabled == previousEnabled)) return emptyList()
+        val unchanged = !dirty && published && current == previous && enabled == previousEnabled
+        val heartbeat = unchanged && current?.state == 1 && now >= nextHeartbeat
+        if (now < nextUpdate || (unchanged && !heartbeat)) return emptyList()
         val frames = mutableListOf<Iap2Csm.Frame>()
         for ((component, subscription) in subscribers) {
             if (current == null && component !in publishedComponents) continue
             val hasManeuver = current?.state == 1 && current.maneuver != null
-            if (hasManeuver) {
+            if (hasManeuver && !heartbeat) {
                 frames += Iap2Csm.Frame(0x5202, concat(
                     Iap2Csm.u16(0, component), Iap2Csm.u16(1, 0),
                     Iap2Csm.string(2, current!!.instruction), Iap2Csm.u8(3, current.maneuver!!),
@@ -80,12 +97,13 @@ internal class RouteGuidanceSession(private val log: (String) -> Unit) {
             frames += Iap2Csm.Frame(0x5201, concat(*fields.toTypedArray()))
             if (current == null) publishedComponents.remove(component) else publishedComponents.add(component)
         }
-        log("HUD: QUEUED components=${subscribers.keys} state=${current?.state ?: 0} maneuver=${current?.maneuver} frames=${frames.size}; awaiting vehicle display validation")
+        log("HUD: QUEUED components=${subscribers.keys} state=${current?.state ?: 0} maneuver=${current?.maneuver} frames=${frames.size} heartbeat=$heartbeat; awaiting vehicle display validation")
         previous = current
         previousEnabled = enabled
         published = current != null
         dirty = false
         nextUpdate = now + 1000
+        nextHeartbeat = now + 10_000
         return frames
     }
 }

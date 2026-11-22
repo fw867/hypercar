@@ -559,6 +559,47 @@ class WifiIap2ProtocolTest {
         assertTrue(car.protocol.advance(car.time + 2000).isEmpty())
     }
 
+    @Test fun hudReceiveDeclarationGatesSubscriptionAndHeartbeatOnTheActualLink() {
+        val car = Car(profileId = "generic")
+        val parameter = Iap2Messages.IDENT_RECEIVE_IDS
+        car.ready(Iap2Csm.u16(parameter, 0x5001))
+        car.navigationAllowed = true
+        car.navigationCue = io.github.hypercar.navigation.NavigationCue("右转", 2, 100)
+        assertTrue(car.message(0x5200, Iap2Csm.u16(0, 77)).isEmpty())
+        assertTrue(car.message(0x1d01, Iap2Csm.param(parameter, byteArrayOf())).none { it.messageId in 0x5201..0x5202 })
+        val supported = car.message(0x1d01, Iap2Csm.u16(parameter, 0x5201))
+        assertEquals(listOf(0x1d02, 0x5202, 0x5201), supported.map { it.messageId })
+        assertArrayEquals(byteArrayOf(0, 77), Iap2Csm.parseParams(supported.last().body).first().value)
+        car.message(0x1d01, Iap2Csm.u16(parameter, 0x5001))
+        car.time += 10_000
+        assertTrue(car.message(0x4154).none { it.messageId in 0x5201..0x5202 })
+
+        // Malformed lists are unknown, so the real subscription is usable again.
+        assertEquals(listOf(0x1d02, 0x5202, 0x5201),
+            car.message(0x1d01, Iap2Csm.param(parameter, byteArrayOf(0x50))).map { it.messageId })
+    }
+
+    @Test fun genericWifiLinkSendsUnchangedHudHeartbeatThenOneClear() {
+        val car = Car(profileId = "generic")
+        car.ready()
+        car.navigationAllowed = true
+        car.navigationCue = io.github.hypercar.navigation.NavigationCue("右转", 2, 100)
+        val first = car.message(0x5200, Iap2Csm.u16(0, 77))
+        assertEquals(listOf(0x5202, 0x5201), first.map { it.messageId })
+        car.time += 10_000
+        val heartbeat = car.message(0x4154).filter { it.messageId in 0x5201..0x5202 }.single()
+        assertEquals(0x5201, heartbeat.messageId)
+        assertArrayEquals(first.last().body, heartbeat.body)
+        car.navigationCue = null
+        car.time += 1_000
+        val clear = car.message(0x4154).filter { it.messageId in 0x5201..0x5202 }.single()
+        assertEquals(0x5201, clear.messageId)
+        assertArrayEquals(byteArrayOf(0, 77), Iap2Csm.parseParams(clear.body).first().value)
+        assertArrayEquals(byteArrayOf(0), Iap2Csm.parseParams(clear.body).single { it.id == 1 }.value)
+        car.time += 10_000
+        assertTrue(car.message(0x4154).none { it.messageId in 0x5201..0x5202 })
+    }
+
     @Test fun communicationsReplyDoesNotClaimUnimplementedPhoneControlsOrInventSimState() {
         val car = Car()
         car.ready()

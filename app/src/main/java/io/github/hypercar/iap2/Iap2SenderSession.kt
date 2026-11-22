@@ -99,7 +99,7 @@ class Iap2SenderSession(
     private var parser = Iap2Csm.Parser()
     private val media = Iap2MediaSession(log, onMediaKey)
     private val nowPlaying = Iap2NowPlayingSession(nowPlayingProvider, log)
-    private val navigation = RouteGuidanceSession(log)
+    private var navigation = RouteGuidanceSession(log)
     private val subscriptions = Iap2StatusSubscriptions(log = log, deviceName = deviceName)
     private var phaseName = "IDLE"
     private var phaseStarted = nanoTime()
@@ -136,6 +136,7 @@ class Iap2SenderSession(
     /** 0x5703 解析结果（保活期车机重发 0x5703 时需重新应答/回调）。 */
     @Volatile
     private var wifi: Iap2Messages.WifiConfiguration? = null
+    private var densoOutback = false
 
     /** 0x4301 是否已产出过端点（区分「首达」与「重发」日志）。 */
     private var endpointEmitted = false
@@ -250,6 +251,7 @@ class Iap2SenderSession(
             throw IOException("MGU-AUTH: auth-first link did not identify as ordinary BMW Apps v1")
         }
         peerIdentification = ident
+        navigation.declareReceiveSupport(ident.acceptsRouteGuidance)
         subscriptions.identify(ident.model, ident.manufacturer)
         media.identify(ident.hidComponents)
         onIdentification(ident)
@@ -410,7 +412,7 @@ class Iap2SenderSession(
                     )
                     wifi = wifiConfiguration
                     // 凭据即刻回调：上层据此绑车机网络 + mDNS，0x4301 到达前就能入网
-                    onEndpoint(endpointOf(null, wifiConfiguration))
+                    onEndpoint(endpointOf(null, wifiConfiguration).copy(densoOutbackWifi = densoOutback))
                     wifiConfiguration
                 }
             }
@@ -700,6 +702,7 @@ class Iap2SenderSession(
     private fun handleReidentification(frame: Iap2Csm.Frame) {
         val ident = Iap2Messages.parseIdentification(frame.body)
         peerIdentification = ident
+        navigation.declareReceiveSupport(ident.acceptsRouteGuidance)
         subscriptions.identify(ident.model, ident.manufacturer)
         media.identify(ident.hidComponents)
         onIdentification(ident)
@@ -770,7 +773,7 @@ class Iap2SenderSession(
                 "psk=${if (parsed.passphrase.isEmpty()) "(空)" else "***"}",
         )
         wifi = parsed
-        onEndpoint(endpointOf(lastStartSession, parsed))
+        onEndpoint(endpointOf(lastStartSession, parsed).copy(densoOutbackWifi = densoOutback))
     }
 
     /** 解析 0x4301 → [CarPlayEndpoint] → 回调；返回解析结果。 */
@@ -1245,6 +1248,7 @@ class Iap2SenderSession(
                     // Late identity can be queued by a Wi-Fi/credential wait. Its capability
                     // boundary must precede the following StartHID, not wait for the keepalive pump.
                     val ident = Iap2Messages.parseIdentification(frame.body)
+                    navigation.declareReceiveSupport(ident.acceptsRouteGuidance)
                     subscriptions.identify(ident.model, ident.manufacturer)
                     media.identify(ident.hidComponents)
                 }
@@ -1268,6 +1272,7 @@ class Iap2SenderSession(
                 media.restartLink()
                 nowPlaying.restartLink()
                 subscriptions.restartLink()
+                navigation = RouteGuidanceSession(log)
                 log("iap2 LINK DETECT restart: 清除旧 CSM 分片；保留 RFCOMM 和当前业务等待")
                 return null
             }
@@ -1311,6 +1316,7 @@ class Iap2SenderSession(
         ident: Iap2Messages.Identification,
         frame: Iap2Csm.Frame,
     ) {
+        densoOutback = io.github.hypercar.net.DensoOutbackProbe.matches(ident.model, ident.manufacturer)
         log("iap2 rx=0x1d01 车机身份 name=${ident.name} model=${ident.model} manufacturer=${ident.manufacturer}")
         ident.sendIds?.let { sends ->
             log("iap2 0x1d01 车机发送清单(${sends.size})=" + sends.sorted().joinToString(" ") { "0x%04x".format(it) })

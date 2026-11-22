@@ -211,6 +211,7 @@ internal class WifiIap2Protocol(
         }
         if (id == 0x1d01 && phase == "READY") {
             val ident = Iap2Messages.parseIdentification(frame.body)
+            navigation.declareReceiveSupport(ident.acceptsRouteGuidance)
             subscriptions.identify(ident.model, ident.manufacturer)
             media.identify(ident.hidComponents)
             send(0x1d02)
@@ -228,6 +229,7 @@ internal class WifiIap2Protocol(
             0x1d01 -> if (phase == "IDENTIFICATION") {
                 val identification = Iap2Messages.parseIdentification(frame.body)
                 this.identification = identification
+                navigation.declareReceiveSupport(identification.acceptsRouteGuidance)
                 subscriptions.identify(identification.model, identification.manufacturer)
                 media.identify(identification.hidComponents)
                 val serialSupported = identification.declaresSend(0xaa06) == true

@@ -460,11 +460,10 @@ object HyperCarRepo {
     val hasCurrentSession: Boolean get() = sessionLive.get() || connecting || streaming
     internal val hasAirPlayTransport: Boolean get() = sessionLive.get() && sessionSockets != null
 
-    /** BMW HUD: AMap notifications for self UI or structured CarWith data; other profiles send none. */
+    /** Source eligibility. Each iAP2 link checks its peer's declaration and subscriptions. */
     @Volatile private var hudSessionEnabled = false
     internal val hudNavigationAllowed: Boolean get() = hudSessionEnabled && hasCurrentSession &&
         sessionCarWithMode == SettingsStore.carWithMode &&
-        headUnitProfile.id == io.github.hypercar.headunit.HeadUnitProfiles.BMW_ID85.id &&
         (sessionCarWithMode || io.github.hypercar.carui.CarUiSettings.defaultMap == io.github.hypercar.carui.MapProvider.AMAP)
     internal val carWithHudNavigationAllowed: Boolean get() = hudNavigationAllowed && sessionCarWithMode
     internal val mapNavigationAllowed: Boolean get() = hasCurrentSession && !sessionCarWithMode &&
@@ -3301,6 +3300,7 @@ object HyperCarRepo {
         }
 
         val callbacks = Channel<CarPlayEndpoint>(Channel.UNLIMITED)
+        var densoProbe: Job? = null
         val joinHints = AtomicReference<CarPlayEndpoint?>(null)
         coordinator.start { endpoint ->
             if (connectionAttemptId != diagnosticId || !sessionLive.get() || iap2 !== coordinator) return@start
@@ -3489,6 +3489,43 @@ object HyperCarRepo {
                     advertisedSsid = merged.ssid
                     connectionDiagnostics.mark(connectionAttemptId, ConnectionDiagnostics.Stage.WIFI_BOUND)
                     advertiser.ensureForNetwork(merged.ssid, network = network)
+                    val hotspot = next.bluetoothHotspot
+                    if (densoProbe == null && !invitationOnly && next.densoOutbackWifi &&
+                        hotspot != null && next.canRequestHotspot(currentBluetoothHotspot(diagnosticId)) &&
+                        !advertiser.hasUnresolvedOrPublishedInvite) {
+                        densoProbe = launch {
+                            // Give the freshly advertised ctrl listener an invitation window first.
+                            fun mayProbe() = sessionLive.get() && connectionAttemptId == diagnosticId &&
+                                iap2 === coordinator && boundNetwork == network && ctrlAdvertiser === advertiser &&
+                                currentBluetoothHotspot(diagnosticId) == hotspot && !advertiser.hasUnresolvedOrPublishedInvite
+                            try {
+                                delay(2_000)
+                                val result = io.github.hypercar.net.DensoOutbackProbe.probe(::mayProbe, {
+                                    val manager = context.getSystemService(ConnectivityManager::class.java)
+                                    AirplayServiceProbe(context, ::log).browse(network, strictNetwork = true) { candidate ->
+                                        val address = runCatching {
+                                            android.net.InetAddresses.parseNumericAddress(candidate.host.substringBefore('%'))
+                                        }.getOrNull()
+                                        val link = manager?.getLinkProperties(network)
+                                        mayProbe() && address != null && !address.isAnyLocalAddress &&
+                                            !address.isLoopbackAddress && !address.isMulticastAddress && link != null &&
+                                            link.linkAddresses.none { it.address == address } &&
+                                            link.routes.any { it.destination.prefixLength > 0 &&
+                                                !it.hasGateway() && it.destination.contains(address) }
+                                    }
+                                }) { endpoint ->
+                                    io.github.hypercar.net.DensoOutbackProbe.requestInfo(
+                                        endpoint, { network.socketFactory.createSocket() }, ::mayProbe)
+                                }
+                                log("DENSO-OUTBACK: attempt=$diagnosticId network=#$network GET /info $result")
+                            } catch (cancelled: CancellationException) {
+                                log("DENSO-OUTBACK: attempt=$diagnosticId network=#$network probe cancelled; invitation or wait ended")
+                                throw cancelled
+                            } catch (error: Exception) {
+                                log("DENSO-OUTBACK: attempt=$diagnosticId network=#$network probe failed ${error.javaClass.simpleName}: ${error.message}")
+                            }
+                        }
+                    }
                 }
                 // Only fresh coordinator callbacks reach here; cached/scanned endpoints
                 // are gated separately during fallback. A fresh 0x4301 is also a receiver invitation.
@@ -3511,6 +3548,7 @@ object HyperCarRepo {
             awaitingCarInvitation = false
             usable
         } finally {
+            densoProbe?.cancel()
             callbacks.close()
         }
     }

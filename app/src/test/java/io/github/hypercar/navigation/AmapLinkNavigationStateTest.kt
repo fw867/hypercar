@@ -3,6 +3,8 @@ package io.github.hypercar.navigation
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
+import io.github.hypercar.iap2.Iap2Csm
+import io.github.hypercar.iap2.RouteGuidanceSession
 
 class AmapLinkNavigationStateTest {
     // Shape and non-sensitive numeric fields from the real 598 callback; road text is synthetic.
@@ -35,9 +37,52 @@ class AmapLinkNavigationStateTest {
         state.clear(old)
         assertFalse(state.accept(old, 4, info(), 3))
         assertTrue(state.accept(current, 4, info(), 4))
-        state.accept(current, 200, null, 5)
+        state.accept(current, 200, JSONObject().put("isArrived", true), 5)
         assertEquals(2, state.snapshot(6)!!.state)
         state.clear(); assertNull(state.snapshot(7))
+    }
+    @Test fun manualExitClearsRouteOnceAndStopsHeartbeats() {
+        val state = AmapLinkNavigationState(); val token = state.begin()
+        val hud = RouteGuidanceSession {}
+        hud.handle(Iap2Csm.Frame(0x5200, Iap2Csm.u16(0, 77)))
+        state.accept(token, 4, info(), 0)
+        assertEquals(listOf(0x5202, 0x5201), hud.updates(0, true, state.snapshot(0)).map { it.messageId })
+        val end = JSONObject().put("isArrived", false).put("action", 0)
+        state.accept(token, 200, end, 1000)
+        assertEquals(0, state.snapshot(1000)!!.state)
+        val clear = hud.updates(1000, true, state.snapshot(1000)).single()
+        assertEquals(0x5201, clear.messageId)
+        val params = Iap2Csm.parseParams(clear.body)
+        assertArrayEquals(byteArrayOf(0, 77), params.single { it.id == 0 }.value)
+        assertArrayEquals(byteArrayOf(0), params.single { it.id == 1 }.value)
+        state.accept(token, 100, null, 2000)
+        state.accept(token, 200, end, 2001)
+        assertTrue(hud.updates(12_000, true, state.snapshot(12_000)).isEmpty())
+    }
+
+    @Test fun confirmedArrivalSendsStateTwoEvenIfTheStopEventFollowsBeforeSending() {
+        val state = AmapLinkNavigationState(); val token = state.begin()
+        val hud = RouteGuidanceSession {}
+        hud.handle(Iap2Csm.Frame(0x5200, Iap2Csm.u16(0, 77)))
+        state.accept(token, 4, info(), 0)
+        hud.updates(0, true, state.snapshot(0))
+        state.accept(token, 200, JSONObject().put("isArrived", true), 1000)
+        state.accept(token, 100, null, 1001)
+        // Link delivered a residual type 4 before the Bluetooth pump could send arrival.
+        assertFalse(state.accept(token, 4, info(), 1050))
+        val arrival = hud.updates(1150, true, state.snapshot(1150)).single()
+        assertEquals(0x5201, arrival.messageId)
+        assertArrayEquals(byteArrayOf(2), Iap2Csm.parseParams(arrival.body).single { it.id == 1 }.value)
+        assertTrue(hud.updates(12_000, true, state.snapshot(12_000)).isEmpty())
+        assertTrue(state.accept(token, 4, info(), 12_100))
+        assertEquals(1, state.snapshot(12_100)!!.state)
+    }
+
+    @Test fun type200WithoutAnArrivalFlagClearsInsteadOfClaimingArrival() {
+        val state = AmapLinkNavigationState(); val token = state.begin()
+        state.accept(token, 4, info(), 0)
+        state.accept(token, 200, JSONObject().put("action", 0), 1)
+        assertEquals(0, state.snapshot(1)!!.state)
     }
     @Test fun naviModeSnapshotAfterGuidanceDoesNotClearTheCurrentArrow() {
         val state = AmapLinkNavigationState(); val token = state.begin()

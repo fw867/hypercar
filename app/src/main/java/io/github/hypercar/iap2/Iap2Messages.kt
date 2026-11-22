@@ -186,6 +186,7 @@ object Iap2Messages {
         val hasWirelessCarPlayComponent: Boolean,
         val hidComponents: List<HidComponent> = emptyList(),
         val vehicleStatusFields: Set<Int> = emptySet(),
+        val acceptsRouteGuidance: Boolean? = null,
     ) {
         /** 车机是否声明会发某消息；null = 未提供清单（未知）。 */
         fun declaresSend(messageId: Int): Boolean? = sendIds?.contains(messageId)
@@ -237,6 +238,10 @@ object Iap2Messages {
         val firstById = params.groupBy { it.id }.mapValues { it.value.first() }
         val sendIds = firstById[IDENT_SEND_IDS]?.asU16List()?.takeIf { it.isNotEmpty() }?.toSet()
         val receiveIds = firstById[IDENT_RECEIVE_IDS]?.asU16List()?.takeIf { it.isNotEmpty() }?.toSet()
+        // Treat an explicit empty receive list as a denial only for RouteGuidance.
+        val routeGuidance = params.singleOrNull { it.id == IDENT_RECEIVE_IDS }
+            ?.takeIf { it.value.size % 2 == 0 && params.sumOf { param -> param.value.size + 4 } == body.size }
+            ?.asU16List()?.any { it in 0x5200..0x52ff }
         val ea = ArrayList<EaProtocol>()
         // 按出现顺序（车机给的顺序就是它的优先级），不要再按 id 排序/去重
         for (param in params) {
@@ -252,6 +257,7 @@ object Iap2Messages {
             manufacturer = firstById[IDENT_MANUFACTURER]?.asStringOrNull(),
             sendIds = sendIds,
             receiveIds = receiveIds,
+            acceptsRouteGuidance = routeGuidance,
             eaProtocols = ea,
             hasWirelessCarPlayComponent = firstById[IDENT_WIRELESS_CARPLAY_COMPONENT] != null,
             hidComponents = params.filter { it.id == 0x12 }.take(32).mapNotNull { component ->

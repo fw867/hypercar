@@ -68,6 +68,23 @@ class RouteGuidanceSessionTest {
         assertEquals(2, s.updates(1001, true, cue.copy(distanceMeters = 200)).size)
     }
 
+    @Test fun unchangedActiveRouteSendsOnlyStatusEveryTenSecondsUntilCleared() {
+        val s = RouteGuidanceSession {}
+        s.handle(start(0x1234))
+        val original = s.updates(0, true, cue)
+        assertEquals(listOf(0x5202, 0x5201), original.map { it.messageId })
+        assertTrue(s.updates(9_999, true, cue).isEmpty())
+        val heartbeat = s.updates(10_000, true, cue).single()
+        assertEquals(0x5201, heartbeat.messageId)
+        assertArrayEquals(original.last().body, heartbeat.body)
+        assertTrue(s.updates(19_999, true, cue).isEmpty())
+        assertEquals(0x5201, s.updates(20_000, true, cue).single().messageId)
+        val clear = s.updates(21_000, true, cue.copy(state = 0)).single()
+        assertEquals(0x5201, clear.messageId)
+        assertArrayEquals(byteArrayOf(0), fields(clear)[1])
+        assertTrue(s.updates(31_000, true, cue.copy(state = 0)).isEmpty())
+    }
+
     @Test fun structuredCarWithUturnReachesWireAsCpUturnWithRoadAndActualSource() {
         val s = RouteGuidanceSession {}; s.handle(start(42))
         val cue = io.github.hypercar.navigation.CarWithCueMapper.map(2, 5, 35, "test")!!
