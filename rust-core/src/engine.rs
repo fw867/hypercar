@@ -916,8 +916,9 @@ pub(crate) async fn video_pump(
 ) {
     let diagnostic_phase = VideoLogLease(source_owner.and_then(crate::carwith_source::diagnostic_phase));
     let transcode = carwith_profile.is_some();
-    let mut converter=crate::video_transcode::Router::new(transcode,fps,crate::video_transcode::hardware_factory());
-    converter.fit_oversize_display = carwith_profile.as_deref() == Some("bmw_id9");
+    let mut converter = crate::video_transcode::Router::for_carwith_profile(
+        carwith_profile.as_deref(), fps, crate::video_transcode::hardware_factory(),
+    );
     let mut converted=std::collections::VecDeque::new();
     let mut sender: Option<ScreenSender> = None;
     let mut commands_open = true;

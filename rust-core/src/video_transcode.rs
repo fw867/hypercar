@@ -10,7 +10,7 @@ pub trait Codec: Send {
 }
 type Factory = Box<dyn FnMut(VideoCodec,VideoCodec,(u32,u32),(u32,u32),u32,&[u8])->io::Result<Box<dyn Codec>> + Send>;
 pub struct Router {
-    pub fit_oversize_display: bool,
+    fit_oversize_display: bool,
     enabled:bool, fps:u32, factory:Factory, active:Option<Box<dyn Codec>>, failed:bool,
     output_size: Option<(u32,u32)>, target: Option<(u32,u32)>, input_codec: Option<VideoCodec>, vps: Vec<u8>,
     sps:Vec<u8>,pps:Vec<u8>,waiting:bool, submitted:u64,produced:u64,
@@ -22,6 +22,13 @@ pub struct Router {
 }
 impl Router {
     pub fn new(enabled:bool,fps:u32,factory:Factory)->Self {Self {fit_oversize_display:false,output_size:None,target:None,input_codec:None,vps:vec![],origins:VecDeque::new(),enabled,fps,factory,active:None,failed:false,sps:vec![],pps:vec![],waiting:true,submitted:0,produced:0,progress:std::time::Instant::now(),last_input:std::time::Instant::now()}}
+    pub fn for_carwith_profile(profile: Option<&str>, fps: u32, factory: Factory) -> Self {
+        let mut router = Self::new(profile.is_some(), fps, factory);
+        // These wide BMW displays can present a smaller, near-ratio stream without filling
+        // the touch surface. Encode at the receiver size while keeping the input canvas.
+        router.fit_oversize_display = matches!(profile, Some("bmw_id85" | "bmw_id9"));
+        router
+    }
     pub fn reset(&mut self) {
         self.pause();
         self.failed = false;
@@ -262,15 +269,37 @@ pub fn hardware_factory()->Factory {Box::new(|codec,output,(w,h),(tw,th),fps,csd
         }
     }
     #[test]
-    fn id9_fills_oversize_screen_from_actual_source_even_when_aspect_matches() {
-        let (mut router, _) = router(true,false);
-        router.set_target(Some((2880,960)));
-        assert_eq!(router.output_canvas((2560,852)), (2560,852));
-        router.fit_oversize_display = true;
-        for actual in [(2560,852), (2400,800), (1024,576)] {
-            assert_eq!(router.output_canvas(actual), (2880,960));
+    fn bmw_carwith_fills_oversize_screen_even_when_the_source_aspect_matches() {
+        for (profile, source, display) in [
+            ("bmw_id85", (2560, 748), (2736, 800)),
+            ("bmw_id9", (2560, 852), (2880, 960)),
+        ] {
+            let mut router = Router::for_carwith_profile(Some(profile), 60,
+                Box::new(|_, _, _, _, _, _| panic!("canvas negotiation should not start the codec")));
+            router.set_target(Some(display));
+            assert_eq!(router.output_canvas(source), display);
+            router.set_target(Some((2560, 748)));
+            assert_eq!(router.output_canvas((2500, 730)), (2500, 730));
         }
+        let mut router = Router::for_carwith_profile(Some("generic"), 60,
+            Box::new(|_, _, _, _, _, _| panic!("canvas negotiation should not start the codec")));
+        router.set_target(Some((2736, 800)));
+        assert_eq!(router.output_canvas((2560, 748)), (2560, 748));
     }
+    #[test]
+    fn bmw_id85_avc_only_receiver_starts_native_size_transcoding() {
+        let mut router = Router::for_carwith_profile(Some("bmw_id85"), 60,
+            Box::new(|input, output, source, target, _, _| {
+                assert_eq!((input, output), (VideoCodec::H264, VideoCodec::H264));
+                assert_eq!((source, target), ((2560, 744), (2736, 800)));
+                Ok(Box::new(Fake { output, fail: false, pending: vec![] }))
+            }));
+        router.set_target(Some((2736, 800)));
+        let frames = router.input(false, 90, avc_with_sps(SPS_744, true), VideoCodec::H264, FrameOrigin::Live);
+        assert_eq!(router.output_size(), Some((2736, 800)));
+        assert_eq!((frames[0].pts, frames[0].codec, frames[0].origin), (90, VideoCodec::H264, FrameOrigin::Live));
+    }
+
     #[test]
     fn stretch_threshold_is_strict_and_source_relative() {
         for dw in [970,1030] { assert!(!needs_stretch((1000,500),(dw,500))); }
