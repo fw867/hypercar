@@ -524,7 +524,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ports = [listener.local_addr().unwrap().port(); 7];
         let (_hub, mut output) = CarLifeHub::connect_to_ports(cfg(), "127.0.0.1".into(), ports,
-            stop.clone(), None, || panic!("retired owner reopened")).unwrap();
+            stop.clone(), None, |_| panic!("retired owner reopened")).unwrap();
         assert!(output.recv().await.is_none());
         assert!(tokio::time::timeout(Duration::from_millis(1), listener.accept()).await.is_err());
     }
@@ -541,17 +541,17 @@ mod tests {
         }
         let old_stop = Arc::new(DialStop::default());
         let (_old, mut old_events) = CarLifeHub::connect_to_ports(cfg(), "127.0.0.1".into(), ports,
-            old_stop.clone(), None, || {}).unwrap();
+            old_stop.clone(), None, |_| {}).unwrap();
         let mut peers = Vec::new();
         for listener in &listeners { peers.push(listener.accept().await.unwrap().0); }
         assert!(matches!(old_events.recv().await, Some(CarLifeEvent::SourceReset { .. })));
         // An intermediate cancelled invitation must not let its successor bypass the old task.
         let skipped_stop = Arc::new(DialStop::default());
         let (_skipped, mut skipped_events) = CarLifeHub::connect_to_ports(cfg(), "127.0.0.1".into(), ports,
-            skipped_stop.clone(), None, || {}).unwrap();
+            skipped_stop.clone(), None, |_| {}).unwrap();
         skipped_stop.cancel();
         let (_new, _events) = CarLifeHub::connect_to_ports(cfg(), "127.0.0.1".into(), ports,
-            Arc::new(DialStop::default()), None, || {}).unwrap();
+            Arc::new(DialStop::default()), None, |_| {}).unwrap();
         assert!(tokio::time::timeout(Duration::from_millis(80), listeners[0].accept()).await.is_err(),
             "new owner dialed while the previous seven sockets were live");
         old_stop.cancel();
@@ -795,7 +795,7 @@ mod tests {
         use std::io::Write;
         let stop=Arc::new(DialStop::default());
         let mut config=cfg();config.width=2732;config.height=794;
-        let (_hub,mut events)=CarLifeHub::connect(config,"127.0.0.1".into(),stop.clone(),None, || {}).unwrap();
+        let (_hub,mut events)=CarLifeHub::connect(config,"127.0.0.1".into(),stop.clone(),None, |_| {}).unwrap();
         let mut authenticated=false;let mut frames=0;let mut touched=false;
         let began=std::time::Instant::now();
         let mut capture=std::fs::File::create("/data/local/tmp/hypercar-carwith-video.h264").unwrap();
@@ -833,7 +833,8 @@ mod tests {
         let receiver = (2880, height);
         let display = DisplayRequest::new((0, 0));
         let stop = Arc::new(DialStop::default());
-        let (_hub, mut events) = CarLifeHub::connect(cfg(), "127.0.0.1".into(), stop.clone(), Some(display.clone()), || {
+        let (_hub, mut events) = CarLifeHub::connect(cfg(), "127.0.0.1".into(), stop.clone(), Some(display.clone()), |startup| {
+            if startup { return; }
             // This opt-in probe runs as adb shell; the app uses the attempt-scoped Kotlin callback.
             let status = std::process::Command::new("/system/bin/am").args(["start", "-n",
                 "com.miui.carlink/com.miui.carlink.castfwk.usb.CarlifeAdbActivity"]).status().unwrap();
@@ -899,7 +900,7 @@ mod tests {
         let began = start_probe_timeline();
         let stop=Arc::new(DialStop::default());
         let mut config=cfg();config.width=2736;config.height=800;
-        let (_hub,mut events)=CarLifeHub::connect(config,"127.0.0.1".into(),stop.clone(),None, || {}).unwrap();
+        let (_hub,mut events)=CarLifeHub::connect(config,"127.0.0.1".into(),stop.clone(),None, |_| {}).unwrap();
         let mut authenticated=false;
         let mut frames=0;
         let mut first_idr=None;

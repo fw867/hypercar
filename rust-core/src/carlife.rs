@@ -242,7 +242,7 @@ impl CarLifeHub {
     /// Android CarWith uses this active seven-channel loopback connection.
     pub fn connect(
         cfg: CarLifeConfig, md_host: String, stop: Arc<DialStop>, requested: Option<DisplayRequest>,
-        reopen_source: impl Fn() + Send + 'static,
+        reopen_source: impl Fn(bool) + Send + 'static,
     ) -> Result<(Self, mpsc::UnboundedReceiver<CarLifeEvent>), String> {
         Self::connect_to_ports(cfg, md_host, [PORT_CMD,PORT_VIDEO,PORT_MEDIA,PORT_TTS,PORT_VR,PORT_CTRL,PORT_DATA],
             stop, requested, reopen_source)
@@ -250,7 +250,7 @@ impl CarLifeHub {
 
     fn connect_to_ports(
         cfg: CarLifeConfig, md_host: String, ports: [u16; 7], stop: Arc<DialStop>, requested: Option<DisplayRequest>,
-        reopen_source: impl Fn() + Send + 'static,
+        reopen_source: impl Fn(bool) + Send + 'static,
     ) -> Result<(Self, mpsc::UnboundedReceiver<CarLifeEvent>), String> {
         let keyframe_request = Arc::new(Notify::new());
         let reset_request = keyframe_request.clone();
@@ -278,14 +278,36 @@ impl CarLifeHub {
         *last_dialer = Some(tokio::spawn(async move {
             if let Some(previous) = previous { let _ = previous.await; }
             let mut throttle=DialLogThrottle::new();
+            let mut startup_refusals = 0;
+            let mut first_round_pending = true;
             loop {
                 // Own all seven sockets together. A failed/closed CMD invalidates the whole round.
                 let mut sockets=Vec::new();
                 for port in ports {
                     let Some(result) = stop.dial(&md_host, port).await else { return; };
                     match result {
-                        Ok(socket)=>sockets.push(socket),
-                        Err(error)=>{ if throttle.ready() {emit_log(&format!("CARWITH-HS: waiting for all seven channels; port={port} error={error}"));} break; }
+                        Ok(socket) => {
+                            if sockets.is_empty() { startup_refusals = 0; }
+                            sockets.push(socket);
+                        }
+                        Err(error) => {
+                            if first_round_pending && sockets.is_empty() &&
+                                error.kind() == std::io::ErrorKind::ConnectionRefused {
+                                startup_refusals += 1;
+                                if startup_refusals == 8 {
+                                    startup_refusals = 0;
+                                    // The Android attempt gate submits at most one startup retry.
+                                    // Keep checking until the AirPlay listener is available.
+                                    if !stop.is_retired() { reopen_source(true); }
+                                }
+                            } else {
+                                startup_refusals = 0;
+                            }
+                            if throttle.ready() {
+                                emit_log(&format!("CARWITH-HS: waiting for all seven channels; port={port} error={error}"));
+                            }
+                            break;
+                        }
                     }
                 }
                 if sockets.len()!=ports.len() {
@@ -294,6 +316,7 @@ impl CarLifeHub {
                     continue;
                 }
                 if stop.is_retired() { return; }
+                first_round_pending = false;
                 emit_log("CARWITH-HS: all seven channels connected; start fresh 4.1 handshake");
                 queue.lock().clear();
                 *round_touch.lock()=session::TouchGesture::default();
@@ -336,7 +359,7 @@ impl CarLifeHub {
                     // All producers for the old round have exited. Flush their queued events
                     // and the replay cache before letting a reattached engine see the waiting period.
                     if !wait_for_canvas_reopen(&events_task, &stop).await || stop.is_retired() { return; }
-                    reopen_source();
+                    reopen_source(false);
                     continue;
                 }
                 emit_log(&format!("CARWITH-HS: round closed: {}",outcome.unwrap_err()));

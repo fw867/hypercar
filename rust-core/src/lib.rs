@@ -121,9 +121,9 @@ pub(crate) fn emit_log(line: &str) {
     });
 }
 
-pub(crate) fn reopen_carwith_entry(owner: u64) {
+pub(crate) fn reopen_carwith_entry(owner: u64, startup: bool) {
     call_listener("onCarWithReopen", |env, obj| {
-        env.call_method(obj, "onCarWithReopen", "(J)V", &[(owner as jlong).into()]).map(|_| ())
+        env.call_method(obj, "onCarWithReopen", "(JZ)V", &[(owner as jlong).into(), jni::sys::jboolean::from(startup).into()]).map(|_| ())
     });
 }
 

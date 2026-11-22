@@ -3003,13 +3003,14 @@ object HyperCarRepo {
             }
         }
 
-        override fun onCarWithReopen(attempt: Long) {
-            if (!carWithEntries.claimReopen(attempt)) return
+        override fun onCarWithReopen(attempt: Long, startup: Boolean) {
+            if (!carWithEntries.claimReopen(attempt, startup)) return
             scope.launch {
                 val ctx = appContext() ?: return@launch
                 if (!sessionLive.get() || connectionAttemptId != attempt || !sessionCarWithMode) return@launch
-                log("CARWITH-SIZE: 车机画布迟到，重新启动本机 CarWith 入口 attempt=$attempt")
-                log("CARWITH-SIZE: " + launchCarWith(ctx, attempt))
+                val reason = if (startup) "源端 CMD 持续拒绝连接" else "车机画布迟到"
+                log("CARWITH-START: $reason，重新启动本机 CarWith 入口 attempt=$attempt")
+                log("CARWITH-START: attempt=$attempt " + launchCarWith(ctx, attempt))
             }
         }
 
