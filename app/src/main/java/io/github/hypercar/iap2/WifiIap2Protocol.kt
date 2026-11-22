@@ -18,7 +18,7 @@ internal class WifiIap2Protocol(
     private val onPeerSynAccepted: () -> Unit = {},
 ) {
     private val audiMib3 = profileId == "audi_mib3"
-    private val challengeSize = if (audiMib3) 20 else 32
+    private val challengeSize = if (audiMib3 || profileId == "bmw_id6") 20 else 32
     private val engine = Iap2LinkEngine(reliableTransport = true, declaredWindow = 32)
     private var parser = Iap2Csm.Parser()
     private val media = Iap2MediaSession(log, onMediaKey)

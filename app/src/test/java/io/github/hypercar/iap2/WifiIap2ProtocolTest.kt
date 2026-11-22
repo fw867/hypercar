@@ -293,8 +293,25 @@ class WifiIap2ProtocolTest {
         assertTrue(car.protocol.diagnosticSummary.contains("aa02_ack=true aa03_rx=true"))
     }
 
+    @Test fun bmwId6WifiUses20ByteChallengeAndWaitsForAa03BeforeAa05() {
+        val car = Car(profileId = "bmw_id6")
+        assertEquals(listOf(0x1d00), car.start().map { it.messageId })
+        assertEquals(listOf(0x1d02, 0xaa00), car.message(0x1d01).map { it.messageId })
+
+        val challenge = car.message(0xaa01, Iap2Csm.param(0, ByteArray(908) { 1 })).single()
+        assertEquals(0xaa02, challenge.messageId)
+        assertArrayEquals(ByteArray(20) { 7 }, Iap2Csm.parseParams(challenge.body).single().value)
+        assertTrue(car.feed(packet(0x40, car.sequence, car.ack)).isEmpty())
+        assertEquals("CHALLENGE", car.protocol.diagnosticPhase)
+
+        val output = car.message(0xaa03, Iap2Csm.param(0, ByteArray(128) { 9 }))
+        assertEquals(listOf(0xaa05), output.filter { it.messageId == 0xaa05 }.map { it.messageId })
+        assertEquals(0xaa05, output.first().messageId)
+        assertFalse(car.protocol.failed)
+    }
+
     @Test fun otherWifiProfilesRetain32ByteChallenge() {
-        for (profile in listOf("", "bmw_id85", "bmw_id9", "mercedes_mbux", "volkswagen_mib")) {
+        for (profile in listOf("", "generic", "bmw_id85", "bmw_id9", "mercedes_mbux", "volkswagen_mib")) {
             Car(profileId = profile).ready()
         }
     }
