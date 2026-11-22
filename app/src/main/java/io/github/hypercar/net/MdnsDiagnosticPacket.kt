@@ -8,7 +8,10 @@ internal data class MdnsDiagnosticPacket(
     val details: List<String>,
     val announcement: Announcement? = null,
     val ctrlQuestion: Boolean = false,
+    val carPlaySources: List<CarPlaySource> = emptyList(),
 ) {
+    /** 网络中广播的 CarPlay 源（实例名不含 _carplay-ctrl._tcp.local 后缀）。 */
+    data class CarPlaySource(val instance: String, val port: Int, val txt: Set<String>)
     data class Announcement(val instance: String, val host: String, val port: Int, val txt: Set<String>, val addresses: Set<InetAddress>) {
         fun matches(name: String, port: Int, mac: String, version: String, linkAddresses: Set<InetAddress>): Boolean =
             instance == "${name.lowercase()}.$CTRL" && this.port == port &&
@@ -81,6 +84,8 @@ internal data class MdnsDiagnosticPacket(
             var pos = 12
             val details = mutableListOf<String>()
             var ctrlQuestion = false
+            val srcPorts = mutableMapOf<String, Int>()
+            val srcTxts = mutableMapOf<String, Set<String>>()
             val replayRecords = if (flags == 0x8400 && u16(0) == 0 && questions == 0 && answers > 0 && authorityEnd == answers)
                 mutableListOf<Record>() else null
             repeat(questions) {
@@ -118,6 +123,7 @@ internal data class MdnsDiagnosticPacket(
                         require(n >= 7)
                         val (target, next) = name(start + 6); require(next == pos)
                         replay = replay.copy(target = target, port = u16(start + 4))
+                        if (owner.endsWith(".$CTRL")) srcPorts[owner] = u16(start + 4)
                         if (service(owner)) "port=${u16(start + 4)} host=$target" else null
                     }
                     16 -> {
@@ -132,6 +138,7 @@ internal data class MdnsDiagnosticPacket(
                         }
                         // Do not retain unknown TXT fields or replay packets that contain any.
                         replay = replay.copy(txt = allowed.map { it.lowercase() }.toSet().takeIf { it.size == count }.orEmpty())
+                        if (owner.endsWith(".$CTRL") && allowed.isNotEmpty()) srcTxts[owner] = allowed.map { it.lowercase() }.toSet()
                         if (service(owner)) "txt=[${allowed.joinToString(",")}]" else null
                     }
                     1, 28 -> {
@@ -146,7 +153,10 @@ internal data class MdnsDiagnosticPacket(
                 if (value != null) details += "RR section=$section name=$owner type=$type ttl=$ttl flush=${cls and 0x8000 != 0} $value"
             }
             val announcement = replayRecords?.takeIf { pos == bytes.size }?.let(::completeAnnouncement)
-            MdnsDiagnosticPacket(response, details, announcement, ctrlQuestion)
+            val carPlaySources = srcPorts
+                .map { (inst, port) -> CarPlaySource(inst.removeSuffix(".$CTRL"), port, srcTxts[inst].orEmpty()) }
+                .distinct()
+            MdnsDiagnosticPacket(response, details, announcement, ctrlQuestion, carPlaySources)
         }.getOrNull()
     }
 }

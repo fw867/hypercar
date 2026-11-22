@@ -36,6 +36,8 @@ internal class CtrlMdnsObserver(
         val source: InetAddress, val seenAt: Long,
     )
     private val localAnnouncements = ConcurrentHashMap<Int, LocalAnnouncement>(2)
+    // 同网络其他 CarPlay 源（实例名@ip:port 去重），首次见到即落诊断日志。
+    private val foreignCarPlaySources = ConcurrentHashMap.newKeySet<String>()
     private fun linkProperties() = context.getSystemService(ConnectivityManager::class.java)?.getLinkProperties(network)
     // Both receive workers share the same short-lived view; replay deliberately bypasses it.
     private val localAddresses = MdnsLocalAddressCache(SystemClock::elapsedRealtime) {
@@ -146,6 +148,15 @@ internal class CtrlMdnsObserver(
                 val wire = bytes.copyOf(packet.length)
                 val decoded = MdnsDiagnosticPacket.decode(wire)
                 if (decoded == null) { malformed++; continue }
+                val addrs = localAddresses.current()
+                if (addrs != null && !(packet.address in addrs) && decoded.carPlaySources.isNotEmpty()) {
+                    for (src in decoded.carPlaySources) {
+                        val key = "${src.instance}@${packet.address.hostAddress}:${src.port}"
+                        if (foreignCarPlaySources.add(key)) {
+                            log("MDNS-OBS: $prefix competitor instance=${src.instance} ${packet.address.hostAddress}:${src.port} txt=[${src.txt.joinToString(",")}]；车机若持续不发 ctrl 邀请，检查车机手机列表是否优先了其它 CarPlay 源（移除/断开其它手机）")
+                        }
+                    }
+                }
                 if (decoded.announcement != null || decoded.ctrlQuestion) {
                     val addresses = localAddresses.current()
                     if (!closed && addresses != null) {

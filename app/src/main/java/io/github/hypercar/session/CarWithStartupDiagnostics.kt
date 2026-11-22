@@ -50,7 +50,7 @@ internal object CarWithStartupDiagnostics {
 
     /** 端口上已有 LISTEN 或 ESTABLISHED 条目即视为源端就绪；监听表不可读时返回 false。 */
     fun isListening(port: Int, tables: List<String> = LOCAL_TABLES): Boolean =
-        localPortState(port, tables)?.any { it.startsWith("LISTEN") || it.startsWith("ESTABLISHED") } == true
+        localPortState(port, tables)?.split(",")?.any { it.startsWith("LISTEN") || it.startsWith("ESTABLISHED") } == true
 
     suspend fun collect(sinceMillis: Long, emit: (String) -> Unit) {
         if (!ShizukuTools.isReady) {
