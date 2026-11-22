@@ -14,6 +14,8 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.SystemClock
 import io.github.hypercar.bluetooth.BtProfiles
+import io.github.hypercar.bluetooth.isBmwBluetoothName
+import io.github.hypercar.settings.SettingsStore
 import java.io.Closeable
 import java.io.IOException
 import java.io.InterruptedIOException
@@ -900,8 +902,11 @@ class Iap2Bluetooth(
             log("BT-WORKER: entry=$tag attempt=$attempt handshake=$handshakeId acceptedUptimeMs=${inboundAt ?: "none"} " +
                 "ticket=$ticket peer=${safeAddress(socket.remoteDevice)} ${diagnosticSummary()}")
             // 记住本轮对端车机（ACL 广播可能没收到，记录「已配对车机」要靠它拿 MAC）
-            runCatching { Iap2Peer.remember(safeAddress(socket.remoteDevice), safeName(socket.remoteDevice)) }
-            val evidence = io.github.hypercar.session.PairingEvidence.read(appContext.filesDir, safeAddress(socket.remoteDevice))
+            val receiver = socket.remoteDevice
+            val receiverAddress = safeAddress(receiver)
+            val receiverName = runCatching { safeName(receiver) }.getOrNull()
+            runCatching { Iap2Peer.remember(receiverAddress, receiverName) }
+            val evidence = io.github.hypercar.session.PairingEvidence.read(appContext.filesDir, receiverAddress)
             sessionLog(handshakeBeginLine(tag, targetProvider() ?: "自动", evidence.identityPresent, evidence.receiverCredentialPresent))
             val deviceName = io.github.hypercar.bluetooth.LocalDeviceName.snapshot()
             val service = if (probeAdmission != null || tag == "BT-C") "…caff" else "…cafe"
@@ -934,8 +939,10 @@ class Iap2Bluetooth(
                         if (accepted) onEndpoint(endpoint)
                     },
                     context = appContext,
-                    receiverAddress = safeAddress(socket.remoteDevice),
+                    receiverAddress = receiverAddress,
                     pairedReceiver = evidence.identityPresent && evidence.receiverCredentialPresent,
+                    bmwAppsV1AuthFirst = inboundAt != null && SettingsStore.bmwAppsV1AuthFirstEnabled &&
+                        isBmwBluetoothName(receiverName) && isBonded(receiver),
                     navigationEnabled = { sessions.allows(ticket) && io.github.hypercar.session.HyperCarRepo.hudNavigationAllowed },
                     navigationCue = { io.github.hypercar.navigation.NavigationSources.snapshot() },
                     onMediaKey = { usage -> io.github.hypercar.session.HyperCarRepo.onIap2MediaKey(usage) { sessions.allows(ticket) } },
@@ -1002,6 +1009,14 @@ class Iap2Bluetooth(
             device?.address
         } catch (_: SecurityException) {
             null
+        }
+
+    @SuppressLint("MissingPermission")
+    private fun isBonded(device: BluetoothDevice?): Boolean =
+        try {
+            device?.bondState == BluetoothDevice.BOND_BONDED
+        } catch (_: SecurityException) {
+            false
         }
 
     private fun sleepQuietly(millis: Long) {

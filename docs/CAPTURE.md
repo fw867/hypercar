@@ -26,8 +26,18 @@ bugreport 可能包含 FS/data/misc/bluetooth/logs 下轮转的 btsnoop_hci 日�
 - `MDNS-OBS`：在已选择的车机 Network/接口被动接收 IPv4/IPv6 组播，记录查询的名称/类型/QU、响应的 PTR/SRV/TXT/A/AAAA、端口/地址、TTL/flush、报文来源及累计计数。TXT只保留id/srcvers；每族每15秒最多24条报文日志，超出保留suppressed计数，每报文最多列12项。ready/unavailable标明各族监听是否成功。
 - `CTRL-DIAG`：NSD注册代次、请求/实际服务实例名、端口、网络/接口/本地地址和监听线程状态；等待邀请时约15秒一次。健康注册复用不会因诊断重注册。监听失败同网络至多启动3次、重试间隔至少15秒。
 - `CTRL-TCP`：TCP已建立后的accept、来源/本地端口、请求头COMPLETE/EOF/TIMEOUT/IO/LIMIT、邀请发布/等待本地地址确认、HTTP200回应和关闭。连接号关联同一条TCP的各阶段；网络过期拒绝单独记录。
+- `CTRL-CLICK`：在开发者菜单点「即将点旧设备 CarPlay」后，导出包含前 15 秒与后 30 秒的观察记录（前段最多 64 条，整个窗口最多 128 条）。用每条事件自己的 `epochMs` 和手机 HCI 对齐。`origin=peer` 是组播来源，需用车机 IP 确认；`known-answer` 是查询里的缓存记录。`listener-open`、`listener-close`、`click-state` 给出端口变更和点击时的监听端口，`tcp-accepted` 表示握手已完成。
+- `OLD-DEVICE-READY`：车机 Wi-Fi 已绑定、已观察到当前注册的 SRV、蓝牙实际可发现时就绪。Wi-Fi 本地地址集合变化后，需要重新观察 SRV。打点和关联记录在后台写盘，以记录里的时间戳为准。
+
+「随 mDNS 发送 model=D83AP」默认关闭。打开后，后续本机通告和手动重发可附带 `_device-info._tcp` TXT；做基线测试时保持关闭。
 
 观察器只绑定具体组播目的地址，不使用通配UDP5353，以免争抢系统NSD的单播流量；不发送DNS查询、不主动拨号。普通应用的该路径不能观察TCP SYN、发往旧端口的连接，或保证收到NSD单播响应；缺少记录不等于车机没发。NSD注册回调也不证明车机已收到线上公告。若仍无法分辨，应保留现场并补Wi-Fi空口/路由侧抓包。
+
+有能解出车机到手机的 IP 流量的 pcap/pcapng 时，可以用 Wireshark 的 `tshark` 和 [对照工具](../tools/compare-carplay-syn.py) 查看最近一次点击附近的初始 SYN。提前从上一轮日志确认旧端口时传入 `--old-port`；IPv4 和 IPv6 地址可分别重复传入。抓包时间与手机时间须对齐。
+
+~~~powershell
+python tools/compare-carplay-syn.py hypercar-log.txt car-wifi.pcapng --car 172.16.222.97 --phone 172.16.222.105 --old-port 46657
+~~~
 
 ## 其他已用数据
 

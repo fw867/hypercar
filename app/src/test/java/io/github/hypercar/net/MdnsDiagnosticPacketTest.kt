@@ -74,6 +74,23 @@ class MdnsDiagnosticPacketTest {
     private fun sections(decoded: MdnsDiagnosticPacket): List<String> =
         decoded.details.map { it.substringAfter("section=").substringBefore(' ') }
 
+    @Test fun deviceInfoIsAnAdditionalTxtWithoutChangingExistingRecords() {
+        val instance = "手机.Phone"
+        val label = instance.toByteArray()
+        val owner = byteArrayOf(label.size.toByte()) + label + name("_device-info._tcp.local")
+        val base = packet(answers = 1, additional = 1,
+            body = rr(name("phone.local"), 1, byteArrayOf(10, 0, 0, 1)) +
+                rr(name("phone.local"), 28, ByteArray(16)))
+        val expected = base.copyOf().apply { this[11] = 2 } +
+            rr(owner, 16, byteArrayOf(11) + "model=D83AP".toByteArray(), ttl = 4500)
+
+        assertNull(MdnsDiagnosticPacket.withDeviceInfo(base, instance))
+        val enriched = MdnsDiagnosticPacket.withDeviceInfo(base, instance, enabled = true)
+        assertArrayEquals(expected, enriched)
+        assertEquals(1, base[11].toInt())
+        assertNull(MdnsDiagnosticPacket.withDeviceInfo(base, "a".repeat(64), enabled = true))
+    }
+
     @Test fun compressedSrvIncludesPortHostFlushAndGoodbye() {
         val owner = name("phone._carplay-ctrl._tcp.local")
         val srv = rr(owner, 33, byteArrayOf(0, 0, 0, 0, 0x83.toByte(), 0xd5.toByte()) + name("phone.local"), ttl = 0)
@@ -156,5 +173,31 @@ class MdnsDiagnosticPacketTest {
             rr(name("printer._ipp._tcp.local"), 16, byteArrayOf(7) + "psk=BAD".toByteArray()))
         val text = MdnsDiagnosticPacket.decode(p)!!.details.joinToString()
         assertTrue(text.contains("172.16.222.98")); assertTrue(text.contains("fe80:")); assertFalse(text.contains("BAD"))
+    }
+
+    @Test fun androidAnnouncementWithLocalReverseRecordsCanBeReplayed() {
+        val service = name("_carplay-ctrl._tcp.local")
+        val instance = name("phone._carplay-ctrl._tcp.local")
+        val host = name("phone.local")
+        val reverse4 = name("42.0.0.10.in-addr.arpa")
+        val reverse6 = name("1." + "0.".repeat(28) + "8.e.f.ip6.arpa")
+        val txt = listOf("id=84:ae:de:56:d3:76", "srcvers=770.8.1").flatMap {
+            listOf(it.length.toByte()) + it.toByteArray().toList()
+        }.toByteArray()
+        val main = rr(service, 12, instance) +
+            rr(instance, 33, byteArrayOf(0, 0, 0, 0, 0x83.toByte(), 0xd5.toByte()) + host) +
+            rr(instance, 16, txt) + rr(host, 1, byteArrayOf(10, 0, 0, 42)) +
+            rr(host, 28, byteArrayOf(0xfe.toByte(), 0x80.toByte()) + ByteArray(13) + byteArrayOf(1))
+        val reverse = rr(reverse4, 12, host) + rr(reverse6, 12, host)
+        val nsec = rr(reverse4, 47, reverse4 + byteArrayOf(0, 2, 0, 8))
+        assertNotNull(MdnsDiagnosticPacket.decode(packet(answers = 7, additional = 1, body = main + reverse + nsec))!!.announcement)
+        val base = packet(answers = 7, additional = 1, body = main + reverse + nsec)
+        val enriched = MdnsDiagnosticPacket.withDeviceInfo(base, "Phone", enabled = true)!!
+        val decoded = MdnsDiagnosticPacket.decode(enriched)!!
+        assertTrue(decoded.details.any { it.contains("phone._device-info._tcp.local") && it.contains("model=D83AP") })
+        assertNull(decoded.announcement) // Supplemental copies must never replace the original packet in the replay cache.
+        assertNull(MdnsDiagnosticPacket.decode(packet(answers = 6, body = main + rr(name("43.0.0.10.in-addr.arpa"), 12, host)))!!.announcement)
+        assertNull(MdnsDiagnosticPacket.decode(packet(answers = 6, body = main + rr(reverse4, 12, name("other.local"))))!!.announcement)
+        assertNull(MdnsDiagnosticPacket.decode(packet(answers = 6, body = main + rr(reverse4, 47, reverse4 + byteArrayOf(0, 2, 0, 8))))!!.announcement)
     }
 }

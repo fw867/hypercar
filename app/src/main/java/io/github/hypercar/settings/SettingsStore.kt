@@ -103,6 +103,22 @@ object SettingsStore {
             SettingsRevision.bump()
         }
 
+    var carPlayDeviceInfoModelEnabled: Boolean
+        get() = developerMenuVisible && p().getBoolean("carplay_device_info_model", false)
+        set(value) {
+            if (!developerModeEnabled) return
+            p().edit().putBoolean("carplay_device_info_model", value).apply()
+            SettingsRevision.bump()
+        }
+
+    var bmwAppsV1AuthFirstEnabled: Boolean
+        get() = developerMenuVisible && p().getBoolean("bmw_apps_v1_auth_first", false)
+        set(value) {
+            if (!developerModeEnabled) return
+            p().edit().putBoolean("bmw_apps_v1_auth_first", value).apply()
+            SettingsRevision.bump()
+        }
+
     var appThemeMode: AppThemeMode
         get() = AppThemeMode.fromValue(p().getString("app_theme_mode", "dark"))
         set(value) {

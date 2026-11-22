@@ -111,6 +111,37 @@ class Iap2MediaBluetoothTest {
         }
     }
 
+    @Test fun authFirstExperimentIsLimitedToPairedBmwV1AndStopsOnBadCertificate() {
+        val cases = listOf(
+            Triple(HeadUnitProfiles.BMW_ID85, true, 1),
+            Triple(HeadUnitProfiles.BMW_ID85, true, 2),
+            Triple(HeadUnitProfiles.BMW_ID85, false, 1),
+            Triple(HeadUnitProfiles.WINPLAY, true, 1),
+        )
+        for ((profile, paired, version) in cases) {
+            val channel = Channel(identificationExchange = appsIdentification(), controlVersion = version)
+            val session = Iap2SenderSession(channel, {}, onEndpoint = {}, profile = profile,
+                pairedReceiver = paired, nanoTime = { channel.time }, bmwAppsV1AuthFirst = true)
+            val result = runCatching { session.run(10_000) }
+            if (profile == HeadUnitProfiles.BMW_ID85 && paired && version == 1) {
+                assertTrue(result.exceptionOrNull() is java.io.IOException)
+                assertEquals(listOf(0xaa00, 0xaa04), channel.sent)
+            } else {
+                assertEquals(listOf(0x1d00, 0x1d02, 0xaa00), channel.sent.take(3))
+            }
+        }
+    }
+
+    @Test fun authFirstRequestsV1SignatureBeforeIdentification() {
+        val leaf = javaClass.getResourceAsStream("/io/github/hypercar/iap2/mfi3-leaf.der")!!.use { it.readBytes() }
+        val channel = Channel(identificationExchange = appsIdentification(), controlVersion = 1,
+            certificateBody = Iap2Csm.param(0, leaf), signatureBody = Iap2Csm.param(0, ByteArray(64)))
+        val session = Iap2SenderSession(channel, {}, onEndpoint = {}, pairedReceiver = true,
+            nanoTime = { channel.time }, bmwAppsV1AuthFirst = true)
+        assertThrows(java.io.IOException::class.java) { session.run(10_000) }
+        assertEquals(listOf(0xaa00, 0xaa02, 0xaa04), channel.sent)
+    }
+
     @Test fun returningMguKeepsAppsLinkAndAcceptsCarPlayOnReidentification() {
         val channel = Channel(identificationExchange = appsIdentification())
         val endpoints = mutableListOf<CarPlayEndpoint>()

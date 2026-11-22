@@ -77,6 +77,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import io.github.hypercar.net.CARPLAY_DEVICE_INFO_BOARD
 import io.github.hypercar.perm.AppPermissions
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.settings.SettingsRevision
@@ -216,10 +217,13 @@ private fun DeveloperModeSection(menuVisible: Boolean) {
 private fun DeveloperMenuSection() {
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
+    val oldDeviceReadiness by HyperCarRepo.oldDeviceReadiness.collectAsStateWithLifecycle()
     var copying by remember { mutableStateOf(false) }
     var experimentResult by rememberSaveable { mutableStateOf<String?>(null) }
     var sending by remember { mutableStateOf(false) }
     var result by rememberSaveable { mutableStateOf<String?>(null) }
+    val deviceInfoModel = remember(SettingsRevision.value) { SettingsStore.carPlayDeviceInfoModelEnabled }
+    val bmwAppsV1AuthFirst = remember(SettingsRevision.value) { SettingsStore.bmwAppsV1AuthFirstEnabled }
     val armedTarget by HyperCarRepo.armedBmwCaffExperiment.collectAsStateWithLifecycle()
     var armError by remember { mutableStateOf<String?>(null) }
     var dialing by remember { mutableStateOf(false) }
@@ -229,6 +233,8 @@ private fun DeveloperMenuSection() {
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("等待车机邀请时，手动补发当前服务的通告。不重新注册服务，也不更换端口。",
                 color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+            SwitchRow("随 mDNS 发送 model=$CARPLAY_DEVICE_INFO_BOARD", "用于对照车机的设备识别，在后续广播和手动重发时生效。",
+                checked = deviceInfoModel, onCheckedChange = { SettingsStore.carPlayDeviceInfoModelEnabled = it })
             CapsuleButton(if (sending) "发送中…" else "重发 mDNS 通告", enabled = !sending && !dialing, onClick = send@{
                 if (sending || dialing) return@send
                 sending = true
@@ -278,10 +284,25 @@ private fun DeveloperMenuSection() {
             dialResult?.let { Text(it, color = TextPrimary, style = MaterialTheme.typography.bodySmall) }
         }
     }
+    SectionLabel("宝马 iD8.5 蓝牙握手实验")
+    GlassPanel(contentPadding = PaddingValues(16.dp)) {
+        SwitchRow("普通 BMW Apps v1 先认证", "用于已配对宝马的入站 v1 握手，按 AA00 → 认证 → 1D00 的顺序。",
+            checked = bmwAppsV1AuthFirst, onCheckedChange = { SettingsStore.bmwAppsV1AuthFirstEnabled = it })
+    }
     SectionLabel("连接实验")
     GlassPanel(contentPadding = PaddingValues(16.dp)) {
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("刷卡解锁后和点旧设备 CarPlay 前分别打点。打开诊断日志记录后，打点会写入导出的日志。",
+            val readiness = oldDeviceReadiness
+            val message = if (readiness == null) "等待连接时显示旧设备就绪状态"
+            else if (readiness.ready) "已就绪，可以点车机里的旧设备 CarPlay"
+            else "等待 ${buildList {
+                if (readiness.network == null) add("车机 Wi-Fi 绑定")
+                if (readiness.srv == null) add("观察到当前 SRV")
+                if (readiness.discoverable != true) add("蓝牙可发现")
+            }.joinToString("、")}"
+            Text(message, color = if (readiness?.ready == true) MintGreen else TextSecondary,
+                style = MaterialTheme.typography.bodyMedium)
+            Text("刷卡解锁后和点旧设备 CarPlay 前分别打点。诊断日志会记录点击前 15 秒、点击后 30 秒的发现和邀请证据。",
                 color = TextSecondary, style = MaterialTheme.typography.bodySmall)
             CapsuleButton("已刷卡", onClick = {
                 experimentResult = HyperCarRepo.markConnectionExperiment(HyperCarRepo.ExperimentMarker.CARD_UNLOCKED)

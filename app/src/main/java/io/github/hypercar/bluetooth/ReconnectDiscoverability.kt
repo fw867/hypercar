@@ -88,6 +88,7 @@ internal fun discoverabilityRoute(shizukuReady: Boolean, immediatePreparation: B
 private const val AUTO_BMW_KEY_PREFIX = "bt:auto:"
 private val bluetoothAddress = Regex("(?:[0-9A-F]{2}:){5}[0-9A-F]{2}")
 private val bmwName = Regex("""(?:^|[^a-z])bmw(?![a-z])|宝马""", RegexOption.IGNORE_CASE)
+internal fun isBmwBluetoothName(name: String?): Boolean = bmwName.containsMatchIn(name.orEmpty())
 
 /** 手动启动在目标已配对且蓝牙监听就绪后直接开一轮；自动重连沿用原窗口策略。 */
 internal class ReconnectDiscoverabilityPolicy(
@@ -214,7 +215,7 @@ internal object ReconnectDiscoverability {
         val mac = successfulCars.asSequence()
             .map { it.substringBefore('|').trim().uppercase(java.util.Locale.ROOT) }
             .distinct()
-            .filter { bluetoothAddress.matches(it) && bmwName.containsMatchIn(bondedName(it).orEmpty()) }
+            .filter { bluetoothAddress.matches(it) && isBmwBluetoothName(bondedName(it)) }
             .singleOrNull() ?: return null
         return "$AUTO_BMW_KEY_PREFIX$mac"
     }

@@ -16,13 +16,55 @@ import java.net.SocketTimeoutException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
-/** Passively observe multicast on the selected car network; explicit developer replay is opt-in. */
+internal data class CtrlSrvObservation(
+    val instance: String, val host: String, val port: Int, val receivedAt: Long,
+    val localAddresses: Set<InetAddress> = emptySet(),
+) {
+    fun matches(name: String, listenerPort: Int, registrationStartedAt: Long): Boolean =
+        receivedAt >= registrationStartedAt && port == listenerPort && instance.equals(name, ignoreCase = true)
+}
+
+/** Scoped to a selected network and accessed under the advertiser's monitor. */
+internal class CtrlSrvEvidence {
+    private var addresses: Set<InetAddress>? = null
+    private var changedAt = Long.MIN_VALUE
+    var latest: CtrlSrvObservation? = null
+        private set
+
+    fun addressesChanged(current: Set<InetAddress>, at: Long): Boolean {
+        if (addresses == current) return false
+        addresses = current
+        changedAt = at
+        latest = null
+        return true
+    }
+
+    fun record(srv: CtrlSrvObservation) {
+        if (srv.receivedAt < changedAt || srv.receivedAt < (latest?.receivedAt ?: Long.MIN_VALUE)) return
+        if (addresses != null && addresses != srv.localAddresses) return
+        addresses = srv.localAddresses
+        latest = srv
+    }
+
+    fun clear() { latest = null }
+
+    fun resetNetwork() {
+        addresses = null
+        changedAt = Long.MIN_VALUE
+        clear()
+    }
+}
+
+/** Observe NSD multicast on the selected car network. Replay and the model TXT are opt-in. */
 internal class CtrlMdnsObserver(
     private val context: Context,
     private val network: Network,
     private val generation: Long,
     private val log: (String) -> Unit,
     private val attemptId: Long = 0,
+    private val onLocalAnnouncement: (family: Int) -> Boolean = { false },
+    private val trace: (String) -> Unit = {},
+    private val onLocalSrv: (CtrlSrvObservation) -> Unit = {},
     private val onObservation: (family: Int, localAnnouncementPort: Int?) -> Unit = { _, _ -> },
 ) : Closeable {
     private val prefix = "attempt=$attemptId gen=$generation network=$network"
@@ -44,6 +86,8 @@ internal class CtrlMdnsObserver(
         runCatching { linkProperties()?.linkAddresses?.map { it.address }?.toSet() }.getOrNull()
     }
 
+    fun invalidateLocalAddresses() = localAddresses.invalidate()
+
     private fun multicastGroup(family: Int, nif: NetworkInterface): InetAddress =
         if (family == 4) InetAddress.getByAddress(byteArrayOf(224.toByte(), 0, 0, 251.toByte()))
         else Inet6Address.getByAddress(null,
@@ -51,17 +95,26 @@ internal class CtrlMdnsObserver(
 
     /** null = no eligible packet; a nonnegative result is the number of successful family sends. */
     fun resend(
-        name: String, port: Int, mac: String, version: String, registrationStartedAt: Long, canSend: () -> Boolean,
+        name: String, port: Int, mac: String, version: String, registrationStartedAt: Long,
+        onlyFamily: Int? = null, includeDeviceInfo: Boolean = false, canSend: () -> Boolean,
     ): Int? {
         if (closed) return null
         val link = linkProperties() ?: return null
         val nif = link.interfaceName?.let(NetworkInterface::getByName) ?: return null
         val addresses = link.linkAddresses.map { it.address }.toSet()
-        val eligible = localAnnouncements.entries.filter { (_, packet) ->
-            packet.seenAt >= registrationStartedAt && packet.source in addresses &&
+        val tag = if (onlyFamily == null) "MDNS-RESEND" else "MDNS-DEVICE-INFO"
+        val eligible = localAnnouncements.entries.filter { (family, packet) ->
+            (onlyFamily == null || family == onlyFamily) && packet.seenAt >= registrationStartedAt && packet.source in addresses &&
                 packet.source in packet.metadata.addresses && packet.metadata.matches(name, port, mac, version, addresses)
         }
-        if (eligible.isEmpty()) return null
+        if (eligible.isEmpty()) {
+            if (onlyFamily != null) return null
+            val candidates = localAnnouncements.values.toList()
+            log("MDNS-RESEND: $prefix cached=${candidates.size} " +
+                "current=${candidates.count { it.seenAt >= registrationStartedAt }} " +
+                "matching=${candidates.count { it.source in addresses && it.metadata.matches(name, port, mac, version, addresses) }}")
+            return null
+        }
         var sent = 0
         for ((family, packet) in eligible) {
             if (closed || !canSend()) break
@@ -69,7 +122,10 @@ internal class CtrlMdnsObserver(
                 val group = multicastGroup(family, nif)
                 val source = if (packet.source is Inet6Address && packet.source.isLinkLocalAddress)
                     Inet6Address.getByAddress(null, packet.source.address, nif.index) else packet.source
-                val datagram = DatagramPacket(packet.bytes, packet.bytes.size, group, 5353)
+                val enriched = MdnsDiagnosticPacket.withDeviceInfo(packet.bytes, name, includeDeviceInfo)
+                if (enriched == null && onlyFamily != null) continue
+                val payload = enriched ?: packet.bytes
+                val datagram = DatagramPacket(payload, payload.size, group, 5353)
                 MulticastSocket(null).use { socket ->
                     socket.reuseAddress = true
                     network.bindSocket(socket)
@@ -81,9 +137,12 @@ internal class CtrlMdnsObserver(
                     socket.send(datagram)
                     sent++
                 }
-                log("MDNS-RESEND: $prefix if=${nif.name} IPv$family host=${packet.metadata.host} port=$port bytes=${packet.bytes.size}")
+                log("$tag: $prefix if=${nif.name} IPv$family host=${packet.metadata.host} port=$port " +
+                    "bytes=${payload.size} deviceInfo=${if (enriched != null) CARPLAY_DEVICE_INFO_BOARD else "none"}")
+                if (onlyFamily == null) trace("event=mdns-resent $prefix family=IPv$family " +
+                    "host=${packet.metadata.host} currentPort=$port")
             } catch (e: Exception) {
-                log("MDNS-RESEND: $prefix if=${nif.name} IPv$family failed=${e.javaClass.simpleName}:${e.message}")
+                log("$tag: $prefix if=${nif.name} IPv$family failed=${e.javaClass.simpleName}:${e.message}")
             }
         }
         return sent
@@ -105,7 +164,7 @@ internal class CtrlMdnsObserver(
             log("MDNS-OBS: $prefix multicast-lock=${e.javaClass.simpleName}")
         }
         log("MDNS-OBS: start $prefix if=${nif.name} index=${nif.index} " +
-            "addresses=${link?.linkAddresses} passive=true; multicast-visible-only, no TCP-SYN/old-port/unicast guarantee")
+            "addresses=${link?.linkAddresses} multicast-visible-only, no TCP-SYN/old-port/unicast guarantee")
         workers.set(2)
         for (family in listOf(4, 6)) Thread({ receive(family, nif) }, "ctrl-mdns-v$family").apply {
             isDaemon = true; start()
@@ -117,6 +176,7 @@ internal class CtrlMdnsObserver(
         var received = 0L; var relevant = 0L; var malformed = 0L; var suppressed = 0L
         var window = SystemClock.elapsedRealtime(); var emitted = 0
         var lastPeerQueryAt: Long? = null
+        var lastDeviceInfoAt: Long? = null
         val label = "$prefix if=${nif.name} IPv$family"
         try {
             val socket = MulticastSocket(null)
@@ -144,11 +204,24 @@ internal class CtrlMdnsObserver(
                 }
                 val packet = DatagramPacket(bytes, bytes.size)
                 try { socket.receive(packet) } catch (_: SocketTimeoutException) { continue }
+                val receivedAt = SystemClock.elapsedRealtime()
                 received++
                 val wire = bytes.copyOf(packet.length)
                 val decoded = MdnsDiagnosticPacket.decode(wire)
                 if (decoded == null) { malformed++; continue }
                 val addrs = localAddresses.current()
+                if (addrs != null && !closed) {
+                    val isLocal = packet.address in addrs
+                    if (isLocal && packet.port == 5353) decoded.carPlaySources.forEach { service ->
+                        onLocalSrv(CtrlSrvObservation(service.instance, service.host, service.port, receivedAt, addrs))
+                    }
+                    val evidence = decoded.details.filter { detail ->
+                        "_carplay-ctrl._tcp.local" in detail || (!isLocal && detail.startsWith("Q "))
+                    }
+                    if (evidence.isNotEmpty()) trace("event=mdns-observed $prefix family=IPv$family " +
+                        "origin=${if (isLocal) "local" else "peer"} peer=${packet.address.hostAddress} " +
+                        "kind=${if (decoded.response) "response" else "query"} ${evidence.take(16).joinToString("; ")}")
+                }
                 if (addrs != null && !(packet.address in addrs) && decoded.carPlaySources.isNotEmpty()) {
                     for (src in decoded.carPlaySources) {
                         if (src.addresses.any { it in addrs }) continue
@@ -168,6 +241,10 @@ internal class CtrlMdnsObserver(
                         if (announcement != null && local && packet.port == 5353 && packet.address in announcement.addresses) {
                             localAnnouncements[family] = LocalAnnouncement(wire, announcement, packet.address, SystemClock.elapsedRealtime())
                             onObservation(family, announcement.port)
+                            val observedAt = SystemClock.elapsedRealtime()
+                            if (lastDeviceInfoAt?.let { observedAt - it < 1_000 } != true && onLocalAnnouncement(family)) {
+                                lastDeviceInfoAt = observedAt
+                            }
                         } else if (decoded.ctrlQuestion && !local && !packet.address.isAnyLocalAddress &&
                             !packet.address.isMulticastAddress) {
                             val observedAt = SystemClock.elapsedRealtime()
@@ -184,7 +261,8 @@ internal class CtrlMdnsObserver(
                 emitted++
                 log("MDNS-OBS: packet $label peer=${packet.address.hostAddress}:${packet.port} bytes=${packet.length} " +
                     "kind=${if (decoded.response) "response" else "query"} " +
-                    decoded.details.take(12).joinToString("; ") + " records=${decoded.details.size}")
+                    decoded.details.take(12).joinToString("; ") + " records=${decoded.details.size} " +
+                    "replayCandidate=${decoded.announcement != null}")
             }
         } catch (e: Exception) {
             if (!closed) log("MDNS-OBS: unavailable $label error=${e.javaClass.simpleName}:${e.message}")

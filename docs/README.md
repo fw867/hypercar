@@ -19,6 +19,7 @@
 | [日志采集](CAPTURE.md) | ADB、蓝牙记录、时间范围及隐私 |
 | [iPhone HCI](IPHONE-HCI-CAPTURE.md) | 新车型第一次上车与二次上车的蓝牙抓取 |
 | [宝马盒子证据](BMW-BOX-CARPLAY-FLOW.md) | 固定样本、时序及结论边界 |
+| [CarPlay 接收端流程对照](CARPLAY-REFERENCE-FLOW.md) | R14G17、iAP2 样例与 HyperCar 的发现、邀请、会话和重入 |
 | [参考实现](REFERENCE-REVIEW.md) | 源码版本、可借鉴机制与角色区别 |
 | [验证](VALIDATION.md) | 实测、单测与尚未完成的闭环 |
 | [滚动审计](AUDIT.md) | 最新审计问题、修正和检查结果 |

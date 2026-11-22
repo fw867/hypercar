@@ -1,9 +1,13 @@
 @file:Suppress("DEPRECATION")   // allNetworks/WifiInfo/getDefaultAdapter 等平台 API 已废弃但无替代
 package io.github.hypercar.session
 
+import android.Manifest
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
 import io.github.hypercar.net.SessionSocketLease
@@ -32,6 +36,7 @@ import io.github.hypercar.iap2.Iap2Coordinator
 import io.github.hypercar.net.BluetoothMac
 import io.github.hypercar.net.AirplayServiceProbe
 import io.github.hypercar.net.CarPlayCtrlAdvertiser
+import io.github.hypercar.net.CtrlDiscoveryTrace
 import io.github.hypercar.net.SpecifierPermissions
 import io.github.hypercar.net.WifiJoiner
 import io.github.hypercar.net.BluetoothHotspot
@@ -84,6 +89,8 @@ object HyperCarRepo {
 
     private val _snapshots = MutableStateFlow(SessionSnapshot())
     val snapshots: StateFlow<SessionSnapshot> = _snapshots.asStateFlow()
+    private val _oldDeviceReadiness = MutableStateFlow<OldDeviceReadiness?>(null)
+    internal val oldDeviceReadiness = _oldDeviceReadiness.asStateFlow()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -472,11 +479,28 @@ object HyperCarRepo {
         ABOUT_TO_SELECT_CARPLAY(ConnectionDiagnostics.Observation.ABOUT_TO_SELECT_CARPLAY),
     }
 
+    private val ctrlDiscoveryTrace = CtrlDiscoveryTrace(SystemClock::elapsedRealtime, System::currentTimeMillis, scope, ::log)
+
     internal fun markConnectionExperiment(marker: ExperimentMarker): String {
         val attempt = connectionAttemptId
         val recorded = connectionDiagnostics.observe(attempt, marker.observation)
         val recording = logRecording
-        log("DEV-MARK: attempt=${if (recorded) attempt.toString() else "none"} ${marker.observation.name} ${marker.observation.label}")
+        val clocks = "epochMs=${System.currentTimeMillis()} elapsedMs=${SystemClock.elapsedRealtime()}"
+        val markLine = "DEV-MARK: attempt=${if (recorded) attempt.toString() else "none"} " +
+            "${marker.observation.name} ${marker.observation.label} $clocks"
+        if (marker == ExperimentMarker.ABOUT_TO_SELECT_CARPLAY) {
+            val readiness = _oldDeviceReadiness.value?.takeIf { it.attempt == attempt }
+            val advertiser = ctrlAdvertiser
+            val network = boundNetwork
+            val port = advertiser?.withListeningPortFor(attempt) { it }
+            val currentSrv = network?.let { advertiser?.currentSrv(it) }
+            val status = readiness?.takeIf { it.network == network?.toString() }
+                ?.copy(srv = currentSrv?.let { OldDeviceReadiness.Srv(it.host, it.port) })
+            val readinessLine = "OLD-DEVICE-READY: at-click " +
+                "${status?.diagnosticFields() ?: "attempt=$attempt state=unavailable"} $clocks"
+            ctrlDiscoveryTrace.mark(listOf(markLine, readinessLine),
+                "event=click-state attempt=$attempt network=$network currentPort=${port ?: "none"} tcpSyn=external-capture-required")
+        } else ctrlDiscoveryTrace.enqueue(markLine)
         return when {
             recording -> "已打点：${marker.observation.label}（已写入诊断日志）"
             recorded -> "已打点：${marker.observation.label}（仅本轮快照，诊断日志已关闭）"
@@ -1337,6 +1361,7 @@ object HyperCarRepo {
         connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.DEPENDENCIES_CHECKED, preflight)
         log("PREFLIGHT: $preflight；${findings.joinToString("；").ifBlank { "依赖检查通过" }}")
         var discoveryJob: Job? = null
+        var readinessJob: Job? = null
         val caffSince = SystemClock.uptimeMillis()
         val caffBaseline = roundSessionBaseline
         val caffProbe = BmwCaffProbe(diagnosticId)
@@ -1424,6 +1449,8 @@ object HyperCarRepo {
                     CarPlayCtrlAdvertiser.Event.INVITED -> ConnectionDiagnostics.Stage.CTRL_INVITED
                 }, detail = if (event == CarPlayCtrlAdvertiser.Event.REGISTERED) port.toString() else "")
             }, serviceNameProvider = { controlServiceName }, attemptId = diagnosticId,
+                traceDiscovery = ctrlDiscoveryTrace::record,
+                deviceInfoEnabled = { SettingsStore.carPlayDeviceInfoModelEnabled },
                 onCtrlEpochChanged = { connectionDiagnostics.newCtrlEpoch(diagnosticId) }, onMdnsObservation = { family, port ->
                 connectionDiagnostics.observe(diagnosticId,
                     if (port != null) ConnectionDiagnostics.Observation.MDNS_LOCAL_ANNOUNCEMENT
@@ -1440,6 +1467,9 @@ object HyperCarRepo {
                 ctrlAdvertiser?.stop()
                 advertiser.selectNetwork(boundNetwork)
                 ctrlAdvertiser = advertiser
+            }
+            readinessJob = CoroutineScope(kotlinx.coroutines.currentCoroutineContext()).launch {
+                watchOldDeviceReadiness(context, diagnosticId, advertiser)
             }
             if (caffDevice != null) {
                 fun waiting() = connectionAttemptId == diagnosticId && sessionLive.get() && !userDisconnectRequested &&
@@ -1837,8 +1867,54 @@ object HyperCarRepo {
             caffJob?.cancel()
             if (caffProbe.attempted && !invited.get()) log("BT-CAFF#$diagnosticId: wait ended without ctrl invitation")
             discoveryJob?.cancel()
+            readinessJob?.cancel()
             if (connectionAttemptId == diagnosticId) connecting = false
             appContext()?.let { io.github.hypercar.carui.MusicNotificationListener.sync(it) }
+        }
+    }
+
+    private suspend fun watchOldDeviceReadiness(context: Context, attempt: Long, advertiser: CarPlayCtrlAdvertiser) {
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return
+        val adapter = context.getSystemService(BluetoothManager::class.java)?.adapter
+        fun current() = sessionLive.get() && connectionAttemptId == attempt && ctrlAdvertiser === advertiser &&
+            !userDisconnectRequested
+        fun publish(next: OldDeviceReadiness?) {
+            synchronized(ctrlNetworkLock) {
+                val previous = _oldDeviceReadiness.value
+                if (previous == next || (next != null && !current()) ||
+                    (next == null && previous?.attempt != attempt)) return
+                _oldDeviceReadiness.value = next
+            }
+            ctrlDiscoveryTrace.enqueue("OLD-DEVICE-READY: ${next?.diagnosticFields() ?: "attempt=$attempt ready=false state=inactive"} " +
+                "epochMs=${System.currentTimeMillis()} elapsedMs=${SystemClock.elapsedRealtime()}")
+        }
+        try {
+            while (current()) {
+                if (streaming || hasAirPlayTransport) {
+                    publish(null)
+                } else {
+                    val network = boundNetwork?.takeIf {
+                        cm.boundNetworkForProcess == it &&
+                            cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+                    }
+                    val scanMode = if (context.checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED) {
+                        runCatching { adapter?.scanMode }.getOrNull()
+                    } else null
+                    val discoverable = scanMode?.takeUnless { it == BluetoothAdapter.ERROR }
+                        ?.let { it == BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE }
+                    val srv = network?.let(advertiser::currentSrv)?.let { OldDeviceReadiness.Srv(it.host, it.port) }
+                    if (network == null || network == boundNetwork) {
+                        publish(OldDeviceReadiness(attempt, network?.toString(), srv, discoverable))
+                    }
+                }
+                delay(300)
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            log("OLD-DEVICE-READY: attempt=$attempt state=unavailable error=${error.javaClass.simpleName}")
+        } finally {
+            publish(null)
         }
     }
 

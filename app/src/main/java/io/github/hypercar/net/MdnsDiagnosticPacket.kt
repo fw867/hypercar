@@ -1,6 +1,12 @@
 package io.github.hypercar.net
 
+import java.io.ByteArrayOutputStream
+import java.io.DataOutputStream
 import java.net.InetAddress
+import java.net.Inet4Address
+
+/** Board class of the iPhone16,1 / 21F90 identity used in AirPlay SETUP. */
+internal const val CARPLAY_DEVICE_INFO_BOARD = "D83AP"
 
 /** Read-only DNS metadata. Never publishes a partial/malformed datagram or arbitrary TXT values. */
 internal data class MdnsDiagnosticPacket(
@@ -25,6 +31,46 @@ internal data class MdnsDiagnosticPacket(
     companion object {
         private const val CTRL = "_carplay-ctrl._tcp.local"
         private const val SERVICES = "_services._dns-sd._udp.local"
+        private const val DEVICE_INFO = "_device-info._tcp.local"
+        private const val DEVICE_MODEL = "model=$CARPLAY_DEVICE_INFO_BOARD"
+
+        /** Append to an already validated local NSD packet, preserving DNS compression offsets. */
+        fun withDeviceInfo(bytes: ByteArray, instance: String, enabled: Boolean = false): ByteArray? {
+            if (!enabled) return null
+            val label = instance.toByteArray(Charsets.UTF_8)
+            if (label.size !in 1..63) return null
+            val additional = ((bytes[10].toInt() and 255) shl 8) or (bytes[11].toInt() and 255)
+            val txt = DEVICE_MODEL.toByteArray(Charsets.US_ASCII)
+            val record = ByteArrayOutputStream().apply {
+                val out = DataOutputStream(this)
+                write(label.size)
+                write(label)
+                DEVICE_INFO.split('.').forEach {
+                    write(it.length)
+                    write(it.toByteArray(Charsets.US_ASCII))
+                }
+                write(0)
+                out.writeShort(16) // TXT
+                out.writeShort(0x8001) // IN, cache flush
+                out.writeInt(4500)
+                out.writeShort(txt.size + 1)
+                write(txt.size)
+                write(txt)
+            }.toByteArray()
+            return (bytes + record).apply {
+                this[10] = ((additional + 1) shr 8).toByte()
+                this[11] = (additional + 1).toByte()
+            }
+        }
+
+        private fun reverseName(address: InetAddress): String = if (address is Inet4Address) {
+            address.address.reversed().joinToString(".") { (it.toInt() and 255).toString() } + ".in-addr.arpa"
+        } else {
+            address.address.reversed().joinToString(".") {
+                val byte = it.toInt() and 255
+                "${(byte and 15).toString(16)}.${(byte shr 4).toString(16)}"
+            } + ".ip6.arpa"
+        }
 
         private fun completeAnnouncement(records: List<Record>): Announcement? {
             if (records.any { it.ttl == 0L }) return null
@@ -34,13 +80,18 @@ internal data class MdnsDiagnosticPacket(
             val host = srv.target?.takeIf { it.endsWith(".local") } ?: return null
             val txt = records.singleOrNull { it.type == 16 && it.owner == instance && it.txt.size == 2 } ?: return null
             val addresses = records.filter { it.owner == host }.mapNotNull { it.address }.toSet()
+            // Android NSD also bundles reverse PTRs and their NSEC records for these addresses.
+            val reverseNames = addresses.map(::reverseName).toSet()
+            val reverseOwners = records.filter { it.type == 12 && it.owner in reverseNames && it.target == host }
+                .map { it.owner }.toSet()
             if (addresses.isEmpty() || records.any {
                 when (it.type) {
                     1, 28 -> it.owner != host
-                    12 -> it != ptr && !(it.owner == SERVICES && it.target == CTRL)
+                    12 -> it != ptr && !(it.owner == SERVICES && it.target == CTRL) &&
+                        !(it.owner in reverseOwners && it.target == host)
                     16 -> it != txt
                     33 -> it != srv
-                    47 -> it.owner !in setOf(host, instance)
+                    47 -> it.target != it.owner || (it.owner != host && it.owner != instance && it.owner !in reverseOwners)
                     else -> true
                 }
             }) return null
@@ -137,17 +188,23 @@ internal data class MdnsDiagnosticPacket(
                         var i = start
                         val allowed = mutableListOf<String>()
                         var count = 0
+                        var deviceModel = false
                         while (i < pos) {
                             val len = bytes[i++].toInt() and 255; require(i + len <= pos)
                             val txt = String(bytes, i, len, Charsets.UTF_8); i += len
                             count++
                             if (txt.substringBefore('=').lowercase() in listOf("id", "srcvers")) allowed += safe(txt)
+                            if (txt == DEVICE_MODEL) deviceModel = true
                         }
                         // Do not retain unknown TXT fields or replay packets that contain any.
                         replay = replay.copy(txt = allowed.map { it.lowercase() }.toSet().takeIf { it.size == count }.orEmpty())
                         if (response && ttl > 0 && owner.endsWith(".$CTRL") && allowed.isNotEmpty())
                             srcTxts[owner] = allowed.map { it.lowercase() }.toSet()
-                        if (service(owner)) "txt=[${allowed.joinToString(",")}]" else null
+                        when {
+                            service(owner) -> "txt=[${allowed.joinToString(",")}]"
+                            owner.endsWith(".$DEVICE_INFO") && deviceModel && count == 1 -> "txt=[$DEVICE_MODEL]"
+                            else -> null
+                        }
                     }
                     1, 28 -> {
                         require(n == if (type == 1) 4 else 16)
@@ -155,6 +212,14 @@ internal data class MdnsDiagnosticPacket(
                         if (response && ttl > 0) srcAddresses.getOrPut(owner) { mutableSetOf() }.add(address)
                         replay = replay.copy(address = address)
                         if (owner.endsWith(".local")) "address=${address.hostAddress}" else null
+                    }
+                    47 -> {
+                        if (replayRecords != null) {
+                            val (target, next) = name(start)
+                            require(next < pos)
+                            replay = replay.copy(target = target)
+                        }
+                        null
                     }
                     else -> null
                 }

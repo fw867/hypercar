@@ -94,6 +94,7 @@ class Iap2SenderSession(
     private val onMediaKey: (Int) -> Unit = {},
     private val nowPlayingProvider: () -> Iap2NowPlaying = { Iap2NowPlaying() },
     private val pairedReceiver: Boolean = false,
+    private val bmwAppsV1AuthFirst: Boolean = false,
 ) {
     private var parser = Iap2Csm.Parser()
     private val media = Iap2MediaSession(log, onMediaKey)
@@ -233,11 +234,21 @@ class Iap2SenderSession(
         }
         log("iap2 link ready peerMaxControl=${channel.peerMaxControlPayload()}")
 
+        // The control descriptor is available before 1D01. Validate the peer's advertised role once 1D01 arrives.
+        val authFirst = bmwAppsV1AuthFirst && pairedReceiver && profile.id == "bmw_id85" && channel.peerControlVersion == 1
+        if (authFirst) {
+            enterPhase("MFI_EXCHANGE")
+            authenticatePairedAppsV1(null, deadline)
+        }
+
         // ---- 识别 ----
         enterPhase("IDENTIFICATION")
         send(Iap2MessageIds.START_IDENTIFICATION)
         val identFrame = expect(Iap2MessageIds.IDENTIFICATION_INFORMATION, deadline)
         val ident = Iap2Messages.parseIdentification(identFrame.body)
+        if (authFirst && (!usesMguReentry(ident) || !isBmwAppsOnly(ident))) {
+            throw IOException("MGU-AUTH: auth-first link did not identify as ordinary BMW Apps v1")
+        }
         peerIdentification = ident
         subscriptions.identify(ident.model, ident.manufacturer)
         media.identify(ident.hidComponents)
@@ -247,12 +258,14 @@ class Iap2SenderSession(
         send(Iap2MessageIds.IDENTIFICATION_ACCEPTED)
         log("iap2 tx=0x1d02 identification-accepted")
 
-        enterPhase("MFI_EXCHANGE")
         val identityText = listOfNotNull(ident.name, ident.model, ident.manufacturer).joinToString(" ").lowercase()
-        if (channel.peerControlVersion == 1 && usesMguReentry(ident) && isBmwAppsOnly(ident)) {
-            authenticatePairedAppsV1(ident, deadline)
-        } else {
-            authenticateCompatibility(ident, identityText, deadline)
+        if (!authFirst) {
+            enterPhase("MFI_EXCHANGE")
+            if (channel.peerControlVersion == 1 && usesMguReentry(ident) && isBmwAppsOnly(ident)) {
+                authenticatePairedAppsV1(ident, deadline)
+            } else {
+                authenticateCompatibility(ident, identityText, deadline)
+            }
         }
         // IDC23 capture: AA05 -> 4300, before greetings, EA, HID or queued subscriptions.
         val earlyAvailability = usesId9MinimalBootstrap() && profile.sendCarPlayAvailability
@@ -828,8 +841,8 @@ class Iap2SenderSession(
 
     // ---- MFi 挑战 ----
 
-    private fun authenticatePairedAppsV1(ident: Iap2Messages.Identification, deadline: Long) {
-        log("MGU-AUTH: paired BMW Apps v1 order=identification-first")
+    private fun authenticatePairedAppsV1(ident: Iap2Messages.Identification?, deadline: Long) {
+        log("MGU-AUTH: paired BMW Apps v1 order=${if (ident == null) "authentication-first" else "identification-first"}")
         val certificate = requestCertificate(ident, deadline)
         fun reject(error: IOException): Nothing {
             log("MGU-AUTH: failed: ${error.message}")
@@ -887,8 +900,8 @@ class Iap2SenderSession(
     private data class CertificateExchange(val frame: Iap2Csm.Frame, val serial: ByteArray?, val cached: Boolean = false)
 
     /** A serial cache hit reuses a real certificate; a miss still fetches AA01 within the original deadline. */
-    private fun requestCertificate(ident: Iap2Messages.Identification, deadline: Long): CertificateExchange {
-        if (ident.declaresSend(Iap2MessageIds.ACCESSORY_AUTHENTICATION_SERIAL_NUMBER) == true)
+    private fun requestCertificate(ident: Iap2Messages.Identification?, deadline: Long): CertificateExchange {
+        if (ident?.declaresSend(Iap2MessageIds.ACCESSORY_AUTHENTICATION_SERIAL_NUMBER) == true)
             send(Iap2MessageIds.MFI_REQUEST_CERTIFICATE, Iap2Csm.param(0, byteArrayOf()))
         else send(Iap2MessageIds.MFI_REQUEST_CERTIFICATE)
         var followedSerial = false
