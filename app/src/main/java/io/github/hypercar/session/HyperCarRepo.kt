@@ -3858,6 +3858,18 @@ object HyperCarRepo {
     /** 单个候选网络上连 AirPlay 控制端口的超时（多网络轮试，单次不能给太久）。 */
     private const val CONTROL_CONNECT_TIMEOUT_MILLIS = 2_500L
 
+    /** CarWith CMD 端口，本地监听自检用。 */
+    private const val CARWITH_CMD_PORT = 7240
+
+    /** 等 CarWith 开始监听 7240 的上限（Rust 拨号器并行继续重试，这里只为确认、重试与诊断落日志）。 */
+    private const val CARWITH_LISTEN_WAIT_MILLIS = 30_000L
+
+    /** 首次启动后仍无监听时，在这个时点重试入口 intent 一次。 */
+    private const val CARWITH_RELAUNCH_AT_MILLIS = 12_000L
+
+    /** CarWith 接口已验证的版本（4.0.23-20261016）；早于此版本提示升级。 */
+    private const val CARWITH_VERIFIED_VERSION_CODE = 104000023L
+
     /** 连 AirPlay 控制端口的重试窗口（接收端常在 invite 之后才开端口，一轮失败不能当死）。 */
     private const val AIRPLAY_CONNECT_WINDOW_MILLIS = 8_000L
 
@@ -3917,9 +3929,33 @@ object HyperCarRepo {
                     context.packageManager.getPackageInfo("com.miui.carlink", 0).let { "${it.versionName}/${it.longVersionCode}" }
                 }.getOrDefault("unknown")
                 log("CARWITH-START: attempt=$diagnosticId version=$version $result")
-                kotlinx.coroutines.delay(6_000)
-                if (current()) CarWithStartupDiagnostics.collect(launchTime) { evidence ->
-                    if (current()) log("CARWITH-START: attempt=$diagnosticId $evidence")
+                val versionCode = runCatching { version.substringAfter('/').toLong() }.getOrNull()
+                if (versionCode != null && versionCode < CARWITH_VERIFIED_VERSION_CODE) {
+                    log("CARWITH-START: attempt=$diagnosticId CarWith $version 早于已验证的 4.0.23-20261016（104000023），建议到应用商店更新到最新版")
+                }
+                // 等 CarWith 开始监听 7240：普通应用可读 /proc/net/tcp，不依赖 Shizuku；
+                // Rust 拨号器在后台逐秒重试，源端就绪后会自动接管，这里只做确认、重试与诊断。
+                var listening = CarWithStartupDiagnostics.isListening(CARWITH_CMD_PORT)
+                var relaunched = false
+                val deadline = launchTime + CARWITH_LISTEN_WAIT_MILLIS
+                while (!listening && current() && System.currentTimeMillis() < deadline) {
+                    if (!relaunched && System.currentTimeMillis() - launchTime >= CARWITH_RELAUNCH_AT_MILLIS) {
+                        relaunched = true
+                        log("CARWITH-START: attempt=$diagnosticId 7240 首次启动 ${CARWITH_RELAUNCH_AT_MILLIS / 1000}s 后未监听，重试入口（首次 startActivity 可能被系统丢弃）")
+                        launchCarWith(context, diagnosticId)
+                    }
+                    kotlinx.coroutines.delay(3_000)
+                    listening = CarWithStartupDiagnostics.isListening(CARWITH_CMD_PORT)
+                }
+                if (current()) {
+                    if (listening) {
+                        log("CARWITH-START: attempt=$diagnosticId 7240=${CarWithStartupDiagnostics.localPortState(CARWITH_CMD_PORT)} CarWith 源端就绪")
+                    } else {
+                        log("CARWITH-START: attempt=$diagnosticId 7240=${CarWithStartupDiagnostics.localPortState(CARWITH_CMD_PORT) ?: "监听表不可读"} CarWith 未开始监听。请检查：1) 允许 HyperCar「后台弹出界面」权限；2) 手机上 CarWith 界面是否弹出并点了「开始连接」；3) 启动 Shizuku 获取 logcat 级诊断")
+                    }
+                    CarWithStartupDiagnostics.collect(launchTime) { evidence ->
+                        if (current()) log("CARWITH-START: attempt=$diagnosticId $evidence")
+                    }
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled

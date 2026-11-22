@@ -2,9 +2,12 @@ package io.github.hypercar.session
 
 import io.github.hypercar.shizuku.ExecResult
 import io.github.hypercar.shizuku.ShizukuTools
+import java.io.File
 import java.util.Locale
 
 internal object CarWithStartupDiagnostics {
+    private val LOCAL_TABLES = listOf("/proc/net/tcp", "/proc/net/tcp6")
+
     fun socketState(result: ExecResult): String {
         if (!result.ok) return "unavailable(exit=${result.code})"
         return result.out.lineSequence().filter { it.isNotBlank() }.map { row ->
@@ -18,9 +21,40 @@ internal object CarWithStartupDiagnostics {
         }.distinct().take(8).joinToString(",").ifEmpty { "no_entry" }
     }
 
+    /**
+     * 免 Shizuku 的本地监听表探测：普通应用可直接读 /proc/net/tcp[6]（只读，不连端口）。
+     * @return null=监听表不可读；否则该端口的状态描述（如 "LISTEN@0100007F:1C48"），无条目时 "no_entry"。
+     */
+    fun localPortState(port: Int, tables: List<String> = LOCAL_TABLES): String? {
+        val hex = String.format(Locale.ROOT, "%04X", port)
+        val states = mutableListOf<String>()
+        var readable = false
+        for (path in tables) {
+            val lines = runCatching { File(path).readLines() }.getOrNull() ?: continue
+            readable = true
+            lines.drop(1).forEach { line ->
+                val parts = line.trim().split(Regex("\\s+"))
+                if (parts.size < 4) return@forEach
+                if (!parts[1].endsWith(":$hex")) return@forEach
+                val label = when (parts[3]) {
+                    "0A" -> "LISTEN"
+                    "01" -> "ESTABLISHED"
+                    else -> parts[3]
+                }
+                states.add("$label@${parts[1]}")
+            }
+        }
+        if (!readable) return null
+        return states.distinct().take(8).joinToString(",").ifEmpty { "no_entry" }
+    }
+
+    /** 端口上已有 LISTEN 或 ESTABLISHED 条目即视为源端就绪；监听表不可读时返回 false。 */
+    fun isListening(port: Int, tables: List<String> = LOCAL_TABLES): Boolean =
+        localPortState(port, tables)?.any { it.startsWith("LISTEN") || it.startsWith("ESTABLISHED") } == true
+
     suspend fun collect(sinceMillis: Long, emit: (String) -> Unit) {
         if (!ShizukuTools.isReady) {
-            emit("7240 系统监听表与 CarWith 系统日志不可读（Shizuku 未就绪）")
+            emit("7240 ${localPortState(7240)?.let { "本地监听表 $it" } ?: "监听表不可读"}；CarWith 系统日志不可读（Shizuku 未就绪）")
             return
         }
         // 1C48 is 7240. Read the local endpoint only; never connect to the CMD socket.
