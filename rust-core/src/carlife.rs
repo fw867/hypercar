@@ -156,6 +156,11 @@ pub struct CarLifeConfig {
     pub data_channel: bool,
     /// 是否要求 CONTENT_ENCRYPTION。公版 CarLife 不做这套，置 false 时不等待 0x1006E。
     pub content_encryption: bool,
+    /// HU_INFO 上报的身份覆盖项；留空时回落到 bt_address/bt_name 与 HyperCar 默认值。
+    pub hu_bt_address: String,
+    pub hu_bt_name: String,
+    pub hu_manufacturer: String,
+    pub hu_model: String,
 }
 
 /// Authenticated seven-channel CarWith gateway with video/audio events and touch input.
@@ -643,11 +648,18 @@ fn proto_statistic_payload() -> Vec<u8> {
 /// ```
 /// 之前这里塞的是**手机侧**的全套字段（还把 24 号当成 carlifeversion 放 "7.0.0"，
 /// 那是 MD_INFO 的语义），并且缺了 required 的 btaddress —— MD 解析必然异常。
-fn proto_hu_info_payload(bt_address: &str, bt_name: &str) -> Vec<u8> {
+fn proto_hu_info_payload(cfg: &CarLifeConfig) -> Vec<u8> {
+    // 三星车联把这次连接记成「哪台车机」就是看这里。系统 CarLife 模式下由 Kotlin 传入
+    // 真实车机的蓝牙名/MAC（例如 mainline / 40:45:DA:70:7A:0F），它才会记住并允许开自动连接。
+    let pick = |override_: &str, fallback: &str| if override_.is_empty() { fallback } else { override_ };
+    let manufacturer = pick(&cfg.hu_manufacturer, "HyperCar");
+    let model = pick(&cfg.hu_model, "HyperCar HU");
+    let bt_name = pick(&cfg.hu_bt_name, &cfg.bt_name);
+    let bt_address = pick(&cfg.hu_bt_address, &cfg.bt_address);
     let mut out = Vec::with_capacity(96);
     proto::string(&mut out, 1, "Android"); // os
-    proto::string(&mut out, 13, "HyperCar"); // manufacturer
-    proto::string(&mut out, 14, "HyperCar HU"); // model
+    proto::string(&mut out, 13, manufacturer); // manufacturer
+    proto::string(&mut out, 14, model); // model
     proto::string(&mut out, 19, "14"); // release
     proto::string(&mut out, 23, bt_address); // btaddress（required）
     proto::string(&mut out, 24, bt_name); // btname（required）

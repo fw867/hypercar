@@ -114,6 +114,16 @@ pub struct EngineConfig {
     /// 是否要求 CONTENT_ENCRYPTION；公版 CarLife 不做这套，为 false 时不等待 0x1006E。
     #[serde(default = "default_true")]
     pub carwith_content_encryption: bool,
+    /// HU_INFO 上报的车机身份。留空时沿用默认的 `HyperCar`。
+    /// 三星车联按 btaddress/btname 记住车机，填成真实车机才允许给它开「自动连接」。
+    #[serde(default)]
+    pub hu_bt_address: String,
+    #[serde(default)]
+    pub hu_bt_name: String,
+    #[serde(default)]
+    pub hu_manufacturer: String,
+    #[serde(default)]
+    pub hu_model: String,
     #[serde(default)]
     pub carwith_cached_canvas: bool,
     #[serde(default)]

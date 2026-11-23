@@ -430,6 +430,22 @@ object SettingsStore {
             // 系统自带 CarLife 没有第 7 路 9440，也不做小米的 CONTENT_ENCRYPTION。
             append("\"carwith_data_channel\":").append(!systemCarLifeSource).append(",")
             append("\"carwith_content_encryption\":").append(!systemCarLifeSource).append(",")
+            // 系统 CarLife：把 HU_INFO 报成「目标车机」，三星车联才会记住它并允许给它开自动连接。
+            // 优先用设置里手选的目标车机；没选过才退回最近一次配对记录。
+            if (systemCarLifeSource) {
+                val paired = pairedCars.maxByOrNull { it.substringAfterLast('|').toLongOrNull() ?: 0L }
+                val huMac = targetCarMac?.takeIf { it.contains(':') }
+                    ?: paired?.substringBefore('|').orEmpty()
+                val huName = (targetCarName?.takeIf { it.isNotBlank() }
+                    ?: paired?.let { it.substringAfter('|').substringBeforeLast('|') })
+                    .orEmpty().ifBlank { huMac }
+                if (huMac.isNotEmpty()) {
+                    append("\"hu_bt_address\":\"").append(esc(huMac)).append("\",")
+                    append("\"hu_bt_name\":").append(org.json.JSONObject.quote(huName)).append(",")
+                    append("\"hu_manufacturer\":").append(org.json.JSONObject.quote(huName)).append(",")
+                    append("\"hu_model\":").append(org.json.JSONObject.quote(huName)).append(",")
+                }
+            }
             append("\"mbux_screen_bootstrap\":").append(profile.mbuxScreenBootstrap).append(",")
             append("\"id9_screen_bootstrap\":").append(profile.id9ScreenBootstrap).append(",")
             append("\"nbt_audio_first\":").append(profile.nbtAudioFirst).append(",")
