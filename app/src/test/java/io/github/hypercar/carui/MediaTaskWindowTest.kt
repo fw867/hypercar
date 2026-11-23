@@ -6,6 +6,31 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class MediaTaskWindowTest {
+    @Test fun launchConfirmationRejectsTaskLostDuringWindowSetup() = runBlocking {
+        val taskOnProjection = """
+            RootTask id=42 bounds=[0,0][2523,800] displayId=8 userId=0
+              taskId=42: com.tencent.mm/.ui.LauncherUI bounds=[0,0][2523,800] userId=0 visible=true
+        """.trimIndent()
+        val taskOnPhone = taskOnProjection.replace("displayId=8", "displayId=0")
+        var stacks = taskOnProjection
+        var prepared = false
+        assertFalse(MediaTaskWindow.confirmLaunch(8, "com.tencent.mm", { true }, readStacks = { stacks }) {
+            prepared = true
+            stacks = taskOnPhone
+        })
+        assertTrue(prepared)
+    }
+
+    @Test fun launchConfirmationAcceptsReplacementActivityOnTheSameDisplay() = runBlocking {
+        var stacks = """
+            RootTask id=42 bounds=[0,0][2523,800] displayId=8 userId=0
+              taskId=42: com.tencent.mm/.Splash bounds=[0,0][2523,800] userId=0 visible=true
+        """.trimIndent()
+        assertTrue(MediaTaskWindow.confirmLaunch(8, "com.tencent.mm", { true }, readStacks = { stacks }) {
+            stacks = stacks.replace(".Splash", ".ui.LauncherUI")
+        })
+    }
+
     @Test fun restoresReusedTaskToItsOriginalDisplayAndRemovesOnlyNewTasks() {
         val previous = MediaTaskWindow.tasks("""
             RootTask id=30 bounds=[0,0][1080,1920] displayId=6 userId=0

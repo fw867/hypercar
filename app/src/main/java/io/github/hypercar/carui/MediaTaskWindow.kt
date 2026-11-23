@@ -33,6 +33,28 @@ internal object MediaTaskWindow {
     fun visibleTask(stacks: String, displayId: Int, packageName: String): Task? =
         tasks(stacks).firstOrNull { it.displayId == displayId && it.packageName == packageName && it.visible }
 
+    suspend fun confirmLaunch(
+        displayId: Int,
+        packageName: String,
+        stillOpen: () -> Boolean,
+        readStacks: suspend () -> String? = { readStackList() },
+        prepareWindow: suspend () -> Unit,
+    ): Boolean {
+        suspend fun taskVisible() = readStacks()?.let { visibleTask(it, displayId, packageName) } != null
+        repeat(4) { attempt ->
+            if (!stillOpen()) return false
+            if (taskVisible()) {
+                if (!stillOpen()) return false
+                prepareWindow()
+                // A launch result can precede a process exit or a splash activity handoff.
+                delay(300)
+                return stillOpen() && taskVisible() && stillOpen()
+            }
+            if (attempt < 3) delay(150)
+        }
+        return false
+    }
+
     fun releaseCommands(
         previous: List<Task>?, current: List<Task>, displayId: Int, packageName: String,
     ): List<String> {
@@ -49,10 +71,7 @@ internal object MediaTaskWindow {
         }
     }
 
-    suspend fun snapshot(): List<Task>? {
-        val result = ShizukuTools.exec("am stack list", 2_000)
-        return if (result.ok) tasks(result.out).takeIf { it.isNotEmpty() } else null
-    }
+    suspend fun snapshot(): List<Task>? = readStackList()?.let(::tasks)?.takeIf { it.isNotEmpty() }
 
     suspend fun releaseTasks(displayId: Int, packageName: String, previous: List<Task>?) {
         val current = snapshot() ?: return
@@ -91,8 +110,9 @@ internal object MediaTaskWindow {
         return false
     }
 
-    private suspend fun findTask(displayId: Int, packageName: String): Task? {
-        val result = ShizukuTools.exec("am stack list", 2_000)
-        return if (result.ok) visibleTask(result.out, displayId, packageName) else null
-    }
+    private suspend fun findTask(displayId: Int, packageName: String): Task? =
+        readStackList()?.let { visibleTask(it, displayId, packageName) }
+
+    private suspend fun readStackList(): String? =
+        ShizukuTools.exec("am stack list", 2_000).let { if (it.ok) it.out else null }
 }

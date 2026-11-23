@@ -77,7 +77,7 @@ internal class MediaCardProjection(context: Context, private val packageName: St
 
     private suspend fun open(request: Request, surface: Surface): Boolean {
         val viewport = request.size
-        val component = runCatching { app.packageManager.getLaunchIntentForPackage(packageName)?.component }.getOrNull()
+        val component = runCatching { ProjectionApps.launcherComponent(app, packageName) }.getOrNull()
         if (component == null) {
             if (isCurrent(request)) error.value = "应用当前无法启动"
             return false
@@ -99,20 +99,23 @@ internal class MediaCardProjection(context: Context, private val packageName: St
         var launched = false
         try {
             if (!isCurrent(request)) return false
-            val result = SpikeDisplay.amStartComponentOnDisplay(id, component.flattenToShortString())
-            launched = !closed && result.contains(" → exit=0 ")
-            if (launched) {
+            val result = SpikeDisplay.amStartLauncherOnDisplay(id, component.flattenToShortString())
+            launched = result.ok && MediaTaskWindow.confirmLaunch(id, packageName, stillOpen = { !closed }) {
                 displayId = id
                 tasksBeforeLaunch = previous
-                attachment = Attachment(request, surface, id)
                 if (isCurrent(request)) applyWindowMode(request)
-            } else if (isCurrent(request)) {
-                error.value = "应用未能在卡片中打开"
             }
-            HyperCarRepo.log("VIDEO-CARD: package=$packageName display=$id size=${viewport.width}x${viewport.height} dpi=${viewport.dpi} ready=$launched result=${result.take(160)}")
+            if (launched) {
+                attachment = Attachment(request, surface, id)
+            } else if (isCurrent(request)) {
+                error.value = if (result.ok) "应用未能在投屏中保持打开" else "应用未能在卡片中打开"
+            }
+            HyperCarRepo.log("VIDEO-CARD: package=$packageName display=$id size=${viewport.width}x${viewport.height} dpi=${viewport.dpi} ready=$launched result=${result.detail.take(300)}")
             return launched
         } finally {
-            if (!launched) releaseProjectionDisplay(id, previous)
+            if (!launched) {
+                if (displayId == id) releaseDisplay() else releaseProjectionDisplay(id, previous)
+            }
         }
     }
 

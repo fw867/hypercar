@@ -137,7 +137,7 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
         val shortVideo = ShortVideoApps.isSupported(app.packageName)
         if (shortVideo) {
             MusicBridge.pauseForShortVideo()
-        } else {
+        } else if (MusicApps.isKnownPlayer(app.packageName)) {
             MusicBridge.selectPackage(context, app.packageName, launchOnPhone = !fromAppsPage)
         }
         if (shortVideo || fromAppsPage) {
@@ -339,7 +339,9 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
                 } else if (about) {
                     CarAboutPage(Modifier.weight(1f)) { about = false }
                 } else if (apps) {
-                    AppsPage(Modifier.weight(1f), musicApps + videoApps,
+                    val selected = CarUiSettings.projectionPackages
+                    val customApps = remember(context, selected) { ProjectionApps.installed(context, selected) }
+                    AppsPage(Modifier.weight(1f), musicApps + videoApps + customApps,
                         onSettings = { settings = true }, onAbout = { about = true },
                         onMapSelected = { apps = false }, onMediaSelected = { selectMediaApp(it, fromAppsPage = true) })
                 } else if (expandedMedia && projection != null) {
@@ -837,8 +839,8 @@ private fun AppsPage(
                 }
                 mediaApps.forEach { app ->
                     key(app.packageName) {
-                        AppTile(bitmap = app.icon, fallback = if (ShortVideoApps.isSupported(app.packageName))
-                            Icons.Rounded.PlayArrow else Icons.Rounded.MusicNote,
+                        AppTile(bitmap = app.icon, fallback = if (MusicApps.isKnownPlayer(app.packageName))
+                            Icons.Rounded.MusicNote else Icons.Rounded.PlayArrow,
                             color = CarCard, label = app.label,
                             onClickLabel = "打开${app.label}") {
                             onMediaSelected(app)

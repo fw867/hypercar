@@ -77,6 +77,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import io.github.hypercar.carui.CarUiSettings
 import io.github.hypercar.net.CARPLAY_DEVICE_INFO_BOARD
 import io.github.hypercar.perm.AppPermissions
 import io.github.hypercar.session.HyperCarRepo
@@ -125,6 +126,7 @@ fun SettingsScreen(
     linkConnected: Boolean = false,
 ) {
     var pageName by rememberSaveable { mutableStateOf(SettingsPage.Main.name) }
+    var showProjectionApps by rememberSaveable { mutableStateOf(false) }
     val developerMode = remember(SettingsRevision.value) { SettingsStore.developerModeEnabled }
     val showDeveloperMenu = remember(SettingsRevision.value) { SettingsStore.developerMenuVisible }
     val page = SettingsPage.entries.firstOrNull { it.name == pageName }
@@ -154,6 +156,10 @@ fun SettingsScreen(
                             SettingsMenuItem("我的车机", "车机型号、目标设备与上车自动连接") { open(SettingsPage.Car) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
                             SettingsMenuItem("画面与声音", "画面来源、音频格式与显示参数") { open(SettingsPage.Display) }
+                            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+                            SettingsMenuItem("自定义投屏应用", "已选 ${CarUiSettings.projectionPackages.size} 个 · 在车机「更多应用」中打开") {
+                                showProjectionApps = true
+                            }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
                             SettingsMenuItem("主题与外观", "跟随系统、HyperOS 风格浅色与深色") { open(SettingsPage.Appearance) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
@@ -193,6 +199,9 @@ fun SettingsScreen(
                 Spacer(Modifier.height(8.dp))
             }
         }
+    }
+    if (page == SettingsPage.Main && showProjectionApps) {
+        ProjectionAppsDialog { showProjectionApps = false }
     }
 }
 

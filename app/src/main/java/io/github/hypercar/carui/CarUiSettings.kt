@@ -25,6 +25,8 @@ object CarUiSettings {
         private set
     var autoPlayOnConnect: Boolean by mutableStateOf(false)
         private set
+    var projectionPackages: Set<String> by mutableStateOf(emptySet())
+        private set
     var themeMode: CarThemeMode by mutableStateOf(CarThemeMode.AUTO)
         private set
     var wallpaper: CarWallpaper by mutableStateOf(CarWallpaper.GUANGYING)
@@ -40,6 +42,9 @@ object CarUiSettings {
         defaultMap = MapApps.fromId(p.getString("default_map", MapProvider.AMAP.id))
         defaultMusicPackage = p.getString("default_music", "").orEmpty()
         autoPlayOnConnect = p.getBoolean("auto_play", false)
+        projectionPackages = ProjectionApps.eligiblePackages(
+            p.getStringSet("projection_packages", emptySet()).orEmpty(), context.packageName,
+        ).toSet()
         themeMode = runCatching {
             CarThemeMode.valueOf(p.getString("theme_mode", CarThemeMode.AUTO.name)!!)
         }.getOrDefault(CarThemeMode.AUTO)
@@ -70,6 +75,12 @@ object CarUiSettings {
     fun updateAutoPlayOnConnect(value: Boolean) {
         autoPlayOnConnect = value
         prefs?.edit()?.putBoolean("auto_play", value)?.apply()
+    }
+
+    fun updateProjectionPackage(packageName: String, enabled: Boolean) {
+        val selected = if (enabled) projectionPackages + packageName else projectionPackages - packageName
+        projectionPackages = selected
+        prefs?.edit()?.putStringSet("projection_packages", selected)?.apply()
     }
 
     fun onCarNight(night: Boolean) {
