@@ -651,6 +651,10 @@ fn proto_statistic_payload() -> Vec<u8> {
 fn proto_hu_info_payload(cfg: &CarLifeConfig) -> Vec<u8> {
     // 三星车联把这次连接记成「哪台车机」就是看这里。系统 CarLife 模式下由 Kotlin 传入
     // 真实车机的蓝牙名/MAC（例如 mainline / 40:45:DA:70:7A:0F），它才会记住并允许开自动连接。
+    let identity = (pick(&cfg.hu_manufacturer, "HyperCar").to_string(), pick(&cfg.hu_model, "HyperCar HU").to_string(),
+        pick(&cfg.hu_bt_address, &cfg.bt_address).to_string(), pick(&cfg.hu_bt_name, &cfg.bt_name).to_string());
+    crate::emit_log(&format!("CARWITH-IDENT: manufacturer={} model={} btaddress={} btname={}",
+        identity.0, identity.1, identity.2, identity.3));
     fn pick<'a>(override_: &'a str, fallback: &'a str) -> &'a str {
         if override_.is_empty() { fallback } else { override_ }
     }
