@@ -17,8 +17,8 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
 /** Cached access to the local-only hotspot. This never represents AirPlay activation. */
-internal object BmwWifiReconnect {
-    private const val PROFILE = "bmw_id85"
+internal object CarHotspotReconnect {
+    // Keep the original alias and directory so upgrades can read existing BMW caches.
     private const val KEY_ALIAS = "bmw-local-wifi"
     private const val NONCE_BYTES = 12
 
@@ -26,7 +26,9 @@ internal object BmwWifiReconnect {
 
     /** Network discovery may run outside the session lock. Its result must survive the same handoff epoch. */
     class Handoff<R : Any, N : Any> {
-        private data class State<R, N>(val request: R? = null, val network: N? = null, val provisional: Boolean = false)
+        private data class State<R, N>(
+            val request: R? = null, val receiver: String? = null, val network: N? = null, val provisional: Boolean = false,
+        )
         private val state = AtomicReference(State<R, N>())
 
         val cachedRequest: R? get() = state.get().takeIf { it.network != null }?.request
@@ -35,17 +37,20 @@ internal object BmwWifiReconnect {
         fun discoveryToken(): Any? = state.get().takeUnless { it.request != null && (it.network == null || it.provisional) }
         fun canCommitDiscovery(token: Any?): Boolean = token != null && token === state.get()
 
-        fun begin(request: R): Boolean {
+        fun begin(request: R, receiver: String): Boolean {
             val previous = state.get()
-            return previous.request == null && state.compareAndSet(previous, State(request))
+            return previous.request == null && state.compareAndSet(previous, State(request, receiver))
         }
+
+        fun matchesTarget(target: String?, established: Boolean): Boolean =
+            established || state.get().receiver?.equals(target, ignoreCase = true) != false
 
         fun isJoining(request: R): Boolean = state.get().let { it.request === request && it.network == null }
 
         fun bind(request: R, network: N) {
             val previous = state.get()
             check(previous.request === request && previous.network == null)
-            check(state.compareAndSet(previous, State(request, network, provisional = true)))
+            check(state.compareAndSet(previous, previous.copy(network = network, provisional = true)))
         }
 
         fun finishJoining(request: R) {
@@ -67,11 +72,19 @@ internal object BmwWifiReconnect {
         }
     }
 
-    fun canRestore(profile: String, manual: Boolean, target: String?, bonded: String?, paired: Boolean): Boolean =
-        profile == PROFILE && manual && paired && target != null &&
+    fun canRestore(manual: Boolean, target: String?, bonded: String?, paired: Boolean, desktop: Boolean): Boolean =
+        manual && paired && !desktop && target != null &&
             PairingEvidence.receiverKey(target) != null && target.equals(bonded, ignoreCase = true)
 
-    fun canRemember(profile: String, passphrase: String): Boolean = profile == PROFILE && passphrase.isNotEmpty()
+    fun canRemember(
+        passphrase: String?, freshHotspot: Boolean, ownedRequest: Boolean, localOnly: Boolean, desktop: Boolean,
+    ): Boolean = !passphrase.isNullOrEmpty() && freshHotspot && ownedRequest && localOnly && !desktop
+
+    fun canUseEndpoint(hasCache: Boolean, carNetworkReady: Boolean, freshCredentials: Boolean): Boolean =
+        !hasCache || carNetworkReady || freshCredentials
+
+    fun <N> canReplaceBinding(bound: N?, invitationOnly: N?, currentSsid: String?, cachedSsid: String): Boolean =
+        bound == null || (bound == invitationOnly && currentSsid != cachedSsid)
 
     @Synchronized
     fun save(context: Context, receiver: String, credentials: Credentials) {

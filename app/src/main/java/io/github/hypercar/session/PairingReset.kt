@@ -7,7 +7,7 @@ import io.github.hypercar.settings.SettingsStore
 object PairingReset {
     fun runAll(context: Context, log: (String) -> Unit): String {
         PairingIdentityFiles.resetAll(context.filesDir)
-        BmwWifiReconnect.forgetAll(context)
+        CarHotspotReconnect.forgetAll(context)
         SettingsStore.forgetAllCarPairings()
         io.github.hypercar.iap2.MfiLengthMemory.clearAll(context)
         io.github.hypercar.iap2.MfiCertificateCache.clearAll(context)
@@ -17,7 +17,7 @@ object PairingReset {
 
     fun run(context: Context, mac: String, log: (String) -> Unit): String {
         PairingIdentityFiles.resetReceiver(context.filesDir, mac)
-        BmwWifiReconnect.forget(context, mac)
+        CarHotspotReconnect.forget(context, mac)
         io.github.hypercar.iap2.MfiCertificateCache.forget(context,mac)
         SettingsStore.forgetCarPairing(mac)
         val summary = "已清除该车机的配对身份与记录"
