@@ -3970,7 +3970,7 @@ object HyperCarRepo {
                 if (!sessionLive.get() || connectionAttemptId != attempt || !sessionSystemCarLife) return@launch
                 val reason = if (startup) "源端 CMD 持续拒绝连接" else "车机画布迟到"
                 log("CARWITH-START: $reason，重新启动本机车联入口 attempt=$attempt")
-                log("CARWITH-START: attempt=$attempt " + if (sessionSystemCarLife) launchSystemCarLife(ctx, attempt) else launchCarWith(ctx, attempt))
+                log("CARWITH-START: attempt=$attempt " + if (sessionSystemCarLife) launchSystemCarLife(ctx, attempt, openUi = startup) else launchCarWith(ctx, attempt))
             }
         }
 
@@ -5173,9 +5173,26 @@ object HyperCarRepo {
      * carlife.samsung，七个监听口全消失。所以这里不主动拉起任何界面，只给提示；Rust 侧负责
      * 每秒拨一次 127.0.0.1:7240，端口一开就接管。
      */
-    private suspend fun launchSystemCarLife(ctx: android.content.Context, attempt: Long): String {
+    private suspend fun launchSystemCarLife(ctx: android.content.Context, attempt: Long, openUi: Boolean = false): String {
         val where = io.github.hypercar.session.StartupRequirements.systemCarLifePackage(ctx) ?: "系统车联"
         val message = "请在$where 里点「百度 CarLife+」→「WLAN 连接」→「开始连接」，再切回本应用；正在等待 7240"
+        // 只有在端口一直拒连（Rust 连续 8 次 refused 回调）时才把车联页拉到前台，让用户点一次「开始连接」。
+        // 端口已在监听时绝不能碰它——重新拉起会把监听全部清掉（2026-11-23 SM-S9380 实测）。
+        if (openUi) {
+            val target = listOf(
+                "com.samsung.android.carlink" to "com.samsung.android.carlink.setting.activity.carlife.CarLifeConnectCarActivity",
+            )
+            for ((pkg, cls) in target) {
+                val opened = runCatching {
+                    ctx.startActivity(android.content.Intent().apply {
+                        setClassName(pkg, cls)
+                        addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                    })
+                    true
+                }.getOrDefault(false)
+                if (opened) { log("SYSTEM-CARLIFE: attempt=$attempt 已把车联页拉到前台，点一次「开始连接」即可"); break }
+            }
+        }
         log("SYSTEM-CARLIFE: attempt=$attempt $message")
         return message
     }
