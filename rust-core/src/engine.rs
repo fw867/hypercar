@@ -85,6 +85,8 @@ pub struct EngineConfig {
     #[serde(default)]
     pub keep_alive_stats: bool,
     #[serde(default)]
+    pub request_receiver_stats: bool,
+    #[serde(default)]
     pub bmw_box_bootstrap: bool,
     #[serde(default)]
     pub head_unit_profile: String,
@@ -192,7 +194,8 @@ pub async fn run_engine(
     let (host_ui_tx, mut host_ui_rx) = mpsc::channel::<()>(1);
     let (view_tx, view_rx) = mpsc::channel::<crate::display_layout::ViewRequest>(1);
     let (audio_claim_tx, mut audio_claim_rx) = mpsc::channel::<(PlaybackIntent, std::time::Instant)>(4);
-    let (video_tx, video_rx) = mpsc::unbounded_channel::<SourceEvent>();
+    let (video_tx, video_rx) = crate::video_queue::channel();
+    let video_queue_observer = video_rx.observer();
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<SourceEvent>();
     let fallback_audio_tx=audio_tx.clone();
     let auxiliary_input=Arc::new(crate::aux_audio::Input::default());
@@ -383,7 +386,11 @@ pub async fn run_engine(
             let mut last_audio_tick=tokio::time::Instant::now();
             let mut last_log=tokio::time::Instant::now()-Duration::from_secs(10);
             loop {
-                let mut snapshot=health.lock().snapshot();
+                let (mut snapshot, queue_report) = {
+                    let mut health = health.lock();
+                    let report = video_queue_observer.report(health.video_tcp.as_ref().map(|tcp| tcp.connection_id));
+                    (health.snapshot(), report)
+                };
                 { let v=vs.lock(); snapshot.video_source_units=v.source_units; snapshot.video_frames_written=v.frames; }
                 let now = tokio::time::Instant::now();
                 if let Some((then, previous)) = last_video_sample.replace((now, snapshot.video_frames_written)) {
@@ -400,6 +407,7 @@ pub async fn run_engine(
                 }
                 snapshot.wifi_iap2=crate::wifi_iap2::phase(snapshot.wifi_id);
                 let now_ms=crate::timing::monotonic_nanos()/1_000_000;
+                if let Some(report) = queue_report { report.log(snapshot.generation, now_ms); }
                 snapshot.timing.refresh_age(now_ms);
                 if let Some(tcp)=snapshot.video_tcp.as_mut() {tcp.age_ms=now_ms.saturating_sub(tcp.sampled_ms);}
                 if let Ok(json)=serde_json::to_string(&snapshot) { crate::emit_pipeline(&json); }
@@ -432,6 +440,7 @@ pub async fn run_engine(
         bmw_capabilities: cfg.bmw_capabilities,
         microphone_probe,
         keep_alive_stats: cfg.keep_alive_stats,
+        request_receiver_stats: cfg.request_receiver_stats,
         bmw_box_bootstrap: cfg.bmw_box_bootstrap,
         head_unit_profile: cfg.head_unit_profile.clone(),
         mbux_screen_bootstrap: cfg.mbux_screen_bootstrap,
@@ -993,7 +1002,7 @@ pub(crate) async fn video_pump(
     resource_lifecycle: bool,
     video_pipeline: Arc<Mutex<crate::pipeline::Pipeline>>,
     mut screen_ready_rx: mpsc::Receiver<crate::screen_session::ScreenCommand>,
-    video_rx: mpsc::UnboundedReceiver<SourceEvent>,
+    video_rx: crate::video_queue::Receiver,
     carwith_profile: Option<String>, fps:u32, source_owner:Option<u64>,
 ) {
     let diagnostic_phase = VideoLogLease(source_owner.and_then(crate::carwith_source::diagnostic_phase));
@@ -1004,6 +1013,7 @@ pub(crate) async fn video_pump(
     let mut converted=std::collections::VecDeque::new();
     let mut sender: Option<ScreenSender> = None;
     let mut commands_open = true;
+    let mut slow_writes = crate::screen_write::SlowWriteTrace::default();
     // 屏幕流就绪前收到的编码尺寸先存着，就绪时补上
     let mut pending_size: Option<(u32, u32)> = None;
     // 编码器真实尺寸（最后一次 EncoderResolution）。VideoConfig/画布都以它为准；
@@ -1024,6 +1034,8 @@ pub(crate) async fn video_pump(
                     if let Some((w, h)) = pending_size.take() {
                         s.set_size(w, h);
                     }
+                    s.activate_keyframe_trace();
+                    s.note_keyframe_request("install");
                     sender = Some(s);
                     crate::emit_force_keyframe();
                     if let Some(owner)=source_owner {crate::carwith_source::replay(owner);}
@@ -1039,6 +1051,7 @@ pub(crate) async fn video_pump(
                             next.set_resource_grant(modes.clone(),revision);
                             if let Some((w,h)) = pending_size.take() { next.set_size(w,h); }
                             video_pipeline.lock().video_stream="READY".into();
+                            next.activate_keyframe_trace();
                             sender = Some(next);
                             true
                         } else { false }
@@ -1046,6 +1059,7 @@ pub(crate) async fn video_pump(
                     let _ = reply.send(accepted);
                     emit_log(&format!("SCREEN-LIFECYCLE: video pump install revision={revision} accepted={accepted}"));
                     if accepted {
+                        if let Some(s) = &sender { s.note_keyframe_request("resume"); }
                         if let Some(owner)=source_owner {crate::carwith_source::replay(owner);}
                         crate::emit_force_keyframe();
                     }
@@ -1063,7 +1077,10 @@ pub(crate) async fn video_pump(
                 },
             },
             ev = async {
-                if let Some(ev)=converted.pop_front() {(true,Some(ev))}else{(false,video_rx.recv().await)}
+                if let Some(ev)=converted.pop_front() {(true,Some(ev))}else{
+                    let connection = sender.as_ref().and_then(ScreenSender::connection_id);
+                    (false,video_rx.recv(connection).await)
+                }
             } => { let (processed,ev)=ev; match ev {
                 Some(SourceEvent::ResetVideoSource) => {
                     encoder_size = None; pending_size = None;
@@ -1092,6 +1109,9 @@ pub(crate) async fn video_pump(
                     };
                     if !processed {
                         stats.lock().source_units += 1;
+                        if let Some(s) = &sender {
+                            s.observe_source_sync(&data, pts_us, codec, origin, video_rx.last_dequeue_age_ms());
+                        }
                         if transcode {
                             let allowed=sender.as_ref().map(|s|s.hevc_allowed()).unwrap_or(false);
                             // Do not initialize a codec until the current screen transport is installed.
@@ -1127,12 +1147,8 @@ pub(crate) async fn video_pump(
                         } else {
                             pts_us
                         };
-                        let written=if resource_lifecycle {
-                            let connection = video_pipeline.lock().video_tcp.as_ref().map(|s|s.connection_id);
-                            crate::screen_write::with_progress(s.send_video_annexb_from(&data,pts,origin), ||
-                                video_pipeline.lock().video_tcp.as_ref()
-                                    .filter(|s|Some(s.connection_id)==connection).and_then(|s|s.acked_bytes)).await
-                        } else { s.send_video_annexb_from(&data,pts,origin).await };
+                        let written = slow_writes.write(s.connection_id(), "frame", &video_pipeline,
+                            resource_lifecycle, s.send_video_annexb_from(&data,pts,origin)).await;
                         if let Err(error) = written {
                             emit_log(&format!("VIDEO: write failed: {error}; {}; tcp_at_failure=[{}]", s.diagnostics(),s.transport_diagnostics()));
                             video_pipeline.lock().video_stream="FAILED".into();
@@ -1175,12 +1191,8 @@ pub(crate) async fn video_pump(
                 }
                 // 屏幕流 keepAlive 帧（明文、1s 节流；缺它 Audi MMI 3315 10.2s 拆轮）
                 if let Some(s) = sender.as_mut() {
-                    let written=if resource_lifecycle {
-                        let connection = video_pipeline.lock().video_tcp.as_ref().map(|s|s.connection_id);
-                        crate::screen_write::with_progress(s.maybe_send_keep_alive(), ||
-                            video_pipeline.lock().video_tcp.as_ref()
-                                .filter(|s|Some(s.connection_id)==connection).and_then(|s|s.acked_bytes)).await
-                    } else { s.maybe_send_keep_alive().await };
+                    let written = slow_writes.write(s.connection_id(), "keepalive", &video_pipeline,
+                        resource_lifecycle, s.maybe_send_keep_alive()).await;
                     if let Err(error) = written {
                         emit_log(&format!("VIDEO: keepAlive failed: {error}; {}; tcp_at_failure=[{}]", s.diagnostics(),s.transport_diagnostics()));
                         video_pipeline.lock().video_stream="FAILED".into();
@@ -1251,7 +1263,7 @@ mod video_pump_tests {
             let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let phone=tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
             let (mut car,_)=listener.accept().await.unwrap();let (_,write)=phone.into_split();
-            let (commands,rx)=mpsc::channel(2);let (source,video_rx)=mpsc::unbounded_channel();
+            let (commands,rx)=mpsc::channel(2);let (source,video_rx)=crate::video_queue::channel();
             let stats=Arc::new(Mutex::new(PumpStat::default()));let stop=Arc::new(Notify::new());
             let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
             let pump=crate::callback_context::spawn(video_pump(stop.clone(),stats.clone(),recovery,pipeline,rx,video_rx,None,30,None));

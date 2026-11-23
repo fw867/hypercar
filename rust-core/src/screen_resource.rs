@@ -305,7 +305,7 @@ pub(crate) mod tests {
     }
     pub(crate) struct Fixture {
         pub(crate) session:Arc<ScreenSession>,modes:Arc<Mutex<Modes>>,pub(crate) car:TcpStream,video:TcpListener,
-        source:mpsc::UnboundedSender<SourceEvent>,pump:tokio::task::JoinHandle<()>,
+        source:crate::video_queue::Sender,pump:tokio::task::JoinHandle<()>,
     }
     impl Drop for Fixture {fn drop(&mut self) {self.pump.abort();}}
     impl Fixture {
@@ -321,13 +321,13 @@ pub(crate) mod tests {
             let params=AirplayParams {
                 wifi_mac_address:None,
                 car_ip:"127.0.0.1".into(),airplay_port:7000,device_id:"test".into(),device_name:"Test phone".into(),identity_path:"unused".into(),
-                receiver_id:None,receiver_model:None,receiver_previously_connected:true,enable_audio:true,audio_codec:String::new(),video_codec:String::new(),bmw_capabilities:true,microphone_probe:None,keep_alive_stats:false,
+                receiver_id:None,receiver_model:None,receiver_previously_connected:true,enable_audio:true,audio_codec:String::new(),video_codec:String::new(),bmw_capabilities:true,microphone_probe:None,keep_alive_stats:false,request_receiver_stats:false,
                 head_unit_profile:if mbux { "mercedes_mbux" } else { "bmw_id85" }.into(),
                 bmw_box_bootstrap:!mbux,mbux_screen_bootstrap:mbux,id9_screen_bootstrap:false,nbt_audio_first:false,mbux_media_compat:false,desktop_receiver:false,width:1920,height:720,touch_display:None,touch_rect:None,
                 encoder_size:Arc::new(Mutex::new((1920,720))),touch_size:Arc::new(Mutex::new((1920,720))),
                 carwith_display:None,carwith_media_rate:None,carwith_stretch:false,screen_resource_lifecycle:true,pipeline:pipeline.clone(),
             };
-            let (commands,rx)=mpsc::channel(2);let (source,video_rx)=mpsc::unbounded_channel();
+            let (commands,rx)=mpsc::channel(2);let (source,video_rx)=crate::video_queue::channel();
             let pump=tokio::spawn(video_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(PumpStat::default())),true,pipeline,rx,video_rx,None,30,None));
             let owned=Arc::new(AtomicBool::new(modes.screen_owned()));
             let session=Arc::new(ScreenSession {control,shutdown:Arc::new(crate::shutdown::EngineShutdown::new()),wifi_iap_id:0,factory:Arc::new(Factory),params,shared:Some([9;32]),uuid:"screen-test".into(),transport_failures:tokio::sync::watch::channel(None).0,
@@ -1099,7 +1099,7 @@ pub(crate) mod tests {
         let socket=TcpStream::connect(video.local_addr().unwrap()).await.unwrap();
         let (mut peer,_)=video.accept().await.unwrap();let (_,write)=socket.into_split();
         let modes=Arc::new(Mutex::new(Modes::initial()));let revision=modes.lock().screen_grant_generation();
-        let (commands,rx)=mpsc::channel(2);let (source,video_rx)=mpsc::unbounded_channel();
+        let (commands,rx)=mpsc::channel(2);let (source,video_rx)=crate::video_queue::channel();
         let (done,accepted)=tokio::sync::oneshot::channel();
         commands.send(ScreenCommand::InstallIfOwned {
             sender:crate::screen::ScreenSender::new(write,crate::screen::ScreenCipher::ChaCha([1;32]),1920,720,false),

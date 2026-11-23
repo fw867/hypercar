@@ -5,6 +5,53 @@ import org.junit.Test
 import io.github.hypercar.session.ConnectionDiagnostics.Stage
 
 class ConnectionDiagnosticsTest {
+    @Test fun videoRecoverySurvivesFeedbackRolloverAndRoutineEventsLimitPersistence() {
+        val journal = ConnectionDiagnostics { 1_000L }
+        val attempt = journal.begin("manual", "bmw_id85")
+        journal.engineStarted(attempt, 2, null, 1_000, 5_000)
+        fun event(at: Long, kind: String) = journal.mediaEvent(attempt, 2,
+            "MEDIA-TIMELINE: $at $kind conn=42")
+        for (kind in listOf("screen_keepalive_write", "video_write_slow", "video_write_end")) {
+            assertTrue(kind, event(1001, kind))
+            assertFalse(kind, event(1002, kind))
+        }
+        repeat(20) { event(2000L + it, "feedback_ok") }
+        val summary = journal.mediaSummaries().values.single()
+        assertTrue(summary.contains("1002ms video_write_end conn=42"))
+    }
+
+    @Test fun overlappingRequestsAndRepeatedNumbersOnNewScreenSurviveFeedbackRollover() {
+        val journal = ConnectionDiagnostics { 1_000L }
+        val attempt = journal.begin("manual", "bmw_id85")
+        journal.engineStarted(attempt, 2, null, 1_000, 5_000)
+        fun event(at: Long, kind: String, details: String) = journal.mediaEvent(attempt, 2,
+            "MEDIA-TIMELINE: $at $kind $details")
+        val old = "conn=42 request=1"
+        val next = "conn=43 request=1"
+        event(1001, "keyframe_request", old)
+        event(1002, "keyframe_source_sync", old)
+        event(1004, "keyframe_tcp_write", old)
+        event(1003, "keyframe_sender_sync", old)
+        event(1005, "keyframe_request", next)
+        event(1006, "keyframe_request", "conn=43 request=2")
+        event(1007, "keyframe_source_sync", next)
+        repeat(20) { event(2000L + it, "feedback_ok", "status=200") }
+        val summary = journal.mediaSummaries().values.single()
+        for (stage in listOf("request", "source_sync", "sender_sync", "tcp_write")) {
+            assertTrue(summary, summary.contains("keyframe_$stage $old"))
+        }
+        assertTrue(summary.contains("keyframe_request $next"))
+        assertTrue(summary.contains("keyframe_source_sync $next"))
+        assertFalse(summary.contains("keyframe_tcp_write $next"))
+
+        event(2100, "keyframe_request", "conn=44 request=1")
+        event(2101, "keyframe_request", "conn=44 request=2")
+        val capped = journal.mediaSummaries().values.single()
+        assertFalse(capped.contains(old))
+        assertTrue(capped.contains("keyframe_request $next"))
+        assertTrue(capped.contains("keyframe_request conn=44 request=2"))
+    }
+
     @Test fun mediaSummaryKeepsFirstFrameTouchAndFeedbackFailuresWhenRecentEntriesRollOver() {
         val journal = ConnectionDiagnostics { 1_000L }
         val first = journal.begin("manual", "bmw_id9")

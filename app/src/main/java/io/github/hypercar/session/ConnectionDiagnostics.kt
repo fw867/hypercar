@@ -28,6 +28,21 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
     ) {
         val mediaRecent = ArrayDeque<MediaEvent>()
         val mediaKeyEvents = linkedMapOf<String, MediaEvent>()
+        val videoSavedAt = mutableMapOf<String, Long>()
+        private val keyframeRequests = linkedMapOf<KeyframeRequest, MutableMap<String, MediaEvent>>()
+
+        fun recordKeyframe(key: KeyframeRequest, event: MediaEvent): Boolean {
+            val group = keyframeRequests.getOrPut(key) { mutableMapOf() }
+            if (group.putIfAbsent(event.kind, event) != null) return false
+            if (keyframeRequests.size > MAX_KEYFRAME_REQUESTS) {
+                val oldest = keyframeRequests.minBy { (_, events) -> events.values.minOf { it.at } }.key
+                keyframeRequests.remove(oldest)
+                if (oldest == key) return false
+            }
+            return true
+        }
+
+        fun hasMediaEvents() = mediaRecent.isNotEmpty() || keyframeRequests.isNotEmpty()
 
         fun accepted(at: Long) {
             if (at <= (lastInbound ?: -1L)) return
@@ -41,12 +56,21 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
         fun summary() = clockAndEvent() +
             " video_tcp=[${tcp ?: "unknown"}] rfcomm_reentry_ms=${reentry ?: "unknown"}" + mediaTimeline()
 
-        fun mediaTimeline() = if (mediaRecent.isEmpty()) "" else (mediaKeyEvents.values + mediaRecent)
+        fun mediaTimeline() = if (!hasMediaEvents()) "" else
+            (mediaKeyEvents.values + mediaRecent + keyframeRequests.values.flatMap { it.values })
                 .distinct().sortedBy { it.at }.joinToString(" | ", prefix = " media_timeline=[", postfix = "]") {
                     "${it.at}ms ${it.kind} ${it.detail}"
                 }
     }
     private data class MediaEvent(val at: Long, val kind: String, val detail: String)
+    private data class KeyframeRequest(val connection: ULong, val sequence: ULong)
+    private val keyframeIdentity = Regex("""\bconn=(\d+) request=(\d+)\b""")
+    private val keyframeEvents = setOf("keyframe_request", "keyframe_source_sync", "keyframe_sender_sync",
+        "keyframe_tcp_write", "keyframe_end")
+
+    private companion object {
+        const val MAX_KEYFRAME_REQUESTS = 4
+    }
     private val mediaProcess = java.util.UUID.randomUUID()
     private var serial = 0L
     private val history = ArrayDeque<Attempt>()
@@ -80,6 +104,13 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
         val at = parts[0].toLongOrNull()?.takeIf { it >= t.anchorUptime } ?: return false
         val kind = parts[1]
         val event = MediaEvent(at, kind, clean(parts[2]))
+        if (kind in keyframeEvents) {
+            keyframeIdentity.find(event.detail)?.destructured?.let { (conn, seq) ->
+                val connection = conn.toULongOrNull() ?: return false
+                val request = seq.toULongOrNull() ?: return false
+                return t.recordKeyframe(KeyframeRequest(connection, request), event)
+            }
+        }
         val persist = when (kind) {
             "first_video_written", "hid_touch_in" -> {
                 val first = t.mediaKeyEvents.putIfAbsent(kind, event) == null
@@ -97,6 +128,12 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
                 true
             } else t.mediaKeyEvents.putIfAbsent("first_feedback_queued", event) == null
             "feedback_ok" -> t.mediaKeyEvents.putIfAbsent("first_feedback_ok", event) == null
+            "screen_keepalive_write", "keyframe_request", "video_write_slow", "video_write_end" -> {
+                if ((t.mediaKeyEvents[kind]?.at ?: -1L) > at) return false
+                t.mediaKeyEvents[kind] = event
+                val saved = t.videoSavedAt[kind]
+                (saved == null || at - saved >= 10_000).also { if (it) t.videoSavedAt[kind] = at }
+            }
             else -> return false
         }
         t.mediaRecent.addLast(event)
@@ -106,7 +143,7 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
 
     @Synchronized internal fun mediaSummaries(): Map<String, String> = buildMap {
         for (attempt in history) {
-            val transport = attempt.transport?.takeIf { it.mediaRecent.isNotEmpty() } ?: continue
+            val transport = attempt.transport?.takeIf { it.hasMediaEvents() } ?: continue
             val key = "$mediaProcess/${attempt.id}/${transport.engine}"
             put(key, "ATTEMPT#${attempt.id} process=$mediaProcess engine=${transport.engine} profile=${attempt.profile} " +
                 "outcome=${attempt.outcome} ${transport.clockAndEvent()}${transport.mediaTimeline()} reason=${attempt.reason}")

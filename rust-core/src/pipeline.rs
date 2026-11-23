@@ -41,6 +41,8 @@ pub struct Pipeline {
     /// Current main connection with a completed video frame write. Telemetry totals span connections.
     #[serde(skip)]
     pub(crate) main_video_connection: Option<MainVideoConnection>,
+    #[serde(skip)]
+    pub(crate) keyframe_trace: std::sync::Weak<crate::screen::keyframe::Trace>,
     pub audio_ready: bool,
     pub audio_codec: String,
     pub main_audio_stream_type: Option<i64>,
@@ -51,12 +53,17 @@ pub struct Pipeline {
     pub screen_rebuilds: u64,
     pub timing: crate::timing::TimingDiagnostics,
     pub video_tcp: Option<crate::tcp_diagnostics::TcpSnapshot>,
+    // The sender owns the counter. An outstanding feedback request must not keep it alive.
+    #[serde(skip)]
+    pub(crate) main_video_writes: std::sync::Weak<AtomicU64>,
     #[serde(skip)]
     retired_video_tcp: Option<crate::tcp_diagnostics::TcpSnapshot>,
 }
 impl Pipeline {
     pub(crate) fn retire_video_tcp(&mut self) {
+        self.keyframe_trace = std::sync::Weak::new();
         self.main_video_connection = None;
+        self.main_video_writes = Default::default();
         if let Some(sample) = self.video_tcp.take() { self.retired_video_tcp = Some(sample); }
     }
 
@@ -100,11 +107,11 @@ impl Pipeline {
         if gaps.is_empty(){"none_observed_receiver_presentation_unconfirmed".into()}else{gaps.join(",")}
     }
     pub fn new() -> Self {
-        Self { video_requested_fps:0,display_max_fps:None,video_actual_fps:None,display_size:None, video_format:None, screen_config_size:None, generation: NEXT.fetch_add(1,Ordering::Relaxed), snapshot_sequence:0, control_ready:false, control_trace_id:None, record_accepted:false, resources_accepted:false,
+        Self { keyframe_trace:Default::default(),video_requested_fps:0,display_max_fps:None,video_actual_fps:None,display_size:None, video_format:None, screen_config_size:None, generation: NEXT.fetch_add(1,Ordering::Relaxed), snapshot_sequence:0, control_ready:false, control_trace_id:None, record_accepted:false, resources_accepted:false,
             screen_setup_accepted:false,video_channel_ready:false,wifi_id:0,
             wifi_iap2:"WAIT_SESSION".into(),screen_owned:None,video_stream:"WAIT_SETUP".into(),
             video_source_units:0,video_frames_written:0,main_video_connection:None,audio_ready:false,audio_codec:String::new(),main_audio_stream_type:None,audio_kbps:0,audio_packets_written:0,
-            audio_signal_packets:0,ui_requests:0,screen_rebuilds:0,timing:Default::default(),video_tcp:None,retired_video_tcp:None }
+            audio_signal_packets:0,ui_requests:0,screen_rebuilds:0,timing:Default::default(),video_tcp:None,main_video_writes:Default::default(),retired_video_tcp:None }
     }
     pub fn effective_fps(&self) -> u32 {
         self.display_max_fps.unwrap_or(self.video_requested_fps).min(self.video_requested_fps)

@@ -94,6 +94,7 @@ object HyperCarRepo {
     internal val oldDeviceReadiness = _oldDeviceReadiness.asStateFlow()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val mediaLog = MediaDiagnosticLog { log(it) }
     private val mediaSummaryWrites = Channel<Unit>(Channel.CONFLATED)
     @Volatile private var mediaSummaryStore: MediaSummaryStore? = null
 
@@ -183,7 +184,12 @@ object HyperCarRepo {
                             if (connectionDiagnostics.mediaEvent(attempt, callbackOwner, line)) {
                                 mediaSummaryWrites.trySend(Unit)
                             }
-                            scope.launch { rustListener.onLog(line) }
+                            mediaLog.offer(line)
+                            return
+                        }
+                        if (line.startsWith("VIDEO-FEEDBACK: ") || line.startsWith("VIDEO-QUEUE: ") ||
+                            line.startsWith("VIDEO: keepAlive written ") || line.startsWith("CLUSTER: keepAlive written ")) {
+                            mediaLog.offer(line)
                             return
                         }
                         if (!line.startsWith("AUDIO-UDP-DROP: ")) {
@@ -376,6 +382,7 @@ object HyperCarRepo {
             appCtx = app
             val summaries = MediaSummaryStore(java.io.File(app.filesDir, "hypercar-media-summaries.txt"))
             mediaSummaryStore = summaries
+            scope.launch { mediaLog.run() }
             scope.launch {
                 for (signal in mediaSummaryWrites) {
                     runCatching { summaries.save(connectionDiagnostics.mediaSummaries()) }
@@ -3969,6 +3976,7 @@ object HyperCarRepo {
      */
     fun exportLogs() {
         scope.launch {
+            mediaLog.flush()
             val logs = withContext(Dispatchers.IO) {
                 synchronized(diskLogLock) {
                     val history = runCatching {

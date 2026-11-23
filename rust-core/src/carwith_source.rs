@@ -344,7 +344,7 @@ mod tests {
         let key = [7; 32];
         let sender = ScreenSender::new(client.into_split().1, ScreenCipher::ChaCha(key), 2736, 800, false);
         let (commands, installs) = mpsc::channel(1);
-        let (source, video) = mpsc::unbounded_channel();
+        let (source, video) = crate::video_queue::channel();
         let stop = Arc::new(Notify::new());
         let pump = tokio::spawn(crate::engine::video_pump(
             stop.clone(), Default::default(), true,

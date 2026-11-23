@@ -446,6 +446,7 @@ object SettingsStore {
             append("\"audio_codec\":\"").append(audioCodec).append("\",")
             append("\"self_microphone_asr\":").append(carVoiceRecognition && !carWithMode).append(",")
             append("\"keep_alive_stats\":").append(keepAliveStats).append(",")
+            append("\"request_receiver_stats\":").append(debugLogEnabled).append(",")
             append("\"bmw_box_bootstrap\":").append(io.github.hypercar.headunit.ReceiverCompatibility.useBmwBootstrap(
                 headUnitProfileId, io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(receiverBluetoothMac))).append(",")
             append("\"desktop_receiver\":").append(io.github.hypercar.headunit.ReceiverCompatibility.isDesktopReceiver(

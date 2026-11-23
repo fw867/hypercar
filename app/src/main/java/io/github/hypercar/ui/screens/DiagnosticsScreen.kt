@@ -140,6 +140,11 @@ private fun Header(
                     style = MaterialTheme.typography.bodySmall,
                     color = if (recording) TextSecondary else AmberWarning,
                 )
+                Text(
+                    text = "连接前开启，可向车机请求视频接收帧率。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary,
+                )
             }
             // 记录开关：暂停后不再写入环形缓冲（既有内容保留），上车抓关键段落用
             Row(verticalAlignment = Alignment.CenterVertically) {

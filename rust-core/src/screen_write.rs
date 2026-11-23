@@ -1,6 +1,61 @@
 //! Bound a complete write without cancelling a frame while the peer is still acknowledging it.
 use std::{future::Future, io, time::Duration};
 
+#[derive(Default)]
+pub(crate) struct SlowWriteTrace {
+    last_report: Option<(Option<u64>, tokio::time::Instant)>,
+}
+
+impl SlowWriteTrace {
+    async fn observe<F>(&mut self, connection: Option<u64>, write: F,
+        mut report: impl FnMut(&'static str, Duration, Option<&io::Result<()>>)) -> io::Result<()>
+    where F: Future<Output = io::Result<()>> {
+        let start = tokio::time::Instant::now();
+        tokio::pin!(write);
+        let can_report = self.last_report.is_none_or(|(id, at)| id != connection || start - at >= Duration::from_secs(10));
+        let result = tokio::select! {
+            biased;
+            result = &mut write => result,
+            _ = tokio::time::sleep(Duration::from_millis(500)), if can_report => {
+                self.last_report = Some((connection, start));
+                report("video_write_slow", start.elapsed(), None);
+                let result = write.await;
+                report("video_write_end", start.elapsed(), Some(&result));
+                return result;
+            }
+        };
+        if result.is_err() { report("video_write_end", start.elapsed(), Some(&result)); }
+        result
+    }
+
+    pub(crate) async fn write<F>(&mut self, connection: Option<u64>, operation: &str,
+        pipeline: &parking_lot::Mutex<crate::pipeline::Pipeline>, guarded: bool, write: F) -> io::Result<()>
+    where F: Future<Output = io::Result<()>> {
+        let guarded_write = async {
+            if guarded {
+                with_progress(write, || pipeline.lock().video_tcp.as_ref()
+                    .filter(|s| Some(s.connection_id) == connection).and_then(|s| s.acked_bytes)).await
+            } else {
+                write.await
+            }
+        };
+        self.observe(connection, guarded_write, |event, elapsed, result| {
+            let sample = pipeline.lock().video_tcp.clone().filter(|s| Some(s.connection_id) == connection);
+            let outcome = match result {
+                None => "pending".into(),
+                Some(Ok(())) => "complete".into(),
+                Some(Err(e)) => format!("error({e})"),
+            };
+            let now = crate::timing::monotonic_nanos() / 1_000_000;
+            let connection = connection.map(|id| id.to_string()).unwrap_or_else(|| "unknown".into());
+            let detail = sample.map(|s| format!("ack={:?} outq={:?} retrans={:?} sampleAgeMs={}",
+                s.acked_bytes, s.outq_bytes, s.total_retrans, now.saturating_sub(s.sampled_ms)))
+                .unwrap_or_else(|| "tcp_sample=unavailable".into());
+            crate::emit_media_trace(now, event, &format!("conn={connection} op={operation} elapsedMs={} result={outcome} {detail}", elapsed.as_millis()));
+        }).await
+    }
+}
+
 pub async fn with_progress<F, P>(write: F, acknowledged: P) -> io::Result<()>
 where F: Future<Output = io::Result<()>>, P: Fn() -> Option<u64> {
     let idle = tokio::time::sleep(Duration::from_secs(2));
@@ -41,6 +96,41 @@ where F: Future<Output = io::Result<()>>, P: Fn() -> Option<u64> {
 mod tests {
     use super::*;
     use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_write_is_polled_to_completion_once_and_traces_follow_connection() {
+        let mut trace = SlowWriteTrace::default();
+        let mut events = Vec::new();
+        for (connection, delay) in [(8,10), (8,600), (8,700), (9,800)] {
+            let mut calls = 0;
+            let write = async {
+                calls += 1;
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                Ok(())
+            };
+            trace.observe(Some(connection), write, |stage, _, _| events.push((connection, stage))).await.unwrap();
+            assert_eq!(calls, 1);
+        }
+        assert_eq!(events, [(8,"video_write_slow"), (8,"video_write_end"),
+                             (9,"video_write_slow"), (9,"video_write_end")]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_terminal_write_error_is_retained_inside_the_slow_log_cooldown() {
+        let mut trace = SlowWriteTrace::default();
+        let wait = async { tokio::time::sleep(Duration::from_secs(1)).await; Ok(()) };
+        trace.observe(Some(1), wait, |_,_,_| {}).await.unwrap();
+        let mut failures = Vec::new();
+        for id in [1,2] {
+            let write = async { Err(io::Error::from(io::ErrorKind::BrokenPipe)) };
+            let result = trace.observe(Some(id), write, |event, _, result| {
+                failures.push((id, event, result.unwrap().as_ref().unwrap_err().kind()));
+            }).await;
+            assert!(result.is_err());
+        }
+        assert_eq!(failures, [(1,"video_write_end",io::ErrorKind::BrokenPipe),
+                              (2,"video_write_end",io::ErrorKind::BrokenPipe)]);
+    }
 
     #[tokio::test]
     async fn real_slow_reader_keeps_a_progressing_tcp_write_alive() {

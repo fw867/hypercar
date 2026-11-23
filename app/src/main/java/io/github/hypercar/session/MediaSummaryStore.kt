@@ -38,7 +38,7 @@ internal class MediaSummaryStore(private val file: File) {
 
     private companion object {
         const val MAX_ROWS = 8
-        const val MAX_SUMMARY_CHARS = 8_192
-        const val MAX_FILE_BYTES = 300_000L
+        const val MAX_SUMMARY_CHARS = 16_384
+        const val MAX_FILE_BYTES = MAX_ROWS * (MAX_SUMMARY_CHARS * 3L + 130)
     }
 }

@@ -52,6 +52,7 @@ pub struct AirplayParams {
     pub bmw_capabilities: bool,
     pub microphone_probe: Option<Arc<crate::mic_probe::ProbeControl>>,
     pub keep_alive_stats: bool,
+    pub request_receiver_stats: bool,
     pub bmw_box_bootstrap: bool,
     pub head_unit_profile: String,
     pub mbux_screen_bootstrap: bool,
@@ -332,7 +333,7 @@ pub async fn negotiate(
     let propose_buffered = p.proposes_buffered_media(shared_secret.is_some(), &info);
     let cluster = crate::cluster_screen::Offer::prepare(&info, shared_secret.is_some(), p.mbux_screen_bootstrap);
     let (root, session_info, hevc_proposed, buffered_offered) = setup_and_read_info(
-        &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap, p.id9_screen_bootstrap, mbux_media_compat, p.bmw_capabilities, p.video_codec == "hevc", propose_buffered, Some(&mut *cleanup), p.wifi_mac_address.as_deref(), cluster,
+        &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap, p.id9_screen_bootstrap, mbux_media_compat, p.bmw_capabilities, p.video_codec == "hevc", propose_buffered, Some(&mut *cleanup), p.wifi_mac_address.as_deref(), cluster, p.request_receiver_stats,
     ).await?;
     let same_connection = early_connection == channel.trace_id();
     info = session_info.value;
@@ -540,6 +541,7 @@ pub async fn negotiate(
         control_ui_rx,
         apply_receiver_modes,
         channel.clone(),
+        p.pipeline.clone(),
         cluster,
         wifi_iap_id,
         modes.clone(),
@@ -575,6 +577,7 @@ pub async fn negotiate(
     let idle_only = crate::udp_keepalive::idle_only(&p.head_unit_profile, p.id9_screen_bootstrap, mbux_media_compat, desktop);
     let mut heartbeat_tasks = spawn_keepalive_loops(
         channel.clone(), factory.clone(), keep_alive_port, p.car_ip.clone(), stop.clone(), Some(wifi_iap_id), idle_only,
+        p.pipeline.clone(),
     );
     keepalive.0.append(&mut heartbeat_tasks.0);
     emit_log("AIRPLAY: 事件通道已建立，UDP/feedback 保活已启动（RECORD 前）");
@@ -935,7 +938,7 @@ mod shutdown_tests {
             captures
         });
         setup_and_read_info(&control, "phone", "test", 1234, true, Value::dict(vec![]),
-            false, true, false, true, false, true, None, None, None).await.unwrap();
+            false, true, false, true, false, true, None, None, None, false).await.unwrap();
         for (method, path, body) in [
             ("POST", "/command", crate::modes::Modes::initial().declaration()),
             ("SETUP", "/", build_screen_setup(42, "display")),
@@ -1009,7 +1012,7 @@ mod shutdown_tests {
                     peer.write_all(&body).await.unwrap();
                 }
             });
-            setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![("model",Value::str(model))]),mbux,id9,false,bmw,false,false,None,mac, None).await.unwrap();
+            setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![("model",Value::str(model))]),mbux,id9,false,bmw,false,false,None,mac, None, false).await.unwrap();
             server.await.unwrap();
         }
     }
@@ -1057,7 +1060,7 @@ mod shutdown_tests {
         let (control, mut peer) = pair().await;
         let mut tasks = spawn_keepalive_loops(
             control, Arc::new(super::display_size_tests::LocalSockets), 0, "127.0.0.1".into(),
-            Arc::new(Notify::new()), None, false,
+            Arc::new(Notify::new()), None, false, Arc::new(Mutex::new(crate::pipeline::Pipeline::new())),
         );
         let mut previous = 0;
         for attempt in 1..=4 {
@@ -1085,6 +1088,7 @@ mod shutdown_tests {
             let first=read_request(&mut peer).await;
             assert_eq!(first.first_line,"SETUP rtsp://[fe80::1%25wlan0]/66 RTSP/1.0");
             let first_body=bplist::parse(&first.body).unwrap();
+            assert_eq!(first_body.get("statsCollectionEnabled").and_then(Value::as_bool), Some(true));
             assert!(!first_body.get("features").unwrap().as_array().unwrap().iter()
                 .any(|feature| feature.as_str() == Some("mainBuffered")));
             assert!(first_body.get("features").unwrap().as_array().unwrap().iter().any(|f|f.as_str()==Some("hevc")));
@@ -1100,7 +1104,7 @@ mod shutdown_tests {
             let body=bplist::encode(&Value::dict(vec![("model",Value::str("test"))]));
             peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: {}\r\n\r\n",info.cseq().unwrap(),body.len()).as_bytes()).await.unwrap();peer.write_all(&body).await.unwrap();
         });
-        let result=setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,true,true,false,None,None, None).await;
+        let result=setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,true,true,false,None,None, None, true).await;
         assert!(result.is_ok(),"{result:?}");assert!(!result.unwrap().2);server.await.unwrap();
     }
     #[tokio::test]
@@ -1129,7 +1133,7 @@ mod shutdown_tests {
             }
         });
         let (setup, info, _, offered) = setup_and_read_info(&channel,"phone","name",1234,true,early_info,
-            false,false,true,false,false,offer,None,None, None).await.unwrap();
+            false,false,true,false,false,offer,None,None, None, false).await.unwrap();
         receiver.await.unwrap();
         assert!(offered);
         let mut candidates = vec![AudioCodec::Aac];
@@ -1190,7 +1194,7 @@ mod shutdown_tests {
             });
             let previous = if fresh_info { Value::dict(vec![]) } else { cached };
             setup_and_read_info(&channel,"phone","name",1234,true,previous,false,false,false,true,false,false,
-                None,None,Some(crate::cluster_screen::Offer::AwaitingDisplays)).await.unwrap();
+                None,None,Some(crate::cluster_screen::Offer::AwaitingDisplays), false).await.unwrap();
             receiver.await.unwrap();
             assert_eq!(channel.cluster_display.get().is_some(), !withdraw && peer_accepts && fresh_info);
         }
@@ -1218,7 +1222,7 @@ mod shutdown_tests {
                 peer.write_all(&body).await.unwrap();
             }
         });
-        let outcome = setup_and_read_info(&channel,"phone","name",1234,true,Value::dict(vec![]),false,true,false,true,true,true,None,None, None).await.unwrap();
+        let outcome = setup_and_read_info(&channel,"phone","name",1234,true,Value::dict(vec![]),false,true,false,true,true,true,None,None, None, false).await.unwrap();
         assert!(outcome.2, "HEVC offer survives the buffered-only retry");
         assert!(!outcome.3, "withdrawn buffered feature cannot select type103 later");
         server.await.unwrap();
@@ -1457,7 +1461,7 @@ mod shutdown_tests {
                 peer.write_all(format!("RTSP/1.0 {status} Denied\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",request.cseq().unwrap()).as_bytes()).await.unwrap();
                 assert!(tokio::time::timeout(Duration::from_millis(50),peer.read(&mut [0u8;1])).await.is_err());
             });
-            assert!(setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,true,true,true,None,None, None).await.is_err());
+            assert!(setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,true,true,true,None,None, None, false).await.is_err());
             server.await.unwrap();
         }
     }
@@ -1521,7 +1525,7 @@ mod shutdown_tests {
         let c=control.clone();
         let task=crate::callback_context::spawn(async move {
             let mut cleanup=crate::negotiation_cleanup::NegotiationCleanup::new(c.clone(),true);
-            let result=setup_and_read_info(&c,"phone","name",1234,true,Value::dict(vec![]),false,true,false,false,false,true,Some(&mut cleanup),None, None).await;
+            let result=setup_and_read_info(&c,"phone","name",1234,true,Value::dict(vec![]),false,true,false,false,false,true,Some(&mut cleanup),None, None, false).await;
             cleanup.finish().await;result
         });
         let setup=read_request(&mut peer).await;assert!(setup.first_line.starts_with("SETUP "));
@@ -2356,7 +2360,7 @@ mod display_size_tests {
         let (read, write) = socket.into_split();
         let (channel, _) = RtspChannel::spawn(read, write, None);
         crate::auth_setup::run(&channel).await.unwrap();
-        let (_, info, _, _) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", "Test phone", 12345, true, Value::dict(vec![]), false, false, false, true, false, false, None, Some("06:12:34:56:78:90"), None).await.unwrap();
+        let (_, info, _, _) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", "Test phone", 12345, true, Value::dict(vec![]), false, false, false, true, false, false, None, Some("06:12:34:56:78:90"), None, false).await.unwrap();
         let display = &info.value.get("displays").unwrap().as_array().unwrap()[0];
         assert_eq!(uuid_text(display.get("uuid")).as_deref(), Some("actual-bmw-display"));
         assert_eq!(read_display_size(display), (2560, 744));
@@ -2520,7 +2524,7 @@ mod display_size_tests {
         let socket = TcpStream::connect(addr).await.unwrap();
         let (read, write) = socket.into_split();
         let (channel, _) = RtspChannel::spawn(read, write, None);
-        let tasks = spawn_keepalive_loops(channel.clone(), Arc::new(LocalSockets), udp_port, "127.0.0.1".to_string(), Arc::new(Notify::new()), None, false);
+        let tasks = spawn_keepalive_loops(channel.clone(), Arc::new(LocalSockets), udp_port, "127.0.0.1".to_string(), Arc::new(Notify::new()), None, false, Arc::new(Mutex::new(crate::pipeline::Pipeline::new())));
         let handles: Vec<_> = tasks.0.iter().map(|task| task.abort_handle()).collect();
         let record = record_session(&channel);
         let ping = async {
@@ -2695,7 +2699,7 @@ fn bmw_capabilities_match_implemented_paths_and_hevc_is_opt_in() {
     assert!(!negotiated_hevc(true,&Value::dict(vec![])));
 }
 
-fn build_session_setup(device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, mbux: bool, id9: bool, media_compat: bool) -> Vec<u8> {
+fn build_session_setup(device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, mbux: bool, id9: bool, media_compat: bool, request_receiver_stats: bool) -> Vec<u8> {
     let session_uuid = box_session_uuid();
     let mut fields: Vec<(&str, Value)> = vec![
         ("deviceID", Value::str(device_id)),
@@ -2710,7 +2714,7 @@ fn build_session_setup(device_id: &str, device_name: &str, timing_port: u16, enc
         ("timingPort", Value::int(timing_port as i64)),
         ("sessionUUID", Value::str(&session_uuid)),
         ("sessionCorrelationUUID", Value::str(&random_uuid_upper())),
-        ("statsCollectionEnabled", Value::bool(false)),
+        ("statsCollectionEnabled", Value::bool(request_receiver_stats)),
         ("updateSessionRequest", Value::bool(false)),
         ("keepAliveLowPower", Value::bool(true)),
         (
@@ -2782,12 +2786,12 @@ struct SessionInfo {
 }
 
 async fn setup_and_read_info(
-    channel: &Arc<RtspChannel>, device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool, id9: bool, media_compat: bool, bmw: bool, prefer_hevc: bool, propose_buffered: bool, cleanup: Option<&mut crate::negotiation_cleanup::NegotiationCleanup>, network_mac: Option<&str>, cluster: Option<crate::cluster_screen::Offer>,
+    channel: &Arc<RtspChannel>, device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool, id9: bool, media_compat: bool, bmw: bool, prefer_hevc: bool, propose_buffered: bool, cleanup: Option<&mut crate::negotiation_cleanup::NegotiationCleanup>, network_mac: Option<&str>, cluster: Option<crate::cluster_screen::Offer>, request_receiver_stats: bool,
 ) -> Result<(Value, SessionInfo, bool, bool), String> {
-    emit_log(&format!("AIRPLAY: session device name={device_name}"));
+    emit_log(&format!("AIRPLAY: session device name={device_name} statsCollectionEnabled={request_receiver_stats}"));
     let mut buffered_offered = propose_buffered;
     let mut cluster_offered = cluster.is_some();
-    let mut request = bplist::parse(&build_session_setup(device_id, device_name, timing_port, encrypted, mbux, id9, media_compat)).map_err(|e|e.to_string())?;
+    let mut request = bplist::parse(&build_session_setup(device_id, device_name, timing_port, encrypted, mbux, id9, media_compat, request_receiver_stats)).map_err(|e|e.to_string())?;
     if let Value::Dict(fields) = &mut request {
         if bmw && !id9 && !mbux && use_box_bootstrap(true, &previous_info) {
             if let Some(mac) = network_mac.and_then(valid_station_mac) {
@@ -2943,7 +2947,7 @@ fn buffered_profile_params_for_test() -> AirplayParams {
         car_ip:"127.0.0.1".into(), airplay_port:7000, device_id:String::new(), device_name:String::new(),
         wifi_mac_address:None, identity_path:String::new(), receiver_id:None, receiver_model:None, receiver_previously_connected:true,
         enable_audio:true, audio_codec:"auto".into(), video_codec:"h264".into(), bmw_capabilities:true,
-        microphone_probe:None, keep_alive_stats:false, bmw_box_bootstrap:true, head_unit_profile:"bmw_id9".into(),
+        microphone_probe:None, keep_alive_stats:false, request_receiver_stats:false, bmw_box_bootstrap:true, head_unit_profile:"bmw_id9".into(),
         mbux_screen_bootstrap:false, id9_screen_bootstrap:true, nbt_audio_first:false, mbux_media_compat:false,
         desktop_receiver:false, width:1920, height:720, touch_display:None, touch_rect:None,
         encoder_size:Arc::new(Mutex::new((1920,720))), touch_size:Arc::new(Mutex::new((1920,720))),
@@ -3391,6 +3395,7 @@ fn spawn_keepalive_loops(
     stop: Arc<Notify>,
     wifi_iap_id: Option<u64>,
     idle_only: bool,
+    pipeline: Arc<Mutex<crate::pipeline::Pipeline>>,
 ) -> KeepaliveTasks {
     let mut tasks = Vec::new();
     if keep_alive_port != 0 {
@@ -3406,16 +3411,25 @@ fn spawn_keepalive_loops(
         let mut first_reply = true;
         let mut previous_reply_timed_out = false;
         let mut audio_trace = crate::audio_diagnostics::FeedbackTrace::default();
+        let mut video_trace = crate::video_feedback::FeedbackTrace::default();
         loop {
             tokio::select! {
                 _ = stop.notified() => return,
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
+            let rtsp = channel.trace_id();
+            let target = crate::video_feedback::FeedbackTarget::current(&pipeline.lock(), rtsp);
             match channel.request_feedback(previous_reply_timed_out).await {
                 Ok(reply) => {
                     if let Some(id) = wifi_iap_id { crate::wifi_iap2::feedback(id, reply.status() == 200); }
                     if reply.status() != 200 { emit_log(&format!("AIRPLAY: feedback rejected status={}", reply.status())); return; }
                     if let Some(line) = audio_trace.observe(channel.trace_id(), reply.cseq(), &reply.body) { emit_log(&line); }
+                    if let (Some(target), Some(cseq)) = (target, reply.cseq()) {
+                        let now_ms = crate::timing::monotonic_nanos() / 1_000_000;
+                        if let Some(line) = video_trace.observe(&pipeline, &target, rtsp, cseq, &reply.body, now_ms) {
+                            emit_log(&line);
+                        }
+                    }
                     if previous_reply_timed_out {
                         emit_log(&format!("AIRPLAY: feedback 应答恢复 CSeq={:?}", reply.cseq()));
                         previous_reply_timed_out = false;
@@ -3450,6 +3464,7 @@ fn spawn_event_dispatcher(
     mut control_ui: mpsc::UnboundedReceiver<crate::rtsp::RtspMessage>,
     apply_receiver_modes: crate::rtsp::CommandReply,
     control: Arc<RtspChannel>,
+    pipeline: Arc<Mutex<crate::pipeline::Pipeline>>,
     cluster: crate::cluster_screen::Commands,
     wifi_iap_id: u64,
     modes: Arc<Mutex<crate::modes::Modes>>,
@@ -3588,6 +3603,7 @@ fn spawn_event_dispatcher(
                         }
                     }
                     let _ = mode_feedback.send(Some(ModeFeedback::Snapshot));
+                    crate::screen::observe_receiver_keyframe_request(&pipeline, control.trace_id(), "requestUI");
                     crate::emit_force_keyframe();
                 }
                 "changeUIContext" => {
@@ -3673,6 +3689,7 @@ fn spawn_event_dispatcher(
                         continue;
                     }
                     emit_log("EVENT: 车机请求关键帧 forceKeyFrame → requestSyncFrame");
+                    crate::screen::observe_receiver_keyframe_request(&pipeline, control.trace_id(), "forceKeyFrame");
                     crate::emit_force_keyframe();
                 }
                 "hidSetInputMode" | "ping" | "fps" => {}
@@ -4044,7 +4061,7 @@ mod mbux_profile_tests {
     fn box_session_uuid_changes_per_attempt_without_replacing_phone_identity() {
         let mut sessions=std::collections::HashSet::new();
         for _ in 0..16 {
-            let body=bplist::parse(&build_session_setup("phone-device","phone",1234,true,false,false,false)).unwrap();
+            let body=bplist::parse(&build_session_setup("phone-device","phone",1234,true,false,false,false, false)).unwrap();
             assert_eq!(body.get("deviceID").and_then(Value::as_str),Some("phone-device"));
             let id=body.get("sessionUUID").and_then(Value::as_str).unwrap();
             assert_eq!(id.len(),36);
@@ -4061,7 +4078,7 @@ mod mbux_profile_tests {
         for encrypted in [true,false] {
             for mbux in [false,true] {
                 for device_id in ["02:11:22:33:44:55", "02:66:77:88:99:00"] {
-                    let body=bplist::parse(&build_session_setup(device_id,"test phone",1234,encrypted,mbux,false,false)).unwrap();
+                    let body=bplist::parse(&build_session_setup(device_id,"test phone",1234,encrypted,mbux,false,false, false)).unwrap();
                     assert_eq!(body.get("macAddress").and_then(Value::as_str),Some(device_id));
                     assert_eq!(body.get("deviceID"),body.get("macAddress"));
                     assert_eq!(body.get("name").and_then(Value::as_str),Some("test phone"));
@@ -4093,8 +4110,8 @@ mod mbux_profile_tests {
     }
     #[test]
     fn mercedes_features_match_implemented_media_without_changing_other_fields() {
-        let baseline=bplist::parse(&build_session_setup("phone","name",1234,true,false,false,false)).unwrap();
-        let compat=bplist::parse(&build_session_setup("phone","name",1234,true,false,false,true)).unwrap();
+        let baseline=bplist::parse(&build_session_setup("phone","name",1234,true,false,false,false, false)).unwrap();
+        let compat=bplist::parse(&build_session_setup("phone","name",1234,true,false,false,true, false)).unwrap();
         let features=compat.get("features").unwrap().as_array().unwrap();
         assert_eq!(features,&baseline.get("features").unwrap().as_array().unwrap().iter()
             .filter(|f| f.as_str()!=Some("hevc")).cloned().collect::<Vec<_>>());
@@ -4111,8 +4128,8 @@ mod mbux_profile_tests {
     fn id9_session_removes_only_hevc_and_preserves_other_profiles() {
         for encrypted in [false, true] {
             for mbux in [false, true] {
-                let baseline = bplist::parse(&build_session_setup("phone", "name", 1234, encrypted, mbux, false,false)).unwrap();
-                let id9 = bplist::parse(&build_session_setup("phone", "name", 1234, encrypted, mbux, true,false)).unwrap();
+                let baseline = bplist::parse(&build_session_setup("phone", "name", 1234, encrypted, mbux, false,false, false)).unwrap();
+                let id9 = bplist::parse(&build_session_setup("phone", "name", 1234, encrypted, mbux, true,false, false)).unwrap();
                 let expected: Vec<_> = baseline.get("features").unwrap().as_array().unwrap().iter()
                     .filter(|f| f.as_str() != Some("hevc")).cloned().collect();
                 assert_eq!(id9.get("features").unwrap().as_array().unwrap(), &expected);
@@ -4133,7 +4150,7 @@ mod mbux_profile_tests {
     #[test]
     fn minimal_features_and_100ms_latency_are_explicit_profile_choices() {
         for mbux in [false,true] {
-            let body=bplist::parse(&build_session_setup("real-mac","测试手机 \"BT\"",1234,true,mbux,false,false)).unwrap();
+            let body=bplist::parse(&build_session_setup("real-mac","测试手机 \"BT\"",1234,true,mbux,false,false, false)).unwrap();
             assert_eq!(body.get("name").and_then(Value::as_str),Some("测试手机 \"BT\""));
             let features=body.get("features").unwrap().as_array().unwrap();
             assert_eq!(features.len(),if mbux {1} else {CONTROLLER_FEATURES.len()});
