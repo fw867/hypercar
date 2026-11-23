@@ -931,7 +931,7 @@ object HyperCarRepo {
         aclObservedAt?.let { recordAclObservation(connectionAttemptId, true, it) }
         val moving = discoveryHandoff?.takeIf { source == "manual-retry" && it.successor == null }
         aclEdge?.ticket?.assign(connectionAttemptId)
-        if (sessionCarWithMode) carWithEntries.begin(connectionAttemptId)
+        if (sessionCarLifeMode) carWithEntries.begin(connectionAttemptId)
         sessionLive.set(true)
         // Readers that observe the published successor must also see its live flag and ID.
         discoveryHandoff = moving?.let { DiscoverabilityHandoff(it.origin, connectionAttemptId) }
