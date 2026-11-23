@@ -86,6 +86,10 @@ impl ScreenSession {
         };
         if !current() { return Err("屏幕授权或会话已失效".into()); }
         let socket=self.factory.open_tcp(&self.params.car_ip,port,5000).ok_or_else(||format!("屏幕端口 {port} 连接失败"))?;
+        match crate::screen_qos::configure_cs4(&socket) {
+            Ok(traffic_class) => crate::emit_log(&format!("VIDEO-QOS: streamConnectionID={conn_id} requested_dscp=32 readback_dscp={} traffic_class=0x{traffic_class:02x}", traffic_class >> 2)),
+            Err(error) => crate::emit_log(&format!("VIDEO-QOS: streamConnectionID={conn_id} requested_dscp=32 error={error}")),
+        }
         let (_,write)=socket.into_split();
         let (w,h)=*self.params.encoder_size.lock();
         let mut sender=ScreenSender::new(write,cipher,w,h,self.keep_stats);

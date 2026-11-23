@@ -188,6 +188,7 @@ object HyperCarRepo {
                             return
                         }
                         if (line.startsWith("VIDEO-FEEDBACK: ") || line.startsWith("VIDEO-QUEUE: ") ||
+                            line.startsWith("VIDEO-QOS: ") || line.startsWith("VIDEO: reset source ") ||
                             line.startsWith("VIDEO: keepAlive written ") || line.startsWith("CLUSTER: keepAlive written ")) {
                             mediaLog.offer(line)
                             return
@@ -1532,7 +1533,6 @@ object HyperCarRepo {
                 }, detail = if (event == CarPlayCtrlAdvertiser.Event.REGISTERED) port.toString() else "")
             }, serviceNameProvider = { controlServiceName }, attemptId = diagnosticId,
                 traceDiscovery = ctrlDiscoveryTrace::record,
-                deviceInfoEnabled = { SettingsStore.carPlayDeviceInfoModelEnabled },
                 onCtrlEpochChanged = { connectionDiagnostics.newCtrlEpoch(diagnosticId) }, onMdnsObservation = { family, port ->
                 connectionDiagnostics.observe(diagnosticId,
                     if (port != null) ConnectionDiagnostics.Observation.MDNS_LOCAL_ANNOUNCEMENT

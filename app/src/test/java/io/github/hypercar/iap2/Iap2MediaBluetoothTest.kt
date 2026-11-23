@@ -3,6 +3,10 @@ package io.github.hypercar.iap2
 import io.github.hypercar.headunit.HeadUnitProfiles
 import org.junit.Assert.*
 import org.junit.Test
+import java.security.KeyPairGenerator
+import java.security.Signature
+import java.security.interfaces.ECPublicKey
+import java.security.spec.ECGenParameterSpec
 
 class Iap2MediaBluetoothTest {
     private val descriptor=byteArrayOf(5,12,9,1,0xa1.toByte(),1,0x15,0,0x25,2,9,0,9,0xb5.toByte(),9,0xb6.toByte(),0x75,8,0x95.toByte(),1,0x81.toByte(),0,0xc0.toByte())
@@ -28,7 +32,8 @@ class Iap2MediaBluetoothTest {
         val communicationsBody:ByteArray=byteArrayOf(),
         val identificationExchange:ByteArray?=null, val afterGreetings:ByteArray?=null,
         val controlVersion: Int? = null, val silentChallenge: Boolean = false,
-        val wifiReply:ByteArray=wifiCredentials("fixture-ap")) : Iap2LinkChannel {
+        val wifiReply:ByteArray=wifiCredentials("fixture-ap"),
+        val signChallenge: ((ByteArray) -> ByteArray)? = null) : Iap2LinkChannel {
         val queue=ArrayDeque<ByteArray>()
         val sent=mutableListOf<Int>()
         val updates=mutableListOf<Iap2Csm.Frame>()
@@ -71,7 +76,10 @@ class Iap2MediaBluetoothTest {
                     }
                     0xaa00->queue+=if(serial && frame.body.isNotEmpty()) Iap2Csm.encode(0xaa06,Iap2Csm.param(0,byteArrayOf(1)))
                         else Iap2Csm.encode(0xaa01,certificateBody)
-                    0xaa02->if (!silentChallenge) queue+=Iap2Csm.encode(0xaa03,signatureBody)
+                    0xaa02->if (!silentChallenge) {
+                        val signature = signChallenge?.invoke(Iap2Csm.parseParams(frame.body).single().value)
+                        queue += Iap2Csm.encode(0xaa03, signature?.let { Iap2Csm.param(0, it) } ?: signatureBody)
+                    }
                     0x4e0b -> afterGreetings?.let { queue += it }
                     0x5702 -> if (wifiReply.isNotEmpty()) queue += wifiReply
                 }
@@ -83,7 +91,7 @@ class Iap2MediaBluetoothTest {
             Iap2Csm.param(6, byteArrayOf(0xea.toByte(), 3, 0x4c, 0)) +
             Iap2Csm.param(7, byteArrayOf(0xea.toByte(), 0, 0x4e, 0x0d, 0x4c, 1)) +
             Iap2Csm.group(10, Iap2Csm.u8(0, 1), Iap2Csm.string(1, "de.bmw.a4a.pairing")))
-    @Test fun onlyPairedAppsV1RequiresVerifiedCertificateAndKeepsIdentificationFirst() {
+    @Test fun onlyPairedAppsV1RequiresVerifiedCertificateOnTheIdentificationFirstPath() {
         for ((paired, version) in listOf(true to 1, true to 2, false to 1)) {
             val channel = Channel(identificationExchange = appsIdentification(), controlVersion = version)
             val session = Iap2SenderSession(channel, {}, onEndpoint = {}, pairedReceiver = paired, nanoTime = { channel.time })
@@ -99,6 +107,29 @@ class Iap2MediaBluetoothTest {
         }
     }
 
+    @Test fun earlyAuthenticatedWirelessV1ContinuesWifiAndOrdinaryAppsWaits() {
+        val keys = KeyPairGenerator.getInstance("EC").apply { initialize(ECGenParameterSpec("secp256r1")) }
+            .generateKeyPair()
+        for (wireless in listOf(true, false)) {
+            val identification = if (wireless) legacyBmwIdentification("NBT Evo") else appsIdentification()
+            val channel = Channel(identificationExchange = identification, controlVersion = 1, signChallenge = {
+                Signature.getInstance("NONEwithECDSAinP1363Format").run {
+                    initSign(keys.private)
+                    update(it)
+                    sign()
+                }
+            })
+            val session = Iap2SenderSession(channel, {}, onEndpoint = {}, profile = HeadUnitProfiles.BMW_ID6,
+                pairedReceiver = true, nanoTime = { channel.time }, bondedBmwInbound = true,
+                verifyMfi3Certificate = { keys.public as ECPublicKey })
+            val endpoint = session.run(10_000)
+            assertEquals(listOf(0xaa00, 0xaa02, 0xaa05, 0x1d00, 0x1d02), channel.sent.take(5))
+            assertEquals(1, channel.sent.count { it == 0xaa00 })
+            assertEquals(wireless, 0x5702 in channel.sent)
+            assertEquals(if (wireless) "fixture-ap" else null, endpoint.ssid)
+        }
+    }
+
     @Test fun verifiedAppsCertificateWithBadSignatureOrSilenceNeverSendsSuccess() {
         val leaf = javaClass.getResourceAsStream("/io/github/hypercar/iap2/mfi3-leaf.der")!!.use { it.readBytes() }
         for (silent in listOf(false, true)) {
@@ -111,19 +142,25 @@ class Iap2MediaBluetoothTest {
         }
     }
 
-    @Test fun authFirstExperimentIsLimitedToPairedBmwV1AndStopsOnBadCertificate() {
+    @Test fun ordinaryAppsAuthenticatesFirstOnEveryPairedBmwInboundV1Profile() {
         val cases = listOf(
             Triple(HeadUnitProfiles.BMW_ID85, true, 1),
+            Triple(HeadUnitProfiles.BMW_ID6, true, 1),
+            Triple(HeadUnitProfiles.BMW_ID9, true, 1),
+            Triple(HeadUnitProfiles.BMW_ID9.copy(id = "bmw_fixture"), true, 1),
             Triple(HeadUnitProfiles.BMW_ID85, true, 2),
+            Triple(HeadUnitProfiles.BMW_ID6, true, 2),
+            Triple(HeadUnitProfiles.BMW_ID9, true, 2),
+            Triple(HeadUnitProfiles.BMW_ID85, true, null),
             Triple(HeadUnitProfiles.BMW_ID85, false, 1),
             Triple(HeadUnitProfiles.WINPLAY, true, 1),
         )
         for ((profile, paired, version) in cases) {
             val channel = Channel(identificationExchange = appsIdentification(), controlVersion = version)
             val session = Iap2SenderSession(channel, {}, onEndpoint = {}, profile = profile,
-                pairedReceiver = paired, nanoTime = { channel.time }, bmwAppsV1AuthFirst = true)
+                pairedReceiver = paired, nanoTime = { channel.time }, bondedBmwInbound = true)
             val result = runCatching { session.run(10_000) }
-            if (profile == HeadUnitProfiles.BMW_ID85 && paired && version == 1) {
+            if (profile.id.startsWith("bmw_") && paired && version == 1) {
                 assertTrue(result.exceptionOrNull() is java.io.IOException)
                 assertEquals(listOf(0xaa00, 0xaa04), channel.sent)
             } else {
@@ -137,7 +174,7 @@ class Iap2MediaBluetoothTest {
         val channel = Channel(identificationExchange = appsIdentification(), controlVersion = 1,
             certificateBody = Iap2Csm.param(0, leaf), signatureBody = Iap2Csm.param(0, ByteArray(64)))
         val session = Iap2SenderSession(channel, {}, onEndpoint = {}, pairedReceiver = true,
-            nanoTime = { channel.time }, bmwAppsV1AuthFirst = true)
+            nanoTime = { channel.time }, bondedBmwInbound = true)
         assertThrows(java.io.IOException::class.java) { session.run(10_000) }
         assertEquals(listOf(0xaa00, 0xaa02, 0xaa04), channel.sent)
     }

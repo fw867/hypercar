@@ -84,11 +84,10 @@ class MdnsDiagnosticPacketTest {
         val expected = base.copyOf().apply { this[11] = 2 } +
             rr(owner, 16, byteArrayOf(11) + "model=D83AP".toByteArray(), ttl = 4500)
 
-        assertNull(MdnsDiagnosticPacket.withDeviceInfo(base, instance))
-        val enriched = MdnsDiagnosticPacket.withDeviceInfo(base, instance, enabled = true)
+        val enriched = MdnsDiagnosticPacket.withDeviceInfo(base, instance)
         assertArrayEquals(expected, enriched)
         assertEquals(1, base[11].toInt())
-        assertNull(MdnsDiagnosticPacket.withDeviceInfo(base, "a".repeat(64), enabled = true))
+        assertNull(MdnsDiagnosticPacket.withDeviceInfo(base, "a".repeat(64)))
     }
 
     @Test fun compressedSrvIncludesPortHostFlushAndGoodbye() {
@@ -192,7 +191,7 @@ class MdnsDiagnosticPacketTest {
         val nsec = rr(reverse4, 47, reverse4 + byteArrayOf(0, 2, 0, 8))
         assertNotNull(MdnsDiagnosticPacket.decode(packet(answers = 7, additional = 1, body = main + reverse + nsec))!!.announcement)
         val base = packet(answers = 7, additional = 1, body = main + reverse + nsec)
-        val enriched = MdnsDiagnosticPacket.withDeviceInfo(base, "Phone", enabled = true)!!
+        val enriched = MdnsDiagnosticPacket.withDeviceInfo(base, "Phone")!!
         val decoded = MdnsDiagnosticPacket.decode(enriched)!!
         assertTrue(decoded.details.any { it.contains("phone._device-info._tcp.local") && it.contains("model=D83AP") })
         assertNull(decoded.announcement) // Supplemental copies must never replace the original packet in the replay cache.

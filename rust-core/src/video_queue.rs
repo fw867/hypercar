@@ -1,4 +1,4 @@
-//! Observations at the shared input FIFO for the main video pump.
+//! Bound encoded video backlog before the main video pump without interrupting TCP writes.
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,14 +9,18 @@ use tokio::time::Instant;
 
 use crate::engine::SourceEvent;
 
+const MAX_AGE: Duration = Duration::from_millis(300);
+const MAX_FRAMES: usize = 32;
+const MAX_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Clone)]
 pub(crate) struct Sender {
-    tx: mpsc::UnboundedSender<SourceEvent>,
+    wake: mpsc::Sender<()>,
     observer: Observer,
 }
 
 pub(crate) struct Receiver {
-    rx: mpsc::UnboundedReceiver<SourceEvent>,
+    wake: mpsc::Receiver<()>,
     observer: Observer,
     last_dequeue_age_ms: Option<u64>,
 }
@@ -26,7 +30,12 @@ pub(crate) struct Observer(Arc<Mutex<State>>);
 
 #[derive(Default)]
 struct State {
-    // The channel owns the payload. One timestamp per queued frame shares FIFO order.
+    events: VecDeque<SourceEvent>,
+    closed: bool,
+    dropped_frames: usize,
+    dropped_bytes: usize,
+    dropped_oldest_ms: u64,
+    // Only video events have timestamps. Control events retain their FIFO order.
     queued_at: VecDeque<Instant>,
     queued_bytes: usize,
     dequeue_connection: Option<u64>,
@@ -47,9 +56,9 @@ pub(crate) struct Report {
 }
 
 pub(crate) fn channel() -> (Sender, Receiver) {
-    let (tx, rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::channel(1);
     let observer = Observer::default();
-    (Sender { tx, observer: observer.clone() }, Receiver { rx, observer, last_dequeue_age_ms: None })
+    (Sender { wake: tx, observer: observer.clone() }, Receiver { wake: rx, observer, last_dequeue_age_ms: None })
 }
 
 fn frame_bytes(event: &SourceEvent) -> Option<usize> {
@@ -61,13 +70,26 @@ fn frame_bytes(event: &SourceEvent) -> Option<usize> {
 
 impl Sender {
     pub fn send(&self, event: SourceEvent) -> Result<(), mpsc::error::SendError<SourceEvent>> {
-        let Some(bytes) = frame_bytes(&event) else { return self.tx.send(event) };
-        // Both producers must publish the timestamp in the same order as the channel send.
         let mut state = self.observer.0.lock();
-        let now = Instant::now();
-        self.tx.send(event)?;
-        state.queued_at.push_back(now);
-        state.queued_bytes += bytes;
+        if state.closed { return Err(mpsc::error::SendError(event)); }
+        if let Some(bytes) = frame_bytes(&event) {
+            let now = Instant::now();
+            state.expire_video(now);
+            if state.queued_at.len() >= MAX_FRAMES || state.queued_bytes + bytes > MAX_BYTES {
+                state.discard_video(now);
+            }
+            if bytes <= MAX_BYTES {
+                state.queued_at.push_back(now);
+                state.queued_bytes += bytes;
+                state.events.push_back(event);
+            } else {
+                state.dropped_frames += 1;
+                state.dropped_bytes += bytes;
+            }
+        } else {
+            state.events.push_back(event);
+        }
+        let _ = self.wake.try_send(());
         Ok(())
     }
 }
@@ -81,40 +103,83 @@ impl Receiver {
         self.observer.clone()
     }
 
+    // The pump checks this before sending any already-converted output.
+    pub fn take_discontinuity(&mut self) -> Option<SourceEvent> {
+        let mut state = self.observer.0.lock();
+        state.expire_video(Instant::now());
+        state.take_discontinuity()
+    }
+
     pub async fn recv(&mut self, connection: Option<u64>) -> Option<SourceEvent> {
-        let event = self.rx.recv().await;
         self.last_dequeue_age_ms = None;
-        let event = event?;
-        if let Some(bytes) = frame_bytes(&event) {
-            let mut state = self.observer.0.lock();
-            let queued = state.queued_at.pop_front().expect("each queued frame has an enqueue timestamp");
-            let age = queued.elapsed().as_millis() as u64;
-            self.last_dequeue_age_ms = Some(age);
-            state.queued_bytes -= bytes;
-            if state.dequeue_connection != connection {
-                state.reset_dequeues();
-                state.dequeue_connection = connection;
+        loop {
+            {
+                let mut state = self.observer.0.lock();
+                let now = Instant::now();
+                state.expire_video(now);
+                if let Some(gap) = state.take_discontinuity() { return Some(gap); }
+                if let Some(event) = state.events.pop_front() {
+                    if let Some(bytes) = frame_bytes(&event) {
+                        let queued = state.queued_at.pop_front().expect("each video event has a timestamp");
+                        let age = (now - queued).as_millis() as u64;
+                        self.last_dequeue_age_ms = Some(age);
+                        state.queued_bytes -= bytes;
+                        if state.dequeue_connection != connection {
+                            state.reset_dequeues();
+                            state.dequeue_connection = connection;
+                        }
+                        if connection.is_some() {
+                            state.dequeued_frames += 1;
+                            state.last_dequeued_ms = Some(age);
+                            state.max_dequeued_ms = Some(state.max_dequeued_ms.unwrap_or(0).max(age));
+                        }
+                    }
+                    return Some(event);
+                }
+                if self.wake.is_closed() { return None; }
             }
-            if connection.is_some() {
-                state.dequeued_frames += 1;
-                state.last_dequeued_ms = Some(age);
-                state.max_dequeued_ms = Some(state.max_dequeued_ms.unwrap_or(0).max(age));
-            }
+            let _ = self.wake.recv().await;
         }
-        Some(event)
     }
 }
 
 impl Drop for Receiver {
     fn drop(&mut self) {
         let mut state = self.observer.0.lock();
-        self.rx.close();
-        state.queued_at = VecDeque::new();
+        state.closed = true;
+        self.wake.close();
+        state.events.clear();
+        state.queued_at.clear();
         state.queued_bytes = 0;
     }
 }
 
 impl State {
+    fn expire_video(&mut self, now: Instant) {
+        if self.queued_at.front().is_some_and(|at| now - *at >= MAX_AGE) {
+            self.discard_video(now);
+        }
+    }
+
+    fn discard_video(&mut self, now: Instant) {
+        if let Some(oldest) = self.queued_at.front() {
+            self.dropped_oldest_ms = self.dropped_oldest_ms.max((now - *oldest).as_millis() as u64);
+        }
+        self.dropped_frames += self.queued_at.len();
+        self.dropped_bytes += self.queued_bytes;
+        self.queued_at.clear();
+        self.queued_bytes = 0;
+        self.events.retain(|event| frame_bytes(event).is_none());
+    }
+
+    fn take_discontinuity(&mut self) -> Option<SourceEvent> {
+        (self.dropped_frames > 0).then(|| SourceEvent::VideoBacklogDropped {
+            frames: std::mem::take(&mut self.dropped_frames),
+            bytes: std::mem::take(&mut self.dropped_bytes),
+            oldest_ms: std::mem::take(&mut self.dropped_oldest_ms),
+        })
+    }
+
     fn reset_dequeues(&mut self) {
         self.dequeued_frames = 0;
         self.last_dequeued_ms = None;
@@ -164,6 +229,31 @@ mod tests {
     use tokio::time::advance;
 
     #[tokio::test(start_paused = true)]
+    async fn stale_backlog_drops_video_preserves_controls_and_accepts_fresh_frames() {
+        let (tx, mut rx) = channel();
+        tx.send(SourceEvent::VideoFrame { pts_us: 1, data: vec![1; 8] }).unwrap();
+        tx.send(SourceEvent::EncoderResolution { width: 1280, height: 720 }).unwrap();
+        advance(Duration::from_millis(350)).await;
+        tx.send(SourceEvent::VideoFrame { pts_us: 2, data: vec![2; 9] }).unwrap();
+        assert!(matches!(rx.recv(Some(1)).await, Some(SourceEvent::VideoBacklogDropped { frames: 1, bytes: 8, .. })));
+        assert!(matches!(rx.recv(Some(1)).await, Some(SourceEvent::EncoderResolution { width: 1280, height: 720 })));
+        assert!(matches!(rx.recv(Some(1)).await, Some(SourceEvent::VideoFrame { pts_us: 2, .. })));
+    }
+
+    #[tokio::test]
+    async fn producer_caps_video_bytes_and_count_even_during_a_pending_write() {
+        let (tx, mut rx) = channel();
+        for n in 0..96 {
+            tx.send(SourceEvent::VideoFrame { pts_us: n, data: vec![0; 8] }).unwrap();
+        }
+        assert!(rx.observer().report(Some(1)).unwrap().queued_frames <= 32);
+        assert!(matches!(rx.recv(Some(1)).await, Some(SourceEvent::VideoBacklogDropped { frames: 64, .. })));
+        tx.send(SourceEvent::VideoFrame { pts_us: 2, data: vec![0; 16 * 1024 * 1024] }).unwrap();
+        tx.send(SourceEvent::VideoFrame { pts_us: 3, data: vec![1] }).unwrap();
+        assert!(rx.observer().0.lock().queued_bytes <= 16 * 1024 * 1024);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn source_frame_residence_survives_report_and_excludes_control_events() {
         let (tx, mut rx) = channel();
         tx.send(SourceEvent::VideoFrame { pts_us: 0, data: vec![1] }).unwrap();
@@ -202,12 +292,12 @@ mod tests {
         assert_eq!((sample.queued_frames, sample.queued_bytes, sample.oldest_ms), (1, 3, Some(2060)));
         assert_eq!((sample.dequeued_frames, sample.max_dequeued_ms), (1, Some(200)));
 
-        assert!(matches!(rx.recv(Some(42)).await, Some(SourceEvent::VideoFrameTagged { .. })));
-        assert!(observer.report(Some(42)).is_none(), "slow samples must be rate limited");
-        advance(Duration::from_secs(2)).await;
+        assert!(matches!(rx.recv(Some(42)).await, Some(SourceEvent::VideoBacklogDropped { frames: 1, .. })));
+        assert!(observer.report(Some(42)).is_none(), "samples must be rate limited");
+        advance(Duration::from_secs(10)).await;
         let sample = observer.report(Some(42)).unwrap();
         assert_eq!((sample.queued_frames, sample.queued_bytes, sample.oldest_ms), (0, 0, None));
-        assert_eq!((sample.dequeued_frames, sample.max_dequeued_ms), (1, Some(2060)));
+        assert_eq!((sample.dequeued_frames, sample.max_dequeued_ms), (0, None));
         drop(tx);
         assert!(rx.recv(Some(42)).await.is_none());
     }
@@ -217,7 +307,7 @@ mod tests {
         let (tx, mut rx) = channel();
         let observer = rx.observer();
         tx.send(SourceEvent::VideoFrame { pts_us: 0, data: vec![1] }).unwrap();
-        advance(Duration::from_secs(2)).await;
+        advance(Duration::from_millis(200)).await;
         rx.recv(Some(1)).await.unwrap();
         assert!(observer.report(None).is_none());
         let idle = observer.report(Some(2)).expect("active main TCP still reports an empty FIFO");

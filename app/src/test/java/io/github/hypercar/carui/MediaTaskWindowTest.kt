@@ -6,6 +6,52 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class MediaTaskWindowTest {
+    @Test fun expandedShortVideoReadsOrientationBeforeSettingItOnItsVirtualDisplay() = runBlocking {
+        val commands = mutableListOf<String>()
+        var ignored = false
+        val prepared = MediaTaskWindow.prepareExpandedShortVideo(8) { command ->
+            commands += command
+            if (command == "wm set-ignore-orientation-request -d 8 true") ignored = true
+            val output = when (command) {
+                "wm get-ignore-orientation-request -d 8" -> "ignoreOrientationRequest $ignored for displayId=8"
+                "wm get-display-windowing-mode -d 8" -> "display windowing mode=fullscreen for displayId=8"
+                else -> ""
+            }
+            ExecResult(0, output, "")
+        }
+        assertTrue(prepared.ready)
+        assertEquals(false, prepared.restoreIgnoreOrientation)
+        assertEquals(listOf(
+            "wm get-ignore-orientation-request -d 8",
+            "wm set-ignore-orientation-request -d 8 true", "wm get-ignore-orientation-request -d 8",
+            "wm set-display-windowing-mode -d 8 1", "wm get-display-windowing-mode -d 8",
+        ), commands)
+    }
+
+    @Test fun expandedShortVideoLeavesAnExistingOrUnknownOrientationSettingAlone() = runBlocking {
+        for ((readback, ready) in listOf("ignoreOrientationRequest true for displayId=8" to true, "" to false)) {
+            val commands = mutableListOf<String>()
+            val prepared = MediaTaskWindow.prepareExpandedShortVideo(8) {
+                commands += it
+                val output = if (it.startsWith("wm get-ignore")) readback else "display windowing mode=fullscreen for displayId=8"
+                ExecResult(0, output, "")
+            }
+            assertEquals(ready, prepared.ready)
+            assertNull(prepared.restoreIgnoreOrientation)
+            assertFalse(commands.any { it.startsWith("wm set-ignore") })
+        }
+    }
+
+    @Test fun orientationRestoreRequiresReadbackAndNeverChangesThePhoneDisplay() = runBlocking {
+        assertFalse(MediaTaskWindow.setIgnoreOrientationRequest(0, false) { error("physical display") })
+        assertFalse(MediaTaskWindow.setIgnoreOrientationRequest(8, false) {
+            ExecResult(0, "ignoreOrientationRequest true for displayId=8", "")
+        })
+        assertTrue(MediaTaskWindow.setIgnoreOrientationRequest(8, false) {
+            ExecResult(0, "ignoreOrientationRequest false for displayId=8", "")
+        })
+    }
+
     @Test fun launchConfirmationRejectsTaskLostDuringWindowSetup() = runBlocking {
         val taskOnProjection = """
             RootTask id=42 bounds=[0,0][2523,800] displayId=8 userId=0
@@ -48,6 +94,20 @@ class MediaTaskWindowTest {
         assertEquals(listOf("am display move-stack 40 6", "am stack remove 41"),
             MediaTaskWindow.releaseCommands(previous, current, 8, "com.luna.music"))
         assertTrue(MediaTaskWindow.releaseCommands(null, current, 8, "com.luna.music").isEmpty())
+    }
+
+    @Test fun closingShortVideoRemovesItsProjectedTaskEvenIfItStartedOnThePhone() {
+        val previous = listOf(MediaTaskWindow.Task(42, "", "com.ss.android.ugc.aweme", 0, 42, true))
+        val current = listOf(
+            MediaTaskWindow.Task(42, "", "com.ss.android.ugc.aweme", 8, 42, true),
+            MediaTaskWindow.Task(43, "", "com.ss.android.ugc.aweme", 0, 43, true),
+            MediaTaskWindow.Task(44, "", "com.ss.android.ugc.aweme", 8, 44, true),
+            MediaTaskWindow.Task(45, "", "com.example.other", 8, 44, false),
+        )
+        assertEquals(listOf("am stack remove 42"),
+            MediaTaskWindow.releaseCommands(previous, current, 8, "com.ss.android.ugc.aweme", closeProjectedTasks = true))
+        assertEquals(listOf("am display move-stack 42 0"),
+            MediaTaskWindow.releaseCommands(previous, current, 8, "com.ss.android.ugc.aweme"))
     }
 
     @Test fun fullscreenRequiresReadbackAndRetriesAnUnappliedChange() = runBlocking {

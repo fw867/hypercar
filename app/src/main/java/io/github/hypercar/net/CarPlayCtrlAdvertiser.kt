@@ -50,7 +50,6 @@ class CarPlayCtrlAdvertiser(
     /** Diagnostic-only callback under the advertiser monitor; must not do I/O. */
     private val onCtrlEpochChanged: () -> Unit = {},
     private val traceDiscovery: (String) -> Unit = {},
-    private val deviceInfoEnabled: () -> Boolean = { false },
 ) {
     private fun logCtrl(message: String) = log("$message attempt=$attemptId")
     enum class Event { REGISTERED, TCP_ACCEPTED, INVITE_HEAD, INVITE_ACK, INVITED }
@@ -261,8 +260,7 @@ class CarPlayCtrlAdvertiser(
         traceDiscovery("event=mdns-resend-request attempt=$attemptId network=$network currentPort=${snapshot.port}")
         var superseded = false
         val sent = runCatching {
-            snapshot.observer?.resend(snapshot.name, snapshot.port, snapshot.mac, SRCVERS, snapshot.registeredSince,
-                includeDeviceInfo = deviceInfoEnabled()) {
+            snapshot.observer?.resend(snapshot.name, snapshot.port, snapshot.mac, SRCVERS, snapshot.registeredSince) {
                 canSend().also { superseded = !it }
             }
         }.getOrElse {
@@ -295,7 +293,7 @@ class CarPlayCtrlAdvertiser(
             observationAttempts++
             val generation = ++observationGeneration
             mdnsObserver = CtrlMdnsObserver(appContext, epoch.network, generation, log, attemptId,
-                onLocalAnnouncement = { family -> deviceInfoEnabled() && announceDeviceInfo(epoch, listener, generation, family) },
+                onLocalAnnouncement = { family -> announceDeviceInfo(epoch, listener, generation, family) },
                 trace = traceDiscovery,
                 onLocalSrv = { srv ->
                     synchronized(this) {
@@ -332,8 +330,8 @@ class CarPlayCtrlAdvertiser(
         }
         return runCatching {
             snapshot.observer?.resend(snapshot.name, snapshot.port, snapshot.mac, SRCVERS, snapshot.registeredSince,
-                onlyFamily = family, includeDeviceInfo = true) {
-                deviceInfoEnabled() && synchronized(this) {
+                onlyFamily = family) {
+                synchronized(this) {
                     current() && registration.currentGeneration == snapshot.registrationToken &&
                         (actualRegisteredName ?: registeredName) == snapshot.name
                 }

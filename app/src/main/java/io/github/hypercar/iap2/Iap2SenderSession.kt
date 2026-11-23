@@ -2,6 +2,7 @@ package io.github.hypercar.iap2
 
 import io.github.hypercar.net.BluetoothHotspot
 import java.io.IOException
+import java.security.interfaces.ECPublicKey
 import java.io.InterruptedIOException
 import java.security.SecureRandom
 import java.util.Date
@@ -94,7 +95,8 @@ class Iap2SenderSession(
     private val onMediaKey: (Int) -> Unit = {},
     private val nowPlayingProvider: () -> Iap2NowPlaying = { Iap2NowPlaying() },
     private val pairedReceiver: Boolean = false,
-    private val bmwAppsV1AuthFirst: Boolean = false,
+    private val bondedBmwInbound: Boolean = false,
+    private val verifyMfi3Certificate: (ByteArray) -> ECPublicKey = Mfi3AccessoryVerifier::verifyCertificate,
 ) {
     private var parser = Iap2Csm.Parser()
     private val media = Iap2MediaSession(log, onMediaKey)
@@ -166,6 +168,7 @@ class Iap2SenderSession(
     /** 车机最近一次识别结果（保活期重探按能力清单决定发哪条，不能硬塞）。 */
     @Volatile
     private var peerIdentification: Iap2Messages.Identification? = null
+    private var authenticatedAppsV1Early = false
 
     private companion object {
         /** MFi 挑战阶梯（长度, 首次试探窗口）：DiPlay/Audi/BMW 双端实测顺序。 */
@@ -235,8 +238,8 @@ class Iap2SenderSession(
         }
         log("iap2 link ready peerMaxControl=${channel.peerMaxControlPayload()}")
 
-        // The control descriptor is available before 1D01. Validate the peer's advertised role once 1D01 arrives.
-        val authFirst = bmwAppsV1AuthFirst && pairedReceiver && profile.id == "bmw_id85" && channel.peerControlVersion == 1
+        // The control descriptor lets paired BMW v1 links authenticate before the peer identifies its role.
+        val authFirst = bondedBmwInbound && pairedReceiver && profile.id.startsWith("bmw_") && channel.peerControlVersion == 1
         if (authFirst) {
             enterPhase("MFI_EXCHANGE")
             authenticatePairedAppsV1(null, deadline)
@@ -247,9 +250,8 @@ class Iap2SenderSession(
         send(Iap2MessageIds.START_IDENTIFICATION)
         val identFrame = expect(Iap2MessageIds.IDENTIFICATION_INFORMATION, deadline)
         val ident = Iap2Messages.parseIdentification(identFrame.body)
-        if (authFirst && (!usesMguReentry(ident) || !isBmwAppsOnly(ident))) {
-            throw IOException("MGU-AUTH: auth-first link did not identify as ordinary BMW Apps v1")
-        }
+        if (authFirst) log("MGU-AUTH: v1 identification ordinaryApps=${isBmwAppsOnly(ident)} wirelessCarPlay=${isCarPlayProfileB(ident)}")
+        authenticatedAppsV1Early = authFirst
         peerIdentification = ident
         navigation.declareReceiveSupport(ident.acceptsRouteGuidance)
         subscriptions.identify(ident.model, ident.manufacturer)
@@ -294,7 +296,7 @@ class Iap2SenderSession(
         val declaresReceiveWifi = ident.declaresReceive(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION)
         val declaresSendWifi = ident.declaresSend(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION)
         val returningMgu = usesMguReentry(ident)
-        if (returningMgu && isBmwAppsOnly(ident) && !profile.abortWhenCarPlayWindowClosed) {
+        if (isBmwAppsOnly(ident) && (authFirst || returningMgu) && !profile.abortWhenCarPlayWindowClosed) {
             enterPhase("WAIT_CARPLAY_WINDOW")
             log("MGU-REENTRY: BMW Apps window; keep RFCOMM for subscriptions, new identification or invitation")
             return endpointOf(null, null)
@@ -710,11 +712,14 @@ class Iap2SenderSession(
             "iap2 rx=0x1d01（重新识别）name=${ident.name} 发送清单=${ident.sendIds?.sorted()?.joinToString { "0x%04x".format(it) }} " +
                 "可收清单=${ident.receiveIds?.sorted()?.joinToString { "0x%04x".format(it) }}",
         )
-        if (usesMguReentry(ident)) {
+        val returningMgu = usesMguReentry(ident)
+        if (returningMgu) {
             eaProtocols = emptyList()
+        } else ident.eaProtocols.takeIf { it.isNotEmpty() }?.let { eaProtocols = it }
+        if (returningMgu || authenticatedAppsV1Early) {
             send(Iap2MessageIds.IDENTIFICATION_ACCEPTED)
             log("MGU-REENTRY: accepted updated identification; CarPlay window=${isCarPlayProfileB(ident)}")
-        } else ident.eaProtocols.takeIf { it.isNotEmpty() }?.let { eaProtocols = it }
+        }
         val declaresWifi = ident.declaresSend(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION) != false
         val declaresStart = ident.declaresSend(Iap2MessageIds.CARPLAY_START_SESSION) != false
         if (declaresWifi || declaresStart) {
@@ -854,7 +859,7 @@ class Iap2SenderSession(
             throw error
         }
         val key = try {
-            Mfi3AccessoryVerifier.verifyCertificate(certificate.frame.body)
+            verifyMfi3Certificate(certificate.frame.body)
         } catch (error: IOException) {
             reject(error)
         }

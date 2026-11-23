@@ -96,7 +96,7 @@ internal class CtrlMdnsObserver(
     /** null = no eligible packet; a nonnegative result is the number of successful family sends. */
     fun resend(
         name: String, port: Int, mac: String, version: String, registrationStartedAt: Long,
-        onlyFamily: Int? = null, includeDeviceInfo: Boolean = false, canSend: () -> Boolean,
+        onlyFamily: Int? = null, canSend: () -> Boolean,
     ): Int? {
         if (closed) return null
         val link = linkProperties() ?: return null
@@ -122,7 +122,7 @@ internal class CtrlMdnsObserver(
                 val group = multicastGroup(family, nif)
                 val source = if (packet.source is Inet6Address && packet.source.isLinkLocalAddress)
                     Inet6Address.getByAddress(null, packet.source.address, nif.index) else packet.source
-                val enriched = MdnsDiagnosticPacket.withDeviceInfo(packet.bytes, name, includeDeviceInfo)
+                val enriched = MdnsDiagnosticPacket.withDeviceInfo(packet.bytes, name)
                 if (enriched == null && onlyFamily != null) continue
                 val payload = enriched ?: packet.bytes
                 val datagram = DatagramPacket(payload, payload.size, group, 5353)

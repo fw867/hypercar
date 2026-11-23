@@ -32,6 +32,7 @@ pub enum SourceEvent {
     RequestCarWithKeyFrame,
     EncoderFrameRate(u32),
     ResetVideoSource,
+    VideoBacklogDropped { frames: usize, bytes: usize, oldest_ms: u64 },
     RequestHostUi,
     RequestViewArea(crate::display_layout::ViewRequest),
     CancelSelfAsr(u64),
@@ -1021,9 +1022,21 @@ pub(crate) async fn video_pump(
     let mut encoder_size: Option<(u32, u32)> = None;
     let mut before_ready_units = 0u64;
     let mut video_rx = video_rx;
+    let mut recovering_backlog = false;
+    let mut waiting_for_live_sync = false;
+    let mut last_backlog_request = None;
     // 16ms tick：仅用于 keepAlive 节拍（真帧由视频泵推送）
     let mut tick = tokio::time::interval(Duration::from_millis(16));
     loop {
+        if recovering_backlog
+            && last_backlog_request.is_none_or(|at: tokio::time::Instant| at.elapsed() >= Duration::from_secs(3)) {
+            if let Some(s) = &sender {
+                last_backlog_request = Some(tokio::time::Instant::now());
+                s.note_keyframe_request("backlog_recovery");
+                if let Some(owner) = source_owner { crate::carwith_source::request_fresh_video(owner); }
+                else { crate::emit_force_keyframe(); }
+            }
+        }
         tokio::select! {
             _ = stop_v.notified() => return,
             command = screen_ready_rx.recv(), if commands_open => match command {
@@ -1037,6 +1050,9 @@ pub(crate) async fn video_pump(
                     s.activate_keyframe_trace();
                     s.note_keyframe_request("install");
                     sender = Some(s);
+                    recovering_backlog = false;
+                    waiting_for_live_sync = false;
+                    last_backlog_request = None;
                     crate::emit_force_keyframe();
                     if let Some(owner)=source_owner {crate::carwith_source::replay(owner);}
                     emit_log(&format!("VIDEO: sender ready; discarded_before_ready_units={before_ready_units}; request fresh SPS/PPS/IDR"));
@@ -1059,6 +1075,9 @@ pub(crate) async fn video_pump(
                     let _ = reply.send(accepted);
                     emit_log(&format!("SCREEN-LIFECYCLE: video pump install revision={revision} accepted={accepted}"));
                     if accepted {
+                        recovering_backlog = false;
+                        waiting_for_live_sync = false;
+                        last_backlog_request = None;
                         if let Some(s) = &sender { s.note_keyframe_request("resume"); }
                         if let Some(owner)=source_owner {crate::carwith_source::replay(owner);}
                         crate::emit_force_keyframe();
@@ -1068,6 +1087,9 @@ pub(crate) async fn video_pump(
                     diagnostic_phase.set_streaming(false);
                     converter.pause(); converted.clear();
                     drop(sender.take());
+                    recovering_backlog = false;
+                    waiting_for_live_sync = false;
+                    last_backlog_request = None;
                     let _=reply.send(());
                     emit_log("VIDEO: old sender released; screen lifecycle pause acknowledged");
                 }
@@ -1077,14 +1099,28 @@ pub(crate) async fn video_pump(
                 },
             },
             ev = async {
-                if let Some(ev)=converted.pop_front() {(true,Some(ev))}else{
+                if !converted.is_empty() {
+                    if let Some(gap) = video_rx.take_discontinuity() { (false, Some(gap)) }
+                    else { (true, converted.pop_front()) }
+                } else {
                     let connection = sender.as_ref().and_then(ScreenSender::connection_id);
                     (false,video_rx.recv(connection).await)
                 }
             } => { let (processed,ev)=ev; match ev {
+                Some(SourceEvent::VideoBacklogDropped { frames, bytes, oldest_ms }) => {
+                    converted.clear();
+                    converter.discard_backlog();
+                    recovering_backlog = sender.is_some();
+                    waiting_for_live_sync = recovering_backlog;
+                    if let Some(s) = sender.as_mut() {
+                        s.reset_source();
+                        emit_log(&format!("VIDEO-QUEUE: recovery conn={:?} dropped_frames={frames} dropped_bytes={bytes} oldest_ms={oldest_ms}; waiting for live sync", s.connection_id()));
+                    }
+                }
                 Some(SourceEvent::ResetVideoSource) => {
                     encoder_size = None; pending_size = None;
                     converter.set_source_fps(None); converter.reset();converted.clear();
+                    waiting_for_live_sync = recovering_backlog;
                     if let Some(s) = sender.as_mut() { s.reset_source(); }
                     emit_log("CARWITH-VIDEO: fresh source round; waiting for current configuration and IDR");
                 }
@@ -1109,6 +1145,13 @@ pub(crate) async fn video_pump(
                     };
                     if !processed {
                         stats.lock().source_units += 1;
+                        if recovering_backlog && (waiting_for_live_sync || origin == FrameOrigin::Cached) {
+                            match crate::screen::recovery_access_unit(codec, &data, origin) {
+                                crate::screen::RecoveryAccessUnit::Sync => waiting_for_live_sync = false,
+                                crate::screen::RecoveryAccessUnit::Parameters => {}
+                                crate::screen::RecoveryAccessUnit::Skip => continue,
+                            }
+                        }
                         if let Some(s) = &sender {
                             s.observe_source_sync(&data, pts_us, codec, origin, video_rx.last_dequeue_age_ms());
                         }
@@ -1163,7 +1206,14 @@ pub(crate) async fn video_pump(
                             return;
                         }
                         let written_frames = s.frames_sent() - before_frames;
-                        if written_frames > 0 { diagnostic_phase.set_streaming(true); }
+                        if written_frames > 0 {
+                            diagnostic_phase.set_streaming(true);
+                            if recovering_backlog {
+                                recovering_backlog = false;
+                                last_backlog_request = None;
+                                emit_log(&format!("VIDEO-QUEUE: recovered conn={:?} first_frame_pts_us={pts}", s.connection_id()));
+                            }
+                        }
                         let mut st = stats.lock();
                         let first_write = written_frames > 0 && st.frames == 0;
                         st.frames += written_frames;
@@ -1257,6 +1307,82 @@ mod video_pump_tests {
         assert!(config.screen_resource_lifecycle);assert!(config.enable_audio);
     }
     use tokio::io::AsyncReadExt;
+    #[tokio::test]
+    async fn backlog_recovery_writes_fresh_sync_on_the_same_encrypted_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let phone = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut car, _) = listener.accept().await.unwrap();
+        let (commands, rx) = mpsc::channel(2);
+        let (source, video_rx) = crate::video_queue::channel();
+        let stats = Arc::new(Mutex::new(PumpStat::default()));
+        let stop = Arc::new(Notify::new());
+        let pipeline = Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
+        let pump = tokio::spawn(video_pump(stop, stats, true, pipeline, rx, video_rx, None, 30, None));
+        commands.send(crate::screen_session::ScreenCommand::Install(ScreenSender::new(
+            phone.into_split().1, crate::screen::ScreenCipher::ChaCha([7; 32]), 1920, 720, false,
+        ))).await.unwrap();
+        tokio::task::yield_now().await;
+        let sync = |stamp, origin, tag| SourceEvent::VideoFrameTagged {
+            pts_us: stamp, codec: crate::video_format::VideoCodec::H264, origin,
+            data: vec![0,0,1,0x67,0x42,0,0x1f,0,0,1,0x68,1,0,0,1,0x65,tag],
+        };
+        async fn read_frame(socket: &mut tokio::net::TcpStream, nonce: u64) -> Vec<u8> {
+            let mut header = [0;128];
+            socket.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[4], 1, "configuration must precede the new GOP");
+            let mut body = vec![0; u32::from_le_bytes(header[..4].try_into().unwrap()) as usize];
+            socket.read_exact(&mut body).await.unwrap();
+            socket.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[4], 0);
+            body.resize(u32::from_le_bytes(header[..4].try_into().unwrap()) as usize, 0);
+            socket.read_exact(&mut body).await.unwrap();
+            crate::crypto::chacha_open(&[7;32], &crate::crypto::nonce64(nonce), &body, &header).unwrap()
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            source.send(sync(1000, FrameOrigin::Live, 2)).unwrap();
+            assert_eq!(read_frame(&mut car, 0).await, [0,0,0,2,0x65,2]);
+            // Fill the FIFO without yielding, as if the video pump were writing a large frame.
+            for n in 0..33 {
+                source.send(SourceEvent::VideoFrame {pts_us:2000+n,data:vec![0,0,1,0x41,3]}).unwrap();
+            }
+            source.send(sync(3000, FrameOrigin::Cached, 4)).unwrap();
+            source.send(sync(4000, FrameOrigin::Live, 5)).unwrap();
+            assert_eq!(read_frame(&mut car, 1).await, [0,0,0,2,0x65,5]);
+        }).await.unwrap();
+        pump.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backlog_recovery_keeps_requesting_sync_after_multiple_dropped_windows() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let phone = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (_car, _) = listener.accept().await.unwrap();
+        let (commands, rx) = mpsc::channel(2);
+        let (source, video_rx) = crate::video_queue::channel();
+        let stats = Arc::new(Mutex::new(PumpStat::default()));
+        let pipeline = Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
+        let mut sender = ScreenSender::new(phone.into_split().1,
+            crate::screen::ScreenCipher::ChaCha([7; 32]), 1920, 720, false);
+        sender.attach_diagnostics(pipeline.clone(), 8);
+        commands.send(crate::screen_session::ScreenCommand::Install(sender)).await.unwrap();
+        let pump = tokio::spawn(video_pump(Arc::new(Notify::new()), stats.clone(), true, pipeline.clone(),
+            rx, video_rx, None, 30, None));
+        tokio::task::yield_now().await;
+        let trace = pipeline.lock().keyframe_trace.upgrade().expect("installed sender trace");
+
+        for window in 0..3 {
+            for n in 0..33 {
+                source.send(SourceEvent::VideoFrame { pts_us: window * 100 + n, data: vec![0, 0, 1, 0x41, 3] }).unwrap();
+            }
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(3)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(trace.pending_with_reason("backlog_recovery") >= 3);
+        assert_eq!(stats.lock().frames, 0, "incremental frames must not leave the pump before sync");
+        pump.abort();
+    }
+
     #[tokio::test]
     async fn negotiation_command_sender_drop_does_not_stop_video_or_keepalive() {
         for recovery in [false,true] {

@@ -74,6 +74,11 @@ impl Trace {
 
     pub(super) fn watermark(&self) -> u64 { self.pending_through.load(Ordering::Acquire) }
 
+    #[cfg(test)]
+    pub(crate) fn pending_with_reason(&self, reason: &str) -> usize {
+        self.requests.lock().pending.iter().filter(|r| r.reason == reason).count()
+    }
+
     fn emit(&self, at: u64, event: &str, r: Request, detail: std::fmt::Arguments<'_>) {
         crate::emit_media_trace(at, event, &format!(
             "engine={} RTSP#{} conn={} request={} reason={} elapsed_ms={} {detail}",

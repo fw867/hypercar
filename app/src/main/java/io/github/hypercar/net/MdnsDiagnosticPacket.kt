@@ -35,8 +35,7 @@ internal data class MdnsDiagnosticPacket(
         private const val DEVICE_MODEL = "model=$CARPLAY_DEVICE_INFO_BOARD"
 
         /** Append to an already validated local NSD packet, preserving DNS compression offsets. */
-        fun withDeviceInfo(bytes: ByteArray, instance: String, enabled: Boolean = false): ByteArray? {
-            if (!enabled) return null
+        fun withDeviceInfo(bytes: ByteArray, instance: String): ByteArray? {
             val label = instance.toByteArray(Charsets.UTF_8)
             if (label.size !in 1..63) return null
             val additional = ((bytes[10].toInt() and 255) shl 8) or (bytes[11].toInt() and 255)

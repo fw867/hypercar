@@ -29,7 +29,7 @@ bugreport 可能包含 FS/data/misc/bluetooth/logs 下轮转的 btsnoop_hci 日�
 - `CTRL-CLICK`：在开发者菜单点「即将点旧设备 CarPlay」后，导出包含前 15 秒与后 30 秒的观察记录（前段最多 64 条，整个窗口最多 128 条）。用每条事件自己的 `epochMs` 和手机 HCI 对齐。`origin=peer` 是组播来源，需用车机 IP 确认；`known-answer` 是查询里的缓存记录。`listener-open`、`listener-close`、`click-state` 给出端口变更和点击时的监听端口，`tcp-accepted` 表示握手已完成。
 - `OLD-DEVICE-READY`：车机 Wi-Fi 已绑定、已观察到当前注册的 SRV、蓝牙实际可发现时就绪。Wi-Fi 本地地址集合变化后，需要重新观察 SRV。打点和关联记录在后台写盘，以记录里的时间戳为准。
 
-「随 mDNS 发送 model=D83AP」默认关闭。打开后，后续本机通告和手动重发可附带 `_device-info._tcp` TXT；做基线测试时保持关闭。
+所有车机档案的本机通告和手动重发都在已核验的 mDNS 包中附带 `_device-info._tcp` TXT `model=D83AP`。
 
 观察器只绑定具体组播目的地址，不使用通配UDP5353，以免争抢系统NSD的单播流量；不发送DNS查询、不主动拨号。普通应用的该路径不能观察TCP SYN、发往旧端口的连接，或保证收到NSD单播响应；缺少记录不等于车机没发。NSD注册回调也不证明车机已收到线上公告。若仍无法分辨，应保留现场并补Wi-Fi空口/路由侧抓包。
 

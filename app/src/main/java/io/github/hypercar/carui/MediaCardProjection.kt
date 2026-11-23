@@ -13,22 +13,29 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /** One application task can move between a full-sized pane and the home card. */
 internal class MediaCardProjection(context: Context, private val packageName: String, private val dialer: String?) {
     private val app = context.applicationContext
     val size = PhoneProjectionSize.read(context)
     val error = MutableStateFlow<String?>(null)
+    val expandedWindowReady = MutableStateFlow(false)
+    val stabilizeExpandedWindow = ShortVideoApps.isSupported(packageName)
 
     private val input = ProjectionSurfaceInput<Request> { id, action, x, y, downTime ->
         SpikeShell.motion(id, action, x, y, downTime)
     }
     private val desired get() = input.desired
-    @Volatile private var closed = false
+    private enum class CloseReason { UserDismissed, ViewDisposed }
+    @Volatile private var closeReason: CloseReason? = null
+    private val closed get() = closeReason != null
+    private val endProjectedTask get() = closeReason == CloseReason.UserDismissed && stabilizeExpandedWindow
     @Volatile private var attachment: Attachment? = null
     private var displayId = -1
     private var tasksBeforeLaunch: List<MediaTaskWindow.Task>? = null
     private var needsFullscreenReset = false
+    private var shortVideoWindow: MediaTaskWindow.ExpandedShortVideo? = null
 
     private data class Request(
         val texture: SurfaceTexture, val size: PhoneProjectionSize, val expanded: Boolean,
@@ -41,6 +48,7 @@ internal class MediaCardProjection(context: Context, private val packageName: St
         val viewport = if (expanded) size.expanded(viewWidth, viewHeight) else size
         val request = Request(texture, viewport, expanded && viewport.width > viewport.height, viewWidth, viewHeight)
         if (!input.replace(request)) return
+        expandedWindowReady.value = false
         texture.setDefaultBufferSize(viewport.width, viewport.height)
         error.value = null
         scope.launch {
@@ -55,24 +63,30 @@ internal class MediaCardProjection(context: Context, private val packageName: St
                 try {
                     if (displayId > 0 && needsFullscreenReset && !request.expanded && !resetWindowMode()) {
                         HyperCarRepo.log("VIDEO-CARD: package=$packageName display=$displayId rebuilding for home card")
-                        releaseDisplay(restoreFullscreen = false)
+                        releaseDisplay(restoreWindow = false)
+                    }
+                    if (displayId > 0 && shortVideoWindow != null && !request.expanded && !resetOrientation()) {
+                        HyperCarRepo.log("VIDEO-CARD: package=$packageName display=$displayId rebuilding for home orientation")
+                        releaseDisplay(restoreWindow = false)
                     }
                     if (!isCurrent(request)) return@withLock
                     if (displayId > 0) {
+                        if (stabilizeExpandedWindow && request.expanded && shortVideoWindow == null) prepareExpandedShortVideo()
+                        if (!isCurrent(request)) return@withLock
                         val result = SpikeShell.updateDisplaySurface(
                             displayId, surface, viewport.width, viewport.height, viewport.dpi,
                         )
-                        if (result.startsWith("OK")) {
+                        if (result.startsWith("OK") && applyWindowMode(request)) {
                             attachment?.surface?.release()
                             attachment = Attachment(request, surface, displayId)
                             attached = true
-                            if (isCurrent(request)) applyWindowMode(request)
+                            markWindowReady(request)
                             HyperCarRepo.log("VIDEO-CARD: package=$packageName surface reattached display=$displayId size=${viewport.width}x${viewport.height} dpi=${viewport.dpi}")
                             return@withLock
                         }
                         releaseDisplay()
                     }
-                    attached = open(request, surface)
+                    if (isCurrent(request)) attached = open(request, surface)
                 } finally {
                     if (!attached) surface.release()
                 }
@@ -104,14 +118,19 @@ internal class MediaCardProjection(context: Context, private val packageName: St
         var launched = false
         try {
             if (!isCurrent(request)) return false
+            displayId = id
+            tasksBeforeLaunch = previous
+            if (stabilizeExpandedWindow && request.expanded) prepareExpandedShortVideo()
+            if (!isCurrent(request)) return false
             val result = SpikeDisplay.amStartLauncherOnDisplay(id, component.flattenToShortString())
-            launched = result.ok && MediaTaskWindow.confirmLaunch(id, packageName, stillOpen = { !closed }) {
-                displayId = id
-                tasksBeforeLaunch = previous
-                if (isCurrent(request)) applyWindowMode(request)
+            var windowUsable = true
+            val confirmed = result.ok && MediaTaskWindow.confirmLaunch(id, packageName, stillOpen = { !closed }) {
+                windowUsable = applyWindowMode(request)
             }
+            launched = confirmed && windowUsable
             if (launched) {
                 attachment = Attachment(request, surface, id)
+                markWindowReady(request)
             } else if (isCurrent(request)) {
                 error.value = if (result.ok) "应用未能在投屏中保持打开" else "应用未能在卡片中打开"
             }
@@ -125,7 +144,10 @@ internal class MediaCardProjection(context: Context, private val packageName: St
     }
 
     fun hide(texture: SurfaceTexture) {
-        if (desired?.texture === texture) input.replace(null)
+        if (desired?.texture === texture) {
+            input.replace(null)
+            expandedWindowReady.value = false
+        }
         scope.launch {
             changes.withLock {
                 val old = attachment?.takeIf { it.request.texture === texture } ?: return@withLock
@@ -137,9 +159,15 @@ internal class MediaCardProjection(context: Context, private val packageName: St
         }
     }
 
-    fun close() {
-        closed = true
+    fun dismiss() = close(CloseReason.UserDismissed)
+
+    fun dispose() = close(CloseReason.ViewDisposed)
+
+    private fun close(reason: CloseReason) {
+        if (closed) return
+        closeReason = reason
         input.replace(null)
+        expandedWindowReady.value = false
         scope.launch { changes.withLock { releaseDisplay() } }
     }
 
@@ -161,15 +189,41 @@ internal class MediaCardProjection(context: Context, private val packageName: St
 
     private fun isCurrent(request: Request) = !closed && desired === request
 
-    private suspend fun applyWindowMode(request: Request) {
-        if (!request.expanded) return
+    private suspend fun markWindowReady(request: Request) {
+        if (!stabilizeExpandedWindow || !request.expanded) return
+        withContext(Dispatchers.Main.immediate) {
+            if (isCurrent(request)) expandedWindowReady.value = true
+        }
+    }
+
+    private suspend fun prepareExpandedShortVideo() {
+        val prepared = MediaTaskWindow.prepareExpandedShortVideo(displayId)
+        shortVideoWindow = prepared
+        HyperCarRepo.log("VIDEO-CARD: package=$packageName display=$displayId shortVideoOrientationLocked=${prepared.ready}")
+    }
+
+    private suspend fun resetOrientation(): Boolean {
+        val original = shortVideoWindow?.restoreIgnoreOrientation
+        if (original != null) {
+            val restored = MediaTaskWindow.setIgnoreOrientationRequest(displayId, original)
+            HyperCarRepo.log("VIDEO-CARD: package=$packageName display=$displayId orientationRestored=$restored")
+            if (!restored) return false
+        }
+        shortVideoWindow = null
+        return true
+    }
+
+    private suspend fun applyWindowMode(request: Request): Boolean {
+        if (!isCurrent(request) || !request.expanded) return true
+        if (stabilizeExpandedWindow && shortVideoWindow?.ready != true) return true
         val viewport = request.size
         needsFullscreenReset = true
         val expanded = runCatching {
             MediaTaskWindow.expand(displayId, packageName, viewport.width, viewport.height)
         }.getOrDefault(false)
-        if (!expanded) resetWindowMode()
+        val usable = expanded || resetWindowMode()
         HyperCarRepo.log("VIDEO-CARD: package=$packageName display=$displayId expandedWindow=$expanded")
+        return usable || !stabilizeExpandedWindow
     }
 
     private suspend fun resetWindowMode(): Boolean {
@@ -179,19 +233,23 @@ internal class MediaCardProjection(context: Context, private val packageName: St
         return restored
     }
 
-    private suspend fun releaseDisplay(restoreFullscreen: Boolean = true) {
-        if (needsFullscreenReset && restoreFullscreen) resetWindowMode()
+    private suspend fun releaseDisplay(restoreWindow: Boolean = true) {
+        if (needsFullscreenReset && restoreWindow) resetWindowMode()
+        if (restoreWindow && !endProjectedTask) resetOrientation()
         if (displayId > 0) releaseProjectionDisplay(displayId, tasksBeforeLaunch)
         displayId = -1
         tasksBeforeLaunch = null
         needsFullscreenReset = false
+        shortVideoWindow = null
         attachment?.surface?.release()
         attachment = null
     }
 
     private suspend fun releaseProjectionDisplay(id: Int, previous: List<MediaTaskWindow.Task>?) {
         try {
-            runCatching { MediaTaskWindow.releaseTasks(id, packageName, previous) }.onFailure {
+            runCatching {
+                MediaTaskWindow.releaseTasks(id, packageName, previous, closeProjectedTasks = endProjectedTask)
+            }.onFailure {
                 HyperCarRepo.log("VIDEO-CARD: package=$packageName display=$id task cleanup failed: ${it.javaClass.simpleName}")
             }
         } finally {

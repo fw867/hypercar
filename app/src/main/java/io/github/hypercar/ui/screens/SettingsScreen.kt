@@ -78,7 +78,6 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.hypercar.carui.CarUiSettings
-import io.github.hypercar.net.CARPLAY_DEVICE_INFO_BOARD
 import io.github.hypercar.perm.AppPermissions
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.settings.SettingsRevision
@@ -231,8 +230,6 @@ private fun DeveloperMenuSection() {
     var experimentResult by rememberSaveable { mutableStateOf<String?>(null) }
     var sending by remember { mutableStateOf(false) }
     var result by rememberSaveable { mutableStateOf<String?>(null) }
-    val deviceInfoModel = remember(SettingsRevision.value) { SettingsStore.carPlayDeviceInfoModelEnabled }
-    val bmwAppsV1AuthFirst = remember(SettingsRevision.value) { SettingsStore.bmwAppsV1AuthFirstEnabled }
     val armedTarget by HyperCarRepo.armedBmwCaffExperiment.collectAsStateWithLifecycle()
     var armError by remember { mutableStateOf<String?>(null) }
     var dialing by remember { mutableStateOf(false) }
@@ -242,8 +239,6 @@ private fun DeveloperMenuSection() {
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("等待车机邀请时，手动补发当前服务的通告。不重新注册服务，也不更换端口。",
                 color = TextSecondary, style = MaterialTheme.typography.bodySmall)
-            SwitchRow("随 mDNS 发送 model=$CARPLAY_DEVICE_INFO_BOARD", "用于对照车机的设备识别，在后续广播和手动重发时生效。",
-                checked = deviceInfoModel, onCheckedChange = { SettingsStore.carPlayDeviceInfoModelEnabled = it })
             CapsuleButton(if (sending) "发送中…" else "重发 mDNS 通告", enabled = !sending && !dialing, onClick = send@{
                 if (sending || dialing) return@send
                 sending = true
@@ -292,11 +287,6 @@ private fun DeveloperMenuSection() {
             })
             dialResult?.let { Text(it, color = TextPrimary, style = MaterialTheme.typography.bodySmall) }
         }
-    }
-    SectionLabel("宝马 iD8.5 蓝牙握手实验")
-    GlassPanel(contentPadding = PaddingValues(16.dp)) {
-        SwitchRow("普通 BMW Apps v1 先认证", "用于已配对宝马的入站 v1 握手，按 AA00 → 认证 → 1D00 的顺序。",
-            checked = bmwAppsV1AuthFirst, onCheckedChange = { SettingsStore.bmwAppsV1AuthFirstEnabled = it })
     }
     SectionLabel("连接实验")
     GlassPanel(contentPadding = PaddingValues(16.dp)) {

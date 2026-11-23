@@ -72,6 +72,13 @@ impl Router {
         data
     }
     pub fn pause(&mut self) {self.active=None;self.output_size=None;self.waiting=true;self.submitted=0;self.produced=0;}
+    pub fn discard_backlog(&mut self) {
+        self.pause();
+        self.vps.clear();
+        self.sps.clear();
+        self.pps.clear();
+        self.origins.clear();
+    }
     fn fail(&mut self, error: impl std::fmt::Display) {
         self.pause();
         self.failed = true;

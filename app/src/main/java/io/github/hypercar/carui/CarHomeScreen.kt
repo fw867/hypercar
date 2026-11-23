@@ -98,20 +98,6 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect, dockEdge:
     var about by remember { mutableStateOf(false) }
     var projectedApp by remember { mutableStateOf<MusicApps.Entry?>(null) }
     var expandedMedia by remember { mutableStateOf(false) }
-    androidx.activity.compose.BackHandler {
-        when {
-            destination != null -> CarReceiverUi.showDestination(null)
-            settings -> settings = false
-            about -> about = false
-            apps -> apps = false
-            expandedMedia -> expandedMedia = false
-            projectedApp != null -> projectedApp = null
-            MusicUiState.appView -> {
-                MusicBridge.hideFromView()
-                MusicUiState.appView = false
-            }
-        }
-    }
     val enterMap: () -> Unit = {
         CarReceiverUi.showDestination(null)
         apps = false
@@ -127,7 +113,25 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect, dockEdge:
     }
     val projectionInteractive = projection?.allowsInteraction(limits) == true
     DisposableEffect(projection) {
-        onDispose { projection?.close() }
+        onDispose { projection?.dispose() }
+    }
+    fun selectProjection(next: MusicApps.Entry?) {
+        if (projectedApp?.packageName != next?.packageName) projection?.dismiss()
+        projectedApp = next
+    }
+    androidx.activity.compose.BackHandler {
+        when {
+            destination != null -> CarReceiverUi.showDestination(null)
+            settings -> settings = false
+            about -> about = false
+            apps -> apps = false
+            expandedMedia -> expandedMedia = false
+            projectedApp != null -> selectProjection(null)
+            MusicUiState.appView -> {
+                MusicBridge.hideFromView()
+                MusicUiState.appView = false
+            }
+        }
     }
     var musicApps by remember(context, apps) { mutableStateOf(MusicApps.installed(context)) }
     var videoApps by remember(context, apps) { mutableStateOf(ShortVideoApps.installed(context)) }
@@ -159,13 +163,13 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect, dockEdge:
             MusicBridge.selectPackage(context, app.packageName, launchOnPhone = !fromAppsPage)
         }
         if (shortVideo || fromAppsPage) {
-            projectedApp = app
+            selectProjection(app)
             expandedMedia = fromAppsPage
             apps = false
             settings = false
             about = false
         } else {
-            projectedApp = null
+            selectProjection(null)
         }
     }
     val host = LocalView.current
@@ -346,7 +350,7 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect, dockEdge:
                         settings = false
                         about = false
                         expandedMedia = false
-                        projectedApp = null
+                        selectProjection(null)
                         when {
                             limits.blockMusicApp -> {
                                 musicPicker = false
@@ -429,7 +433,7 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect, dockEdge:
                             ProjectedMediaPanel(
                                 projection, Modifier.fillMaxSize().clip(CardShape), expanded = true, interactive = projectionInteractive,
                             ) {
-                                projectedApp = null
+                                selectProjection(null)
                                 expandedMedia = false
                             }
                         }
@@ -441,7 +445,7 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect, dockEdge:
                             Modifier.width(musicCardWidth).fillMaxHeight(), musicPicker, ::openMusicPicker,
                             onClosePicker = { musicPicker = false }, projectedApp = projectedApp, limits = limits,
                             projectionInteractive = projectionInteractive,
-                            projection = projection, onCloseProjection = { projectedApp = null },
+                            projection = projection, onCloseProjection = { selectProjection(null) },
                             onSelectApp = { selectMediaApp(it, fromAppsPage = false) })
                     }
                 }
@@ -1058,6 +1062,8 @@ private fun ProjectedMediaPanel(
     onClose: () -> Unit,
 ) {
     val error by projection.error.collectAsStateWithLifecycle()
+    val expandedWindowReady by projection.expandedWindowReady.collectAsStateWithLifecycle()
+    val settlingWindow = expanded && projection.stabilizeExpandedWindow && !expandedWindowReady
     BoxWithConstraints(modifier.background(Color.Black), contentAlignment = Alignment.Center) {
         val density = LocalDensity.current
         val surfaceModifier = if (expanded) Modifier.fillMaxSize() else {
@@ -1106,6 +1112,7 @@ private fun ProjectedMediaPanel(
             },
             onRelease = { view -> view.surfaceTexture?.let(projection::hide) },
         )
+        if (settlingWindow) Box(Modifier.matchParentSize().background(Color.Black))
         error?.let { Text(it, color = White, textAlign = TextAlign.Center, modifier = Modifier.padding(18.dp)) }
         Box(
             Modifier.align(Alignment.TopEnd).padding(10.dp).size(38.dp).clip(CircleShape)
@@ -1127,7 +1134,7 @@ private fun ReceiverPhonePage(modifier: Modifier, dialer: String?, limited: Bool
         return
     }
     val projection = remember(context, dialer) { MediaCardProjection(context, dialer, dialer) }
-    DisposableEffect(projection) { onDispose { projection.close() } }
+    DisposableEffect(projection) { onDispose { projection.dispose() } }
     ProjectedMediaPanel(projection, modifier, expanded = true, onClose = close)
 }
 

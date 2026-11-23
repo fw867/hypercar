@@ -36,6 +36,7 @@ mod rtsp;
 mod resource_trace;
 mod rtsp_uri;
 mod screen;
+mod screen_qos;
 mod screen_write;
 mod video_queue;
 mod h264;

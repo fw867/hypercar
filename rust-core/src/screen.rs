@@ -41,6 +41,22 @@ use std::sync::Arc;
 
 pub(crate) mod keyframe;
 
+pub(crate) enum RecoveryAccessUnit { Sync, Parameters, Skip }
+
+/// While recovering a discontinuity, only configuration and a live random access unit are useful.
+pub(crate) fn recovery_access_unit(codec: VideoCodec, data: &[u8], origin: FrameOrigin) -> RecoveryAccessUnit {
+    let nals = annexb_nals(data);
+    if origin == FrameOrigin::Live && keyframe::sync_frame(codec, &nals).is_some() {
+        return RecoveryAccessUnit::Sync;
+    }
+    let is_parameter = |nal: &&[u8]| match codec {
+        VideoCodec::H264 => matches!(nal_type(nal), 7 | 8),
+        VideoCodec::Hevc => matches!(crate::hevc::nal_type(nal), Some(32..=34)),
+    };
+    if !nals.is_empty() && nals.iter().all(is_parameter) { RecoveryAccessUnit::Parameters }
+    else { RecoveryAccessUnit::Skip }
+}
+
 /** 消息头定长。 */
 const HEADER_LEN: usize = 128;
 /** opcode：密封视频帧。 */

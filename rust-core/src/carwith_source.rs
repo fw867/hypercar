@@ -166,6 +166,19 @@ pub(crate) fn replay(owner:u64) {
     }
 }
 
+pub(crate) fn request_fresh_video(owner: u64) {
+    let slot = SOURCE.lock();
+    if let Some(source) = slot.current.as_ref().filter(|source| source.owner == owner) {
+        let feed = source.feed.lock();
+        if let Some(tx) = &feed.target {
+            for (_, parameter) in &feed.parameters {
+                let _ = tx.send((parameter.clone(), FrameOrigin::Cached));
+            }
+        }
+        source.hub.request_keyframe();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
