@@ -6,6 +6,9 @@ import kotlin.math.roundToInt
 data class VideoEncodingPlan(val width: Int, val height: Int, val fps: Int, val densityDpi: Int) {
     val bitrate: Int get() = (width.toLong() * height * fps / 5).coerceIn(2_000_000L, 8_000_000L).toInt()
 
+    fun withReceiverMaxFps(limit: Int?): VideoEncodingPlan =
+        if (limit != null && limit in 1 until fps) copy(fps = limit) else this
+
     /** Keep native resolution first, then try aligned canvases with the same orientation and aspect. */
     fun encoderCandidates(): List<VideoEncodingPlan> = buildList {
         fun addRates(mode: VideoEncodingPlan) {

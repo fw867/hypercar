@@ -11,6 +11,9 @@ pub trait Codec: Send {
 type Factory = Box<dyn FnMut(VideoCodec,VideoCodec,(u32,u32),(u32,u32),u32,&[u8])->io::Result<Box<dyn Codec>> + Send>;
 pub struct Router {
     fit_oversize_display: bool,
+    requested_fps: u32,
+    display_max_fps: Option<u32>,
+    source_fps: Option<u32>,
     enabled:bool, fps:u32, factory:Factory, active:Option<Box<dyn Codec>>, failed:bool,
     output_size: Option<(u32,u32)>, target: Option<(u32,u32)>, input_codec: Option<VideoCodec>, vps: Vec<u8>,
     sps:Vec<u8>,pps:Vec<u8>,waiting:bool, submitted:u64,produced:u64,
@@ -21,7 +24,7 @@ pub struct Router {
     last_input:std::time::Instant,
 }
 impl Router {
-    pub fn new(enabled:bool,fps:u32,factory:Factory)->Self {Self {fit_oversize_display:false,output_size:None,target:None,input_codec:None,vps:vec![],origins:VecDeque::new(),enabled,fps,factory,active:None,failed:false,sps:vec![],pps:vec![],waiting:true,submitted:0,produced:0,progress:std::time::Instant::now(),last_input:std::time::Instant::now()}}
+    pub fn new(enabled:bool,fps:u32,factory:Factory)->Self {Self {fit_oversize_display:false,requested_fps:fps,display_max_fps:None,source_fps:None,output_size:None,target:None,input_codec:None,vps:vec![],origins:VecDeque::new(),enabled,fps,factory,active:None,failed:false,sps:vec![],pps:vec![],waiting:true,submitted:0,produced:0,progress:std::time::Instant::now(),last_input:std::time::Instant::now()}}
     pub fn for_carwith_profile(profile: Option<&str>, fps: u32, factory: Factory) -> Self {
         let mut router = Self::new(profile.is_some(), fps, factory);
         // CarWith's source is capped at 2560; any receiver may expose a larger display.
@@ -37,8 +40,23 @@ impl Router {
         self.sps.clear();
         self.pps.clear();
     }
-    pub fn set_target(&mut self, target: Option<(u32,u32)>) {
-        if self.target != target { self.reset(); self.target = target; } else { self.pause(); }
+    pub fn set_target(&mut self, target: Option<(u32,u32)>, max_fps: Option<u32>) {
+        if self.target != target || self.display_max_fps != max_fps {
+            self.reset();
+            self.target = target;
+            self.display_max_fps = max_fps;
+            self.fps = self.requested_fps.min(max_fps.unwrap_or(self.requested_fps));
+        } else { self.pause(); }
+    }
+
+    pub fn set_source_fps(&mut self, fps: Option<u32>) {
+        let was_over = self.needs_rate_conversion();
+        self.source_fps = fps;
+        if self.needs_rate_conversion() != was_over { self.reset(); }
+    }
+
+    fn needs_rate_conversion(&self) -> bool {
+        self.display_max_fps.is_some() && self.source_fps.is_none_or(|source| source > self.fps)
     }
     fn output_canvas(&self, source: (u32,u32)) -> (u32,u32) {
         self.target.filter(|&(w,h)| needs_stretch(source, (w,h)) ||
@@ -57,7 +75,9 @@ impl Router {
     fn fail(&mut self, error: impl std::fmt::Display) {
         self.pause();
         self.failed = true;
-        crate::emit_log(&format!("CARWITH-TRANSCODE: source passthrough fallback latched: {error}; request source IDR"));
+        let fallback = if self.needs_rate_conversion() { "source frame rate unconfirmed or exceeds maxFPS; withholding video" }
+            else { "source passthrough fallback latched" };
+        crate::emit_log(&format!("CARWITH-TRANSCODE: {fallback}: {error}; request source IDR"));
         crate::emit_force_keyframe();
     }
     pub fn poll(&mut self)->Vec<Unit> {
@@ -81,7 +101,7 @@ impl Router {
     }
     pub fn input(&mut self, hevc_allowed:bool, pts:u64,data:Vec<u8>,codec:VideoCodec,origin:FrameOrigin)->Vec<Unit> {
         // Keep an unsupported HEVC source tagged for ScreenSender's explicit session rejection.
-        if !self.enabled || (!hevc_allowed && (codec == VideoCodec::Hevc || self.target.is_none())) {
+        if !self.enabled || (!hevc_allowed && (codec == VideoCodec::Hevc || (self.target.is_none() && !self.needs_rate_conversion()))) {
             if self.input_codec.is_some() { self.reset(); }
             return vec![Unit { pts, data, codec, origin }];
         }
@@ -125,7 +145,7 @@ impl Router {
                 if let Some(source) = source {
                     let target = self.output_canvas(source);
                     let output = if hevc_allowed { VideoCodec::Hevc } else { VideoCodec::H264 };
-                    if codec != output || source != target {
+                    if codec != output || source != target || self.needs_rate_conversion() {
                         match (self.factory)(codec,output,source,target,self.fps,&configured) {
                             Ok(c) => {
                                 self.origins.clear(); self.active=Some(c); self.output_size=Some(target); self.submitted=0; self.produced=0;
@@ -151,6 +171,9 @@ impl Router {
                 self.waiting=false;self.submitted+=1;self.last_input=std::time::Instant::now();return self.poll();
             },Err(e)=>self.fail(e)}
         }
+        // Dropping arbitrary P pictures would corrupt references. If the phone
+        // exceeds the effective limit or omits its rate for a capped display, only paced output is valid.
+        if self.needs_rate_conversion() { return vec![]; }
         if self.waiting {
             if !idr {return vec![];}
             self.waiting=false;
@@ -227,7 +250,7 @@ pub fn hardware_factory()->Factory {Box::new(|codec,output,(w,h),(tw,th),fps,csd
             crate::screen::ScreenCipher::ChaCha(key), 2560, 744, false);
         sender.set_receiver_size((2736,800));
         let (mut router, opened) = router(true, false);
-        router.set_target(sender.receiver_size());
+        router.set_target(sender.receiver_size(), None);
         for (pts, origin, bytes) in [(1, FrameOrigin::Cached, avc_with_sps(SPS_744,true)), (2, FrameOrigin::Live, avc_with_sps(SPS_744,false))] {
             let frames = router.input(false, pts, bytes.clone(), VideoCodec::H264, origin);
             assert_eq!(frames.len(), 1);
@@ -252,16 +275,57 @@ pub fn hardware_factory()->Factory {Box::new(|codec,output,(w,h),(tw,th),fps,csd
         }
     }
     #[test]
+    fn unconfirmed_handset_rate_requires_pacing_for_any_declared_ceiling() {
+        for ceiling in [30, 60] {
+            let mut router = Router::new(true, 30, Box::new(|_, output, _, _, fps, _| {
+                assert_eq!(fps, 30);
+                Ok(Box::new(Fake { output, fail: false, pending: vec![] }))
+            }));
+            router.set_target(Some((1920, 1080)), Some(ceiling));
+            for (pts, idr) in [(1, true), (2, false), (3, false)] {
+                let output = router.input(false, pts, avc(idr), VideoCodec::H264, FrameOrigin::Live);
+                assert_eq!(output.len(), 1);
+                assert!(output[0].data.is_empty(), "the compressed picture bypassed the decoder");
+                assert_eq!(output[0].pts, pts);
+            }
+            router.set_source_fps(Some(30));
+            let frame = avc(true);
+            assert_eq!(router.input(false, 4, frame.clone(), VideoCodec::H264, FrameOrigin::Live)[0].data, frame);
+        }
+    }
+
+    #[test]
+    fn handset_above_receiver_limit_is_decoded_before_pacing_even_at_native_size() {
+        for failed in [false,true] {
+            let (mut router, opens) = router(true,failed);
+            router.set_target(Some((1920,1080)), Some(30));
+            router.set_source_fps(Some(30));
+            let frame = avc(true);
+            assert_eq!(router.input(false,1,frame.clone(),VideoCodec::H264, FrameOrigin::Live)[0].data,frame);
+            assert_eq!(opens.load(Ordering::SeqCst),0);
+            router.set_source_fps(Some(60));
+            for (pts, idr) in [(2,true),(3,false)] {
+                let frames = router.input(false,pts,avc(idr),VideoCodec::H264, FrameOrigin::Live);
+                assert_eq!(frames.len(),usize::from(!failed));
+                if !failed { assert!(frames[0].data.is_empty()); } // Fake decoder/encoder output
+            }
+            assert_eq!(opens.load(Ordering::SeqCst),1);
+            router.set_target(Some((1920,1080)), None);
+            assert_eq!(router.input(false,4,frame.clone(),VideoCodec::H264, FrameOrigin::Live)[0].data,frame);
+        }
+    }
+
+    #[test]
     fn stretch_encoder_uses_requested_frame_rate_for_avc_and_hevc() {
-        for fps in [30, 60] {
+        for fps in [12, 30, 60] {
             for hevc_allowed in [false, true] {
                 let codec = if hevc_allowed { VideoCodec::Hevc } else { VideoCodec::H264 };
-                let mut router = Router::new(true, fps, Box::new(move |input, output, source, target, rate, _| {
+                let mut router = Router::new(true, 60, Box::new(move |input, output, source, target, rate, _| {
                     assert_eq!((input, output, rate), (VideoCodec::H264, codec, fps));
                     assert_eq!((source, target), ((1920,720), (2736,800)));
                     Ok(Box::new(Fake { output, fail:false, pending:vec![] }))
                 }));
-                router.set_target(Some((2736,800)));
+                router.set_target(Some((2736,800)), Some(fps));
                 let output = router.input(hevc_allowed, 90, avc_with_sps(SPS_720,true), VideoCodec::H264, FrameOrigin::Cached);
                 assert_eq!(router.output_size(), Some((2736,800)));
                 assert_eq!((output[0].pts, output[0].codec, output[0].origin), (90, codec, FrameOrigin::Cached));
@@ -276,15 +340,15 @@ pub fn hardware_factory()->Factory {Box::new(|codec,output,(w,h),(tw,th),fps,csd
                 Box::new(|_, _, _, _, _, _| panic!("canvas negotiation should not start the codec")));
             for (source, display) in [((2560, 748), (2736, 800)), ((2560, 852), (2880, 960)),
                 ((748, 2560), (800, 2736))] {
-                router.set_target(Some(display));
+                router.set_target(Some(display), None);
                 assert_eq!(router.output_canvas(source), display, "{profile}");
             }
-            router.set_target(Some((2560, 748)));
+            router.set_target(Some((2560, 748)), None);
             assert_eq!(router.output_canvas((2500, 730)), (2500, 730));
         }
         let mut router = Router::for_carwith_profile(None, 60,
             Box::new(|_, _, _, _, _, _| panic!("canvas negotiation should not start the codec")));
-        router.set_target(Some((2736, 800)));
+        router.set_target(Some((2736, 800)), None);
         assert_eq!(router.output_canvas((2560, 748)), (2560, 748));
     }
     #[test]
@@ -297,7 +361,7 @@ pub fn hardware_factory()->Factory {Box::new(|codec,output,(w,h),(tw,th),fps,csd
                 assert_eq!((source, target), ((2560, 744), (2736, 800)));
                 Ok(Box::new(Fake { output, fail: false, pending: vec![] }))
             }));
-        router.set_target(Some((2736, 800)));
+        router.set_target(Some((2736, 800)), None);
         let frames = router.input(false, 90, avc_with_sps(SPS_744, true), VideoCodec::H264, FrameOrigin::Live);
         assert_eq!(router.output_size(), Some((2736, 800)));
         assert_eq!((frames[0].pts, frames[0].codec, frames[0].origin), (90, VideoCodec::H264, FrameOrigin::Live));
@@ -308,7 +372,7 @@ pub fn hardware_factory()->Factory {Box::new(|codec,output,(w,h),(tw,th),fps,csd
     fn self_drawn_source_never_starts_carwith_scaling_on_an_oversize_display() {
         let mut router = Router::for_carwith_profile(None, 60,
             Box::new(|_, _, _, _, _, _| panic!("self-drawn source must not create a CarWith codec")));
-        router.set_target(Some((2736, 800)));
+        router.set_target(Some((2736, 800)), None);
         let source = avc_with_sps(SPS_744, true);
         let frames = router.input(false, 91, source.clone(), VideoCodec::H264, FrameOrigin::Cached);
         assert_eq!(router.output_size(), None);
@@ -329,7 +393,7 @@ pub fn hardware_factory()->Factory {Box::new(|codec,output,(w,h),(tw,th),fps,csd
                     if fail_creation { Err(io::Error::other("unsupported display size")) }
                     else { Ok(Box::new(Fake { output, fail: true, pending: vec![] })) }
                 }));
-            router.set_target(Some((2736, 800)));
+            router.set_target(Some((2736, 800)), None);
             for pts in [92, 93] {
                 let source = avc_with_sps(SPS_744, true);
                 let frames = router.input(false, pts, source.clone(), VideoCodec::H264, FrameOrigin::Live);
@@ -350,7 +414,7 @@ pub fn hardware_factory()->Factory {Box::new(|codec,output,(w,h),(tw,th),fps,csd
     #[test]
     fn failed_avc_stretch_joins_split_parameters_to_source_idr() {
         let (mut router, opened) = router(true, true);
-        router.set_target(Some((2736,800)));
+        router.set_target(Some((2736,800)), None);
         let separate = avc(true);
         let idr_at = separate.len()-6;
         assert!(router.input(false, 8, separate[..idr_at].to_vec(), VideoCodec::H264, FrameOrigin::Cached).is_empty());
@@ -365,7 +429,7 @@ pub fn hardware_factory()->Factory {Box::new(|codec,output,(w,h),(tw,th),fps,csd
     #[test]
     fn forbidden_hevc_stays_tagged_for_transport_rejection() {
         let (mut router, opened) = router(true, false);
-        router.set_target(Some((2736,800)));
+        router.set_target(Some((2736,800)), None);
         let data = vec![0,0,0,1,0x26,1,0x80];
         let units = router.input(false, 10, data.clone(), VideoCodec::Hevc, FrameOrigin::Live);
         assert_eq!(units[0].codec, VideoCodec::Hevc);
@@ -388,7 +452,7 @@ pub fn hardware_factory()->Factory {Box::new(|codec,output,(w,h),(tw,th),fps,csd
                 count.fetch_add(1,Ordering::SeqCst);
                 Ok(Box::new(Fake{output:encoded,fail:false,pending:vec![]}))
             }));
-            r.set_target(Some(target));
+            r.set_target(Some(target), None);
             assert_eq!(r.input(true,1,data.clone(),VideoCodec::Hevc,FrameOrigin::Cached)[0].codec,VideoCodec::Hevc);
             assert_eq!(opened.load(Ordering::SeqCst),usize::from(target==(2400,1080)));
         }

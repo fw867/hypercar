@@ -120,11 +120,12 @@ pub async fn negotiate(
     factory: Arc<dyn SocketProvider>,
     touch_tx: mpsc::UnboundedSender<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
-    stop: Arc<Notify>,
+    shutdown: Arc<crate::shutdown::EngineShutdown>,
     screen_ready: tokio::sync::mpsc::Sender<crate::screen_session::ScreenCommand>,
     pending_cleanup: &mut Option<crate::negotiation_cleanup::NegotiationCleanup>,
     receiver_audio_generation: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<AirplayOutcome, String> {
+    let stop = shutdown.signal.clone();
     let mbux_media_compat = p.mbux_media_compat && !p.desktop_receiver;
     let spawn_control = |read, write| {
         let (control, inbound) = RtspChannel::spawn(read, write, None);
@@ -153,13 +154,19 @@ pub async fn negotiate(
     };
     // CarWith prewarms before pairing. Give its encoder INIT this receiver's
     // declaration as soon as we have it, even on the first uncached connection.
-    let early_carwith_display = p.carwith_display.as_ref().and_then(|requested| {
-        let display = if p.id9_screen_bootstrap { select_id9_display(&info) } else { select_display(&info) }?;
+    let early_connection = channel.trace_id();
+    let early_display = if p.id9_screen_bootstrap { select_id9_display(&info) } else { select_display(&info) };
+    let early_rate = early_display.and_then(|d| Some((uuid_text(d.get("uuid")), display_max_fps(d)?)));
+    let early_carwith_size = p.carwith_display.as_ref().zip(early_display).map(|(requested, display)| {
         let size = read_display_size(display);
-        if size.0 < 2 || size.1 < 2 { return None; }
-        requested.send_replace(size);
-        emit_log(&format!("CARWITH-SIZE: pre-SETUP /info display={}x{}", size.0, size.1));
-        Some(size)
+        let max_fps = early_rate.as_ref().map(|(_, fps)| *fps);
+        requested.send_modify(|d| {
+            if size.0 >= 2 && size.1 >= 2 { d.size = size; }
+            d.max_fps = max_fps;
+            d.confirmed = false;
+        });
+        emit_log(&format!("CARWITH-SIZE: pre-SETUP /info display={}x{} maxFPS={max_fps:?}", size.0, size.1));
+        size
     });
     let receiver_pk = info
         .get("pk")
@@ -323,10 +330,12 @@ pub async fn negotiate(
     let timing = TimingServer::start(control_local, |socket| factory.bind_timing_network(socket), p.pipeline.clone())
         .map_err(|e| format!("计时服务启动失败 ({control_local}): {e}"))?;
     let propose_buffered = p.proposes_buffered_media(shared_secret.is_some(), &info);
+    let cluster = crate::cluster_screen::Offer::prepare(&info, shared_secret.is_some(), p.mbux_screen_bootstrap);
     let (root, session_info, hevc_proposed, buffered_offered) = setup_and_read_info(
-        &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap, p.id9_screen_bootstrap, mbux_media_compat, p.bmw_capabilities, p.video_codec == "hevc", propose_buffered, Some(&mut *cleanup), p.wifi_mac_address.as_deref(),
+        &channel, &p.device_id, &p.device_name, timing.port, shared_secret.is_some(), info, p.mbux_screen_bootstrap, p.id9_screen_bootstrap, mbux_media_compat, p.bmw_capabilities, p.video_codec == "hevc", propose_buffered, Some(&mut *cleanup), p.wifi_mac_address.as_deref(), cluster,
     ).await?;
-    info = session_info;
+    let same_connection = early_connection == channel.trace_id();
+    info = session_info.value;
     let desktop = effective_desktop(p, &info);
     let id9_modes = p.id9_screen_bootstrap.then(|| {
         crate::modes::Modes::id9_initial(&info, p.enable_audio,
@@ -361,17 +370,35 @@ pub async fn negotiate(
             .unwrap_or(false);
     let display = if p.id9_screen_bootstrap { select_id9_display(&info) } else { select_display(&info) };
     let display_uuid = display.and_then(|d| uuid_text(d.get("uuid")));
+    if display.is_none() && info.get("displays").and_then(Value::as_array)
+        .is_some_and(|entries| entries.iter().any(|d| d.get("type").and_then(Value::as_int) == Some(111))) {
+        return Err("车机声明了副屏，但缺少可用主屏，已取消主屏 SETUP".into());
+    }
+    let mut limited_ui = crate::receiver_ui::LimitedUi::from_info(&info);
+    if let Some(initial) = limited_ui.update(&info) {
+        crate::emit_receiver_ui("setLimitedUI", initial);
+    }
     let area_source = display.filter(|d| d.get("viewAreas").and_then(Value::as_array).is_some()).unwrap_or(&info);
     crate::display_layout::log_declaration(area_source, display_uuid.as_deref(), emit_log);
     if p.id9_screen_bootstrap && display_uuid.is_none() {
         return Err("ID9 /info lacks a valid main display UUID/size; refusing guessed screen SETUP".into());
     }
     let (disp_w, disp_h) = display.map(read_display_size)
-        .or_else(|| early_carwith_display.filter(|_| info.get("displays").is_none()))
+        .or_else(|| early_carwith_size.filter(|_| same_connection && info.get("displays").is_none()))
         .unwrap_or((0, 0));
-    p.pipeline.lock().display_size = (disp_w >= 2 && disp_h >= 2).then_some((disp_w,disp_h));
+    let early_rate = early_rate.as_ref().filter(|_| same_connection).map(|(uuid, fps)| (uuid.as_deref(), *fps));
+    let max_fps = session_display_max_fps(&info, display, session_info.fresh, early_rate);
+    {
+        let mut pipeline = p.pipeline.lock();
+        pipeline.display_size = (disp_w >= 2 && disp_h >= 2).then_some((disp_w,disp_h));
+        pipeline.display_max_fps = max_fps;
+    }
     if let Some(requested) = &p.carwith_display {
-        if disp_w >= 2 && disp_h >= 2 { requested.send_replace((disp_w, disp_h)); }
+        requested.send_modify(|d| {
+            if disp_w >= 2 && disp_h >= 2 { d.size = (disp_w, disp_h); }
+            d.max_fps = max_fps;
+            d.confirmed = true;
+        });
     }
     // 车机能力位图：判断是否支持 HEVC 等能力，只能靠它（codec 由本机编码器决定）
     let car_features = info.get("features").and_then(Value::as_int).unwrap_or(0);
@@ -382,11 +409,15 @@ pub async fn negotiate(
 
     // The receiver defines the viewport ratio, not the phone's encoding workload.
     // Kotlin chooses a proportional capped canvas and reports the actual size before its first frame.
-    crate::emit_display_size(disp_w, disp_h);
+    crate::emit_display_size(disp_w, disp_h, max_fps);
     if let Some(layout) = crate::display_layout::read(area_source, disp_w, disp_h, display_uuid.as_deref()) {
         emit_log(&format!("DISPLAY: canvas={disp_w}x{disp_h} view={:?} safe={:?} drawOutside={}", layout.view,layout.safe,layout.draw_outside));
-        crate::emit_display_layout(disp_w,disp_h,&layout);
-        let _ = channel.view_areas.set(crate::display_layout::ViewAreas::new(area_source, disp_w, disp_h, display_uuid.as_deref()));
+        let negotiated = root.get("enabledFeatures").and_then(Value::as_array)
+            .is_some_and(|features| features.iter().any(|f| f.as_str() == Some("viewAreas")));
+        let areas = channel.view_areas.get_or_init(|| crate::display_layout::ViewAreas::new(
+            area_source, disp_w, disp_h, display_uuid.as_deref(), negotiated,
+            crate::display_layout::right_hand_drive(&info)));
+        areas.publish_initial(&layout);
     }
 
     // ---- 5. 事件通道 ----
@@ -413,7 +444,12 @@ pub async fn negotiate(
     let unborrow_control = Arc::downgrade(&channel);
     let rtsp_id = channel.trace_id();
     let reply_modes = modes.clone();
+    let main_screen_id = display_uuid.clone().unwrap_or_else(|| "6E4E3B31-0E5B-4A8F-9F1B-2C5D7E9A0C11".into());
+    let reply_display = main_screen_id.clone();
     let reply_owner = screen_owned.clone();
+    // Startup claims also update the pump gate. Track the last UI notification separately
+    // so a local regrant is published before the next incoming focus or page request.
+    let last_ui_owner = std::sync::atomic::AtomicBool::new(screen_owned.load(std::sync::atomic::Ordering::Acquire));
     let reply_pipeline=p.pipeline.clone();
     let event_trace = channel.id9_trace.get().cloned();
     let event_health = p.pipeline.clone();
@@ -430,11 +466,12 @@ pub async fn negotiate(
             });
         }
     });
-    let (event_channel, event_rx) = channel.spawn_event(ev_r, ev_w, Some(Arc::new(move |message| {
+    let apply_receiver_modes: crate::rtsp::CommandReply = Arc::new(move |message| {
         if !message.first_line.contains("/command") { return None; }
         let command = bplist::parse(&message.body).ok()?;
         let mut modes = reply_modes.lock();
-        if command.get("type").and_then(Value::as_str) == Some("requestUI") { modes.request_ui(); }
+        if command.get("type").and_then(Value::as_str) == Some("requestUI")
+            && crate::receiver_ui::main_target(&command, Some(&reply_display)) { modes.request_ui(); }
         let response = modes.response(&command, &reply_audio_generation);
         // Publish the Take/return to the pause gate before another task can observe the new modes.
         if let Some(taken) = response.as_ref().and_then(|reply| reply.receiver_audio_take) {
@@ -442,7 +479,8 @@ pub async fn negotiate(
         }
         let unborrow = audio_unborrow.as_ref().filter(|_| response.as_ref().is_some_and(|reply| reply.audio_unborrowed))
             .map(|generation| generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel).wrapping_add(1));
-        reply_owner.store(modes.screen_owned(), std::sync::atomic::Ordering::Release);
+        let screen_owned = modes.screen_owned();
+        reply_owner.store(screen_owned, std::sync::atomic::Ordering::Release);
         reply_buffered.publish_with_gate(&reply_audio, modes.audio_owned());
         if let Some(unborrow) = unborrow {
             emit_log(&format!("AUDIO-RESUME: RTSP#{rtsp_id} unborrow={unborrow} event=main_audio_returned monoNs={}", crate::timing::monotonic_nanos()));
@@ -458,8 +496,12 @@ pub async fn negotiate(
                 command.get("type").and_then(Value::as_str).unwrap_or("?"),modes.diagnostics(),response.as_ref().map_or(0, |r| r.body.len())));
         }
         drop(modes);
+        if last_ui_owner.swap(screen_owned, std::sync::atomic::Ordering::Relaxed) != screen_owned {
+            crate::emit_receiver_ui("screenOwned", serde_json::json!({"owned": screen_owned}));
+        }
         response.map(|reply| reply.body)
-    })), observe_event);
+    });
+    let (event_channel, event_rx) = channel.spawn_event(ev_r, ev_w, Some(apply_receiver_modes.clone()), observe_event);
 
     emit_log(&format!("AIRPLAY: 事件连接 RTSP#{} 建立，port={event_port}", event_channel.trace_id()));
     if let Some(trace) = channel.id9_trace.get() {
@@ -476,28 +518,37 @@ pub async fn negotiate(
     let wifi_iap = crate::wifi_iap2::WifiIap2::start(channel.clone(), &p.device_id, &p.device_name, &p.head_unit_profile, stop.clone());
     let wifi_iap_id = wifi_iap.id;
     p.pipeline.lock().wifi_id=wifi_iap_id;
-    keepalive.0.push(crate::wifi_iap2::spawn_control_ingress(control_inbound, wifi_iap_id, stop.clone()));
     let initially_owned=modes.lock().screen_owned();
     p.pipeline.lock().screen_owned=Some(initially_owned);
     let screen_session=Arc::new(crate::screen_session::ScreenSession {
-        control:channel.clone(), wifi_iap_id, factory:factory.clone(), params:p.clone(), shared:shared_secret,
+        control:channel.clone(), shutdown, wifi_iap_id, factory:factory.clone(), params:p.clone(), shared:shared_secret,
         software_receiver:p.desktop_receiver || !use_box_bootstrap(true, &info),
-        uuid:display_uuid.clone().unwrap_or_else(|| "6E4E3B31-0E5B-4A8F-9F1B-2C5D7E9A0C11".into()),
+        uuid:main_screen_id.clone(),
         hevc_allowed, keep_stats:keep_alive_stats, display:(disp_w,disp_h), owned:screen_owned.clone(),
-        commands:screen_ready,
+        commands:screen_ready, transport_failures:tokio::sync::watch::channel(None).0,
         bootstrap_event: if p.id9_screen_bootstrap { Some(event_for_bootstrap) } else { None },
         bootstrap_hids: if p.id9_screen_bootstrap { id9_hid_ids(&info, display_uuid.as_deref()) } else { Vec::new() },
         activated:std::sync::atomic::AtomicBool::new(false), resource_state:tokio::sync::Mutex::new(Default::default()),
     });
+    let cluster = crate::cluster_screen::Commands::new(&info, &root, screen_session.clone(), &mut keepalive.0);
+    let (control_ui_tx, control_ui_rx) = mpsc::unbounded_channel();
+    let current = screen_session.clone();
+    keepalive.0.push(crate::wifi_iap2::spawn_control_ingress(control_inbound, wifi_iap_id, stop.clone(), session_info.setup_accepted_at,
+        move || current.session_is_live(), control_ui_tx));
     keepalive.0.push(spawn_event_dispatcher(
         event_rx,
+        control_ui_rx,
+        apply_receiver_modes,
         channel.clone(),
+        cluster,
         wifi_iap_id,
         modes.clone(),
         p.screen_resource_lifecycle.then(|| screen_session.clone()),
         touch_tx,
         key_tx,
         crate::consumer_hid::ConsumerHid::for_session(wifi_iap_id, &info),
+        limited_ui,
+        Some(main_screen_id),
         // 触摸的「显示空间」分母，优先级：
         //  ① /info 报的显示器尺寸（真车会给真实值）
         //  ② `--touch-display` 手动指定（仅无有效上报时使用；历史 WinPlay 按窗口
@@ -884,7 +935,7 @@ mod shutdown_tests {
             captures
         });
         setup_and_read_info(&control, "phone", "test", 1234, true, Value::dict(vec![]),
-            false, true, false, true, false, true, None, None).await.unwrap();
+            false, true, false, true, false, true, None, None, None).await.unwrap();
         for (method, path, body) in [
             ("POST", "/command", crate::modes::Modes::initial().declaration()),
             ("SETUP", "/", build_screen_setup(42, "display")),
@@ -958,7 +1009,7 @@ mod shutdown_tests {
                     peer.write_all(&body).await.unwrap();
                 }
             });
-            setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![("model",Value::str(model))]),mbux,id9,false,bmw,false,false,None,mac).await.unwrap();
+            setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![("model",Value::str(model))]),mbux,id9,false,bmw,false,false,None,mac, None).await.unwrap();
             server.await.unwrap();
         }
     }
@@ -1049,7 +1100,7 @@ mod shutdown_tests {
             let body=bplist::encode(&Value::dict(vec![("model",Value::str("test"))]));
             peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: {}\r\n\r\n",info.cseq().unwrap(),body.len()).as_bytes()).await.unwrap();peer.write_all(&body).await.unwrap();
         });
-        let result=setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,true,true,false,None,None).await;
+        let result=setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,true,true,false,None,None, None).await;
         assert!(result.is_ok(),"{result:?}");assert!(!result.unwrap().2);server.await.unwrap();
     }
     #[tokio::test]
@@ -1078,14 +1129,72 @@ mod shutdown_tests {
             }
         });
         let (setup, info, _, offered) = setup_and_read_info(&channel,"phone","name",1234,true,early_info,
-            false,false,true,false,false,offer,None,None).await.unwrap();
+            false,false,true,false,false,offer,None,None, None).await.unwrap();
         receiver.await.unwrap();
         assert!(offered);
         let mut candidates = vec![AudioCodec::Aac];
-        prioritize_buffered_media(&info, &setup, &mut candidates);
+        prioritize_buffered_media(&info.value, &setup, &mut candidates);
         assert_eq!(candidates, [AudioCodec::BufferedAac, AudioCodec::Aac]);
     }
 
+    #[tokio::test]
+    async fn late_instrument_declaration_requires_an_accepted_offer_and_fresh_info() {
+        for (withdraw, peer_accepts, fresh_info) in [
+            (false, true, true), (false, false, true), (true, true, true), (false, true, false),
+        ] {
+            let screen = |kind,id| Value::dict(vec![("type", Value::int(kind)), ("uuid", Value::str(id)),
+                ("widthPixels", Value::int(800)), ("heightPixels", Value::int(480))]);
+            let cached = Value::dict(vec![("displays", Value::array(vec![
+                screen(110,"71c97aaf-48eb-4d9a-91b6-fdd5e39a94b5"), screen(111,"1af5fe8c-b86a-4ede-8d08-2e29f0240980")
+            ]))]);
+            let info = cached.clone();
+            let (channel, mut peer) = pair().await;
+            let receiver = tokio::spawn(async move {
+                let first = read_request(&mut peer).await;
+                let mut expected = bplist::parse(&first.body).unwrap();
+                assert!(expected.get("features").unwrap().as_array().unwrap().contains(&Value::str("altScreen")));
+                assert_eq!(expected.get("altScreenURLs"), Some(&Value::array(vec![Value::str(crate::cluster_screen::MAP_URL)])));
+                let accepted = if withdraw {
+                    peer.write_all(format!("RTSP/1.0 400 Bad Request\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n", first.cseq().unwrap()).as_bytes()).await.unwrap();
+                    let retry = read_request(&mut peer).await;
+                    assert_eq!(first.first_line, retry.first_line);
+                    let Value::Dict(fields) = &mut expected else { panic!() };
+                    fields.retain(|(k,_)| k.as_str() != Some("altScreenURLs"));
+                    let (_,Value::Array(features)) = fields.iter_mut().find(|(k,_)| k.as_str()==Some("features")).unwrap() else { panic!() };
+                    features.retain(|f| f.as_str()!=Some("altScreen"));
+                    assert_eq!(bplist::parse(&retry.body).unwrap(), expected);
+                    retry
+                } else { first };
+                let enabled = if peer_accepts { vec![Value::str("altScreen")] } else { vec![] };
+                let setup = Value::dict(vec![("enabledFeatures", Value::array(enabled))]);
+                for (i, body) in [setup, info].iter().enumerate() {
+                    let cseq = if i == 0 { accepted.cseq().unwrap() } else {
+                        let get = read_request(&mut peer).await;
+                        assert!(get.first_line.starts_with("GET /info "));
+                        get.cseq().unwrap()
+                    };
+                    if i == 1 && !fresh_info {
+                        let rejection = |seq| format!("RTSP/1.0 455 Method Not Valid in This State\r\nCSeq: {seq}\r\nContent-Length: 0\r\n\r\n");
+                        peer.write_all(rejection(cseq).as_bytes()).await.unwrap();
+                        for method in ["POST /info ", "GET /info "] {
+                            let next = read_request(&mut peer).await;
+                            assert!(next.first_line.starts_with(method));
+                            peer.write_all(rejection(next.cseq().unwrap()).as_bytes()).await.unwrap();
+                        }
+                        break;
+                    }
+                    let bytes = bplist::encode(body);
+                    peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Length: {}\r\n\r\n", bytes.len()).as_bytes()).await.unwrap();
+                    peer.write_all(&bytes).await.unwrap();
+                }
+            });
+            let previous = if fresh_info { Value::dict(vec![]) } else { cached };
+            setup_and_read_info(&channel,"phone","name",1234,true,previous,false,false,false,true,false,false,
+                None,None,Some(crate::cluster_screen::Offer::AwaitingDisplays)).await.unwrap();
+            receiver.await.unwrap();
+            assert_eq!(channel.cluster_display.get().is_some(), !withdraw && peer_accepts && fresh_info);
+        }
+    }
     #[tokio::test]
     async fn session_rejection_withdraws_buffered_offer_before_other_features() {
         let (channel, mut peer) = pair().await;
@@ -1109,7 +1218,7 @@ mod shutdown_tests {
                 peer.write_all(&body).await.unwrap();
             }
         });
-        let outcome = setup_and_read_info(&channel,"phone","name",1234,true,Value::dict(vec![]),false,true,false,true,true,true,None,None).await.unwrap();
+        let outcome = setup_and_read_info(&channel,"phone","name",1234,true,Value::dict(vec![]),false,true,false,true,true,true,None,None, None).await.unwrap();
         assert!(outcome.2, "HEVC offer survives the buffered-only retry");
         assert!(!outcome.3, "withdrawn buffered feature cannot select type103 later");
         server.await.unwrap();
@@ -1348,7 +1457,7 @@ mod shutdown_tests {
                 peer.write_all(format!("RTSP/1.0 {status} Denied\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n",request.cseq().unwrap()).as_bytes()).await.unwrap();
                 assert!(tokio::time::timeout(Duration::from_millis(50),peer.read(&mut [0u8;1])).await.is_err());
             });
-            assert!(setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,true,true,true,None,None).await.is_err());
+            assert!(setup_and_read_info(&control,"phone","name",1234,true,Value::dict(vec![]),false,true,false,true,true,true,None,None, None).await.is_err());
             server.await.unwrap();
         }
     }
@@ -1412,7 +1521,7 @@ mod shutdown_tests {
         let c=control.clone();
         let task=crate::callback_context::spawn(async move {
             let mut cleanup=crate::negotiation_cleanup::NegotiationCleanup::new(c.clone(),true);
-            let result=setup_and_read_info(&c,"phone","name",1234,true,Value::dict(vec![]),false,true,false,false,false,true,Some(&mut cleanup),None).await;
+            let result=setup_and_read_info(&c,"phone","name",1234,true,Value::dict(vec![]),false,true,false,false,false,true,Some(&mut cleanup),None, None).await;
             cleanup.finish().await;result
         });
         let setup=read_request(&mut peer).await;assert!(setup.first_line.starts_with("SETUP "));
@@ -1666,17 +1775,74 @@ mod id9_tests {
     }
 }
 
-/// BOX-OFF 的规则：`displays` 里先取 `type` 整数为 0 的一项，没有再用第一项。
-/// 宝马、奔驰、ID9 都走这里。没有 uuid 时调用方仍用原来的常量。
+/// Encoders here accept whole frames per second. Round a finite numeric ceiling down.
+pub(crate) fn display_max_fps(display: &Value) -> Option<u32> {
+    let n = match display.get("maxFPS")? {
+        Value::Int(n) => i32::try_from(*n).ok()?,
+        Value::Real(n) if n.is_finite() && *n >= 1.0 && *n <= f64::from(i32::MAX) => n.floor() as i32,
+        _ => return None,
+    };
+    (n > 0).then_some(n as u32)
+}
+
+fn session_display_max_fps(info: &Value, display: Option<&Value>, fresh: bool, early: Option<(Option<&str>, u32)>) -> Option<u32> {
+    // A failed /info can return a plist from a retired pairing socket. Only use the
+    // early declaration supplied by the owner of the current control connection.
+    if !fresh { return early.map(|(_, fps)| fps); }
+    if let Some(fps) = display.and_then(display_max_fps) { return Some(fps); }
+    let (early_uuid, fps) = early?;
+    if info.get("displays").is_none() { return Some(fps); }
+    let uuid = uuid_text(display?.get("uuid"))?;
+    early_uuid?.eq_ignore_ascii_case(&uuid).then_some(fps)
+}
+
+/// Preserve BOX-OFF's type-zero preference while keeping instruments out of the main stream.
 fn select_display(info: &Value) -> Option<&Value> {
     let displays = info.get("displays")?.as_array()?;
     displays.iter()
         .find(|display| display.get("type").and_then(Value::as_int) == Some(0))
-        .or_else(|| displays.first())
+        .or_else(|| displays.iter().find(|display| display.get("type").and_then(Value::as_int) != Some(111)))
 }
 
 #[cfg(test)]
 mod display_selection_tests {
+    #[test]
+    fn session_display_keeps_its_own_early_ceiling_until_a_valid_update() {
+        let early = Some((Some("MAIN"), 30));
+        for (id, cap, expected) in [
+            ("main", None, Some(30)),
+            ("main", Some(Value::str("invalid")), Some(30)),
+            ("main", Some(Value::int(24)), Some(24)),
+            ("other", None, None),
+            ("", None, None),
+        ] {
+            let mut fields = vec![("type", Value::int(110)), ("uuid", Value::str(id))];
+            if let Some(cap) = cap { fields.push(("maxFPS", cap)); }
+            let fresh = info(vec![Value::dict(fields)]);
+            assert_eq!(session_display_max_fps(&fresh, select_display(&fresh), true, early), expected, "{id}");
+            if expected == Some(30) {
+                assert_eq!(session_display_max_fps(&fresh, select_display(&fresh), true, None), None);
+            }
+        }
+        let prior = info(vec![Value::dict(vec![("uuid", Value::str("main")), ("maxFPS", Value::int(30))])]);
+        assert_eq!(session_display_max_fps(&prior, select_display(&prior), false, early), Some(30));
+        assert_eq!(session_display_max_fps(&prior, select_display(&prior), false, None), None);
+        assert_eq!(session_display_max_fps(&Value::dict(vec![]), None, true, early), Some(30));
+        assert_eq!(session_display_max_fps(&info(vec![]), None, true, early), None);
+    }
+
+    #[test]
+    fn selected_display_frame_limit_is_numeric_positive_and_local_to_main() {
+        let aux = Value::dict(vec![("type",Value::int(111)), ("maxFPS",Value::int(1))]);
+        for (value, expected) in [(Value::int(30),Some(30)), (Value::real(29.97),Some(29)),
+            (Value::int(-1),None), (Value::int(0),None), (Value::str("30"),None)] {
+            let main = Value::dict(vec![("type",Value::int(110)), ("maxFPS",value)]);
+            let info = info(vec![aux.clone(), main]);
+            assert_eq!(select_display(&info).and_then(display_max_fps),expected);
+        }
+        assert_eq!(display_max_fps(&Value::dict(vec![])),None);
+    }
+
     use super::*;
 
     fn display(uuid: &str, type_value: Option<i64>) -> Value {
@@ -1723,6 +1889,13 @@ mod display_selection_tests {
             build_screen_setup(42, selected_uuid(&parsed).as_deref().unwrap()),
             build_screen_setup(42, "first-type-zero"),
         );
+    }
+
+    #[test]
+    fn auxiliary_display_cannot_be_the_main_stream_target() {
+        let list = info(vec![display("instrument", Some(111)), display("main", Some(110))]);
+        assert_eq!(selected_uuid(&list).as_deref(), Some("main"));
+        assert!(select_display(&info(vec![display("instrument", Some(111))])).is_none());
     }
 
     #[test]
@@ -2183,8 +2356,8 @@ mod display_size_tests {
         let (read, write) = socket.into_split();
         let (channel, _) = RtspChannel::spawn(read, write, None);
         crate::auth_setup::run(&channel).await.unwrap();
-        let (_, info, _, _) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", "Test phone", 12345, true, Value::dict(vec![]), false, false, false, true, false, false, None, Some("06:12:34:56:78:90")).await.unwrap();
-        let display = &info.get("displays").unwrap().as_array().unwrap()[0];
+        let (_, info, _, _) = setup_and_read_info(&channel, "84:AE:DE:56:D3:76", "Test phone", 12345, true, Value::dict(vec![]), false, false, false, true, false, false, None, Some("06:12:34:56:78:90"), None).await.unwrap();
+        let display = &info.value.get("displays").unwrap().as_array().unwrap()[0];
         assert_eq!(uuid_text(display.get("uuid")).as_deref(), Some("actual-bmw-display"));
         assert_eq!(read_display_size(display), (2560, 744));
         activate_session(&channel, &crate::modes::Modes::initial().declaration(), &Arc::new(Mutex::new(crate::pipeline::Pipeline::new()))).await.unwrap();
@@ -2457,10 +2630,8 @@ async fn fetch_info(channel: &Arc<RtspChannel>) -> Result<Value, String> {
 const CONTROLLER_FEATURES: &[&str] = &[
     "uiContext",
     "viewAreas",
-    "cornerMasks",
     "focusTransfer",
     "h.264Level5.1",
-    "altScreen",
     "enhancedSiri",
     "hevc",
     "sessionManagement",
@@ -2510,7 +2681,7 @@ fn every_profile_proposes_hevc_only_when_effective_preference_allows_it() {
 #[test]
 fn bmw_capabilities_match_implemented_paths_and_hevc_is_opt_in() {
     let features = video_session_features(false, false, false, true, false);
-    for absent in ["hevc", "mainBuffered", "sessionManagement", "logTransfer", "vehicleStateProtocol"] {
+    for absent in ["hevc", "mainBuffered", "sessionManagement", "logTransfer", "vehicleStateProtocol", "altScreen"] {
         assert!(!features.iter().any(|f| f.as_str() == Some(absent)));
     }
     for present in ["uiContext", "viewAreas", "focusTransfer", "iAPChannel"] {
@@ -2603,11 +2774,19 @@ fn valid_station_mac(value: &str) -> Option<String> {
     Some(normalized)
 }
 
+#[derive(Debug)]
+struct SessionInfo {
+    value: Value,
+    fresh: bool,
+    setup_accepted_at: std::time::Instant,
+}
+
 async fn setup_and_read_info(
-    channel: &Arc<RtspChannel>, device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool, id9: bool, media_compat: bool, bmw: bool, prefer_hevc: bool, propose_buffered: bool, cleanup: Option<&mut crate::negotiation_cleanup::NegotiationCleanup>, network_mac: Option<&str>,
-) -> Result<(Value, Value, bool, bool), String> {
+    channel: &Arc<RtspChannel>, device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, previous_info: Value, mbux: bool, id9: bool, media_compat: bool, bmw: bool, prefer_hevc: bool, propose_buffered: bool, cleanup: Option<&mut crate::negotiation_cleanup::NegotiationCleanup>, network_mac: Option<&str>, cluster: Option<crate::cluster_screen::Offer>,
+) -> Result<(Value, SessionInfo, bool, bool), String> {
     emit_log(&format!("AIRPLAY: session device name={device_name}"));
     let mut buffered_offered = propose_buffered;
+    let mut cluster_offered = cluster.is_some();
     let mut request = bplist::parse(&build_session_setup(device_id, device_name, timing_port, encrypted, mbux, id9, media_compat)).map_err(|e|e.to_string())?;
     if let Value::Dict(fields) = &mut request {
         if bmw && !id9 && !mbux && use_box_bootstrap(true, &previous_info) {
@@ -2620,10 +2799,16 @@ async fn setup_and_read_info(
         }
         if let Some((_,features))=fields.iter_mut().find(|(key,_)|key.as_str()==Some("features")) {
             let mut offer = video_session_features(mbux,id9,media_compat,bmw,prefer_hevc);
+            if cluster_offered {
+                offer.push(Value::str("altScreen"));
+            }
             if buffered_offered {
                 offer.push(Value::str("mainBuffered"));
             }
             *features=Value::array(offer);
+        }
+        if cluster_offered {
+            fields.push((Value::str("altScreenURLs"), Value::array(vec![Value::str(crate::cluster_screen::MAP_URL)])));
         }
     }
     let body=bplist::encode(&request);
@@ -2644,10 +2829,13 @@ async fn setup_and_read_info(
     ).await?;
     // An explicit rejection has not created a session. Withdraw each offered feature
     // at most once, keeping the same URI and identity. Never replay an uncertain SETUP.
-    for (name, offered) in [("mainBuffered", &mut buffered_offered), ("hevc", &mut hevc_proposed)] {
+    for (name, offered) in [("altScreen", &mut cluster_offered), ("mainBuffered", &mut buffered_offered), ("hevc", &mut hevc_proposed)] {
         if !*offered || !matches!(reply.status(),400|406|415|451|456|461) { continue; }
         emit_log(&format!("AIRPLAY: session SETUP rejected status={}; retry without {name}",reply.status()));
         if let Value::Dict(fields)=&mut request {
+            if name == "altScreen" {
+                fields.retain(|(key, _)| key.as_str() != Some("altScreenURLs"));
+            }
             if let Some((_,Value::Array(offer)))=fields.iter_mut().find(|(key,_)|key.as_str()==Some("features")) {
                 offer.retain(|f| f.as_str() != Some(name));
             }
@@ -2684,7 +2872,17 @@ async fn setup_and_read_info(
     for line in media_info_latency_lines(channel.trace_id(), info_source, &info) {
         emit_log(&line);
     }
-    Ok((setup, info, hevc_proposed, buffered_offered))
+    if let Some(offer) = cluster.filter(|_| cluster_offered) {
+        let deferred = matches!(offer, crate::cluster_screen::Offer::AwaitingDisplays);
+        if info_source == "session_info" {
+            if let Some(display) = offer.resolve(&info, &setup) {
+                let _ = channel.cluster_display.set(display);
+            }
+        }
+        emit_log(&format!("CLUSTER: altScreen offered=true awaited_displays={deferred} info_source={info_source} confirmed={}",
+            channel.cluster_display.get().is_some()));
+    }
+    Ok((setup, SessionInfo { value: info, fresh: info_source == "session_info", setup_accepted_at: reply.received_at }, hevc_proposed, buffered_offered))
 }
 
 pub(crate) fn build_screen_setup(conn_id: i64, uuid: &str) -> Vec<u8> {
@@ -3249,13 +3447,18 @@ fn spawn_keepalive_loops(
 
 fn spawn_event_dispatcher(
     mut inbound: tokio::sync::mpsc::UnboundedReceiver<crate::rtsp::RtspMessage>,
+    mut control_ui: mpsc::UnboundedReceiver<crate::rtsp::RtspMessage>,
+    apply_receiver_modes: crate::rtsp::CommandReply,
     control: Arc<RtspChannel>,
+    cluster: crate::cluster_screen::Commands,
     wifi_iap_id: u64,
     modes: Arc<Mutex<crate::modes::Modes>>,
     screen_lifecycle: Option<Arc<crate::screen_session::ScreenSession>>,
     touch_tx: mpsc::UnboundedSender<TouchInput>,
     key_tx: mpsc::UnboundedSender<u32>,
     mut consumer_hid: crate::consumer_hid::ConsumerHid,
+    mut limited_ui: crate::receiver_ui::LimitedUi,
+    main_uuid: Option<String>,
     display_size: (u32, u32),
     touch_surface: TouchSurface,
     target_size: Arc<Mutex<(u32, u32)>>,
@@ -3263,6 +3466,15 @@ fn spawn_event_dispatcher(
 ) -> tokio::task::JoinHandle<()> {
     let mode_feedback = spawn_mode_feedback(control.clone(), stop.clone(), modes.clone(), screen_lifecycle.clone());
     crate::callback_context::spawn(async move {
+        // Dropping the event dispatcher (EOF, stop, or negotiation rollback) cancels
+        // any pending main-screen recovery along with the mode feedback worker.
+        let mut transport_worker = tokio::task::JoinSet::new();
+        if let Some(session) = screen_lifecycle.clone() {
+            let modes = modes.clone();
+            transport_worker.spawn(crate::callback_context::inherit(async move {
+                session.monitor_transport_failures(&modes).await;
+            }));
+        }
         let mut bad_commands = 0usize;
         let mut contact = TouchContact::Idle;
         let mut seen_commands: Vec<String> = Vec::new();
@@ -3270,11 +3482,17 @@ fn spawn_event_dispatcher(
         let mut touch_logged: u32 = 0;
         let mut last_touch_trace = None;
         let mut other_lines: u64 = 0;
+        let mut control_ui_open = true;
         loop {
-            let msg = tokio::select! {
+            let (msg, from_control) = tokio::select! {
                 _ = stop.notified() => return,
+                m = control_ui.recv(), if control_ui_open => match m {
+                    Some(m) if control.session_is_live() => (m, true),
+                    Some(_) => continue,
+                    None => { control_ui_open = false; continue; }
+                },
                 m = inbound.recv() => match m {
-                    Some(m) => m,
+                    Some(m) => (m, false),
                     None => {
                         crate::wifi_iap2::mark_ready(wifi_iap_id, false);
                         if crate::wifi_iap2::take_rtsp_end(wifi_iap_id) { emit_state("ended", control.end_detail(RtspEndCause::EventClosed)); }
@@ -3311,14 +3529,19 @@ fn spawn_event_dispatcher(
                 }
             };
             let cmd_type = command.get("type").and_then(Value::as_str).unwrap_or("");
+            // The event reader applies requestUI when answering. The control reader already
+            // sent its empty ACK, so apply the same screen arbitration once before dispatch.
+            if from_control && cmd_type == "requestUI" { apply_receiver_modes(&msg); }
             // 事件通道是「车机 → 手机」的唯一通道（触摸/HID/命令）。它是否在工作，
             // 现场只能靠日志判断，所以每类命令第一次出现时记一行（之后不刷屏）。
             if !seen_commands.iter().any(|c| c == cmd_type) {
                 if seen_commands.len() < 32 {
                     seen_commands.push(cmd_type.to_string());
                 }
-                emit_log(&format!("EVENT: 车机命令 type={cmd_type}（首次）"));
+                    let source = if from_control { "control" } else { "event" };
+                    emit_log(&format!("EVENT: 车机命令 type={cmd_type}（首次）source={source}"));
             }
+            if cluster.handle(cmd_type, &command) { continue; }
             match cmd_type {
                 "requestSiri" => {
                     let action=command.get("params").and_then(|v|v.get("siriAction")).or_else(||command.get("siriAction")).and_then(Value::as_int);
@@ -3332,6 +3555,22 @@ fn spawn_event_dispatcher(
                         emit_log("WIFI-IAP: missing/oversized params.data");
                     }
                 }
+                "setLimitedUI" => {
+                    if let Some(payload) = limited_ui.update(&command) {
+                        crate::emit_receiver_ui(cmd_type, payload);
+                    } else {
+                        emit_log("RECEIVER-UI: ignored setLimitedUI without a valid limit state");
+                    }
+                }
+                "accessoryGiveFocus" => {
+                    if crate::receiver_ui::main_target(&command, main_uuid.as_deref()) && modes.lock().screen_owned() {
+                        if let Some(payload) = crate::receiver_ui::focus(&command, display_size) {
+                            crate::emit_receiver_ui(cmd_type, payload);
+                        } else {
+                            emit_log("RECEIVER-UI: ignored invalid focus rectangle or heading");
+                        }
+                    }
+                }
                 kind if crate::rtsp::is_box_observation_command(kind) => {
                     // Match the box's observation-only branches. In particular stopUI
                     // is not a request to tear down video/Wi-Fi or change resource ownership.
@@ -3342,6 +3581,12 @@ fn spawn_event_dispatcher(
                 }
                 "requestUI" => {
                     log_ui_command(&command);
+                    if !crate::receiver_ui::main_target(&command, main_uuid.as_deref()) { continue; }
+                    if modes.lock().screen_owned() {
+                        if let Some(url) = crate::receiver_ui::destination(&command) {
+                            crate::emit_receiver_ui(cmd_type, serde_json::json!({"url": url}));
+                        }
+                    }
                     let _ = mode_feedback.send(Some(ModeFeedback::Snapshot));
                     crate::emit_force_keyframe();
                 }
@@ -3423,6 +3668,10 @@ fn spawn_event_dispatcher(
                     }
                 }
                 "forceKeyFrame" => {
+                    if !crate::receiver_ui::main_target(&command, main_uuid.as_deref()) {
+                        emit_log("EVENT: ignored forceKeyFrame for an unknown display");
+                        continue;
+                    }
                     emit_log("EVENT: 车机请求关键帧 forceKeyFrame → requestSyncFrame");
                     crate::emit_force_keyframe();
                 }
@@ -3821,6 +4070,7 @@ mod mbux_profile_tests {
                     assert_eq!(body.get("et").and_then(Value::as_int),if encrypted {None} else {Some(1)});
                     let features=body.get("features").unwrap().as_array().unwrap();
                     assert_eq!(features.len(),if mbux {1} else {CONTROLLER_FEATURES.len()});
+                    assert!(!features.contains(&Value::str("cornerMasks")));
                     if !mbux {
                         for capability in ["viewAreas","uiContext","focusTransfer","iAPChannel"] {
                             assert!(features.iter().any(|v|v.as_str()==Some(capability)));
@@ -3852,9 +4102,10 @@ mod mbux_profile_tests {
         let stable=|v:&Value|v.as_dict().unwrap().iter().filter(|(k,_)|
             !matches!(k.as_str(),Some("features"|"sessionUUID"|"sessionCorrelationUUID"))).cloned().collect::<Vec<_>>();
         assert_eq!(stable(&baseline),stable(&compat));
-        assert_eq!(session_features(false,false,false).len(),13);
-        assert_eq!(session_features(false,true,false).len(),12);
-        assert_eq!(features.len(),12);
+        let base = session_features(false,false,false);
+        assert!(!base.iter().any(|f| f.as_str()==Some("altScreen")));
+        assert_eq!(session_features(false,true,false).len(),base.len()-1);
+        assert_eq!(features.len(),base.len()-1);
     }
     #[test]
     fn id9_session_removes_only_hevc_and_preserves_other_profiles() {
@@ -3865,7 +4116,7 @@ mod mbux_profile_tests {
                 let expected: Vec<_> = baseline.get("features").unwrap().as_array().unwrap().iter()
                     .filter(|f| f.as_str() != Some("hevc")).cloned().collect();
                 assert_eq!(id9.get("features").unwrap().as_array().unwrap(), &expected);
-                assert_eq!(expected.len(), if mbux { 1 } else { 12 });
+                assert_eq!(expected.len(), if mbux { 1 } else { CONTROLLER_FEATURES.len()-1 });
                 // These two UUIDs intentionally change on every build of a session body.
                 let stable_fields = |v: &Value| v.as_dict().unwrap().iter()
                     .filter(|(k, _)| !matches!(k.as_str(), Some("features" | "sessionUUID" | "sessionCorrelationUUID")))

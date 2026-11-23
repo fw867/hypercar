@@ -3,6 +3,7 @@
 package io.github.hypercar.spike;
 
 import android.os.ParcelFileDescriptor;
+import android.os.SharedMemory;
 import android.view.Surface;
 import android.view.MotionEvent;
 
@@ -63,4 +64,7 @@ interface ISpikeShell {
     String consoleKey(int displayId, int keyCode, int metaState);
     String readDisplayImePolicy(int displayId);
 
+    /** Copy only the focused native AMap card's UID-owned layers into the caller's bounded RGBA buffer. */
+    int[] captureInstrumentMap(IBinder owner, int displayId, int width, int height,
+                               int maxWidth, int maxHeight, in SharedMemory pixels);
 }

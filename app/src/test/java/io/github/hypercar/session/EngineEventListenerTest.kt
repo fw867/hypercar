@@ -144,6 +144,8 @@ class EngineEventListenerTest {
         val screenSetupAccepted = mutableListOf<Long>()
         var stopped = false
         val audioTakes = mutableListOf<Boolean>()
+        val receiverUi = mutableListOf<String>()
+        var activeViewTargets = emptyList<Int>()
         var pending: (() -> Unit)? = null
         val target = object : RustCoreBridge.EventListener {
             override fun onState(state: String, detail: String) {
@@ -156,6 +158,10 @@ class EngineEventListenerTest {
                 if (state == "stopping") stopped = true
             }
             override fun onReceiverAudioTake(taken: Boolean) { audioTakes += taken }
+            override fun onReceiverUi(kind: String, payload: String) { receiverUi += kind }
+            override fun onViewAreaChoices(revision: Long, uuid: String, targets: IntArray) {
+                activeViewTargets = targets.toList()
+            }
             override fun onLog(line: String) {}
             override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {}
             override fun onNightMode(night: Boolean) {}
@@ -184,6 +190,13 @@ class EngineEventListenerTest {
         val current = EngineEventListener(gate, gate.begin(), target)
         current.onIap2Start(12, "phone", "phone", "audi_mib3")
         old.onReceiverAudioTake(true)
+        old.onReceiverUi("requestUI", """{"url":"maps:"}""")
+        current.onReceiverUi("setLimitedUI", """{"limitedUI":true}""")
+        old.onReceiverUi("screenOwned", """{"owned":false}""")
+        assertEquals(listOf("setLimitedUI"), receiverUi)
+        current.onViewAreaChoices(7L, "Main", intArrayOf(1, 3))
+        old.onViewAreaChoices(6L, "Main", intArrayOf())
+        assertEquals(listOf(1, 3), activeViewTargets)
         current.onReceiverAudioTake(true)
         old.onReceiverAudioTake(false)
         assertEquals(listOf(true), audioTakes)

@@ -4,6 +4,18 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class VideoEncodingPlanTest {
+    @Test fun receiverLimitAppliesToEveryEncoderCandidateWithoutRaisingOrReplacingUserPreference() {
+        val request = VideoEncodingPlan.fit(2736, 800, 60)
+        for (limit in listOf(1, 12, 24, 30, 45, 60, 120)) {
+            val capped = request.withReceiverMaxFps(limit)
+            assertEquals(minOf(limit, 60), capped.fps)
+            assertTrue(capped.encoderCandidates().all { it.fps <= limit })
+        }
+        assertEquals(request, request.withReceiverMaxFps(null))
+        assertEquals(request, request.withReceiverMaxFps(0))
+        assertEquals(60, request.fps)
+    }
+
     @Test fun rejectedBmwNativeModeCanFallBackToAvcSizeAndRate() {
         val requested = VideoEncodingPlan.fit(2736, 800, 60)
         val candidates = requested.encoderCandidates()

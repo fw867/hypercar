@@ -7,6 +7,19 @@ use crate::{airplay::{self,AirplayParams,SocketProvider},bplist::{self,Value},rt
 #[path = "setup_stream.rs"]
 pub(crate) mod setup_stream;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GrantedTransport {
+    pub revision: u64,
+    pub connection_id: u64,
+}
+
+pub(crate) struct TransportMonitor {
+    pub control: Arc<RtspChannel>,
+    pub shutdown: Arc<crate::shutdown::EngineShutdown>,
+    pub failures: tokio::sync::watch::Sender<Option<GrantedTransport>>,
+    pub connection_id: u64,
+}
+
 pub enum ScreenCommand {
     Install(ScreenSender),
     Pause(oneshot::Sender<()>),
@@ -15,6 +28,7 @@ pub enum ScreenCommand {
 
 pub struct ScreenSession {
     pub control: Arc<RtspChannel>,
+    pub(crate) shutdown: Arc<crate::shutdown::EngineShutdown>,
     pub wifi_iap_id: u64,
     pub factory: Arc<dyn SocketProvider>,
     pub params: AirplayParams,
@@ -29,11 +43,20 @@ pub struct ScreenSession {
     pub bootstrap_event: Option<Arc<RtspChannel>>,
     pub bootstrap_hids: Vec<Value>,
     pub activated: AtomicBool,
+    pub(crate) transport_failures: tokio::sync::watch::Sender<Option<GrantedTransport>>,
     pub(crate) resource_state: tokio::sync::Mutex<crate::screen_resource::ResourceStream>,
 }
 
 impl ScreenSession {
+    pub(crate) fn session_is_live(&self) -> bool {
+        !self.shutdown.requested() && self.control.session_is_live()
+    }
+
     pub async fn open(&self) -> Result<ScreenSender,String> {
+        self.open_while(|| true).await
+    }
+
+    pub(crate) async fn open_while(&self, current: impl Fn() -> bool) -> Result<ScreenSender,String> {
         let conn_id=airplay::random_positive_i64();
         let body=if self.params.mbux_screen_bootstrap {
             airplay::build_screen_setup_with_latency(conn_id,&self.uuid,100)
@@ -61,6 +84,7 @@ impl ScreenSession {
             Some(shared)=>ScreenCipher::ChaCha(airplay::stream_key(shared,conn_id as u64)),
             None=>{let (key,iv)=airplay::aes_stream_keys_zero(conn_id as u64);ScreenCipher::AesCtr(crate::crypto::Aes128CtrStream::new(&key,&iv))},
         };
+        if !current() { return Err("屏幕授权或会话已失效".into()); }
         let socket=self.factory.open_tcp(&self.params.car_ip,port,5000).ok_or_else(||format!("屏幕端口 {port} 连接失败"))?;
         let (_,write)=socket.into_split();
         let (w,h)=*self.params.encoder_size.lock();
@@ -70,6 +94,12 @@ impl ScreenSession {
         sender.attach_diagnostics(self.params.pipeline.clone(),conn_id as u64);
         if self.params.carwith_stretch { sender.set_display_target(self.display.0,self.display.1); }
         sender.set_ownership(self.owned.clone());
+        if self.params.screen_resource_lifecycle {
+            sender.transport_monitor = Some(TransportMonitor {
+                control: self.control.clone(), shutdown: self.shutdown.clone(),
+                failures: self.transport_failures.clone(), connection_id: conn_id as u64,
+            });
+        }
         crate::emit_log(&format!("AIRPLAY: 主屏 TCP 就绪 dataPort={port} connId={conn_id} source={w}x{h}; new cipher/config state"));
         if !(self.params.mbux_screen_bootstrap || self.params.id9_screen_bootstrap) || self.activated.load(std::sync::atomic::Ordering::Acquire) {
             crate::pipeline::activation(&self.params.pipeline, "VIDEO_CHANNEL_READY");

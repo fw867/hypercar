@@ -8,6 +8,8 @@ internal class DisplayOwnerLease<T>(
     private class Owner<T>(val token: T, val identity: Any, val unlink: () -> Unit)
     private var current: Owner<T>? = null
 
+    fun owns(token: T): Boolean = synchronized(lock) { current?.token == token }
+
     fun bind(token: T, link: (onDeath: () -> Unit) -> (() -> Unit)?): Boolean = synchronized(lock) {
         if (current?.token == token) return@synchronized true
         val identity = Any()

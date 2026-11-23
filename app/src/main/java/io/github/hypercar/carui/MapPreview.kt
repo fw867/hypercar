@@ -34,12 +34,28 @@ object MapPreview {
     private var cardSurface: Surface? = null
     private var width = 0
     private var height = 0
-    private var target: SurfaceTexture? = null
+    private class CardTarget(val texture: SurfaceTexture)
+    @Volatile private var visibleTarget: CardTarget? = null
+    @Volatile private var target: CardTarget? = null
     private var fullscreen = false
     private var stopped = true
     private var carMode = false
     private var presentation: MapPresentation? = null
     private val cardInput = MapCardInputState()
+    @Volatile private var clusterBinding: MapCardInputState.Binding? = null
+
+    /** Encoder thread. A resized/detached card invalidates an in-flight read immediately. */
+    internal fun clusterMap(w: Int, h: Int): android.graphics.Bitmap? {
+        val card = visibleTarget ?: return null
+        val binding = clusterBinding ?: return null
+        fun active() = card === visibleTarget && card === target && binding.source === card.texture &&
+            clusterBinding === binding && cardInput.accepts(binding)
+        if (!active()) return null
+        val image = SpikeShell.captureInstrumentMap(binding.displayId, binding.width, binding.height, w, h) ?: return null
+        if (active()) return image
+        image.recycle()
+        return null
+    }
     private data class CardTouch(val binding: MapCardInputState.Binding, val event: MotionEvent)
     private val cardTouches = Channel<CardTouch>(Channel.UNLIMITED)
     private val queuedTouches = java.util.concurrent.atomic.AtomicInteger()
@@ -54,6 +70,10 @@ object MapPreview {
                 try {
                     lock.withLock {
                         if (!cardInput.accepts(packet.binding)) return@withLock
+                        if (CarReceiverUi.state.value.limits.blockMapApp) {
+                            cancelInjectedTouch()
+                            return@withLock
+                        }
                         val action = packet.event.actionMasked
                         if (action == MotionEvent.ACTION_DOWN) cancelInjectedTouch()
                         else if (injectedTouch?.binding !== packet.binding) return@withLock
@@ -82,6 +102,10 @@ object MapPreview {
 
     internal fun acquireCardTouch(texture: SurfaceTexture): MapCardInputState.Binding? = cardInput.acquire(texture)
 
+    internal fun cancelCardGesture() {
+        scope.launch { lock.withLock { cancelInjectedTouch() } }
+    }
+
     internal fun forwardCardTouch(binding: MapCardInputState.Binding, event: MotionEvent, w: Int, h: Int) {
         if (!cardInput.accepts(binding) || w <= 0 || h <= 0) return
         // Skip excess intermediate moves if the shell is briefly slow; never drop gesture edges.
@@ -107,15 +131,17 @@ object MapPreview {
     }
 
     private fun clearCardInput() {
+        clusterBinding = null
         cardInput.clear()
         runCatching { cancelInjectedTouch() }
             .onFailure { HyperCarRepo.log("MAP-CARD-TOUCH: 取消手势失败 ${it.message}") }
     }
 
     private fun bindCardInput(nextPresentation: MapPresentation, w: Int, h: Int) {
-        val texture = target
+        val texture = target?.texture
         if (nextPresentation == MapPresentation.CARD && texture != null && !stopped && !fullscreen) {
             cardInput.bind(texture, displayId, w, h)
+            clusterBinding = cardInput.current.takeIf { carMode && activeProvider == MapProvider.AMAP }
         }
     }
     private fun displayName(provider: MapProvider) = "hypercar-map-${provider.id}"
@@ -138,10 +164,14 @@ object MapPreview {
     }
 
     fun attach(texture: SurfaceTexture, w: Int, h: Int) {
+        val card = CardTarget(texture)
+        visibleTarget = card
         scope.launch {
             lock.withLock {
+                if (visibleTarget !== card) return@withLock
                 val previous = cardSurface
-                target = texture
+                clearCardInput()
+                target = card
                 width = w
                 height = h
                 texture.setDefaultBufferSize(w, h)
@@ -155,9 +185,10 @@ object MapPreview {
     }
 
     fun detach(texture: SurfaceTexture) {
+        if (visibleTarget?.texture === texture) visibleTarget = null
         scope.launch {
             lock.withLock {
-                if (target === texture) {
+                if (target?.texture === texture) {
                     clearCardInput()
                     if (!fullscreen && displayId > 0) {
                         // Keep the task/navigation alive while the applications page hides the card.
@@ -329,7 +360,7 @@ object MapPreview {
 }
 
 @Composable
-fun MapPreviewView(modifier: Modifier = Modifier) {
+fun MapPreviewView(modifier: Modifier = Modifier, interactive: Boolean = true) {
     AndroidView(modifier = modifier, factory = { context ->
         MapPreview.init(context)
         TextureView(context).apply {
@@ -349,7 +380,7 @@ fun MapPreviewView(modifier: Modifier = Modifier) {
                 pendingUp = null
                 pendingBinding = null
             }
-            setOnClickListener { MapController.requestEnter() }
+            setOnClickListener { if (!CarReceiverUi.state.value.limits.blockMapApp) MapController.requestEnter() }
             contentDescription = "全屏地图"
             val confirmTap = Runnable {
                 val binding = pendingBinding
@@ -427,5 +458,5 @@ fun MapPreviewView(modifier: Modifier = Modifier) {
                 override fun onSurfaceTextureUpdated(texture: SurfaceTexture) = Unit
             }
         }
-    })
+    }, update = { it.isEnabled = interactive })
 }

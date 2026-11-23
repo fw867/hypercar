@@ -6,8 +6,18 @@ static NEXT: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct VideoFormat { pub width: u32, pub height: u32, pub codec: &'static str }
 
+#[derive(Clone, Debug)]
+pub(crate) struct MainVideoConnection {
+    pub id: u64,
+    pub resource_grant: Option<(std::sync::Arc<parking_lot::Mutex<crate::modes::Modes>>, u64)>,
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Pipeline {
+    pub video_requested_fps: u32,
+    pub display_max_fps: Option<u32>,
+    /// Main video frame writes per second in the most recent sampling window.
+    pub video_actual_fps: Option<f64>,
     pub display_size: Option<(u32,u32)>,
     pub video_format: Option<VideoFormat>,
     /// Dimensions in the current sender's last successfully written VideoConfig header.
@@ -28,6 +38,9 @@ pub struct Pipeline {
     pub video_stream: String,
     pub video_source_units: u64,
     pub video_frames_written: u64,
+    /// Current main connection with a completed video frame write. Telemetry totals span connections.
+    #[serde(skip)]
+    pub(crate) main_video_connection: Option<MainVideoConnection>,
     pub audio_ready: bool,
     pub audio_codec: String,
     pub main_audio_stream_type: Option<i64>,
@@ -43,6 +56,7 @@ pub struct Pipeline {
 }
 impl Pipeline {
     pub(crate) fn retire_video_tcp(&mut self) {
+        self.main_video_connection = None;
         if let Some(sample) = self.video_tcp.take() { self.retired_video_tcp = Some(sample); }
     }
 
@@ -86,16 +100,21 @@ impl Pipeline {
         if gaps.is_empty(){"none_observed_receiver_presentation_unconfirmed".into()}else{gaps.join(",")}
     }
     pub fn new() -> Self {
-        Self { display_size:None, video_format:None, screen_config_size:None, generation: NEXT.fetch_add(1,Ordering::Relaxed), snapshot_sequence:0, control_ready:false, control_trace_id:None, record_accepted:false, resources_accepted:false,
+        Self { video_requested_fps:0,display_max_fps:None,video_actual_fps:None,display_size:None, video_format:None, screen_config_size:None, generation: NEXT.fetch_add(1,Ordering::Relaxed), snapshot_sequence:0, control_ready:false, control_trace_id:None, record_accepted:false, resources_accepted:false,
             screen_setup_accepted:false,video_channel_ready:false,wifi_id:0,
             wifi_iap2:"WAIT_SESSION".into(),screen_owned:None,video_stream:"WAIT_SETUP".into(),
-            video_source_units:0,video_frames_written:0,audio_ready:false,audio_codec:String::new(),main_audio_stream_type:None,audio_kbps:0,audio_packets_written:0,
+            video_source_units:0,video_frames_written:0,main_video_connection:None,audio_ready:false,audio_codec:String::new(),main_audio_stream_type:None,audio_kbps:0,audio_packets_written:0,
             audio_signal_packets:0,ui_requests:0,screen_rebuilds:0,timing:Default::default(),video_tcp:None,retired_video_tcp:None }
     }
+    pub fn effective_fps(&self) -> u32 {
+        self.display_max_fps.unwrap_or(self.video_requested_fps).min(self.video_requested_fps)
+    }
     pub fn summary(&self) -> String {
-        format!("PIPELINE#{}: control={} record={} resources={} screen_setup={} video_tcp_ready={} wifi_iap2={} screen_phone={:?} video={} source_units={} tcp_frames={} audio_ready={} audio_codec={} audio_kbps={} rtp_packets={} signal_packets={} requestUI={} rebuilds={} timing=[{}] tcp=[{}] activation_gaps=[{}] receiver_display=unknown receiver_audio=unknown",
+        let declared = self.display_max_fps.map_or_else(|| "undeclared".into(), |fps| fps.to_string());
+        let actual = self.video_actual_fps.map_or_else(|| "pending".into(), |fps| format!("{fps:.1}"));
+        format!("PIPELINE#{}: control={} record={} resources={} screen_setup={} video_tcp_ready={} wifi_iap2={} screen_phone={:?} video={} source_units={} tcp_frames={} requested_fps={} declared_max_fps={declared} effective_fps={} actual_tcp_fps={actual} audio_ready={} audio_codec={} audio_kbps={} rtp_packets={} signal_packets={} requestUI={} rebuilds={} timing=[{}] tcp=[{}] activation_gaps=[{}] receiver_display=unknown receiver_audio=unknown",
             self.generation,self.control_ready,self.record_accepted,self.resources_accepted,self.screen_setup_accepted,self.video_channel_ready,self.wifi_iap2,self.screen_owned,self.video_stream,
-            self.video_source_units,self.video_frames_written,self.audio_ready,self.audio_codec,self.audio_kbps,self.audio_packets_written,
+            self.video_source_units,self.video_frames_written,self.video_requested_fps,self.effective_fps(),self.audio_ready,self.audio_codec,self.audio_kbps,self.audio_packets_written,
             self.audio_signal_packets,self.ui_requests,self.screen_rebuilds,self.timing.summary(),
             self.video_tcp.as_ref().map(|s|s.summary()).unwrap_or_else(||"not sampled".into()),self.activation_gaps())
     }

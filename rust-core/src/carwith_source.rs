@@ -14,7 +14,7 @@ struct Feed {
     target: Option<mpsc::UnboundedSender<(CarLifeEvent, FrameOrigin)>>,
     parameters: Vec<(u8, CarLifeEvent)>,
     gop: VecDeque<CarLifeEvent>, bytes: usize, since: Option<Instant>,
-    codec: Option<VideoCodec>, size: Option<(u32,u32)>,
+    codec: Option<VideoCodec>, size: Option<(u32,u32)>, source_fps: Option<u32>,
     formats: [Option<CarLifeEvent>;3], handshake: bool,
     media_rate: tokio::sync::watch::Sender<Option<u32>>,
     #[cfg(test)]
@@ -26,11 +26,12 @@ impl Feed {
         match &event {
             CarLifeEvent::SourceReset { cache_cleared } => {
                 self.clear_video(); self.parameters.clear(); self.codec=None;
-                self.size=None; self.formats=[None,None,None]; self.handshake=false;
+                self.size=None; self.source_fps=None; self.formats=[None,None,None]; self.handshake=false;
                 self.media_rate.send_replace(None);
                 if let Some(cleared) = cache_cleared { cleared.notify_one(); }
             }
             CarLifeEvent::Handshake => self.handshake=true,
+            CarLifeEvent::EncoderFrameRate(rate) => self.source_fps = Some(*rate),
             CarLifeEvent::EncoderResolution{width,height} => {
                 if self.size.is_some_and(|old|old!=(*width,*height)) {
                     self.clear_video(); self.parameters.clear();
@@ -93,6 +94,7 @@ impl Feed {
         if self.since.is_some_and(|at|at.elapsed()>MAX_GOP_AGE) {self.clear_video();}
         let Some(tx)=&self.target else {return;};
         let _=tx.send((CarLifeEvent::VideoReplay, FrameOrigin::Cached));
+        if let Some(rate)=self.source_fps {let _=tx.send((CarLifeEvent::EncoderFrameRate(rate), FrameOrigin::Cached));}
         if let Some((width,height))=self.size {let _=tx.send((CarLifeEvent::EncoderResolution{width,height}, FrameOrigin::Cached));}
         for (_,parameter) in &self.parameters {let _=tx.send((parameter.clone(), FrameOrigin::Cached));}
         for frame in &self.gop {let _=tx.send((frame.clone(), FrameOrigin::Cached));}
@@ -118,7 +120,8 @@ pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
     slot.current=None;slot.newest=owner;
     let stop=Arc::new(DialStop::default());
     // A missing declaration uses the prewarm fallback for INIT only.
-    let display=crate::carlife::DisplayRequest::new(if cfg.carwith_cached_canvas { (cfg.width,cfg.height) } else { (0,0) });
+    let display=crate::carlife::DisplayRequest::new(crate::carlife::ReceiverDisplay {
+        size: if cfg.carwith_cached_canvas { (cfg.width,cfg.height) } else { (0,0) }, ..Default::default() });
     let microphone=cfg.carwith_microphone.then(||Arc::new(crate::mic_probe::ProbeControl::for_carwith()));
     let config=CarLifeConfig{width:cfg.width,height:cfg.height,fps:cfg.carwith_fps(),bt_address:cfg.device_id.clone(),
         bt_name:"HyperCar".into(),navigation_updates:cfg.carwith_navigation_enabled,microphone:microphone.clone()};

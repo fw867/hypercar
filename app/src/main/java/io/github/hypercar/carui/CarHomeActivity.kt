@@ -8,6 +8,8 @@ import android.os.Bundle
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.MotionEvent
+import android.view.View
+import android.widget.FrameLayout
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -26,6 +28,7 @@ class CarHomeActivity : ComponentActivity() {
 
     private var downTime = 0L
     private var touchLogs = 0
+    private lateinit var focusAnchor: View
     /** 本 Activity 应所在的虚显 id（2026-10-31）。 */
     private var expectedDisplayId = -1
     private var displayListener: android.hardware.display.DisplayManager.DisplayListener? = null
@@ -69,11 +72,31 @@ class CarHomeActivity : ComponentActivity() {
                 }
             }
         }
+        // Compose reuses its current focus when the host already has focus. Temporarily move
+        // focus outside the Compose tree so its spatial search starts at the receiver's rectangle.
+        focusAnchor = View(this).apply {
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            isFocusable = false
+        }
+        addContentView(focusAnchor, FrameLayout.LayoutParams(1, 1))
         instance = this
         HyperCarRepo.log(
             "CARUI: CarHomeActivity onCreate display=${display?.displayId} " +
                 "mode=${display?.mode?.physicalWidth}x${display?.mode?.physicalHeight}",
         )
+    }
+
+    internal fun transferFocus(host: View, request: ReceiverFocus): Boolean {
+        if (host.width <= 0 || host.height <= 0 || !host.isAttachedToWindow) return false
+        val box = request.onCanvas(host.width, host.height)
+        focusAnchor.isFocusableInTouchMode = true
+        return try {
+            focusAnchor.requestFocus() && host.requestFocus(request.direction,
+                android.graphics.Rect(box.x, box.y, box.right, box.bottom))
+        } finally {
+            focusAnchor.isFocusableInTouchMode = false
+            focusAnchor.isFocusable = false
+        }
     }
 
     override fun onResume() {

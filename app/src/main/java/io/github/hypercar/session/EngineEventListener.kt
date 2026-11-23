@@ -24,6 +24,7 @@ internal class EngineEventListener(
     override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) =
         deliver { target.onStats(fps, frames, kbps, audioPlaying, ducking) }
     override fun onNightMode(night: Boolean) = deliver { target.onNightMode(night) }
+    override fun onReceiverUi(kind: String, payload: String) = deliver { target.onReceiverUi(kind, payload) }
     override fun onMediaKey(usage: Int) = deliver { target.onMediaKey(usage) }
     // Native holds its modes lock. The target orders this event with pause/retirement on the
     // separate audio lock and rechecks owner there; never wait for general callback delivery here.
@@ -38,11 +39,14 @@ internal class EngineEventListener(
     }
     override fun onForceKeyFrame() = deliver { target.onForceKeyFrame() }
     override fun onVideoCapabilities(hevcAllowed: Boolean) = deliver { target.onVideoCapabilities(hevcAllowed) }
-    override fun onDisplaySize(width: Int, height: Int) = deliver { target.onDisplaySize(width, height) }
+    override fun onDisplaySize(width: Int, height: Int, maxFps: Int) = deliver { target.onDisplaySize(width, height, maxFps) }
+    override fun onViewAreaChoices(revision: Long, uuid: String, targets: IntArray) =
+        deliver { target.onViewAreaChoices(revision, uuid, targets) }
     override fun onDisplayLayout(width: Int, height: Int, viewX: Int, viewY: Int, viewWidth: Int, viewHeight: Int,
-        safeX: Int, safeY: Int, safeWidth: Int, safeHeight: Int, drawOutside: Boolean) = deliver {
+        safeX: Int, safeY: Int, safeWidth: Int, safeHeight: Int, drawOutside: Boolean,
+        statusBarEdge: Int, rightHandDrive: Boolean, allowsFocus: Boolean) = deliver {
         target.onDisplayLayout(width, height, viewX, viewY, viewWidth, viewHeight,
-            safeX, safeY, safeWidth, safeHeight, drawOutside)
+            safeX, safeY, safeWidth, safeHeight, drawOutside, statusBarEdge, rightHandDrive, allowsFocus)
     }
     override fun onIap2Start(id: Long, deviceId: String, deviceName: String, profileId: String) =
         deliver { target.onIap2Start(id, deviceId, deviceName, profileId) }

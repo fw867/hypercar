@@ -366,6 +366,37 @@ class SpikeShellService : ISpikeShell.Stub {
 
     override fun readDisplayImePolicy(displayId: Int): String = ShellDisplayIme.read(displayId)
 
+    override fun captureInstrumentMap(owner: IBinder, displayId: Int, width: Int, height: Int,
+                                      maxWidth: Int, maxHeight: Int, pixels: android.os.SharedMemory?): IntArray? {
+        if (pixels == null) return null
+        return pixels.use { memory ->
+            val ctx = appContext ?: return null
+            val serviceUid = android.os.Process.myUid()
+            if ((serviceUid != 2000 && serviceUid != 0) || ctx.packageName != io.github.hypercar.BuildConfig.APPLICATION_ID ||
+                android.os.Binder.getCallingUid() != ctx.applicationInfo.uid || displayId <= 0) return null
+            val identity = android.os.Binder.clearCallingIdentity()
+            try {
+                val (vd, surface) = synchronized(lock) {
+                    val vd = displays[displayId] ?: return null
+                    vd to (vd.surface ?: return null)
+                }
+                ShellInstrumentMap.capture(ctx, displayId, width, height, maxWidth, maxHeight, memory) {
+                    synchronized(lock) {
+                        val size = displaySizes[displayId]
+                        val actual = android.graphics.Point()
+                        vd.display.getRealSize(actual)
+                        owner.isBinderAlive && displayLease.owns(owner) && displays[displayId] === vd &&
+                            vd.display.isValid && vd.display.name == "hypercar-map-amap" && vd.surface === surface &&
+                            surface.isValid && size?.first == width && size.second == height &&
+                            actual.x == width && actual.y == height
+                    }
+                }
+            } catch (_: Exception) { null }
+            catch (_: LinkageError) { null }
+            finally { android.os.Binder.restoreCallingIdentity(identity) }
+        }
+    }
+
     override fun inputState(): String {
         val ok = ensureInput()
         return if (ok) "OK inject=${injectMethod != null} displayId=${setDisplayIdMethod != null}"

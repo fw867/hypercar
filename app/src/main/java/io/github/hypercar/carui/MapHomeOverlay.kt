@@ -30,6 +30,7 @@ internal class MapHomeOverlay(
     private val scope = CoroutineScope(Dispatchers.Default)
     private lateinit var placement: MapButtonPlacement
     private var previouslyShown = false
+    @Volatile private var focused: MapControl? = null
 
     @Synchronized fun attach(withReset: Boolean) {
         placement = MapButtonPlacement(CarDisplayLayout.contentBounds(width, height), withReset,
@@ -62,6 +63,13 @@ internal class MapHomeOverlay(
                 val size = bounds.width.toFloat()
                 paint.color = 0xCF171B24.toInt()
                 canvas.drawRoundRect(0f, 0f, size, size, size * .25f, size * .25f, paint)
+                if (focused == control) {
+                    paint.style = Paint.Style.STROKE
+                    paint.color = Color.WHITE
+                    paint.strokeWidth = 4f
+                    canvas.drawRoundRect(3f, 3f, size - 3f, size - 3f, size * .23f, size * .23f, paint)
+                    paint.style = Paint.Style.FILL
+                }
                 paint.color = Color.WHITE
                 if (control == MapControl.RESET) {
                     paint.textAlign = Paint.Align.CENTER
@@ -90,6 +98,41 @@ internal class MapHomeOverlay(
                 }
             }
         } finally { bitmap.recycle() }
+    }
+
+    @Synchronized fun giveFocus(request: ReceiverFocus): Boolean {
+        if (closed || !::placement.isInitialized) return false
+        focused = request.target(placement.layout.buttons, width, height) ?: return false
+        install(placement.layout)
+        peek(hold = true)
+        return true
+    }
+
+    @Synchronized fun key(key: CarConsoleKey, activate: (MapControl) -> Unit): Boolean {
+        val selected = focused ?: return false
+        if (closed) return false
+        val buttons = placement.layout.buttons.keys.toList()
+        when (key) {
+            CarConsoleKey.SELECT -> if (selected in input?.drawn.orEmpty()) activate(selected)
+            CarConsoleKey.NEXT, CarConsoleKey.DOWN, CarConsoleKey.PREVIOUS, CarConsoleKey.UP -> {
+                val step = if (key == CarConsoleKey.NEXT || key == CarConsoleKey.DOWN) 1 else -1
+                focused = buttons[(buttons.indexOf(selected) + step).coerceIn(buttons.indices)]
+                install(placement.layout)
+                peek(hold = true)
+            }
+            else -> {
+                clearFocus()
+                return false
+            }
+        }
+        return true
+    }
+
+    @Synchronized fun clearFocus() {
+        if (focused == null || closed) return
+        focused = null
+        install(placement.layout)
+        peek()
     }
 
     @Synchronized fun move(dx: Int, dy: Int, save: Boolean = false) {

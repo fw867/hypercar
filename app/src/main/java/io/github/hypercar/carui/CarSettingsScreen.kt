@@ -29,7 +29,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 @Composable
-fun CarSettingsPage(modifier: Modifier = Modifier, onBack: () -> Unit) {
+fun CarSettingsPage(modifier: Modifier = Modifier, musicListsAllowed: Boolean = true, onBack: () -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val installed = remember(context) { MusicApps.installed(context) }
     val maps = MapApps.installed(context)
@@ -86,13 +86,13 @@ fun CarSettingsPage(modifier: Modifier = Modifier, onBack: () -> Unit) {
 
         Spacer(Modifier.height(14.dp))
         SettingsGroup("音乐") {
-            MusicDefaultRow(
+            if (musicListsAllowed) MusicDefaultRow(
                 installed = installed,
                 current = CarUiSettings.defaultMusicPackage,
                 expanded = musicPicker,
                 onToggle = { musicPicker = !musicPicker },
             )
-            if (musicPicker) {
+            if (musicPicker && musicListsAllowed) {
                 Spacer(Modifier.height(8.dp))
                 installed.forEach { app ->
                     Row(

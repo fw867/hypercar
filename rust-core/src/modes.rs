@@ -45,11 +45,8 @@ impl Resource {
     }
     fn take_by(&mut self, actor: i64, priority: i64, take: i64, borrow: i64) -> bool {
         let other = 3 - actor;
-        let other_borrowed = self.current == other && self.permanent == actor;
-        if other_borrowed && !Self::allowed(priority, self.unborrow) { return false; }
-        if !other_borrowed && (self.current != actor || self.permanent != actor) {
-            if !Self::allowed(priority, self.take) { return false; }
-        }
+        if self.current == other && self.borrows > 0 && !Self::allowed(priority, self.unborrow) { return false; }
+        if self.permanent != actor && !Self::allowed(priority, self.take) { return false; }
         *self = Self::owned(actor, take, borrow);
         true
     }
@@ -70,6 +67,13 @@ impl Resource {
             Some(3) => {
                 if value.get("takeConstraint").is_some() || value.get("borrowConstraint").is_some() { return false; }
                 let (Some(priority), Some(unborrow)) = (priority(value), constraint(value, "unborrowConstraint")) else { return false; };
+                // The box records one temporary screen borrow even after the car has taken
+                // permanent ownership. A repeated request replaces its return constraint.
+                if self.permanent == actor && self.current == actor && resource_id(value) == Some(0) {
+                    self.borrows = 1;
+                    self.unborrow = unborrow;
+                    return true;
+                }
                 if self.current == actor && self.permanent == other {
                     self.borrows = self.borrows.saturating_add(1);
                     return true;
@@ -83,9 +87,9 @@ impl Resource {
             }
             Some(4) => {
                 if !release_fields_empty(value) { return false; }
-                if self.current == actor && self.permanent == other {
+                if self.current == actor && self.borrows > 0 {
                     self.borrows = self.borrows.saturating_sub(1);
-                    if self.borrows == 0 { self.current = other; self.unborrow = ANYTIME; }
+                    if self.borrows == 0 { self.current = self.permanent; self.unborrow = ANYTIME; }
                 } else if self.current == other && self.permanent == actor { return false; }
                 true
             }
@@ -304,7 +308,7 @@ impl Modes {
                         *r = Resource::owned(2, optional_constraint(v, "takeConstraint")?, optional_constraint(v, "borrowConstraint")?);
                         if id == 0 { screen = ScreenFields::ownership(v); }
                     }
-                    3 => if r.permanent != 2 {
+                    3 => if id == 0 || r.permanent != 2 {
                         r.current = 2; r.borrows = 1; r.unborrow = optional_constraint(v, "unborrowConstraint")?;
                         if id == 0 { screen.current = true; screen.unborrow = v.get("unborrowConstraint").is_some(); }
                     },
@@ -670,6 +674,61 @@ mod tests {
         } }
         let modes=Modes::from_info(&info,true,true);
         assert!(!modes.audio_owned()); assert_eq!(modes.speech,0);
+    }
+
+    fn camera_borrow(unborrow: i64) -> Value {
+        Value::dict(vec![("resourceID", Value::int(1)), ("transferType", Value::int(3)),
+            ("transferPriority", Value::int(USER_INITIATED)), ("unborrowConstraint", Value::int(unborrow))])
+    }
+
+    #[test]
+    fn camera_borrow_after_receiver_take_updates_one_lease_and_returns_success() {
+        let mut modes = Modes::initial();
+        let take = Value::dict(vec![("resourceID", Value::int(1)), ("transferType", Value::int(1)),
+            ("transferPriority", Value::int(USER_INITIATED)), ("takeConstraint", Value::int(USER_INITIATED)),
+            ("borrowConstraint", Value::int(ANYTIME))]);
+        assert!(modes.change(&Value::dict(vec![("resources", Value::array(vec![take]))])));
+        let grant = modes.screen_grant_generation();
+        let snapshot = modes.snapshot();
+        for constraint in [ANYTIME, NEVER, NEVER] {
+            let params = Value::dict(vec![("resources", Value::array(vec![camera_borrow(constraint)]))]);
+            let command = Value::dict(vec![("type", Value::str("changeModes")), ("params", params)]);
+            let reply = modes.response(&command, &Default::default()).unwrap();
+            let body = bplist::parse(&reply.body).unwrap();
+            assert_eq!(integer(&body, "status"), Some(0));
+            assert_eq!(body.get("params"), Some(&snapshot));
+            assert_eq!(modes.resources[0].borrows, 1);
+            assert_eq!(modes.resources[0].unborrow, constraint);
+        }
+        modes.request_ui();
+        assert!(!modes.claim_startup_screen());
+        assert_eq!(modes.snapshot(), snapshot);
+        assert!(modes.change(&change(1, 4)));
+        assert_eq!(modes.resources[0].borrows, 0);
+        assert_eq!(modes.resources[0].unborrow, ANYTIME);
+        assert_eq!(modes.snapshot(), snapshot);
+        assert_eq!(modes.screen_grant_generation(), grant);
+        modes.request_ui();
+        assert!(modes.screen_owned());
+    }
+
+    #[test]
+    fn initial_camera_borrow_respects_both_permanent_and_temporary_constraints() {
+        for (take, unborrow) in [(USER_INITIATED, NEVER), (NEVER, ANYTIME)] {
+            let owner = Value::dict(vec![("resourceID", Value::int(1)), ("permanentEntity", Value::int(2)),
+                ("takeConstraint", Value::int(take))]);
+            let info = Value::dict(vec![("modes", Value::dict(vec![
+                ("initialPermanentEntity", Value::array(vec![owner])),
+                ("resources", Value::array(vec![camera_borrow(unborrow)])),
+            ]))]);
+            let mut modes = Modes::from_info(&info, true, true);
+            assert_eq!(modes.resources[0].borrows, 1);
+            modes.request_ui();
+            assert!(!modes.screen_owned());
+            assert!(modes.change(&change(1, 4)));
+            modes.request_ui();
+            assert_eq!(modes.screen_owned(), take == USER_INITIATED);
+        }
     }
 
     #[test] fn borrowing_screen_preserves_permanent_owner_and_audio() {

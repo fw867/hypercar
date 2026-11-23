@@ -3,16 +3,48 @@
 use std::sync::{Arc, atomic::Ordering};
 use std::time::Duration;
 use parking_lot::Mutex;
-use crate::{bplist::{self, Value}, modes::Modes, screen_session::{ScreenSession, ScreenCommand}};
+use crate::{bplist::{self, Value}, modes::Modes, screen_session::{GrantedTransport, ScreenSession, ScreenCommand}};
 
 #[derive(Default)]
 pub(crate) struct ResourceStream {
     negotiated: bool,
     ever_installed: bool,
-    revision: Option<u64>,
+    installed: Option<GrantedTransport>,
+    auto_retry_revision: Option<u64>,
 }
 
 impl ScreenSession {
+    pub(crate) async fn monitor_transport_failures(&self, modes: &Arc<Mutex<Modes>>) {
+        let mut failures = self.transport_failures.subscribe();
+        loop {
+            let failure = *failures.borrow_and_update();
+            if let Some(transport) = failure {
+                let mut state = self.resource_state.lock().await;
+                let revision = transport.revision;
+                if self.activated.load(Ordering::Acquire) && self.session_is_live()
+                    && state.installed == Some(transport) && state.auto_retry_revision != Some(revision)
+                    && modes.lock().can_restore_screen(revision)
+                {
+                    // A replacement that immediately fails must not create an autonomous loop.
+                    // Explicit receiver/UI reconciliation stays available after this attempt.
+                    state.auto_retry_revision = Some(revision);
+                    crate::emit_log(&format!("SCREEN-LIFECYCLE: main TCP failed; one screen-only retry revision={revision} connId={}", transport.connection_id));
+                    let result = async {
+                        self.release_resource_stream(&mut state).await?;
+                        if self.session_is_live() && modes.lock().can_restore_screen(revision) {
+                            self.establish_resource_stream(&mut state, modes, revision, true).await?;
+                        }
+                        Ok::<(),String>(())
+                    }.await;
+                    if let Err(error) = result {
+                        self.params.pipeline.lock().video_stream = "FAILED".into();
+                        crate::emit_log(&format!("SCREEN-LIFECYCLE: main TCP retry failed revision={revision}: {error}"));
+                    }
+                }
+            }
+            if failures.changed().await.is_err() { return; }
+        }
+    }
     /// Match the MGU box's post-handoff initial Take, without replaying a receiver decision.
     /// The caller has completed RECORD/resources but has not activated screen reconciliation.
     pub async fn claim_box_startup_screen(&self, modes: &Arc<Mutex<Modes>>, revision: u64) -> Result<(), String> {
@@ -109,12 +141,13 @@ impl ScreenSession {
         crate::emit_log(&format!("{label}: RECORD accepted; video installation now permitted"));
         if let Some(sender) = sender {
             let (done, installed) = tokio::sync::oneshot::channel();
+            let transport = sender.transport_for(revision);
             // The pump verifies both the latest grant and its revision after the network awaits.
             self.commands.send(ScreenCommand::InstallIfOwned {
                 sender, modes: modes.clone(), revision, reply: done,
             }).await.map_err(|_| "视频泵已退出".to_string())?;
             if installed.await.map_err(|_| "视频安装未确认".to_string())? {
-                state.revision = Some(revision);
+                state.installed = transport;
                 state.ever_installed = true;
                 crate::pipeline::activation(&self.params.pipeline, "VIDEO_CHANNEL_READY");
             } else {
@@ -142,7 +175,9 @@ impl ScreenSession {
         }).await.map_err(|_| "视频释放超时".to_string())?.map_err(str::to_string)?;
         // Pump acknowledgement follows socket drop. Never retain stale TCP samples as live facts.
         self.params.pipeline.lock().retire_video_tcp();
-        state.revision = None;
+        state.installed = None;
+        // Shutdown includes every still-negotiated stream in its own final TEARDOWN.
+        if !self.session_is_live() { return Ok(()); }
         if state.negotiated {
             let body = bplist::encode(&Value::dict(vec![("streams", Value::array(vec![Value::dict(vec![
                 ("type", Value::int(110)), ("uuid", Value::str(&self.uuid)),
@@ -162,11 +197,12 @@ impl ScreenSession {
         if !self.activated.load(Ordering::Acquire) { return Ok(()); }
         let mut state = self.resource_state.lock().await;
         loop {
+            if !self.session_is_live() { return Err("屏幕控制会话已结束".into()); }
             let (revision, owned, declaration, note) = {
                 let m = modes.lock();
                 (m.screen_grant_generation(), m.screen_owned(), m.declaration(), m.diagnostics())
             };
-            crate::emit_log(&format!("SCREEN-LIFECYCLE: reconcile {note} negotiated={} installed_revision={:?}", state.negotiated, state.revision));
+            crate::emit_log(&format!("SCREEN-LIFECYCLE: reconcile {note} negotiated={} installed={:?}", state.negotiated, state.installed));
             // This also publishes audio/app updates while video is awaiting screen ownership.
             let response = self.control.request("POST", "/command", &declaration, "application/x-apple-binary-plist", &[], Duration::from_secs(3)).await?;
             let business = bplist::parse(&response.body).ok().and_then(|v| v.get("status").and_then(Value::as_int));
@@ -176,7 +212,7 @@ impl ScreenSession {
             }
             if modes.lock().screen_grant_generation() != revision { continue; }
             let failed = self.params.pipeline.lock().video_stream == "FAILED";
-            if state.negotiated && (!owned || state.revision != Some(revision) || failed) {
+            if state.negotiated && (!owned || state.installed.map(|s|s.revision) != Some(revision) || failed) {
                 self.release_resource_stream(&mut state).await?;
                 // A grant arriving during TEARDOWN needs its own current declaration before SETUP.
                 if modes.lock().screen_grant_generation() != revision { continue; }
@@ -188,48 +224,52 @@ impl ScreenSession {
             }
             if state.negotiated { return Ok(()); }
             if !modes.lock().can_restore_screen(revision) { continue; }
-            self.params.pipeline.lock().video_stream = "REBUILDING".into();
             crate::emit_log(&format!("SCREEN-LIFECYCLE: SETUP after modes feedback revision={revision}"));
-            // Conservatively clean up even if SETUP succeeded but the local data socket failed.
-            state.negotiated = true;
-            let sender = match self.open().await {
-                Ok(sender) => sender,
-                Err(error) => {
-                    if let Err(cleanup) = self.release_resource_stream(&mut state).await {
-                        crate::emit_log(&format!("SCREEN-LIFECYCLE: partial SETUP cleanup failed: {cleanup}"));
-                    }
-                    return Err(error);
-                }
-            };
-            if !modes.lock().can_restore_screen(revision) {
-                drop(sender);
-                self.release_resource_stream(&mut state).await?;
-                continue;
-            }
-            // Validate again in the actual video pump: a queued install must not resurrect a
-            // stream from a superseded grant, even if the car has since returned the screen.
-            let (done, installed) = tokio::sync::oneshot::channel();
-            self.commands.send(ScreenCommand::InstallIfOwned {
-                sender, modes: modes.clone(), revision, reply: done,
-            }).await.map_err(|_| "视频泵已退出".to_string())?;
-            let accepted = installed.await.map_err(|_| "视频安装未确认".to_string())?;
-            if !accepted {
-                self.release_resource_stream(&mut state).await?;
-                continue;
-            }
-            state.revision = Some(revision);
-            if state.ever_installed { self.params.pipeline.lock().screen_rebuilds += 1; }
-            state.ever_installed = true;
-            crate::emit_log(&format!("SCREEN-LIFECYCLE: stream installed revision={revision}; fresh config/IDR requested; global RECORD retained"));
+            if !self.establish_resource_stream(&mut state, modes, revision, false).await? { continue; }
             // A change concurrent with installation must be reconciled even on the initial call.
             if modes.lock().screen_grant_generation() != revision { continue; }
             return Ok(());
         }
     }
+
+    async fn establish_resource_stream(&self, state: &mut ResourceStream, modes: &Arc<Mutex<Modes>>,
+        revision: u64, transport_retry: bool) -> Result<bool,String> {
+        let current = || self.session_is_live() && modes.lock().can_restore_screen(revision);
+        if !current() { return Ok(false); }
+        self.params.pipeline.lock().video_stream = "REBUILDING".into();
+        // SETUP may have allocated a stream even if its response or the local TCP dial failed.
+        state.negotiated = true;
+        let sender = match self.open_while(|| !transport_retry || current()).await {
+            Ok(sender) => sender,
+            Err(error) => {
+                if self.session_is_live() {
+                    self.release_resource_stream(state).await?;
+                }
+                return Err(error);
+            }
+        };
+        let transport = sender.transport_for(revision);
+        let accepted = if current() {
+            let (done, installed) = tokio::sync::oneshot::channel();
+            self.commands.send(ScreenCommand::InstallIfOwned {
+                sender, modes: modes.clone(), revision, reply: done,
+            }).await.map_err(|_| "视频泵已退出".to_string())?;
+            installed.await.map_err(|_| "视频安装未确认".to_string())?
+        } else { drop(sender); false };
+        if !accepted {
+            if self.session_is_live() { self.release_resource_stream(state).await?; }
+            return Ok(false);
+        }
+        state.installed = transport;
+        if state.ever_installed { self.params.pipeline.lock().screen_rebuilds += 1; }
+        state.ever_installed = true;
+        crate::emit_log(&format!("SCREEN-LIFECYCLE: stream installed revision={revision}; fresh config/IDR requested; global RECORD retained"));
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
     use tokio::{net::{TcpListener,TcpStream,UdpSocket},io::{AsyncReadExt,AsyncWriteExt},sync::{mpsc,Notify}};
@@ -243,7 +283,7 @@ mod tests {
         }
         fn open_udp(&self,_host:&str,_port:u16)->Option<UdpSocket> { None }
     }
-    async fn read(car:&mut TcpStream)->RtspMessage {
+    pub(crate) async fn read(car:&mut TcpStream)->RtspMessage {
         tokio::time::timeout(Duration::from_secs(2),async {
             let mut buffer=Vec::new();let mut chunk=[0;4096];
             loop {
@@ -253,7 +293,7 @@ mod tests {
             }
         }).await.unwrap()
     }
-    async fn reply(car:&mut TcpStream,message:&RtspMessage,status:u16,body:&[u8]) {
+    pub(crate) async fn reply(car:&mut TcpStream,message:&RtspMessage,status:u16,body:&[u8]) {
         car.write_all(format!("RTSP/1.0 {status} Reply\r\nCSeq: {}\r\nContent-Length: {}\r\n\r\n",message.cseq().unwrap(),body.len()).as_bytes()).await.unwrap();
         car.write_all(body).await.unwrap();
     }
@@ -263,13 +303,13 @@ mod tests {
             ("transferPriority",Value::int(500)),("unborrowConstraint",Value::int(unborrow)),
         ])]))])));
     }
-    struct Fixture {
-        session:Arc<ScreenSession>,modes:Arc<Mutex<Modes>>,car:TcpStream,video:TcpListener,
+    pub(crate) struct Fixture {
+        pub(crate) session:Arc<ScreenSession>,modes:Arc<Mutex<Modes>>,pub(crate) car:TcpStream,video:TcpListener,
         source:mpsc::UnboundedSender<SourceEvent>,pump:tokio::task::JoinHandle<()>,
     }
     impl Drop for Fixture {fn drop(&mut self) {self.pump.abort();}}
     impl Fixture {
-        async fn new(modes:Modes)->Self { Self::with_bootstrap(modes, false).await }
+        pub(crate) async fn new(modes:Modes)->Self { Self::with_bootstrap(modes, false).await }
         async fn with_bootstrap(modes:Modes, mbux:bool)->Self {
             let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
             let socket=TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
@@ -290,7 +330,7 @@ mod tests {
             let (commands,rx)=mpsc::channel(2);let (source,video_rx)=mpsc::unbounded_channel();
             let pump=tokio::spawn(video_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(PumpStat::default())),true,pipeline,rx,video_rx,None,30,None));
             let owned=Arc::new(AtomicBool::new(modes.screen_owned()));
-            let session=Arc::new(ScreenSession {control,wifi_iap_id:0,factory:Arc::new(Factory),params,shared:Some([9;32]),uuid:"screen-test".into(),
+            let session=Arc::new(ScreenSession {control,shutdown:Arc::new(crate::shutdown::EngineShutdown::new()),wifi_iap_id:0,factory:Arc::new(Factory),params,shared:Some([9;32]),uuid:"screen-test".into(),transport_failures:tokio::sync::watch::channel(None).0,
                 hevc_allowed:false,keep_stats:false,software_receiver:false,display:(1920,720),owned,commands,bootstrap_event:None,bootstrap_hids:Vec::new(),activated:AtomicBool::new(!mbux),resource_state:tokio::sync::Mutex::new(Default::default())});
             Self {session,modes:Arc::new(Mutex::new(modes)),car,video,source,pump}
         }
@@ -487,6 +527,123 @@ mod tests {
         assert!(msg.first_line.starts_with("POST /feedback "));
         reply(&mut f.car, &msg, 200, &[]).await;
         assert_eq!(task.await.unwrap().unwrap().status(), 200);
+    }
+
+    async fn streaming_for_recovery() -> (Fixture, TcpStream, u64, tokio::task::JoinHandle<()>) {
+        let mut f = Fixture::new(Modes::initial()).await;
+        let session = f.session.clone();
+        let modes = f.modes.clone();
+        let worker = tokio::spawn(async move { session.monitor_transport_failures(&modes).await });
+        let initial = f.reconcile();
+        f.modes_reply(1).await;
+        let setup = read(&mut f.car).await;
+        let (mut peer, id) = f.setup_reply(&setup).await;
+        initial.await.unwrap().unwrap();
+        f.video_frame(&mut peer, id).await;
+        (f, peer, id, worker)
+    }
+
+    fn reset_video_socket(peer: TcpStream) {
+        socket2::SockRef::from(&peer).set_linger(Some(Duration::ZERO)).unwrap();
+        drop(peer);
+    }
+
+    #[tokio::test]
+    async fn main_tcp_failure_recovers_once_per_grant_without_ui_or_audio_setup() {
+        let (mut f, peer, first, worker) = streaming_for_recovery().await;
+        reset_video_socket(peer);
+        f.source.send(SourceEvent::VideoFrame {pts_us:3000,data:vec![0,0,0,1,0x41,3]}).unwrap();
+        f.teardown_reply().await;
+        let setup = read(&mut f.car).await;
+        let (mut replacement, second) = f.setup_reply(&setup).await;
+        assert_ne!(first, second);
+        // The pump must have acknowledged installation before source delivery.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while f.session.params.pipeline.lock().screen_rebuilds != 1 { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        f.video_frame(&mut replacement, second).await;
+        reset_video_socket(replacement); // An idle sender will detect this on its keepAlive.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while f.session.params.pipeline.lock().video_stream != "FAILED" { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(150), read(&mut f.car)).await.is_err());
+        assert!(f.session.params.pipeline.lock().audio_ready);
+        verify_feedback(&mut f).await;
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_main_tcp_recovery_does_not_use_returned_grant_after_teardown() {
+        let (mut f, peer, _, worker) = streaming_for_recovery().await;
+        reset_video_socket(peer); // No source frames. Only the keepAlive can start recovery.
+        let teardown = read(&mut f.car).await;
+        assert!(teardown.first_line.starts_with("TEARDOWN "));
+        f.update(|m| { borrow(m,100); m.request_ui(); });
+        reply(&mut f.car,&teardown,200,&[]).await;
+        assert!(tokio::time::timeout(Duration::from_millis(150), read(&mut f.car)).await.is_err());
+        assert!(f.session.params.pipeline.lock().audio_ready);
+        verify_feedback(&mut f).await;
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn rejected_main_tcp_recovery_leaves_feedback_and_explicit_retry_available() {
+        let (mut f, peer, _, worker) = streaming_for_recovery().await;
+        reset_video_socket(peer);
+        f.teardown_reply().await;
+        let setup = read(&mut f.car).await;
+        assert!(setup.first_line.starts_with("SETUP "));
+        reply(&mut f.car,&setup,400,&[]).await;
+        f.teardown_reply().await;
+        verify_feedback(&mut f).await;
+        let retry = f.reconcile();
+        f.modes_reply(1).await;
+        let setup = read(&mut f.car).await;
+        let (mut peer, id) = f.setup_reply(&setup).await;
+        retry.await.unwrap().unwrap();
+        f.video_frame(&mut peer,id).await;
+        assert!(f.session.params.pipeline.lock().audio_ready);
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn receiver_session_teardown_during_main_tcp_recovery_prevents_new_setup() {
+        let (mut f, peer, _, worker) = streaming_for_recovery().await;
+        reset_video_socket(peer);
+        let teardown = read(&mut f.car).await;
+        assert!(teardown.first_line.starts_with("TEARDOWN "));
+        f.car.write_all(b"TEARDOWN / RTSP/1.0\r\nCSeq: 77\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+        reply(&mut f.car, &teardown, 200, &[]).await;
+        // The control reader may ACK the inbound TEARDOWN while its TCP socket is still open.
+        if let Ok(request) = tokio::time::timeout(Duration::from_millis(150), read(&mut f.car)).await {
+            assert_eq!(request.status(), 200);
+            assert!(tokio::time::timeout(Duration::from_millis(150), read(&mut f.car)).await.is_err());
+        }
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn main_tcp_recovery_rechecks_grant_and_engine_stop_before_dial() {
+        for stopped in [false, true] {
+            let (mut f, peer, _, worker) = streaming_for_recovery().await;
+            reset_video_socket(peer);
+            f.teardown_reply().await;
+            let setup = read(&mut f.car).await;
+            assert!(setup.first_line.starts_with("SETUP "));
+            if stopped { f.session.shutdown.request(true); }
+            else { f.update(|m| { borrow(m,100); m.request_ui(); }); }
+            let stream = Value::dict(vec![("type", Value::int(110)),
+                ("dataPort", Value::int(f.video.local_addr().unwrap().port() as i64))]);
+            reply(&mut f.car, &setup, 200, &bplist::encode(&Value::dict(vec![
+                ("streams", Value::array(vec![stream]))
+            ]))).await;
+            // A still-live session cleans the negotiated partial stream. During engine
+            // shutdown the ordinary final TEARDOWN owns it.
+            if !stopped { f.teardown_reply().await; }
+            assert!(tokio::time::timeout(Duration::from_millis(150),f.video.accept()).await.is_err());
+            assert_eq!(f.session.params.pipeline.lock().screen_rebuilds,0);
+            worker.abort();
+        }
     }
 
     #[tokio::test]
@@ -918,7 +1075,10 @@ mod tests {
         let task=f.reconcile();f.modes_reply(1).await;let setup=read(&mut f.car).await;
         let (mut peer,id)=f.setup_reply(&setup).await;task.await.unwrap().unwrap();
         f.video_frame(&mut peer,id).await;
+        let requested = AtomicBool::new(true);
+        assert_eq!(crate::cluster_screen::active_main_connection(&f.session,&requested), Some(id));
         f.update(|m|{borrow(m,100);m.request_ui();});
+        assert_eq!(crate::cluster_screen::active_main_connection(&f.session,&requested), None);
         // The dispatcher can see borrow+return faster than lifecycle cleanup runs. The old
         // active sender must still stop; merely seeing phone_owned=true again is insufficient.
         f.source.send(SourceEvent::VideoFrame {pts_us:3000,data:vec![0,0,0,1,0x41,3]}).unwrap();

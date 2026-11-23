@@ -167,6 +167,7 @@ object HyperCarRepo {
                 if (!sessionLive.get() || connectionAttemptId != attempt || sessionSockets !== sockets)
                     throw CancellationException("旧核心启动结果已失效")
                 val callbackOwner = engineCallbacks.begin()
+                io.github.hypercar.carui.CarReceiverUi.reset()
                 log("CORE-OWNER: start owner=$callbackOwner attempt=$attempt network=${sockets.network}")
                 val config = org.json.JSONObject(configure()).put("carwith_source_owner", attempt)
                 val stationMac = wifiStationSnapshot?.takeIf { it.first == attempt && it.second == sockets.network }?.third
@@ -1907,6 +1908,9 @@ object HyperCarRepo {
                     kotlinx.coroutines.currentCoroutineContext().ensureActive()
                     if (!sessionLive.get() || connectionAttemptId != diagnosticId || sessionSockets !== sockets) return
                     engineCallbacks.retire()
+                    SettingsStore.receiverMaxFps = null
+                    io.github.hypercar.carui.CarDisplayLayout.viewAreaChoices.value = null
+                    io.github.hypercar.carui.CarReceiverUi.reset()
                     // Stop only the failed media engine. Keep the same identity, Wi-Fi lease,
                     // RFCOMM session and ctrl listener/port alive for the receiver's next invite.
                     streaming = false
@@ -2077,6 +2081,9 @@ object HyperCarRepo {
     /** 释放保活服务、iAP2、Rust 和 WiFi 绑定；拆除与失败路径共用。 */
     private fun releaseSessionResources(keepListening: Boolean = false, graceful: Boolean = false) {
         engineCallbacks.retire()
+        SettingsStore.receiverMaxFps = null
+        io.github.hypercar.carui.CarDisplayLayout.viewAreaChoices.value = null
+        io.github.hypercar.carui.CarReceiverUi.reset()
         val advertised = announcedHotspot.getAndSet(null)
         val requestPeer = advertised?.second?.takeIf {
             it.applies(advertised.first, connectionAttemptId, iap2?.activePeerAddress, SettingsStore.targetCarMac) &&
@@ -3065,7 +3072,9 @@ object HyperCarRepo {
                 }
                 "negotiating" -> {
                     SettingsStore.receiverViewport = null
+                    SettingsStore.receiverMaxFps = null
                     io.github.hypercar.carui.CarDisplayLayout.state.value = null
+                    io.github.hypercar.carui.CarDisplayLayout.viewAreaChoices.value = null
                     push(link = LinkState.Negotiating(detail))
                 }
                 "connected" -> {
@@ -3170,7 +3179,7 @@ object HyperCarRepo {
             scope.launch {
                 val ctx = appContext() ?: return@launch
                 if (!sessionLive.get() || connectionAttemptId != attempt || !sessionCarWithMode) return@launch
-                val reason = if (startup) "源端 CMD 持续拒绝连接" else "车机画布迟到"
+                val reason = if (startup) "源端 CMD 持续拒绝连接" else "收到车机显示尺寸或帧率声明"
                 log("CARWITH-START: $reason，重新启动本机 CarWith 入口 attempt=$attempt")
                 log("CARWITH-START: attempt=$attempt " + launchCarWith(ctx, attempt))
             }
@@ -3180,7 +3189,8 @@ object HyperCarRepo {
             io.github.hypercar.carui.CarUiCaster.requestKeyFrame()
         }
 
-        override fun onDisplaySize(width: Int, height: Int) {
+        override fun onDisplaySize(width: Int, height: Int, maxFps: Int) {
+            SettingsStore.receiverMaxFps = maxFps.takeIf { it > 0 }
             SettingsStore.receiverViewport = (width to height).takeIf { width >= 320 && height >= 240 }
             if (sessionLive.get() && width in 320..8192 && height in 240..8192) {
                 // receiverForEngine froze the actual peer for this AirPlay session.
@@ -3190,18 +3200,32 @@ object HyperCarRepo {
             }
         }
 
+        override fun onViewAreaChoices(revision: Long, uuid: String, targets: IntArray) {
+            io.github.hypercar.carui.CarDisplayLayout.viewAreaChoices.value =
+                if (sessionLive.get() && !sessionCarWithMode && targets.isNotEmpty())
+                    io.github.hypercar.carui.CarDisplayLayout.ViewAreaChoices(revision, uuid, targets.toList())
+                else null
+        }
+
         override fun onDisplayLayout(width: Int, height: Int, viewX: Int, viewY: Int, viewWidth: Int, viewHeight: Int,
-                                     safeX: Int, safeY: Int, safeWidth: Int, safeHeight: Int, drawOutside: Boolean) {
+                                     safeX: Int, safeY: Int, safeWidth: Int, safeHeight: Int, drawOutside: Boolean,
+                                     statusBarEdge: Int, rightHandDrive: Boolean, allowsFocus: Boolean) {
+            if (!sessionCarWithMode) io.github.hypercar.carui.CarReceiverUi.setFocusTransferAllowed(allowsFocus)
             io.github.hypercar.carui.CarDisplayLayout.state.value = io.github.hypercar.carui.DisplayLayout(
                 width, height,
                 io.github.hypercar.carui.DisplayRect(viewX, viewY, viewWidth, viewHeight),
                 io.github.hypercar.carui.DisplayRect(safeX, safeY, safeWidth, safeHeight), drawOutside,
+                io.github.hypercar.carui.CarDockEdge.fromReceiver(statusBarEdge, rightHandDrive),
             )
         }
 
         override fun onNightMode(night: Boolean) {
             io.github.hypercar.carui.CarUiSettings.onCarNight(night)
             log("CARUI: 车机日夜模式 night=$night")
+        }
+
+        override fun onReceiverUi(kind: String, payload: String) {
+            if (!sessionCarWithMode) io.github.hypercar.carui.CarReceiverUi.handle(kind, payload)
         }
 
         override fun onMediaKey(usage: Int) {

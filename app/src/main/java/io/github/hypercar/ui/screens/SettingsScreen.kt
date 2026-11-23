@@ -1406,6 +1406,11 @@ private fun FpsSegment(fps: Int, onFpsChanged: (Int) -> Unit) {
             )
         }
     }
+    Text(
+        text = "所选帧率为目标值。车机声明的帧率上限更低时，以车机上限为准。",
+        style = MaterialTheme.typography.bodySmall,
+        color = TextSecondary,
+    )
 }
 
 /* ---------- 开关组 ---------- */

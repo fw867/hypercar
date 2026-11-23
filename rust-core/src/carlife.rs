@@ -155,7 +155,18 @@ pub struct CarLifeConfig {
 /// Authenticated seven-channel CarWith gateway with video/audio events and touch input.
 struct QueuedControl { bytes:Vec<u8>, expires:Option<std::time::Instant> }
 
-pub type DisplayRequest = tokio::sync::watch::Sender<(u32, u32)>;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReceiverDisplay {
+    pub size: (u32, u32),
+    pub max_fps: Option<u32>,
+    // A prepared encoder can use preliminary values for INIT. Delay its one permitted
+    // local reopen until the post-SETUP display selection has delivered both fields.
+    pub confirmed: bool,
+}
+impl ReceiverDisplay {
+    pub fn effective_fps(&self, requested: u32) -> u32 { self.max_fps.unwrap_or(requested).min(requested) }
+}
+pub type DisplayRequest = tokio::sync::watch::Sender<ReceiverDisplay>;
 
 /// Retirement persists across the gaps between the timer, the JNI callback and each dial.
 #[derive(Default)]
@@ -257,7 +268,7 @@ impl CarLifeHub {
         let (events, event_rx) = mpsc::unbounded_channel();
         let (touch_tx, mut touch_rx) = mpsc::unbounded_channel::<QueuedControl>();
         let encoder_size = Arc::new(Mutex::new((cfg.width.max(2),cfg.height.max(2))));
-        let requested = requested.unwrap_or_else(|| DisplayRequest::new((0,0)));
+        let requested = requested.unwrap_or_else(|| DisplayRequest::new(ReceiverDisplay::default()));
         let touch_state=Arc::new(Mutex::new(session::TouchGesture::default()));
         let round_touch=touch_state.clone();
         let queue = Arc::new(Mutex::new(Vec::<QueuedControl>::new()));
@@ -280,6 +291,7 @@ impl CarLifeHub {
             let mut throttle=DialLogThrottle::new();
             let mut startup_refusals = 0;
             let mut first_round_pending = true;
+            let mut can_reopen_display = true;
             loop {
                 // Own all seven sockets together. A failed/closed CMD invalidates the whole round.
                 let mut sockets=Vec::new();
@@ -349,7 +361,7 @@ impl CarLifeHub {
                     biased;
                     _=stop.cancelled()=>{children.shutdown().await; return;},
                     _=children.join_next()=>Err("CarWith media/control channel closed".into()),
-                    result=session::run(cmd,events_task.clone(),size.clone(),requested.clone(),config.clone(),state.clone(),reset_request.clone())=>result,
+                    result=session::run(cmd,events_task.clone(),size.clone(),requested.clone(),config.clone(),state.clone(),reset_request.clone(),can_reopen_display)=>result,
                 };
                 children.abort_all(); while children.join_next().await.is_some() {}
                 queue.lock().clear();
@@ -359,6 +371,7 @@ impl CarLifeHub {
                     // All producers for the old round have exited. Flush their queued events
                     // and the replay cache before letting a reattached engine see the waiting period.
                     if !wait_for_canvas_reopen(&events_task, &stop).await || stop.is_retired() { return; }
+                    can_reopen_display = false;
                     reopen_source(false);
                     continue;
                 }

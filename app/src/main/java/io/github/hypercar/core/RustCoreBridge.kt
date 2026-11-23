@@ -48,6 +48,7 @@ object RustCoreBridge {
 
         /** 车机日夜模式（AirPlay setNightMode）：true = 夜间。 */
         fun onNightMode(night: Boolean)
+        fun onReceiverUi(kind: String, payload: String) {}
         /** Consumer media usage, or a CarConsoleKey event when the projected source is the local UI. */
         fun onMediaKey(usage: Int) {}
         fun onReceiverAudioTake(taken: Boolean) {}
@@ -61,9 +62,11 @@ object RustCoreBridge {
 
         fun onVideoCapabilities(hevcAllowed: Boolean) {}
 
-        fun onDisplaySize(width: Int, height: Int) {}
+        fun onDisplaySize(width: Int, height: Int, maxFps: Int) {}
+        fun onViewAreaChoices(revision: Long, uuid: String, targets: IntArray) {}
         fun onDisplayLayout(width: Int, height: Int, viewX: Int, viewY: Int, viewWidth: Int, viewHeight: Int,
-                            safeX: Int, safeY: Int, safeWidth: Int, safeHeight: Int, drawOutside: Boolean) {}
+                            safeX: Int, safeY: Int, safeWidth: Int, safeHeight: Int, drawOutside: Boolean,
+                            statusBarEdge: Int, rightHandDrive: Boolean, allowsFocus: Boolean) {}
         fun onIap2Start(id: Long, deviceId: String, deviceName: String, profileId: String) {
             io.github.hypercar.iap2.WifiIap2Bridge.start(id, deviceId, deviceName, profileId)
         }
@@ -87,6 +90,11 @@ object RustCoreBridge {
     fun setTouchListener(listener: TouchListener?) = nativeSetTouchListener(listener)
 
     external fun nativeInitLogger()
+
+    fun clusterMapAvailable(w: Int, h: Int) = ClusterMapEncoder.available(w, h)
+    fun clusterMapCapable() = ClusterMapEncoder.capable()
+    fun openClusterMap(w: Int, h: Int, x: Int, y: Int, sw: Int, sh: Int, fps: Int): ClusterMapEncoder? =
+        ClusterMapEncoder.open(w, h, x, y, sw, sh, fps)
 
     /** JNI factory belongs to the stable bridge, independent of delegated session listeners. */
     fun createCarWithTranscoder(inputHevc: Boolean, outputHevc: Boolean, width: Int, height: Int, targetWidth: Int, targetHeight: Int, fps: Int, csd: ByteArray): CarWithHevcTranscoder =
@@ -125,6 +133,8 @@ object RustCoreBridge {
     external fun nativeSendIap2(id: Long, bytes: ByteArray, hudMessageId: Int, hudSerial: Long): Boolean
     external fun nativeWifiIap2PeerSyn(id: Long)
     external fun nativeSendWifiIap2Detect(id: Long): Boolean
+
+    external fun nativeRequestViewArea(revision: Long, uuid: String, target: Int): Boolean
 
     /** Request native head-unit UI without tearing down CarPlay or its audio route. */
     external fun nativeRequestHostUi(): Boolean

@@ -204,6 +204,7 @@ fn find_head_separator(buf: &[u8]) -> Option<usize> {
 /// - 入向请求（车机发来的 POST /command 等）：及时应答，非法 `/command` 回 400、未知命令回 501，
 ///   `/command` 的 body 经 [RtspChannel::inbound] 交给上层分发。
 pub struct RtspChannel {
+    pub(crate) cluster_display: std::sync::OnceLock<crate::cluster_screen::Display>,
     trace_id: u64,
     event_trace: Option<Arc<EventTrace>>,
     session_end: Arc<SessionEnd>,
@@ -327,6 +328,10 @@ impl Drop for TransactionGuard<'_> {
 }
 
 impl RtspChannel {
+    pub(crate) fn session_is_live(&self) -> bool {
+        !self.is_closed() && self.session_end.cause.get().is_none()
+    }
+
     pub(crate) fn end_detail(&self, fallback: RtspEndCause) -> &'static str {
         self.session_end.cause.get().copied().unwrap_or(fallback).detail()
     }
@@ -409,6 +414,7 @@ impl RtspChannel {
             session_uri,
             mbux_session,
             view_areas,
+            cluster_display: Default::default(),
             id9_trace: std::sync::OnceLock::new(),
             first_screen_cseq: std::sync::OnceLock::new(),
         });
@@ -919,9 +925,6 @@ async fn reader_loop(
                     }
                     continue;
                 }
-                if let (Ok(Some(layout)), Some(areas)) = (validation, view_areas.get()) {
-                    crate::emit_display_layout(areas.width, areas.height, layout);
-                }
                 let body = reply.as_ref().and_then(|f| f(&msg)).unwrap_or_default();
                 let ui_type = if msg.first_line.contains("/command") {
                     crate::bplist::parse(&msg.body).ok().and_then(|v| match v.get("type").and_then(crate::bplist::Value::as_str) {
@@ -1085,7 +1088,7 @@ mod tests {
         let cropped = Value::dict(vec![("widthPixels", Value::int(700)), ("heightPixels", Value::int(450)),
             ("safeArea", rect(20, 650))]);
         let info = Value::dict(vec![("viewAreas", Value::array(vec![rect(0, 800), cropped]))]);
-        let areas = ViewAreas::new(&info, 800, 480, Some("Main"));
+        let areas = ViewAreas::new(&info, 800, 480, Some("Main"), true, false);
         let event = |uuid, index| RtspMessage { received_at: std::time::Instant::now(), first_line: "POST /command RTSP/1.0".into(),
             headers: HashMap::new(), body: encode(&Value::dict(vec![("type", Value::str("updateViewArea")),
                 ("params", Value::dict(vec![("uuid", Value::str(uuid)), ("viewAreaIndex", Value::int(index))]))])) };

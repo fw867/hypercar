@@ -24,13 +24,14 @@ object MapController {
     private val transitions = Mutex()
 
     private var appContext: Context? = null
-    private var homeCaster: SpikeCaster? = null
+    @Volatile private var homeCaster: SpikeCaster? = null
     private var mapCaster: SpikeCaster? = null
     @Volatile private var mapOverlay: MapHomeOverlay? = null
     @Volatile private var imeDiagnostics: MapImeDiagnostics? = null
     private var mapDisplayId = -1
     internal val fullscreenDisplayId: Int get() = if (mapActive) mapDisplayId else -1
-    private var entering = false
+    @Volatile private var fullscreenRequested = false
+    internal val fullscreenInputActive get() = mapActive && fullscreenRequested
 
     @Volatile
     var mapActive: Boolean = false
@@ -51,6 +52,9 @@ object MapController {
         Thread(r, "carui-map-touch").apply { isDaemon = true }
     }
     private var lastMoveInjectAt = 0L
+    // Accessed only by touchExecutor, including cancellation on a receiver limit change.
+    private var injectedDownAt: Long? = null
+    private var injectedDisplay = -1
 
     suspend fun init(context: Context, home: SpikeCaster) = transitions.withLock {
         appContext = context.applicationContext
@@ -67,27 +71,22 @@ object MapController {
     }
 
     fun requestEnter() {
-        if (mapActive || entering) return
-        entering = true
-        val expectedHome = homeCaster
+        val expectedHome = homeCaster ?: return
+        fullscreenRequested = true
         scope.launch {
-            try {
-                transitions.withLock {
-                    if (expectedHome != null && homeCaster === expectedHome)
-                        HyperCarRepo.log("CARUI-MAP: ${enter()}")
-                }
-            } finally {
-                entering = false
+            transitions.withLock {
+                if (fullscreenRequested && !mapActive && homeCaster === expectedHome)
+                    HyperCarRepo.log("CARUI-MAP: ${enter()}")
             }
         }
     }
 
     fun requestExit() {
-        if (!mapActive) return
-        val expectedCaster = mapCaster
+        val expectedHome = homeCaster ?: return
+        fullscreenRequested = false
         scope.launch {
             transitions.withLock {
-                if (expectedCaster != null && mapCaster === expectedCaster)
+                if (!fullscreenRequested && mapActive && homeCaster === expectedHome)
                     HyperCarRepo.log("CARUI-MAP: ${exit()}")
             }
         }
@@ -99,7 +98,7 @@ object MapController {
         val home = homeCaster ?: return "home caster 不在"
         val provider = MapApps.selected(ctx) ?: return "请在手机安装高德地图或百度地图"
 
-        val c = SpikeCaster(width = W, height = H, fps = CarUiCaster.plan.fps, bitrate = CarUiCaster.plan.bitrate, tag = "CARUI-MAP", preferredCodec = home.actualCodec)
+        val c = SpikeCaster(width = W, height = H, fps = CarUiCaster.plan.fps, bitrate = CarUiCaster.plan.bitrate, tag = "CARUI-MAP", preferredCodec = home.actualCodec, receiverRateLimited = home.receiverRateLimited)
         mapCaster = c
         c.setPushing(false)
         try {
@@ -173,6 +172,20 @@ object MapController {
         mapCaster?.requestSyncFrame()
     }
 
+    internal fun transferFocus(request: ReceiverFocus): Boolean = mapOverlay?.giveFocus(request) == true
+
+    internal fun cancelMapGesture() {
+        MapPreview.cancelCardGesture()
+        touchExecutor.execute {
+            injectedDownAt?.let { inject(injectedDisplay, 3, 0, 0, it) }
+        }
+    }
+
+    internal fun overlayKey(key: CarConsoleKey): Boolean {
+        val caster = mapCaster ?: return false
+        return mapOverlay?.key(key) { control -> requestControl(caster, control) } == true
+    }
+
     private fun requestControl(caster: SpikeCaster, action: MapControl) {
         scope.launch {
             transitions.withLock {
@@ -209,6 +222,7 @@ object MapController {
                 pressedOverlay?.cancelDrag()
                 val overlay = mapOverlay
                 val input = overlay?.input
+                overlay?.clearFocus()
                 pressedControl = input?.visible(caster, x, y)
                 wakingControl = pressedControl == null && input?.slot(caster, x, y) != null
                 pressedOverlay = overlay.takeIf { pressedControl != null }
@@ -304,7 +318,15 @@ object MapController {
     }
 
     private fun inject(displayId: Int, action: Int, x: Int, y: Int, downTimeMs: Long) {
+        if (CarReceiverUi.state.value.limits.blockMapApp && action != 3) return
+        if (action != 0 && (injectedDisplay != displayId || injectedDownAt != downTimeMs)) return
         val result = SpikeShell.motion(displayId, action, x, y, downTimeMs)
+        if (action == 0 && result.startsWith("OK")) {
+            injectedDisplay = displayId
+            injectedDownAt = downTimeMs
+        } else if (action == 1 || action == 3) {
+            injectedDownAt = null
+        }
         if (!result.startsWith("OK")) {
             if (touchLogs++ < 12) {
                 HyperCarRepo.log("CARUI-MAP: motion($action $x,$y) display=$displayId 失败: $result")
@@ -316,6 +338,7 @@ object MapController {
 
     /** Stop projection only; retain the map display, task, route and native camera. */
     suspend fun stop() = transitions.withLock {
+        fullscreenRequested = false
         stopImeDiagnostics()
         runCatching { MapPreview.suspendProjection() }
             .onFailure { HyperCarRepo.log("CARUI-MAP: 分离地图输出失败 ${it.message}") }

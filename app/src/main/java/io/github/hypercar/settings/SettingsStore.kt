@@ -278,6 +278,7 @@ object SettingsStore {
     val preferredVideoCodec: VideoCodec
         get() = VideoCodecPolicy.preferred(videoCodec, videoCapabilities.hevcAllowed)
 
+    @Volatile var receiverMaxFps: Int? = null
     @Volatile var receiverViewport: Pair<Int, Int>? = null
 
     /** CarWith prewarm uses only this receiver's observed canvas, never custom UI size. */
@@ -299,7 +300,7 @@ object SettingsStore {
             // 有 /info 时用它；没有 /info 才回退设置。编码画布与引擎必须同源，
             // 但最终比例要跟车机实际 viewport 一致，否则接收端会横向压缩。
             val viewport = receiverViewport ?: (videoWidth to videoHeight)
-            return VideoEncodingPlan.fit(viewport.first, viewport.second, videoFps)
+            return VideoEncodingPlan.fit(viewport.first, viewport.second, videoFps).withReceiverMaxFps(receiverMaxFps)
         }
 
     var videoFps: Int

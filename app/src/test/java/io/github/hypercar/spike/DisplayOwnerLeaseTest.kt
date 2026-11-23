@@ -18,12 +18,15 @@ class DisplayOwnerLeaseTest {
         assertTrue(bind("old"))
         assertEquals(0, releases)
         assertTrue(bind("new"))
+        assertFalse(lease.owns("old"))
+        assertTrue(lease.owns("new"))
         assertEquals(1, releases)
         notifications.getValue("old")()
         assertEquals(1, releases)
         notifications.getValue("new")()
         notifications.getValue("new")()
         assertEquals(2, releases)
+        assertFalse(lease.owns("new"))
     }
 
     @Test fun alreadyDeadClientCannotReplaceLiveOwner() {

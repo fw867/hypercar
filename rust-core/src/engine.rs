@@ -30,8 +30,10 @@ use crate::{emit_log, emit_stats, emit_state};
 pub enum SourceEvent {
     CarWithTouch(TouchInput),
     RequestCarWithKeyFrame,
+    EncoderFrameRate(u32),
     ResetVideoSource,
     RequestHostUi,
+    RequestViewArea(crate::display_layout::ViewRequest),
     CancelSelfAsr(u64),
     RequestAudioOwnership(PlaybackIntent, std::time::Instant),
     /// 视频编码器产出一帧（H.264 Annex B，可能含 SPS/PPS/IDR）。
@@ -181,12 +183,14 @@ pub async fn run_engine(
     let stop = shutdown.signal.clone();
     let mut tasks = EngineTasks::default();
     let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
+    pipeline.lock().video_requested_fps = cfg.carwith_fps();
     emit_state("negotiating", "AirPlay 会话启动");
     // 触摸/按键通道：CarPlay 事件通道把车机操作送到这里，P1 起交给自绘 UI 处理。
     let _ = (&touch_tx, &key_tx);
 
     // ---- 分发器：外部事件 → 视频泵 / 音频泵 ----
     let (host_ui_tx, mut host_ui_rx) = mpsc::channel::<()>(1);
+    let (view_tx, view_rx) = mpsc::channel::<crate::display_layout::ViewRequest>(1);
     let (audio_claim_tx, mut audio_claim_rx) = mpsc::channel::<(PlaybackIntent, std::time::Instant)>(4);
     let (video_tx, video_rx) = mpsc::unbounded_channel::<SourceEvent>();
     let (audio_tx, audio_rx) = mpsc::unbounded_channel::<SourceEvent>();
@@ -242,6 +246,7 @@ pub async fn run_engine(
                             CarLifeEvent::VideoFrameTagged { pts_us, data, codec } => {
                                 let _=vtx.send(SourceEvent::VideoFrameTagged {pts_us,data,codec,origin});
                             }
+                            CarLifeEvent::EncoderFrameRate(fps) => { let _ = vtx.send(SourceEvent::EncoderFrameRate(fps)); }
                             CarLifeEvent::EncoderResolution { width, height } => {
                                 *carwith_touch_size.lock() = (width, height);
                                 let _ = vtx.send(SourceEvent::EncoderResolution { width, height });
@@ -323,6 +328,7 @@ pub async fn run_engine(
                             if let Some(mic)=&microphone_cancel {mic.cancel_asr(id);}
                         }
                         Some(SourceEvent::RequestHostUi) => { let _ = host_ui_tx.try_send(()); }
+                        Some(SourceEvent::RequestViewArea(request)) => { let _ = view_tx.try_send(request); }
                         Some(SourceEvent::RequestAudioOwnership(intent, at)) => {
                             if let Err(error) = claims.try_send((intent, at)) {
                                 emit_log(&format!("AUDIO-RESOURCE: claim user=true queue rejected: {error}"));
@@ -372,12 +378,18 @@ pub async fn run_engine(
         let health=pipeline.clone(); let vs=video_stats.clone(); let aus=audio_stats.clone(); let signal=stop.clone();
         tasks.spawn(async move {
             let mut last_key=String::new();
+            let mut last_video_sample = None;
             let mut last_audio_bytes=0u64;
             let mut last_audio_tick=tokio::time::Instant::now();
             let mut last_log=tokio::time::Instant::now()-Duration::from_secs(10);
             loop {
                 let mut snapshot=health.lock().snapshot();
                 { let v=vs.lock(); snapshot.video_source_units=v.source_units; snapshot.video_frames_written=v.frames; }
+                let now = tokio::time::Instant::now();
+                if let Some((then, previous)) = last_video_sample.replace((now, snapshot.video_frames_written)) {
+                    snapshot.video_actual_fps = Some(snapshot.video_frames_written.saturating_sub(previous) as f64 /
+                        now.duration_since(then).as_secs_f64().max(0.001));
+                }
                 {
                     let a=aus.lock();
                     snapshot.audio_packets_written=a.packets; snapshot.audio_signal_packets=a.signal_packets;
@@ -465,7 +477,7 @@ pub async fn run_engine(
         factory,
         touch_tx,
         key_tx,
-        stop.clone(),
+        shutdown.clone(),
         screen_ready_tx,
         &mut pending_cleanup,
         receiver_audio_generation.clone(),
@@ -511,6 +523,14 @@ pub async fn run_engine(
         }
     });
     let control = outcome.control;
+    let view_control = control.clone();
+    let view_stop = stop.clone();
+    tasks.spawn(async move {
+        tokio::select! {
+            _ = view_stop.notified() => {}
+            _ = crate::display_layout::send_requests(view_control, view_rx) => {}
+        }
+    });
     let close_control = control.clone();
     let stop_ui = stop.clone();
     tasks.spawn(async move {
@@ -999,7 +1019,7 @@ pub(crate) async fn video_pump(
             command = screen_ready_rx.recv(), if commands_open => match command {
                 Some(crate::screen_session::ScreenCommand::Install(mut s)) => {
                     diagnostic_phase.set_streaming(false);
-                    converter.set_target(s.receiver_size());
+                    converter.set_target(s.receiver_size(), video_pipeline.lock().display_max_fps);
                     converted.clear();
                     if let Some((w, h)) = pending_size.take() {
                         s.set_size(w, h);
@@ -1012,9 +1032,9 @@ pub(crate) async fn video_pump(
                 Some(crate::screen_session::ScreenCommand::InstallIfOwned { sender: mut next, modes, revision, reply }) => {
                     let accepted = {
                         let state = modes.lock();
-                        if state.can_restore_screen(revision) {
+                        if state.can_restore_screen(revision) && next.session_is_live() {
                             diagnostic_phase.set_streaming(false);
-                            converter.set_target(next.receiver_size());
+                            converter.set_target(next.receiver_size(), video_pipeline.lock().display_max_fps);
                             converted.clear();
                             next.set_resource_grant(modes.clone(),revision);
                             if let Some((w,h)) = pending_size.take() { next.set_size(w,h); }
@@ -1047,10 +1067,11 @@ pub(crate) async fn video_pump(
             } => { let (processed,ev)=ev; match ev {
                 Some(SourceEvent::ResetVideoSource) => {
                     encoder_size = None; pending_size = None;
-                    converter.reset();converted.clear();
+                    converter.set_source_fps(None); converter.reset();converted.clear();
                     if let Some(s) = sender.as_mut() { s.reset_source(); }
                     emit_log("CARWITH-VIDEO: fresh source round; waiting for current configuration and IDR");
                 }
+                Some(SourceEvent::EncoderFrameRate(rate)) => converter.set_source_fps(Some(rate)),
                 Some(SourceEvent::EncoderResolution { width, height }) => {
                     // 手机回报实际编码尺寸 → 同步 AirPlay 画布（VideoConfig 宽高）。
                     // 必须在首帧引出 VideoConfig 之前生效，否则车机按旧画布解码。
@@ -1117,9 +1138,9 @@ pub(crate) async fn video_pump(
                             video_pipeline.lock().video_stream="FAILED".into();
                             if resource_lifecycle {
                                 diagnostic_phase.set_streaming(false);
-                                drop(sender.take());
                                 video_pipeline.lock().retire_video_tcp();
-                                emit_log("SCREEN-LIFECYCLE: video write failed; keep audio/control, await next allowed requestUI");
+                                s.report_transport_failure(&error);
+                                drop(sender.take());
                                 continue;
                             }
                             emit_state("ended", "屏幕流写失败（请检查网络及车机会话）");
@@ -1165,9 +1186,9 @@ pub(crate) async fn video_pump(
                         video_pipeline.lock().video_stream="FAILED".into();
                         if resource_lifecycle {
                             diagnostic_phase.set_streaming(false);
-                            drop(sender.take());
                             video_pipeline.lock().retire_video_tcp();
-                            emit_log("SCREEN-LIFECYCLE: video keepAlive failed; preserve other channels");
+                            s.report_transport_failure(&error);
+                            drop(sender.take());
                             continue;
                         }
                         emit_state("ended", "屏幕保活写失败");
@@ -1508,6 +1529,7 @@ pub enum CarLifeEvent {
     SourceReset { cache_cleared: Option<Arc<Notify>> },
     /// Replay for a new screen transport without resetting active audio/navigation.
     VideoReplay,
+    EncoderFrameRate(u32),
     Handshake,
     VideoFrame { pts_us: u64, data: Vec<u8> },
     VideoFrameTagged { pts_us:u64, data:Vec<u8>, codec:crate::video_format::VideoCodec },

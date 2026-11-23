@@ -137,7 +137,8 @@ pub fn receive_bytes(id: u64, data: &[u8], source: &str) -> bool {
 
 async fn run_control_ingress(
     mut inbound: mpsc::UnboundedReceiver<crate::rtsp::RtspMessage>, id: u64, stop: Arc<Notify>,
-    current: impl Fn() -> bool, mut deliver: impl FnMut(&[u8]),
+    ui_since: std::time::Instant, current: impl Fn() -> bool, mut deliver: impl FnMut(&[u8]),
+    mut ui: impl FnMut(crate::rtsp::RtspMessage),
 ) -> &'static str {
     let mut other=std::collections::HashSet::new();
     let mut invalid=0;
@@ -159,6 +160,12 @@ async fn run_control_ingress(
             if invalid<3 {crate::emit_log(&format!("WIFI-IAP#{id}: control iAP data missing/oversized"));} invalid+=1;
         } else {
             let kind=command.get("type").and_then(Value::as_str).unwrap_or("unknown");
+            // updateViewArea is applied once by the RTSP reader on either socket.
+            if matches!(kind, "showUI" | "stopUI" | "setLimitedUI" | "accessoryGiveFocus" |
+                "forceKeyFrame" | "requestUI" | "changeUIContext" | "setNightMode") {
+                if message.received_at >= ui_since { ui(message); }
+                continue;
+            }
             if other.len()<16 && other.insert(kind.to_owned()) {
                 crate::emit_log(&format!("CONTROL-IN: command type={} not routed as iAP; existing RTSP acknowledgement preserved",kind.chars().take(48).collect::<String>()));
             }
@@ -169,9 +176,11 @@ async fn run_control_ingress(
 /// Some receivers place iAP commands on the control socket; its automatic 200 is not delivery.
 pub fn spawn_control_ingress(
     inbound: mpsc::UnboundedReceiver<crate::rtsp::RtspMessage>, id: u64, stop: Arc<Notify>,
+    ui_since: std::time::Instant, current: impl Fn() -> bool + Send + 'static, ui: mpsc::UnboundedSender<crate::rtsp::RtspMessage>,
 ) -> tokio::task::JoinHandle<()> {
     crate::callback_context::spawn(async move {
-        let reason=run_control_ingress(inbound,id,stop,||is_active(id),|bytes|{receive_bytes(id,bytes,"control");}).await;
+        let reason=run_control_ingress(inbound,id,stop,ui_since,current,|bytes|{receive_bytes(id,bytes,"control");},
+            |message| { let _ = ui.send(message); }).await;
         if reason=="closed" { mark_ready(id,false); }
         crate::emit_log(&format!("WIFI-IAP#{id}: control ingress ended={reason}"));
     })
@@ -355,13 +364,55 @@ mod tests {
         bplist::encode(&Value::dict(vec![("type",Value::str("iAPSendMessage")),("params",Value::dict(vec![("data",Value::Data(data))]))]))
     }
     #[tokio::test]
+    async fn acknowledged_control_ui_reaches_the_session_dispatcher_in_order() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let (r,w) = socket.into_split();
+        let (_control, requests) = RtspChannel::spawn(r,w,None);
+        let (to_dispatch, mut ui) = mpsc::unbounded_channel();
+        let receiver = tokio::spawn(run_control_ingress(requests, 1, Arc::new(Notify::new()), std::time::Instant::now(), || true,
+            |_| panic!("unexpected iAP"), move |message| { to_dispatch.send(message).unwrap(); }));
+        let expected = ["setLimitedUI","showUI","forceKeyFrame","stopUI","accessoryGiveFocus","requestUI","setNightMode"];
+        for (seq, kind) in expected.iter().enumerate() {
+            let body = bplist::encode(&Value::dict(vec![("type", Value::str(kind)),("params",Value::dict(vec![
+                ("uuid",Value::str("target")), ("nightMode",Value::bool(true)), ("limitedUI", Value::bool(true))
+            ]))]));
+            peer.write_all(format!("POST /command RTSP/1.0\r\nCSeq: {seq}\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+            peer.write_all(&body).await.unwrap();
+            let mut buf = Vec::new();
+            let ack = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let mut chunk = [0u8;512];
+                    let n = peer.read(&mut chunk).await.unwrap();
+                    assert_ne!(n,0);
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(reply) = crate::rtsp::parse_rtsp_messages(&mut buf).unwrap().pop() { break reply; }
+                }
+            }).await.unwrap();
+            assert_eq!(ack.status(), 200);
+            assert_eq!(ack.cseq(), Some(seq as i32));
+        }
+        drop(peer);
+        assert_eq!(receiver.await.unwrap(),"closed");
+        for kind in expected {
+            let message = ui.recv().await.expect("acknowledged UI was not forwarded");
+            let body = bplist::parse(&message.body).unwrap();
+            assert_eq!(body.get("type").and_then(Value::as_str), Some(kind));
+            assert_eq!(body.get("params").unwrap().get("uuid").and_then(Value::as_str),Some("target"));
+        }
+        assert!(ui.recv().await.is_none());
+    }
+    #[tokio::test]
     async fn control_ingress_filters_invalid_and_delivers_only_iap_data() {
         let (tx,rx)=mpsc::unbounded_channel();
-        for data in [vec![0],iap(vec![]),iap(vec![0;65536]),bplist::encode(&Value::dict(vec![("type",Value::str("requestSiri"))])),iap(vec![4,5,6])] {
+        for data in [vec![0],iap(vec![]),iap(vec![0;65536]),bplist::encode(&Value::dict(vec![("type",Value::str("requestSiri"))])),
+            bplist::encode(&Value::dict(vec![("type",Value::str("setLimitedUI"))])),iap(vec![4,5,6])] {
             tx.send(incoming(data)).unwrap();
         }
         drop(tx); let mut delivered=Vec::new();
-        let result=run_control_ingress(rx,9,Arc::new(Notify::new()),||true,|data|delivered.push(data.to_vec())).await;
+        let result=run_control_ingress(rx,9,Arc::new(Notify::new()),std::time::Instant::now(),||true,|data|delivered.push(data.to_vec()), |_| panic!("pre-SETUP UI")).await;
         assert_eq!(result,"closed"); assert_eq!(delivered,vec![vec![4,5,6]]);
     }
     #[tokio::test]
@@ -371,7 +422,7 @@ mod tests {
             let (tx,rx)=mpsc::unbounded_channel(); tx.send(incoming(iap(vec![1]))).unwrap(); drop(tx);
             let stop=Arc::new(Notify::new()); if mode==0 {stop.notify_one();}
             let probes=AtomicUsize::new(0); let mut delivered=false;
-            let reason=run_control_ingress(rx,9,stop,||match mode {1=>false,2=>probes.fetch_add(1,Ordering::SeqCst)==0,_=>true},|_|delivered=true).await;
+            let reason=run_control_ingress(rx,9,stop,std::time::Instant::now(),||match mode {1=>false,2=>probes.fetch_add(1,Ordering::SeqCst)==0,_=>true},|_|delivered=true, |_| panic!("stale UI")).await;
             assert_eq!(reason,if mode==0 {"cancelled"}else{"stale"}); assert!(!delivered);
         }
     }
@@ -389,7 +440,7 @@ mod tests {
         }).await.unwrap();
         assert_eq!(ack.status(),200);assert_eq!(ack.headers.get("cseq").map(String::as_str),Some("9"));
         let stop=Arc::new(Notify::new());let notify=stop.clone();let mut delivered=Vec::new();
-        assert_eq!(run_control_ingress(rx,9,stop,||true,|data|{delivered.push(data.to_vec());notify.notify_one();}).await,"cancelled");
+        assert_eq!(run_control_ingress(rx,9,stop,std::time::Instant::now(),||true,|data|{delivered.push(data.to_vec());notify.notify_one();}, |_| panic!("unexpected UI")).await,"cancelled");
         assert_eq!(delivered,vec![payload]);
     }
     #[tokio::test]

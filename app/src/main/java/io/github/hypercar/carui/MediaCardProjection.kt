@@ -15,28 +15,33 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 /** One application task can move between a full-sized pane and the home card. */
-internal class MediaCardProjection(context: Context, private val packageName: String) {
+internal class MediaCardProjection(context: Context, private val packageName: String, private val dialer: String?) {
     private val app = context.applicationContext
     val size = PhoneProjectionSize.read(context)
     val error = MutableStateFlow<String?>(null)
 
-    @Volatile private var desired: Request? = null
+    private val input = ProjectionSurfaceInput<Request> { id, action, x, y, downTime ->
+        SpikeShell.motion(id, action, x, y, downTime)
+    }
+    private val desired get() = input.desired
     @Volatile private var closed = false
     @Volatile private var attachment: Attachment? = null
     private var displayId = -1
     private var tasksBeforeLaunch: List<MediaTaskWindow.Task>? = null
     private var needsFullscreenReset = false
 
-    private data class Request(val texture: SurfaceTexture, val size: PhoneProjectionSize, val expanded: Boolean)
+    private data class Request(
+        val texture: SurfaceTexture, val size: PhoneProjectionSize, val expanded: Boolean,
+        val viewWidth: Int, val viewHeight: Int,
+    )
     private data class Attachment(val request: Request, val surface: Surface, val displayId: Int)
 
     fun show(texture: SurfaceTexture, viewWidth: Int, viewHeight: Int, expanded: Boolean) {
         if (closed || viewWidth <= 0 || viewHeight <= 0) return
         val viewport = if (expanded) size.expanded(viewWidth, viewHeight) else size
+        val request = Request(texture, viewport, expanded && viewport.width > viewport.height, viewWidth, viewHeight)
+        if (!input.replace(request)) return
         texture.setDefaultBufferSize(viewport.width, viewport.height)
-        val request = Request(texture, viewport, expanded && viewport.width > viewport.height)
-        if (desired == request) return
-        desired = request
         error.value = null
         scope.launch {
             changes.withLock {
@@ -120,7 +125,7 @@ internal class MediaCardProjection(context: Context, private val packageName: St
     }
 
     fun hide(texture: SurfaceTexture) {
-        if (desired?.texture === texture) desired = null
+        if (desired?.texture === texture) input.replace(null)
         scope.launch {
             changes.withLock {
                 val old = attachment?.takeIf { it.request.texture === texture } ?: return@withLock
@@ -134,17 +139,25 @@ internal class MediaCardProjection(context: Context, private val packageName: St
 
     fun close() {
         closed = true
-        desired = null
+        input.replace(null)
         scope.launch { changes.withLock { releaseDisplay() } }
     }
 
     fun touch(texture: SurfaceTexture, action: Int, x: Float, y: Float, downTime: Long) {
         val display = attachment?.takeIf { isCurrent(it.request) && it.request.texture === texture } ?: return
+        if (!allowsInteraction(CarReceiverUi.state.value.limits)) {
+            cancelTouch()
+            return
+        }
         val viewport = display.request.size
         val px = (x * viewport.width).toInt().coerceIn(0, viewport.width - 1)
         val py = (y * viewport.height).toInt().coerceIn(0, viewport.height - 1)
-        SpikeShell.motion(display.displayId, action, px, py, downTime)
+        input.touch(display.request, display.displayId, action, px, py, downTime)
     }
+
+    fun allowsInteraction(limits: UiLimits) = limits.allowsProjection(packageName, dialer)
+
+    fun cancelTouch() = input.cancel()
 
     private fun isCurrent(request: Request) = !closed && desired === request
 

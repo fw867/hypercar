@@ -4,6 +4,12 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class DisplayLayoutTest {
+    @Test fun bottomAndDriverEdgesRespectTheReceiverDrivingSide() {
+        assertEquals(CarDockEdge.BOTTOM, CarDockEdge.fromReceiver(1, true))
+        assertEquals(CarDockEdge.LEFT, CarDockEdge.fromReceiver(2, false))
+        assertEquals(CarDockEdge.RIGHT, CarDockEdge.fromReceiver(2, true))
+        for (wire in listOf(-1, 0, 3)) assertEquals(CarDockEdge.AUTO, CarDockEdge.fromReceiver(wire, true))
+    }
     private val bmw = DisplayLayout(2736,800,DisplayRect(0,0,2736,798),DisplayRect(4,4,2732,794),false)
     @Test fun bmwRetainsReportedAsymmetricEdgesWithoutChangingCanvas() {
         assertEquals(DisplayRect(4,4,2732,794), bmw.contentBounds(2736,800))

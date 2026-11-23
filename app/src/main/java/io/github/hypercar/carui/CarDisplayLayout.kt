@@ -16,7 +16,20 @@ data class DisplayRect(val x: Int, val y: Int, val width: Int, val height: Int) 
     }
 }
 
-data class DisplayLayout(val width: Int, val height: Int, val view: DisplayRect, val safe: DisplayRect, val drawOutside: Boolean) {
+enum class CarDockEdge {
+    AUTO, BOTTOM, LEFT, RIGHT;
+
+    companion object {
+        fun fromReceiver(edge: Int, rightHandDrive: Boolean): CarDockEdge = when (edge) {
+            1 -> BOTTOM
+            2 -> if (rightHandDrive) RIGHT else LEFT
+            else -> AUTO
+        }
+    }
+}
+
+data class DisplayLayout(val width: Int, val height: Int, val view: DisplayRect, val safe: DisplayRect,
+    val drawOutside: Boolean, val dockEdge: CarDockEdge = CarDockEdge.AUTO) {
     fun contentBounds(canvasWidth: Int, canvasHeight: Int): DisplayRect = scale(safe, canvasWidth, canvasHeight)
     fun backgroundBounds(canvasWidth: Int, canvasHeight: Int): DisplayRect = scale(if (drawOutside) view else safe, canvasWidth, canvasHeight)
     private fun scale(area: DisplayRect, canvasWidth: Int, canvasHeight: Int): DisplayRect {
@@ -36,6 +49,8 @@ data class DisplayLayout(val width: Int, val height: Int, val view: DisplayRect,
 
 object CarDisplayLayout {
     val state = MutableStateFlow<DisplayLayout?>(null)
+    data class ViewAreaChoices(val revision: Long, val uuid: String, val targets: List<Int>)
+    val viewAreaChoices = MutableStateFlow<ViewAreaChoices?>(null)
     fun contentBounds(width: Int, height: Int): DisplayRect = state.value?.contentBounds(width, height) ?: DisplayRect(0,0,width,height)
     fun homeButtonBounds(width: Int, height: Int): DisplayRect {
         val safe = contentBounds(width,height)

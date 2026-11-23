@@ -29,6 +29,8 @@ class SpikeCaster(
     private val bitrate: Int = 8_000_000,
     private val tag: String = "S3",
     val preferredCodec: VideoCodec = VideoCodec.H264,
+    val receiverRateLimited: Boolean = false,
+    private val independentOutput: ((ByteArray, Long) -> Unit)? = null,
 ) {
 
     private val lock = Any()
@@ -128,6 +130,7 @@ class SpikeCaster(
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
             setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+            if (receiverRateLimited) setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, fps.toFloat())
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
         }
         val format = surfaceFormat().apply {
@@ -140,7 +143,7 @@ class SpikeCaster(
             // 避免点击后的尾帧卡在编码器 pipeline 里。
             runCatching { setInteger(MediaFormat.KEY_PRIORITY, 0) }
             runCatching { setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0) }
-            runCatching { setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L) }
+            if (independentOutput == null) runCatching { setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, maxOf(100_000L, (1_000_000L + fps - 1) / fps)) }
             if (android.os.Build.VERSION.SDK_INT >= 30) {
                 runCatching { setInteger(MediaFormat.KEY_LATENCY, 0) }
             }
@@ -202,7 +205,7 @@ class SpikeCaster(
             running = true
 
             // 先对齐画布，再出帧（send_config 由帧里的 SPS/PPS 触发）
-            RustCoreBridge.nativeSetVideoSize(width, height)
+            if (independentOutput == null) RustCoreBridge.nativeSetVideoSize(width, height)
             val msg = "编码器启动：${width}x${height}@${fps} ${bitrate / 1000}kbps " +
                 "surface=${surface.isValid} encoder=${enc.name}"
             SpikeReport.add(tag, msg)
@@ -281,7 +284,8 @@ class SpikeCaster(
                             synchronized(lock) {
                                 if (pushing && (!awaitingKeyFrame || key)) {
                                     awaitingKeyFrame = false
-                                    RustCoreBridge.nativePushVideoFrameWithCodec(payload, info.presentationTimeUs, actualCodec.wireId)
+                                    if (independentOutput != null) independentOutput.invoke(payload, info.presentationTimeUs)
+                                    else RustCoreBridge.nativePushVideoFrameWithCodec(payload, info.presentationTimeUs, actualCodec.wireId)
                                     onFrame(info.presentationTimeUs, payload.size, now)
                                 }
                             }

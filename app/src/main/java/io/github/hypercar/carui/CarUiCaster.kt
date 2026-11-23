@@ -57,6 +57,7 @@ object CarUiCaster {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private var caster: SpikeCaster? = null
+    private var encoderTargetFps = 0
     @Volatile private var displayId = -1
     @Volatile private var displayService: IBinder? = null
     private var cpuLock: PowerManager.WakeLock? = null
@@ -231,8 +232,11 @@ object CarUiCaster {
 
     private suspend fun startLocked(context: Context, keepAudio: Boolean = false, current: () -> Boolean): String {
         val desiredCodec = SettingsStore.preferredVideoCodec
-        if (running && caster?.preferredCodec != desiredCodec) {
-            HyperCarRepo.log("CARUI: video codec preference changed; rebuilding home/map encoders")
+        val requested = SettingsStore.encodingPlan
+        val limited = SettingsStore.receiverMaxFps != null
+        if (running && (caster?.preferredCodec != desiredCodec || encoderTargetFps != requested.fps ||
+                caster?.receiverRateLimited != limited)) {
+            HyperCarRepo.log("CARUI: rebuilding home/map encoders codec=$desiredCodec target_fps=${requested.fps}")
             stopLocked(keepAudio)
         }
         if (running) {
@@ -251,13 +255,12 @@ object CarUiCaster {
             }
             return "已经在跑（display=$displayId，已重新上报 ${width}x$height）"
         }
-        val requested = SettingsStore.encodingPlan
         var lastError: Exception? = null
         var encoder = ""
         for (candidate in requested.encoderCandidates()) {
             if (!current()) return "会话已停止，取消编码启动"
             val next = SpikeCaster(width = candidate.width, height = candidate.height, fps = candidate.fps,
-                bitrate = candidate.bitrate, tag = TAG, preferredCodec = desiredCodec)
+                bitrate = candidate.bitrate, tag = TAG, preferredCodec = desiredCodec, receiverRateLimited = limited)
             try {
                 encoder = next.startEncoder()
             } catch (e: Exception) {
@@ -267,13 +270,14 @@ object CarUiCaster {
                 continue
             }
             caster = next
+            encoderTargetFps = requested.fps
             plan = candidate
             width = candidate.width
             height = candidate.height
             break
         }
         val c = caster ?: return "编码器启动失败: ${lastError?.message}"
-        HyperCarRepo.log("CARUI: requested=${requested.width}x${requested.height}@${requested.fps} stream=${width}x${height}@${plan.fps} dpi=$DPI $encoder")
+        HyperCarRepo.log("CARUI: requested=${requested.width}x${requested.height}@${requested.fps} stream=${width}x${height}@${plan.fps} requested_fps=${SettingsStore.videoFps} declared_max_fps=${SettingsStore.receiverMaxFps} effective_fps=${requested.fps} encoder_fps=${plan.fps} dpi=$DPI $encoder")
         val surface = c.encoderSurface ?: run {
             c.stop()
             caster = null
@@ -346,6 +350,7 @@ object CarUiCaster {
                 MapController.requestExit()
                 return
             }
+            if (MapController.overlayKey(key) || CarReceiverUi.state.value.limits.blockMapApp) return
             MapController.fullscreenDisplayId
         } else displayId
         if (target <= 0) return

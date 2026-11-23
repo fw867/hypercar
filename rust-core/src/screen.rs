@@ -73,6 +73,7 @@ pub enum ScreenCipher {
 
 /// 屏幕流发送器：持有 TCP 写半部（由调用方 `split_owned` 后传入）与加密形态。
 pub struct ScreenSender {
+    instrument_map: bool,
     w: OwnedWriteHalf,
     cipher: ScreenCipher,
     /** ChaCha 帧计数（每帧自增；AES-CTR 形态不使用但照常计数，对齐参考实现）。 */
@@ -111,6 +112,7 @@ pub struct ScreenSender {
     last_sync_request: Option<tokio::time::Instant>,
     ownership: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     resource_grant: Option<(std::sync::Arc<parking_lot::Mutex<crate::modes::Modes>>,u64)>,
+    pub(crate) transport_monitor: Option<crate::screen_session::TransportMonitor>,
     source_frames: u64,
     ownership_skips: u64,
     sync_skips: u64,
@@ -138,6 +140,7 @@ impl ScreenSender {
             w,
             cipher,
             frame_counter: 0,
+            instrument_map: false,
             width: even_width as f32,
             height: even_height as f32,
             display_target: None,
@@ -160,6 +163,7 @@ impl ScreenSender {
             last_sync_request: None,
             ownership: None,
             resource_grant: None,
+            transport_monitor: None,
             source_frames: 0,
             ownership_skips: 0,
             sync_skips: 0,
@@ -173,12 +177,20 @@ impl ScreenSender {
         }
     }
 
+    pub(crate) fn mark_instrument_map(&mut self) { self.instrument_map = true; }
+
+    fn video_log(&self, message: std::fmt::Arguments<'_>) {
+        let channel = if self.instrument_map { "CLUSTER" } else { "VIDEO" };
+        crate::emit_log(&format!("{channel}: {message}"));
+    }
+
     pub fn attach_diagnostics(&mut self,pipeline:std::sync::Arc<parking_lot::Mutex<crate::pipeline::Pipeline>>,connection_id:u64) {
         self.tcp_monitor.take();
         let snapshot = crate::tcp_diagnostics::TcpSnapshot::capture(self.w.as_ref().as_raw_fd(),connection_id);
         {
             let mut p = pipeline.lock();
             p.video_tcp = Some(snapshot);
+            p.main_video_connection = None;
             p.screen_config_size = None;
             p.video_format = None;
         }
@@ -192,6 +204,16 @@ impl ScreenSender {
                 p.screen_config_size = header_size;
                 p.video_format = sps_size.map(|(width,height)| crate::pipeline::VideoFormat {
                     width, height, codec: self.codec.as_str()
+                });
+            }
+        }
+    }
+    fn publish_main_video_ready(&self, ready: bool) {
+        if let Some((pipeline, id)) = &self.tcp_diagnostics {
+            let mut p = pipeline.lock();
+            if p.video_tcp.as_ref().is_some_and(|tcp| tcp.connection_id == *id) {
+                p.main_video_connection = ready.then(|| crate::pipeline::MainVideoConnection {
+                    id: *id, resource_grant: self.resource_grant.clone(),
                 });
             }
         }
@@ -225,11 +247,11 @@ impl ScreenSender {
         } else {
             None
         };
-        crate::emit_log(&format!("VIDEO: header-only stretch suspended requested={:?}; config follows encoded SPS/source", self.display_target));
+        self.video_log(format_args!("header-only stretch suspended requested={:?}; config follows encoded SPS/source", self.display_target));
     }
 
     pub fn reset_source(&mut self) {
-        crate::emit_log(&format!("VIDEO: reset source {}", self.diagnostics()));
+        self.video_log(format_args!("reset source {}", self.diagnostics()));
         self.publish_format(None, None);
         self.config_sent = false;
         self.last_vps = None; self.last_sps = None; self.last_pps = None;
@@ -264,12 +286,39 @@ impl ScreenSender {
         self.resource_grant=Some((modes,revision));
     }
 
+    pub(crate) fn session_is_live(&self) -> bool {
+        self.transport_monitor.as_ref().is_none_or(|monitor|
+            !monitor.shutdown.requested() && monitor.control.session_is_live())
+    }
+
+    pub(crate) fn transport_for(&self, revision: u64) -> Option<crate::screen_session::GrantedTransport> {
+        self.transport_monitor.as_ref().map(|monitor| crate::screen_session::GrantedTransport {
+            revision, connection_id: monitor.connection_id,
+        })
+    }
+
+    pub(crate) fn report_transport_failure(&self, error: &std::io::Error) {
+        // Invalid codec data also returns io::Error from the frame path. Reopening
+        // TCP can only help a socket write failure or its progress deadline.
+        if error.raw_os_error().is_none() && !matches!(error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WriteZero |
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset |
+            std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::NotConnected) { return; }
+        if let (Some(monitor), Some((_, revision))) = (&self.transport_monitor, &self.resource_grant) {
+            monitor.failures.send_replace(self.transport_for(*revision));
+        }
+    }
+
     fn observe_owner(&mut self) -> bool {
         let owned = self.ownership.as_ref().map(|v| v.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(true)
             && self.resource_grant.as_ref().map(|(modes,revision)|modes.lock().can_restore_screen(*revision)).unwrap_or(true);
         if self.last_owner != Some(owned) {
-            crate::emit_log(&format!("VIDEO: screen gate phone_owned={owned} written_frames={} source_units={} (local arbitration; not receiver display confirmation)", self.frames, self.source_frames));
+            self.video_log(format_args!("screen gate phone_owned={owned} written_frames={} source_units={} (local arbitration; not receiver display confirmation)", self.frames, self.source_frames));
             self.last_owner = Some(owned);
+            if !owned {
+                self.publish_main_video_ready(false);
+                self.waiting_idr = true;
+            }
         }
         owned
     }
@@ -329,7 +378,7 @@ impl ScreenSender {
         self.publish_format(sps_size, Some((display_w, display_h)));
         self.config_sent = true;
         self.waiting_idr = true;
-        crate::emit_log(&format!("VIDEO: config TCP written {}B codec={} header={}x{} encoder_report={}x{} sps={sps_size:?} report_matches_sps={:?} flags=0x{:02x} header_stretch=false requested_target={:?}; receiver decode/display unconfirmed",
+        self.video_log(format_args!("config TCP written {}B codec={} header={}x{} encoder_report={}x{} sps={sps_size:?} report_matches_sps={:?} flags=0x{:02x} header_stretch=false requested_target={:?}; receiver decode/display unconfirmed",
             avcc.len(), self.codec.as_str(), display_w, display_h, self.width, self.height, sps_size.map(|s| s == self.size()), header[6], self.display_target));
         Ok(())
     }
@@ -389,7 +438,7 @@ impl ScreenSender {
         if !self.logged_first_frame {
             self.logged_first_frame = true;
             let types: Vec<_> = nals.iter().take(6).map(|n| self.source_nal_type(n)).collect();
-            crate::emit_log(&format!("VIDEO: codec={} first NAL types={types:?}",self.codec.as_str()));
+            self.video_log(format_args!("codec={} first NAL types={types:?}",self.codec.as_str()));
         }
         if self.codec == VideoCodec::Hevc {
             if nals.iter().any(|n|crate::hevc::nal_type(n).is_none()) {
@@ -432,14 +481,17 @@ impl ScreenSender {
             self.sync_skips += 1;
             if self.last_sync_request.map(|t| t.elapsed() >= Duration::from_secs(1)).unwrap_or(true) {
                 self.last_sync_request = Some(tokio::time::Instant::now());
+                if self.instrument_map {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "cluster encoder lost config/IDR"));
+                }
                 crate::emit_force_keyframe();
-                crate::emit_log(&format!("VIDEO: awaiting config/IDR config={} idr={is_idr}; requested sync frame", self.config_sent));
+                self.video_log(format_args!("awaiting config/IDR config={} idr={is_idr}; requested sync frame", self.config_sent));
             }
             return Ok(());
         }
         let resuming = self.waiting_idr;
         if self.waiting_idr {
-            crate::emit_log(&format!("VIDEO: first IDR ready pts={pts_us}us clock={}us", crate::timing::monotonic_nanos() / 1000));
+            self.video_log(format_args!("first IDR ready pts={pts_us}us clock={}us", crate::timing::monotonic_nanos() / 1000));
             self.waiting_idr = false;
         }
 
@@ -482,13 +534,16 @@ impl ScreenSender {
         wire.extend_from_slice(&body);
         self.w.write_all(&wire).await?;
 
+        if self.frames == 0 || resuming {
+            self.publish_main_video_ready(true);
+        }
         self.frames = self.frames.wrapping_add(1);
         self.wire_bytes = self.wire_bytes.wrapping_add(wire.len() as u64);
         self.last_write = Some(tokio::time::Instant::now());
         if is_idr {
             self.written_idrs += 1;
             if self.written_idrs == 1 || resuming {
-                crate::emit_log(&format!("VIDEO: IDR TCP written pts={pts_us}us frame={} wire={}B origin={}; receiver decode/display unconfirmed", self.frames, wire.len(), origin.as_str()));
+                self.video_log(format_args!("IDR TCP written pts={pts_us}us frame={} wire={}B origin={}; receiver decode/display unconfirmed", self.frames, wire.len(), origin.as_str()));
             }
         }
         self.bytes = self.bytes.wrapping_add(plain.len() as u64);
@@ -545,7 +600,7 @@ impl ScreenSender {
         wire.extend_from_slice(&body);
         self.w.write_all(&wire).await?;
         if self.keep_alive_count == 1 || self.keep_alive_count % 10 == 0 {
-            crate::emit_log(&format!("VIDEO: keepAlive written opcode={opcode} body={}B count={} window_fps={:.1} window_payload_Bps={:.0} {}", body.len(), self.keep_alive_count,
+            self.video_log(format_args!("keepAlive written opcode={opcode} body={}B count={} window_fps={:.1} window_payload_Bps={:.0} {}", body.len(), self.keep_alive_count,
                 frames_in_window as f64 / window, bytes_in_window as f64 / window, self.diagnostics()));
         }
         Ok(())
@@ -564,8 +619,9 @@ impl ScreenSender {
 
 impl Drop for ScreenSender {
     fn drop(&mut self) {
-        crate::emit_log(&format!("VIDEO: sender released {}", self.diagnostics()));
+        self.video_log(format_args!("sender released {}", self.diagnostics()));
         // Must stop descriptor sampling BEFORE Rust drops the write half and closes its fd.
+        self.publish_main_video_ready(false);
         self.publish_format(None, None);
         self.tcp_monitor.take();
     }
