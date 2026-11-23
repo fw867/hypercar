@@ -157,7 +157,7 @@ fun SettingsScreen(
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
                             SettingsMenuItem("画面与声音", "画面来源、音频格式与显示参数") { open(SettingsPage.Display) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-                            SettingsMenuItem("自定义投屏应用", "已选 ${CarUiSettings.projectionPackages.size} 个 · 在车机「更多应用」中打开") {
+                            SettingsMenuItem("自定义投屏应用", "仅对自绘车机 UI 生效 · 已选 ${CarUiSettings.projectionPackages.size} 个") {
                                 showProjectionApps = true
                             }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))

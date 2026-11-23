@@ -42,32 +42,30 @@ internal fun ProjectionAppsDialog(onClose: () -> Unit) {
         value = withContext(Dispatchers.IO) { runCatching { ProjectionApps.candidates(context) } }
     }
     val candidates = loaded?.getOrNull()
-    val unavailable = if (candidates == null) emptyList()
-        else (selected - candidates.map { it.packageName }.toSet()).sorted()
+    val unavailable = if (candidates == null) emptySet()
+        else selected - candidates.map { it.packageName }.toSet()
     val query = search.trim()
-    val visible = candidates.orEmpty().filter { it.label.contains(query, ignoreCase = true) ||
-        it.packageName.contains(query, ignoreCase = true) }
-    val unavailableMatches = unavailable.filter { it.contains(query, ignoreCase = true) }
+    val visible = (candidates.orEmpty() + unavailable.sorted().map { ProjectionApps.Candidate(it, it) })
+        .filter { it.label.contains(query, ignoreCase = true) || it.packageName.contains(query, ignoreCase = true) }
+        .sortedBy { it.packageName !in selected }
     AlertDialog(
         onDismissRequest = onClose,
         title = { Text("自定义投屏应用") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("仅对自绘车机 UI 生效。勾选后可在车机「更多应用」中打开。",
+                    color = TextSecondary, style = MaterialTheme.typography.bodySmall)
                 OutlinedTextField(search, { search = it }, Modifier.fillMaxWidth(),
                     label = { Text("搜索应用名或包名") }, singleLine = true)
                 when {
                     loaded == null -> Text("正在读取已安装应用")
                     candidates == null -> Text("读取应用列表失败，请关闭后重试")
-                    visible.isEmpty() && unavailableMatches.isEmpty() -> Text("没有符合条件的应用")
+                    visible.isEmpty() -> Text("没有符合条件的应用")
                     else -> LazyColumn(Modifier.fillMaxWidth().heightIn(max = 350.dp)) {
                         items(visible, key = { it.packageName }) { app ->
-                            ProjectionAppOption(app.label, app.packageName, app.packageName in selected) {
+                            val detail = if (app.packageName in unavailable) "应用暂不可用" else app.packageName
+                            ProjectionAppOption(app.label, detail, app.packageName in selected) {
                                 CarUiSettings.updateProjectionPackage(app.packageName, it)
-                            }
-                        }
-                        items(unavailableMatches, key = { it }) { pkg ->
-                            ProjectionAppOption(pkg, "应用暂不可用", checked = true) {
-                                CarUiSettings.updateProjectionPackage(pkg, enabled = false)
                             }
                         }
                     }
