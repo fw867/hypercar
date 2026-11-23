@@ -1,5 +1,7 @@
 //! ACK-committed temporary speech ownership; navigation only updates its app state.
-use std::sync::{Arc,atomic::{AtomicBool,Ordering}};
+use std::sync::{Arc,atomic::AtomicBool};
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use parking_lot::Mutex;
 use crate::{bplist,modes::{AuxTransition,Modes},rtsp::RtspChannel};
 pub use crate::modes::{SpeechLease,NavigationLease};
@@ -50,8 +52,7 @@ impl SpeechResource {
         if !accepted {crate::emit_log("SPEECH-RESOURCE: declaration rejected/timed out; gate unchanged");return false;}
         let mut modes=self.modes.lock();
         let committed=modes.commit_aux(&proposal);
-        self.owned.store(modes.audio_owned(),Ordering::Release);
-        self.control.buffered_ownership.publish(modes.audio_owned());
+        self.control.buffered_ownership.publish_with_gate(&self.owned, modes.audio_owned());
         crate::emit_log(&format!("SPEECH-RESOURCE: acknowledged committed={committed}; receiver audibility unconfirmed"));
         committed
     }

@@ -5,6 +5,30 @@ import org.junit.Test
 import io.github.hypercar.session.ConnectionDiagnostics.Stage
 
 class ConnectionDiagnosticsTest {
+    @Test fun mediaSummaryKeepsFirstFrameTouchAndFeedbackFailuresWhenRecentEntriesRollOver() {
+        val journal = ConnectionDiagnostics { 1_000L }
+        val first = journal.begin("manual", "bmw_id9")
+        journal.engineStarted(first, 10, null, 1_000, 5_000)
+        fun event(at: Int, detail: String, engine: Long = 10) =
+            journal.mediaEvent(first, engine, "MEDIA-TIMELINE: $at $detail")
+        event(1_002, "hid_touch_in RTSP#3 bytes=6 mapped=false")
+        event(1_001, "first_video_written socket_write")
+        event(1_003, "feedback_timeout RTSP#2 CSeq=20")
+        event(1_004, "feedback_error RTSP#2 CSeq=21 control_closed")
+        event(1_005, "feedback_error WRONG_ENGINE", 11)
+        for (n in 1..20) event(1_010 + n, "feedback_ok RTSP#2 CSeq=${21 + n} status=200")
+        val line = journal.report().single()
+        assertTrue(line.indexOf("1001ms first_video_written") in 0 until line.indexOf("1002ms hid_touch_in"))
+        assertTrue(line.contains("1003ms feedback_timeout RTSP#2 CSeq=20"))
+        assertTrue(line.contains("1004ms feedback_error RTSP#2 CSeq=21"))
+        assertTrue(line.contains("feedback_ok RTSP#2 CSeq=41"))
+        assertFalse(line.contains("feedback_ok RTSP#2 CSeq=23"))
+        assertFalse(line.contains("WRONG_ENGINE"))
+        val next = journal.begin("manual", "other")
+        journal.engineStarted(next, 11, null, 2_000, 6_000)
+        assertFalse(journal.report().last().contains("media_timeline"))
+    }
+
     @Test fun developerSnapshotKeepsLatestObservationsAndDoesNotBorrowFromOtherAttempts() {
         var now = 100L
         val journal = ConnectionDiagnostics { now }

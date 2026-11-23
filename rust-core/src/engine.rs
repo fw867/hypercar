@@ -903,7 +903,8 @@ async fn audio_pump(
                     let result = if a.buffered_failed() {
                         Err(std::io::Error::other("buffered playback control failed"))
                     } else {
-                        a.send_pcm_recovering(mixed, generation, recovery_deadline).await
+                        let current_due = crate::audio_pacing::current_pcm_due(scheduled.into_std(), missed, mix_rate);
+                        a.send_main_tick(mixed, generation, recovery_deadline, current_due).await
                     };
                     pacing.costs.send_us = pacing.costs.send_us.max(send_started.elapsed().as_micros());
                     if let Some(costs) = a.io_costs.take() {
@@ -931,7 +932,7 @@ async fn audio_pump(
                     let mut counters=stats.lock();
                     counters.packets += written;
                     counters.payload_bytes = a.payload_bytes_sent();
-                    if mixed.iter().any(|s| *s != 0) { counters.signal_packets += written; }
+                    counters.signal_packets += a.tick_signal_packets(mixed, written);
                 }
                 if let Some(line) = pacing.periodic() { emit_log(&line); }
                 // 每秒报一次实际发包速率：48000/352 ≈ 136/s。低于它就是漏拍，
@@ -939,6 +940,9 @@ async fn audio_pump(
                 if rate_mark.elapsed() >= Duration::from_secs(1) {
                     let secs = rate_mark.elapsed().as_secs_f64().max(0.001);
                     if let Some(report) = out.as_mut().and_then(|audio| audio.take_udp_drop_report()) {
+                        emit_log(&report);
+                    }
+                    if let Some(report) = out.as_mut().and_then(|audio| audio.take_pcm_retry_report()) {
                         emit_log(&report);
                     }
                     emit_log(&format!(
@@ -1124,8 +1128,14 @@ pub(crate) async fn video_pump(
                         let written_frames = s.frames_sent() - before_frames;
                         if written_frames > 0 { diagnostic_phase.set_streaming(true); }
                         let mut st = stats.lock();
+                        let first_write = written_frames > 0 && st.frames == 0;
                         st.frames += written_frames;
                         st.bytes += s.bytes_per_second() - before_bytes;
+                        drop(st);
+                        if first_write {
+                            crate::emit_media_trace(crate::timing::monotonic_nanos() / 1_000_000,
+                                "first_video_written", "socket_write");
+                        }
                     } else {
                         before_ready_units += 1;
                         if before_ready_units == 1 {

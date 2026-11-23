@@ -32,6 +32,7 @@ mod aac_worker;
 pub(crate) use buffered::tests::{accept_start, control_pair};
 use crate::timing::ntp_be;
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::time::{Duration, Instant};
 use tokio::net::{TcpStream, UdpSocket};
 
 /** 每包样本帧数 = AirPlay 标准 SPF 352（48000/352 ≈ 136 包/秒）。 */
@@ -158,6 +159,70 @@ impl UdpDropWindow {
     }
 }
 
+struct PendingPcm {
+    wire: Vec<u8>,
+    has_signal: bool,
+    seq: u16,
+    diagnostic: Option<PcmWriteFailure>,
+    payload_bytes: usize,
+    expires: Instant,
+    ownership_generation: Option<u64>,
+    cache_generation: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct PcmWriteFailure {
+    seq: u16,
+    rtp_ts: u32,
+    mono_ns: u64,
+    errno: Option<i32>,
+}
+
+// The next report can also receive the outcome of one pending packet from the prior window.
+const PCM_DETAIL_LIMIT: usize = 4;
+struct PcmPacketOutcome {
+    write: PcmWriteFailure,
+    mono_ns: u64,
+    reason: &'static str,
+    retry_errno: Option<i32>,
+}
+
+#[derive(Default)]
+struct PcmRetryWindow {
+    new_writes: u64,
+    max_new_delay_us: u128,
+    saved: u64,
+    replaced: u64,
+    expired: u64,
+    no_slack: u64,
+    discarded: u64,
+    sent: u64,
+    failed: u64,
+    last_errno: Option<i32>,
+    sampled: usize,
+    suppressed: u64,
+    outcomes: [Option<PcmPacketOutcome>; PCM_DETAIL_LIMIT + 1],
+}
+
+impl PcmRetryWindow {
+    fn sample(&mut self, rtp: RtpHeader, mono_ns: u64, errno: Option<i32>) -> Option<PcmWriteFailure> {
+        if self.sampled == PCM_DETAIL_LIMIT {
+            self.suppressed += 1;
+            return None;
+        }
+        self.sampled += 1;
+        Some(PcmWriteFailure { seq: rtp.seq, rtp_ts: rtp.rtp_ts, mono_ns, errno })
+    }
+
+    fn finish(&mut self, write: Option<PcmWriteFailure>, reason: &'static str, retry_errno: Option<i32>) {
+        if let Some(write) = write {
+            if let Some(slot) = self.outcomes.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(PcmPacketOutcome { write, mono_ns: crate::timing::monotonic_nanos(), reason, retry_errno });
+            }
+        }
+    }
+}
+
 /// CarPlay 音频发送器。
 pub struct AudioOut {
     transport: AudioTransport,
@@ -181,6 +246,11 @@ pub struct AudioOut {
     packets: u64,
     pub(crate) congestion_drops: u64,
     udp_drop_window: UdpDropWindow,
+    pcm_tick_due: Option<Instant>,
+    pcm_tick_signal_packets: u64,
+    pending_pcm: Option<PendingPcm>,
+    pcm_retry: PcmRetryWindow,
+    pcm_ownership: Option<tokio::sync::watch::Receiver<crate::buffered_ownership::Ownership>>,
     payload_bytes: u64,
     /** 同步包自己的序号（与音频 RTP 序号无关，独立递增）。 */
     sync_seq: u16,
@@ -226,6 +296,11 @@ impl AudioOut {
             packets: 0,
             congestion_drops: 0,
             udp_drop_window: UdpDropWindow::default(),
+            pcm_tick_due: None,
+            pcm_tick_signal_packets: 0,
+            pending_pcm: None,
+            pcm_retry: Default::default(),
+            pcm_ownership: None,
             payload_bytes: 0,
             sync_seq: 0,
             marker_pending: true,
@@ -280,6 +355,9 @@ impl AudioOut {
         setup_accepted_at: std::time::Instant, ownership: &crate::buffered_ownership::BufferedOwnership,
         listening: Option<(UdpSocket, std::net::IpAddr)>) {
         self.pacing_id = Some(crate::audio_pacing::StreamId { rtsp, stream_id, setup_accepted_at });
+        if self.pt == 100 && self.opus.is_none() {
+            self.pcm_ownership = Some(ownership.subscribe());
+        }
         let label = format!("RTSP#{rtsp} type={} streamConnectionID={stream_id} negotiatedHz={}", self.pt, self.sample_rate);
         if self.pt == 103 {
             crate::emit_log(&format!("AUDIO-RTCP: {label} observation inapplicable transport=TCP"));
@@ -332,6 +410,23 @@ impl AudioOut {
             libc::ENOBUFS, self.congestion_drops,
         ))
     }
+    pub(crate) fn take_pcm_retry_report(&mut self) -> Option<String> {
+        let w = std::mem::take(&mut self.pcm_retry);
+        if w.new_writes == 0 && w.discarded == 0 && w.expired == 0 && w.outcomes[0].is_none() { return None; }
+        let stream = self.pacing_id.map(|id| format!("RTSP#{} streamConnectionID={}", id.rtsp, id.stream_id)).unwrap_or_default();
+        let mut line = format!("AUDIO-UDP-RETRY: {stream} type=100 monoNs={} newWrites={} maxNewWriteDelayUs={} saved={} replaced={} expired={} noSlack={} discarded={} retrySent={} retryFailed={} lastRetryErrno={:?} detailSuppressed={}",
+            crate::timing::monotonic_nanos(), w.new_writes, w.max_new_delay_us, w.saved, w.replaced, w.expired, w.no_slack, w.discarded, w.sent, w.failed, w.last_errno, w.suppressed);
+        for detail in w.outcomes.into_iter().flatten() {
+            use std::fmt::Write;
+            let p = detail.write;
+            let _ = write!(line, " [seq={} rtpTs={} writeMonoNs={} writeErrno={} outcome={} outcomeMonoNs={}",
+                p.seq, p.rtp_ts, p.mono_ns, p.errno.map_or_else(|| "NA".into(), |n| n.to_string()), detail.reason, detail.mono_ns);
+            if let Some(errno) = detail.retry_errno { let _ = write!(line, " retryErrno={errno}"); }
+            line.push(']');
+        }
+        Some(line)
+    }
+
     fn is_aac(&self) -> bool { matches!(self.pt, 102 | 103) && self.opus.is_none() }
     pub fn codec_name(&self) -> &'static str { if self.opus.is_some() { "OPUS" } else if self.is_aac() { "AAC" } else if self.pt==100 { "PCM" } else { "" } }
     pub fn payload_bytes_sent(&self) -> u64 {
@@ -394,6 +489,92 @@ impl AudioOut {
         self.send_pcm_recovering(frames, expected_generation, None).await
     }
 
+    // Only the paced main sender has a trustworthy boundary for the next new packet.
+    pub(crate) async fn send_main_tick(&mut self, frames: &[i16], generation: Option<u64>,
+        recover_until: Option<Instant>, due: Instant) -> std::io::Result<()> {
+        if self.pt != 100 || self.opus.is_some() {
+            return self.send_pcm_recovering(frames, generation, recover_until).await;
+        }
+        let previous = self.pending_pcm.take();
+        self.pcm_tick_signal_packets = 0;
+        self.pcm_tick_due = Some(due);
+        let before = self.packets;
+        let initial_drops = self.congestion_drops;
+        let result = self.send_pcm_recovering(frames, generation, recover_until).await;
+        self.pcm_tick_due = None;
+        if let Some(old) = previous {
+            let period = crate::audio_pacing::period(self.sample_rate);
+            let now = Instant::now();
+            if now >= old.expires {
+                self.pcm_retry.expired += 1;
+                self.pcm_retry.finish(old.diagnostic, "expired", None);
+            } else if self.pending_pcm.is_some() {
+                self.pcm_retry.replaced += 1;
+                self.pcm_retry.finish(old.diagnostic, "replaced", None);
+            } else if let Some(reason) = self.pcm_discard_reason(result.is_err(), initial_drops, before) {
+                self.pcm_retry.discarded += 1;
+                self.pcm_retry.finish(old.diagnostic, reason, None);
+            } else if let AudioTransport::Realtime(socket) = &self.transport {
+                let write = self.with_pcm_retry_ownership(old.ownership_generation, || {
+                    // A handover may have held the watch lock while this tick was running.
+                    let now = Instant::now();
+                    if now >= old.expires { return Err("expired"); }
+                    if (due + period).saturating_duration_since(now) <= Duration::from_millis(1) { return Err("no_slack"); }
+                    Ok(socket2::SockRef::from(socket).send_with_flags(&old.wire, libc::MSG_DONTWAIT))
+                });
+                match write {
+                    Err(reason) => {
+                        match reason {
+                            "expired" => self.pcm_retry.expired += 1,
+                            "no_slack" => self.pcm_retry.no_slack += 1,
+                            _ => self.pcm_retry.discarded += 1,
+                        }
+                        self.pcm_retry.finish(old.diagnostic, reason, None);
+                    }
+                    Ok(Ok(_)) => {
+                        self.pcm_retry.sent += 1;
+                        self.pcm_retry.finish(old.diagnostic, "retry_sent", None);
+                        self.packets += 1;
+                        self.pcm_tick_signal_packets += u64::from(old.has_signal);
+                        self.payload_bytes += old.payload_bytes as u64;
+                        if let (Some(observer), Some(gen)) = (&self.control_observer, old.cache_generation) {
+                            observer.remember_sent(old.seq, gen, old.wire);
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        self.pcm_retry.failed += 1;
+                        self.pcm_retry.last_errno = e.raw_os_error();
+                        self.pcm_retry.finish(old.diagnostic, "retry_failed", e.raw_os_error());
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn pcm_discard_reason(&self, new_error: bool, initial_drops: u64, before: u64) -> Option<&'static str> {
+        if new_error { return Some("new_write_error"); }
+        if self.congestion_drops != initial_drops { return Some("new_write_congested"); }
+        if self.packets == before { return Some("no_new_packet"); }
+        None
+    }
+
+    fn with_pcm_retry_ownership<T>(&self, generation: Option<u64>, write: impl FnOnce() -> Result<T, &'static str>) -> Result<T, &'static str> {
+        let guard = self.pcm_ownership.as_ref().map(|rx| rx.borrow());
+        if !self.owns_audio() { return Err("ownership_lost"); }
+        if guard.as_ref().is_some_and(|state| !state.owned || generation != Some(state.losses)) {
+            return Err("ownership_changed");
+        }
+        let result = write();
+        drop(guard);
+        result
+    }
+
+    pub(crate) fn tick_signal_packets(&self, mixed: &[i16], written: u64) -> u64 {
+        if self.pt == 100 && self.opus.is_none() { return self.pcm_tick_signal_packets; }
+        if mixed.iter().any(|s| *s != 0) { written } else { 0 }
+    }
+
     pub(crate) async fn send_pcm_recovering(&mut self, mut frames: &[i16], expected_generation: Option<u64>,
         recover_until: Option<std::time::Instant>) -> std::io::Result<()> {
         let mut fresh = true;
@@ -442,7 +623,11 @@ impl AudioOut {
                 self.skip_source_frames(SAMPLES_PER_PACKET as u64);
                 frames = &frames[SAMPLES_PER_PACKET * CHANNELS..];
             }
-            for chunk in frames.chunks_exact(SAMPLES_PER_PACKET * CHANNELS) {
+            let current_due = self.pcm_tick_due;
+            let mut chunks = frames.chunks_exact(SAMPLES_PER_PACKET * CHANNELS);
+            while let Some(chunk) = chunks.next() {
+                // The last remaining block belongs to the current slot, even if an expired head was trimmed.
+                self.pcm_tick_due = current_due.map(|due| due - crate::audio_pacing::period(self.sample_rate) * chunks.len() as u32);
                 let mut payload = Vec::with_capacity(chunk.len() * 2);
                 for sample in chunk { payload.extend_from_slice(&sample.to_be_bytes()); }
                 self.send_payload(&payload, SAMPLES_PER_PACKET as u32).await?;
@@ -513,6 +698,7 @@ impl AudioOut {
     }
 
     async fn send_payload(&mut self, payload: &[u8], sample_frames: u32) -> std::io::Result<()> {
+        let ownership_generation = self.pcm_tick_due.and_then(|_| self.pcm_ownership.as_ref().map(|rx| rx.borrow().losses));
         // Recheck ownership after encoding; a resource handover may occur concurrently.
         if !self.owns_audio() {
             self.marker_pending = true;
@@ -544,18 +730,47 @@ impl AudioOut {
         let resend_generation = self.control_observer.as_ref().and_then(|observer| observer.generation());
         let started = self.io_costs.as_ref().map(|_| crate::timing::monotonic_nanos());
         let sent = socket2::SockRef::from(udp).send_with_flags(&wire, libc::MSG_DONTWAIT);
+        if let Some(due) = self.pcm_tick_due {
+            self.pcm_retry.new_writes += 1;
+            self.pcm_retry.max_new_delay_us = self.pcm_retry.max_new_delay_us.max(due.elapsed().as_micros());
+        }
         if let (Some(costs), Some(started)) = (&mut self.io_costs, started) {
             costs.udp.observe(crate::audio_pacing::StageSpan::since(started));
         }
         if let Err(error) = sent {
             if error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == Some(libc::ENOBUFS) {
                 self.congestion_drops = self.congestion_drops.saturating_add(1);
-                self.udp_drop_window.record(&error, crate::timing::monotonic_nanos());
+                let mono_ns = crate::timing::monotonic_nanos();
+                self.udp_drop_window.record(&error, mono_ns);
+                if let Some(due) = self.pcm_tick_due {
+                    let expires = due + crate::audio_pacing::period(self.sample_rate) * 2;
+                    let fresh = Instant::now() < expires;
+                    let diagnostic = self.pcm_retry.sample(rtp, mono_ns, error.raw_os_error());
+                    if fresh {
+                        let pending = PendingPcm { wire, has_signal: payload.iter().any(|b| *b != 0), seq: rtp.seq, diagnostic, payload_bytes: payload.len(), expires,
+                            ownership_generation, cache_generation: resend_generation };
+                        if let Some(old) = self.pending_pcm.replace(pending) {
+                            self.pcm_retry.replaced += 1;
+                            self.pcm_retry.finish(old.diagnostic, "replaced", None);
+                        }
+                        self.pcm_retry.saved += 1;
+                    } else {
+                        self.pcm_retry.expired += 1;
+                        self.pcm_retry.finish(diagnostic, "expired", None);
+                    }
+                }
                 return Ok(());
+            }
+            if self.pcm_tick_due.is_some() {
+                let diagnostic = self.pcm_retry.sample(rtp, crate::timing::monotonic_nanos(), error.raw_os_error());
+                self.pcm_retry.finish(diagnostic, "non_retryable_error", None);
             }
             return Err(error);
         }
         self.payload_bytes = self.payload_bytes.saturating_add(payload.len() as u64);
+        if self.pcm_tick_due.is_some() && payload.iter().any(|b| *b != 0) {
+            self.pcm_tick_signal_packets += 1;
+        }
         if let (Some(observer), Some(generation)) = (&self.control_observer, resend_generation) {
             observer.remember_sent(rtp.seq, generation, wire);
         }
@@ -688,6 +903,11 @@ fn build_sync_packet_for_frames(seq: u16, rtp_ts: u32, ntp_nanos: u64, sample_fr
 
 impl Drop for AudioOut {
     fn drop(&mut self) {
+        if let Some(old) = self.pending_pcm.take() {
+            self.pcm_retry.discarded += 1;
+            self.pcm_retry.finish(old.diagnostic, "stream_retired", None);
+        }
+        if let Some(report) = self.take_pcm_retry_report() { crate::emit_log(&report); }
         if let Some(report) = self.take_udp_drop_report() {
             crate::emit_log(&report);
         }
@@ -1051,6 +1271,194 @@ mod ownership_tests {
         assert_eq!(audio.codec_name(),"PCM");
         assert_eq!(audio.payload_bytes_sent(),(samples.len()*2) as u64);
         assert_ne!(packet[1] & 0x80, 0);
+    }
+
+    #[tokio::test]
+    async fn pcm_diagnostics_bound_new_samples_without_losing_the_previous_window_outcome() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut out = AudioOut::new_pcm(socket, None, [0; 32], 48000);
+        let mut rtp = RtpHeader { seq: u16::MAX, rtp_ts: 123, marker: false };
+        out.pcm_retry.new_writes = 1;
+        let carry = out.pcm_retry.sample(rtp, 100, Some(libc::ENOBUFS));
+        out.take_pcm_retry_report().unwrap();
+        out.pcm_retry.finish(carry, "expired", None);
+        for i in 0..12 {
+            rtp.seq = i;
+            rtp.rtp_ts = 475 + u32::from(i) * 352;
+            let sampled = out.pcm_retry.sample(rtp, 200 + u64::from(i), Some(libc::ENOBUFS));
+            out.pcm_retry.finish(sampled, "no_slack", None);
+        }
+        let report = out.take_pcm_retry_report().unwrap();
+        assert_eq!(report.matches("outcomeMonoNs=").count(), PCM_DETAIL_LIMIT + 1);
+        assert!(report.contains("detailSuppressed=8"));
+        assert!(report.contains(&format!("seq=65535 rtpTs=123 writeMonoNs=100 writeErrno={} outcome=expired", libc::ENOBUFS)));
+        assert!(report.contains("seq=0 rtpTs=475"));
+        assert!(out.take_pcm_retry_report().is_none());
+    }
+
+    #[tokio::test]
+    async fn pcm_retry_uses_each_slot_after_a_late_wake() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixDatagram;
+        let (tx, _rx) = UnixDatagram::pair().unwrap();
+        tx.set_nonblocking(true).unwrap();
+        while tx.send(&[0; 2048]).is_ok() {}
+        let fd: OwnedFd = tx.into();
+        let rate = 44100;
+        let mut audio = AudioOut::new_pcm(UdpSocket::from_std(fd.into()).unwrap(), None, [4;32], rate);
+        let period = crate::audio_pacing::period(rate);
+        let now = Instant::now();
+        let scheduled = now - period * 2;
+        let current = crate::audio_pacing::current_pcm_due(scheduled, 704, rate);
+        assert_eq!(current, now);
+        let samples = [1; SAMPLES_PER_PACKET * CHANNELS * 2];
+        audio.send_main_tick(&samples[..samples.len()/2], None, None, current).await.unwrap();
+        assert_eq!(audio.pending_pcm.take().unwrap().expires, now + period * 2);
+        audio.send_main_tick(&samples, None, Some(now + Duration::from_secs(1)), current).await.unwrap();
+        assert_eq!(audio.pending_pcm.take().unwrap().expires, now + period * 2);
+        assert!(audio.pcm_retry.max_new_delay_us >= period.as_micros());
+    }
+
+    #[tokio::test]
+    async fn pcm_retry_serializes_generation_change_with_write() {
+        use std::sync::mpsc;
+        let ownership = crate::buffered_ownership::BufferedOwnership::default();
+        let gate = Arc::new(AtomicBool::new(false));
+        ownership.publish_with_gate(&gate, true);
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(peer.local_addr().unwrap()).await.unwrap();
+        let mut audio = AudioOut::new_pcm(socket, None, [0;32], 48000);
+        audio.pcm_ownership = Some(ownership.subscribe());
+        audio.set_ownership(gate.clone());
+        let (start, wait) = mpsc::channel();
+        let (entered, attempting) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        let writer_gate = gate.clone();
+        let writer = std::thread::spawn(move || {
+            wait.recv().unwrap();
+            entered.send(()).unwrap();
+            ownership.publish_with_gate(&writer_gate, false);
+            assert!(!writer_gate.load(Ordering::Acquire));
+            ownership.publish_with_gate(&writer_gate, true);
+            done.send(()).unwrap();
+        });
+        let AudioTransport::Realtime(socket) = &audio.transport else { unreachable!() };
+        let wire = [1, 2, 3, 4];
+        audio.with_pcm_retry_ownership(Some(0), || {
+            start.send(()).unwrap();
+            attempting.recv().unwrap();
+            assert_eq!(finished.recv_timeout(Duration::from_millis(20)), Err(mpsc::RecvTimeoutError::Timeout));
+            assert!(gate.load(Ordering::Acquire), "the production gate changed during an in-flight write");
+            assert_eq!(socket2::SockRef::from(socket).send_with_flags(&wire, libc::MSG_DONTWAIT).unwrap(), wire.len());
+            Ok(())
+        }).unwrap();
+        writer.join().unwrap();
+        assert!(audio.with_pcm_retry_ownership::<()>(Some(0), || panic!("stale write")).is_err());
+        let mut received = [0; 4];
+        let size = tokio::time::timeout(Duration::from_secs(1), peer.recv(&mut received)).await.unwrap().unwrap();
+        assert_eq!(&received[..size], &wire);
+    }
+
+    #[tokio::test]
+    async fn pcm_retry_writes_new_first_then_only_the_latest_original_datagram() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixDatagram;
+        use std::time::Instant;
+        let (tx, rx) = UnixDatagram::pair().unwrap();
+        tx.set_nonblocking(true).unwrap();
+        rx.set_nonblocking(true).unwrap();
+        while tx.send(&[0; 2048]).is_ok() {}
+        let fd: OwnedFd = tx.into();
+        let mut audio = AudioOut::new_pcm(UdpSocket::from_std(fd.into()).unwrap(), None, [7; 32], 48000);
+        let samples = [42; SAMPLES_PER_PACKET * CHANNELS];
+        for _ in 0..2 {
+            audio.send_main_tick(&samples, None, None, Instant::now()).await.unwrap();
+        }
+        let mut buf = [0; 2048];
+        while rx.recv(&mut buf).is_ok() {}
+        let silence = [0; SAMPLES_PER_PACKET * CHANNELS];
+        audio.send_main_tick(&silence, None, None, Instant::now()).await.unwrap();
+        let size = rx.recv(&mut buf).unwrap();
+        assert_eq!(&buf[2..4], &2u16.to_be_bytes());
+        assert_eq!(rx.recv(&mut buf).unwrap(), size);
+        let mut header = [0u8; RTP_HEADER_LEN];
+        header[..4].copy_from_slice(&[0x80, 0x80 | 100, 0, 1]);
+        header[4..8].copy_from_slice(&352u32.to_be_bytes());
+        let pcm = 42i16.to_be_bytes().repeat(samples.len());
+        let sealed = chacha_seal(&[7;32], &nonce64(1), &pcm, &header[4..]);
+        assert_eq!(&buf[..size], [header.as_slice(), &sealed, &1u64.to_le_bytes()].concat());
+        assert!(rx.recv(&mut buf).is_err());
+        assert_eq!(audio.packets_sent(), 2);
+        assert_eq!(audio.tick_signal_packets(&silence, 2), 1);
+        let report = audio.take_pcm_retry_report().unwrap();
+        assert!(report.contains("seq=0 rtpTs=0") && report.contains("outcome=replaced"), "{report}");
+        assert!(report.contains("seq=1 rtpTs=352") && report.contains("outcome=retry_sent"), "{report}");
+        assert!(report.contains(&format!("writeErrno={}", libc::EAGAIN)), "{report}");
+        // Reverse the contents: the new packet is audible, the retried one silent.
+        let AudioTransport::Realtime(sock) = &audio.transport else { unreachable!() };
+        while socket2::SockRef::from(sock).send_with_flags(&buf, libc::MSG_DONTWAIT).is_ok() {}
+        audio.send_main_tick(&silence, None, None, Instant::now()).await.unwrap();
+        while rx.recv(&mut buf).is_ok() {}
+        audio.send_main_tick(&samples, None, None, Instant::now()).await.unwrap();
+        assert_eq!(audio.packets_sent(), 4);
+        assert_eq!(audio.tick_signal_packets(&samples, 2), 1);
+    }
+
+    #[tokio::test]
+    async fn pcm_retry_kernel_rejection_is_final() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixDatagram;
+        let (tx, rx) = UnixDatagram::pair().unwrap();
+        tx.set_nonblocking(true).unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let mut buf = [0; RTP_HEADER_LEN + SAMPLES_PER_PACKET * CHANNELS * 2 + 16 + NONCE_TAIL_LEN];
+        while tx.send(&buf).is_ok() {}
+        let fd: OwnedFd = tx.into();
+        let mut audio = AudioOut::new_pcm(UdpSocket::from_std(fd.into()).unwrap(), None, [1; 32], 48000);
+        let samples = [0; SAMPLES_PER_PACKET * CHANNELS];
+        audio.send_main_tick(&samples, None, None, Instant::now()).await.unwrap();
+        assert_eq!(audio.pcm_retry.saved, 1);
+        let _ = audio.take_pcm_retry_report(); // The outcome belongs to the next report.
+        // Make space for exactly the new datagram. Its predecessor must not get another turn.
+        rx.recv(&mut buf).unwrap();
+        audio.send_main_tick(&samples, None, None, Instant::now()).await.unwrap();
+        assert_eq!((audio.packets_sent(), audio.pcm_retry.failed), (1, 1));
+        let report = audio.take_pcm_retry_report().unwrap();
+        assert!(report.contains("seq=0 rtpTs=0") && report.contains("outcome=retry_failed"), "{report}");
+        assert!(report.contains(&format!("retryErrno={}", libc::EAGAIN)), "{report}");
+        assert!(audio.pending_pcm.is_none());
+        while rx.recv(&mut buf).is_ok() {}
+        audio.send_main_tick(&samples, None, None, Instant::now()).await.unwrap();
+        assert_eq!((audio.packets_sent(), audio.pcm_retry.sent), (2, 0));
+    }
+
+    #[tokio::test]
+    async fn pcm_retry_expires_skips_without_slack_and_dies_on_handover() {
+        use std::time::{Duration, Instant};
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(peer.local_addr().unwrap()).await.unwrap();
+        let ownership = crate::buffered_ownership::BufferedOwnership::default();
+        ownership.publish(true);
+        let mut out = AudioOut::new_pcm(socket, None, [0; 32], 48000);
+        out.pcm_ownership = Some(ownership.subscribe());
+        let samples = [0; SAMPLES_PER_PACKET * CHANNELS];
+        for case in 0..3 {
+            let now = Instant::now();
+            out.pending_pcm = Some(PendingPcm { wire: vec![42], has_signal: false, seq: 7, diagnostic: None, payload_bytes: 1,
+                expires: if case == 0 { now } else { now + Duration::from_secs(1) },
+                ownership_generation: Some(0), cache_generation: None });
+            if case == 2 { ownership.publish(false); ownership.publish(true); }
+            let due = if case == 1 { now - crate::audio_pacing::period(48000) } else { now };
+            out.send_main_tick(&samples, None, None, due).await.unwrap();
+            assert!(out.pending_pcm.is_none());
+        }
+        assert_eq!((out.pcm_retry.expired, out.pcm_retry.no_slack, out.pcm_retry.discarded), (1, 1, 1));
+        assert_eq!(out.packets_sent(), 3);
+        let report = out.take_pcm_retry_report().unwrap();
+        assert!(report.contains("newWrites=3") && report.contains("retrySent=0"));
+        assert!(out.take_pcm_retry_report().is_none());
     }
 
     #[tokio::test]

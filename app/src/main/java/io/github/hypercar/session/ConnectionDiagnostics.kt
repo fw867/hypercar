@@ -26,15 +26,28 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
         var closeReason: String? = null, var tcp: String? = null, var reentry: Long? = null,
         var lastInbound: Long? = null,
     ) {
+        val mediaRecent = ArrayDeque<MediaEvent>()
+        val mediaKeyEvents = linkedMapOf<String, MediaEvent>()
+
         fun accepted(at: Long) {
             if (at <= (lastInbound ?: -1L)) return
             if (lastInbound != null || opened?.let { at >= it } == true) reentry = at
             lastInbound = at
         }
-        fun summary() = "diag_clock=uptime_ms anchor_uptime_ms=$anchorUptime anchor_unix_ms=$anchorEpoch " +
+        fun clockAndEvent() = "diag_clock=uptime_ms anchor_uptime_ms=$anchorUptime anchor_unix_ms=$anchorEpoch " +
             "event_rtsp=${rtsp ?: "unknown"} event_open_ms=${opened ?: "unknown"} event_close_ms=${closed ?: "unknown"} " +
-            "event_close=[${closeReason ?: "unknown"}] video_tcp=[${tcp ?: "unknown"}] rfcomm_reentry_ms=${reentry ?: "unknown"}"
+            "event_close=[${closeReason ?: "unknown"}]"
+
+        fun summary() = clockAndEvent() +
+            " video_tcp=[${tcp ?: "unknown"}] rfcomm_reentry_ms=${reentry ?: "unknown"}" + mediaTimeline()
+
+        fun mediaTimeline() = if (mediaRecent.isEmpty()) "" else (mediaKeyEvents.values + mediaRecent)
+                .distinct().sortedBy { it.at }.joinToString(" | ", prefix = " media_timeline=[", postfix = "]") {
+                    "${it.at}ms ${it.kind} ${it.detail}"
+                }
     }
+    private data class MediaEvent(val at: Long, val kind: String, val detail: String)
+    private val mediaProcess = java.util.UUID.randomUUID()
     private var serial = 0L
     private val history = ArrayDeque<Attempt>()
     private val ctrlStages = setOf(Stage.CTRL_REGISTERED, Stage.CTRL_TCP_ACCEPTED, Stage.CTRL_INVITE_HEAD,
@@ -59,6 +72,48 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
             if (tcp.isNotEmpty()) t.tcp = tcp
         }
     }
+
+    @Synchronized internal fun mediaEvent(id: Long, engine: Long, line: String): Boolean {
+        val t = history.find { it.id == id }?.transport?.takeIf { it.engine == engine } ?: return false
+        val parts = line.removePrefix("MEDIA-TIMELINE: ").split(' ', limit = 3)
+        if (parts.size != 3) return false
+        val at = parts[0].toLongOrNull()?.takeIf { it >= t.anchorUptime } ?: return false
+        val kind = parts[1]
+        val event = MediaEvent(at, kind, clean(parts[2]))
+        val persist = when (kind) {
+            "first_video_written", "hid_touch_in" -> {
+                val first = t.mediaKeyEvents.putIfAbsent(kind, event) == null
+                val firstMapped = kind == "hid_touch_in" && event.detail.endsWith("mapped=true") &&
+                    t.mediaKeyEvents.putIfAbsent("first_mapped_touch", event) == null
+                first || firstMapped
+            }
+            "feedback_timeout", "feedback_error" -> {
+                t.mediaKeyEvents.putIfAbsent("first_$kind", event)
+                t.mediaKeyEvents["last_$kind"] = event
+                true
+            }
+            "feedback_queued" -> if (event.detail.endsWith("afterTimeout=true")) {
+                t.mediaKeyEvents["last_feedback_retry"] = event
+                true
+            } else t.mediaKeyEvents.putIfAbsent("first_feedback_queued", event) == null
+            "feedback_ok" -> t.mediaKeyEvents.putIfAbsent("first_feedback_ok", event) == null
+            else -> return false
+        }
+        t.mediaRecent.addLast(event)
+        if (t.mediaRecent.size > 12) t.mediaRecent.removeFirst()
+        return persist
+    }
+
+    @Synchronized internal fun mediaSummaries(): Map<String, String> = buildMap {
+        for (attempt in history) {
+            val transport = attempt.transport?.takeIf { it.mediaRecent.isNotEmpty() } ?: continue
+            val key = "$mediaProcess/${attempt.id}/${transport.engine}"
+            put(key, "ATTEMPT#${attempt.id} process=$mediaProcess engine=${transport.engine} profile=${attempt.profile} " +
+                "outcome=${attempt.outcome} ${transport.clockAndEvent()}${transport.mediaTimeline()} reason=${attempt.reason}")
+        }
+    }
+
+    @Synchronized internal fun exportSnapshot() = report() to mediaSummaries()
 
     @Synchronized fun rfcommAccepted(id: Long, peer: String?, at: Long) {
         val a = history.lastOrNull()?.takeIf { it.id == id && it.ended == null && at >= it.startedUptime } ?: return

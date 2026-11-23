@@ -482,9 +482,38 @@ impl RtspChannel {
     async fn request_resolved(&self, method: &str, path: &str, body: &[u8], content_type: &str,
         extra_headers: &[(&str, String)], timeout: Duration, written: Option<oneshot::Sender<()>>,
         purpose: RequestPurpose) -> Result<RtspMessage, RequestError> {
-        if self.is_closed() { return Err(RequestError::Other("控制通道已关闭".into())); }
+        let feedback = path == "/feedback";
+        if self.is_closed() {
+            if feedback {
+                crate::emit_media_trace(crate::timing::monotonic_nanos() / 1_000_000,
+                    "feedback_error", &format!("RTSP#{} CSeq=NA control_closed_before_queue", self.trace_id));
+            }
+            return Err(RequestError::Other("控制通道已关闭".into()));
+        }
         let deadline = tokio::time::Instant::now() + timeout;
         let cseq = self.next_cseq();
+        if feedback {
+            crate::emit_media_trace(crate::timing::monotonic_nanos() / 1_000_000, "feedback_queued",
+                &format!("RTSP#{} CSeq={cseq} afterTimeout={}", self.trace_id, purpose == RequestPurpose::FeedbackAfterTimeout));
+        }
+        let result = self.request_transaction(method, path, body, content_type, extra_headers,
+            timeout, written, purpose, deadline, cseq).await;
+        if feedback {
+            let (event, detail) = match &result {
+                Ok(reply) if reply.status() == 200 => ("feedback_ok", "status=200".to_owned()),
+                Ok(reply) => ("feedback_error", format!("status={}", reply.status())),
+                Err(RequestError::ReplyTimeout(detail)) => ("feedback_timeout", detail.clone()),
+                Err(error) => ("feedback_error", error.to_string()),
+            };
+            crate::emit_media_trace(crate::timing::monotonic_nanos() / 1_000_000, event,
+                &format!("RTSP#{} CSeq={cseq} {detail}", self.trace_id));
+        }
+        result
+    }
+
+    async fn request_transaction(&self, method: &str, path: &str, body: &[u8], content_type: &str,
+        extra_headers: &[(&str, String)], timeout: Duration, written: Option<oneshot::Sender<()>>,
+        purpose: RequestPurpose, deadline: tokio::time::Instant, cseq: i32) -> Result<RtspMessage, RequestError> {
         let started = std::time::Instant::now();
         let trace = path != "/feedback";
         let kind = crate::resource_trace::trace_kind(method, path, body);

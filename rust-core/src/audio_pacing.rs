@@ -251,7 +251,13 @@ impl Drop for PacingTrace {
     }
 }
 
-fn period(rate: u32) -> Duration { Duration::from_nanos(352 * 1_000_000_000 / u64::from(rate)) }
+pub(crate) fn period(rate: u32) -> Duration { Duration::from_nanos(352 * 1_000_000_000 / u64::from(rate)) }
+
+pub(crate) fn current_pcm_due(scheduled: Instant, missed_frames: u64, rate: u32) -> Instant {
+    let missed_slots = missed_frames / crate::audio_out::SAMPLES_PER_PACKET as u64;
+    let slot_ns = period(rate).as_nanos() as u64;
+    scheduled + Duration::from_nanos(missed_slots.saturating_mul(slot_ns))
+}
 
 pub(crate) const RECOVERY_DEADLINE: Duration = Duration::from_millis(60);
 

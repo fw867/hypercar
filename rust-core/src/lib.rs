@@ -134,6 +134,10 @@ pub(crate) fn emit_pipeline(json: &str) {
     });
 }
 
+pub(crate) fn emit_media_trace(at_ms: u64, event: &str, detail: &str) {
+    emit_log(&format!("MEDIA-TIMELINE: {at_ms} {event} {detail}"));
+}
+
 pub(crate) fn emit_event_channel(id: u64, at: u64, cause: &str, sample: Option<&tcp_diagnostics::TcpSnapshot>) {
     let tcp = sample.and_then(|s| serde_json::to_string(s).ok()).unwrap_or_default();
     call_listener("onEventChannel", |env,obj| {

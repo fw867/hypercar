@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::watch;
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -27,7 +28,18 @@ impl BufferedOwnership {
     pub(crate) fn subscribe(&self) -> watch::Receiver<Ownership> { self.0.subscribe() }
 
     pub(crate) fn publish(&self, owned: bool) {
+        self.update(owned, None);
+    }
+
+    pub(crate) fn publish_with_gate(&self, gate: &AtomicBool, owned: bool) {
+        self.update(owned, Some(gate));
+    }
+
+    fn update(&self, owned: bool, gate: Option<&AtomicBool>) {
         self.0.send_if_modified(|state| {
+            // A PCM retry holds a watch read guard through the nonblocking send.
+            // Publish the packet gate and generation while holding the same write lock.
+            if let Some(gate) = gate { gate.store(owned, Ordering::Release); }
             if state.owned == owned { return false; }
             if !owned {
                 state.losses = state.losses.wrapping_add(1);

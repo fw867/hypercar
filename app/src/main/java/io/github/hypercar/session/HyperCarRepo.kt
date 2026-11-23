@@ -84,6 +84,7 @@ object HyperCarRepo {
 
     private fun finishDiagnostic(outcome: String, reason: String) {
         connectionDiagnostics.finish(connectionAttemptId, outcome, reason)
+        mediaSummaryWrites.trySend(Unit)
         connectionDiagnostics.report().lastOrNull()?.let { log(it) }
     }
 
@@ -93,6 +94,8 @@ object HyperCarRepo {
     internal val oldDeviceReadiness = _oldDeviceReadiness.asStateFlow()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val mediaSummaryWrites = Channel<Unit>(Channel.CONFLATED)
+    @Volatile private var mediaSummaryStore: MediaSummaryStore? = null
 
     @Volatile
     private var initialized = false
@@ -175,6 +178,13 @@ object HyperCarRepo {
                 connectionDiagnostics.engineStarted(attempt, callbackOwner, sessionReceiverMac, SystemClock.uptimeMillis(), System.currentTimeMillis())
                 RustCoreBridge.setListener(EngineEventListener(engineCallbacks, callbackOwner, object : RustCoreBridge.EventListener by rustListener {
                     override fun onLog(line: String) {
+                        if (line.startsWith("MEDIA-TIMELINE: ")) {
+                            if (connectionDiagnostics.mediaEvent(attempt, callbackOwner, line)) {
+                                mediaSummaryWrites.trySend(Unit)
+                            }
+                            scope.launch { rustListener.onLog(line) }
+                            return
+                        }
                         if (!line.startsWith("AUDIO-UDP-DROP: ")) {
                             rustListener.onLog(line)
                             return
@@ -194,8 +204,10 @@ object HyperCarRepo {
                                 if (current()) wifi else "wifiSample=session_changed")
                         }
                     }
-                    override fun onEventChannel(rtsp: Long, uptime: Long, cause: String, videoTcp: String) =
+                    override fun onEventChannel(rtsp: Long, uptime: Long, cause: String, videoTcp: String) {
                         connectionDiagnostics.eventChannel(attempt, callbackOwner, rtsp, uptime, cause, videoTcp)
+                        if (cause != "open") mediaSummaryWrites.trySend(Unit)
+                    }
                     override fun onReceiverAudioTake(taken: Boolean) {
                         val ticket = engineCallbacks.receiverAudioTake(callbackOwner, taken) ?: return
                         appContext()?.let { context ->
@@ -361,6 +373,14 @@ object HyperCarRepo {
             initialized = true
             val app = context.applicationContext
             appCtx = app
+            val summaries = MediaSummaryStore(java.io.File(app.filesDir, "hypercar-media-summaries.txt"))
+            mediaSummaryStore = summaries
+            scope.launch {
+                for (signal in mediaSummaryWrites) {
+                    runCatching { summaries.save(connectionDiagnostics.mediaSummaries()) }
+                        .onFailure { android.util.Log.w("HyperCar", "Media summary write failed", it) }
+                }
+            }
             // 恢复日志记录开关（诊断页切换过则沿用）
             logRecording = SettingsStore.debugLogEnabled
             _snapshots.value = _snapshots.value.copy(logRecording = logRecording)
@@ -3941,11 +3961,19 @@ object HyperCarRepo {
                     history.ifEmpty { _snapshots.value.recentLogs }
                 }
             }
-            if (logs.isEmpty() && connectionDiagnostics.report().isEmpty()) {
+            val (report, liveMedia) = connectionDiagnostics.exportSnapshot()
+            val previousMedia = withContext(Dispatchers.IO) {
+                runCatching { mediaSummaryStore?.previous(liveMedia).orEmpty() }
+                    .getOrElse {
+                        log("LOG: 读取已保存媒体摘要失败 ${it.message}")
+                        emptyList()
+                    }
+            }
+            if (logs.isEmpty() && report.isEmpty() && previousMedia.isEmpty()) {
                 log("LOG: 无日志可导出")
                 return@launch
             }
-            val result = withContext(Dispatchers.IO) { writeDownloadsFile(logs) }
+            val result = withContext(Dispatchers.IO) { writeDownloadsFile(logs, report, previousMedia) }
             result.onSuccess { path ->
                 _snapshots.value = _snapshots.value.copy(lastExportPath = path)
                 log("LOG: ✓ 日志已导出 $path（${logs.size} 行）")
@@ -3956,7 +3984,7 @@ object HyperCarRepo {
     }
 
     /** 写 `Download/HyperCar/hypercar-log-<时间戳>.txt`；Android 10+ 走 MediaStore 免权限。 */
-    private fun writeDownloadsFile(logs: List<String>): Result<String> = runCatching {
+    private fun writeDownloadsFile(logs: List<String>, report: List<String>, previousMedia: List<String>): Result<String> = runCatching {
         val ctx = requireNotNull(appCtx) { "Repo 未初始化" }
         val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
             .format(java.util.Date())
@@ -3968,7 +3996,8 @@ object HyperCarRepo {
             appendLine("# 说明：以下时间戳为本机时间；保留的落盘日志（含上一份轮转，读取失败时回退当前日志）共 ${logs.size} 行")
             appendLine("# 连接摘要：CONTROL_READY=控制就绪；VIDEO_WRITING=已有视频写出；均不代表车机已进入桌面或实际出声")
             appendLine("# ACTIVATION-GAP/PIPELINE.activation_gaps 分别核对邀请、iAP2、资源、主屏及媒体；Wi-Fi iAP2 未就绪是独立观察，不强制套用所有接收端")
-            connectionDiagnostics.report().forEach { appendLine("# $it") }
+            report.forEach { appendLine("# $it") }
+            previousMedia.forEach { appendLine("# SAVED_MEDIA $it") }
             appendLine()
             logs.forEach { appendLine(it) }
         }

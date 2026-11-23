@@ -443,8 +443,7 @@ pub async fn negotiate(
         let unborrow = audio_unborrow.as_ref().filter(|_| response.as_ref().is_some_and(|reply| reply.audio_unborrowed))
             .map(|generation| generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel).wrapping_add(1));
         reply_owner.store(modes.screen_owned(), std::sync::atomic::Ordering::Release);
-        reply_audio.store(modes.audio_owned(), std::sync::atomic::Ordering::Release);
-        reply_buffered.publish(modes.audio_owned());
+        reply_buffered.publish_with_gate(&reply_audio, modes.audio_owned());
         if let Some(unborrow) = unborrow {
             emit_log(&format!("AUDIO-RESUME: RTSP#{rtsp_id} unborrow={unborrow} event=main_audio_returned monoNs={}", crate::timing::monotonic_nanos()));
             if let Some(control) = unborrow_control.upgrade() { control.audio_unborrow_wake.notify_one(); }
@@ -597,8 +596,7 @@ pub async fn negotiate(
     // modesChanged before stream SETUP. Receiver borrow/take requests still gate packets.
     {
         let modes = modes.lock();
-        audio_owned.store(modes.audio_owned(), std::sync::atomic::Ordering::Release);
-        channel.buffered_ownership.publish(modes.audio_owned());
+        channel.buffered_ownership.publish_with_gate(&audio_owned, modes.audio_owned());
     }
     emit_log(&format!("AUDIO: enabled={} preference={} owner_controller={}", p.enable_audio, p.audio_codec, modes.lock().audio_owned()));
     if p.enable_audio && !nbt_mode {
@@ -3111,6 +3109,11 @@ pub(crate) async fn negotiate_realtime_audio(
             }
         };
         let udp = factory.open_udp(&p.car_ip, data_port)?;
+        if matches!(codec, AudioCodec::Pcm | AudioCodec::Pcm441) {
+            let actual = socket2::SockRef::from(&udp).send_buffer_size()
+                .map_or_else(|error| format!("NA error={error}"), |bytes| bytes.to_string());
+            emit_log(&format!("AUDIO-UDP-SNDBUF: RTSP#{} type=100 streamConnectionID={conn_id} dataPort={data_port} soSndbufBytes={actual}", channel.trace_id()));
+        }
         let mut listening = None;
         let sync = if let Some(socket) = local_control {
             match udp.peer_addr() {
@@ -3265,6 +3268,7 @@ fn spawn_event_dispatcher(
         let mut seen_commands: Vec<String> = Vec::new();
         let mut hid_reports: u64 = 0;
         let mut touch_logged: u32 = 0;
+        let mut last_touch_trace = None;
         let mut other_lines: u64 = 0;
         loop {
             let msg = tokio::select! {
@@ -3377,8 +3381,14 @@ fn spawn_event_dispatcher(
                             }
                             continue;
                         }
+                        let payload = consumer_hid.touch_payload(uuid, report);
+                        let touch_trace = if payload.len() >= 5 {
+                            let at = crate::timing::monotonic_nanos() / 1_000_000;
+                            last_touch_trace.is_none_or(|last| at.saturating_sub(last) >= 1000).then_some(at)
+                        } else { None };
+                        let before = touch_logged;
                         handle_hid_report(
-                            consumer_hid.touch_payload(uuid, report),
+                            payload,
                             &touch_tx,
                             display_size,
                             &touch_surface,
@@ -3386,6 +3396,11 @@ fn spawn_event_dispatcher(
                             &mut contact,
                             &mut touch_logged,
                         );
+                        if let Some(at) = touch_trace {
+                            last_touch_trace = Some(at);
+                            crate::emit_media_trace(at, "hid_touch_in",
+                                &format!("RTSP#{} bytes={} mapped={}", control.trace_id(), payload.len(), touch_logged != before));
+                        }
                     }
                 }
                 "setNightMode" => {
