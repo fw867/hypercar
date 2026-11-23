@@ -54,6 +54,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -105,8 +107,10 @@ object HyperCarRepo {
     private var iap2: Iap2Coordinator? = null
 
     @Volatile private var wifiJoiner: WifiJoiner? = null
+    private val bmwWifiHandoff = BmwWifiReconnect.Handoff<WifiJoiner, Network>()
     private val wifiRecoveryLease = io.github.hypercar.net.WifiRecoveryLease<WifiJoiner> { request ->
         if (request.release() == null && wifiJoiner === request) {
+            bmwWifiHandoff.clear(request)
             wifiJoiner = null
             joinedNetwork = null
             joinedSsid = null
@@ -301,6 +305,13 @@ object HyperCarRepo {
     @Volatile private var sessionReceiverMac: String? = null
     @Volatile private var sessionWifiSsid: String? = null
     private val announcedHotspot = AtomicReference<Pair<Long, BluetoothHotspot>?>(null)
+    private class PendingBmwWifi(
+        val attempt: Long,
+        val receiver: String,
+        val network: Network,
+        val credentials: BmwWifiReconnect.Credentials,
+    )
+    private val pendingBmwWifi = AtomicReference<PendingBmwWifi?>(null)
     @Volatile private var wifiStationSnapshot: Triple<Long, Network, String>? = null
     private var wifiReconnectMonitor: ConnectivityManager.NetworkCallback? = null
     private var wifiReconnectCheck: Job? = null
@@ -1291,13 +1302,34 @@ object HyperCarRepo {
 
     private suspend fun resumeKnownCarNetwork(context: Context, advertiser: CarPlayCtrlAdvertiser) {
         val attempt = connectionAttemptId
-        val ssid = currentWifiSsid(context) ?: return
-        val mac = knownWifiReceiver(ssid) ?: return
-        val network = knownWifiNetwork(context, ssid) ?: return
+        val discovery = bmwWifiHandoff.discoveryToken()
+        val retainedRequest = wifiJoiner
+        val retainedNetwork = retainedRequest?.let { request ->
+            request.currentNetwork?.takeIf { request.ownsLiveRequest(it) && request.isReady(it) }
+        }
+        val retainedSsid = joinedSsid?.takeIf {
+            boundNetwork == null && retainedNetwork != null && joinedNetwork == retainedNetwork &&
+                retainedRequest?.requiresDifferentHotspot(it) == false
+        }
+        val ssid = if (discovery != null) retainedSsid ?: currentWifiSsid(context) else null
+        val mac = ssid?.let(::knownWifiReceiver)
+        val network = if (ssid != null && mac != null)
+            retainedNetwork?.takeIf { retainedSsid != null } ?: knownWifiNetwork(context, ssid) else null
         autoConnectChanges.lock()
         try {
             kotlinx.coroutines.currentCoroutineContext().ensureActive()
             if (!sessionLive.get() || connectionAttemptId != attempt || ctrlAdvertiser !== advertiser) return
+            // Only the cached request may publish its handle. Periodic checks can still retry its NSD registration.
+            val provisional = bmwWifiHandoff.provisionalNetwork
+            if (provisional != null && boundNetwork == provisional) {
+                joinedSsid?.let { advertiser.ensureForNetwork(it, network = provisional) }
+                return
+            }
+            if (!bmwWifiHandoff.canCommitDiscovery(discovery) || ssid == null || mac == null || network == null) return
+            if (retainedSsid != null && (retainedRequest == null || wifiJoiner !== retainedRequest ||
+                    !wifiRecoveryLease.isRetained(retainedRequest) || !retainedRequest.ownsLiveRequest(network) ||
+                    !retainedRequest.isReady(network) ||
+                    knownWifiReceiver(ssid) != mac)) return
             val changed = boundNetwork != network || joinedSsid != ssid || wifiReceiverMac != mac
             if (changed) {
                 val cm = context.getSystemService(ConnectivityManager::class.java) ?: return
@@ -1318,6 +1350,31 @@ object HyperCarRepo {
             // 同一网络不会反复重注册；上次注册失败则允许重试。
             advertiser.ensureForNetwork(ssid, network = network)
         } finally { autoConnectChanges.unlock() }
+    }
+
+    /** Both Android loss callbacks are serialized here. A cached association is optional until activation. */
+    private fun releaseLostProvisionalBmwWifi(
+        context: Context, network: Network, expectedRequest: WifiJoiner? = null,
+    ): Boolean {
+        val request = bmwWifiHandoff.provisionalRequest(network) ?: return false
+        if (boundNetwork != network || wifiJoiner !== request ||
+            (expectedRequest != null && request !== expectedRequest)) return false
+        val cm = context.getSystemService(ConnectivityManager::class.java)
+        val monitor = sessionNetworkMonitor
+        sessionNetworkMonitor = null
+        monitor?.let { runCatching { cm?.unregisterNetworkCallback(it) } }
+        wifiJoiner = null
+        boundNetwork = null // Also retires the ctrl listener and any invitation tied to this network.
+        joinedNetwork = null
+        joinedSsid = null
+        wifiReceiverMac = null
+        sessionWifiSsid = null
+        wifiStationSnapshot = null
+        if (cm?.boundNetworkForProcess == network) runCatching { cm.bindProcessToNetwork(null) }
+        request.release(keepConnected = false)
+        bmwWifiHandoff.clear(request)
+        log("BMW-WIFI-RESUME: 缓存热点已断开，保留本轮蓝牙监听，等待新热点参数或车机邀请")
+        return true
     }
 
     private fun watchSessionNetwork(context: Context, expected: Network) {
@@ -1344,12 +1401,13 @@ object HyperCarRepo {
             }
             override fun onLost(network: Network) {
                 if (network != expected || sessionNetworkMonitor !== this) return
-                log("NET-WATCH: network=#$network lost；终止本轮网络，不切到其他网络")
                 val owner = this
                 scope.launch {
                     autoConnectChanges.lock()
                     try {
                         if (sessionNetworkMonitor === owner && boundNetwork == network) {
+                            if (releaseLostProvisionalBmwWifi(context, network)) return@launch
+                            log("NET-WATCH: network=#$network lost；终止本轮网络，不切到其他网络")
                             sessionSockets?.takeIf { it.network == expected }?.invalidate()
                             val pending = connectJob
                             pending?.cancel()
@@ -1695,6 +1753,10 @@ object HyperCarRepo {
             // 它连 iAP2 都不再发起（10-25 日志：10 分钟里 0 次连入）。所以这里改成
             // 「超时只提示、不拆链，继续下一轮等」，直到用户断开 / ACL 断开 / 拿到端点。
             var invitationOnly = false
+            var cachedWifiReceiver = caffTarget?.takeIf {
+                BmwWifiReconnect.canRestore(p.id, manual, it, caffDevice?.address, SettingsStore.isCarPaired(it)) &&
+                    PairingEvidence.read(context.filesDir, it).mayDropProfiles
+            }
             suspend fun waitForInvitation(
                 reason: String,
             ) {
@@ -1726,6 +1788,7 @@ object HyperCarRepo {
                     endpoint =
                         awaitUsableEndpoint(
                             context, coordinator, lastSeen, advertiser, invitationOnly, usesFallbackPhoneIdentity,
+                            cachedWifiReceiver.also { cachedWifiReceiver = null },
                         )
                             ?: if (invitationOnly) null else gatewayFallbackEndpoint(context, lastSeen.get())
                     if (endpoint == null) {
@@ -2088,6 +2151,7 @@ object HyperCarRepo {
     /** 释放保活服务、iAP2、Rust 和 WiFi 绑定；拆除与失败路径共用。 */
     private fun releaseSessionResources(keepListening: Boolean = false, graceful: Boolean = false) {
         engineCallbacks.retire()
+        pendingBmwWifi.set(null)
         SettingsStore.receiverMaxFps = null
         io.github.hypercar.carui.CarDisplayLayout.viewAreaChoices.value = null
         io.github.hypercar.carui.CarReceiverUi.reset()
@@ -2137,7 +2201,8 @@ object HyperCarRepo {
         sessionNetworkMonitor?.let { runCatching { cm?.unregisterNetworkCallback(it) } }
         sessionNetworkMonitor = null
         val request = wifiJoiner
-        val retainNetwork = request?.release()
+        val provisional = boundNetwork?.let(bmwWifiHandoff::provisionalRequest)
+        val retainNetwork = request?.release(keepConnected = request !== provisional)
         if (request != null && retainNetwork != null) {
             request.unbindProcess()
             wifiRecoveryLease.retain(request, requestReceiver.orEmpty())
@@ -2145,6 +2210,7 @@ object HyperCarRepo {
             log("WIFI-LEASE: CarPlay 暂停/结束，保留已连接车机热点；仅解绑进程，不撤销热点请求")
         } else {
             releaseRetainedWifi()
+            request?.let(bmwWifiHandoff::clear)
             wifiJoiner = null
             joinedSsid = null
             joinedNetwork = null
@@ -2416,7 +2482,10 @@ object HyperCarRepo {
                 val association = request.currentNetwork
                 if (association != null && request.ownsLiveRequest(association)) {
                     val confirmedSame = association == matchingAssociation
-                    if (confirmedSame || !request.requiresDifferentHotspot(endpoint.ssid)) {
+                    val freshCredentialsReplaceCached = request === bmwWifiHandoff.cachedRequest &&
+                        endpoint.passphrase != null && endpoint.canRequestHotspot(currentBluetoothHotspot(attempt)) &&
+                        !request.ownsHotspot(association, endpoint.ssid, endpoint.passphrase)
+                    if (!freshCredentialsReplaceCached && (confirmedSame || !request.requiresDifferentHotspot(endpoint.ssid))) {
                         protectedSameAssociation = true
                         // All live requests are protected, not only those parked after a stop.
                         // Missing credentials/capabilities are not evidence of a different AP.
@@ -2432,6 +2501,11 @@ object HyperCarRepo {
                         request.release(keepConnected = false)
                         releaseRetainedWifi()
                         if (wifiJoiner === request) wifiJoiner = null
+                        bmwWifiHandoff.clear(request)
+                        if (freshCredentialsReplaceCached) {
+                            if (reuse == association) reuse = null
+                            if (confirmedSame) protectedSameAssociation = false
+                        }
                     }
                 }
             }
@@ -2440,6 +2514,7 @@ object HyperCarRepo {
                 // Keep a specifier request owning this network alive; retire callbacks for other links.
                 if (wifiJoiner?.ownsBinding(reuse) == false && wifiJoiner?.ownsLiveRequest(reuse) == false) {
                     if (wifiJoiner?.release() != null) return null
+                    wifiJoiner?.let(bmwWifiHandoff::clear)
                     wifiJoiner = null
                 }
                 if (cm.boundNetworkForProcess != reuse && !cm.bindProcessToNetwork(reuse)) return null
@@ -2461,6 +2536,7 @@ object HyperCarRepo {
             sessionNetworkMonitor?.let { runCatching { cm.unregisterNetworkCallback(it) } }
             sessionNetworkMonitor = null
             val previousNetwork = boundNetwork
+            wifiJoiner?.let(bmwWifiHandoff::clear)
             wifiJoiner = null
             if (previousNetwork != null && cm.boundNetworkForProcess == previousNetwork)
                 runCatching { cm.bindProcessToNetwork(null) }
@@ -2468,23 +2544,8 @@ object HyperCarRepo {
             joinedNetwork = null
             joinedSsid = null
         } finally { autoConnectChanges.unlock() }
-        lateinit var joiner: WifiJoiner
-        joiner = WifiJoiner(context, diagnostic = ::log, maySubmitRequest = {
-            wifiJoiner === joiner && endpoint.canRequestHotspot(currentBluetoothHotspot(attempt))
-        }) {
-            scope.launch {
-                autoConnectChanges.lock()
-                try {
-                    if (wifiJoiner !== joiner || joiner.release() != null) return@launch
-                    if (wifiRecoveryLease.isRetained(joiner)) {
-                        releaseRetainedWifi()
-                        log("WIFI-LEASE: 待机中的局域网请求已丢失，释放旧租约")
-                    } else if (sessionLive.get()) {
-                        log("WIFI: 本轮局域网请求已丢失；回调本身不判定热点关闭或断链发起方")
-                        disconnect(userInitiated = false, expectedAttempt = connectionAttemptId, reason = "车机局域网请求丢失")
-                    }
-                } finally { autoConnectChanges.unlock() }
-            }
+        val joiner = createWifiJoiner(context) {
+            wifiJoiner === it && endpoint.canRequestHotspot(currentBluetoothHotspot(attempt))
         }
         autoConnectChanges.lock()
         try { ensureCurrent(); wifiJoiner = joiner } finally { autoConnectChanges.unlock() }
@@ -2527,9 +2588,94 @@ object HyperCarRepo {
             joinedSsid = ssid
             joinedNetwork = effective
             watchSessionNetwork(context, effective)
+            val hotspot = currentBluetoothHotspot(attempt)
+            if (ssid != null && psk != null && hotspot != null && endpoint.canRequestHotspot(hotspot) &&
+                BmwWifiReconnect.canRemember(headUnitProfile.id, psk) && joiner.ownsHotspot(effective, ssid, psk)) {
+                pendingBmwWifi.set(PendingBmwWifi(attempt, hotspot.peer, effective, BmwWifiReconnect.Credentials(ssid, psk)))
+            }
             log("WIFI +${stageMs()}ms ✓ 已绑定车机网络：${describeNetwork(context, effective)}")
             return effective
         } finally { autoConnectChanges.unlock() }
+    }
+
+    private fun createWifiJoiner(context: Context, maySubmitRequest: (WifiJoiner) -> Boolean): WifiJoiner {
+        lateinit var joiner: WifiJoiner
+        joiner = WifiJoiner(context, diagnostic = ::log, maySubmitRequest = { maySubmitRequest(joiner) }) {
+            scope.launch {
+                autoConnectChanges.lock()
+                try {
+                    if (wifiJoiner !== joiner) return@launch
+                    val provisional = bmwWifiHandoff.provisionalNetwork
+                    if (provisional != null && releaseLostProvisionalBmwWifi(context, provisional, joiner)) return@launch
+                    if (joiner.release() != null) return@launch
+                    if (wifiRecoveryLease.isRetained(joiner)) {
+                        releaseRetainedWifi()
+                        log("WIFI-LEASE: 待机中的局域网请求已丢失，释放旧租约")
+                    } else if (sessionLive.get()) {
+                        log("WIFI: 本轮局域网请求已丢失；回调本身不判定热点关闭或断链发起方")
+                        disconnect(userInitiated = false, expectedAttempt = connectionAttemptId, reason = "车机局域网请求丢失")
+                    }
+                } finally { autoConnectChanges.unlock() }
+            }
+        }
+        return joiner
+    }
+
+    private suspend fun restoreBmwWifi(
+        context: Context,
+        receiver: String,
+        advertiser: CarPlayCtrlAdvertiser,
+        mayRestore: () -> Boolean,
+    ) {
+        val credentials = runCatching { BmwWifiReconnect.load(context, receiver) }
+            .onFailure { log("BMW-WIFI-RESUME: 缓存读取失败（${it.javaClass.simpleName}）") }.getOrNull()
+        if (credentials == null) {
+            log("BMW-WIFI-RESUME: 尚无已验证的热点缓存，继续等待车机")
+            return
+        }
+        val joiner = createWifiJoiner(context) { bmwWifiHandoff.isJoining(it) && mayRestore() }
+        val reserved = autoConnectChanges.withLock { mayRestore() && bmwWifiHandoff.begin(joiner) }
+        if (!reserved) return
+        try {
+            log("BMW-WIFI-RESUME: 尝试重新接入已配对车机的专用 Wi-Fi")
+            val result = withTimeoutOrNull(12_000) {
+                joiner.joinCarHotspotSilently(credentials.ssid, credentials.passphrase)
+            }
+            val network = (result as? WifiJoiner.JoinResult.Joined)?.network
+            if (network == null) {
+                log("BMW-WIFI-RESUME: 未取得车机 Wi-Fi，继续等待本轮蓝牙参数或车机邀请")
+                return
+            }
+            autoConnectChanges.lock()
+            try {
+                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                if (!mayRestore() || !joiner.ownsHotspot(network, credentials.ssid, credentials.passphrase) ||
+                    !joiner.bindProcess(network)) return
+                bmwWifiHandoff.bind(joiner, network)
+                wifiJoiner = joiner
+                wifiReceiverMac = receiver
+                CarProfileGuard.noteCar(receiver)
+                sessionWifiSsid = credentials.ssid
+                boundNetwork = network
+                joinedSsid = credentials.ssid
+                joinedNetwork = network
+                watchSessionNetwork(context, network)
+                advertiser.ensureForNetwork(credentials.ssid, network = network)
+                log("BMW-WIFI-RESUME: 已接入专用 Wi-Fi 并开始等待车机邀请")
+            } finally { autoConnectChanges.unlock() }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            log("BMW-WIFI-RESUME: 入网异常（${error.javaClass.simpleName}），继续等待车机")
+        } finally {
+            if (bmwWifiHandoff.isJoining(joiner)) {
+                try {
+                    joiner.release(keepConnected = false)
+                } finally {
+                    bmwWifiHandoff.finishJoining(joiner)
+                }
+            }
+        }
     }
 
     /** Live network diagnostics; no saved credentials. */
@@ -3110,6 +3256,21 @@ object HyperCarRepo {
                                 bondedNameOf(mac),
                             )
                             SettingsStore.markCarPaired(mac, carName)
+                            val candidate = pendingBmwWifi.getAndSet(null)
+                            val context = appContext()
+                            if (context != null && candidate != null && candidate.attempt == diagnosticId &&
+                                candidate.network == sessionSockets?.network && candidate.receiver.equals(mac, true)) {
+                                scope.launch {
+                                    autoConnectChanges.lock()
+                                    try {
+                                        if (connectionAttemptId == candidate.attempt && SettingsStore.isCarPaired(mac) &&
+                                            PairingEvidence.read(context.filesDir, mac).mayDropProfiles) {
+                                            runCatching { BmwWifiReconnect.save(context, mac, candidate.credentials) }
+                                                .onFailure { log("BMW-WIFI-RESUME: 缓存保存失败（${it.javaClass.simpleName}）") }
+                                        }
+                                    } finally { autoConnectChanges.unlock() }
+                                }
+                            }
                             val rememberedSsid = sessionWifiSsid ?: joinedSsid
                             if (!rememberedSsid.isNullOrBlank()) SettingsStore.rememberCarNetwork(rememberedSsid, mac)
                             val from = when {
@@ -3380,6 +3541,7 @@ object HyperCarRepo {
         advertiser: CarPlayCtrlAdvertiser,
         invitationOnly: Boolean,
         usesFallbackPhoneIdentity: Boolean,
+        cachedWifiReceiver: String?,
     ): CarPlayEndpoint? = withTimeoutOrNull(ENDPOINT_TIMEOUT_MILLIS) {
         val diagnosticId = connectionAttemptId
         // BMW's second-entry box trace still obtains Bluetooth credentials and a fresh ctrl invite.
@@ -3418,6 +3580,16 @@ object HyperCarRepo {
             // 端口阶段（awaitUsableEndpoint 已返回）再来的 0x4301：记下来供端口循环热切换
             recordLateAirplayEndpoint(coordinator, diagnosticId, endpoint)
         }
+        val cachedWifiJob = cachedWifiReceiver?.let { receiver ->
+            launch {
+                delay(2_000) // Give the live Bluetooth handoff the first opportunity.
+                fun mayRestore() = sessionLive.get() && connectionAttemptId == diagnosticId && !userDisconnectRequested &&
+                    SettingsStore.targetCarMac.equals(receiver, true) && ctrlAdvertiser === advertiser &&
+                    boundNetwork == null && wifiJoiner == null && joinHints.get() == null &&
+                    standbyEndpoint.get() == null && !advertiser.hasUnresolvedOrPublishedInvite
+                if (mayRestore()) restoreBmwWifi(context, receiver, advertiser, ::mayRestore)
+            }
+        }
         try {
             var usable: CarPlayEndpoint? = null
             var ticks = 0
@@ -3435,8 +3607,11 @@ object HyperCarRepo {
                 if (boundNetwork != null) connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.WIFI_BOUND)
                 val next = standbyEndpoint.getAndSet(null)
                     ?: withTimeoutOrNull(ENDPOINT_TICK_MILLIS) { callbacks.receive() }
-                if (next != null) connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.IAP2_PARAMETERS,
-                    "wifiCredentials=${!next.ssid.isNullOrBlank()} endpoint=${next.ipAddresses.isNotEmpty()}")
+                if (next != null) {
+                    cachedWifiJob?.cancelAndJoin()
+                    connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.IAP2_PARAMETERS,
+                        "wifiCredentials=${!next.ssid.isNullOrBlank()} endpoint=${next.ipAddresses.isNotEmpty()}")
+                }
                 if (next == null) {
                     ticks++
                     // 手动连接可以早于车机热点出现。等待期间也检查已配对网络，
@@ -3445,7 +3620,9 @@ object HyperCarRepo {
                     // ① 车机已经来邀请过（GET /ctrl-int/1/connect）→ 直接用邀请方 IP 当端点。
                     //    BMW MGU-55 实测：清单里声明「0x4301 不发」，等它是死等；而邀请一旦
                     //    到达，TCP 对端地址就是车机在热点网段上的地址，AirPlay 控制面在 7000。
-                    val inviteIp = usableCtrlInvitation(advertiser)?.host
+                    val inviteIp = autoConnectChanges.withLock {
+                        usableCtrlInvitation(advertiser)?.also { bmwWifiHandoff.confirm(it.network) }?.host
+                    }
                     if (inviteIp != null) {
                         val base = lastSeen.get()
                         log("SESSION: ✓ 车机已邀请（$inviteIp）——用它当 AirPlay 端点 :7000")
@@ -3636,6 +3813,7 @@ object HyperCarRepo {
                 // Only fresh coordinator callbacks reach here; cached/scanned endpoints
                 // are gated separately during fallback. A fresh 0x4301 is also a receiver invitation.
                 if (!headUnitProfile.requireFreshCtrlInvite && pickHost(merged) != null) {
+                    autoConnectChanges.withLock { boundNetwork?.let(bmwWifiHandoff::confirm) }
                     usable = merged
                     continue
                 }
@@ -3654,6 +3832,7 @@ object HyperCarRepo {
             awaitingCarInvitation = false
             usable
         } finally {
+            cachedWifiJob?.cancel()
             densoProbe?.cancel()
             callbacks.close()
         }
