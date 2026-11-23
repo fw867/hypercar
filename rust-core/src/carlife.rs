@@ -336,14 +336,21 @@ impl CarLifeHub {
                         }
                     }
                 }
-                if sockets.len()!=ports.len() {
+                // 9440 是小米/三星 CarLife 的私有 DATA 通道，公版没有。按需补一条：
+                // 连不上不影响本轮（公版就是没有这一路），连上就按 DATA 通道接管。
+                if sockets.len() == ports.len() && !ports.contains(&PORT_DATA) {
+                    if let Some(Ok(socket)) = stop.dial(&md_host, PORT_DATA).await {
+                        sockets.push(socket);
+                    }
+                }
+                if sockets.len()<ports.len() {
                     drop(sockets);
                     tokio::select! { biased; _=stop.cancelled()=>return, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
                     continue;
                 }
                 if stop.is_retired() { return; }
                 first_round_pending = false;
-                emit_log(&format!("CARWITH-HS: all {} channels connected; start fresh 4.1 handshake", ports.len()));
+                emit_log(&format!("CARWITH-HS: all {} channels connected; start fresh 4.1 handshake", sockets.len()));
                 queue.lock().clear();
                 let _ = events_task.send(CarLifeEvent::SourceReset { cache_cleared: None });
                 let state=session::Shared::new(Mutex::new(session::Session::default()));

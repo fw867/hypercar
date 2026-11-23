@@ -5173,6 +5173,22 @@ object HyperCarRepo {
      * 由用户自己进入「无线连接」并停在等待页。Rust 侧同时在六路端口上守候，等它开监听后接管。
      */
     private suspend fun launchSystemCarLife(ctx: android.content.Context, attempt: Long): String {
+        // 三星车联：直接落到「连接汽车」页，比停在它的启动器页少走两步。
+        // 该 Activity 在 SM-S9380 上能从冷启动直接拉起（2026-11-23 实测，force-stop 后仍可）。
+        val explicit = listOf(
+            "com.samsung.android.carlink/.setting.activity.carlife.CarLifeConnectCarActivity",
+        )
+        for (component in explicit) {
+            val intent = android.content.Intent().apply {
+                setClassName(component.substringBefore('/'), component.substringAfter('/'))
+                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (runCatching { ctx.startActivity(intent); true }.getOrDefault(false)) {
+                val message = "已打开三星车联「连接汽车」页；请点「百度 CarLife+」→「WLAN 连接」→「开始连接」"
+                log("SYSTEM-CARLIFE: attempt=$attempt $message")
+                return message
+            }
+        }
         val pkg = io.github.hypercar.session.StartupRequirements.systemCarLifePackage(ctx)
         if (pkg != null) {
             val intent = runCatching { ctx.packageManager.getLaunchIntentForPackage(pkg) }.getOrNull()
