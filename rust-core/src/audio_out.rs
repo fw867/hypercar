@@ -134,6 +134,30 @@ impl AudioResumeTrace {
     }
 }
 
+#[derive(Default)]
+struct UdpDropWindow {
+    first_mono_ns: u64,
+    last_mono_ns: u64,
+    would_block: u64,
+    would_block_errno: Option<i32>,
+    enobufs: u64,
+}
+
+impl UdpDropWindow {
+    fn record(&mut self, error: &std::io::Error, mono_ns: u64) {
+        if self.would_block == 0 && self.enobufs == 0 {
+            self.first_mono_ns = mono_ns;
+        }
+        self.last_mono_ns = mono_ns;
+        if error.raw_os_error() == Some(libc::ENOBUFS) {
+            self.enobufs += 1;
+        } else {
+            self.would_block += 1;
+            self.would_block_errno = error.raw_os_error();
+        }
+    }
+}
+
 /// CarPlay 音频发送器。
 pub struct AudioOut {
     transport: AudioTransport,
@@ -156,6 +180,7 @@ pub struct AudioOut {
     /** 已发包数（对外统计）。 */
     packets: u64,
     pub(crate) congestion_drops: u64,
+    udp_drop_window: UdpDropWindow,
     payload_bytes: u64,
     /** 同步包自己的序号（与音频 RTP 序号无关，独立递增）。 */
     sync_seq: u16,
@@ -200,6 +225,7 @@ impl AudioOut {
             pt: payload_type,
             packets: 0,
             congestion_drops: 0,
+            udp_drop_window: UdpDropWindow::default(),
             payload_bytes: 0,
             sync_seq: 0,
             marker_pending: true,
@@ -291,6 +317,21 @@ impl AudioOut {
         });
     }
     pub fn stream_type(&self) -> i64 { self.pt as i64 }
+
+    pub(crate) fn take_udp_drop_report(&mut self) -> Option<String> {
+        let window = std::mem::take(&mut self.udp_drop_window);
+        if window.would_block == 0 && window.enobufs == 0 { return None; }
+        let stream = self.pacing_id.map_or_else(|| "RTSP#NA streamConnectionID=NA".to_owned(),
+            |id| format!("RTSP#{} streamConnectionID={}", id.rtsp, id.stream_id));
+        let anchor = crate::audio_pacing::boot_clock_anchor()
+            .map_or_else(|| "NA".to_owned(), |(mono, boot)| format!("{mono},{boot}"));
+        let would_block_errno = window.would_block_errno.map_or_else(|| "NA".to_owned(), |n| n.to_string());
+        Some(format!(
+            "AUDIO-UDP-DROP: {stream} type={} firstMonoNs={} lastMonoNs={} clockAnchorMonoBootNs={anchor} wouldBlock={} enobufs={} wouldBlockErrno={would_block_errno} enobufsErrno={} totalDrops={}",
+            self.pt, window.first_mono_ns, window.last_mono_ns, window.would_block, window.enobufs,
+            libc::ENOBUFS, self.congestion_drops,
+        ))
+    }
     fn is_aac(&self) -> bool { matches!(self.pt, 102 | 103) && self.opus.is_none() }
     pub fn codec_name(&self) -> &'static str { if self.opus.is_some() { "OPUS" } else if self.is_aac() { "AAC" } else if self.pt==100 { "PCM" } else { "" } }
     pub fn payload_bytes_sent(&self) -> u64 {
@@ -509,6 +550,7 @@ impl AudioOut {
         if let Err(error) = sent {
             if error.kind() == std::io::ErrorKind::WouldBlock || error.raw_os_error() == Some(libc::ENOBUFS) {
                 self.congestion_drops = self.congestion_drops.saturating_add(1);
+                self.udp_drop_window.record(&error, crate::timing::monotonic_nanos());
                 return Ok(());
             }
             return Err(error);
@@ -644,9 +686,18 @@ fn build_sync_packet_for_frames(seq: u16, rtp_ts: u32, ntp_nanos: u64, sample_fr
     packet
 }
 
+impl Drop for AudioOut {
+    fn drop(&mut self) {
+        if let Some(report) = self.take_udp_drop_report() {
+            crate::emit_log(&report);
+        }
+    }
+}
+
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
+    use super::buffered::tests::{accept_start, control_pair};
     use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
     #[tokio::test]
@@ -1020,6 +1071,10 @@ mod ownership_tests {
             .await.expect("an unwritable data port must not hold the audio pump").unwrap();
         assert_eq!((sender.packets_sent(), sender.payload_bytes_sent()), (0, 0));
         assert_eq!(sender.congestion_drops, 1);
+        let diagnostic = sender.take_udp_drop_report().expect("record the kernel rejection");
+        assert!(diagnostic.contains("wouldBlock=1 enobufs=0"));
+        assert!(diagnostic.contains(&format!("wouldBlockErrno={}", libc::EAGAIN)));
+        assert!(sender.take_udp_drop_report().is_none());
         let mut wire = [0; 2048];
         loop {
             match rx.recv(&mut wire) {
@@ -1035,6 +1090,16 @@ mod ownership_tests {
         assert_eq!(u64::from_le_bytes(wire[n-8..n].try_into().unwrap()), 1);
         assert_ne!(wire[1] & 0x80, 0);
         assert_eq!((sender.packets_sent(), sender.payload_bytes_sent()), (1, 64));
+    }
+
+    #[test]
+    fn udp_drop_report_keeps_enobufs_separate_from_would_block() {
+        let mut drops = UdpDropWindow::default();
+        drops.record(&std::io::Error::from_raw_os_error(libc::ENOBUFS), 12);
+        drops.record(&std::io::Error::from_raw_os_error(libc::EAGAIN), 14);
+        drops.record(&std::io::Error::from_raw_os_error(libc::ENOBUFS), 20);
+        assert_eq!((drops.would_block, drops.enobufs), (1, 2));
+        assert_eq!((drops.first_mono_ns, drops.last_mono_ns), (12, 20));
     }
 
     #[tokio::test]

@@ -938,6 +938,9 @@ async fn audio_pump(
                 // 接收端会表现为 late/discontinuity 增长、听感断续。
                 if rate_mark.elapsed() >= Duration::from_secs(1) {
                     let secs = rate_mark.elapsed().as_secs_f64().max(0.001);
+                    if let Some(report) = out.as_mut().and_then(|audio| audio.take_udp_drop_report()) {
+                        emit_log(&report);
+                    }
                     emit_log(&format!(
                         "AUDIO: 发包 {:.0}/s（应 {:.0}/s） 队列 media={}ms tts={}ms vr={}ms owner_phone={} blocked_samples={} udp_congestion_drops={} aac_queue_dropped_frames={}",
                         sent_packets as f64 / secs,

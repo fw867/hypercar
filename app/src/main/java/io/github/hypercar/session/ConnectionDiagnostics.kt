@@ -120,6 +120,7 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
 
     internal enum class Observation(val label: String) {
         CARD_UNLOCKED("已刷卡"), ABOUT_TO_SELECT_CARPLAY("即将点旧设备 CarPlay"),
+        OLD_CARPLAY_ERROR("旧设备 CarPlay 报错"), NEW_LIST_PHONE_SELECTED("在连接新设备列表点手机"),
         ACL_UP("车机蓝牙 ACL 连上"), ACL_DOWN("车机蓝牙 ACL 断开"),
         MDNS_LOCAL_ANNOUNCEMENT("本机完整 mDNS 通告（最近观察）"),
         MDNS_PEER_QUERY("对端 CarPlay ctrl mDNS 查询（最近观察）"),

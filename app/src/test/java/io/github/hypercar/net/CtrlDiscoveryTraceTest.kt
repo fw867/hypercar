@@ -40,6 +40,26 @@ class CtrlDiscoveryTraceTest {
         } finally { scope.cancel() }
     }
 
+    @Test fun overlappingMarkersKeepEndpointChangesUntilTheirOwnDeadline() = runBlocking {
+        var now = 0L
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Unconfined)
+        val lines = mutableListOf<String>()
+        try {
+            val trace = CtrlDiscoveryTrace({ now }, { 100_000 + now }, scope, lines::add)
+            trace.mark(clickState = "event=click-state currentPort=37611")
+            now = 5_000
+            trace.mark(clickState = "event=click-state currentPort=37611")
+            repeat(140) { trace.record("event=query") }
+            now = 30_000
+            trace.record("event=listener-close closedPort=37611")
+            now++
+            trace.record("event=listener-open currentPort=45678")
+            assertEquals(listOf(1, 2), lines.filter { "event=listener-close" in it }.map { it.substringAfter("marker=").substringBefore(" ").toInt() })
+            assertEquals(1, lines.count { "marker=2 " in it && "event=listener-open" in it })
+            assertEquals(0, lines.count { "marker=1 " in it && "event=listener-open" in it })
+        } finally { scope.cancel() }
+    }
+
     @Test fun recordingInvitationDoesNotWaitForDiskWriter() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val writerStarted = CompletableDeferred<Unit>()

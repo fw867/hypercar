@@ -151,7 +151,7 @@ pub(crate) struct AudioIoCosts {
     pub udp: StagePeak,
 }
 
-fn boot_clock_anchor() -> Option<(u64, u64)> {
+pub(crate) fn boot_clock_anchor() -> Option<(u64, u64)> {
     #[cfg(target_os = "android")]
     {
         let before = crate::timing::monotonic_nanos();

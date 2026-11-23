@@ -310,6 +310,12 @@ private fun DeveloperMenuSection() {
             CapsuleButton("即将点旧设备 CarPlay", onClick = {
                 experimentResult = HyperCarRepo.markConnectionExperiment(HyperCarRepo.ExperimentMarker.ABOUT_TO_SELECT_CARPLAY)
             })
+            CapsuleButton("旧设备 CarPlay 报错", onClick = {
+                experimentResult = HyperCarRepo.markConnectionExperiment(HyperCarRepo.ExperimentMarker.OLD_CARPLAY_ERROR)
+            })
+            CapsuleButton("在连接新设备列表点手机", onClick = {
+                experimentResult = HyperCarRepo.markConnectionExperiment(HyperCarRepo.ExperimentMarker.NEW_LIST_PHONE_SELECTED)
+            })
             CapsuleButton("复制本轮连接快照", enabled = !copying, onClick = copy@{
                 if (copying) return@copy
                 copying = true

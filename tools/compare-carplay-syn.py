@@ -13,11 +13,45 @@ EVENT = re.compile(r"CTRL-CLICK: marker=(\d+) deltaMs=(-?\d+) epochMs=(\d+) elap
 FIELDS = ("frame.time_epoch", "ip.src", "ipv6.src", "ip.dst", "ipv6.dst", "tcp.dstport")
 
 
+def select_anchor(lines, marker=None, epoch_ms=None):
+    anchors = [(int(m[2]), int(m[1])) for line in lines if (m := ANCHOR.search(line))]
+    candidates = sorted({(at, number) for at, number in anchors
+                         if (marker is None or number == marker) and (epoch_ms is None or at == epoch_ms)})
+    if not candidates:
+        raise ValueError("No matching CTRL-CLICK anchor")
+    if marker is not None and len(candidates) > 1:
+        choices = ", ".join(str(at) for at, _ in candidates)
+        raise ValueError(f"Marker {marker} is ambiguous; select --epoch-ms from: {choices}")
+    if epoch_ms is not None and len(candidates) > 1:
+        raise ValueError(f"Multiple markers at epochMs={epoch_ms}; also select --marker")
+    return candidates[-1]
+
+
 def endpoint_events(lines, marker, anchor):
     events = {}
+    # Numbering restarts in each process. Collect overlapping legacy windows only
+    # from the process that produced the selected anchor.
+    selected = False
+    anchors = {}
     for line in lines:
+        header = ANCHOR.search(line)
+        if header:
+            number, epoch = int(header[1]), int(header[2])
+            if anchors and number <= next(reversed(anchors)):
+                if selected:
+                    break
+                anchors.clear()
+                events.clear()
+            anchors[number] = epoch
+            selected = selected or (number, epoch) == (marker, anchor)
+            continue
         match = EVENT.search(line)
-        if not match or int(match[1]) != marker or abs(int(match[3]) - anchor - int(match[2])) > 1000:
+        if not match:
+            continue
+        event_anchor = anchors.get(int(match[1]))
+        if event_anchor is None or abs(int(match[3]) - event_anchor - int(match[2])) > 1000:
+            continue
+        if not -15_000 <= int(match[3]) - anchor <= 30_000:
             continue
         fields = dict(re.findall(r"\b(event|attempt|currentPort|closedPort)=(\S+)", match[4]))
         kind = fields.get("event")
@@ -64,14 +98,16 @@ def main():
     parser.add_argument("--car", required=True, action="append", type=ip_address, help="Car source IP; repeat for IPv6")
     parser.add_argument("--phone", required=True, action="append", type=ip_address, help="Phone IP; repeat for IPv6 or an old address")
     parser.add_argument("--old-port", action="append", type=int, default=[], help="Known previous CarPlay control port from earlier logs")
+    parser.add_argument("--marker", type=int, help="Select a CTRL-CLICK marker number (default: latest)")
+    parser.add_argument("--epoch-ms", type=int, help="Exact epochMs of the CTRL-CLICK anchor")
     parser.add_argument("--tshark", default="tshark", help="Path to the Wireshark command-line decoder")
     args = parser.parse_args()
 
     lines = args.log.read_text(encoding="utf-8-sig").splitlines()
-    anchors = [(int(match[2]), int(match[1])) for line in lines if (match := ANCHOR.search(line))]
-    if not anchors:
-        parser.error("No CTRL-CLICK clock anchor in the log")
-    anchor, marker = max(anchors)
+    try:
+        anchor, marker = select_anchor(lines, args.marker, args.epoch_ms)
+    except ValueError as error:
+        parser.error(str(error))
     events = endpoint_events(lines, marker, anchor)
     cmd = [args.tshark, "-r", str(args.capture), "-Y", "tcp.flags.syn == 1 && tcp.flags.ack == 0",
            "-T", "fields", "-E", "occurrence=f"]

@@ -179,7 +179,7 @@ class Iap2Bluetooth(
         }
         acceptedSockets.incrementAndGet()
         lastAcceptAt = SystemClock.elapsedRealtime()
-        log("BT-ACCEPT: entry=$tag attempt=${diagnosticAttempt()} acceptedUptimeMs=$acceptedAt " +
+        log("BT-ACCEPT: entry=$tag attempt=${diagnosticAttempt()} acceptedUptimeMs=$acceptedAt elapsedMs=$lastAcceptAt epochMs=${System.currentTimeMillis()} " +
             "listenerGeneration=$epoch peer=${safeAddress(socket.remoteDevice)} ${diagnosticSummary()}")
         handleIncomingSocket(socket, epoch, tag, acceptedAt)
     }

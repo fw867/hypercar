@@ -174,6 +174,26 @@ object HyperCarRepo {
                 SettingsStore.videoCapabilities.begin(videoGeneration)
                 connectionDiagnostics.engineStarted(attempt, callbackOwner, sessionReceiverMac, SystemClock.uptimeMillis(), System.currentTimeMillis())
                 RustCoreBridge.setListener(EngineEventListener(engineCallbacks, callbackOwner, object : RustCoreBridge.EventListener by rustListener {
+                    override fun onLog(line: String) {
+                        if (!line.startsWith("AUDIO-UDP-DROP: ")) {
+                            rustListener.onLog(line)
+                            return
+                        }
+                        val receivedBootNs = SystemClock.elapsedRealtimeNanos()
+                        scope.launch {
+                            fun current() = sessionLive.get() && connectionAttemptId == attempt &&
+                                sessionSockets === sockets && boundNetwork == sockets.network &&
+                                engineCallbacks.isCurrent(callbackOwner)
+                            val sampleStartBootNs = SystemClock.elapsedRealtimeNanos()
+                            val wifi = if (current()) runCatching { audioWifiSnapshot(sockets.network) }
+                                .getOrElse { "wifiSample=error error=${it.javaClass.simpleName}" }
+                            else "wifiSample=session_changed"
+                            val sampleEndBootNs = SystemClock.elapsedRealtimeNanos()
+                            log("$line attempt=$attempt engine=$callbackOwner network=${sockets.network} " +
+                                "receivedBootNs=$receivedBootNs sampleBootNs=$sampleStartBootNs,$sampleEndBootNs " +
+                                if (current()) wifi else "wifiSample=session_changed")
+                        }
+                    }
                     override fun onEventChannel(rtsp: Long, uptime: Long, cause: String, videoTcp: String) =
                         connectionDiagnostics.eventChannel(attempt, callbackOwner, rtsp, uptime, cause, videoTcp)
                     override fun onReceiverAudioTake(taken: Boolean) {
@@ -198,6 +218,21 @@ object HyperCarRepo {
         } finally {
             if (!transferred) runCatching { ParcelFileDescriptor.adoptFd(fd).close() }
         }
+    }
+
+    private fun audioWifiSnapshot(network: Network): String {
+        val cm = appContext()?.getSystemService(ConnectivityManager::class.java)
+            ?: return "wifiSample=no_connectivity_manager"
+        val caps = cm.getNetworkCapabilities(network) ?: return "wifiSample=network_unavailable"
+        val isWifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+        val info = (caps.transportInfo as? android.net.wifi.WifiInfo)?.takeIf { isWifi }
+        val properties = cm.getLinkProperties(network)
+        val validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        val bound = cm.boundNetworkForProcess == network
+        return "wifiSample=available wifi=$isWifi processBound=$bound validated=$validated " +
+            "if=${properties?.interfaceName ?: "NA"} rssiDbm=${info?.rssi ?: "NA"} " +
+            "frequencyMHz=${info?.frequency ?: "NA"} txLinkMbps=${info?.txLinkSpeedMbps ?: "NA"} " +
+            "rxLinkMbps=${info?.rxLinkSpeedMbps ?: "NA"} supplicant=${info?.supplicantState ?: "NA"}"
     }
 
     /** 本轮连接的计时基准（毫秒）；日志里统一打成 `+Nms`，便于定位慢在哪一步。 */
@@ -441,6 +476,7 @@ object HyperCarRepo {
             lastAclEventAt = now
             return
         }
+        ctrlDiscoveryTrace.record("event=bluetooth-acl connected=$connected attempt=$connectionAttemptId elapsedMsAtAcl=$now")
         lastAclEventKey = key
         lastAclEventAt = now
         log("AUTO: 车机蓝牙 ${if (connected) "连上" else "断开"}（$name）")
@@ -476,6 +512,8 @@ object HyperCarRepo {
     internal enum class ExperimentMarker(val observation: ConnectionDiagnostics.Observation) {
         CARD_UNLOCKED(ConnectionDiagnostics.Observation.CARD_UNLOCKED),
         ABOUT_TO_SELECT_CARPLAY(ConnectionDiagnostics.Observation.ABOUT_TO_SELECT_CARPLAY),
+        OLD_CARPLAY_ERROR(ConnectionDiagnostics.Observation.OLD_CARPLAY_ERROR),
+        NEW_LIST_PHONE_SELECTED(ConnectionDiagnostics.Observation.NEW_LIST_PHONE_SELECTED),
     }
 
     private val ctrlDiscoveryTrace = CtrlDiscoveryTrace(SystemClock::elapsedRealtime, System::currentTimeMillis, scope, ::log)
@@ -487,7 +525,7 @@ object HyperCarRepo {
         val clocks = "epochMs=${System.currentTimeMillis()} elapsedMs=${SystemClock.elapsedRealtime()}"
         val markLine = "DEV-MARK: attempt=${if (recorded) attempt.toString() else "none"} " +
             "${marker.observation.name} ${marker.observation.label} $clocks"
-        if (marker == ExperimentMarker.ABOUT_TO_SELECT_CARPLAY) {
+        if (marker != ExperimentMarker.CARD_UNLOCKED) {
             val readiness = _oldDeviceReadiness.value?.takeIf { it.attempt == attempt }
             val advertiser = ctrlAdvertiser
             val network = boundNetwork
@@ -498,7 +536,7 @@ object HyperCarRepo {
             val readinessLine = "OLD-DEVICE-READY: at-click " +
                 "${status?.diagnosticFields() ?: "attempt=$attempt state=unavailable"} $clocks"
             ctrlDiscoveryTrace.mark(listOf(markLine, readinessLine),
-                "event=click-state attempt=$attempt network=$network currentPort=${port ?: "none"} tcpSyn=external-capture-required")
+                "event=click-state action=${marker.name} attempt=$attempt network=$network currentPort=${port ?: "none"} tcpSyn=external-capture-required")
         } else ctrlDiscoveryTrace.enqueue(markLine)
         return when {
             recording -> "已打点：${marker.observation.label}（已写入诊断日志）"
@@ -523,20 +561,37 @@ object HyperCarRepo {
 
     /** Manual single-variable diagnostic: reuse only the current Wi-Fi listener and service identity. */
     internal suspend fun resendCtrlMdnsAnnouncement(): String = withContext(Dispatchers.IO) {
-        if (!SettingsStore.developerMenuVisible) return@withContext "请先显示开发者菜单"
-        if (streaming) return@withContext "CarPlay 已连接，无需重发"
-        if (hasAirPlayTransport) return@withContext "本轮正在处理连接，暂不重发"
+        val requestedBootNs = SystemClock.elapsedRealtimeNanos()
         val attempt = connectionAttemptId
         val advertiser = ctrlAdvertiser
         val network = boundNetwork
-        if (!sessionLive.get() || advertiser == null || network == null)
-            return@withContext "请先连接车机 Wi-Fi，并让 HyperCar 等待车机邀请"
-        runDeveloperConnectionAction {
+        fun finish(reason: String, message: String): String {
+            log("MDNS-RESEND: manual attempt=$attempt network=$network requestBootNs=$requestedBootNs " +
+                "resultBootNs=${SystemClock.elapsedRealtimeNanos()} result=$reason message=$message")
+            return message
+        }
+        if (!SettingsStore.developerMenuVisible) return@withContext finish("menu_hidden", "请先显示开发者菜单")
+        if (streaming) return@withContext finish("streaming", "CarPlay 已连接，无需重发")
+        if (hasAirPlayTransport) return@withContext finish("transport_in_progress", "本轮正在处理连接，暂不重发")
+        if (!sessionLive.get() || advertiser == null || network == null) {
+            val reason = when {
+                !sessionLive.get() -> "no_active_attempt"
+                network == null -> "wifi_not_bound"
+                else -> "no_advertiser"
+            }
+            return@withContext finish(reason, "请先连接车机 Wi-Fi，并让 HyperCar 等待车机邀请")
+        }
+        if (!developerConnectionAction.tryLock())
+            return@withContext finish("action_busy", "另一项连接实验仍在进行，请稍后再试")
+        val result = try {
             advertiser.resendAnnouncement(network) {
                 connectionAttemptId == attempt && sessionLive.get() && !userDisconnectRequested &&
                     ctrlAdvertiser === advertiser && boundNetwork == network && !streaming && !hasAirPlayTransport
             }
+        } finally {
+            developerConnectionAction.unlock()
         }
+        finish(result.status, result.message)
     }
 
     private fun bmwCaffExperimentTarget(): String? = SettingsStore.targetCarMac?.takeIf {
@@ -3683,6 +3738,7 @@ object HyperCarRepo {
      * 故障就是 0.6s 灌了 300 行；有了限流，环形缓冲能把真正的上下文留下来。
      */
     fun log(line: String) {
+        if (line.startsWith("BT-ACCEPT: ")) ctrlDiscoveryTrace.record("event=rfcomm-inbound " + line.removePrefix("BT-ACCEPT: "))
         val now = SystemClock.elapsedRealtime()
         var folded = 0
         var overBudget = false

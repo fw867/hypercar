@@ -15,11 +15,14 @@ internal class CtrlDiscoveryTrace(
     private data class Event(val elapsedMs: Long, val epochMs: Long, val details: String)
     private class Window(val marker: Long, val at: Long) {
         var emitted = 0
-        fun format(event: Event): String? = when (++emitted) {
-            in 1..128 -> "CTRL-CLICK: marker=$marker deltaMs=${event.elapsedMs - at} " +
+        fun format(event: Event): String? {
+            // Keep endpoint transitions even if noisy discovery traffic exhausts the log budget.
+            val endpoint = event.details.startsWith("event=listener-") || event.details.startsWith("event=click-state")
+            if (!endpoint && ++emitted > 128) {
+                return if (emitted == 129) "CTRL-CLICK: marker=$marker observationLimit=128" else null
+            }
+            return "CTRL-CLICK: marker=$marker deltaMs=${event.elapsedMs - at} " +
                 "epochMs=${event.epochMs} elapsedMs=${event.elapsedMs} ${event.details}"
-            129 -> "CTRL-CLICK: marker=$marker observationLimit=128"
-            else -> null
         }
     }
 
@@ -29,14 +32,22 @@ internal class CtrlDiscoveryTrace(
 
     private val history = ArrayDeque<Event>()
     private var sequence = 0L
-    private var window: Window? = null
+    private val windows = ArrayDeque<Window>()
 
     @Synchronized fun record(details: String) {
         val event = Event(elapsed(), wall(), details)
         remember(event)
-        window?.let {
-            if (event.elapsedMs - it.at <= 30_000) it.format(event)?.let(::enqueue) else window = null
-        }
+        publishToWindows(event)
+    }
+
+    private fun publishToWindows(event: Event) {
+        expireWindows(event.elapsedMs)
+        val lines = windows.mapNotNull { it.format(event) }
+        if (lines.isNotEmpty()) pending.trySend(lines)
+    }
+
+    private fun expireWindows(now: Long) {
+        while (windows.firstOrNull()?.let { now - it.at > 30_000 } == true) windows.removeFirst()
     }
 
     fun enqueue(line: String) { pending.trySend(listOf(line)) }
@@ -44,9 +55,16 @@ internal class CtrlDiscoveryTrace(
     @Synchronized fun mark(prefix: List<String> = emptyList(), clickState: String? = null) {
         val at = elapsed()
         val epochMs = wall()
-        if (clickState != null) remember(Event(at, epochMs, clickState)) else prune(at)
+        if (clickState != null) {
+            val state = Event(at, epochMs, clickState)
+            remember(state)
+            publishToWindows(state)
+        } else {
+            prune(at)
+            expireWindows(at)
+        }
         val newWindow = Window(++sequence, at)
-        window = newWindow
+        windows.addLast(newWindow)
         pending.trySend(prefix + "CTRL-CLICK: marker=${newWindow.marker} epochMs=$epochMs elapsedMs=$at" +
             history.mapNotNull(newWindow::format))
     }

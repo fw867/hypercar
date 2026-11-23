@@ -233,9 +233,11 @@ class CarPlayCtrlAdvertiser(
         val port: Int, val registeredSince: Long, val publishedInvites: Int,
     )
 
+    internal data class ResendResult(val status: String, val message: String)
+
     /** Developer command: never restarts NSD, changes the listener, or initiates a connection. */
-    internal fun resendAnnouncement(network: Network, stillWaiting: () -> Boolean = { true }): String {
-        val notWaiting = "连接状态已变化，不再重发 mDNS 通告"
+    internal fun resendAnnouncement(network: Network, stillWaiting: () -> Boolean = { true }): ResendResult {
+        val notWaiting = ResendResult("session_changed", "连接状态已变化，不再重发 mDNS 通告")
         if (!stillWaiting()) return notWaiting
         val snapshot = synchronized(this) {
             val epoch = invites.current
@@ -243,9 +245,9 @@ class CarPlayCtrlAdvertiser(
             val name = actualRegisteredName
             val mac = registeredMac
             if (!listeningOn(network) || epoch == null || listener == null || name == null || mac == null)
-                return "车机 Wi-Fi 控制服务尚未就绪"
+                return ResendResult("listener_not_ready", "车机 Wi-Fi 控制服务尚未就绪")
             if (hasUnresolvedOrPublishedInvite)
-                return "本轮已收到车机邀请，无需重发"
+                return ResendResult("invite_received", "本轮已收到车机邀请，无需重发")
             MdnsReplaySnapshot(epoch, registration.currentGeneration, listener, mdnsObserver, name, mac,
                 listener.localPort, registrationStartedAt, inviteCount)
         }
@@ -265,13 +267,14 @@ class CarPlayCtrlAdvertiser(
             }
         }.getOrElse {
             logCtrl("MDNS-RESEND: failed network=$network port=${snapshot.port} error=${it.javaClass.simpleName}:${it.message}")
-            return "mDNS 通告发送失败，请查看日志"
+            return ResendResult("send_exception", "mDNS 通告发送失败，请查看日志")
         }
-        if (sent != null && sent > 0) return "已提交 mDNS 通告（$sent 个数据包，端口 ${snapshot.port}）"
+        if (sent != null && sent > 0)
+            return ResendResult("submitted", "已提交 mDNS 通告（$sent 个数据包，端口 ${snapshot.port}）")
         if (superseded || !canSend()) return notWaiting
-        if (sent == 0) return "mDNS 通告发送失败，请查看日志"
+        if (sent == 0) return ResendResult("no_datagrams_sent", "mDNS 通告发送失败，请查看日志")
         logCtrl("MDNS-RESEND: skipped=no-current-announcement network=$network port=${snapshot.port}")
-        return "未发送：未捕获当前服务的完整 mDNS 通告"
+        return ResendResult("no_current_announcement", "未发送：未捕获当前服务的完整 mDNS 通告")
     }
 
     private fun ensureAcceptThread(socket: ServerSocket, epoch: CtrlInvitationInbox.Epoch<Network>) {
@@ -343,19 +346,17 @@ class CarPlayCtrlAdvertiser(
 
     private fun openListener(): ServerSocket? {
         val epoch = invites.current ?: return null
-        fun listen(port: Int): ServerSocket = ServerSocket().apply {
-            try {
-                reuseAddress = true
-                bind(InetSocketAddress(port))
-            } catch (error: IOException) {
-                close()
-                throw error
-            }
-        }
         val socket = try {
-            serverSocket?.takeUnless { it.isClosed } ?: try { listen(previousPort) } catch (busy: java.net.BindException) {
-                if (previousPort == 0) throw busy
-                listen(0)
+            serverSocket?.takeUnless { it.isClosed } ?: run {
+                val prefs = appContext.getSharedPreferences("carplay_ctrl_listener", Context.MODE_PRIVATE)
+                val preferred = previousPort.takeIf { it > 0 } ?: prefs.getInt("last_port", 0)
+                val listener = bindCtrlPort(preferred) { reason ->
+                    logCtrl("CTRL-PORT: preferred=$preferred fallback=dynamic reason=$reason")
+                }
+                val actual = listener.localPort
+                prefs.edit().putInt("last_port", actual).apply()
+                logCtrl("CTRL-PORT: preferred=$preferred actual=$actual reused=${preferred == actual} network=${epoch.network}")
+                listener
             }
         } catch (error: IOException) {
             logCtrl("$TAG: 监听端口创建失败 - ${error.message}")
@@ -622,5 +623,24 @@ class CarPlayCtrlAdvertiser(
         acceptThread?.interrupt()
         acceptThread = null
         logCtrl("$TAG: 已停止")
+    }
+}
+
+internal fun bindCtrlPort(preferred: Int, onFallback: (String) -> Unit): ServerSocket {
+    fun listen(port: Int): ServerSocket = ServerSocket().apply {
+        try {
+            reuseAddress = true
+            bind(InetSocketAddress(port))
+        } catch (error: IOException) {
+            close()
+            throw error
+        }
+    }
+    if (preferred !in 1..65535) return listen(0)
+    return try {
+        listen(preferred)
+    } catch (error: java.net.BindException) {
+        onFallback("BindException:${error.message}")
+        listen(0)
     }
 }
