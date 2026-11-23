@@ -21,6 +21,8 @@ data class StartupReadiness(
             "carwith" -> if (!carWithInstalled) add("安装并启用系统 CarWith（com.miui.carlink）")
             // DeX 靠 Shizuku 建虚拟屏，其余与自绘 UI 相同。
             "dex" -> if (!shizukuReady) add("安装、启动 Shizuku 并授权 HyperCar")
+            // 系统 CarLife 由用户自己在它的「无线连接」页里启动，本应用不设前置门槛。
+            "system_carlife" -> Unit
             else -> add("选择车机画面来源")
         }
     }

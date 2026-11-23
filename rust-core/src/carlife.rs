@@ -152,6 +152,10 @@ pub struct CarLifeConfig {
     pub bt_address: String,
     /// `HU_INFO` 里 required 的 `btname`（车机蓝牙名）。
     pub bt_name: String,
+    /// 是否额外拨第 7 路 9440。小米 CarWith 有；公版 CarLife（三星车联/荣耀车联等）没有。
+    pub data_channel: bool,
+    /// 是否要求 CONTENT_ENCRYPTION。公版 CarLife 不做这套，置 false 时不等待 0x1006E。
+    pub content_encryption: bool,
 }
 
 /// Authenticated seven-channel CarWith gateway with video/audio events and touch input.
@@ -265,12 +269,14 @@ impl CarLifeHub {
         cfg: CarLifeConfig, md_host: String, stop: Arc<DialStop>, requested: Option<DisplayRequest>,
         reopen_source: impl Fn(bool) + Send + 'static,
     ) -> Result<(Self, mpsc::UnboundedReceiver<CarLifeEvent>), String> {
-        Self::connect_to_ports(cfg, md_host, [PORT_CMD,PORT_VIDEO,PORT_MEDIA,PORT_TTS,PORT_VR,PORT_CTRL,PORT_DATA],
-            stop, requested, reopen_source)
+        // 小米 CarWith 额外开 9440；公版 CarLife 只有六路。
+        const CHANNELS: [u16; 7] = [PORT_CMD,PORT_VIDEO,PORT_MEDIA,PORT_TTS,PORT_VR,PORT_CTRL,PORT_DATA];
+        let ports: Vec<u16> = if cfg.data_channel { CHANNELS.to_vec() } else { CHANNELS[..6].to_vec() };
+        Self::connect_to_ports(cfg, md_host, ports, stop, requested, reopen_source)
     }
 
     fn connect_to_ports(
-        cfg: CarLifeConfig, md_host: String, ports: [u16; 7], stop: Arc<DialStop>, requested: Option<DisplayRequest>,
+        cfg: CarLifeConfig, md_host: String, ports: Vec<u16>, stop: Arc<DialStop>, requested: Option<DisplayRequest>,
         reopen_source: impl Fn(bool) + Send + 'static,
     ) -> Result<(Self, mpsc::UnboundedReceiver<CarLifeEvent>), String> {
         let keyframe_request = Arc::new(Notify::new());
@@ -301,9 +307,9 @@ impl CarLifeHub {
             let mut first_round_pending = true;
             let mut can_reopen_display = true;
             loop {
-                // Own all seven sockets together. A failed/closed CMD invalidates the whole round.
+                // Own all channels together. A failed/closed CMD invalidates the whole round.
                 let mut sockets=Vec::new();
-                for port in ports {
+                for &port in &ports {
                     let Some(result) = stop.dial(&md_host, port).await else { return; };
                     match result {
                         Ok(socket) => {
@@ -324,7 +330,7 @@ impl CarLifeHub {
                                 startup_refusals = 0;
                             }
                             if throttle.ready() {
-                                emit_log(&format!("CARWITH-HS: waiting for all seven channels; port={port} error={error}"));
+                                emit_log(&format!("CARWITH-HS: waiting for all {} channels; port={port} error={error}", ports.len()));
                             }
                             break;
                         }
@@ -337,7 +343,7 @@ impl CarLifeHub {
                 }
                 if stop.is_retired() { return; }
                 first_round_pending = false;
-                emit_log("CARWITH-HS: all seven channels connected; start fresh 4.1 handshake");
+                emit_log(&format!("CARWITH-HS: all {} channels connected; start fresh 4.1 handshake", ports.len()));
                 queue.lock().clear();
                 let _ = events_task.send(CarLifeEvent::SourceReset { cache_cleared: None });
                 let state=session::Shared::new(Mutex::new(session::Session::default()));
@@ -363,7 +369,8 @@ impl CarLifeHub {
                 } else { children.spawn(drain_stream(vr, state.clone(), events_task.clone(), stop.diagnostic_phase())); }
                 let ctrl=sockets.next().unwrap(); let q=queue.clone(); let cipher=state.clone(); let stop_ctrl=stop.signal.clone();
                 children.spawn(async move { session::control(ctrl,q,cipher,stop_ctrl).await; });
-                children.spawn(session::data(sockets.next().unwrap(),state.clone(),events_task.clone()));
+                // 第 7 路（9440）只有小米 CarWith 有；公版 CarLife 到此为止。
+                if let Some(data) = sockets.next() { children.spawn(session::data(data,state.clone(),events_task.clone())); }
                 let outcome=tokio::select! {
                     biased;
                     _=stop.cancelled()=>{children.shutdown().await; return;},

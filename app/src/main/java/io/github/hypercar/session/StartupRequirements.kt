@@ -16,6 +16,20 @@ object StartupRequirements {
         context.packageManager.getApplicationInfo(CARWITH_PACKAGE, 0).enabled
     }.getOrDefault(false)
 
+    /** 常见系统自带 CarLife 客户端的包名（三星车联 / 三星版 / 公版）。 */
+    val SYSTEM_CARLIFE_PACKAGES = listOf(
+        "com.samsung.android.carlink",
+        "com.samsung.android.smartcarlink",
+        "com.baidu.carlife.samsung",
+        "com.baidu.carlife",
+    )
+
+    /** 找到的第一个系统 CarLife 包；找不到返回 null。 */
+    @Suppress("DEPRECATION")
+    fun systemCarLifePackage(context: Context): String? = SYSTEM_CARLIFE_PACKAGES.firstOrNull {
+        runCatching { context.packageManager.getApplicationInfo(it, 0).enabled }.getOrDefault(false)
+    }
+
     fun read(context: Context): StartupReadiness = StartupReadiness(
         source = SettingsStore.carSource.takeIf { SettingsStore.carSourceSelected },
         missingPermissions = AppPermissions.missingRequired(context).map {

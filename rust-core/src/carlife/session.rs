@@ -182,6 +182,7 @@ pub(super) struct Session {
     init_fps: Option<u32>,
     fallback_init: Option<(u32,u32)>,
     declared_display: Option<(u32,u32)>,
+    content_encryption: bool,
     pub started: bool,
     matched: bool,
     navigation_requested: bool,
@@ -197,7 +198,7 @@ impl Default for Session {
             #[cfg(test)]
             probe_reset_written: false,
             proof_ok: false, admitted: false, features_requested: false, features_sent: false,
-            rsa: None, seed: None, ready: false, init_sent: false, init_fps: None, fallback_init: None, declared_display: None, started: false, matched: false, navigation_requested: false, navigation_started: false, vehicle_gps_subscribed: false }
+            rsa: None, seed: None, ready: false, init_sent: false, init_fps: None, fallback_init: None, declared_display: None, content_encryption: true, started: false, matched: false, navigation_requested: false, navigation_started: false, vehicle_gps_subscribed: false }
     }
 }
 
@@ -210,7 +211,9 @@ fn navigation_subscription()->Vec<u8> {
     let mut list=Vec::new();proto::varint(&mut list,1,1);proto::bytes(&mut list,2,&module);list
 }
 impl Session {
-    pub(super) fn navigation_ready(&self) -> bool { self.proof_ok && self.admitted && self.ready }
+    pub(super) fn navigation_ready(&self) -> bool {
+        self.proof_ok && self.admitted && (self.ready || !self.content_encryption)
+    }
     fn vehicle_gps_ready(&self) -> bool {
         self.vehicle_gps_subscribed && self.started && self.navigation_ready()
     }
@@ -339,7 +342,8 @@ impl Session {
         }
         if self.proof_ok && self.features_requested && !self.features_sent {
             self.features_sent = true;
-            let mut features = vec![("CONTENT_ENCRYPTION", 1), ("VOICE_MIC", u64::from(cfg.microphone.is_none()))];
+            let mut features = vec![("VOICE_MIC", u64::from(cfg.microphone.is_none()))];
+            if cfg.content_encryption { features.insert(0, ("CONTENT_ENCRYPTION", 1)); }
             if self.declared_display.is_some() {
                 features.push(("DISABLE_RESOLUTION_OPTION", 1));
             }
@@ -353,7 +357,8 @@ impl Session {
             }
             out.push((CMD_HU_FEATURE_CONFIG_RESPONSE, payload));
         }
-        if self.proof_ok && self.admitted && self.ready && !self.init_sent {
+        let encrypted_ready = self.ready || !cfg.content_encryption;
+        if self.proof_ok && self.admitted && encrypted_ready && !self.init_sent {
             self.init_sent = true;
             self.init_fps = Some(cfg.fps);
             let (width,height) = self.declared_display.unwrap_or((cfg.width,cfg.height));
@@ -405,6 +410,7 @@ fn crypt(bytes: &[u8], key: Option<&[u8]>, encrypt: bool) -> Result<Vec<u8>,Stri
 pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLifeEvent>,
     size: Arc<Mutex<(u32,u32)>>, requested: DisplayRequest, cfg: CarLifeConfig, state: Shared, reset_request: Arc<Notify>, can_reopen_display: bool) -> Result<(),String> {
     let (mut rd, mut wr) = stream.into_split();
+    state.lock().content_encryption = cfg.content_encryption;
     if !send_cmd(&mut wr, CMD_HU_PROTOCOL_VERSION, &proto_version_payload()).await { return Err("version write failed".into()); }
     #[cfg(test)]
     log::info!(target: "carwith_probe", "CMD TX written id=0x{CMD_HU_PROTOCOL_VERSION:x}");
@@ -761,7 +767,7 @@ mod tests {
         }
     }
     use tokio::net::TcpListener;
-    fn cfg()->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:60,navigation_updates:false,microphone:None,vehicle_gps:None,bt_address:"00:11:22:33:44:55".into(),bt_name:"HyperCar".into()}}
+    fn cfg()->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:60,navigation_updates:false,microphone:None,vehicle_gps:None,bt_address:"00:11:22:33:44:55".into(),bt_name:"HyperCar".into(),data_channel:true,content_encryption:true}}
 
     #[test]
     fn vehicle_gps_requires_this_command_sessions_gps_subscription_and_encryption() {
@@ -1389,7 +1395,7 @@ mod navigation_tests {
 #[cfg(test)]
 mod navigation_subscription_tests {
     use super::*;
-    fn config(enabled:bool)->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:30,navigation_updates:enabled,microphone:None,vehicle_gps:None,bt_address:String::new(),bt_name:String::new()}}
+    fn config(enabled:bool)->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:30,navigation_updates:enabled,microphone:None,vehicle_gps:None,bt_address:String::new(),bt_name:String::new(),data_channel:true,content_encryption:true}}
     fn ready()->Session {let mut s=Session::default();s.proof_ok=true;s.admitted=true;s.ready=true;s.init_sent=true;s}
     #[test] fn capability_query_ack_then_start_only_once() {
         let mut s=ready();let c=config(true);

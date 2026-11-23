@@ -127,7 +127,7 @@ pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
     let vehicle_gps = Arc::new(crate::carlife::vehicle_gps::PendingLocation::default());
     let config=CarLifeConfig{width:cfg.width,height:cfg.height,fps:cfg.carwith_fps(),bt_address:cfg.device_id.clone(),
         bt_name:"HyperCar".into(),navigation_updates:cfg.carwith_navigation_enabled,microphone:microphone.clone(),
-        vehicle_gps:Some(vehicle_gps.clone())};
+        vehicle_gps:Some(vehicle_gps.clone()),data_channel:cfg.carwith_data_channel,content_encryption:cfg.carwith_content_encryption};
     let (hub,mut events)=CarLifeHub::connect(config,"127.0.0.1".into(),stop.clone(),Some(display.clone()),
         move |startup| crate::reopen_carwith_entry(owner, startup))?;
     let feed=Arc::new(Mutex::new(Feed::default()));let sink=feed.clone();

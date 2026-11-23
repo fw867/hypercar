@@ -1614,9 +1614,10 @@ fun CarSourceSection(
             GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
                 SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
                     listOf(
-                        "car_ui" to "自绘车机 UI",
+                        "car_ui" to "自绘 UI",
                         "dex" to "DeX",
                         "carwith" to "CarWith",
+                        "system_carlife" to "系统 CarLife",
                     ).forEachIndexed { index, (source, label) ->
                         SegmentedButton(
                             selected = current == source,
@@ -1626,7 +1627,7 @@ fun CarSourceSection(
                                 else -> true
                             },
                             onClick = { selectSource(source) },
-                            shape = SegmentedButtonDefaults.itemShape(index = index, count = 3),
+                            shape = SegmentedButtonDefaults.itemShape(index = index, count = 4),
                             label = { Text(label, style = MaterialTheme.typography.labelMedium) },
                         )
                     }
@@ -1635,6 +1636,8 @@ fun CarSourceSection(
                 Text(when {
                     connected -> "断开连接后可切换画面来源。"
                     current == "dex" -> "把三星 DeX 桌面放到虚拟屏上推给车机：需要 Shizuku，桌面与多窗口由 DeX 自己渲染。"
+                    current == "system_carlife" ->
+                        "用手机自带的百度 CarLife 出画面（三星车联 / 荣耀车联）。选好后在它的「无线连接」页停住，本应用接管本机端口。"
                     current == "carwith" -> "CarWith 画面按车机屏幕自动换算并按需拉伸，源画面最高 2560×2560，无需手动设置。"
                     !startup.shizukuReady -> "自绘 UI 需先在「权限与后台」完成 Shizuku 授权。"
                     else -> "自绘 UI 使用下方显示设置。"
@@ -1720,6 +1723,17 @@ fun CarSourceSection(
             if (startup.carWithInstalled) {
                 CarWithSettingsShortcut()
             }
+            Spacer(Modifier.height(16.dp))
+            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+            Spacer(Modifier.height(16.dp))
+            Text("系统 CarLife 模式", color = TextPrimary, style = MaterialTheme.typography.titleSmall)
+            Text("用手机自带的百度 CarLife 出画面（三星车联 / 荣耀车联等系统组件），不需要装 CarWith。" +
+                "选好后打开它的「无线连接」，停在三步引导页，本应用会在本机六路 CarLife 端口上接管画面。",
+                color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.height(8.dp))
+            CapsuleButton(if (current == "system_carlife") "已选择系统 CarLife" else "选择系统 CarLife",
+                onClick = { selectSource("system_carlife") }, enabled = !connected,
+                modifier = Modifier.fillMaxWidth(), filled = current == "system_carlife")
             if (!compact) {
                 Spacer(Modifier.height(8.dp))
                 Text("从安装或授权页面返回后会自动重新检查。", color = TextSecondary,

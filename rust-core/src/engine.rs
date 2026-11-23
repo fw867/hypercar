@@ -108,6 +108,12 @@ pub struct EngineConfig {
     pub carlife_source: bool,
     #[serde(default)]
     pub carwith_source_owner: u64,
+    /// 是否拨第 7 路 9440；小米 CarWith 为 true，公版 CarLife（三星/荣耀车联等）为 false。
+    #[serde(default = "default_true")]
+    pub carwith_data_channel: bool,
+    /// 是否要求 CONTENT_ENCRYPTION；公版 CarLife 不做这套，为 false 时不等待 0x1006E。
+    #[serde(default = "default_true")]
+    pub carwith_content_encryption: bool,
     #[serde(default)]
     pub carwith_cached_canvas: bool,
     #[serde(default)]

@@ -355,9 +355,16 @@ object HyperCarRepo {
     // 不需要用户去点「连接」。用户主动断开时置 userDisconnectRequested，不再重连。
     private var reconnectJob: Job? = null
     private var sessionUiJob: Job? = null
+    /** 本轮会话是否走小米 CarWith（决定用哪个入口去拉起手机端 CarLife）。 */
     @Volatile private var sessionCarWithMode = false
     /** 连接开始时冻结的 DeX 源标记：会话中改设置不影响本条链路。 */
     @Volatile private var sessionSourceIsDex = false
+    /** 本轮会话是否走手机自带的系统 CarLife（三星车联 / 荣耀车联等）。 */
+    @Volatile private var sessionSystemCarLife = false
+    /** 本轮会话冻结的来源字符串，用于判断设置是否已切源。 */
+    @Volatile private var sessionCarSource = "car_ui"
+    /** 任一由本机 CarLife 引擎提供画面的来源。 */
+    internal val sessionCarLifeMode: Boolean get() = sessionCarWithMode || sessionSystemCarLife
     @Volatile private var sessionIdentity: PairingIdentityFiles.Location? = null
     private var automaticResumeJob: Job? = null
     private val automaticModeRequest = AtomicLong()
@@ -582,11 +589,11 @@ object HyperCarRepo {
     /** Source eligibility. Each iAP2 link checks its peer's declaration and subscriptions. */
     @Volatile private var hudSessionEnabled = false
     internal val hudNavigationAllowed: Boolean get() = hudSessionEnabled && hasCurrentSession &&
-        sessionCarWithMode == SettingsStore.carWithMode &&
-        (sessionCarWithMode || io.github.hypercar.carui.CarUiSettings.defaultMap == io.github.hypercar.carui.MapProvider.AMAP)
-    internal val carWithHudNavigationAllowed: Boolean get() = hudNavigationAllowed && sessionCarWithMode
-    internal val mapNavigationAllowed: Boolean get() = hasCurrentSession && !sessionCarWithMode &&
-        !SettingsStore.carWithMode && io.github.hypercar.carui.CarUiSettings.defaultMap == io.github.hypercar.carui.MapProvider.AMAP
+        sessionCarSource == SettingsStore.carSource &&
+        (sessionCarLifeMode || io.github.hypercar.carui.CarUiSettings.defaultMap == io.github.hypercar.carui.MapProvider.AMAP)
+    internal val carWithHudNavigationAllowed: Boolean get() = hudNavigationAllowed && sessionCarLifeMode
+    internal val mapNavigationAllowed: Boolean get() = hasCurrentSession && !sessionCarLifeMode &&
+        !SettingsStore.carLifeMode && io.github.hypercar.carui.CarUiSettings.defaultMap == io.github.hypercar.carui.MapProvider.AMAP
 
     internal fun connect(context: Context, systemPrompt: SystemDiscoverabilityPrompt? = null) =
         requestConnect(context, manual = true, source = "manual", systemPrompt = systemPrompt,
@@ -678,7 +685,7 @@ object HyperCarRepo {
     }
 
     private fun bmwCaffExperimentTarget(): String? = SettingsStore.targetCarMac?.takeIf {
-        headUnitProfile.id == "bmw_id85" && !headUnitProfile.allowOutboundIap2 && !SettingsStore.carWithMode
+        headUnitProfile.id == "bmw_id85" && !headUnitProfile.allowOutboundIap2 && !SettingsStore.carLifeMode
     }
 
     internal fun disarmBmwCaffExperiment() = caffExperiment.clear()
@@ -901,8 +908,10 @@ object HyperCarRepo {
         reconnectBudget.start(retryReceiver(), manual = source == "manual")
         sessionHadLink = false
         roundSessionBaseline = iap2?.sessionStartCount ?: 0
+        sessionCarSource = SettingsStore.carSource
         sessionCarWithMode = SettingsStore.carWithMode
         sessionSourceIsDex = SettingsStore.dexMode
+        sessionSystemCarLife = SettingsStore.systemCarLifeMode
         hudSessionEnabled = true
         io.github.hypercar.navigation.NavigationSources.clear()
         sessionIdentity = null
@@ -1733,7 +1742,7 @@ object HyperCarRepo {
             val deviceMac = phoneIdentity.address
             val usesFallbackPhoneIdentity = deviceMac == SettingsStore.stableDeviceId
             fallbackToRemember = phoneIdentity.takeIf { SettingsStore.manualBtMac == null && usesFallbackPhoneIdentity }
-            if (sessionCarWithMode && !prepareCarWithSource(context, diagnosticId, deviceMac, wakePeer)) {
+            if (sessionCarLifeMode && !prepareCarWithSource(context, diagnosticId, deviceMac, wakePeer)) {
                 if (carWithEntries.current(diagnosticId)) fail("CarWith 源端守候服务准备失败")
                 return
             }
@@ -1805,7 +1814,7 @@ object HyperCarRepo {
                     headUnitProfile.id == "bmw_id85" && SettingsStore.targetCarMac == caffTarget &&
                     iap2 === coordinator && coordinator.sessionStartCount == caffBaseline &&
                     !invited.get() && !hasAirPlayTransport
-                if (experimentTarget != null && experimentTarget.equals(caffTarget, ignoreCase = true) && !sessionCarWithMode) {
+                if (experimentTarget != null && experimentTarget.equals(caffTarget, ignoreCase = true) && !sessionCarLifeMode) {
                     val requesting = java.util.concurrent.atomic.AtomicBoolean(false)
                     fun manualWaiting() = waiting() && ctrlAdvertiser === advertiser && !advertiser.hasUnresolvedOrPublishedInvite
                     val action = ManualCaffAction(diagnosticId) dial@{
@@ -2275,7 +2284,8 @@ object HyperCarRepo {
                             receiverBluetoothMac = receiver, carWithSource = sessionCarWithMode,
                             receiverModel = coordinator.activePeerAddress?.takeIf { it.equals(receiver, ignoreCase = true) }
                                 ?.let { io.github.hypercar.iap2.Iap2Peer.modelFor(it) } ?: mdnsEndpoint?.model,
-                            headUnitProfile = headUnitProfile)
+                            headUnitProfile = headUnitProfile,
+                            systemCarLifeSource = sessionSystemCarLife)
                         log("SESSION-ORIGIN: ctrlInvite=${advertiser.lastInvitation != null} endpointFromInvite=${endpoint.fromInvite} " +
                             "bluetoothSession=${coordinator.isSessionActive} knownWifi=${wifiReceiverMac != null} network=$boundNetwork")
                         log("CORE +${stageMs()}ms 引擎配置：$json")
@@ -2320,7 +2330,7 @@ object HyperCarRepo {
                     // RFCOMM session and ctrl listener/port alive for the receiver's next invite.
                     streaming = false
                     // Keep the source service and launch alive across media activations.
-                    if (!sessionCarWithMode) {
+                    if (!sessionCarLifeMode) {
                         sessionUiJob?.cancel()
                         sessionUiJob = null
                     }
@@ -3907,7 +3917,7 @@ object HyperCarRepo {
                     )
                     // The source service already receives and caches independently.
                     val ctx = appContext()
-                    if (ctx != null && !sessionCarWithMode) {
+                    if (ctx != null && !sessionCarLifeMode) {
                         sessionUiJob?.cancel()
                         sessionUiJob = scope.launch {
                             fun current() = sessionLive.get() && streaming && connectionAttemptId == diagnosticId &&
@@ -3957,8 +3967,8 @@ object HyperCarRepo {
             if (!carWithEntries.claimReopen(attempt, startup)) return
             scope.launch {
                 val ctx = appContext() ?: return@launch
-                if (!sessionLive.get() || connectionAttemptId != attempt || !sessionCarWithMode) return@launch
-                val reason = if (startup) "源端 CMD 持续拒绝连接" else "收到车机显示尺寸或帧率声明"
+                if (!sessionLive.get() || connectionAttemptId != attempt || !sessionSystemCarLife) return@launch
+                val reason = if (startup) "源端 CMD 持续拒绝连接" else "车机画布迟到"
                 log("CARWITH-START: $reason，重新启动本机 CarWith 入口 attempt=$attempt")
                 log("CARWITH-START: attempt=$attempt " + launchCarWith(ctx, attempt))
             }
@@ -4014,7 +4024,7 @@ object HyperCarRepo {
             log("CARKEY: usage=0x" + usage.toString(16))
             val consoleKey = io.github.hypercar.carui.CarConsoleKey.fromInput(usage)
             if (consoleKey != null) {
-                if (!sessionCarWithMode) {
+                if (!sessionCarLifeMode) {
                     if (sessionSourceIsDex) io.github.hypercar.carui.DexCaster.onConsoleKey(consoleKey)
                     else io.github.hypercar.carui.CarUiCaster.onConsoleKey(consoleKey)
                 }
@@ -5099,7 +5109,9 @@ object HyperCarRepo {
         val cached = PairingEvidence.cachedCanvas(key, SettingsStore::carWithCanvas)
         val canvas = cached ?: (1920 to 1080)
         val config = org.json.JSONObject(SettingsStore.engineConfigJson("127.0.0.1", 0, deviceMac, "",
-            carWithSource = true, headUnitProfile = headUnitProfile)).put("width", canvas.first).put("height", canvas.second)
+            carWithSource = true, headUnitProfile = headUnitProfile,
+            systemCarLifeSource = sessionSystemCarLife))
+            .put("width", canvas.first).put("height", canvas.second)
             .put("carwith_cached_canvas", cached != null)
             .put("carwith_navigation_enabled", carWithHudNavigationAllowed).toString()
         log("CARWITH: 源端预热画布 ${canvas.first}x${canvas.second} canvas_cache=" +
@@ -5115,9 +5127,10 @@ object HyperCarRepo {
                 CarUiCaster.releaseForCarWith()
                 kotlinx.coroutines.currentCoroutineContext().ensureActive()
                 if (!current()) return@launch
-                log("CARWITH: 七路守候与接收服务就绪；启动源端 attempt=$diagnosticId；独立保持至本轮连接结束")
+                log("CARWITH: CarLife 通道守候与接收服务就绪；启动源端 attempt=$diagnosticId；独立保持至本轮连接结束")
                 val launchTime = System.currentTimeMillis()
-                val result = launchCarWith(context, diagnosticId)
+                val result = if (sessionSystemCarLife) launchSystemCarLife(context, diagnosticId)
+                    else launchCarWith(context, diagnosticId)
                 if (!current()) return@launch
                 val version = runCatching {
                     context.packageManager.getPackageInfo("com.miui.carlink", 0).let { "${it.versionName}/${it.longVersionCode}" }
@@ -5151,6 +5164,38 @@ object HyperCarRepo {
      * 前提：装了 CarWith（com.miui.carlink）；MIUI「后台弹出界面」需允许，
      * 否则入口会被静默丢弃（7240 一直 ECONNREFUSED）。不再检查/冻结任何包。
      */
+
+    /**
+     * 系统自带 CarLife 入口（三星车联 / 荣耀车联等）。
+     *
+     * 这类 ROM 没有 CarWith 的 `CarlifeAdbActivity` 那样的调试入口，也不保证第三方能直接拉起
+     * 它的「无线连接」页，所以这里只做尽力而为：找到系统车联应用就打开它，否则退回系统设置，
+     * 由用户自己进入「无线连接」并停在等待页。Rust 侧同时在六路端口上守候，等它开监听后接管。
+     */
+    private suspend fun launchSystemCarLife(ctx: android.content.Context, attempt: Long): String {
+        val pkg = io.github.hypercar.session.StartupRequirements.systemCarLifePackage(ctx)
+        if (pkg != null) {
+            val intent = runCatching { ctx.packageManager.getLaunchIntentForPackage(pkg) }.getOrNull()
+            if (intent != null) {
+                intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                val opened = runCatching { ctx.startActivity(intent); true }.getOrDefault(false)
+                val message = if (opened) "已打开 $pkg，请进入「无线连接」并停在三步引导页"
+                    else "打开 $pkg 失败（可能缺少后台弹出界面权限）"
+                log("SYSTEM-CARLIFE: attempt=$attempt $message")
+                return message
+            }
+        }
+        val opened = runCatching {
+            ctx.startActivity(android.content.Intent(android.provider.Settings.ACTION_SETTINGS)
+                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+            true
+        }.getOrDefault(false)
+        val message = if (opened)
+            "未找到系统车联应用（尝试过 ${io.github.hypercar.session.StartupRequirements.SYSTEM_CARLIFE_PACKAGES.joinToString()}）；已打开系统设置"
+        else "未找到系统车联应用，且打开系统设置失败"
+        log("SYSTEM-CARLIFE: attempt=$attempt $message")
+        return message
+    }
 
     private suspend fun launchCarWith(ctx: android.content.Context, attempt: Long): String {
         // Do not probe 7240 with a disposable client: it consumes a real CarLife connection.
