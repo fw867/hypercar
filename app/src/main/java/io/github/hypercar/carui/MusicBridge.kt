@@ -32,14 +32,21 @@ internal class ReceiverPauseTarget<P, K>(val player: P, val token: K, val genera
         token == selected && this.generation == generation && this.switchRevision == switchRevision
 }
 
-private fun MediaController.isPlayingPhoneMusic(context: Context, preferred: String?): Boolean {
-    if (playbackState?.state != PlaybackState.STATE_PLAYING) return false
+private fun MediaController.isPlayingPhoneMusic(context: Context, preferred: String?): Boolean =
+    playbackState?.state == PlaybackState.STATE_PLAYING && isLocalMusic(context, preferred)
+
+private fun MediaController.isLocalMusic(context: Context?, preferred: String?): Boolean {
+    if (ShortVideoApps.isSupported(packageName)) return false
     val info = playbackInfo ?: return false
     if (info.playbackType != MediaController.PlaybackInfo.PLAYBACK_TYPE_LOCAL) return false
     return packageName == preferred || MusicApps.isKnownPlayer(packageName) ||
         info.audioAttributes.contentType == AudioAttributes.CONTENT_TYPE_MUSIC ||
-        runCatching { context.packageManager.getApplicationInfo(packageName, 0).category }.getOrNull() == ApplicationInfo.CATEGORY_AUDIO
+        runCatching { context?.packageManager?.getApplicationInfo(packageName, 0)?.category }.getOrNull() == ApplicationInfo.CATEGORY_AUDIO
 }
+
+internal fun <T : Any, K> shortVideoPauseTargets(
+    active: List<T>, selected: T?, tokenOf: (T) -> K, isActiveMusic: (T) -> Boolean,
+): List<T> = (active + listOfNotNull(selected)).distinctBy(tokenOf).filter(isActiveMusic)
 
 /**
  * 音乐卡片的数据源：NotificationListenerService 权限 + MediaSessionManager.getActiveSessions。
@@ -723,7 +730,7 @@ object MusicBridge {
     }
 
     /** 音乐卡片左上角切换 App：记住选择并把目标 App 拉到手机前台（车机只显示媒体卡片）。 */
-    fun selectPackage(context: Context, packageName: String) {
+    fun selectPackage(context: Context, packageName: String, launchOnPhone: Boolean = true) {
         if (packageName.isBlank()) return
         val switchRevision = packageSwitchRevision.incrementAndGet()
         // 切换前先停掉/关掉上一个 App（即使它已暂停，也一并清掉，避免后台残留）。
@@ -740,7 +747,7 @@ object MusicBridge {
         val prefs = playbackPrefs
             ?: context.getSharedPreferences("car_playback", Context.MODE_PRIVATE)
         prefs.edit().putString("preferred_package", packageName).apply()
-        val intent = context.packageManager.getLaunchIntentForPackage(packageName)
+        val intent = if (launchOnPhone) context.packageManager.getLaunchIntentForPackage(packageName) else null
         val component = intent?.component
         if (component != null && ShizukuTools.isReady) {
             // 走 shell 拉起：MIUI 对后台 startActivity 会弹「是否允许启动」确认页，
@@ -845,12 +852,13 @@ object MusicBridge {
                 HyperCarRepo.log("MUSIC: getActiveSessions 失败: ${it.javaClass.simpleName}: ${it.message}")
                 emptyList()
             }.orEmpty()
-            val target = sessions.firstOrNull { it.packageName == preferred }
-                ?: sessions.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING && it.metadata != null }
-                ?: sessions.firstOrNull { session ->
+            val players = sessions.filterNot { ShortVideoApps.isSupported(it.packageName) }
+            val target = players.firstOrNull { it.packageName == preferred }
+                ?: players.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING && it.metadata != null }
+                ?: players.firstOrNull { session ->
                     session.metadata?.let { musicTrackText(it::getString).title.isNotBlank() } == true
                 }
-                ?: sessions.firstOrNull()
+                ?: players.firstOrNull()
             SessionSnapshot(target, target?.metadata, target?.playbackState,
                 target?.ratingType ?: Rating.RATING_NONE, sessions.size, denied,
                 runCatching { target?.queue?.map { it.queueId } }.getOrNull())
@@ -980,12 +988,41 @@ object MusicBridge {
         return pos.coerceAtLeast(0L).let { if (duration > 0) it.coerceAtMost(duration) else it }
     }
 
-    fun playPause() {
+    private fun cancelAutoPlay() {
         autoPlayPending = false
         autoPlayDeadline = 0L
         // Explicit user playback controls supersede the saved automatic-resume request.
         resumePackage = null
         playbackPrefs?.edit()?.remove("resume_package")?.apply()
+    }
+
+    fun pauseForShortVideo() = onMusicThread {
+        cancelAutoPlay()
+        val s = service
+        val sessions = runCatching {
+            s?.getSystemService(MediaSessionManager::class.java)?.getActiveSessions(
+                ComponentName(s, MusicNotificationListener::class.java),
+            )
+        }.getOrNull().orEmpty()
+        val selected = controller
+        val players = shortVideoPauseTargets(sessions, selected, MediaController::getSessionToken) { player ->
+            val state = player.playbackState?.state ?: playback?.state.takeIf {
+                player.sessionToken == selected?.sessionToken
+            }
+            (state == PlaybackState.STATE_PLAYING || state == PlaybackState.STATE_BUFFERING ||
+                state == PlaybackState.STATE_CONNECTING) && player.isLocalMusic(s, preferredPackage)
+        }
+        for (player in players) {
+            runCatching { player.transportControls.pause() }
+                .onSuccess { HyperCarRepo.log("MUSIC: 打开短视频，已请求暂停 ${player.packageName}") }
+                .onFailure {
+                    HyperCarRepo.log("MUSIC: 打开短视频时暂停失败 ${it.javaClass.simpleName}")
+                }
+        }
+    }
+
+    fun playPause() {
+        cancelAutoPlay()
         val c = controller ?: return
         if (playback?.state == PlaybackState.STATE_PLAYING) {
             manualPauseRequested = true

@@ -75,6 +75,8 @@ fun CarHomeScreen() {
 private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
     val density = LocalDensity.current
     val musicCardWidth = with(density) { (safe.width * .25f).toDp() }
+    val cardVerticalInset = 22.dp
+    val homeFooterHeight = 15.dp
     fun bounds(rect: DisplayRect): Modifier = with(density) {
         Modifier.absoluteOffset(rect.x.toDp(), rect.y.toDp())
             .requiredSize(rect.width.toDp(), rect.height.toDp()).clipToBounds()
@@ -85,11 +87,15 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
     var apps by remember { mutableStateOf(false) }
     var settings by remember { mutableStateOf(false) }
     var about by remember { mutableStateOf(false) }
+    var projectedApp by remember { mutableStateOf<MusicApps.Entry?>(null) }
+    var expandedMedia by remember { mutableStateOf(false) }
     androidx.activity.compose.BackHandler {
         when {
             settings -> settings = false
             about -> about = false
             apps -> apps = false
+            expandedMedia -> expandedMedia = false
+            projectedApp != null -> projectedApp = null
             MusicUiState.appView -> {
                 MusicBridge.hideFromView()
                 MusicUiState.appView = false
@@ -100,10 +106,18 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
         apps = false
         settings = false
         about = false
+        expandedMedia = false
         MapController.requestEnter()
     }
     val context = LocalContext.current
+    val projection = remember(context, projectedApp?.packageName) {
+        projectedApp?.let { MediaCardProjection(context, it.packageName) }
+    }
+    DisposableEffect(projection) {
+        onDispose { projection?.close() }
+    }
     var musicApps by remember(context, apps) { mutableStateOf(MusicApps.installed(context)) }
+    var videoApps by remember(context, apps) { mutableStateOf(ShortVideoApps.installed(context)) }
     val idlePlayer = MusicApps.idlePlayer(musicApps.map { it.packageName }, selectedPlayer, CarUiSettings.defaultMusicPackage)
     val displayedPackage = music.packageName.ifBlank { idlePlayer.orEmpty() }
     val displayedApp = musicApps.firstOrNull { it.packageName == displayedPackage }
@@ -114,7 +128,27 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
     var musicPicker by remember { mutableStateOf(false) }
     fun openMusicPicker() {
         musicApps = MusicApps.installed(context)
+        videoApps = ShortVideoApps.installed(context)
         musicPicker = true
+    }
+    fun selectMediaApp(app: MusicApps.Entry, fromAppsPage: Boolean) {
+        musicPicker = false
+        MusicUiState.appView = false
+        val shortVideo = ShortVideoApps.isSupported(app.packageName)
+        if (shortVideo) {
+            MusicBridge.pauseForShortVideo()
+        } else {
+            MusicBridge.selectPackage(context, app.packageName, launchOnPhone = !fromAppsPage)
+        }
+        if (shortVideo || fromAppsPage) {
+            projectedApp = app
+            expandedMedia = fromAppsPage
+            apps = false
+            settings = false
+            about = false
+        } else {
+            projectedApp = null
+        }
     }
     var battery by remember { mutableIntStateOf(0) }
     var charging by remember { mutableStateOf(false) }
@@ -250,6 +284,8 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
                         apps = false
                         settings = false
                         about = false
+                        expandedMedia = false
+                        projectedApp = null
                         when {
                             music.packageName.isNotBlank() -> {
                                 musicPicker = false
@@ -271,7 +307,7 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
                 // **底部「更多应用 / 返回首页」移进 Dock 列**（2026-10-31）：
                 // 之前是外面单独一个 BottomStart 的 Box，和 Dock 列的中轴对不齐（偏右约 10dp）。
                 // 放进同一列后由 CenterHorizontally 统一对齐。
-                val onHome = !apps && !settings && !about
+                val onHome = !apps && !settings && !about && !expandedMedia
                 Box(
                     Modifier
                         .size(68.dp)
@@ -280,7 +316,10 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
                             if (onHome) {
                                 apps = true
                             } else {
-                                apps = false; settings = false; about = false
+                                apps = false
+                                settings = false
+                                about = false
+                                expandedMedia = false
                             }
                         },
                     contentAlignment = Alignment.Center,
@@ -292,28 +331,45 @@ private fun CarHomeContent(safe: DisplayRect, background: DisplayRect) {
             }
             // 与「地图卡 ↔ 音乐卡」相同的 20dp 间距
             Spacer(Modifier.width(20.dp))
-            Column(Modifier.weight(1f).fillMaxHeight().padding(top = 22.dp, bottom = 22.dp)) {
+            val expandedPane = expandedMedia && projection != null && !apps && !settings && !about
+            Column(Modifier.weight(1f).fillMaxHeight()
+                .padding(vertical = if (expandedPane) 0.dp else cardVerticalInset)) {
                 if (settings) {
                     CarSettingsPage(Modifier.weight(1f)) { settings = false }
                 } else if (about) {
                     CarAboutPage(Modifier.weight(1f)) { about = false }
                 } else if (apps) {
-                    AppsPage(Modifier.weight(1f), musicApps, { settings = true }, { about = true }) {
-                        apps = false
+                    AppsPage(Modifier.weight(1f), musicApps + videoApps,
+                        onSettings = { settings = true }, onAbout = { about = true },
+                        onMapSelected = { apps = false }, onMediaSelected = { selectMediaApp(it, fromAppsPage = true) })
+                } else if (expandedMedia && projection != null) {
+                    Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        key(projection) {
+                            ProjectedMediaPanel(
+                                projection, Modifier.fillMaxSize().clip(CardShape), expanded = true,
+                            ) {
+                                projectedApp = null
+                                expandedMedia = false
+                            }
+                        }
                     }
                 } else {
                     Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
                         MapCard(Modifier.weight(1f).fillMaxHeight())
-                        MusicCard(music, musicApps, displayedPackage, musicLabel, musicIcon,
+                        MusicCard(music, musicApps + videoApps, displayedPackage, musicLabel, musicIcon,
                             Modifier.width(musicCardWidth).fillMaxHeight(), musicPicker, ::openMusicPicker,
-                            onClosePicker = { musicPicker = false })
+                            onClosePicker = { musicPicker = false }, projectedApp = projectedApp,
+                            projection = projection, onCloseProjection = { projectedApp = null },
+                            onSelectApp = { selectMediaApp(it, fromAppsPage = false) })
                     }
                 }
-                Row(Modifier.fillMaxWidth().height(15.dp), horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.Bottom) {
-                    repeat(2) { index ->
-                        Box(Modifier.padding(horizontal = 4.dp).size(5.dp).clip(CircleShape)
-                            .background(if ((index == 1) == apps) CarInk else CarInk.copy(alpha = .3f)))
+                if (!expandedPane) {
+                    Row(Modifier.fillMaxWidth().height(homeFooterHeight), horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.Bottom) {
+                        repeat(2) { index ->
+                            Box(Modifier.padding(horizontal = 4.dp).size(5.dp).clip(CircleShape)
+                                .background(if ((index == 1) == apps) CarInk else CarInk.copy(alpha = .3f)))
+                        }
                     }
                 }
             }
@@ -505,6 +561,10 @@ private fun MusicCard(
     picker: Boolean,
     onOpenPicker: () -> Unit,
     onClosePicker: () -> Unit,
+    projectedApp: MusicApps.Entry?,
+    projection: MediaCardProjection?,
+    onCloseProjection: () -> Unit,
+    onSelectApp: (MusicApps.Entry) -> Unit,
 ) {
     val context = LocalContext.current
     val pickerButton = remember { FocusRequester() }
@@ -524,10 +584,31 @@ private fun MusicCard(
         else listOf(Color(0xFFD6E5F5), Color(0xFFF1F7FE), Color(0xFFE4EFFA))))) {
         // **音乐 App 直接显示在这张卡片里**（2026-11-01）：打开后可直接在车机上操作它的
         // 音乐应用界面/设置；右上角关闭按钮收起、回到常规音乐卡。画面来自音乐虚显，触摸经 shell 注入。
-        if (MusicUiState.appView) {
-            MusicAppPanel(Modifier.fillMaxSize()) { MusicUiState.appView = false }
-            return@Box
-        }
+        if (projection != null || MusicUiState.appView) {
+            if (projection != null) {
+                key(projection) {
+                    ProjectedMediaPanel(projection, Modifier.fillMaxSize(), onClose = onCloseProjection)
+                }
+            } else {
+                MusicAppPanel(Modifier.fillMaxSize()) { MusicUiState.appView = false }
+            }
+            Row(
+                Modifier.align(Alignment.TopStart).padding(10.dp)
+                    .clip(RoundedCornerShape(12.dp)).background(Color(0xCC1B1930))
+                    .widthIn(max = 145.dp).focusRequester(pickerButton)
+                    .clickable(onClickLabel = "切换卡片应用", onClick = onOpenPicker)
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                (if (projectedApp != null) projectedApp.icon else appIcon)?.let {
+                    Image(it.asImageBitmap(), null, Modifier.size(22.dp).clip(CircleShape))
+                    Spacer(Modifier.width(6.dp))
+                }
+                Text(projectedApp?.label ?: appLabel, color = White, fontSize = 12.sp,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                Icon(Icons.Rounded.ExpandMore, null, tint = White, modifier = Modifier.size(18.dp))
+            }
+        } else {
         music.albumArt?.let {
             Image(it.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
         }
@@ -563,7 +644,7 @@ private fun MusicCard(
                     // 只让"图标 + 应用名"这一小段可点（原来整行/整条顶部都能点，容易误触）
                     .widthIn(max = 150.dp)
                     .focusRequester(pickerButton)
-                    .clickable(onClickLabel = "切换音乐应用", onClick = onOpenPicker)
+                    .clickable(onClickLabel = "切换卡片应用", onClick = onOpenPicker)
                     .padding(horizontal = 4.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -623,15 +704,17 @@ private fun MusicCard(
                 Text(hint, color = sub, fontSize = 12.sp)
                 Spacer(Modifier.height(12.dp))
                 TextButton(onClick = onOpenPicker) {
-                    Text("选择音乐应用", color = ink, fontSize = 15.sp)
+                    Text("选择应用", color = ink, fontSize = 15.sp)
                 }
             }
         }
+        }
         if (picker) {
+            val selectedPackage = projectedApp?.packageName ?: displayedPackage
             val choices = remember(installed) { installed.map { FocusRequester() } }
             LaunchedEffect(inputMode.inputMode, choices) {
                 if (inputMode.inputMode == InputMode.Keyboard) {
-                    val selected = installed.indexOfFirst { it.packageName == displayedPackage }
+                    val selected = installed.indexOfFirst { it.packageName == selectedPackage }
                     choices.getOrNull(selected.coerceAtLeast(0))?.requestFocus()
                 }
             }
@@ -653,10 +736,10 @@ private fun MusicCard(
                     .verticalScroll(rememberScrollState())
                     .padding(vertical = 8.dp),
             ) {
-                Text("切换音乐应用", color = sub, fontSize = 12.sp,
+                Text("切换卡片应用", color = sub, fontSize = 12.sp,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
                 if (installed.isEmpty()) {
-                    Text("未发现可切换的音乐应用", color = sub, fontSize = 13.sp,
+                    Text("未发现可切换的应用", color = sub, fontSize = 13.sp,
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp))
                 }
                 installed.forEachIndexed { index, app ->
@@ -674,7 +757,7 @@ private fun MusicCard(
                             }
                             .clickable {
                                 closePicker()
-                                MusicBridge.selectPackage(context, app.packageName)
+                                onSelectApp(app)
                             }
                             .padding(horizontal = 16.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -683,11 +766,12 @@ private fun MusicCard(
                             Image(app.icon.asImageBitmap(), null, Modifier.size(28.dp).clip(CircleShape),
                                 contentScale = ContentScale.Crop)
                         } else {
-                            Icon(Icons.Rounded.MusicNote, null, tint = ink, modifier = Modifier.size(24.dp))
+                            Icon(if (ShortVideoApps.isSupported(app.packageName)) Icons.Rounded.PlayArrow else Icons.Rounded.MusicNote,
+                                null, tint = ink, modifier = Modifier.size(24.dp))
                         }
                         Spacer(Modifier.width(12.dp))
                         Text(app.label, color = ink, fontSize = 15.sp, modifier = Modifier.weight(1f))
-                        if (app.packageName == displayedPackage) {
+                        if (app.packageName == selectedPackage) {
                             Icon(Icons.Rounded.Check, "当前", tint = Color(0xFF6EE7B7), modifier = Modifier.size(18.dp))
                         }
                     }
@@ -716,10 +800,11 @@ private fun PlayerButton(
 @Composable
 private fun AppsPage(
     modifier: Modifier,
-    musicApps: List<MusicApps.Entry>,
+    mediaApps: List<MusicApps.Entry>,
     onSettings: () -> Unit = {},
     onAbout: () -> Unit = {},
     onMapSelected: () -> Unit = {},
+    onMediaSelected: (MusicApps.Entry) -> Unit,
 ) {
     val context = LocalContext.current
     val mapLabel = MapApps.selected(context)?.label ?: "地图"
@@ -750,12 +835,13 @@ private fun AppsPage(
                         }
                     }
                 }
-                musicApps.forEach { app ->
+                mediaApps.forEach { app ->
                     key(app.packageName) {
-                        AppTile(bitmap = app.icon, fallback = Icons.Rounded.MusicNote,
+                        AppTile(bitmap = app.icon, fallback = if (ShortVideoApps.isSupported(app.packageName))
+                            Icons.Rounded.PlayArrow else Icons.Rounded.MusicNote,
                             color = CarCard, label = app.label,
                             onClickLabel = "打开${app.label}") {
-                            MusicBridge.selectPackage(context, app.packageName)
+                            onMediaSelected(app)
                         }
                     }
                 }
@@ -859,6 +945,68 @@ private fun AppTile(
  * 触摸按比例换算成虚显像素后经 SpikeShell 注入，于是可以在车机上操作它的
  * 音乐应用界面/设置；右上角「关闭」收起回到常规音乐卡。
  */
+@Composable
+private fun ProjectedMediaPanel(
+    projection: MediaCardProjection,
+    modifier: Modifier,
+    expanded: Boolean = false,
+    onClose: () -> Unit,
+) {
+    val error by projection.error.collectAsStateWithLifecycle()
+    BoxWithConstraints(modifier.background(Color.Black), contentAlignment = Alignment.Center) {
+        val density = LocalDensity.current
+        val surfaceModifier = if (expanded) Modifier.fillMaxSize() else {
+            val (width, height) = projection.size.fit(constraints.maxWidth, constraints.maxHeight)
+            with(density) { Modifier.size(width.toDp(), height.toDp()) }
+        }
+        AndroidView(
+            modifier = surfaceModifier,
+            factory = { context ->
+                android.view.TextureView(context).apply {
+                    setOnTouchListener { view, event ->
+                        val action = when (event.actionMasked) {
+                            android.view.MotionEvent.ACTION_DOWN -> 0
+                            android.view.MotionEvent.ACTION_MOVE -> 2
+                            android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> 1
+                            else -> -1
+                        }
+                        val texture = surfaceTexture
+                        if (texture != null && action >= 0 && view.width > 0 && view.height > 0) {
+                            projection.touch(
+                                texture, action, event.x / view.width, event.y / view.height, event.downTime,
+                            )
+                        }
+                        true
+                    }
+                    surfaceTextureListener = object : android.view.TextureView.SurfaceTextureListener {
+                        override fun onSurfaceTextureAvailable(texture: android.graphics.SurfaceTexture, width: Int, height: Int) =
+                            projection.show(texture, width, height, expanded)
+
+                        override fun onSurfaceTextureSizeChanged(texture: android.graphics.SurfaceTexture, width: Int, height: Int) =
+                            projection.show(texture, width, height, expanded)
+
+                        override fun onSurfaceTextureDestroyed(texture: android.graphics.SurfaceTexture): Boolean {
+                            projection.hide(texture)
+                            return true
+                        }
+
+                        override fun onSurfaceTextureUpdated(texture: android.graphics.SurfaceTexture) = Unit
+                    }
+                }
+            },
+            onRelease = { view -> view.surfaceTexture?.let(projection::hide) },
+        )
+        error?.let { Text(it, color = White, textAlign = TextAlign.Center, modifier = Modifier.padding(18.dp)) }
+        Box(
+            Modifier.align(Alignment.TopEnd).padding(10.dp).size(38.dp).clip(CircleShape)
+                .background(Color(0xCC1B1930)).clickable(onClickLabel = "关闭应用页面", onClick = onClose),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(Icons.Rounded.Close, "关闭", tint = White, modifier = Modifier.size(20.dp))
+        }
+    }
+}
+
 @Composable
 private fun MusicAppPanel(modifier: Modifier, onClose: () -> Unit) {
     Box(modifier.background(Color.Black)) {

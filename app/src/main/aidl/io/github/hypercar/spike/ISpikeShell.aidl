@@ -8,7 +8,7 @@ import android.view.MotionEvent;
 
 interface ISpikeShell {
     /** 返回 "OK id=<n> flags=0x<hex>" 或 "ERR ..."。 */
-    String createDisplay(in Surface surface, int width, int height, int dpi, int flags, String name);
+    String createDisplay(IBinder owner, in Surface surface, int width, int height, int dpi, int flags, String name);
 
     String releaseDisplay();
 

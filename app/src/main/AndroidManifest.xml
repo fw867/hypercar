@@ -74,6 +74,11 @@
         <package android:name="com.apple.android.music" />
         <package android:name="cmccwm.mobilemusic" />
         <package android:name="com.huawei.music" />
+        <package android:name="com.ss.android.ugc.aweme" />
+        <package android:name="com.phoenix.read" />
+        <package android:name="com.smile.gifmaker" />
+        <package android:name="com.ss.android.ugc.aweme.lite" />
+        <package android:name="com.kuaishou.nebula" />
     </queries>
 
     <application

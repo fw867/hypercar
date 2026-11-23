@@ -24,7 +24,7 @@ import java.lang.reflect.Method
  * 所以把「建屏」这一步搬到 shell 进程（与 headless-android / ShadowAuto 同款做法）。
  *
  * 进程模型：Shizuku 用 app_process 以 shell 身份加载本类并实例化；它不是 Android Service，
- * 没有生命周期回调，VirtualDisplay 的生命周期由本对象的静态字段 + binder 调用维持。
+ * 通过客户端 Binder 的死亡通知释放虚拟屏，即使 App 被更新或强制退出。
  */
 class SpikeShellService : ISpikeShell.Stub {
 
@@ -107,6 +107,7 @@ class SpikeShellService : ISpikeShell.Stub {
     }
 
     override fun createDisplay(
+        owner: IBinder,
         surface: Surface?,
         width: Int,
         height: Int,
@@ -121,6 +122,14 @@ class SpikeShellService : ISpikeShell.Stub {
         //   SecurityException: packageName must match the owner uid
         // 传 null 也会被拒（已实测）。这里把包名覆盖成 shell uid 自己登记的包名再试。
         synchronized(lock) {
+            if (!displayLease.bind(owner) { callback ->
+                    val death = IBinder.DeathRecipient { callback() }
+                    runCatching {
+                        owner.linkToDeath(death, 0)
+                        val unlink: () -> Unit = { runCatching { owner.unlinkToDeath(death, 0) } }
+                        unlink
+                    }.getOrNull()
+                }) return "ERR display owner disconnected"
             val base = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION or
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
@@ -186,7 +195,7 @@ class SpikeShellService : ISpikeShell.Stub {
 
     override fun releaseDisplay(): String = synchronized(lock) {
         val had = displays.size
-        releaseLocked()
+        releaseDisplaysLocked()
         if (physicalScreenOff) {
             runCatching { setPhysicalScreenPower(true) }
         }
@@ -635,22 +644,27 @@ class SpikeShellService : ISpikeShell.Stub {
         }
     }
 
-    private fun releaseLocked() {
-        displays.values.forEach { runCatching { it.release() } }
-        displays.clear()
-        displaySizes.clear()
-        display = null
-        flagsUsed = 0
-    }
-
     private companion object {
         private const val TAG = "HyperCar-SpikeShell"
         private val lock = Any()
         private var display: VirtualDisplay? = null
         private val displays = LinkedHashMap<Int, VirtualDisplay>()
         private val displaySizes = LinkedHashMap<Int, Triple<Int, Int, Int>>()
+        private val displayLease = DisplayOwnerLease<IBinder>(lock) {
+            val count = displays.size
+            releaseDisplaysLocked()
+            Log.i(TAG, "display owner retired released=$count")
+        }
         private var flagsUsed: Int = 0
         private var appContext: Context? = null
+
+        private fun releaseDisplaysLocked() {
+            displays.values.forEach { runCatching { it.release() } }
+            displays.clear()
+            displaySizes.clear()
+            display = null
+            flagsUsed = 0
+        }
 
         /** SurfaceControl 显示电源模式：OFF=硬件断电，NORMAL=正常点亮。 */
         private const val POWER_MODE_OFF = 0

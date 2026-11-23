@@ -37,9 +37,11 @@ object MusicApps {
     internal fun idlePlayer(installed: List<String>, selected: String?, default: String): String? =
         selected?.takeIf { it in installed } ?: default.takeIf { it in installed } ?: installed.singleOrNull()
 
-    fun installed(context: Context): List<Entry> {
+    fun installed(context: Context): List<Entry> = installedEntries(context, CANDIDATES)
+
+    internal fun installedEntries(context: Context, packages: List<String>): List<Entry> {
         val pm = context.packageManager
-        return CANDIDATES.mapNotNull { pkg ->
+        return packages.mapNotNull { pkg ->
             runCatching {
                 val ai = pm.getApplicationInfo(pkg, 0)
                 // 没有 Launcher 入口的（组件被禁用/仅服务）不算可切换
