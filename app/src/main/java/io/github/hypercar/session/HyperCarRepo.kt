@@ -3969,8 +3969,8 @@ object HyperCarRepo {
                 val ctx = appContext() ?: return@launch
                 if (!sessionLive.get() || connectionAttemptId != attempt || !sessionSystemCarLife) return@launch
                 val reason = if (startup) "源端 CMD 持续拒绝连接" else "车机画布迟到"
-                log("CARWITH-START: $reason，重新启动本机 CarWith 入口 attempt=$attempt")
-                log("CARWITH-START: attempt=$attempt " + launchCarWith(ctx, attempt))
+                log("CARWITH-START: $reason，重新启动本机车联入口 attempt=$attempt")
+                log("CARWITH-START: attempt=$attempt " + if (sessionSystemCarLife) launchSystemCarLife(ctx, attempt) else launchCarWith(ctx, attempt))
             }
         }
 
@@ -5168,47 +5168,14 @@ object HyperCarRepo {
     /**
      * 系统自带 CarLife 入口（三星车联 / 荣耀车联等）。
      *
-     * 这类 ROM 没有 CarWith 的 `CarlifeAdbActivity` 那样的调试入口，也不保证第三方能直接拉起
-     * 它的「无线连接」页，所以这里只做尽力而为：找到系统车联应用就打开它，否则退回系统设置，
-     * 由用户自己进入「无线连接」并停在等待页。Rust 侧同时在六路端口上守候，等它开监听后接管。
+     * 这些 ROM 的 CarLife 引擎在用户点「开始连接」后进入等待态并监听 7240 等端口，但**再次拉起
+     * 它的界面会把等待态清掉**——2026-11-23 在 SM-S9380 实测：端口已 LISTEN 时重新启动
+     * carlife.samsung，七个监听口全消失。所以这里不主动拉起任何界面，只给提示；Rust 侧负责
+     * 每秒拨一次 127.0.0.1:7240，端口一开就接管。
      */
     private suspend fun launchSystemCarLife(ctx: android.content.Context, attempt: Long): String {
-        // 三星车联：直接落到「连接汽车」页，比停在它的启动器页少走两步。
-        // 该 Activity 在 SM-S9380 上能从冷启动直接拉起（2026-11-23 实测，force-stop 后仍可）。
-        val explicit = listOf(
-            "com.samsung.android.carlink/.setting.activity.carlife.CarLifeConnectCarActivity",
-        )
-        for (component in explicit) {
-            val intent = android.content.Intent().apply {
-                setClassName(component.substringBefore('/'), component.substringAfter('/'))
-                addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            if (runCatching { ctx.startActivity(intent); true }.getOrDefault(false)) {
-                val message = "已打开三星车联「连接汽车」页；请点「百度 CarLife+」→「WLAN 连接」→「开始连接」"
-                log("SYSTEM-CARLIFE: attempt=$attempt $message")
-                return message
-            }
-        }
-        val pkg = io.github.hypercar.session.StartupRequirements.systemCarLifePackage(ctx)
-        if (pkg != null) {
-            val intent = runCatching { ctx.packageManager.getLaunchIntentForPackage(pkg) }.getOrNull()
-            if (intent != null) {
-                intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
-                val opened = runCatching { ctx.startActivity(intent); true }.getOrDefault(false)
-                val message = if (opened) "已打开 $pkg，请进入「无线连接」并停在三步引导页"
-                    else "打开 $pkg 失败（可能缺少后台弹出界面权限）"
-                log("SYSTEM-CARLIFE: attempt=$attempt $message")
-                return message
-            }
-        }
-        val opened = runCatching {
-            ctx.startActivity(android.content.Intent(android.provider.Settings.ACTION_SETTINGS)
-                .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
-            true
-        }.getOrDefault(false)
-        val message = if (opened)
-            "未找到系统车联应用（尝试过 ${io.github.hypercar.session.StartupRequirements.SYSTEM_CARLIFE_PACKAGES.joinToString()}）；已打开系统设置"
-        else "未找到系统车联应用，且打开系统设置失败"
+        val where = io.github.hypercar.session.StartupRequirements.systemCarLifePackage(ctx) ?: "系统车联"
+        val message = "请在$where 里点「百度 CarLife+」→「WLAN 连接」→「开始连接」，再切回本应用；正在等待 7240"
         log("SYSTEM-CARLIFE: attempt=$attempt $message")
         return message
     }
