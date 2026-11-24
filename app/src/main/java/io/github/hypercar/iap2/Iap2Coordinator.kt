@@ -2,6 +2,7 @@ package io.github.hypercar.iap2
 
 import android.content.Context
 import io.github.hypercar.net.BluetoothHotspot
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.runBlocking
 
 /**
@@ -33,11 +34,37 @@ data class CarPlayEndpoint(
     val bluetoothHotspot: BluetoothHotspot? = null,
     /** Received directly in 0x5703 from a DENSO Outback in this handshake. */
     val densoOutbackWifi: Boolean = false,
+    /** The advertised AirPlay route carries no Wi-Fi identity of its own. */
+    val requiresBoundAirplayRoute: Boolean = false,
+    val addressOnlyAirplayReport: Boolean = false,
+    /** A route taken out of the deferred queue needs the new request's credential proof. */
+    val requiresMatchingAirplayCredentials: Boolean = false,
+    val airplayRouteBinding: AirplayRouteBinding? = if (requiresBoundAirplayRoute) AirplayRouteBinding() else null,
+    /** A replay can retain the current credentials while advertising the previous hotspot's address. */
+    val replayedWifiConfiguration: Iap2Messages.WifiConfiguration? = null,
 ) {
+    val verifiedAirplayNetworkHandle: Long? get() = airplayRouteBinding?.networkHandle
+
     /** Only this peer's current Wi-Fi parameters can start or replace an Android request. */
     internal fun canRequestHotspot(current: BluetoothHotspot?): Boolean =
         !fromInvite && !proactive && current != null && bluetoothHotspot == current && current.ssid == ssid
 }
+
+/** Copies of one address report share its first successful Network verification. */
+class AirplayRouteBinding {
+    private val verifiedNetwork = AtomicReference<Long?>(null)
+    internal val networkHandle: Long? get() = verifiedNetwork.get()
+    internal fun bind(networkHandle: Long): Boolean =
+        verifiedNetwork.compareAndSet(null, networkHandle) || verifiedNetwork.get() == networkHandle
+}
+
+/** Resolve under the receiver's endpoint lock, then commit only if the report is accepted. */
+class Iap2EndpointUpdate(
+    val endpoint: CarPlayEndpoint,
+    val commitDeferred: (CarPlayEndpoint) -> Unit,
+    val commit: () -> Unit,
+)
+typealias Iap2EndpointProposal = () -> Iap2EndpointUpdate?
 
 /**
  * iAP2 协商层对外门面（Orchestrator 的唯一入口）。
@@ -67,6 +94,7 @@ class Iap2Coordinator(
     private val log: (String) -> Unit,
     private val onInboundSession: (Long, String?, Long) -> Unit = { _, _, _ -> },
     private val diagnosticAttempt: () -> Long = { 0L },
+    private val wifiCredentialHistory: () -> Iap2WifiCredentialHistory = { Iap2WifiCredentialHistory() },
 ) {
 
     private val appContext = context.applicationContext
@@ -75,7 +103,7 @@ class Iap2Coordinator(
     private var bluetooth: Iap2Bluetooth? = null
 
     @Volatile
-    private var endpointCallback: ((CarPlayEndpoint) -> Unit)? = null
+    private var endpointCallback: ((Iap2EndpointProposal) -> Boolean)? = null
 
     private val phoneIdentity = io.github.hypercar.net.PhoneIdentitySnapshot(
         nowMillis = android.os.SystemClock::elapsedRealtime,
@@ -103,7 +131,7 @@ class Iap2Coordinator(
      *
      * 可重复调用：已在运行时只更新回调，不重建蓝牙栈。
      */
-    fun start(onEndpoint: (CarPlayEndpoint) -> Unit) = startTransport(true, onEndpoint)
+    fun start(onEndpoint: (Iap2EndpointProposal) -> Boolean) = startTransport(true, onEndpoint)
 
     fun keepIdentityOnly() = startTransport(false, null)
 
@@ -119,7 +147,7 @@ class Iap2Coordinator(
         endpointCallback = null
     }
 
-    private fun startTransport(allowSessions: Boolean, onEndpoint: ((CarPlayEndpoint) -> Unit)?) {
+    private fun startTransport(allowSessions: Boolean, onEndpoint: ((Iap2EndpointProposal) -> Boolean)?) {
         synchronized(this) {
             endpointCallback = onEndpoint
             bluetooth?.let { existing ->
@@ -147,9 +175,10 @@ class Iap2Coordinator(
                     allowOutboundIap2 = allowOutboundIap2,
                     profileId = profileId,
                     log = log,
-                    onEndpoint = { endpoint -> endpointCallback?.invoke(endpoint) },
+                    onEndpoint = { proposed -> endpointCallback?.invoke(proposed) == true },
                     onInboundSession = onInboundSession,
                     diagnosticAttempt = diagnosticAttempt,
+                    wifiCredentialHistory = wifiCredentialHistory,
                     onSessionEnded = { reason -> log("IAP2: 会话结束（$reason），继续监听/出站等待重连") },
                 )
             bluetooth = bt

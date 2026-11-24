@@ -221,6 +221,8 @@ object Iap2Messages {
         val wirelessAp: WifiConfiguration?,
         val sdkVersion: String? = null,
         val mutualAuth: Boolean? = null,
+        val airplayRouteBinding: AirplayRouteBinding? = if (wirelessAp == null) AirplayRouteBinding() else null,
+        val replayedWifiConfiguration: WifiConfiguration? = null,
     )
 
     /**

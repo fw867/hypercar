@@ -1,5 +1,6 @@
 package io.github.hypercar.net
 
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
@@ -9,6 +10,29 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class VerifiedWifiWaitTest {
+    @Test fun sameSsidPasswordChangeStopsAnOutstandingRequestBeforeItsSystemTimeout() = runTest {
+        val request = CarWifiRequestIdentity("car", "old-passphrase")
+        val association = WifiRequestAssociation<Any, String>()
+        val old = Any()
+        assertTrue(association.register(old))
+        var newestPassword = "old-passphrase"
+        launch {
+            delay(250)
+            newestPassword = "new-passphrase"
+        }
+        val current = VerifiedWifiWait.awaitCallback(60_000, { testScheduler.currentTime },
+            credentialsCurrent = { !request.requiresCredentialUpdate("car", newestPassword) },
+            poll = {
+                delay(it)
+                testScheduler.currentTime == 400L && association.available(old, "old-network")
+            })
+        if (!current) association.release()
+        assertFalse(current)
+        assertEquals(400L, testScheduler.currentTime)
+        assertFalse(association.available(old, "late-old-network"))
+        assertTrue(association.register(Any()))
+    }
+
     @Test fun unavailable_at_twenty_seconds_can_recover_a_later_verified_network() = runTest {
         testScheduler.advanceTimeBy(20_106)
         val result = VerifiedWifiWait.await(3_000, { testScheduler.currentTime }, { true }) {

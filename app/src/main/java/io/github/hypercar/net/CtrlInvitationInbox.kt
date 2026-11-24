@@ -1,5 +1,15 @@
 package io.github.hypercar.net
 
+internal class CtrlInvitation<N : Any>(
+    val host: String,
+    val receivedAtMillis: Long,
+    private val epoch: CtrlInvitationInbox.Epoch<N>,
+    val receiverId: String?,
+) {
+    val network: N get() = epoch.network
+    fun isOn(network: N?): Boolean = epoch.isCurrent && epoch.network == network
+}
+
 /** The advertiser serializes network changes and publication on the same monitor. */
 internal class CtrlInvitationInbox<N : Any, A : Any, V : Any>(private val publish: (Epoch<N>, V) -> Unit) {
     class Epoch<N>(val network: N) {

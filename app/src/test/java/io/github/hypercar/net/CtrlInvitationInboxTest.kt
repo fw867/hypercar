@@ -9,6 +9,24 @@ class CtrlInvitationInboxTest {
     private val events = mutableListOf<String>()
     private val inbox = CtrlInvitationInbox<String, String, String> { _, invite -> events += invite }
 
+    @Test fun selectedInvitationSurvivesADifferentAddressUntilItsNetworkEpochIsRetired() {
+        val requests = CtrlInvitationInbox<String, String, CtrlInvitation<String>> { _, _ -> }
+        val wifi = checkNotNull(requests.select("car"))
+        requests.advertise(wifi)
+        requests.addresses(wifi, setOf("local-v4", "local-v6"))
+        val v6 = CtrlInvitation("fe80::1234%wlan0", 100, wifi, "car")
+        requests.offer(checkNotNull(requests.accept(wifi)), "local-v6", v6)
+        val selected = checkNotNull(requests.latest.get())
+        val v4 = CtrlInvitation("192.168.5.1", 118, wifi, "car")
+        requests.offer(checkNotNull(requests.accept(wifi)), "local-v4", v4)
+        assertSame(v4, requests.latest.get())
+        assertEquals("fe80::1234%wlan0", selected.host)
+        assertTrue(selected.isOn("car"))
+        requests.select(null)
+        requests.select("car")
+        assertFalse(selected.isOn("car"))
+    }
+
     @Test fun lateAWithIdenticalAddressesCannotPublishOrConsumeB() {
         val a = inbox.select("A")!!
         val old = inbox.accept(a)!!

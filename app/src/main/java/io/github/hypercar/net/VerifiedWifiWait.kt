@@ -8,6 +8,23 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 /** Network callbacks and address/capability publication need not arrive together. */
 internal object VerifiedWifiWait {
+    suspend fun awaitCallback(
+        waitMs: Long,
+        now: () -> Long,
+        credentialsCurrent: () -> Boolean,
+        poll: suspend (Long) -> Boolean,
+        onWaiting: () -> Unit = {},
+    ): Boolean {
+        val deadline = now() + waitMs
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            if (!credentialsCurrent()) return false
+            val remaining = deadline - now()
+            if (remaining <= 0 || poll(minOf(200L, remaining))) return credentialsCurrent()
+            onWaiting()
+        }
+    }
+
     suspend fun <T> await(
         waitMs: Long,
         now: () -> Long,

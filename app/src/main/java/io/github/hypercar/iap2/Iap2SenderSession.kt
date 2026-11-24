@@ -79,7 +79,7 @@ class Iap2SenderSession(
     /** 本机蓝牙名（0x4E09 设备信息）。 */
     private val deviceName: String = "HyperCar",
     /** 每次拿到/更新端点即回调（0x5703 与 0x4301 各触发一次，保活期 0x4301 重发也触发）。 */
-    private val onEndpoint: (CarPlayEndpoint) -> Unit,
+    private val onEndpoint: (CarPlayEndpoint) -> Unit = {},
     /** 用于 MFi 挑战长度与真实证书的按车机持久化记忆；null = 只用进程内内存表（纯 JVM 单测）。 */
     private val context: android.content.Context? = null,
     /** 车机档案：品牌特有的行为差异都从这里读（见 `headunit/HeadUnitProfile.kt`）。 */
@@ -97,6 +97,13 @@ class Iap2SenderSession(
     private val pairedReceiver: Boolean = false,
     private val bondedBmwInbound: Boolean = false,
     private val verifyMfi3Certificate: (ByteArray) -> ECPublicKey = Mfi3AccessoryVerifier::verifyCertificate,
+    private val wifiHistory: Iap2WifiCredentialHistory.Receiver = Iap2WifiCredentialHistory.Receiver(),
+    private val publishEndpoint: (Iap2EndpointProposal) -> Boolean = { propose ->
+        propose()?.let { update ->
+            update.commit()
+            onEndpoint(update.endpoint)
+        } != null
+    },
 ) {
     private var parser = Iap2Csm.Parser()
     private val media = Iap2MediaSession(log, onMediaKey)
@@ -412,10 +419,8 @@ class Iap2SenderSession(
                             "security=${wifiConfiguration.securityType} " +
                             "psk=${if (wifiConfiguration.passphrase.isEmpty()) "(空)" else "***"}",
                     )
-                    wifi = wifiConfiguration
                     // 凭据即刻回调：上层据此绑车机网络 + mDNS，0x4301 到达前就能入网
-                    onEndpoint(endpointOf(null, wifiConfiguration).copy(densoOutbackWifi = densoOutback))
-                    wifiConfiguration
+                    wifiConfiguration.takeIf { publishWifiConfiguration(it, null) }
                 }
             }
 
@@ -774,12 +779,24 @@ class Iap2SenderSession(
     private fun handleLateWifiConfiguration(frame: Iap2Csm.Frame) {
         val parsed = Iap2Messages.parseWifiConfiguration(frame.body)
         log(
-            "iap2 rx=0x5703（保活期重发）ssid=${parsed.ssid} channel=${parsed.channel} " +
+            "iap2 rx=0x5703 phase=$phaseName ssid=${parsed.ssid} channel=${parsed.channel} " +
                 "psk=${if (parsed.passphrase.isEmpty()) "(空)" else "***"}",
         )
-        wifi = parsed
-        onEndpoint(endpointOf(lastStartSession, parsed).copy(densoOutbackWifi = densoOutback))
+        publishWifiConfiguration(parsed, lastStartSession)
     }
+
+    private fun publishWifiConfiguration(configuration: Iap2Messages.WifiConfiguration, start: Iap2Messages.StartSession?): Boolean =
+        publishEndpoint {
+            if (wifiHistory.isRetiredRecoveryCredential(configuration.ssid, configuration.passphrase)) return@publishEndpoint null
+            val sameHotspot = wifi?.let { it.ssid == configuration.ssid && it.passphrase == configuration.passphrase } != false
+            val endpoint = endpointOf(start.takeIf { sameHotspot }, configuration).copy(densoOutbackWifi = densoOutback)
+            val remember = { wifiHistory.remember(configuration) }
+            Iap2EndpointUpdate(endpoint, { remember() }) {
+                remember()
+                wifi = configuration
+                if (!sameHotspot) lastStartSession = null
+            }
+        }
 
     /** 解析 0x4301 → [CarPlayEndpoint] → 回调；返回解析结果。 */
     private var lastStartSession: Iap2Messages.StartSession? = null
@@ -790,32 +807,49 @@ class Iap2SenderSession(
     ): CarPlayEndpoint {
         logStartSessionRaw(frame)
         val parsed = Iap2Messages.parseStartSession(frame.body)
-        if (lastStartSession == null || parsed.sdkVersion != lastStartSession?.sdkVersion ||
-            parsed.mutualAuth != lastStartSession?.mutualAuth) {
-            log("iap2 START_SESSION sdk=${parsed.sdkVersion ?: "not-declared"} mutualAuth=${parsed.mutualAuth?.toString() ?: "not-declared"}; observation only, not authentication success")
+        val previous = lastStartSession
+        val previousWifi = wifi
+        var replayedPassword = false
+        val accepted = publishEndpoint {
+            val resolved = wifiHistory.resolve(parsed, previousWifi) ?: return@publishEndpoint null
+            replayedPassword = resolved.replayedPassword
+            val remember = { wifiHistory.commitStart(resolved) }
+            val endpoint = endpointOf(resolved.start, resolved.credential).copy(
+                addressOnlyAirplayReport = parsed.wirelessAp == null,
+            )
+            Iap2EndpointUpdate(endpoint, { released ->
+                wifiHistory.commitStart(resolved.copy(start = resolved.start.copy(
+                    ipAddresses = released.ipAddresses, airPlayPort = released.airPlayPort,
+                    airplayRouteBinding = released.airplayRouteBinding,
+                )))
+            }) {
+                remember()
+                wifi = resolved.credential
+                lastStartSession = resolved.start
+            }
         }
-        lastStartSession = parsed
-        // A newly supplied AP supersedes earlier credentials; absent AP keeps the latest 5703.
-        if (parsed.wirelessAp != null) {
-            val changed = wifi != parsed.wirelessAp
-            wifi = parsed.wirelessAp
-            if (changed) log("iap2 0x4301 自带 AP 已更新（不记录热点名称/密码）")
+        val endpoint = endpointOf(lastStartSession, wifi)
+        if (accepted) {
+            val current = checkNotNull(lastStartSession)
+            if (replayedPassword) {
+                log("iap2 0x4301 重发旧热点凭据，仅更新连接端点")
+            } else if (wifi != previousWifi) {
+                log("iap2 0x4301 自带 AP 已更新（不记录热点名称/密码）")
+            }
+            if (previous == null || current.sdkVersion != previous.sdkVersion || current.mutualAuth != previous.mutualAuth) {
+                log("iap2 START_SESSION sdk=${current.sdkVersion ?: "not-declared"} mutualAuth=${current.mutualAuth?.toString() ?: "not-declared"}; observation only, not authentication success")
+            }
+            // Repeated 0x4301 reports still reach the inbox, with endpoint details logged only on change.
+            val signature = endpoint.hashCode()
+            if (endpointEmitted && signature == lastLateStartSessionSignature) return endpoint
+            endpointEmitted = true
+            lastLateStartSessionSignature = signature
+            log(
+                "iap2 rx=0x4301${if (phase1) "" else "（晚到）"} airPlayPort=${endpoint.airPlayPort} " +
+                    "device=${endpoint.deviceIdentifier} publicKey=${endpoint.publicKeyHex?.take(16)}… " +
+                    "srcvers=${endpoint.sourceVersion} ips=${endpoint.ipAddresses}",
+            )
         }
-        val endpoint = endpointOf(parsed, wifi)
-        if (endpointEmitted && endpoint.hashCode() == lastLateStartSessionSignature) {
-            // 车机周期性重发同一份 0x4301：详情只在端点变化时打，避免刷日志；
-            // 但回调照发（契约：0x4301 是生命周期事件，重复到达都回调）。
-            onEndpoint(endpoint)
-            return endpoint
-        }
-        endpointEmitted = true
-        lastLateStartSessionSignature = endpoint.hashCode()
-        log(
-            "iap2 rx=0x4301${if (phase1) "" else "（晚到）"} airPlayPort=${endpoint.airPlayPort} " +
-                "device=${endpoint.deviceIdentifier} publicKey=${endpoint.publicKeyHex?.take(16)}… " +
-                "srcvers=${endpoint.sourceVersion} ips=${endpoint.ipAddresses}",
-        )
-        onEndpoint(endpoint)
         return endpoint
     }
 
@@ -845,6 +879,9 @@ class Iap2SenderSession(
             // 网关不在 iAP2 消息里；上层入网后从 DHCP/链路信息取
             gateway = null,
             bluetoothHotspot = BluetoothHotspot.fromPeer(receiverAddress, wifi?.ssid ?: startSession?.wirelessAp?.ssid),
+            requiresBoundAirplayRoute = startSession != null && startSession.wirelessAp == null,
+            airplayRouteBinding = startSession?.airplayRouteBinding,
+            replayedWifiConfiguration = startSession?.replayedWifiConfiguration,
         )
 
     // ---- MFi 挑战 ----
@@ -1188,10 +1225,20 @@ class Iap2SenderSession(
         val waitStarted = nanoTime()
         val expected = messageIds.joinToString("/") { "0x${it.toString(16)}" }
         log("WAIT phase=$phaseName ids=$expected budget=${((deadlineNanos - waitStarted) / 1_000_000L).coerceAtLeast(0)}ms pending=${pendingFrames.size}")
-        pendingFrames.firstOrNull { it.messageId in messageIds }?.let {
-            pendingFrames.remove(it)
-            log("MATCH phase=$phaseName id=0x${it.messageId.toString(16)} source=pending")
-            return it
+        // Publish a fresh password before the next 0x4301, in the same order as it arrived.
+        // Otherwise a cached Wi-Fi invitation can dial while the update waits for the keepalive pump.
+        val wifiUpdateId = Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION.takeIf {
+            Iap2MessageIds.CARPLAY_START_SESSION in messageIds && it !in messageIds
+        }
+        while (true) {
+            val pending = pendingFrames.firstOrNull { it.messageId in messageIds || it.messageId == wifiUpdateId } ?: break
+            pendingFrames.remove(pending)
+            if (pending.messageId == wifiUpdateId) {
+                handleLateWifiConfiguration(pending)
+                continue
+            }
+            log("MATCH phase=$phaseName id=0x${pending.messageId.toString(16)} source=pending")
+            return pending
         }
         while (true) {
             val remaining = (deadlineNanos - nanoTime()) / 1_000_000L
@@ -1207,6 +1254,10 @@ class Iap2SenderSession(
             if (frame.messageId in messageIds) {
                 log("MATCH phase=$phaseName id=0x${frame.messageId.toString(16)} elapsed=${(nanoTime() - waitStarted) / 1_000_000L}ms")
                 return frame
+            }
+            if (frame.messageId == wifiUpdateId) {
+                handleLateWifiConfiguration(frame)
+                continue
             }
             log(
                 "iap2 rx=0x${frame.messageId.toString(16).padStart(4, '0')} " +

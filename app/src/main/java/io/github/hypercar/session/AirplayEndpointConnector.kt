@@ -1,12 +1,60 @@
 package io.github.hypercar.session
 
+import io.github.hypercar.iap2.CarPlayEndpoint
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
-internal data class AirplayTarget(val host: String, val port: Int) {
+/** Android owns the connected socket until the native start commits under the session lock. */
+internal suspend fun <P, T> handOffControlSocket(
+    lock: Mutex,
+    credentialCommitLock: Any,
+    closeUnclaimed: () -> Unit,
+    checkCurrent: () -> Unit,
+    prepare: () -> P,
+    start: (P, transfer: (() -> T) -> T) -> T,
+): T {
+    val context = currentCoroutineContext()
+    var transferred = false
+    try {
+        return lock.withLock {
+            context.ensureActive()
+            checkCurrent()
+            val prepared = prepare()
+            start(prepared) { adopt ->
+                synchronized(credentialCommitLock) {
+                    context.ensureActive()
+                    checkCurrent()
+                    transferred = true
+                    adopt()
+                }
+            }
+        }
+    } finally {
+        if (!transferred) closeUnclaimed()
+    }
+}
+
+internal data class AirplayTarget(val host: String, val port: Int, val verifiedNetworkHandle: Long? = null) {
     init { require(host.isNotBlank() && port in 1..65535) }
     override fun toString() = "$host:$port"
+}
+
+/** Keep an address-only report's port paired with an address verified on the bound WLAN. */
+internal fun CarPlayEndpoint.verifiedAirplayEndpoint(
+    boundSsid: String?, networkHandle: Long, retiredAddresses: Set<String> = emptySet(),
+    hasMatchingCredentials: Boolean = false, isOnLink: (String) -> Boolean,
+): CarPlayEndpoint? {
+    if (!requiresBoundAirplayRoute) return this
+    val binding = airplayRouteBinding ?: return null
+    if (binding.networkHandle?.let { it != networkHandle } == true) return null
+    if (ssid != null && ssid != boundSsid) return null
+    if (requiresMatchingAirplayCredentials && !hasMatchingCredentials) return null
+    val addresses = ipAddresses.filter { it.substringBefore('%') !in retiredAddresses && isOnLink(it) }
+    if (addresses.isEmpty() || !binding.bind(networkHandle)) return null
+    return copy(ipAddresses = addresses, gateway = null)
 }
 
 /** Invitations identify a host, not a port. Preserve a recent explicit SRV/iAP2 port. */

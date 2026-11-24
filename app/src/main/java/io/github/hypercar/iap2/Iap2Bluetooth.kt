@@ -65,11 +65,12 @@ class Iap2Bluetooth(
     private val preferredProvider: () -> String? = { null },
     private val log: (String) -> Unit,
     /** 每次拿到/更新端点即回调（0x5703 凭据与 0x4301 端点都会触发，可能多次）。 */
-    private val onEndpoint: (CarPlayEndpoint) -> Unit,
+    private val onEndpoint: (Iap2EndpointProposal) -> Boolean,
     /** 会话结束（拿到端点后链路断开，或中途失败）——上层用来收尾/重排。 */
     private val onSessionEnded: (String) -> Unit,
     private val onInboundSession: (Long, String?, Long) -> Unit = { _, _, _ -> },
     private val diagnosticAttempt: () -> Long = { 0L },
+    private val wifiCredentialHistory: () -> Iap2WifiCredentialHistory = { Iap2WifiCredentialHistory() },
 ) {
     companion object {
         private val HANDSHAKE_IDS = java.util.concurrent.atomic.AtomicLong(0)
@@ -892,6 +893,7 @@ class Iap2Bluetooth(
             currentSocket.set(socket)
         }
         val attempt = caffAttempt.takeIf { it != 0L } ?: diagnosticAttempt()
+        val wifiHistory = wifiCredentialHistory()
         inboundAt?.let { onInboundSession(attempt, safeAddress(socket.remoteDevice), it) }
         val handshakeId = HANDSHAKE_IDS.incrementAndGet()
         val started = SystemClock.elapsedRealtime()
@@ -926,19 +928,24 @@ class Iap2Bluetooth(
                     },
                     // 端点回调顺手标记「本轮已拿到凭据」：acceptLoop 用它决定是否允许
                     // 车机的新连入顶替本轮（空转轮次可顶替，有凭据的不许抢）
-                    onEndpoint = { endpoint ->
-                        fun acceptEndpoint(): Boolean {
-                            if (!sessions.allows(ticket)) return false
-                            if (!endpoint.ssid.isNullOrBlank() || endpoint.ipAddresses.isNotEmpty()) sessionProductive = true
-                            return true
+                    publishEndpoint = { propose ->
+                        val current = if (probeAdmission == null) sessions.allows(ticket) else synchronized(this) {
+                            activeCaffSocket === socket && sessions.allows(ticket)
                         }
-                        val accepted = if (probeAdmission == null) acceptEndpoint() else synchronized(this) {
-                            activeCaffSocket === socket && acceptEndpoint()
+                        current && onEndpoint {
+                            propose()?.let { update ->
+                                Iap2EndpointUpdate(update.endpoint, update.commitDeferred) {
+                                    update.commit()
+                                    if (!update.endpoint.ssid.isNullOrBlank() || update.endpoint.ipAddresses.isNotEmpty()) {
+                                        sessionProductive = true
+                                    }
+                                }
+                            }
                         }
-                        if (accepted) onEndpoint(endpoint)
                     },
                     context = appContext,
                     receiverAddress = receiverAddress,
+                    wifiHistory = wifiHistory.forReceiver(receiverAddress),
                     pairedReceiver = evidence.identityPresent && evidence.receiverCredentialPresent,
                     bondedBmwInbound = inboundAt != null &&
                         isBmwBluetoothName(receiverName) && isBonded(receiver),

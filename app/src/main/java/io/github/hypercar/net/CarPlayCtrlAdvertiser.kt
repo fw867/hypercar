@@ -129,19 +129,18 @@ class CarPlayCtrlAdvertiser(
      * 但它会主动来 `GET /ctrl-int/1/connect` 邀请手机，TCP 对端地址就是车机自己。
      * 于是把「邀请方 IP + 7000」当 AirPlay 端点，是这条链路上唯一可靠的来源。
      */
-    internal class Invitation(val host: String, val receivedAtMillis: Long, val network: Network, val receiverId: String?)
-    private val invites = CtrlInvitationInbox<Network, InetAddress, Invitation> { epoch, invite ->
+    private val invites = CtrlInvitationInbox<Network, InetAddress, CtrlInvitation<Network>> { epoch, invite ->
         inviteCount++
         runCatching { onNetworkInvitation(this, epoch.network, epoch::isCurrent) }
         runCatching { onDiagnostic(Event.INVITED, port) }
         logCtrl("$TAG: ✓ 车机 ctrl 邀请（第 $inviteCount 次，receiver=${invite.receiverId ?: "?"} network=#${epoch.network}）——AirPlay 窗口已开启")
     }
-    internal val lastInvitation: Invitation? @Synchronized get() = invites.latest.get()
+    internal val lastInvitation: CtrlInvitation<Network>? @Synchronized get() = invites.latest.get()
     // Read without taking the advertiser monitor: the Bluetooth probe may hold its own lock.
     internal val hasUnresolvedOrPublishedInvite: Boolean get() =
         invitesBeingAcknowledged.get() > 0 || invites.awaitingConfirmation || invites.latest.get() != null
     val lastInvitePeerIp: String? get() = lastInvitation?.host
-    internal fun discardInvitation(expected: Invitation): Boolean = invites.latest.discard(expected)
+    internal fun discardInvitation(expected: CtrlInvitation<Network>): Boolean = invites.latest.discard(expected)
 
     /** A client accepted on A always carries A's listener epoch, even if B reuses both IPs. */
     @Synchronized internal fun selectNetwork(network: Network?) {
@@ -539,7 +538,7 @@ class CarPlayCtrlAdvertiser(
             logCtrl("CTRL-TCP: head connection=$connection bytes=${head.length} complete=${read.termination == "COMPLETE"} " +
                 "connect=${decision.reply == CtrlHttpHead.Reply.OK} elapsedMs=${SystemClock.elapsedRealtime() - started}")
             var reply = decision.reply
-            var invite: Invitation? = null
+            var invite: CtrlInvitation<Network>? = null
             if (reply == CtrlHttpHead.Reply.OK) {
                 val host = EndpointScope.invitationHost(peer)
                 synchronized(this) {
@@ -547,7 +546,7 @@ class CarPlayCtrlAdvertiser(
                         invites.current !== receipt.epoch || serverSocket !== listener -> reply = CtrlHttpHead.Reply.STALE_NETWORK
                         host == null -> reply = CtrlHttpHead.Reply.BAD_REQUEST
                         else -> {
-                            invite = Invitation(host, SystemClock.elapsedRealtime(), receipt.epoch.network, decision.request?.receiverId)
+                            invite = CtrlInvitation(host, SystemClock.elapsedRealtime(), receipt.epoch, decision.request?.receiverId)
                             invitesBeingAcknowledged.incrementAndGet()
                             acknowledgingInvite = true
                             runCatching { onDiagnostic(Event.INVITE_HEAD, port) }

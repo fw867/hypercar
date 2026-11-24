@@ -10,6 +10,7 @@ import android.os.SystemClock
 import android.util.Log
 import io.github.hypercar.bluetooth.BtProfiles
 import io.github.hypercar.bluetooth.CarAclPolicy
+import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.settings.SettingsStore
 
 /**
@@ -39,7 +40,7 @@ class CarBluetoothReceiver : BroadcastReceiver() {
         }
         val app = context.applicationContext
         // 每次都读开关：进程可能刚被广播冷启动，无内存缓存可依赖
-        if (!SettingsStore.autoConnect && !io.github.hypercar.session.HyperCarRepo.hasCurrentSession) return
+        if (!SettingsStore.autoConnect && !HyperCarRepo.hasCurrentSession) return
 
         val device = deviceOf(intent)
         if (device == null) {
@@ -54,9 +55,14 @@ class CarBluetoothReceiver : BroadcastReceiver() {
         }
         // address/name 都要 BLUETOOTH_CONNECT；拿不到（或拿到占位 MAC）无法判断是否目标车机
         val address = runCatching { device.address }.getOrNull()
+        if (address == null || address.equals(PLACEHOLDER_MAC, ignoreCase = true)) {
+            Log.i(TAG, "拿不到蓝牙 address（缺 BLUETOOTH_CONNECT？）——放弃")
+            return
+        }
+        val forwardAcl = connected || HyperCarRepo.onCarAclDisconnected(address, BtProfiles.isSelfDrop(address))
         val name = runCatching { device.name }.getOrNull()
-        if (address == null || address.equals(PLACEHOLDER_MAC, ignoreCase = true) || name == null) {
-            Log.i(TAG, "拿不到蓝牙 name/address（缺 BLUETOOTH_CONNECT？）——放弃")
+        if (name == null) {
+            Log.i(TAG, "拿不到蓝牙 name（缺 BLUETOOTH_CONNECT？）——放弃")
             return
         }
         if (!isTargetCar(device, address, name)) {
@@ -66,7 +72,7 @@ class CarBluetoothReceiver : BroadcastReceiver() {
         // iAP2 的「只配对、不连接」会主动断车机音频配置文件（个别 ROM 退到设备级断开），
         // 系统随即广播 ACL 断开——那不是下车，是**我们自己干的**。放行会立刻拆掉刚建的
         // 会话，并与前台服务的 ACTION_STOP 串成刷屏回环（历史故障）。
-        if (!connected && BtProfiles.isSelfDrop(address)) {
+        if (!forwardAcl) {
             val now = SystemClock.elapsedRealtime()
             if (now - lastSelfDropLogAt > SELF_DROP_LOG_THROTTLE_MILLIS) {
                 lastSelfDropLogAt = now
