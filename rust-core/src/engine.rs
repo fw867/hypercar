@@ -640,6 +640,7 @@ async fn audio_pump(
 ) {
     let mut out: Option<AudioOut> = None;
     let mut paused = false;
+    let mut hold_mixed_voice = false;
     let mut commands_open = true;
     let mut pending_events = VecDeque::new();
     let mut ready = Some(audio_out_rx);
@@ -699,9 +700,13 @@ async fn audio_pump(
         tokio::select! {
             _ = stop_a.notified() => return,
             command = commands.recv(), if commands_open => match command {
-                Some(MainCommand::Pause(reply)) => {
+                Some(MainCommand::Pause { reply, hold_mixed_voice: hold_voice }) => {
                     if reply.is_closed() {continue;}
-                    drop(out.take()); paused = true;
+                    // The transition drops the old sender before remote TEARDOWN.
+                    // A simultaneous Pause timeout leaves the current sender here.
+                    if let Err(sender) = reply.send(out.take()) { out = sender; continue; }
+                    paused = true;
+                    hold_mixed_voice = hold_voice;
                     pipeline.lock().observe_main_sender(None);
                     media_mix.clear(); media_remain.clear();
                     // Retire queued main media but preserve assistant/navigation boundaries.
@@ -710,12 +715,15 @@ async fn audio_pump(
                             pending_events.push_back(event);
                         }
                     }
-                    let _=reply.send(());
                     emit_log("AUDIO-RESOURCE: main sender released; pause acknowledged");
                 }
                 Some(MainCommand::Install(next)) => {
                     ready = None;
                     media_mix.clear(); media_remain.clear();
+                    if next.is_none() && hold_mixed_voice {
+                        voice.discard_reply();
+                        hold_mixed_voice = false;
+                    }
                     pipeline.lock().observe_main_sender(next.as_ref());
                     out=next; paused=false;
                 }
@@ -747,6 +755,12 @@ async fn audio_pump(
             }
             ev = async { if let Some(event)=pending_events.pop_front() {Some(event)} else {audio_rx.recv().await} } => match ev {
                 Some(SourceEvent::AuxFallback{kind,samples}) => {
+                    if kind == crate::aux_setup::Kind::Speech && voice.discarded_reply { continue; }
+                    let limit = if kind == crate::aux_setup::Kind::Speech {
+                        voice.queue_limit(mix_rate, hold_mixed_voice)
+                    } else {
+                        mix_rate as usize
+                    };
                     let queue=if kind==crate::aux_setup::Kind::Speech {&mut voice.mix} else {&mut tts_mix};
                     // A failed independent setup hands us one buffered 48 kHz stereo clip.
                     if mix_rate == 48000 { queue.extend(samples); }
@@ -754,7 +768,7 @@ async fn audio_pump(
                         let pcm: Vec<_> = samples.into_iter().flat_map(i16::to_le_bytes).collect();
                         PcmToStereo::default().push(&pcm,48000,2,mix_rate,queue);
                     }
-                    let overflow=queue.len().saturating_sub(mix_rate as usize);
+                    let overflow=queue.len().saturating_sub(limit);
                     if overflow>0 {queue.drain(..overflow);}
                 }
                 Some(SourceEvent::VoiceAudioInit {rate,channels}) => {
@@ -764,7 +778,7 @@ async fn audio_pump(
                 }
                 Some(SourceEvent::VoiceAudioData {rate,channels,data}) => {
                     let accepted=match auxiliary.push(crate::aux_setup::Kind::Speech,rate,channels,&data) {
-                        crate::aux_audio::Route::Mix=>voice.push(rate,channels,&data,mix_rate),
+                        crate::aux_audio::Route::Mix=>voice.push(rate,channels,&data,mix_rate,hold_mixed_voice),
                         crate::aux_audio::Route::Independent=>true,
                         crate::aux_audio::Route::Drop=>false,
                     };
@@ -867,6 +881,8 @@ async fn audio_pump(
             }
             scheduled = tick.tick() => {
                 let now=tokio::time::Instant::now();
+                let defer_voice = hold_mixed_voice && !out.as_ref().is_some_and(AudioOut::owns_audio);
+                voice.update_hold(now, defer_voice);
                 let wake_ns = crate::timing::monotonic_nanos();
                 let missed=crate::audio_pacing::missed_source_frames(scheduled,now,mix_rate);
                 let late = now.saturating_duration_since(scheduled);
@@ -890,9 +906,12 @@ async fn audio_pump(
                     let tts_drop=((skipped as u128*2).min(tts_mix.len() as u128)) as usize;
                     tts_mix.drain(..tts_drop);
                     pacing.dropped.tts+=(tts_drop/2) as u64;
-                    let voice_drop=((skipped as u128*2).min(voice.mix.len() as u128)) as usize;
-                    voice.mix.drain(..voice_drop); pacing.dropped.voice+=(voice_drop/2) as u64;
-                    tts_remain.clear(); voice.remain.clear();
+                    if !hold_mixed_voice {
+                        let voice_drop=((skipped as u128*2).min(voice.mix.len() as u128)) as usize;
+                        voice.mix.drain(..voice_drop); pacing.dropped.voice+=(voice_drop/2) as u64;
+                        voice.remain.clear();
+                    }
+                    tts_remain.clear();
                     if let Some(a)=out.as_mut() {
                         if a.skip_source_frames(skipped) {
                             let started = std::time::Instant::now();
@@ -919,11 +938,13 @@ async fn audio_pump(
                     let mr = take_or_zero(&mut media_mix);
                     let tl = take_or_zero(&mut tts_mix);
                     let tr = take_or_zero(&mut tts_mix);
-                    let vl = take_or_zero(&mut voice.mix);
-                    let vr = take_or_zero(&mut voice.mix);
+                    let (vl, vr) = if defer_voice { (0, 0) } else {
+                        (take_or_zero(&mut voice.mix), take_or_zero(&mut voice.mix))
+                    };
                     mixed[i * 2] = mix_audio_sample(ml,tl,vl,gain);
                     mixed[i * 2 + 1] = mix_audio_sample(mr,tr,vr,gain);
                 }
+                hold_mixed_voice = defer_voice;
                 stats.lock().ducking = duck_hold > 0;
                 let mix = crate::audio_pacing::StageSpan::since(mix_started);
                 pacing.costs.mix_us = pacing.costs.mix_us.max(u128::from(mix.duration_ns() / 1_000));
@@ -1558,18 +1579,45 @@ struct VoicePcm {
     format:Option<(u32,u8)>,
     remain:PcmToStereo,
     mix:VecDeque<i16>,
+    hold_deadline:Option<tokio::time::Instant>,
+    discarded_reply:bool,
 }
 impl VoicePcm {
     fn init(&mut self,rate:u32,channels:u8) {
         self.format=if (4000..=96000).contains(&rate) && (1..=2).contains(&channels) {Some((rate,channels))} else {None};
         self.remain.clear(); self.mix.clear();
+        self.hold_deadline=None;
+        self.discarded_reply=false;
     }
     fn stop(&mut self) {self.format=None; self.remain.clear();}
-    fn push(&mut self,rate:u32,channels:u8,data:&[u8],mix_rate:u32)->bool {
+    fn discard_reply(&mut self) {
+        self.stop();
+        self.mix.clear();
+        self.hold_deadline = None;
+        self.discarded_reply = true;
+    }
+    fn update_hold(&mut self, now: tokio::time::Instant, held: bool) {
+        // Check expiry even on the tick that restores ownership.
+        if self.hold_deadline.is_some_and(|deadline| now >= deadline) {
+            self.discard_reply();
+            crate::emit_log("VOICE-AUDIO: pending assistant reply expired waiting for main audio");
+        } else if !held {
+            self.hold_deadline = None;
+        } else if !self.mix.is_empty() {
+            self.hold_deadline.get_or_insert(now + Duration::from_secs(5));
+        }
+    }
+    fn queue_limit(&self, mix_rate: u32, holding: bool) -> usize {
+        let regular = mix_rate as usize; // Half a second of stereo.
+        // Let an assistant reply collect during shared microphone cleanup. Keep
+        // the larger bound while the backlog drains after media is restored.
+        if holding || self.mix.len() > regular { 10 * regular } else { regular }
+    }
+    fn push(&mut self,rate:u32,channels:u8,data:&[u8],mix_rate:u32,holding:bool)->bool {
         if self.format!=Some((rate,channels)) {return false;}
+        let limit = self.queue_limit(mix_rate, holding);
         self.remain.push(data,rate,channels,mix_rate,&mut self.mix);
-        // Match the existing half-second limit and retire whole stereo frames.
-        let overflow=self.mix.len().saturating_sub(mix_rate as usize);
+        let overflow=self.mix.len().saturating_sub(limit);
         if overflow>0 {self.mix.drain(..overflow);}
         true
     }
@@ -1607,22 +1655,38 @@ mod voice_mix_tests {
     fn voice_end_preserves_tail_and_new_init_cannot_replay_old_reply() {
         let mut voice=VoicePcm::default();
         let pcm=1500i16.to_le_bytes().repeat(160);
-        assert!(!voice.push(16000,1,&pcm,48000));
+        assert!(!voice.push(16000,1,&pcm,48000,false));
         voice.init(16000,1);
-        assert!(voice.push(16000,1,&pcm,48000));
+        assert!(voice.push(16000,1,&pcm,48000,false));
         let queued=voice.mix.len(); assert!(queued>0);
         voice.stop();
         assert_eq!(voice.mix.len(),queued);
-        assert!(!voice.push(16000,1,&pcm,48000));
+        assert!(!voice.push(16000,1,&pcm,48000,false));
         assert_eq!(mix_audio_sample(0,0,take_or_zero(&mut voice.mix),0.25),1500);
         voice.init(4000,1);
-        assert!(voice.push(4000,1,&pcm,48000));
+        assert!(voice.push(4000,1,&pcm,48000,false));
         assert!(voice.mix.len()>queued);
         voice.init(48000,2);
         assert!(voice.mix.is_empty());
-        assert!(!voice.push(16000,1,&pcm,48000));
-        assert!(voice.push(48000,2,&[1;500000],48000));
+        assert!(!voice.push(16000,1,&pcm,48000,false));
+        assert!(voice.push(48000,2,&[1;500000],48000,false));
         assert_eq!(voice.mix.len(),TARGET_RATE as usize);
+    }
+    #[test]
+    fn held_reply_expires_even_when_audio_ownership_returns_on_the_deadline() {
+        let mut voice = VoicePcm::default();
+        let pcm = 1500i16.to_le_bytes().repeat(160);
+        let start = tokio::time::Instant::now();
+        voice.init(16000, 1);
+        assert!(voice.push(16000, 1, &pcm, 48000, true));
+        voice.update_hold(start, true);
+        voice.update_hold(start + Duration::from_secs(4), true);
+        assert!(!voice.mix.is_empty());
+        voice.update_hold(start + Duration::from_secs(5), false);
+        assert!(voice.mix.is_empty());
+        assert!(!voice.push(16000, 1, &pcm, 48000, false));
+        voice.init(16000, 1);
+        assert!(voice.push(16000, 1, &pcm, 48000, false));
     }
     #[test]
     fn independent_voice_is_audible_with_silent_media_and_saturates_with_tts() {
@@ -1926,8 +1990,11 @@ mod main_audio_command_tests {
         let mut packet=[0;4096];tokio::time::timeout(Duration::from_secs(1),peer.recv(&mut packet)).await.unwrap().unwrap();
         assert_eq!(pipeline.lock().activation_snapshot("SCREEN_SETUP").unwrap().main_audio_stream_type, Some(100));
         events.send(SourceEvent::AudioData{received_at:std::time::Instant::now(),tts:false,rate:48000,channels:2,data:10000i16.to_le_bytes().repeat(12000)}).unwrap();
-        let(ack,done)=tokio::sync::oneshot::channel();commands.send(MainCommand::Pause(ack)).unwrap();
-        assert!(tokio::time::timeout(Duration::from_millis(250),done).await.is_ok(),"pause must finish before lifecycle allocates speech");
+        let(ack,done)=tokio::sync::oneshot::channel();
+        commands.send(MainCommand::Pause { reply: ack, hold_mixed_voice: false }).unwrap();
+        let outgoing = tokio::time::timeout(Duration::from_millis(250), done).await.unwrap().unwrap();
+        assert!(outgoing.is_some(), "the pause owner must receive the old sender");
+        drop(outgoing);
         let rebound=UdpSocket::bind(local).await;assert!(rebound.is_ok(),"pause acknowledgment must follow physical sender drop");
         assert_eq!(pipeline.lock().activation_snapshot("SCREEN_SETUP").unwrap().main_audio_stream_type, None);
         let(next,peer,_)=output().await;commands.send(MainCommand::Install(Some(next))).unwrap();
@@ -2017,11 +2084,55 @@ mod main_audio_command_tests {
     }
 
     #[tokio::test]
+    async fn mixed_assistant_reply_waits_for_media_after_shared_microphone_pause() {
+        let (ready, rx) = tokio::sync::oneshot::channel();
+        let (events, audio) = mpsc::unbounded_channel();
+        let (commands, cmd) = mpsc::unbounded_channel();
+        let (claims, _) = mpsc::channel(4);
+        let (initial, initial_peer, _) = output().await;
+        let mut packet = [0; 4096];
+        let task = tokio::spawn(audio_pump(Arc::default(), Arc::default(), claims, rx, audio, cmd,
+            Arc::default(), test_pipeline()));
+        assert!(ready.send(initial).is_ok());
+        tokio::time::timeout(Duration::from_secs(1), initial_peer.recv(&mut packet)).await.unwrap().unwrap();
+
+        let (reply, done) = tokio::sync::oneshot::channel();
+        commands.send(MainCommand::Pause { reply, hold_mixed_voice: true }).unwrap();
+        drop(done.await.unwrap());
+        events.send(SourceEvent::VoiceAudioInit { rate: 16000, channels: 1 }).unwrap();
+        events.send(SourceEvent::VoiceAudioData { rate: 16000, channels: 1,
+            data: 2300i16.to_le_bytes().repeat(1600) }).unwrap();
+        events.send(SourceEvent::VoiceAudioData { rate: 16000, channels: 1,
+            data: 1300i16.to_le_bytes().repeat(9600) }).unwrap();
+        events.send(SourceEvent::VoiceAudioStop).unwrap();
+        tokio::time::sleep(Duration::from_millis(180)).await;
+
+        let (mut restored, peer, _) = output().await;
+        let owned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        restored.set_ownership(owned.clone());
+        commands.send(MainCommand::Install(Some(restored))).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        owned.store(true, std::sync::atomic::Ordering::Release);
+        let heard = tokio::time::timeout(Duration::from_millis(400), async {
+            loop {
+                let n = peer.recv(&mut packet).await.unwrap();
+                let nonce = u64::from_le_bytes(packet[n - 8..n].try_into().unwrap());
+                let pcm = crate::crypto::chacha_open(&[7; 32], &crate::crypto::nonce64(nonce),
+                    &packet[12..n - 8], &packet[4..12]).unwrap();
+                if pcm.chunks_exact(2).any(|p| i16::from_be_bytes([p[0], p[1]]) == 2300) { return; }
+            }
+        }).await;
+        task.abort();
+        assert!(heard.is_ok(), "mixed assistant reply must reach RTP after media is restored");
+    }
+
+    #[tokio::test]
     async fn paused_pump_drops_late_initial_sender_until_explicit_install() {
         let(claims,_)=mpsc::channel(4);let(ready,rx)=tokio::sync::oneshot::channel();
         let(_events,audio)=mpsc::unbounded_channel();let(commands,command_rx)=mpsc::unbounded_channel();
         let worker=crate::callback_context::spawn(audio_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(AudioPumpStat::default())),claims,rx,audio,command_rx,Arc::new(crate::aux_audio::Input::default()),test_pipeline()));
-        let(ack,done)=tokio::sync::oneshot::channel();commands.send(MainCommand::Pause(ack)).unwrap();
+        let(ack,done)=tokio::sync::oneshot::channel();
+        commands.send(MainCommand::Pause { reply: ack, hold_mixed_voice: false }).unwrap();
         assert!(tokio::time::timeout(Duration::from_millis(250),done).await.is_ok(),"pause before negotiation must be acknowledged");
         let(initial,peer,_)=output().await;assert!(ready.send(initial).is_ok());
         assert!(tokio::time::timeout(Duration::from_millis(40),peer.recv(&mut [0;4096])).await.is_err(),"late negotiation cannot restart paused media");
@@ -2036,7 +2147,7 @@ mod main_audio_command_tests {
         let(next,peer,local)=output().await;
         commands.send(MainCommand::Install(Some(next))).unwrap();
         let(ack,done)=tokio::sync::oneshot::channel();drop(done);
-        commands.send(MainCommand::Pause(ack)).unwrap();
+        commands.send(MainCommand::Pause { reply: ack, hold_mixed_voice: false }).unwrap();
         let worker=crate::callback_context::spawn(audio_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(AudioPumpStat::default())),claims,rx,audio,command_rx,Arc::new(crate::aux_audio::Input::default()),test_pipeline()));
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(UdpSocket::bind(local).await.is_err(),"cancelled pause cannot release a current sender");

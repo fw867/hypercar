@@ -72,6 +72,12 @@ object Iap2MessageIds {
     const val POWER_UPDATE = 0xAE01
     const val START_COMMUNICATIONS_UPDATES = 0x4157
     const val START_CALL_STATE_UPDATES = 0x4154
+    const val CALL_STATE_UPDATE = 0x4155
+    const val STOP_CALL_STATE_UPDATES = 0x4156
+
+    const val START_LOCATION_INFORMATION = 0xFFFA
+    const val LOCATION_INFORMATION = 0xFFFB
+    const val STOP_LOCATION_INFORMATION = 0xFFFC
 
     // ---- ExternalAccessory 会话 ----
     const val EA_OPEN_SESSION = 0xEA00 // 手机 → 配件
@@ -123,6 +129,11 @@ object Iap2MessageIds {
             START_POWER_UPDATES -> "StartPowerUpdates"
             START_COMMUNICATIONS_UPDATES -> "StartCommunicationsUpdates"
             START_CALL_STATE_UPDATES -> "StartCallStateUpdates"
+            CALL_STATE_UPDATE -> "CallStateUpdate"
+            STOP_CALL_STATE_UPDATES -> "StopCallStateUpdates"
+            START_LOCATION_INFORMATION -> "StartLocationInformation"
+            LOCATION_INFORMATION -> "LocationInformation"
+            STOP_LOCATION_INFORMATION -> "StopLocationInformation"
             else -> "0x%04X".format(messageId)
         }
 }
@@ -187,6 +198,7 @@ object Iap2Messages {
         val hidComponents: List<HidComponent> = emptyList(),
         val vehicleStatusFields: Set<Int> = emptySet(),
         val acceptsRouteGuidance: Boolean? = null,
+        val locationNmeaTypes: Set<Int> = emptySet(),
     ) {
         /** 车机是否声明会发某消息；null = 未提供清单（未知）。 */
         fun declaresSend(messageId: Int): Boolean? = sendIds?.contains(messageId)
@@ -241,9 +253,15 @@ object Iap2Messages {
         val sendIds = firstById[IDENT_SEND_IDS]?.asU16List()?.takeIf { it.isNotEmpty() }?.toSet()
         val receiveIds = firstById[IDENT_RECEIVE_IDS]?.asU16List()?.takeIf { it.isNotEmpty() }?.toSet()
         // Treat an explicit empty receive list as a denial only for RouteGuidance.
-        val routeGuidance = params.singleOrNull { it.id == IDENT_RECEIVE_IDS }
-            ?.takeIf { it.value.size % 2 == 0 && params.sumOf { param -> param.value.size + 4 } == body.size }
-            ?.asU16List()?.any { it in 0x5200..0x52ff }
+        val whole = params.sumOf { it.value.size + Iap2Csm.PARAM_HEADER_BYTES } == body.size
+        fun declaredIds(id: Int) = params.singleOrNull { it.id == id }
+            ?.takeIf { whole && it.value.size % 2 == 0 }?.asU16List()?.toSet()
+        val receiveDeclaration = declaredIds(IDENT_RECEIVE_IDS)
+        val routeGuidance = receiveDeclaration?.any { it in 0x5200..0x52ff }
+        val locationTypes = if (declaredIds(IDENT_SEND_IDS)?.contains(Iap2MessageIds.LOCATION_INFORMATION) == true &&
+            receiveDeclaration?.containsAll(listOf(Iap2MessageIds.START_LOCATION_INFORMATION, Iap2MessageIds.STOP_LOCATION_INFORMATION)) == true) {
+            params.singleOrNull { it.id == 22 }?.let { locationNmeaTypes(it.value) }.orEmpty()
+        } else emptySet()
         val ea = ArrayList<EaProtocol>()
         // 按出现顺序（车机给的顺序就是它的优先级），不要再按 id 排序/去重
         for (param in params) {
@@ -260,6 +278,7 @@ object Iap2Messages {
             sendIds = sendIds,
             receiveIds = receiveIds,
             acceptsRouteGuidance = routeGuidance,
+            locationNmeaTypes = locationTypes,
             eaProtocols = ea,
             hasWirelessCarPlayComponent = firstById[IDENT_WIRELESS_CARPLAY_COMPONENT] != null,
             hidComponents = params.filter { it.id == 0x12 }.take(32).mapNotNull { component ->
@@ -275,6 +294,18 @@ object Iap2Messages {
                 else fields.filter { it.value.isEmpty() }.mapTo(mutableSetOf()) { it.id }
             }.orEmpty(),
         )
+    }
+
+    private fun locationNmeaTypes(body: ByteArray): Set<Int> {
+        val fields = Iap2Csm.parseParams(body)
+        if (fields.sumOf { it.value.size + Iap2Csm.PARAM_HEADER_BYTES } != body.size) return emptySet()
+        if (fields.singleOrNull { it.id == 0 }?.value?.size != 2) return emptySet()
+        val name = fields.singleOrNull { it.id == 1 } ?: return emptySet()
+        if (name.value.lastOrNull() != 0.toByte() || name.asStringOrNull().isNullOrBlank()) return emptySet()
+        // AIS R32 95-19/95-86: component flags 17/18 select request flags 1/2 (GGA/RMC).
+        return (17..18).mapNotNull { id ->
+            (id - 16).takeIf { fields.singleOrNull { it.id == id }?.value?.isEmpty() == true }
+        }.toSet()
     }
 
     /** 纯函数解析 0x5703：SSID/密码/安全类型/信道（地址类字段一律 rstrip 全部尾部 NUL）。 */

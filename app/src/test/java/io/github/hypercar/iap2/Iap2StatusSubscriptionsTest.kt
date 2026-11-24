@@ -40,6 +40,83 @@ class Iap2StatusSubscriptionsTest {
             assertTrue(s.drain().isEmpty())
         }
     }
+
+    @Test fun malformedCallSelectorsCannotActivateAStatusSubscription() {
+        val session = Iap2StatusSubscriptions()
+        session.authenticated()
+        assertTrue(session.handle(Iap2Csm.Frame(0x4154, hex("0004000200"))))
+        assertTrue(session.drain().isEmpty())
+        assertTrue(session.handle(Iap2Csm.Frame(0x4154, hex("00040002"))))
+        assertArrayEquals(hex("0005000200"), session.drain().single().body)
+    }
+
+    @Test fun callStatusFollowsOnlyActualChangesAfterStartAndBeforeStop() {
+        var call: Iap2CallState? = Iap2CallState.RINGING
+        val observation = mutableListOf<Boolean>()
+        val session = Iap2StatusSubscriptions(
+            callState = { call?.let { Iap2CallSample.Known(it) } ?: Iap2CallSample.Unavailable },
+            observeCalls = { observation.add(it) },
+        )
+        val start = Iap2Csm.Frame(0x4154, hex("0004000200040004"))
+        session.handle(start)
+        assertTrue(session.drain().isEmpty())
+        assertFalse(observation.last())
+        session.authenticated()
+        assertTrue(observation.last())
+        assertArrayEquals(hex("0005000202"), session.drain().single().body)
+        assertTrue(session.drain().isEmpty())
+        call = Iap2CallState.ACTIVE
+        assertArrayEquals(hex("0005000204"), session.drain().single().body)
+        call = null // A failed read cannot imply that an observed active call ended.
+        assertTrue(session.drain().isEmpty())
+        call = Iap2CallState.DISCONNECTED
+        assertArrayEquals(hex("0005000200"), session.drain().single().body)
+        session.handle(frame(0x4156))
+        assertFalse(observation.last())
+        call = Iap2CallState.RINGING
+        assertTrue(session.drain().isEmpty())
+        session.handle(start)
+        session.reset()
+        session.authenticated()
+        assertFalse(observation.last())
+        assertTrue(session.drain().isEmpty())
+    }
+
+    @Test fun firstCallReplyWaitsForTheSampleWithoutBlockingOtherStatuses() {
+        var sample: Iap2CallSample = Iap2CallSample.Pending
+        val session = Iap2StatusSubscriptions(callState = { sample })
+        session.authenticated()
+        session.handle(frame(0x4154))
+        session.handle(frame(0x4170))
+        assertEquals(listOf(0x4171), session.drain().map { it.messageId })
+        assertTrue(session.drain().isEmpty())
+        sample = Iap2CallSample.Known(Iap2CallState.ACTIVE)
+        assertArrayEquals(hex("0005000204"), session.drain().single().body)
+        assertTrue(session.drain().isEmpty())
+
+        sample = Iap2CallSample.Pending
+        session.handle(frame(0x4154))
+        assertTrue(session.drain().isEmpty())
+        session.handle(frame(0x4156))
+        sample = Iap2CallSample.Known(Iap2CallState.DISCONNECTED)
+        assertTrue(session.drain().isEmpty())
+    }
+
+    @Test fun androidOffhookAloneCannotImpersonateAPreciseCallState() {
+        fun sample(coarse: Int, ringing: Int = 0, foreground: Int = 0, background: Int = 0) =
+            Iap2CallState.fromTelephonyRegistry("""
+                mCallState=$coarse
+                mPreciseCallState=PreciseCallState { Ringing call state: $ringing, Foreground call state: $foreground, Background call state: $background, Disconnect cause: -1, Precise disconnect cause: -1}
+            """.trimIndent())
+        assertNull(sample(2))
+        assertEquals(Iap2CallState.DISCONNECTED, sample(0))
+        assertEquals(Iap2CallState.RINGING, sample(1, ringing = 6, foreground = 1))
+        assertEquals(Iap2CallState.SENDING, sample(2, foreground = 3))
+        assertEquals(Iap2CallState.ACTIVE, sample(2, foreground = 1, background = 2))
+        assertEquals(Iap2CallState.HELD, sample(2, background = 2))
+        assertEquals(Iap2CallState.DISCONNECTING, sample(2, foreground = 8))
+        assertNull(Iap2CallState.fromTelephonyRegistry("Permission Denial"))
+    }
     @Test fun repeatedRequestsCoalesceAndEveryStatusBodyIsWholeTlv() {
         val s=Iap2StatusSubscriptions()
         repeat(100) { for(id in listOf(0x4154,0x4157,0x4170,0xae00,0xad00)) s.handle(frame(id)) }

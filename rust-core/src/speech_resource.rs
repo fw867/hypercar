@@ -24,6 +24,11 @@ impl SpeechResource {
         let (proposal,lease)=self.modes.lock().speech_begin(user_initiated)?;
         if self.publish(proposal).await {Some(lease)} else {None}
     }
+    pub(crate) async fn begin_recognition(&self)->Option<SpeechLease> {
+        let _serial=self.serial.lock().await;
+        let (proposal,lease)=self.modes.lock().recognition_begin()?;
+        if self.publish(proposal).await {Some(lease)} else {None}
+    }
     pub async fn end_speech(&self,lease:SpeechLease)->bool {
         let _serial=self.serial.lock().await;
         let proposal=self.modes.lock().speech_end(&lease);

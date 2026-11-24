@@ -91,6 +91,26 @@ class Iap2DetectionRestartTest {
         assertEquals(1, output[7].toInt()) // New control session, not stale session 10.
     }
 
+    @Test fun aRetiredProductiveEndpointNoLongerBlocksReplacementRfcomm() {
+        val admission = Iap2RfcommEndpointState()
+        val oldGeneration = Iap2EndpointGeneration()
+        val endpoint = CarPlayEndpoint("car", "password", 0, null, null, null, emptyList(), null,
+            sourceGeneration = oldGeneration)
+        admission.accepted(endpoint)
+        assertTrue(admission.hasCurrentEndpoint)
+        oldGeneration.retire()
+        assertFalse(admission.hasCurrentEndpoint)
+        admission.accepted(endpoint)
+        assertFalse(admission.hasCurrentEndpoint)
+
+        val newGeneration = Iap2EndpointGeneration()
+        admission.accepted(endpoint.copy(ssid = null, sourceGeneration = newGeneration))
+        assertFalse(admission.hasCurrentEndpoint)
+        admission.accepted(endpoint.copy(sourceGeneration = newGeneration))
+        admission.accepted(endpoint)
+        assertTrue(admission.hasCurrentEndpoint)
+    }
+
     @Test fun repeatedMarkerIsBoundedButPeerCanRetry() {
         val link = normal()
         var restarts = 0

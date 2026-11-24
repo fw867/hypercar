@@ -2,6 +2,7 @@ package io.github.hypercar.session
 
 import io.github.hypercar.iap2.AirplayRouteBinding
 import io.github.hypercar.iap2.CarPlayEndpoint
+import io.github.hypercar.iap2.Iap2EndpointGeneration
 import io.github.hypercar.iap2.Iap2Messages
 import io.github.hypercar.net.BluetoothHotspot
 import io.github.hypercar.net.CarWifiRequestIdentity
@@ -732,6 +733,122 @@ class CarHotspotReconnectTest {
         assertTrue(applied.requiresCredentialUpdate(latest.ssid, latest.passphrase))
         assertFalse(applied.requiresCredentialUpdate(current.ssid, current.passphrase))
         assertFalse(applied.requiresCredentialUpdate(current.ssid, null))
+    }
+
+    @Test fun retiredJoinRetriesBeforeAndAfterSameCredentialsAreReannounced() = kotlinx.coroutines.test.runTest {
+        val hotspot = checkNotNull(BluetoothHotspot.fromPeer(receiver, "CAR-WIFI"))
+        val source = Iap2EndpointGeneration()
+        val obsolete = CarPlayEndpoint(hotspot.ssid, "new-passphrase", 7000, null, null, null,
+            listOf("192.168.5.1"), null, bluetoothHotspot = hotspot, sourceGeneration = source)
+        val inbox = CarHotspotReconnect.EndpointInbox(hasFreshCredentials = { it.canRequestHotspot(hotspot) })
+        inbox.offer(obsolete)
+        assertSame(obsolete, inbox.poll())
+        assertFalse(inbox.shouldRetryJoin(obsolete))
+
+        source.retire()
+        assertTrue(inbox.shouldRetryJoin(obsolete))
+        assertNull(inbox.poll())
+        val refreshed = obsolete.copy(sourceGeneration = Iap2EndpointGeneration())
+        assertTrue(inbox.offer(refreshed))
+        assertTrue(inbox.shouldRetryJoin(obsolete))
+        assertSame(refreshed, inbox.poll())
+        assertFalse(inbox.shouldRetryJoin(refreshed))
+    }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test fun retiredRecoveryJoinRetainsLossProtectionWhileWaitingForTheNewSource() = kotlinx.coroutines.test.runTest {
+        val hotspot = checkNotNull(BluetoothHotspot.fromPeer(receiver, "CAR-WIFI"))
+        val source = Iap2EndpointGeneration()
+        val old = CarPlayEndpoint(hotspot.ssid, "old-passphrase", 0, null, null, null,
+            emptyList(), null, bluetoothHotspot = hotspot)
+        val replacement = old.copy(passphrase = "new-passphrase", sourceGeneration = source)
+        val inbox = CarHotspotReconnect.EndpointInbox(nowMillis = { testScheduler.currentTime },
+            hasFreshCredentials = { it.canRequestHotspot(hotspot) })
+        val lost = CarWifiRequestIdentity(hotspot.ssid, "old-passphrase")
+        inbox.beginWifiRecovery(lost, 1_000)
+        assertTrue(inbox.offer(replacement))
+        assertSame(replacement, inbox.awaitReplacementCredentials(lost, 1_000))
+        source.retire()
+        inbox.finishRecoveryJoin()
+
+        assertTrue(inbox.shouldRetryJoin(replacement))
+        assertFalse(inbox.offer(old))
+        assertNull(inbox.poll())
+        kotlinx.coroutines.delay(1_100)
+        val refreshed = replacement.copy(sourceGeneration = Iap2EndpointGeneration())
+        assertTrue(inbox.offer(refreshed))
+        assertSame(refreshed, inbox.poll())
+    }
+
+    @Test fun unknownPasswordRecoveryReleasesARetiredPinToTheNewSource() = kotlinx.coroutines.test.runTest {
+        val source = Iap2EndpointGeneration()
+        val firstHotspot = checkNotNull(BluetoothHotspot.fromPeer(receiver, "CAR-OLD"))
+        val nextHotspot = checkNotNull(BluetoothHotspot.fromPeer(receiver, "CAR-NEW"))
+        val first = CarPlayEndpoint(firstHotspot.ssid, "first-password", 0, null, null, null,
+            emptyList(), null, bluetoothHotspot = firstHotspot, sourceGeneration = source)
+        var elapsed = 100L
+        var announced = firstHotspot
+        val inbox = CarHotspotReconnect.EndpointInbox(nowMillis = { elapsed },
+            hasProposedCredentials = { it.canRequestHotspot(it.bluetoothHotspot) && it.passphrase != null },
+            hasFreshCredentials = { it.canRequestHotspot(announced) })
+        inbox.beginWifiRecovery(null, 1_000)
+        assertTrue(inbox.offer(first))
+        assertSame(first, inbox.awaitReplacementCredentials(null, 1_000))
+
+        source.retire()
+        inbox.finishRecoveryJoin()
+        val replacement = first.copy(ssid = nextHotspot.ssid, passphrase = "next-password",
+            bluetoothHotspot = nextHotspot, sourceGeneration = Iap2EndpointGeneration())
+        elapsed = 200
+        assertFalse(replacement.canRequestHotspot(announced))
+        assertFalse(inbox.offer(replacement.copy(bluetoothHotspot = firstHotspot)))
+        assertTrue(inbox.offer(replacement, onAccept = { announced = nextHotspot }))
+        assertFalse(inbox.offer(replacement.copy(passphrase = "unselected-password")))
+        assertSame(replacement, inbox.poll())
+        assertFalse(inbox.offer(replacement.copy(passphrase = "unselected-password")))
+    }
+
+    @Test fun unknownPasswordRecoveryDefersLateNewSourceUntilTheRetiredJoinEnds() = kotlinx.coroutines.test.runTest {
+        val hotspot = checkNotNull(BluetoothHotspot.fromPeer(receiver, "CAR-WIFI"))
+        val source = Iap2EndpointGeneration()
+        val first = CarPlayEndpoint(hotspot.ssid, "first-password", 0, null, null, null, emptyList(), null,
+            bluetoothHotspot = hotspot, sourceGeneration = source)
+        var elapsed = 100L
+        val inbox = CarHotspotReconnect.EndpointInbox(nowMillis = { elapsed },
+            hasFreshCredentials = { it.canRequestHotspot(hotspot) })
+        inbox.beginWifiRecovery(null, 1_000)
+        assertTrue(inbox.offer(first))
+        assertSame(first, inbox.awaitReplacementCredentials(null, 1_000))
+        source.retire()
+        elapsed = 1_100
+        val replacement = first.copy(passphrase = "next-password", sourceGeneration = Iap2EndpointGeneration())
+        var committed: CarPlayEndpoint? = null
+        assertFalse(inbox.offer(replacement, onDeferredAccept = { committed = it }))
+        assertFalse(inbox.offer(replacement.copy(passphrase = "unselected-password")))
+        assertNull(committed)
+        assertNull(inbox.poll())
+
+        inbox.finishRecoveryJoin()
+        assertSame(replacement, committed)
+        assertSame(replacement, inbox.poll())
+        assertFalse(inbox.offer(replacement.copy(passphrase = "unselected-password")))
+    }
+
+    @Test fun switchSsidRetiresAnOldHintEvenWhenItsSourceIsNoLongerUsable() {
+        val source = Iap2EndpointGeneration()
+        val previous = CarPlayEndpoint("old-ap", "old-password", 7200, null, null, null,
+            listOf("192.168.5.2", "fe80::2%wlan0"), "192.168.5.1", sourceGeneration = source)
+        val next = CarPlayEndpoint("new-ap", "new-password", 0, null, null, null, emptyList(), null)
+        val inbox = CarHotspotReconnect.EndpointInbox(hasFreshCredentials = { it.passphrase != null })
+        source.retire()
+
+        val transition = inbox.classifyHintTransition(previous, next)
+        assertNull(transition.mergeFrom)
+        assertTrue(transition.invalidateLateAddress)
+        assertEquals(setOf("192.168.5.2", "fe80::2", "192.168.5.1"), transition.retiredSsidAddresses)
+        val replay = next.copy(airPlayPort = 7200, ipAddresses = listOf("192.168.5.2"),
+            addressOnlyAirplayReport = true, requiresBoundAirplayRoute = true, airplayRouteBinding = AirplayRouteBinding())
+        assertNull(replay.verifiedAirplayEndpoint("new-ap", 11L, transition.retiredSsidAddresses) { true })
     }
 
     @Test

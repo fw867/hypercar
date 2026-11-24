@@ -1,4 +1,4 @@
-//! Reliable iAP2 bytes: event/control ingress, control-channel command egress.
+//! Reliable iAP2 bytes through RTSP commands or the negotiated DiPlay data stream.
 //! A generation guard prevents an old Kotlin worker writing into a new CarPlay session.
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use std::time::Duration;
@@ -20,6 +20,13 @@ struct StartupDetect {
     peer_syn_seen: bool,
     queued: bool,
 }
+
+#[derive(Clone, Copy)]
+pub(crate) struct TransportReadiness {
+    generation: u64,
+    ready: bool,
+}
+
 impl Handoff {
     fn new_session(id: u64) -> Self {
         Self { id, rtsp_owner: Some(id), ..Self::default() }
@@ -35,6 +42,13 @@ impl Handoff {
         self.rtsp_owner = None;
         true
     }
+
+    fn readiness(&self, id: u64) -> Option<TransportReadiness> {
+        (self.id == id && self.rtsp_owner == Some(id)).then_some(TransportReadiness {
+            generation: self.ready_token,
+            ready: self.ready,
+        })
+    }
 }
 static HANDOFF: Lazy<Mutex<Handoff>> = Lazy::new(|| Mutex::new(Handoff::default()));
 pub fn take_rtsp_end(id: u64) -> bool { HANDOFF.lock().take_rtsp_end(id) }
@@ -48,12 +62,26 @@ pub fn phase(id: u64) -> String {
     if id==0 { "WAIT_SESSION".into() } else if s.id!=id { "STOPPED".into() }
     else if s.ready { "READY_TRANSPORT".into() } else if s.phase.is_empty() { "WAIT_PEER".into() } else { s.phase.clone() }
 }
-pub fn transport_ready(id: u64) -> bool {
-    let s=HANDOFF.lock(); id!=0 && s.id==id && s.ready
+pub(crate) fn transport_readiness(id: u64) -> Option<TransportReadiness> {
+    HANDOFF.lock().readiness(id)
+}
+
+pub(crate) fn transport_ready(id: u64) -> bool {
+    transport_readiness(id).is_some_and(|state| state.ready)
+}
+
+/// Bracket one attempt, so a reset followed by rapid reauthentication remains observable.
+pub(crate) async fn watch_media_attempt<T>(snapshot: impl Fn() -> Option<TransportReadiness>,
+    attempt: impl std::future::Future<Output = T>) -> (T, bool) {
+    let before = snapshot();
+    let result = attempt.await;
+    let crossed_readiness = before.zip(snapshot()).is_some_and(|(before, after)|
+        !before.ready || before.generation != after.generation);
+    (result, crossed_readiness)
 }
 /// Readiness is a local write barrier, not certificate/signature verification.
 pub async fn wait_transport_ready(id: u64, stop: Arc<Notify>, budget: Duration) -> bool {
-    wait_ready_barrier(||is_active(id), ||transport_ready(id), stop, budget).await
+    wait_ready_barrier(||transport_readiness(id).is_some(), ||transport_ready(id), stop, budget).await
 }
 async fn wait_ready_barrier(current:impl Fn()->bool, ready:impl Fn()->bool, stop:Arc<Notify>, budget:Duration)->bool {
     let deadline=tokio::time::sleep(budget);tokio::pin!(deadline);
@@ -70,24 +98,26 @@ async fn wait_ready_barrier(current:impl Fn()->bool, ready:impl Fn()->bool, stop
         }
     }
 }
-pub fn mark_ready(id: u64, ready: bool) {
+pub fn mark_ready(id: u64, ready: bool) -> bool {
     let token = {
         let mut state = HANDOFF.lock();
-        if state.id != id { return; }
-        state.ready = false;
-        state.ready_token = state.ready_token.wrapping_add(1);
-        if !ready { return; }
+        if id == 0 || state.id != id { return false; }
+        if !ready {
+            state.ready = false;
+            state.ready_token = state.ready_token.wrapping_add(1);
+            return true;
+        }
+        if state.rtsp_owner != Some(id) { return false; }
         state.ready_token
     };
     // FIFO barrier: only become transport-ready after earlier authentication/greeting writes.
-    let queued = OUTPUT.lock().as_ref().filter(|(current,_)| *current == id)
-        .map(|(_,tx)| tx.try_send(Outbound::Ready(token)).is_ok()).unwrap_or(false);
-    if !queued { crate::emit_log(&format!("WIFI-IAP#{id}: readiness barrier could not be queued")); }
+    OUTPUT.lock().as_ref().filter(|(current,_)| *current == id)
+        .is_some_and(|(_,tx)| tx.try_send(Outbound::Ready(token)).is_ok())
 }
 fn ready_written(id: u64, token: u64) {
     let accepted = {
         let mut state = HANDOFF.lock();
-        if state.id != id || state.ready_token != token { false }
+        if state.id != id || state.rtsp_owner != Some(id) || state.ready_token != token { false }
         else { state.ready=true; true }
     };
     if accepted { crate::emit_log(&format!("WIFI-IAP#{id}: READY transport barrier reached (peer authentication acceptance is separate)")); }
@@ -253,7 +283,8 @@ pub struct WifiIap2 {
 }
 
 impl WifiIap2 {
-    pub fn start(channel: Arc<RtspChannel>, device: &str, device_name: &str, profile_id: &str, stop: Arc<Notify>) -> Self {
+    pub fn start(channel: Arc<RtspChannel>, device: &str, device_name: &str, profile_id: &str, stop: Arc<Notify>,
+        tunnel: Option<crate::iap2_tunnel::Target>) -> Self {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::channel::<Outbound>(64);
         *OUTPUT.lock() = Some((id, tx));
@@ -261,6 +292,17 @@ impl WifiIap2 {
         if profile_id == "audi_mib3" { handoff.startup_detect = Some(StartupDetect::default()); }
         *HANDOFF.lock() = handoff;
         let task = crate::callback_context::spawn(async move {
+            let mut tunnel = if let Some(target) = tunnel {
+                let result = tokio::select! { _ = stop.notified() => None, result = target.open(&channel) => Some(result) };
+                match result {
+                    Some(Ok(tunnel)) => Some(tunnel),
+                    Some(Err(error)) => {
+                        crate::emit_log(&format!("WIFI-IAP#{id}: type 130 unavailable: {error}; using RTSP commands"));
+                        None
+                    }
+                    None => return,
+                }
+            } else { None };
             let mut sent = 0u64;
             let mut last_written = String::from("none");
             loop {
@@ -270,11 +312,30 @@ impl WifiIap2 {
                 };
                 let (data, hud, startup_detect) = match data {
                     Outbound::Frame(data, hud) => (data, hud, false),
-                    Outbound::Ready(token) => { ready_written(id,token); continue; }
+                    Outbound::Ready(token) => {
+                        if !channel.session_is_live() { break; }
+                        ready_written(id, token);
+                        continue;
+                    }
                     Outbound::StartupDetect => (DETECT.to_vec(), None, true),
                 };
                 let frame_bytes = data.len();
                 let metadata = if startup_detect { "link=startup_detect_after_screen_setup".into() } else { frame_diagnostic(&data) };
+                if let Some(tunnel) = tunnel.as_mut() {
+                    if startup_detect && !HANDOFF.lock().startup_detect_for(id)
+                        .is_some_and(|detect| !detect.peer_syn_seen) { continue; }
+                    let write = tokio::select! { _ = stop.notified() => break, result = tunnel.write(&data) => result };
+                    if let Err(error) = write {
+                        crate::emit_log(&format!("WIFI-IAP#{id}: type 130 transport failed: {error}"));
+                        break;
+                    }
+                    sent += 1;
+                    last_written = metadata;
+                    if sent <= 128 || sent % 50 == 0 {
+                        crate::emit_log(&format!("WIFI-IAP#{id}: type 130 TCP written {last_written} frameBytes={frame_bytes} count={sent}"));
+                    }
+                    continue;
+                }
                 let body = bplist::encode(&Value::dict(vec![
                     ("type", Value::str("iAPSendMessage")),
                     ("params", Value::dict(vec![("data", Value::Data(data))])),
@@ -451,7 +512,7 @@ mod tests {
         let (mut car, _) = listener.accept().await.unwrap();
         let (r,w) = phone.into_split();
         let (channel, _) = RtspChannel::spawn(r,w,None);
-        let guard = WifiIap2::start(channel, "unit-test", "Test phone", "", Arc::new(Notify::new()));
+        let guard = WifiIap2::start(channel, "unit-test", "Test phone", "", Arc::new(Notify::new()), None);
         assert!(send(guard.id, vec![1,2,3], 0, 0));
         assert!(send(guard.id, vec![4,5,6], 0, 0));
         let requests = tokio::time::timeout(Duration::from_secs(1), async {
@@ -480,7 +541,7 @@ mod tests {
         let (mut car, _) = listener.accept().await.unwrap();
         let (r, w) = phone.into_split();
         let (channel, _rx) = RtspChannel::spawn(r, w, None);
-        let start = || WifiIap2::start(channel.clone(), "phone", "Test phone", "audi_mib3", Arc::new(Notify::new()));
+        let start = || WifiIap2::start(channel.clone(), "phone", "Test phone", "audi_mib3", Arc::new(Notify::new()), None);
         let old = start();
         let old_id = old.id;
         assert!(!queue_startup_detect(old.id));
@@ -536,16 +597,53 @@ mod tests {
         assert!(wait_ready_barrier(||true,||flag.load(Ordering::Acquire),stop,Duration::from_secs(1)).await);
         worker.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn media_attempt_observes_link_reset_even_when_ready_again_before_reply() {
+        use std::cell::Cell;
+
+        let ready = TransportReadiness { generation: 3, ready: true };
+        let reset = TransportReadiness { generation: 4, ready: false };
+        let recovered = TransportReadiness { ready: true, ..reset };
+        let snapshot = Cell::new(Some(ready));
+
+        let (_, crossing) = watch_media_attempt(|| snapshot.get(), async { 400 }).await;
+        assert!(!crossing, "an ordinary rejection from a ready receiver is final");
+
+        let (status, crossing) = watch_media_attempt(|| snapshot.get(), async {
+            snapshot.set(Some(reset));
+            tokio::task::yield_now().await;
+            snapshot.set(Some(recovered));
+            400
+        }).await;
+        assert_eq!(status, 400);
+        assert!(crossing, "reset and reauthentication during SETUP allow a retry");
+
+        let (_, crossing) = watch_media_attempt(|| snapshot.get(), async { 400 }).await;
+        assert!(!crossing, "a later audio candidate starts in its own ready generation");
+
+        snapshot.set(Some(reset));
+        let (_, crossing) = watch_media_attempt(|| snapshot.get(), async {
+            snapshot.set(Some(recovered));
+        }).await;
+        assert!(crossing, "an attempt that began during negotiation can be retried");
+
+        let (_, crossing) = watch_media_attempt(|| snapshot.get(), async { snapshot.set(None) }).await;
+        assert!(!crossing, "a retired AirPlay session cannot retry");
+    }
+
     #[test]
     fn bluetooth_retirement_requires_current_ready_and_fresh_health() {
         let (tx,mut rx)=mpsc::channel(4);
         *OUTPUT.lock()=Some((77,tx));
-        *HANDOFF.lock() = Handoff { id: 77, ..Handoff::default() };
+        *HANDOFF.lock() = Handoff::new_session(77);
         assert!(!can_keep_session()); feedback(77, true); assert!(!can_keep_session());
-        mark_ready(76, true); assert!(!can_keep_session());
-        assert!(send(77, vec![1,2,3], 0, 0));
-        mark_ready(77, true); assert!(!can_keep_session());
+        assert!(!mark_ready(76, true)); assert!(!can_keep_session());
+        for _ in 0..4 { assert!(send(77, vec![1,2,3], 0, 0)); }
+        assert!(!mark_ready(77, true));
         match rx.try_recv().unwrap() { Outbound::Frame(data, None)=>assert_eq!(data,vec![1,2,3]), _=>panic!("barrier overtook frame") }
+        assert!(mark_ready(77, true)); assert!(!can_keep_session());
+        for _ in 0..3 { assert!(matches!(rx.try_recv().unwrap(), Outbound::Frame(_, None))); }
         let token=match rx.try_recv().unwrap() { Outbound::Ready(t)=>t, _=>panic!("expected barrier") };
         ready_written(77,token);
         assert!(can_keep_generation(77)); assert!(!can_keep_generation(76));
@@ -555,6 +653,12 @@ mod tests {
         mark_ready(77,true);
         let token=match rx.try_recv().unwrap() { Outbound::Ready(t)=>t, _=>panic!("expected barrier") };
         mark_ready(77,false); ready_written(77,token); assert!(!can_keep_session());
+        assert!(mark_ready(77, true));
+        let token=match rx.try_recv().unwrap() { Outbound::Ready(t)=>t, _=>panic!("expected barrier") };
+        assert!(take_rtsp_end(77));
+        ready_written(77,token);
+        assert!(!mark_ready(77, true));
+        assert!(!can_keep_session());
         clear_handoff(77); assert!(!can_keep_session()); *OUTPUT.lock()=None;
     }
     #[test]

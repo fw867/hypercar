@@ -5,13 +5,23 @@ internal class Iap2StatusSubscriptions(
     private val power: () -> Iap2Power = Iap2PowerSource::snapshot,
     private val log: (String) -> Unit = {},
     private val deviceName: String = "HyperCar",
+    private val callState: () -> Iap2CallSample = { Iap2CallSample.Unavailable },
+    private val observeCalls: (Boolean) -> Unit = {},
 ) {
     private var diagnostics = 0
     private var authenticated = false
     private val pending = linkedMapOf<Int, List<Iap2Csm.Frame>>()
+    private var callStatusRequested = false
+    private var lastCallState: Iap2CallState? = null
     val isAuthenticated: Boolean get() = authenticated
-    fun authenticated() { authenticated = true }
-    fun restartLink() { pending.clear() }
+    fun authenticated() {
+        authenticated = true
+        observeCalls(callStatusRequested)
+    }
+    fun restartLink() {
+        pending.clear()
+        clearCallSubscription()
+    }
     private var separatePowerUpdates = false
     private var communicationsFields = defaultCommunicationsFields
 
@@ -22,12 +32,16 @@ internal class Iap2StatusSubscriptions(
         communicationsFields = if (bmw && mgu) mguCommunicationsFields else defaultCommunicationsFields
     }
 
-    fun reset() { authenticated = false; identify(null, null); pending.clear() }
+    fun reset() { authenticated = false; identify(null, null); restartLink() }
 
     fun handle(frame: Iap2Csm.Frame): Boolean {
         val stop = when (frame.messageId) {
             0x4c02 -> if (frame.body.isEmpty()) 0x4c00 else return true
-            0x4156 -> 0x4154
+            Iap2MessageIds.STOP_CALL_STATE_UPDATES -> {
+                if (frame.body.isNotEmpty()) return true
+                clearCallSubscription()
+                Iap2MessageIds.START_CALL_STATE_UPDATES
+            }
             0x4159 -> 0x4157
             0x4172 -> 0x4170
             0xae02 -> 0xae00
@@ -46,7 +60,14 @@ internal class Iap2StatusSubscriptions(
                 }
                 Iap2MediaLibrary.updates(fields)
             }
-            0x4154 -> listOf(Iap2Csm.Frame(0x4155, Iap2Csm.u8(2, 0)))
+            Iap2MessageIds.START_CALL_STATE_UPDATES -> {
+                val fields = Iap2Csm.parseParams(frame.body)
+                if (fields.sumOf { it.value.size + Iap2Csm.PARAM_HEADER_BYTES } != frame.body.size ||
+                    fields.any { it.value.isNotEmpty() }) return true
+                callStatusRequested = fields.isEmpty() || fields.any { it.id == 2 }
+                observeCalls(authenticated && callStatusRequested)
+                emptyList() // Keep initial-response order and sample the current state at drain time.
+            }
             0x4157 -> {
                 val fields = Iap2Csm.parseParams(frame.body)
                 if (fields.sumOf { it.value.size + 4 } != frame.body.size) {
@@ -92,7 +113,31 @@ internal class Iap2StatusSubscriptions(
     }
     fun drain(): List<Iap2Csm.Frame> {
         if (!authenticated) return emptyList()
-        return pending.values.flatten().also { pending.clear() }
+        val callStart = Iap2MessageIds.START_CALL_STATE_UPDATES
+        val sample = if (callStatusRequested) callState() else Iap2CallSample.Unavailable
+        val currentCall = (sample as? Iap2CallSample.Known)?.state
+        val initialCallReply = callStart in pending
+        val awaitingFirstSample = initialCallReply && sample == Iap2CallSample.Pending
+        val callReply = if (!awaitingFirstSample && (initialCallReply || currentCall != null && currentCall != lastCallState)) {
+            // xiap2 0x64f40 replies with only status=0 if it has no usable call record.
+            val state = currentCall ?: Iap2CallState.DISCONNECTED
+            lastCallState = state
+            Iap2Csm.Frame(Iap2MessageIds.CALL_STATE_UPDATE, Iap2Csm.u8(2, state.wireValue))
+        } else null
+        return buildList {
+            for ((id, frames) in pending) {
+                if (id == callStart) callReply?.let(::add) else addAll(frames)
+            }
+            if (!initialCallReply) callReply?.let(::add)
+            pending.clear()
+            if (awaitingFirstSample) pending[callStart] = emptyList()
+        }
+    }
+
+    private fun clearCallSubscription() {
+        callStatusRequested = false
+        lastCallState = null
+        observeCalls(false)
     }
 
     private companion object {

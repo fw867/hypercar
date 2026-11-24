@@ -30,14 +30,10 @@ pub fn supports(info:&Value,kind:Kind)->bool {
 pub async fn open(control:&Arc<RtspChannel>,factory:&Arc<dyn SocketProvider>,params:&AirplayParams,shared:&[u8;32],info:&Value,kind:Kind)->Result<AudioOut,OpenError> {
     open_at(control,factory,&params.car_ip,params.airplay_port,shared,info,kind).await
 }
-// xiap2 parseAudioFormats reads outputLatencyMicros (0x20254); its SETUP writes
-// audioLatencyMs (0x41960). Match the receiver's stream/audio type, not a car model.
 fn latency_ms(info:&Value,kind:Kind)->i64 {
-    info.get("audioLatencies").and_then(Value::as_array).into_iter().flatten().find_map(|v| {
-        let typ=v.get("type").or_else(||v.get("streamType")).and_then(Value::as_int);
-        if typ!=Some(kind.stream_type()) || v.get("audioType").and_then(Value::as_str)!=Some(kind.label()){return None;}
-        v.get("outputLatencyMicros").and_then(Value::as_int).filter(|n|*n>=0).map(|n|n/1000)
-    }).unwrap_or(0)
+    // Both negotiated Opus formats decode to 16-bit mono. 32 is the R14G17 Opus compression selector.
+    crate::airplay::output_audio_latency_ms(info, kind.stream_type(), kind.label(),
+        [i64::from(kind.rate()), 16, 1, 32], true).unwrap_or_default()
 }
 fn setup(info:&Value,kind:Kind,id:i64)->Vec<u8> {
     bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![
@@ -168,6 +164,27 @@ mod tests {
             entry(100,"speechRecognition","outputLatencyMicros",72555)]))]);
         assert_eq!(latency_ms(&info,Kind::Speech),72);assert_eq!(latency_ms(&info,Kind::Navigation),98);
         assert_eq!(latency_ms(&Value::dict(vec![]),Kind::Speech),0);
+    }
+    #[test]
+    fn setup_latency_uses_the_negotiated_mono_opus_format_and_wildcards() {
+        let row = |selectors: &[(&str, i64)], micros| {
+            let mut fields = vec![("outputLatencyMicros", Value::int(micros))];
+            fields.extend(selectors.iter().map(|&(key, value)| (key, Value::int(value))));
+            Value::dict(fields)
+        };
+        let info = Value::dict(vec![("audioLatencies", Value::array(vec![
+            row(&[("type", 100), ("sr", 48_000)], 999_000),
+            row(&[("type", 100), ("ch", 2)], 888_000),
+            row(&[("type", 100), ("ss", 24)], 777_000),
+            row(&[("type", 100), ("ct", 4)], 666_000),
+            row(&[("streamType", 100), ("sr", 24_000), ("ss", 16), ("ch", 1), ("ct", 32)], 72_555),
+            row(&[("sr", 48_000), ("ct", 32)], 98_000),
+        ]))]);
+        for (kind, expected) in [(Kind::Speech, 72), (Kind::Navigation, 98)] {
+            let body = bplist::parse(&setup(&info, kind, 42)).unwrap();
+            let stream = &body.get("streams").unwrap().as_array().unwrap()[0];
+            assert_eq!(stream.get("audioLatencyMs").and_then(Value::as_int), Some(expected));
+        }
     }
     #[tokio::test] async fn rejected_duck_is_undone_without_setup_and_close_still_tears_down_on_unduck_error(){
         let(c,mut peer)=channel().await;let cc=c.clone();let mut buf=Vec::new();

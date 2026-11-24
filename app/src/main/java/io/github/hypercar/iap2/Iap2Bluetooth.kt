@@ -207,7 +207,7 @@ class Iap2Bluetooth(
      * （拆链会让车机收起 CarPlay 图标），也不会把车机的下一轮挡在门外。
      */
     @Volatile
-    private var sessionProductive = false
+    private var sessionEndpoints = Iap2RfcommEndpointState()
 
     /** 「是否提供 iAP2 服务」结论缓存（地址→结论）：SDP 查询不便宜，勿每 3s 重查。 */
     private data class ServiceResult(val revision: Long, val available: Boolean)
@@ -468,7 +468,7 @@ class Iap2Bluetooth(
                 rejectSocket(socket, tag, "active-session-during-airplay")
                 return
             }
-            if (sessionProductive) {
+            if (sessionEndpoints.hasCurrentEndpoint) {
                 log("$tag: 已有 iAP2 会话在跑且已拿到凭据，忽略新的连入 addr=${peerAddress ?: "?"}")
                 rejectSocket(socket, tag, "productive-session")
                 return
@@ -861,6 +861,7 @@ class Iap2Bluetooth(
         inboundGeneration: Long? = null,
         handoff: BmwCaffHandoff<BluetoothSocket>? = null,
     ) {
+        val workerEndpoints = Iap2RfcommEndpointState()
         // Publish the socket atomically with the pause check, so pausing can always close it.
         synchronized(this) {
             val rejected = when {
@@ -889,7 +890,7 @@ class Iap2Bluetooth(
             if (handoff != null) log("$tag: 旧 …caff 握手已退出，接管保留的入站 RFCOMM")
             sessionSocket.set(socket)
             sessionStarts.incrementAndGet()
-            sessionProductive = false
+            sessionEndpoints = workerEndpoints
             currentSocket.set(socket)
         }
         val attempt = caffAttempt.takeIf { it != 0L } ?: diagnosticAttempt()
@@ -934,11 +935,12 @@ class Iap2Bluetooth(
                         }
                         current && onEndpoint {
                             propose()?.let { update ->
-                                Iap2EndpointUpdate(update.endpoint, update.commitDeferred) {
+                                Iap2EndpointUpdate(update.endpoint, { released ->
+                                    update.commitDeferred(released)
+                                    workerEndpoints.accepted(released)
+                                }) {
                                     update.commit()
-                                    if (!update.endpoint.ssid.isNullOrBlank() || update.endpoint.ipAddresses.isNotEmpty()) {
-                                        sessionProductive = true
-                                    }
+                                    workerEndpoints.accepted(update.endpoint)
                                 }
                             }
                         }
@@ -1048,7 +1050,14 @@ private class RfcommLinkChannel(
     private var socketWriteBytes = 0L
     private val files = java.util.concurrent.ArrayBlockingQueue<ByteArray>(64)
     private val controls = LinkedBlockingQueue<ByteArray?>()
-    private val readyLatch = CountDownLatch(1)
+    private var readyLatch = CountDownLatch(1)
+    private var workerGeneration: Long? = null
+    // Endpoint commits can hold the application inbox lock. Keep that lock order
+    // independent of the RFCOMM engine lock used by Android socket I/O.
+    private var endpointSource = Iap2EndpointGeneration()
+
+    @Volatile override var linkGeneration = 0L
+        private set
 
     @Volatile
     private var terminated = false
@@ -1062,8 +1071,6 @@ private class RfcommLinkChannel(
     override val closeReason: String? get() = terminationReason
     override val isCancelled: Boolean get() = locallyCancelled
 
-    private var readySignalled = false
-
     /** 逐帧摘要日志预算（每方向每连接，防刷屏）。 */
     private var rxFrameLogs = 0
     private var txFrameLogs = 0
@@ -1073,11 +1080,16 @@ private class RfcommLinkChannel(
     init {
         engine.hudLog = log
         engine.onDetectionRestart = {
+            endpointSource.retire()
+            linkGeneration++
+            endpointSource = Iap2EndpointGeneration()
             log("LINK: DETECT restart; retain RFCOMM, clear old control queue and sequence/window state")
+            readyLatch.countDown()
+            readyLatch = CountDownLatch(1)
             files.clear()
             controls.clear()
             // Empty payload is an ordered CSM parser boundary, distinct from POISON by identity.
-            controls.offer(ByteArray(0))
+            controls.offer(RESTART)
         }
         engine.onPeerSynchronizationAdopted = { sync ->
             log(
@@ -1117,14 +1129,33 @@ private class RfcommLinkChannel(
         }
     }
 
-    override fun awaitReady(timeoutMillis: Long): Boolean {
-        try {
-            if (!readyLatch.await(timeoutMillis, TimeUnit.MILLISECONDS)) return false
-        } catch (error: InterruptedException) {
-            Thread.currentThread().interrupt()
-            throw InterruptedIOException("iAP2 链路协商已取消").apply { initCause(error) }
+    override fun awaitReady(timeoutMillis: Long): Boolean = awaitReadyGeneration(timeoutMillis) != null
+
+    override fun endpointGeneration(expected: Long): Iap2EndpointGeneration = synchronized(lock) {
+        if (linkGeneration == expected) endpointSource else Iap2EndpointGeneration().apply { retire() }
+    }
+
+    override fun awaitReadyGeneration(timeoutMillis: Long): Long? {
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
+        while (true) {
+            val latch = synchronized(lock) {
+                if (terminated) return null
+                if (engine.state == Iap2LinkEngine.State.NORMAL) {
+                    workerGeneration = linkGeneration
+                    controls.remove(RESTART)
+                    return linkGeneration
+                }
+                readyLatch
+            }
+            val remaining = deadline - System.nanoTime()
+            if (remaining <= 0) return null
+            try {
+                if (!latch.await(remaining, TimeUnit.NANOSECONDS)) return null
+            } catch (error: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw InterruptedIOException("iAP2 链路协商已取消").apply { initCause(error) }
+            }
         }
-        return !terminated
     }
 
     override fun peerMaxControlPayload(): Int? =
@@ -1137,10 +1168,14 @@ private class RfcommLinkChannel(
     }
 
     override val supportsFileTransfer: Boolean get() = synchronized(lock) { engine.fileTransferSession != null }
-    override val canQueueMedia: Boolean get() = synchronized(lock) { !terminated && engine.queuedControlPackets < 4 && engine.outstandingPackets < 8 }
-    override fun recvFileTransfer(): ByteArray? = files.poll()
+    override val canQueueMedia: Boolean get() = synchronized(lock) {
+        workerCanSendLocked() && engine.queuedControlPackets < 4 && engine.outstandingPackets < 8
+    }
+    override fun recvFileTransfer(): ByteArray? = synchronized(lock) {
+        if (workerCanSendLocked()) files.poll() else null
+    }
     override fun sendFileTransfer(bytes: ByteArray): Boolean = synchronized(lock) {
-        if (terminated) return@synchronized false
+        if (!workerCanSendLocked()) return@synchronized false
         engine.sendFileTransfer(bytes, nowMillis()).also { drainOutputLocked() }
     }
 
@@ -1151,12 +1186,15 @@ private class RfcommLinkChannel(
 
     override fun sendHudControl(bytes: ByteArray, awaitAck: Boolean, messageId: Int): Boolean {
         synchronized(lock) {
-            if (terminated) return false
+            if (!workerCanSendLocked()) return false
             val accepted = engine.sendControl(bytes, nowMillis(), awaitAck, hudMessageId = messageId)
             drainOutputLocked()
             return accepted
         }
     }
+
+    private fun workerCanSendLocked(): Boolean = !terminated &&
+        workerGeneration == linkGeneration && engine.state == Iap2LinkEngine.State.NORMAL
 
     override fun recvControl(timeoutMillis: Long): ByteArray? {
         val polled =
@@ -1276,10 +1314,7 @@ private class RfcommLinkChannel(
     }
 
     private fun signalReadyLocked() {
-        if (!readySignalled && engine.state == Iap2LinkEngine.State.NORMAL) {
-            readySignalled = true
-            readyLatch.countDown()
-        }
+        if (engine.state == Iap2LinkEngine.State.NORMAL) readyLatch.countDown()
     }
 
     /** 可重入（close 可能从任意线程调用）：置终止位、清队列、关 socket。 */
@@ -1308,6 +1343,7 @@ private class RfcommLinkChannel(
 
         /** 链路终结哨兵；真实控制载荷至少包含一段 CSM 帧，不会为空。 */
         val POISON = ByteArray(0)
+        val RESTART = ByteArray(0)
     }
 }
 

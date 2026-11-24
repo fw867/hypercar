@@ -46,6 +46,8 @@ pub struct Pipeline {
     pub audio_ready: bool,
     pub audio_codec: String,
     pub main_audio_stream_type: Option<i64>,
+    #[serde(skip)]
+    pub(crate) main_audio_clock: Option<crate::audio_diagnostics::ClockTarget>,
     pub audio_kbps: u64,
     pub audio_packets_written: u64,
     pub audio_signal_packets: u64,
@@ -73,6 +75,11 @@ impl Pipeline {
     pub(crate) fn observe_main_sender(&mut self, sender: Option<&crate::audio_out::AudioOut>) {
         self.main_audio_stream_type = sender.map(crate::audio_out::AudioOut::stream_type);
         self.audio_codec = sender.map(crate::audio_out::AudioOut::codec_name).unwrap_or("").into();
+        self.main_audio_clock = sender.filter(|sender| sender.high_accuracy_timestamps).and_then(|sender| {
+            let id = sender.pacing_id?;
+            Some(crate::audio_diagnostics::ClockTarget { rtsp: id.rtsp, stream_id: id.stream_id,
+                stream_type: sender.stream_type(), rate: sender.sample_rate() })
+        });
     }
 
     /// Allocate the order under the same lock that protects the captured facts.
@@ -110,7 +117,7 @@ impl Pipeline {
         Self { keyframe_trace:Default::default(),video_requested_fps:0,display_max_fps:None,video_actual_fps:None,display_size:None, video_format:None, screen_config_size:None, generation: NEXT.fetch_add(1,Ordering::Relaxed), snapshot_sequence:0, control_ready:false, control_trace_id:None, record_accepted:false, resources_accepted:false,
             screen_setup_accepted:false,video_channel_ready:false,wifi_id:0,
             wifi_iap2:"WAIT_SESSION".into(),screen_owned:None,video_stream:"WAIT_SETUP".into(),
-            video_source_units:0,video_frames_written:0,main_video_connection:None,audio_ready:false,audio_codec:String::new(),main_audio_stream_type:None,audio_kbps:0,audio_packets_written:0,
+            video_source_units:0,video_frames_written:0,main_video_connection:None,audio_ready:false,audio_codec:String::new(),main_audio_stream_type:None,main_audio_clock:None,audio_kbps:0,audio_packets_written:0,
             audio_signal_packets:0,ui_requests:0,screen_rebuilds:0,timing:Default::default(),video_tcp:None,main_video_writes:Default::default(),retired_video_tcp:None }
     }
     pub fn effective_fps(&self) -> u32 {

@@ -442,7 +442,7 @@ pub(crate) mod tests {
             let mut tasks = Vec::new();
             let handoff = crate::airplay::start_mgu_handoff(&mut tasks, session.control.clone(),
                 "phone".into(), || true, Arc::new(Notify::new()));
-            assert!(!crate::airplay::activate_screen_before_handoff(&session, &modes, Some(handoff)).await.unwrap());
+            assert!(!crate::airplay::activate_screen_before_handoff(&session, &modes, Some(handoff), false).await.unwrap());
             tasks.pop().unwrap()
         });
         f.modes_reply(1).await;
@@ -609,16 +609,15 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn receiver_session_teardown_during_main_tcp_recovery_prevents_new_setup() {
         let (mut f, peer, _, worker) = streaming_for_recovery().await;
+        f.session.control.set_session_uri(crate::rtsp_uri::SessionUri::new("127.0.0.1", 7).unwrap()).unwrap();
         reset_video_socket(peer);
         let teardown = read(&mut f.car).await;
         assert!(teardown.first_line.starts_with("TEARDOWN "));
         f.car.write_all(b"TEARDOWN / RTSP/1.0\r\nCSeq: 77\r\nContent-Length: 0\r\n\r\n").await.unwrap();
         reply(&mut f.car, &teardown, 200, &[]).await;
-        // The control reader may ACK the inbound TEARDOWN while its TCP socket is still open.
-        if let Ok(request) = tokio::time::timeout(Duration::from_millis(150), read(&mut f.car)).await {
-            assert_eq!(request.status(), 200);
-            assert!(tokio::time::timeout(Duration::from_millis(150), read(&mut f.car)).await.is_err());
-        }
+        let ack = tokio::time::timeout(Duration::from_secs(1), read(&mut f.car)).await.unwrap();
+        assert_eq!((ack.status(), ack.cseq()), (200, Some(77)));
+        assert!(tokio::time::timeout(Duration::from_millis(150), read(&mut f.car)).await.is_err());
         worker.abort();
     }
 

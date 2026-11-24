@@ -3,10 +3,14 @@ use std::{collections::VecDeque,sync::{Arc,atomic::{AtomicBool,AtomicU8,AtomicU6
 use parking_lot::Mutex;
 use tokio::sync::{mpsc,oneshot,Notify};
 use crate::{airplay::{AirplayParams,AudioCodec,SocketProvider},audio_out::AudioOut,aux_setup::Kind,bplist::Value,rtsp::RtspChannel,speech_resource::SpeechResource};
+use crate::mic_probe::{self, InputFormat, InputStream, ProbeControl};
 use crate::shutdown::EngineShutdown;
 
 pub enum MainCommand {
-    Pause(oneshot::Sender<()>),
+    Pause {
+        reply: oneshot::Sender<Option<AudioOut>>,
+        hold_mixed_voice: bool,
+    },
     Install(Option<AudioOut>),
     ReplaceRealtime {
         output: AudioOut,
@@ -36,6 +40,7 @@ struct Pending { epoch:u64,format:Option<(u32,u8)>,samples:VecDeque<i16>,remain:
 #[derive(Default)]
 pub struct Input {
     lanes:[Mutex<Pending>;2],supported:AtomicU8,media_epoch:AtomicU64,wake:Notify,user_intent:Mutex<Option<std::time::Instant>>,
+    shared_voice_wait:AtomicBool,
     pub(crate) buffered_owner: std::sync::OnceLock<tokio::sync::watch::Receiver<crate::buffered_ownership::Ownership>>,
     pub(crate) buffered_failed: Notify,
 }
@@ -53,8 +58,11 @@ impl Input {
         let route=self.route(kind,&pending);
         if route!=Route::Drop {
             let Pending{remain,samples,..}=&mut *pending;
+            let reply_is_waiting = kind == Kind::Speech && route == Route::Independent &&
+                (self.shared_voice_wait.load(Ordering::Acquire) || samples.len() > 48000);
+            let cap = if reply_is_waiting { 480000 } else { 48000 };
             remain.push(data,rate,channels,48000,samples);
-            let overflow=samples.len().saturating_sub(48000);
+            let overflow=samples.len().saturating_sub(cap);
             if overflow>0 {samples.drain(..overflow);}
         }
         drop(pending);self.wake.notify_waiters();route
@@ -87,6 +95,17 @@ impl Input {
     }
 }
 
+struct SharedVoiceWait<'a>(&'a AtomicBool);
+impl<'a> SharedVoiceWait<'a> {
+    fn start(input: &'a Input) -> Self {
+        input.shared_voice_wait.store(true, Ordering::Release);
+        Self(&input.shared_voice_wait)
+    }
+}
+impl Drop for SharedVoiceWait<'_> {
+    fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+}
+
 pub struct Session {
     pub kinds: &'static [Kind],
     pub control:Arc<RtspChannel>,pub factory:Arc<dyn SocketProvider>,pub params:AirplayParams,
@@ -99,7 +118,13 @@ pub struct Controller {
     stop:Arc<Stop>,tasks:Vec<tokio::task::JoinHandle<()>>,allocated:Arc<[AtomicBool;2]>,
 }
 #[derive(Default)]
-struct Stop { requested:AtomicBool,wake:Notify }
+struct Stop {
+    requested:AtomicBool,
+    wake:Notify,
+    // R14G17 type100/102 SETUP and TEARDOWN share a receiver slot. Serialize
+    // media swaps and temporary users of the slot until cleanup is acknowledged.
+    main_transition:Arc<tokio::sync::Mutex<()>>,
+}
 impl Stop {
     async fn wait(&self) {
         let wake=self.wake.notified();tokio::pin!(wake);wake.as_mut().enable();
@@ -114,6 +139,16 @@ impl Controller {
         let mut tasks: Vec<_> = session.kinds.iter().copied().map(|kind| {
             crate::callback_context::spawn(run_lane(kind,session.clone(),input.clone(),commands.clone(),fallback.clone(),stop.clone(),allocated.clone()))
         }).collect();
+        if let Some((trigger, format)) = session.params.microphone_probe.clone().zip(mic_probe::shared_format(&session.info)) {
+            let session = session.clone();
+            let mix_input = input.clone();
+            let commands = commands.clone();
+            let stop = stop.clone();
+            let allocated = allocated.clone();
+            tasks.push(crate::callback_context::spawn(async move {
+                session.run_shared_microphone(trigger, format, &mix_input, &commands, &stop, &allocated).await;
+            }));
+        }
         if *session.media_codec.lock() == Some(AudioCodec::BufferedAac) {
             let _ = input.buffered_owner.set(session.control.buffered_ownership.subscribe());
             let recovery = session.clone();
@@ -140,7 +175,7 @@ impl Controller {
                     biased;
                     _ = shutdown.wait() => (),
                     _ = stopping.wait() => (),
-                    _ = recovery.rebuild_on_unborrow(&commands, &shutdown) => (),
+                    _ = recovery.rebuild_on_unborrow(&commands, &shutdown, &stopping) => (),
                 }
             }));
         }
@@ -178,11 +213,12 @@ impl Lease {
 struct Active { output:AudioOut,lease:Lease }
 enum StartError {Refused(String),Failed(String),AwaitNavigationCleanup(String)}
 impl Session {
-    async fn rebuild_on_unborrow(&self, commands: &mpsc::UnboundedSender<MainCommand>, shutdown: &Arc<EngineShutdown>) {
+    async fn rebuild_on_unborrow(&self, commands: &mpsc::UnboundedSender<MainCommand>, shutdown: &Arc<EngineShutdown>, stop: &Stop) {
         let unborrow = &self.control.audio_unborrow_generation;
         let mut handled = 0;
         loop {
             self.control.audio_unborrow_wake.notified().await;
+            let _transition = stop.main_transition.lock().await;
             let generation = unborrow.load(Ordering::Acquire);
             if generation == handled { continue; }
             handled = generation;
@@ -237,6 +273,12 @@ impl Session {
 
     // The buffered stream owns only main media; independent audio keeps running.
     async fn fallback_buffered(&self, commands:&mpsc::UnboundedSender<MainCommand>, stop:&Stop, shutdown:&EngineShutdown) {
+        let _transition = tokio::select! {
+            biased;
+            _ = stop.wait() => return,
+            _ = shutdown.wait() => return,
+            guard = stop.main_transition.lock() => guard,
+        };
         self.params.pipeline.lock().audio_ready = false;
         let rtsp = self.control.trace_id();
         let stopped = || stop.requested.load(Ordering::Acquire) || shutdown.requested() || self.control.is_closed();
@@ -282,6 +324,155 @@ impl Session {
         let reply=self.control.request("TEARDOWN","/",&body,"application/x-apple-binary-plist",&[],Duration::from_secs(2)).await?;
         crate::resource_trace::validate_ack("AUX_MEDIA_PAUSE",&reply)
     }
+    async fn pause_main(&self, commands: &mpsc::UnboundedSender<MainCommand>, cleanup: &mut Cleanup,
+        hold_mixed_voice: bool) -> Result<(), String> {
+        let (tx, mut rx) = oneshot::channel();
+        if commands.send(MainCommand::Pause { reply: tx, hold_mixed_voice }).is_err() {
+            return Err("media pump pause was not acknowledged".into());
+        }
+        let sender = match tokio::time::timeout(Duration::from_secs(1), &mut rx).await {
+            Ok(Ok(sender)) => sender,
+            Ok(Err(_)) => return Err("media pump pause was not acknowledged".into()),
+            Err(_) => {
+                rx.close();
+                rx.try_recv().map_err(|_| "media pump pause timed out")?
+            }
+        };
+        drop(sender);
+        cleanup.restore = true;
+        cleanup.retire_media = true;
+        self.retire_media().await?;
+        cleanup.retire_media = false;
+        Ok(())
+    }
+
+    async fn run_shared_microphone(&self, trigger: Arc<ProbeControl>, format: InputFormat,
+        mix_input: &Input, commands: &mpsc::UnboundedSender<MainCommand>, stop: &Stop, allocated: &[AtomicBool;2]) {
+        const CAPTURE_START_BUDGET: Duration = Duration::from_secs(3);
+        const SHARED_CLEANUP_ATTEMPTS: u32 = 3;
+        let (_armed, mut rx) = trigger.arm();
+        let input = InputStream::Shared(format);
+        let learn_sender_port = crate::airplay::is_diplay_receiver(&self.info);
+        crate::emit_log(&format!("MIC-PROBE: armed declared shared type100 {format:?}; waiting for an explicit capture request"));
+        let mut cleanup = Cleanup::default();
+        let mut voice_wait = None;
+        let mut handled = 0;
+        let mut attempts = 0;
+        let mut retry_at = tokio::time::Instant::now();
+        let mut media_epoch = mix_input.media_epoch.load(Ordering::Acquire);
+        let mut awaiting_capture = None;
+        loop {
+            if stop.requested.load(Ordering::Acquire) || self.control.is_closed() { break; }
+            let generation = *rx.borrow_and_update();
+            let now = tokio::time::Instant::now();
+            if generation & 1 != 0 && generation != handled {
+                if awaiting_capture.is_none_or(|(pending, _)| pending != generation) {
+                    awaiting_capture = Some((generation, now + CAPTURE_START_BUDGET));
+                }
+            } else {
+                awaiting_capture = None;
+            }
+            let capture_deadline = awaiting_capture.map(|(_, deadline)| deadline);
+            if capture_deadline.is_some_and(|deadline| deadline <= now) {
+                handled = generation;
+                trigger.finish(generation);
+                crate::emit_log("MIC-PROBE: capture start timed out waiting for main audio transition");
+                continue;
+            }
+            let mut media_wake = std::pin::pin!(mix_input.wake.notified());
+            media_wake.as_mut().enable();
+            if cleanup.pending() {
+                let current_media = mix_input.media_epoch.load(Ordering::Acquire);
+                if cleanup.shared_input.is_none() && current_media != media_epoch {
+                    media_epoch = current_media;
+                    attempts = 0;
+                    retry_at = tokio::time::Instant::now();
+                }
+                let retry_limit = if cleanup.shared_input.is_some() { SHARED_CLEANUP_ATTEMPTS } else { 2 };
+                if attempts < retry_limit && now >= retry_at {
+                    cleanup.run(Kind::Speech, self, commands, allocated, false).await;
+                    attempts += 1;
+                    let delay = if cleanup.shared_input.is_some() && attempts > 1 { 300 } else { 100 };
+                    retry_at = tokio::time::Instant::now() + Duration::from_millis(delay);
+                }
+                if cleanup.shared_input.is_some() && attempts >= SHARED_CLEANUP_ATTEMPTS {
+                    // The receiver may still own the shared type100 slot. Exiting
+                    // this session avoids colliding with it by reopening media.
+                    crate::emit_log("MIC-PROBE: shared input cleanup unconfirmed; ending control for session recovery");
+                    self.control.close();
+                    break;
+                }
+                if cleanup.pending() {
+                    let wake_at = (attempts < retry_limit).then_some(retry_at).into_iter().chain(capture_deadline).min();
+                    tokio::select! {
+                        biased;
+                        _ = stop.wait() => break,
+                        change = rx.changed() => if change.is_err() { break; },
+                        _ = media_wake => {},
+                        _ = async { match wake_at { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {},
+                    }
+                    continue;
+                }
+            }
+            voice_wait.take();
+            let Some(capture_deadline) = capture_deadline else {
+                tokio::select! { biased; _ = stop.wait() => break, change = rx.changed() => if change.is_err() { break; } }
+                continue;
+            };
+            let transition = tokio::select! {
+                biased;
+                _ = stop.wait() => break,
+                change = rx.changed() => { if change.is_err() { break; } continue; },
+                _ = tokio::time::sleep_until(capture_deadline) => continue,
+                guard = stop.main_transition.clone().lock_owned() => guard,
+            };
+            let media_ready = self.media_codec.lock().is_none_or(|codec| {
+                self.params.pipeline.lock().main_audio_stream_type == Some(codec.stream_type())
+            });
+            if !media_ready {
+                drop(transition);
+                // Install is asynchronous, so its pipeline publication can trail
+                // release of the transition guard.
+                tokio::select! {
+                    biased;
+                    _ = stop.wait() => break,
+                    change = rx.changed() => if change.is_err() { break; },
+                    _ = tokio::time::sleep_until(capture_deadline.min(tokio::time::Instant::now() + Duration::from_millis(25))) => {},
+                }
+                continue;
+            }
+            handled = generation;
+            let result = async {
+                if trigger.generation() != generation || stop.requested.load(Ordering::Acquire) || self.control.is_closed() {
+                    return Err("capture superseded".into());
+                }
+                voice_wait = Some(SharedVoiceWait::start(mix_input));
+                let lease = self.resource.begin_recognition().await.ok_or("recognition resource denied or superseded")?;
+                cleanup.main_transition = Some(transition);
+                cleanup.lease = Some(Lease::Speech(lease.clone()));
+                let valid = || self.resource.speech_valid(&lease);
+                if trigger.generation() != generation || stop.requested.load(Ordering::Acquire) || !valid() {
+                    return Err("capture superseded after recognition grant".into());
+                }
+                self.pause_main(commands, &mut cleanup, true).await?;
+                let capture = mic_probe::InputSession { control: &self.control, factory: self.factory.as_ref(),
+                    shared: &self.shared, host: &self.params.car_ip, port: self.params.airplay_port };
+                capture.sample(input, &mut rx, stop.wait(), &trigger, generation, Duration::from_secs(20), learn_sender_port, valid, |id| {
+                    allocated[index(Kind::Speech)].store(id.is_some(), Ordering::Release);
+                    cleanup.shared_input = id.map(|id| (input, id));
+                }).await
+            }.await;
+            trigger.finish(generation);
+            match result {
+                Ok(stats) => crate::emit_log(&format!("MIC-PROBE: shared type100 stopped packets={} decoded_samples={}", stats.packets, stats.samples)),
+                Err(error) => crate::emit_log(&format!("MIC-PROBE: shared type100 stopped: {error}")),
+            }
+            attempts = 0;
+            retry_at = tokio::time::Instant::now();
+        }
+        if cleanup.pending() { cleanup.run(Kind::Speech, self, commands, allocated, true).await; }
+    }
+
     async fn restore_media(&self,commands:&mpsc::UnboundedSender<MainCommand>)->bool {
         let Some(codec)=*self.media_codec.lock() else {let _=commands.send(MainCommand::Install(None));return true;};
         let desktop = crate::airplay::effective_desktop(&self.params, &self.info);
@@ -299,9 +490,13 @@ impl Session {
     }
 }
 #[derive(Default)]
-struct Cleanup {lease:Option<Lease>,close:bool,retire_media:bool,restore:bool}
+struct Cleanup {
+    lease:Option<Lease>,close:bool,retire_media:bool,restore:bool,
+    shared_input: Option<(InputStream, i64)>,
+    main_transition: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
 impl Cleanup {
-    fn pending(&self)->bool {self.lease.is_some()||self.close||self.retire_media||self.restore}
+    fn pending(&self)->bool {self.lease.is_some()||self.close||self.retire_media||self.restore||self.shared_input.is_some()}
     async fn run(&mut self,kind:Kind,session:&Session,commands:&mpsc::UnboundedSender<MainCommand>,allocated:&[AtomicBool;2],stopping:bool)->bool {
         if self.retire_media {
             if let Err(error)=session.retire_media().await {crate::emit_log(&format!("AUX-AUDIO: pending media teardown: {error}"));return false;}
@@ -311,6 +506,14 @@ impl Cleanup {
             if let Err(error)=crate::aux_setup::close(&session.control,kind).await {crate::emit_log(&format!("AUX-AUDIO: {:?} pending stream cleanup: {error}",kind));return false;}
             self.close=false;allocated[index(kind)].store(false,Ordering::Release);
         }
+        if let Some((input, id)) = self.shared_input {
+            if let Err(error) = mic_probe::close(&session.control, input, id).await {
+                crate::emit_log(&format!("MIC-PROBE: shared type100 cleanup pending: {error}"));
+                return false;
+            }
+            self.shared_input = None;
+            allocated[index(Kind::Speech)].store(false, Ordering::Release);
+        }
         if let Some(lease)=self.lease.as_ref() {
             if !lease.finish(session).await {crate::emit_log(&format!("AUX-AUDIO: {:?} app/resource release pending",kind));return false;}
             self.lease=None;
@@ -319,27 +522,23 @@ impl Cleanup {
             if !stopping && !session.restore_media(commands).await {return false;}
             self.restore=false;
         }
+        self.main_transition = None;
         true
     }
 }
-async fn start(kind:Kind,session:&Session,input:&Input,commands:&mpsc::UnboundedSender<MainCommand>,allocated:&[AtomicBool;2],cleanup:&mut Cleanup)->Result<Active,StartError> {
+async fn start(kind:Kind,session:&Session,input:&Input,commands:&mpsc::UnboundedSender<MainCommand>,allocated:&[AtomicBool;2],cleanup:&mut Cleanup,transition:Option<tokio::sync::OwnedMutexGuard<()>>)->Result<Active,StartError> {
     crate::opus_encode::OpusEncoder::new(kind.rate(),kind.spf()).map_err(|e|StartError::Failed(e.to_string()))?;
     let lease=match kind {
         Kind::Speech=>Lease::Speech(session.resource.begin_speech(input.user_initiated()).await.ok_or_else(||StartError::Refused("speech resource denied or superseded".into()))?),
         Kind::Navigation=>Lease::Navigation(session.resource.begin_navigation().await.ok_or_else(||StartError::Refused("navigation app state denied or superseded".into()))?),
     };
     cleanup.lease=Some(lease.clone());
+    cleanup.main_transition = transition;
     if kind==Kind::Speech {
-        let(tx,rx)=oneshot::channel();
-        if commands.send(MainCommand::Pause(tx)).is_err() || !matches!(tokio::time::timeout(Duration::from_secs(1),rx).await,Ok(Ok(()))) {
-            cleanup.run(kind,session,commands,allocated,false).await;
-            return Err(StartError::Refused("media pump pause was not acknowledged; cancelled late commands are ignored".into()));
-        }
-        cleanup.restore=true;cleanup.retire_media=true;
-        if let Err(error)=session.retire_media().await {
+        if let Err(error)=session.pause_main(commands, cleanup, false).await {
+            if !cleanup.retire_media { cleanup.run(kind,session,commands,allocated,false).await; }
             return Err(StartError::Refused(format!("media teardown pending; no conflicting SETUP: {error}")));
         }
-        cleanup.retire_media=false;
     }
     allocated[index(kind)].store(true,Ordering::Release);
     match crate::aux_setup::open(&session.control,&session.factory,&session.params,&session.shared,&session.info,kind).await {
@@ -430,8 +629,14 @@ async fn run_lane(kind:Kind,session:Arc<Session>,input:Arc<Input>,commands:mpsc:
             }
         }
         if active.is_none() && route==Route::Independent && queued>0 && handled!=epoch {
+            let transition = if kind == Kind::Speech {
+                // An assistant reply can arrive while its microphone stream is
+                // releasing the main slot. Keep the bounded reply queue intact.
+                let Ok(guard) = stop.main_transition.clone().try_lock_owned() else { continue; };
+                Some(guard)
+            } else { None };
             handled=epoch;
-            match start(kind,&session,&input,&commands,&allocated,&mut cleanup).await {
+            match start(kind,&session,&input,&commands,&allocated,&mut cleanup,transition).await {
                 Ok(output)=>{
                     active=Some(output);tick.reset();sync.reset();last_data=tokio::time::Instant::now();
                     crate::emit_log(&format!("AUX-AUDIO: {:?} independent type={} OPUS {}Hz mono SPF{} ready; receiver audibility unconfirmed",kind,kind.stream_type(),kind.rate(),kind.spf()));

@@ -34,8 +34,8 @@ private const val PHONE_DECLARED_MAX_OUTGOING = 0x7F
  */
 class Iap2LinkEngine(
     private val maxOutgoing: Int = 4,
-    private val retransmissionTimeoutMillis: Long = 4_000L,
-    private val maxRetransmissions: Int = 4,
+    retransmissionTimeoutMillis: Long = 4_000L,
+    maxRetransmissions: Int = 4,
     private val reliableTransport: Boolean = false,
     private val declaredWindow: Int = PHONE_DECLARED_MAX_OUTGOING,
 ) {
@@ -176,6 +176,10 @@ class Iap2LinkEngine(
 
     /** Wi-Fi flow control follows the receiver's offer, independently of retransmission policy. */
     val peerReceiveWindow: Int? get() = peerSynchronization?.maxOutgoing
+    internal val controlSessionVersion: Int?
+        get() = peerSynchronization?.sessions?.firstOrNull {
+            it.kind == CONTROL_KIND && it.id != 0 && it.id == controlSessionId()
+        }?.version
     val queuedControlPackets: Int get() = sendBacklog.size
     val outstandingPackets: Int get() = lastSentAcknowledged?.let { sequenceDistance(sentSequence,it) } ?: 0
 
@@ -202,6 +206,20 @@ class Iap2LinkEngine(
     private var markerDeadline: Long? = null
     private var syncDeadline: Long? = null
     private var retransmitDeadline: Long? = null
+    private val localRetryTimeoutMillis = retransmissionTimeoutMillis.coerceIn(0L, 0xFFFFL)
+    private val localRetryCount = maxRetransmissions.coerceIn(0, 0xFF)
+    // Passive links echo the peer's proposal. Active links have already advertised local limits.
+    private val agreedRetryTimeoutMillis: Long
+        get() = peerSynchronization?.retransmissionTimeoutMillis?.toLong()?.let {
+            if (passiveNegotiation) it else minOf(it, localRetryTimeoutMillis)
+        } ?: localRetryTimeoutMillis
+    private val agreedRetryCount: Int
+        get() = peerSynchronization?.maxRetransmissions?.let {
+            if (passiveNegotiation) it else minOf(it, localRetryCount)
+        } ?: localRetryCount
+    // Preserve the local timeout fallback for peers that specify retries with a zero interval.
+    private val retryTimeoutMillis: Long
+        get() = agreedRetryTimeoutMillis.takeIf { it > 0 } ?: localRetryTimeoutMillis
 
     /** 上一次回显 SYN 时对端的 SYN 序号与我方序号（重传同一 SYN 时原样重放）。 */
     private var lastEchoPeerSequence: Int? = null
@@ -550,13 +568,17 @@ class Iap2LinkEngine(
     }
 
     /**
-     * 回显用的「我方参数」：会话表/超时沿用对端声明（手机端无特殊要求），
+     * 回显用的「我方参数」：会话表沿用对端声明，重传参数按双方协商值，
      * 但 **maxOutgoing 提到 0x7F**——原样回显会把我们自己的发送窗口限死在对端的
      * 小窗口（MIB3 突发 8 条在 maxOutgoing=4 下积压；真机 iPhone/AADisplay 均声明
      * 0x7F）。maxLength 保持对端值（=我们的收包上限，勿放大）。
      */
     private fun ownSyncOf(peer: SynchronizationPayload): SynchronizationPayload =
-        peer.copy(maxOutgoing = declaredWindow).also {
+        peer.copy(
+            maxOutgoing = declaredWindow,
+            retransmissionTimeoutMillis = agreedRetryTimeoutMillis.toInt(),
+            maxRetransmissions = agreedRetryCount,
+        ).also {
             declaredMaxOutgoing = declaredWindow
         }
 
@@ -623,13 +645,14 @@ class Iap2LinkEngine(
         // Box firmware uses the same negotiated mode for the send window and standalone ACKs.
         val sendWindow = if (reliableTransport) (peer?.maxOutgoing ?: maxOutgoing).coerceIn(1, 127)
             else declaredMaxOutgoing
+        val retryCount = agreedRetryCount
+        val retryTimeout = retryTimeoutMillis
         while (sendBacklog.isNotEmpty()) {
             if (!zeroRetryAndAckMode && lastSentAcknowledged != null && outstandingPackets >= sendWindow) return
             val packet = sendBacklog.removeFirst()
             sentSequence = nextSequence(sentSequence)
             packet.sequence = sentSequence
             packet.onSequenceAssigned?.invoke(packet.sequence)
-            packet.deadlineMillis = nowMillis + retransmissionTimeoutMillis
             if (hudAwaitingAck.isNotEmpty()) {
                 hudAwaitingAck.values.removeAll { frame ->
                     val expired = sequenceDistance(sentSequence, frame.sequence) >= 127 || frame.sequence == sentSequence
@@ -644,10 +667,11 @@ class Iap2LinkEngine(
             }
             writeDataPacket(packet)
             if (!packet.awaitAck) continue // 发后不管：不追踪、不重传（见 sendControl 注释）
-            if (peer == null || peer.maxRetransmissions > 0) {
+            if (retryCount > 0 && retryTimeout > 0) {
+                packet.deadlineMillis = nowMillis + retryTimeout
                 unacknowledged += packet
-                retransmitDeadline = packet.deadlineMillis
-            } else if (!reliableTransport) {
+                retransmitDeadline = retransmitDeadline?.let { minOf(it, packet.deadlineMillis) } ?: packet.deadlineMillis
+            } else if (!reliableTransport && retryCount == 0) {
                 lastSentAcknowledged = sentSequence
             }
         }
@@ -658,7 +682,6 @@ class Iap2LinkEngine(
 
     private fun retransmitDue(nowMillis: Long) {
         val next = unacknowledged.minByOrNull { it.deadlineMillis } ?: return
-        next.deadlineMillis = nowMillis + retransmissionTimeoutMillis
         next.retransmissions += 1
         if (next.optional && next.retransmissions > 1) {
             // Artwork has its own bounded business timeout. Its loss must not kill CarPlay.
@@ -666,10 +689,11 @@ class Iap2LinkEngine(
             retransmitDeadline = unacknowledged.minOfOrNull { it.deadlineMillis }
             return
         }
-        if (next.retransmissions > maxRetransmissions) {
+        if (next.retransmissions > agreedRetryCount) {
             die("packet ${next.sequence} not acknowledged")
             return
         }
+        next.deadlineMillis = nowMillis + retryTimeoutMillis
         writeDataPacket(next)
         retransmitDeadline = unacknowledged.minOfOrNull { it.deadlineMillis }
     }
@@ -679,9 +703,9 @@ class Iap2LinkEngine(
             SynchronizationPayload(
                 maxOutgoing = maxOutgoing,
                 maxLength = 0xFFFF,
-                retransmissionTimeoutMillis = retransmissionTimeoutMillis.toInt().coerceIn(0, 0xFFFF),
+                retransmissionTimeoutMillis = localRetryTimeoutMillis.toInt(),
                 acknowledgementTimeoutMillis = DEFAULT_ACK_TIMEOUT_MILLIS,
-                maxRetransmissions = maxRetransmissions,
+                maxRetransmissions = localRetryCount,
                 maxAcknowledgements = 3,
                 sessions =
                     listOf(

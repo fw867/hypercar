@@ -142,3 +142,9 @@ Android app_process检查中，PCM队列字节/EOF检查通过；该辅助进程
 另外两路也已区分：`OSbotSpeechService`要求`com.xiaomi.speech.permission.BIND_SPEECH_SERVICE`（signature|privileged），getCapabilities的audio_source只声明internal_mic，不能当作外部PCM入口。`PublicAsrProvider`（content://com.miui.voiceassist.speech.api）要求`miui.permission.USE_INTERNAL_GENERAL_API`（本机同样为signature|privileged），start/stop/cancel/status由内部AsrProxyService处理；openFile提供的是闹钟TTS/新闻/BGM等输出文件，没有外部收音写入分支。shell访问该Provider同样在权限检查处被拒绝。
 
 完整定点源码和manifest保存在工作区外 `D:/devtools/hypercar-diagnostics/self-voice-20261114`。当前未改运行代码、未申请或绕过签名权限、未更改小爱包。后续若具备合法接口授权，可直接把现有type107解码后的PCM接到feedAudio，再将partial/final回调接到已经实现的顶部语音框，无须重新实现语音模型；在此之前继续区分可用的文本入口、受限的原生ASR入口和尚未实车完成的CarWith链路。
+
+## 共享主音频流收音
+
+CarWith 的识别开始请求和自绘 UI 已启用的收音实验仍优先使用独立 type107／Opus 16 kHz。当前 `/info` 缺少兼容的 type107 时，只有 type100／`speechRecognition` 同一条记录同时声明输入与输出的 Opus 16 kHz 或 PCM16 16 kHz 单声道格式，才允许在现有语音操作触发后申请共享主音频流。
+
+车机确认识别资源后，先暂停并释放正在使用的主音频流，再发送 `input=true` 和本机绑定的 `dataPort`。共享流只接收来自应答端口的认证 RTP。停止、超时或资源收回时关闭收音，按输入连接 ID 选择性释放流，随后恢复原媒体格式。清理应答暂时失败时，新的媒体起点可触发恢复。收音样本最多处理 20 秒，不落盘。车机上的收音和识别仍需实测。

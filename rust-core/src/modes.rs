@@ -122,8 +122,8 @@ pub struct Modes {
 }
 
 #[derive(Clone, Debug)]
-pub struct SpeechLease { generation:u64, borrow_generation:u64, borrowed:bool }
-impl SpeechLease { pub fn valid(&self,modes:&Modes)->bool { modes.speech_epoch==self.generation && modes.audio_borrow_epoch==self.borrow_generation && modes.apps[0]==1 && modes.speech==1 && modes.audio_owned() } }
+pub struct SpeechLease { generation:u64, borrow_generation:u64, borrowed:bool, mode:i64 }
+impl SpeechLease { pub fn valid(&self,modes:&Modes)->bool { modes.speech_epoch==self.generation && modes.audio_borrow_epoch==self.borrow_generation && modes.apps[0]==1 && modes.speech==self.mode && modes.audio_owned() } }
 #[derive(Clone, Debug)]
 pub struct NavigationLease { generation:u64 }
 impl NavigationLease { pub fn valid(&self,modes:&Modes)->bool { modes.navigation_epoch==self.generation && modes.apps[2]==1 } }
@@ -133,6 +133,14 @@ impl AuxTransition { pub fn declaration(&self)->Vec<u8> { self.next.declaration(
 
 impl Modes {
     pub(crate) fn speech_begin(&self,user:bool)->Option<(AuxTransition,SpeechLease)> {
+        self.speech_begin_mode(user, 1)
+    }
+
+    pub(crate) fn recognition_begin(&self)->Option<(AuxTransition,SpeechLease)> {
+        self.speech_begin_mode(true, 2) // R14G17 kAirPlaySpeechMode_Recognizing
+    }
+
+    fn speech_begin_mode(&self,user:bool,mode:i64)->Option<(AuxTransition,SpeechLease)> {
         if self.apps[0]!=0 || self.speech!=-1 { return None; }
         let mut next=self.clone(); let borrowed=!self.audio_owned();
         if borrowed {
@@ -144,15 +152,15 @@ impl Modes {
                 ("unborrowConstraint",Value::int(ANYTIME))]);
             if !next.resources[1].request(&request,1) {return None;}
         }
-        next.apps[0]=1; next.speech=1; next.speech_epoch=self.speech_epoch.wrapping_add(1);
+        next.apps[0]=1; next.speech=mode; next.speech_epoch=self.speech_epoch.wrapping_add(1);
         next.audio_borrow_epoch=self.audio_borrow_epoch.wrapping_add(1);
-        let lease=SpeechLease{generation:next.speech_epoch,borrow_generation:next.audio_borrow_epoch,borrowed};
+        let lease=SpeechLease{generation:next.speech_epoch,borrow_generation:next.audio_borrow_epoch,borrowed,mode};
         Some((AuxTransition{base:self.aux_generations(),next,speech:true},lease))
     }
     pub(crate) fn speech_end(&self,lease:&SpeechLease)->Option<AuxTransition> {
         // Receiver audio arbitration revokes the playback gate, but does not take
         // ownership of our speech app. Clear only that app if it is still ours.
-        if self.speech_epoch!=lease.generation || self.apps[0]!=1 || self.speech!=1 {return None;}
+        if self.speech_epoch!=lease.generation || self.apps[0]!=1 || self.speech!=lease.mode {return None;}
         let mut next=self.clone();
         if lease.borrowed && self.audio_borrow_epoch==lease.borrow_generation &&
             !next.resources[1].request(&Value::dict(vec![("transferType",Value::int(4))]),1) {return None;}
@@ -194,7 +202,7 @@ impl Modes {
     }
     pub fn audio_owned(&self) -> bool { self.resources[1].current == 1 }
     pub(crate) fn media_rebuild_epoch(&self) -> Option<u64> {
-        (self.audio_owned() && !(self.apps[0] == 1 && self.speech == 1)).then_some(self.audio_borrow_epoch)
+        (self.audio_owned() && !(self.apps[0] == 1 && matches!(self.speech, 1 | 2))).then_some(self.audio_borrow_epoch)
     }
     pub fn audio_change_epoch(&self) -> u64 { self.audio_change_epoch }
     pub fn audio_claim(&self, user_initiated: bool) -> Option<(u64, Self)> {

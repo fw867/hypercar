@@ -1,6 +1,8 @@
 package io.github.hypercar.net
 
 import java.io.IOException
+import java.net.InetAddress
+import java.net.UnknownHostException
 
 /** Link-local unicast is fe80::/10, not just the four commonly printed prefix values. */
 object EndpointScope {
@@ -24,6 +26,21 @@ object EndpointScope {
 
     private val linkLocalPrefix = Regex("(?i)^fe[89ab][0-9a-f]:")
     fun isLinkLocal(host: String): Boolean = linkLocalPrefix.containsMatchIn(host.trim())
+
+    /** Both addresses already belong to one Network. A scope may be printed as a name or an ID. */
+    internal fun sameAddressOnNetwork(host: String, other: String): Boolean =
+        addressKey(host)?.let { it == addressKey(other) } ?: false
+
+    /** The gate rules out hostnames before invoking Java's numeric address parser. */
+    internal fun addressKey(host: String): String? {
+        val address = invitationHost(host)?.substringBefore('%') ?: return null
+        if (':' !in address) return address.split('.').joinToString(".") { it.toInt().toString() }
+        return try {
+            InetAddress.getByName(address).hostAddress
+        } catch (_: UnknownHostException) {
+            null
+        }
+    }
 
     fun onNetwork(host: String, interfaceName: String?): String {
         val raw = host.trim()

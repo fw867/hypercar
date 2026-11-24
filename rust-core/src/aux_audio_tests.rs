@@ -5,12 +5,13 @@ use std::{sync::{Arc,atomic::AtomicBool},time::Duration};
 use parking_lot::Mutex;
 use tokio::{net::{TcpListener,TcpStream,UdpSocket},sync::mpsc,io::{AsyncReadExt,AsyncWriteExt}};
 
-struct Factory;
+struct Factory { receive: bool }
 impl SocketProvider for Factory {
     fn open_tcp(&self,_:&str,_:u16,_:u32)->Option<TcpStream>{None}
     fn open_udp(&self,host:&str,port:u16)->Option<UdpSocket>{
         let socket=std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
-        socket.connect((host,port)).ok()?;socket.set_nonblocking(true).ok()?;UdpSocket::from_std(socket).ok()
+        if port != 0 || !self.receive { socket.connect((host,port)).ok()?; }
+        socket.set_nonblocking(true).ok()?;UdpSocket::from_std(socket).ok()
     }
 }
 struct Fixture {
@@ -51,12 +52,13 @@ impl Fixture {
         configure(&mut params, &mut info);
         let kinds = crate::airplay::independent_audio_kinds(&params, &info);
         let realtime_media_rebuild = crate::airplay::supports_realtime_media_rebuild(&params, &info, params.desktop_receiver);
-        let session=Session{kinds,control,factory:Arc::new(Factory),params,shared:[9;32],info,resource,media_codec:Mutex::new(Some(codec)),receiver_audio_generation:Arc::default(),realtime_media_rebuild};
+        let factory=Arc::new(Factory { receive: params.microphone_probe.is_some() });
+        let session=Session{kinds,control,factory,params,shared:[9;32],info,resource,media_codec:Mutex::new(Some(codec)),receiver_audio_generation:Arc::default(),realtime_media_rebuild};
         let input=Arc::new(Input::default());let(command_tx,mut command_rx)=mpsc::unbounded_channel();
         let(event_tx,commands)=mpsc::unbounded_channel();let(fallback_tx,fallback)=mpsc::unbounded_channel();
         let command_task=tokio::spawn(async move {while let Some(command)=command_rx.recv().await {
             match command {
-                MainCommand::Pause(reply)=>{event_tx.send("pause").unwrap();let _=reply.send(());}
+                MainCommand::Pause { reply, .. }=>{event_tx.send("pause").unwrap();let _=reply.send(None);}
                 MainCommand::Install(out)=>{assert!(out.is_some(),"working PCM media must be restored");event_tx.send("install").unwrap();drop(out);}
                 MainCommand::ReplaceRealtime { output, reply, .. } => {
                     assert_eq!(output.stream_type(), 102);
@@ -112,6 +114,199 @@ impl Fixture {
     async fn stopped(&mut self){
         assert!(self.controller.shutdown().await.is_empty());assert!(self.fallback.try_recv().is_err());
     }
+}
+
+#[tokio::test]
+async fn shared_main_microphone_requires_an_explicit_start_and_restores_media_after_acknowledged_cleanup() {
+    shared_microphone_handoff(SharedSetup::Audio).await;
+}
+
+#[tokio::test]
+async fn rejected_shared_microphone_transport_restores_media_without_tearing_down_a_missing_stream() {
+    for status in [400, 451, 461] {
+        shared_microphone_handoff(SharedSetup::Rejected(status)).await;
+    }
+}
+
+#[tokio::test]
+async fn cancelling_shared_microphone_setup_waits_for_the_transaction_before_teardown() {
+    shared_microphone_handoff(SharedSetup::Cancelled).await;
+}
+
+#[tokio::test]
+async fn diplay_shared_microphone_latches_the_first_authenticated_uplink_port() {
+    shared_microphone_handoff(SharedSetup::DiPlay).await;
+}
+
+#[tokio::test]
+async fn shared_microphone_start_waits_for_an_existing_media_transition() {
+    shared_microphone_handoff(SharedSetup::Busy).await;
+}
+
+#[tokio::test]
+async fn shared_microphone_recovers_after_lost_ack_and_matching_stream_absent() {
+    shared_microphone_handoff(SharedSetup::Absent).await;
+}
+
+#[tokio::test]
+async fn shared_microphone_exhausts_cleanup_when_absence_is_not_scoped() {
+    shared_microphone_handoff(SharedSetup::Unknown).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SharedSetup { Audio, Rejected(u16), Cancelled, DiPlay, Busy, Absent, Unknown }
+
+fn shared_input_absent(id: i64) -> Value {
+    Value::dict(vec![("status", Value::int(-6727)), ("streams", Value::array(vec![Value::dict(vec![
+        ("type", Value::int(100)), ("streamConnectionID", Value::int(id)), ("status", Value::int(-6727)),
+    ])]))])
+}
+
+async fn shared_microphone_handoff(outcome: SharedSetup) {
+    let probe = Arc::new(crate::mic_probe::ProbeControl::for_carwith());
+    let mut f = Fixture::with_config(|params, info| {
+        params.microphone_probe = Some(probe.clone());
+        params.pipeline.lock().main_audio_stream_type = Some(100);
+        let Value::Dict(fields) = info else { panic!("/info dictionary"); };
+        if outcome == SharedSetup::DiPlay { fields.push((Value::str("model"), Value::str("DiPlay"))); }
+        let (_, Value::Array(formats)) = fields.iter_mut().find(|(key, _)| key.as_str() == Some("audioFormats")).unwrap() else { panic!("audioFormats array"); };
+        formats.push(Value::dict(vec![
+            ("type", Value::int(100)), ("audioType", Value::str("speechRecognition")),
+            ("audioInputFormats", Value::int(16)), ("audioOutputFormats", Value::int(16)),
+        ]));
+    }).await;
+    let sink = probe.carwith.as_ref().unwrap();
+    let mut byte = [0];
+    assert!(tokio::time::timeout(Duration::from_millis(30), f.peer.read(&mut byte)).await.is_err());
+    let transition = if outcome == SharedSetup::Busy {
+        Some(f.controller.stop.main_transition.clone().lock_owned().await)
+    } else { None };
+    probe.request(true);
+    if transition.is_some() {
+        assert!(tokio::time::timeout(Duration::from_millis(50), f.peer.read(&mut byte)).await.is_err());
+    }
+    drop(transition);
+    let (m, modes) = f.request("modesChanged").await;
+    let app = &modes.get("params").unwrap().get("appStates").unwrap().as_array().unwrap()[0];
+    assert_eq!(app.get("speechMode").and_then(Value::as_int), Some(2));
+    f.ack(&m, None).await;
+    let (m, _) = f.request("teardown:100").await;
+    assert_eq!(f.commands.try_recv().unwrap(), "pause");
+    f.ack(&m, None).await;
+    let (m, setup) = f.request("setup:100:speechRecognition").await;
+    let stream = &setup.get("streams").unwrap().as_array().unwrap()[0];
+    assert_eq!(stream.get("input").and_then(Value::as_bool), Some(true));
+    assert_eq!(stream.get("audioFormat").and_then(Value::as_int), Some(16));
+    let id = stream.get("streamConnectionID").and_then(Value::as_int).unwrap();
+    let port = stream.get("dataPort").and_then(Value::as_int).unwrap() as u16;
+    if let SharedSetup::Rejected(status) = outcome {
+        f.reject(&m, status).await;
+    } else {
+        if matches!(outcome, SharedSetup::Cancelled | SharedSetup::Busy | SharedSetup::Absent | SharedSetup::Unknown) {
+            probe.request(false);
+            assert!(tokio::time::timeout(Duration::from_millis(30), f.peer.read(&mut byte)).await.is_err());
+        }
+        f.setup_reply(&m, &setup).await;
+    }
+
+    if matches!(outcome, SharedSetup::Audio | SharedSetup::DiPlay) {
+    let key = crate::mic_probe::input_key(&[9; 32], id as u64);
+    let packet = |kind, sequence: u8, key: &[u8;32]| {
+        let mut wire = vec![0x80, kind, 0, sequence, 0, 0, 0, 0, 0, 0, 0, 0];
+        let payload = 1234i16.to_be_bytes().repeat(512);
+        wire.extend(crate::crypto::chacha_seal(key, &crate::crypto::nonce64(u64::from(sequence)), &payload, &[0;8]));
+        wire.extend(u64::from(sequence).to_le_bytes());
+        wire
+    };
+    let address = ("127.0.0.1", port);
+    if outcome == SharedSetup::Audio {
+        f.sync.send_to(&packet(100, 1, &key), address).await.unwrap(); // Wrong sender port.
+    }
+    f.data.send_to(&packet(107, 1, &key), address).await.unwrap();
+    f.data.send_to(&packet(100, 1, &[0; 32]), address).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(sink.queued_bytes(), 0);
+    let uplink = if outcome == SharedSetup::DiPlay { &f.sync } else { &f.data };
+    uplink.send_to(&packet(100, 1, &key), address).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while sink.queued_bytes() == 0 { tokio::time::sleep(Duration::from_millis(2)).await; }
+    }).await.unwrap();
+    assert_eq!(sink.queued_bytes(), 1024);
+    if outcome == SharedSetup::DiPlay {
+        f.data.send_to(&packet(100, 2, &key), address).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(sink.queued_bytes(), 1024, "an established sender cannot migrate to another port");
+    }
+
+    probe.request(false);
+    assert_eq!(sink.queued_bytes(), 0);
+    if outcome == SharedSetup::Audio {
+    f.input.init(Kind::Speech, 48000, 2);
+    let mut reply = 4000i16.to_le_bytes().repeat(9_600);
+    reply.extend(2000i16.to_le_bytes().repeat(57_600));
+    assert_eq!(f.input.push(Kind::Speech, 48000, 2, &reply), super::Route::Independent);
+    f.input.stop(Kind::Speech);
+    assert_eq!(f.input.lanes[0].lock().samples.front(), Some(&4000), "preserve the start of the queued assistant reply");
+    for _ in 0..2 {
+        let (m, cleanup) = f.request("teardown:100").await;
+        let rows = cleanup.get("streams").unwrap().as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("streamConnectionID").and_then(Value::as_int), Some(id));
+        assert!(f.commands.try_recv().is_err());
+        f.reject(&m, 500).await;
+    }
+    assert!(tokio::time::timeout(Duration::from_millis(150), f.peer.read(&mut byte)).await.is_err());
+    assert!(f.input.independent(Kind::Speech), "assistant reply must wait for the microphone teardown ACK");
+    f.input.media_restart();
+    }
+    }
+    if matches!(outcome, SharedSetup::Absent | SharedSetup::Unknown) {
+        let _lost_ack = f.request("teardown:100").await;
+        let (m, _) = f.request("teardown:100").await;
+        if outcome == SharedSetup::Unknown {
+            f.reject(&m, 454).await;
+            let (r, _) = f.request("teardown:100").await;
+            f.ack(&r, Some(shared_input_absent(id + 1))).await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !f.controller.session.control.is_closed() { tokio::time::sleep(Duration::from_millis(2)).await; }
+            }).await.expect("unresolved stream cleanup must end the old control channel");
+            assert!(f.commands.try_recv().is_err(), "never reopen the main stream over an unverified slot");
+            return;
+        }
+        f.ack(&m, Some(shared_input_absent(id))).await;
+    }
+    if !matches!(outcome, SharedSetup::Rejected(_) | SharedSetup::Absent) {
+        let (m, cleanup) = f.request("teardown:100").await;
+        assert_eq!(cleanup.get("streams").unwrap().as_array().unwrap()[0].get("streamConnectionID").and_then(Value::as_int), Some(id));
+        f.ack(&m, None).await;
+    }
+    let (m, _) = f.request("modesChanged").await;
+    f.ack(&m, None).await;
+    let (m, restored) = f.request("setup:100:media").await;
+    let stream = &restored.get("streams").unwrap().as_array().unwrap()[0];
+    assert_ne!(stream.get("streamConnectionID").and_then(Value::as_int), Some(id));
+    assert_eq!(stream.get("input").and_then(Value::as_bool), Some(false));
+    assert_eq!(stream.get("audioFormat").and_then(Value::as_int), Some(1 << 15));
+    f.setup_reply(&m, &restored).await;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), f.commands.recv()).await.unwrap(), Some("install"));
+    if outcome == SharedSetup::Audio {
+        let (m, _) = f.request("modesChanged").await;
+        f.ack(&m, None).await;
+        let (m, _) = f.request("teardown:100").await;
+        assert_eq!(f.commands.try_recv().unwrap(), "pause");
+        f.ack(&m, None).await;
+        let (m, offer) = f.request("setup:100:speechRecognition").await;
+        f.setup_reply(&m, &offer).await;
+        f.opus_packet(100).await;
+        let (m, _) = f.request("teardown:100").await;
+        f.ack(&m, None).await;
+        let (m, _) = f.request("modesChanged").await;
+        f.ack(&m, None).await;
+        let (m, offer) = f.request("setup:100:media").await;
+        f.setup_reply(&m, &offer).await;
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1), f.commands.recv()).await.unwrap(), Some("install"));
+    }
+    f.stopped().await;
 }
 
 #[tokio::test]
@@ -435,8 +630,18 @@ async fn failed_buffered_playback_tries_preferred_aac_then_accepts_untyped_pcm_f
     f.input.buffered_failed.notify_one();
     let (teardown, _) = f.request("teardown:103").await;
     f.ack(&teardown, None).await;
-    let (aac, _) = f.request("setup:102:media").await;
+    let (aac, offer) = f.request("setup:102:media").await;
+    let stream = &offer.get("streams").unwrap().as_array().unwrap()[0];
+    let port = stream.get("controlPort").cloned();
     f.reject(&aac, 400).await;
+    if let Some(port) = port {
+        assert_eq!(stream.get("supportsHighAccuracyTimestamps").and_then(Value::as_bool), Some(true));
+        let (retry, offer) = f.request("setup:102:media").await;
+        let stream = &offer.get("streams").unwrap().as_array().unwrap()[0];
+        assert_eq!(stream.get("controlPort"), Some(&port));
+        assert!(stream.get("supportsHighAccuracyTimestamps").is_none());
+        f.reject(&retry, 400).await;
+    }
     let (pcm, offer) = f.request("setup:100:media").await;
     f.setup_reply_with_type(&pcm, &offer, false).await;
     assert_eq!(tokio::time::timeout(Duration::from_secs(1), f.commands.recv()).await.unwrap(), Some("install"));
@@ -611,7 +816,7 @@ async fn completed_speech_before_end_ack()->Fixture {
         // a new source media event wakes the pending recovery independently.
         if refusals>=2 && tokio::time::timeout(Duration::from_millis(1600),f.peer.readable()).await.is_err(){break;}
         let(m,_)=f.request("setup:100:media").await;f.reject(&m,400).await;refusals+=1;
-        assert!(refusals<=12,"media recovery must remain bounded");
+        assert!(refusals<=18,"media recovery must remain bounded");
         assert!(f.commands.try_recv().is_err(),"refused restore cannot install an empty sender");
     }
     assert!(refusals>=2);

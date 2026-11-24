@@ -127,7 +127,7 @@ object RustCoreBridge {
     external fun nativeStop()
     /** 主动退出：有界等待 TEARDOWN 和旧引擎资源释放，不用于网络丢失或蓝牙交接。 */
     external fun nativeStopGracefully(): Boolean
-    external fun nativeMarkWifiIap2Ready(id: Long, ready: Boolean)
+    external fun nativeMarkWifiIap2Ready(id: Long, ready: Boolean): Boolean
     external fun nativeSetWifiIap2Phase(id: Long, phase: String)
     external fun nativeCanKeepWifiSession(): Boolean
     external fun nativeSendIap2(id: Long, bytes: ByteArray, hudMessageId: Int, hudSerial: Long): Boolean

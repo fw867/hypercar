@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, Notify};
 use crate::audio_out::AudioOut;
 use crate::bplist::{self, Value};
 use crate::pairing::{ControllerIdentity, PairSetupClient, PairVerifyClient, TlvTransport};
-use crate::rtsp::{ControlCipher, RtspChannel, RtspEndCause};
+use crate::rtsp::{ControlCipher, FeedbackFailure, RtspChannel, RtspEndCause};
 use crate::timing::TimingServer;
 use crate::{emit_log, emit_state};
 
@@ -517,7 +517,10 @@ pub async fn negotiate(
     let mut keepalive = KeepaliveTasks(Vec::new(), None, None);
     // Both rollback and manual pause keep the event socket until control teardown finishes.
     cleanup.event = Some(event_channel.clone());
-    let wifi_iap = crate::wifi_iap2::WifiIap2::start(channel.clone(), &p.device_id, &p.device_name, &p.head_unit_profile, stop.clone());
+    let tunnel = shared_secret.filter(|_| is_diplay_receiver(&info) && root.get("enabledFeatures")
+        .and_then(Value::as_array).is_some_and(|features| features.iter().any(|feature| feature.as_str() == Some("iAPChannel"))))
+        .map(|shared| crate::iap2_tunnel::Target { host: p.car_ip.clone(), factory: factory.clone(), shared });
+    let wifi_iap = crate::wifi_iap2::WifiIap2::start(channel.clone(), &p.device_id, &p.device_name, &p.head_unit_profile, stop.clone(), tunnel);
     let wifi_iap_id = wifi_iap.id;
     p.pipeline.lock().wifi_id=wifi_iap_id;
     let initially_owned=modes.lock().screen_owned();
@@ -636,7 +639,6 @@ pub async fn negotiate(
         }
     }
 
-    let media_started_before_ready = mbux_media_compat && !crate::wifi_iap2::transport_ready(wifi_iap_id);
     // On MGU the iPhone publishes the initial screen owner before asking the receiver
     // to retire Bluetooth. The receiver may retain the screen and may initiate iAP only later.
     let handoff = mgu_handoff.then(|| async {
@@ -647,7 +649,7 @@ pub async fn negotiate(
         if !crate::wifi_iap2::is_active(wifi_iap_id) { return Err("MGU handoff session expired".into()); }
         Ok(())
     });
-    let screen_failed = activate_screen_before_handoff(&screen_session, &modes, handoff).await?;
+    let retry_screen = activate_screen_before_handoff(&screen_session, &modes, handoff, mbux_media_compat).await?;
     // ---- 9. 音频流 SETUP（会话已激活后再试；失败只记录）----
     // The phone is the resource arbiter. CatPlay marks changeModes FromAccessory;
     // sending it to BMW returned 422. Initial local ownership was already published via
@@ -657,6 +659,7 @@ pub async fn negotiate(
         channel.buffered_ownership.publish_with_gate(&audio_owned, modes.audio_owned());
     }
     emit_log(&format!("AUDIO: enabled={} preference={} owner_controller={}", p.enable_audio, p.audio_codec, modes.lock().audio_owned()));
+    let mut audio_retries = Vec::new();
     if p.enable_audio && !nbt_mode {
         let mut candidates = media_plan().await;
         if buffered_offered {
@@ -667,28 +670,34 @@ pub async fn negotiate(
         let mut buffered_failed = false;
         for codec in candidates {
             if buffered_failed { emit_log(&format!("BUFFERED-AUDIO: after type103 failure trying {codec:?} type={}", codec.stream_type())); }
-            audio = negotiate_audio(&channel, &factory, shared_secret.as_ref(), p, desktop, &info, codec).await;
+            let (result, crossed_readiness) = crate::wifi_iap2::watch_media_attempt(
+                || mbux_media_compat.then_some(wifi_iap_id).and_then(crate::wifi_iap2::transport_readiness),
+                negotiate_audio(&channel, &factory, shared_secret.as_ref(), p, desktop, &info, codec),
+            ).await;
+            audio = result;
             if audio.is_some() { break; }
+            if crossed_readiness && codec != AudioCodec::BufferedAac { audio_retries.push(codec); }
             buffered_failed |= codec == AudioCodec::BufferedAac;
         }
         if audio.is_none() { emit_log("AUDIO: no usable media stream; retain video/control"); }
     }
 
-    // One transition-triggered retry only: no timers looping on a READY receiver's 400.
-    // Historical MBUX also rejected streams after READY; this is not proof of authentication.
-    if media_started_before_ready && (screen_failed || (p.enable_audio && audio.is_none())) {
-        let ready=crate::wifi_iap2::wait_transport_ready(wifi_iap_id, stop.clone(), Duration::from_secs(3)).await;
-        emit_log(&format!("MBUX-MEDIA: pre-ready failure; retry_barrier={ready} screen_failed={screen_failed} audio_missing={}; no extra RECORD",audio.is_none()));
+    // Retry only streams that failed before readiness or across a link reset.
+    // A rejection entirely within one ready generation stays final.
+    if retry_screen || (audio.is_none() && !audio_retries.is_empty()) {
+        let ready = crate::wifi_iap2::wait_transport_ready(wifi_iap_id, stop.clone(), Duration::from_secs(3)).await;
+        emit_log(&format!("MBUX-MEDIA: retry_barrier={ready} screen={retry_screen} audio={audio_retries:?}; no extra RECORD"));
         if ready {
-            if screen_failed && p.screen_resource_lifecycle {
+            if retry_screen && crate::wifi_iap2::transport_ready(wifi_iap_id) {
                 if let Err(error)=screen_session.reconcile_resource(&modes).await {
                     p.pipeline.lock().video_stream="FAILED".into();
                     emit_log(&format!("MBUX-MEDIA: one screen retry rejected: {error}; await real resource/UI event"));
                 }
             }
-            if p.enable_audio && audio.is_none() {
-                for codec in media_plan().await {
-                    audio=negotiate_audio(&channel,&factory,shared_secret.as_ref(),p,false,&info,codec).await;
+            if audio.is_none() {
+                for codec in audio_retries {
+                    if !crate::wifi_iap2::transport_ready(wifi_iap_id) { break; }
+                    audio = negotiate_audio(&channel, &factory, shared_secret.as_ref(), p, desktop, &info, codec).await;
                     if audio.is_some() {break;}
                 }
             }
@@ -716,7 +725,8 @@ pub async fn negotiate(
     let buffered_media = audio.as_ref().is_some_and(|out| out.stream_type() == 103);
     let realtime_media_rebuild = supports_realtime_media_rebuild(p, &info, desktop);
     let realtime_media = realtime_media_rebuild && audio.as_ref().is_some_and(|out| out.stream_type() == 102);
-    let aux_audio=if p.enable_audio && (!kinds.is_empty() || buffered_media || realtime_media) {
+    let shared_input = p.microphone_probe.is_some() && crate::mic_probe::shared_format(&info).is_some();
+    let aux_audio=if shared_input || p.enable_audio && (!kinds.is_empty() || buffered_media || realtime_media) {
         shared_secret.map(|shared|crate::aux_audio::Session {
             kinds,
             control:channel.clone(),factory:factory.clone(),params:p.clone(),shared,info:info.clone(),resource:speech_resource.clone(),
@@ -749,14 +759,19 @@ pub(crate) async fn activate_screen_before_handoff(
     screen_session: &crate::screen_session::ScreenSession,
     modes: &Arc<Mutex<crate::modes::Modes>>,
     handoff: Option<impl std::future::Future<Output = Result<(), String>>>,
+    retry_on_readiness: bool,
 ) -> Result<bool, String> {
-    let mut screen_failed = false;
+    let mut retry_screen = false;
     // ---- 6. 屏幕流 SETUP ----
     screen_session.activated.store(true, std::sync::atomic::Ordering::Release);
     emit_log(&format!("SCREEN-LIFECYCLE: session enabled={} initial={}", screen_session.params.screen_resource_lifecycle,modes.lock().diagnostics()));
     if screen_session.params.screen_resource_lifecycle {
-        if let Err(error) = screen_session.reconcile_resource(modes).await {
-            screen_failed = true;
+        let (result, crossed_readiness) = crate::wifi_iap2::watch_media_attempt(
+            || retry_on_readiness.then_some(screen_session.wifi_iap_id).and_then(crate::wifi_iap2::transport_readiness),
+            screen_session.reconcile_resource(modes),
+        ).await;
+        if let Err(error) = result {
+            retry_screen = crossed_readiness;
             screen_session.params.pipeline.lock().video_stream="FAILED".into();
             emit_log(&format!("SCREEN-LIFECYCLE: initial video failed: {error}; preserve audio/control"));
         }
@@ -767,7 +782,7 @@ pub(crate) async fn activate_screen_before_handoff(
         emit_state("connected", "控制会话与视频通道就绪；车机显示尚未确认");
     }
     if let Some(request) = handoff { request.await?; }
-    Ok(screen_failed)
+    Ok(retry_screen)
 }
 
 pub(crate) fn independent_audio_kinds(p: &AirplayParams, info: &Value) -> &'static [crate::aux_setup::Kind] {
@@ -789,9 +804,12 @@ pub(crate) fn independent_audio_kinds(p: &AirplayParams, info: &Value) -> &'stat
 }
 
 fn independent_audio_receiver(bmw:bool,nbt:bool,id9:bool,desktop:bool,info:&Value)->bool {
-    let diplay=["name","model","manufacturer"].into_iter().any(|key|
-        info.get(key).and_then(Value::as_str).is_some_and(|v|v.to_ascii_lowercase().contains("diplay")));
-    !nbt && !id9 && ((bmw && !desktop) || diplay)
+    !nbt && !id9 && ((bmw && !desktop) || is_diplay_receiver(info))
+}
+
+pub(crate) fn is_diplay_receiver(info: &Value) -> bool {
+    ["name", "model", "manufacturer"].into_iter().any(|key|
+        info.get(key).and_then(Value::as_str).is_some_and(|v| v.to_ascii_lowercase().contains("diplay")))
 }
 #[test]
 fn diplay_can_validate_independent_audio_without_enabling_other_desktop_receivers() {
@@ -1088,6 +1106,134 @@ mod shutdown_tests {
         tokio::time::timeout(Duration::from_secs(4), &mut tasks.0[0]).await
             .expect("two consecutive unanswered feedback requests must end the worker").unwrap();
     }
+
+    #[tokio::test]
+    async fn empty_feedback_500_leaves_control_open_until_transport_ends() {
+        let (control, mut peer) = pair().await;
+        let mut tasks = spawn_keepalive_loops(
+            control.clone(), Arc::new(super::display_size_tests::LocalSockets), 0, "127.0.0.1".into(),
+            Arc::new(Notify::new()), None, false, Arc::new(Mutex::new(crate::pipeline::Pipeline::new())),
+        );
+        for cseq in 1..=2 {
+            let request = read_request_with_timeout(&mut peer, Duration::from_secs(2)).await;
+            assert_eq!(request.first_line, "POST /feedback RTSP/1.0");
+            assert_eq!(request.cseq(), Some(cseq));
+            peer.write_all(format!("RTSP/1.0 500 Internal Server Error\r\nCSeq: {cseq}\r\nContent-Length: 0\r\n\r\n").as_bytes())
+                .await.unwrap();
+        }
+        let mut extra = [0];
+        assert!(tokio::time::timeout(Duration::from_millis(1300), peer.read(&mut extra)).await.is_err());
+        assert!(control.session_is_live(), "empty /feedback 500 is not a closed control transport");
+        assert!(!tasks.0[0].is_finished());
+
+        let (reply, ()) = tokio::join!(
+            control.request("POST", "/command", &[], "application/octet-stream", &[], Duration::from_secs(1)),
+            async {
+                let request = read_request(&mut peer).await;
+                assert_eq!(request.first_line, "POST /command RTSP/1.0");
+                peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n", request.cseq().unwrap()).as_bytes())
+                    .await.unwrap();
+            },
+        );
+        assert_eq!(reply.unwrap().status(), 200);
+        peer.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_millis(500), &mut tasks.0[0]).await
+            .expect("the worker must still observe control EOF").unwrap();
+        assert!(!control.session_is_live());
+    }
+
+    #[tokio::test]
+    async fn empty_feedback_500_after_success_still_observes_peer_teardown() {
+        let (control, mut peer) = pair().await;
+        control.set_session_uri(crate::rtsp_uri::SessionUri::new("127.0.0.1", 42).unwrap()).unwrap();
+        let mut tasks = spawn_keepalive_loops(
+            control.clone(), Arc::new(super::display_size_tests::LocalSockets), 0, "127.0.0.1".into(),
+            Arc::new(Notify::new()), None, false, Arc::new(Mutex::new(crate::pipeline::Pipeline::new())),
+        );
+        for (cseq, status) in [(1, 200), (2, 500), (3, 500)] {
+            let request = read_request_with_timeout(&mut peer, Duration::from_secs(2)).await;
+            assert_eq!(request.first_line, "POST /feedback RTSP/1.0");
+            assert_eq!(request.cseq(), Some(cseq));
+            peer.write_all(format!("RTSP/1.0 {status} Reply\r\nCSeq: {cseq}\r\nContent-Length: 0\r\n\r\n").as_bytes())
+                .await.unwrap();
+        }
+        let mut extra = [0];
+        assert!(tokio::time::timeout(Duration::from_millis(1300), peer.read(&mut extra)).await.is_err());
+        assert!(control.session_is_live());
+        peer.write_all(b"TEARDOWN rtsp://127.0.0.1/42 RTSP/1.0\r\nCSeq: 72\r\n\r\n").await.unwrap();
+        let ack = read_request(&mut peer).await;
+        assert_eq!((ack.status(), ack.cseq()), (200, Some(72)));
+        tokio::time::timeout(Duration::from_millis(500), &mut tasks.0[0]).await
+            .expect("peer teardown must still end the session").unwrap();
+        assert_eq!(control.end_detail(RtspEndCause::FeedbackFailed), "车机主动结束");
+    }
+
+    #[tokio::test]
+    async fn feedback_rejection_retries_and_success_restores_the_retry() {
+        let (control, mut peer) = pair().await;
+        let mut tasks = spawn_keepalive_loops(
+            control.clone(), Arc::new(super::display_size_tests::LocalSockets), 0, "127.0.0.1".into(),
+            Arc::new(Notify::new()), None, false, Arc::new(Mutex::new(crate::pipeline::Pipeline::new())),
+        );
+        for (cseq, status, body) in [(1, 500, ""), (2, 200, ""), (3, 500, ""), (4, 500, "error")] {
+            let request = read_request_with_timeout(&mut peer, Duration::from_secs(2)).await;
+            assert_eq!(request.first_line, "POST /feedback RTSP/1.0");
+            assert_eq!(request.cseq(), Some(cseq));
+            assert!(control.session_is_live());
+            peer.write_all(format!("RTSP/1.0 {status} Reply\r\nCSeq: {cseq}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes())
+                .await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_millis(500), &mut tasks.0[0]).await
+            .expect("two consecutive rejections end the session").unwrap();
+        assert!(!control.session_is_live());
+        assert_eq!(control.end_detail(RtspEndCause::EventClosed), "控制保活失败");
+    }
+
+    #[tokio::test]
+    async fn acknowledged_peer_teardown_ends_even_with_feedback_pending_and_sockets_open() {
+        for on_event in [false, true] {
+            let (control, mut control_peer) = pair().await;
+            control.set_session_uri(crate::rtsp_uri::SessionUri::new("127.0.0.1", 42).unwrap()).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let event = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (mut event_peer, _) = listener.accept().await.unwrap();
+            let (read, write) = event.into_split();
+            let (_event, _inbound) = control.spawn_event(read, write, None, Arc::new(|_, _| {}));
+            let mut tasks = spawn_keepalive_loops(
+                control.clone(), Arc::new(super::display_size_tests::LocalSockets), 0, "127.0.0.1".into(),
+                Arc::new(Notify::new()), None, false, Arc::new(Mutex::new(crate::pipeline::Pipeline::new())),
+            );
+            let feedback = read_request_with_timeout(&mut control_peer, Duration::from_secs(2)).await;
+            assert_eq!(feedback.first_line, "POST /feedback RTSP/1.0");
+            let peer = if on_event { &mut event_peer } else { &mut control_peer };
+            peer.write_all(b"TEARDOWN rtsp://127.0.0.1/42 RTSP/1.0\r\nCSeq: 72\r\n\r\n").await.unwrap();
+            let ack = read_request(peer).await;
+            assert_eq!(ack.cseq(), Some(72));
+            assert_eq!(ack.status(), 200);
+            tokio::time::timeout(Duration::from_millis(500), &mut tasks.0[0]).await
+                .expect("peer teardown must end without waiting for feedback or EOF").unwrap();
+            assert_eq!(control.end_detail(RtspEndCause::FeedbackFailed), "车机主动结束");
+            assert!(!control.is_closed());
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_control_batch_does_not_leave_teardown_pending() {
+        let (control, mut peer) = pair().await;
+        control.set_session_uri(crate::rtsp_uri::SessionUri::new("127.0.0.1", 42).unwrap()).unwrap();
+        let mut tasks = spawn_keepalive_loops(
+            control.clone(), Arc::new(super::display_size_tests::LocalSockets), 0, "127.0.0.1".into(),
+            Arc::new(Notify::new()), None, false, Arc::new(Mutex::new(crate::pipeline::Pipeline::new())),
+        );
+        let feedback = read_request_with_timeout(&mut peer, Duration::from_secs(2)).await;
+        assert_eq!(feedback.first_line, "POST /feedback RTSP/1.0");
+        peer.write_all(b"TEARDOWN / RTSP/1.0\r\nCSeq: 72\r\n\r\nRTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: invalid\r\n\r\n").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), &mut tasks.0[0]).await
+            .expect("closing the control reader must finish the session").unwrap();
+        assert!(!control.peer_teardown_pending());
+        assert!(control.is_closed());
+    }
+
     #[tokio::test]
     async fn rejected_hevc_session_retries_once_without_changing_other_fields() {
         let (control,mut peer)=pair().await;
@@ -1748,7 +1894,7 @@ mod id9_tests {
     fn buffered_setup_sends_the_stream_key_and_realtime_aac_does_not() {
         let id = 42;
         let key = stream_key(&[9; 32], id as u64);
-        let buffered = bplist::parse(&build_audio_setup_request(id, 250, AudioCodec::BufferedAac, Some(&key), None)).unwrap();
+        let buffered = bplist::parse(&build_audio_setup_request(id, 250, AudioCodec::BufferedAac, Some(&key), None, false)).unwrap();
         let stream = &buffered.get("streams").unwrap().as_array().unwrap()[0];
         assert_eq!(stream.get("shk").and_then(Value::as_bytes), Some(key.as_slice()));
         assert_eq!(stream.get("ct").and_then(Value::as_int), Some(4));
@@ -1938,6 +2084,12 @@ fn read_display_size(display: &Value) -> (u32, u32) {
 #[cfg(test)]
 mod display_size_tests {
     use super::*;
+    fn handle_hid_report(report: &[u8], touch_tx: &mpsc::UnboundedSender<TouchInput>, display: (u32,u32),
+        surface: &TouchSurface, target_size: &Arc<Mutex<(u32,u32)>>, contact: &mut TouchContact, logged: &mut u32) {
+        let sample = crate::consumer_hid::TouchSample::legacy(report).unwrap();
+        handle_touch_sample(sample, touch_tx, display, surface, target_size, contact, logged);
+    }
+
     #[tokio::test]
     async fn dropping_worker_while_feedback_pending_releases_control_without_stop_notification() {
         use tokio::io::AsyncReadExt;
@@ -1954,6 +2106,32 @@ mod display_size_tests {
         }).await.unwrap();
         assert_eq!(car.read(&mut bytes).await.unwrap(),0);
     }
+    #[test]
+    fn descriptor_touch_coordinates_use_bit_ranges_and_logical_bounds() {
+        let descriptor = vec![
+            0x05,0x0d,0x09,0x04,0xa1,1,0x85,7,0x09,0x22,0xa1,2,
+            0x09,0x42,0x15,0,0x25,1,0x75,1,0x95,1,0x81,2,
+            0x75,7,0x95,1,0x81,1,
+            0x05,1,0x09,0x30,0x09,0x31,0x15,0,0x26,0xff,0x0f,
+            0x75,12,0x95,2,0x81,2,0xc0,0xc0,
+        ];
+        let id = Value::int(4);
+        let mut hid = crate::consumer_hid::ConsumerHid::from_info(&Value::dict(vec![("hidDevices", Value::array(vec![
+            Value::dict(vec![("uuid", id.clone()), ("hidDescriptor", Value::Data(descriptor))]),
+        ]))]));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let source = Arc::new(Mutex::new((2000, 1000)));
+        let mut contact = TouchContact::Idle;
+        let mut logged = 0;
+        let report = [7, 1, 0, 8, 0x40]; // X=2048, Y=1024, both out of 4095.
+        assert!(hid.report(Some(&id), &report).is_none());
+        let sample = hid.touch_sample(Some(&id), &report, (2000, 1000)).unwrap();
+        handle_touch_sample(sample, &tx, (2000, 1000),
+            &TouchSurface::Display, &source, &mut contact, &mut logged);
+        let touch = rx.try_recv().unwrap();
+        assert_eq!((touch.action, touch.x, touch.y), (0, 1000, 250));
+    }
+
     #[test]
     fn hid_mapping_tracks_actual_carwith_source_without_changing_receiver_coordinates() {
         let (tx,mut rx)=mpsc::unbounded_channel();
@@ -2109,6 +2287,47 @@ mod display_size_tests {
     }
 
     #[test]
+    fn media_latency_matches_rate_sample_size_channels_and_compression() {
+        let entry = |kind, conditions: &[(&str, i64)], micros| {
+            let mut fields = vec![("type", Value::int(kind)), ("audioType", Value::str("media")),
+                ("outputLatencyMicros", Value::int(micros))];
+            fields.extend(conditions.iter().map(|&(key, value)| (key, Value::int(value))));
+            Value::dict(fields)
+        };
+        let info = Value::dict(vec![("audioLatencies", Value::array(vec![
+            entry(102, &[("sr", 44_100), ("ss", 16), ("ch", 2), ("ct", 4)], 510_000),
+            entry(102, &[("ss", 24)], 520_000),
+            entry(102, &[("ch", 1)], 530_000),
+            entry(102, &[("ct", 1)], 540_000),
+            entry(102, &[("sr", 48_000), ("ss", 16), ("ch", 2), ("ct", 4)], 550_000),
+            entry(100, &[("ct", 4)], 560_000),
+            entry(100, &[("ct", 1), ("ss", 16)], 570_000),
+            entry(103, &[("ct", 8)], 2_100_000),
+            entry(103, &[("ct", 4)], 1_400_000),
+        ]))]);
+        for (codec, expected) in [
+            (AudioCodec::Aac441, 510), (AudioCodec::Aac, 550),
+            (AudioCodec::Pcm, 570), (AudioCodec::BufferedAac, 1400),
+        ] {
+            let setup = bplist::parse(&build_audio_setup_for_codec(42, media_latency_ms(&info, codec), codec)).unwrap();
+            let stream = &setup.get("streams").unwrap().as_array().unwrap()[0];
+            assert_eq!(stream.get("audioLatencyMs").and_then(Value::as_int), Some(expected), "{codec:?}");
+        }
+    }
+
+    #[test]
+    fn media_latency_uses_first_matching_entry_with_optional_selectors() {
+        let info = Value::dict(vec![("audioLatencies", Value::array(vec![
+            Value::dict(vec![("sr", Value::str("48000")), ("outputLatencyMicros", Value::int(800_000))]),
+            Value::dict(vec![("audioType", Value::str("default")), ("outputLatencyMicros", Value::int(700_000))]),
+            Value::dict(vec![("ch", Value::int(2)), ("outputLatencyMicros", Value::int(600_000))]),
+            Value::dict(vec![("type", Value::int(100)), ("audioType", Value::str("media")),
+                ("sr", Value::int(48_000)), ("outputLatencyMicros", Value::int(500_000))]),
+        ]))]);
+        assert_eq!(media_latency_ms(&info, AudioCodec::Pcm), 600);
+    }
+
+    #[test]
     fn pcm_setup_with_no_declared_latency_preserves_wire_format() {
         let codec = AudioCodec::Pcm;
         let body = bplist::parse(&build_audio_setup_for_codec(42, media_latency_ms(&Value::dict(vec![]), codec), codec)).unwrap();
@@ -2165,17 +2384,18 @@ mod display_size_tests {
                 assert_eq!(stream.get(key).and_then(Value::as_int),Some(value));
             }
         }
-        // Enabling 44.1 kHz for ID6 must not change the old MGU/default candidates.
-        assert_eq!(audio_candidates(&info,"auto",false),vec![AudioCodec::Pcm,AudioCodec::Aac]);
+        assert_eq!(audio_candidates(&info, "auto", false), [AudioCodec::Pcm, AudioCodec::Aac, AudioCodec::Aac441]);
+        assert_eq!(audio_candidates(&info, "auto", true), [AudioCodec::Pcm, AudioCodec::Aac]);
     }
     #[test]
-    fn aac_setup_and_candidates_keep_pcm_default_and_respect_receiver_direction() {
+    fn aac_setup_and_candidates_follow_declared_media_output_before_pcm_default() {
         let format=|kind,audio_type,bits| Value::dict(vec![("type",Value::int(kind)),
             ("audioType",Value::str(audio_type)),("audioOutputFormats",Value::int(bits))]);
         let info=|formats| Value::dict(vec![("audioFormats",Value::array(formats))]);
         let aac_only=info(vec![format(102,"media",1<<23)]);
-        assert_eq!(audio_candidates(&aac_only,"auto",false),vec![AudioCodec::Pcm,AudioCodec::Aac]);
+        assert_eq!(audio_candidates(&aac_only,"auto",false),vec![AudioCodec::Aac,AudioCodec::Pcm]);
         assert_eq!(audio_candidates(&aac_only,"auto",true),vec![AudioCodec::Aac]);
+        assert_eq!(audio_candidates(&aac_only,"pcm",false),vec![AudioCodec::Pcm]);
         assert_eq!(audio_candidates(&aac_only,"pcm",true),vec![]);
         assert_eq!(audio_candidates(&aac_only,"aac",false),vec![AudioCodec::Aac,AudioCodec::Pcm]);
         assert_eq!(audio_candidates(&info(vec![format(102,"telephony",1<<23)]),"auto",true),vec![]);
@@ -2186,6 +2406,24 @@ mod display_size_tests {
         for (key,value) in [("type",102),("audioFormat",1<<23),("spf",1024),("ct",4),("sr",48000)] {
             assert_eq!(stream.get(key).and_then(Value::as_int),Some(value));
         }
+    }
+
+    #[test]
+    fn automatic_legacy_media_accepts_only_same_row_output_at_supported_rates() {
+        use AudioCodec::*;
+        let format = |kind, role, direction, bits| Value::dict(vec![
+            ("type", Value::int(kind)), ("audioType", Value::str(role)), (direction, Value::int(bits)),
+        ]);
+        let info = Value::dict(vec![("audioFormats", Value::array(vec![
+            format(102, "media", "audioInputFormats", 1 << 23),
+            format(102, "default", "audioOutputFormats", 1 << 23),
+            format(101, "media", "audioOutputFormats", 1 << 23),
+            format(102, "media", "audioOutputFormats", -1),
+            format(100, "media", "audioOutputFormats", 1 << 11),
+            format(102, "media", "audioOutputFormats", 1 << 22),
+        ]))]);
+        assert_eq!(audio_candidates(&info, "auto", false), [Pcm441, Aac441, Pcm]);
+        assert!(audio_candidates(&info, "auto", true).is_empty());
     }
     #[test]
     fn desktop_info_overrides_bmw_bootstrap_without_weakening_real_car_grants() {
@@ -2412,9 +2650,10 @@ mod display_size_tests {
         ] {
             let control = bind_main_audio_control(&factory, "127.0.0.1", codec);
             let port = control.as_ref().map(|s| s.local_addr().unwrap().port());
-            let body = bplist::parse(&build_audio_setup_request(42, 300, codec, None, port)).unwrap();
+            let body = bplist::parse(&build_audio_setup_request(42, 300, codec, None, port, expected)).unwrap();
             let stream = &body.get("streams").unwrap().as_array().unwrap()[0];
             assert_eq!(stream.get("controlPort").and_then(Value::as_int), port.map(i64::from));
+            assert_eq!(stream.get("supportsHighAccuracyTimestamps").and_then(Value::as_bool), expected.then_some(true));
             assert_eq!(control.is_some(), expected, "{codec:?}");
             if let Some(socket) = control {
                 let local = socket.local_addr().unwrap();
@@ -2933,6 +3172,12 @@ impl AudioCodec {
     fn format(self) -> i64 { match self {Self::Pcm=>1<<15,Self::Pcm441=>1<<11,Self::Aac | Self::BufferedAac=>1<<23,Self::Aac441=>1<<22} }
     fn rate(self) -> u32 { if matches!(self, Self::Aac441 | Self::Pcm441) {44100} else {48000} }
     fn spf(self) -> i64 { if matches!(self, Self::Pcm | Self::Pcm441) {352} else {1024} }
+    fn compression_type(self) -> i64 {
+        match self {
+            Self::Pcm | Self::Pcm441 => 1,
+            Self::Aac | Self::Aac441 | Self::BufferedAac => 4,
+        }
+    }
 }
 pub(crate) fn declares_media(info: &Value, codec: AudioCodec) -> bool {
     info.get("audioFormats").and_then(Value::as_array).into_iter().flatten().any(|f|
@@ -3045,30 +3290,50 @@ fn nbt_audio_candidates(info: &Value, preference: &str) -> Vec<AudioCodec> {
     candidates.into_iter().filter(|codec|declares_media(info,*codec)).collect()
 }
 fn audio_candidates(info: &Value, preference: &str, strict: bool) -> Vec<AudioCodec> {
-    let aac = declares_media(info, AudioCodec::Aac);
-    let pcm = !strict || declares_media(info, AudioCodec::Pcm);
-    let mut result = Vec::new();
-    if preference == "aac" && aac { result.push(AudioCodec::Aac); }
-    if pcm { result.push(AudioCodec::Pcm); }
-    if preference != "pcm" && aac && !result.contains(&AudioCodec::Aac) { result.push(AudioCodec::Aac); }
-    result
+    use AudioCodec::*;
+    let ordered: &[_] = match preference {
+        "pcm" => &[Pcm],
+        "aac" => &[Aac, Pcm],
+        _ if strict => &[Pcm, Aac],
+        _ => &[Pcm, Aac, Pcm441, Aac441],
+    };
+    let mut candidates: Vec<_> = ordered.iter().copied().filter(|&codec| declares_media(info, codec)).collect();
+    // Some older receivers accept PCM48 SETUP even without a matching /info row.
+    if !strict && !candidates.contains(&Pcm) {
+        candidates.push(Pcm);
+    }
+    candidates
 }
-fn media_latency_entries(info: &Value, stream_type: i64) -> impl Iterator<Item = &Value> {
+fn audio_latency_entries<'a>(info: &'a Value, stream_type: i64, audio_type: &'a str) -> impl Iterator<Item = &'a Value> {
     info.get("audioLatencies").and_then(Value::as_array).into_iter().flatten()
         .filter(move |entry| {
-            let kind = entry.get("type").or_else(|| entry.get("streamType")).and_then(Value::as_int);
-            kind == Some(stream_type) && entry.get("audioType").and_then(Value::as_str)
-                .is_some_and(|role| role.eq_ignore_ascii_case("media"))
+            let kind = entry.get("type").or_else(|| entry.get("streamType"));
+            entry.as_dict().is_some()
+                && kind.is_none_or(|value| value.as_int() == Some(stream_type))
+                && entry.get("audioType").is_none_or(|value| {
+                    value.as_str().is_some_and(|role| role.eq_ignore_ascii_case(audio_type))
+                })
         })
 }
 
 fn media_info_latency_lines(rtsp: u64, source: &str, info: &Value) -> [String; 3] {
     [100, 102, 103].map(|stream_type| {
-        let values: Vec<_> = media_latency_entries(info, stream_type).map(|entry| {
-            match entry.get("outputLatencyMicros") {
+        let values: Vec<_> = audio_latency_entries(info, stream_type, "media").map(|entry| {
+            let micros = match entry.get("outputLatencyMicros") {
                 Some(Value::Int(micros)) => micros.to_string(),
-                Some(_) => "invalid".into(),
-                None => "missing_field".into(),
+                Some(_) => "invalid".to_owned(),
+                None => "missing_field".to_owned(),
+            };
+            let selectors: Vec<_> = ["sr", "ss", "ch", "ct"].into_iter().filter_map(|key| {
+                entry.get(key).map(|value| {
+                    let value = value.as_int().map_or_else(|| "invalid".to_owned(), |n| n.to_string());
+                    format!("{key}={value}")
+                })
+            }).collect();
+            if selectors.is_empty() {
+                micros
+            } else {
+                format!("{micros}[{}]", selectors.join(" "))
             }
         }).collect();
         let raw = if values.is_empty() { "missing_entry".into() } else { values.join(",") };
@@ -3080,14 +3345,27 @@ fn media_latency_ms(info: &Value, codec: AudioCodec) -> i64 {
     // DiPlay's recommended extra headroom is for buffered TCP. Do not inflate
     // the real-time UDP queues (WinPlay PCM in particular has a packet limit).
     let floor_ms = if codec == AudioCodec::BufferedAac { 1000 } else { 300 };
-    let declared_micros = media_latency_entries(info, codec.stream_type()).find_map(|entry|
-        entry.get("outputLatencyMicros").and_then(Value::as_int).filter(|&micros| micros > 0));
-    declared_micros.map_or(floor_ms, |micros| (micros / 1000).max(floor_ms))
+    // R14G17 uses 16-bit samples for these PCM formats and for decoded AAC-LC output.
+    output_audio_latency_ms(info, codec.stream_type(), "media",
+        [i64::from(codec.rate()), 16, 2, codec.compression_type()], false).unwrap_or_default().max(floor_ms)
+}
+
+/// R14G17 orders the rows and treats absent selectors as wildcards.
+pub(crate) fn output_audio_latency_ms(info: &Value, stream_type: i64, audio_type: &str,
+    format: [i64; 4], allow_zero: bool) -> Option<i64> {
+    let selectors = ["sr", "ss", "ch", "ct"].into_iter().zip(format);
+    audio_latency_entries(info, stream_type, audio_type)
+        .filter(|entry| selectors.clone().all(|(key, expected)| {
+            entry.get(key).is_none_or(|value| value.as_int() == Some(expected))
+        }))
+        .find_map(|entry| entry.get("outputLatencyMicros").and_then(Value::as_int)
+            .filter(|&micros| micros > 0 || (allow_zero && micros == 0)))
+        .map(|micros| micros / 1000)
 }
 
 #[cfg(test)]
 fn build_audio_setup_for_codec(conn_id: i64, latency_ms: i64, codec: AudioCodec) -> Vec<u8> {
-    build_audio_setup_request(conn_id, latency_ms, codec, None, None)
+    build_audio_setup_request(conn_id, latency_ms, codec, None, None, false)
 }
 
 fn bind_main_audio_control(factory: &dyn SocketProvider, host: &str, codec: AudioCodec) -> Option<UdpSocket> {
@@ -3100,7 +3378,7 @@ fn bind_main_audio_control(factory: &dyn SocketProvider, host: &str, codec: Audi
     socket
 }
 
-fn build_audio_setup_request(conn_id: i64, latency_ms: i64, codec: AudioCodec, shk: Option<&[u8; 32]>, control_port: Option<u16>) -> Vec<u8> {
+fn build_audio_setup_request(conn_id: i64, latency_ms: i64, codec: AudioCodec, shk: Option<&[u8; 32]>, control_port: Option<u16>, high_accuracy: bool) -> Vec<u8> {
     let mut stream = vec![
         ("type", Value::int(codec.stream_type())),
         ("streamConnectionID", Value::int(conn_id)),
@@ -3112,8 +3390,13 @@ fn build_audio_setup_request(conn_id: i64, latency_ms: i64, codec: AudioCodec, s
         ("spf", Value::int(codec.spf())),
     ];
     // Leave the validated PCM proposal unchanged. AAC explicitly describes compression/rate.
-    if matches!(codec.stream_type(),102|103) { stream.extend([("ct",Value::int(4)),("sr",Value::int(codec.rate() as i64))]); }
-    if let Some(port) = control_port { stream.push(("controlPort", Value::int(i64::from(port)))); }
+    if matches!(codec.stream_type(), 102 | 103) {
+        stream.extend([("ct", Value::int(codec.compression_type())), ("sr", Value::int(codec.rate().into()))]);
+    }
+    if let Some(port) = control_port {
+        stream.push(("controlPort", Value::int(i64::from(port))));
+        if high_accuracy { stream.push(("supportsHighAccuracyTimestamps", Value::bool(true))); }
+    }
     // DiPlay decrypts type 103 with this key directly and drops the stream when it is absent.
     if let Some(key) = shk { stream.push(("shk", Value::Data(key.to_vec()))); }
     bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(stream)]))]))
@@ -3173,7 +3456,7 @@ async fn negotiate_buffered_audio(channel: &Arc<RtspChannel>, factory: &Arc<dyn 
     let id = random_positive_i64();
     let latency_ms = media_latency_ms(info, codec);
     let key = stream_key(shared, id as u64);
-    let request = build_audio_setup_request(id, latency_ms, codec, Some(&key), None);
+    let request = build_audio_setup_request(id, latency_ms, codec, Some(&key), None, false);
     emit_log(&format!("BUFFERED-AUDIO: type103 SETUP latencyMs={latency_ms} shk_bytes={}", key.len()));
     let started = Instant::now();
     channel.buffered_cleanup_pending.store(true, Ordering::Release);
@@ -3276,13 +3559,19 @@ pub(crate) async fn negotiate_realtime_audio(
     // 屏幕流与初始 SETUP 才用相对路径。URI 用反会 400/404。
     let audio_uri = crate::rtsp_uri::audio_uri(&p.car_ip, p.airplay_port);
     let mut offer_port = advertised_port;
+    let mut high_accuracy = offer_port.is_some();
     let resp = loop {
-        let body = build_audio_setup_request(conn_id, latency_ms, codec, None, offer_port);
+        let body = build_audio_setup_request(conn_id, latency_ms, codec, None, offer_port, high_accuracy);
         match channel.request("SETUP", &audio_uri, &body, "application/x-apple-binary-plist", &[], Duration::from_secs(8)).await {
+            Ok(reply) if high_accuracy && matches!(reply.status(), 400 | 451 | 461) => {
+                emit_log(&format!("AUDIO-RTCP: type={} timestamp capability rejected status={}; retrying with the same local control port", codec.stream_type(), reply.status()));
+                high_accuracy = false;
+            }
             Ok(reply) if codec.stream_type() == 100 && offer_port.is_some() && matches!(reply.status(), 400 | 451 | 461) => {
                 emit_log(&format!("AUDIO-RTCP: type=100 controlPort SETUP rejected status={}; retrying PCM without a local port", reply.status()));
                 offer_port = None;
                 local_control = None;
+                high_accuracy = false;
             }
             Ok(reply) => break reply,
             Err(error) => {
@@ -3373,6 +3662,7 @@ pub(crate) async fn negotiate_realtime_audio(
             return None;
         }
         out.observe_main_stream(channel.trace_id(), conn_id, control_port, resp.received_at, &channel.buffered_ownership, listening);
+        out.high_accuracy_timestamps = high_accuracy;
         if p.head_unit_profile == "bmw_id9" {
             out.observe_id9_resume(channel.audio_unborrow_generation.clone());
         }
@@ -3426,53 +3716,102 @@ fn spawn_keepalive_loops(
     }
 
     tasks.push(crate::callback_context::spawn(async move {
-        let mut first_reply = true;
-        let mut previous_reply_timed_out = false;
-        let mut audio_trace = crate::audio_diagnostics::FeedbackTrace::default();
-        let mut video_trace = crate::video_feedback::FeedbackTrace::default();
-        loop {
-            tokio::select! {
-                _ = stop.notified() => return,
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-            }
-            let rtsp = channel.trace_id();
-            let target = crate::video_feedback::FeedbackTarget::current(&pipeline.lock(), rtsp);
-            match channel.request_feedback(previous_reply_timed_out).await {
-                Ok(reply) => {
-                    if let Some(id) = wifi_iap_id { crate::wifi_iap2::feedback(id, reply.status() == 200); }
-                    if reply.status() != 200 { emit_log(&format!("AIRPLAY: feedback rejected status={}", reply.status())); return; }
-                    if let Some(line) = audio_trace.observe(channel.trace_id(), reply.cseq(), &reply.body) { emit_log(&line); }
-                    if let (Some(target), Some(cseq)) = (target, reply.cseq()) {
-                        let now_ms = crate::timing::monotonic_nanos() / 1_000_000;
-                        if let Some(line) = video_trace.observe(&pipeline, &target, rtsp, cseq, &reply.body, now_ms) {
-                            emit_log(&line);
-                        }
+        let teardown = channel.wait_for_peer_teardown();
+        tokio::pin!(teardown);
+        let cause = tokio::select! {
+            biased;
+            _ = stop.notified() => return,
+            cause = &mut teardown => cause,
+            failure = run_feedback(&channel, wifi_iap_id, &pipeline) => {
+                if channel.peer_teardown_pending() {
+                    tokio::select! {
+                        _ = stop.notified() => return,
+                        cause = &mut teardown => cause,
                     }
-                    if previous_reply_timed_out {
-                        emit_log(&format!("AIRPLAY: feedback 应答恢复 CSeq={:?}", reply.cseq()));
-                        previous_reply_timed_out = false;
-                    }
-                    if first_reply {
-                        emit_log(&format!("AIRPLAY: feedback 首次应答 status={}", reply.status()));
-                        first_reply = false;
-                    }
+                } else {
+                    if matches!(failure, RtspEndCause::FeedbackFailed) { channel.record_feedback_failure(); }
+                    failure
                 }
-                Err(crate::rtsp::RequestError::ReplyTimeout(detail)) if !previous_reply_timed_out && !channel.is_closed() => {
-                    previous_reply_timed_out = true;
-                    emit_log(&format!("AIRPLAY: feedback 首次应答超时，下个周期使用新 CSeq 再发：{detail}"));
-                }
-                Err(error) => {
-                    emit_log(&format!("AIRPLAY: feedback stopped: {error}"));
-                    if let Some(id) = wifi_iap_id {
-                        crate::wifi_iap2::feedback(id, false);
-                        if crate::wifi_iap2::take_rtsp_end(id) { emit_state("ended", channel.end_detail(RtspEndCause::FeedbackFailed)); }
-                    }
-                    return;
-                },
             }
-        }
+        };
+        if let Some(id) = wifi_iap_id { emit_rtsp_end(&channel, id, cause); }
     }));
     KeepaliveTasks(tasks, None, None)
+}
+
+async fn run_feedback(
+    channel: &RtspChannel,
+    wifi_iap_id: Option<u64>,
+    pipeline: &Arc<Mutex<crate::pipeline::Pipeline>>,
+) -> RtspEndCause {
+    let mut first_reply = true;
+    let mut previous_failure = None;
+    let mut audio_trace = crate::audio_diagnostics::FeedbackTrace::default();
+    let mut video_trace = crate::video_feedback::FeedbackTrace::default();
+    let audio_ownership = channel.buffered_ownership.subscribe();
+    let audio_target = || {
+        let ownership = *audio_ownership.borrow();
+        pipeline.lock().main_audio_clock.filter(|target| ownership.owned && target.rtsp == channel.trace_id())
+            .map(|target| (target, ownership.losses))
+    };
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let rtsp = channel.trace_id();
+        let target = crate::video_feedback::FeedbackTarget::current(&pipeline.lock(), rtsp);
+        let clock_target = audio_target();
+        match channel.request_feedback(previous_failure).await {
+            Ok(reply) if reply.status() == 200 => {
+                if let Some(id) = wifi_iap_id { crate::wifi_iap2::feedback(id, true); }
+                audio_trace.set_clock_target(clock_target.filter(|target| Some(*target) == audio_target()));
+                if let Some(line) = audio_trace.observe(rtsp, reply.cseq(), &reply.body) { emit_log(&line); }
+                if let (Some(target), Some(cseq)) = (target, reply.cseq()) {
+                    let now_ms = crate::timing::monotonic_nanos() / 1_000_000;
+                    if let Some(line) = video_trace.observe(pipeline, &target, rtsp, cseq, &reply.body, now_ms) {
+                        emit_log(&line);
+                    }
+                }
+                if previous_failure.take().is_some() {
+                    emit_log(&format!("AIRPLAY: feedback 应答恢复 status=200 CSeq={:?}", reply.cseq()));
+                }
+                if first_reply {
+                    emit_log(&format!("AIRPLAY: feedback 首次成功应答 status=200 CSeq={:?}", reply.cseq()));
+                    first_reply = false;
+                }
+            }
+            Ok(reply) => {
+                let retry = previous_failure.is_none() && !channel.is_closed();
+                emit_log(&format!("AIRPLAY: feedback rejected status={} CSeq={:?} retry={retry}", reply.status(), reply.cseq()));
+                let empty_server_error = reply.is_empty_server_error();
+                if !retry {
+                    if empty_server_error && previous_failure == Some(FeedbackFailure::EmptyServerError) {
+                        // The receiver answered both requests, but cannot provide feedback in this session.
+                        emit_log(&format!("AIRPLAY: feedback polling disabled after two empty 500 responses RTSP#{rtsp}; monitoring control transport"));
+                        channel.wait_for_control_close().await;
+                        return RtspEndCause::ControlClosed;
+                    }
+                    return RtspEndCause::FeedbackFailed;
+                }
+                previous_failure = Some(if empty_server_error { FeedbackFailure::EmptyServerError }
+                    else { FeedbackFailure::Rejected });
+            }
+            Err(crate::rtsp::RequestError::ReplyTimeout(detail)) if previous_failure.is_none() && !channel.is_closed() => {
+                previous_failure = Some(FeedbackFailure::Timeout);
+                emit_log(&format!("AIRPLAY: feedback 首次应答超时，下个周期使用新 CSeq 再发：{detail}"));
+            }
+            Err(error) => {
+                emit_log(&format!("AIRPLAY: feedback stopped: {error}"));
+                return RtspEndCause::FeedbackFailed;
+            }
+        }
+    }
+}
+
+fn emit_rtsp_end(control: &RtspChannel, id: u64, fallback: RtspEndCause) {
+    if crate::wifi_iap2::take_rtsp_end(id) {
+        crate::wifi_iap2::feedback(id, false);
+        crate::wifi_iap2::mark_ready(id, false);
+        emit_state("ended", control.end_detail(fallback));
+    }
 }
 
 // ---------------------------------------------------------------- 事件通道分发
@@ -3525,10 +3864,12 @@ fn spawn_event_dispatcher(
                     None => { control_ui_open = false; continue; }
                 },
                 m = inbound.recv() => match m {
-                    Some(m) => (m, false),
+                    Some(m) if control.session_is_live() => (m, false),
+                    Some(_) => continue,
                     None => {
-                        crate::wifi_iap2::mark_ready(wifi_iap_id, false);
-                        if crate::wifi_iap2::take_rtsp_end(wifi_iap_id) { emit_state("ended", control.end_detail(RtspEndCause::EventClosed)); }
+                        if !control.peer_teardown_pending() {
+                            emit_rtsp_end(&control, wifi_iap_id, RtspEndCause::EventClosed);
+                        }
                         return;
                     },
                 },
@@ -3660,14 +4001,12 @@ fn spawn_event_dispatcher(
                             }
                             continue;
                         }
-                        let payload = consumer_hid.touch_payload(uuid, report);
-                        let touch_trace = if payload.len() >= 5 {
-                            let at = crate::timing::monotonic_nanos() / 1_000_000;
-                            last_touch_trace.is_none_or(|last| at.saturating_sub(last) >= 1000).then_some(at)
-                        } else { None };
+                        let Some(sample) = consumer_hid.touch_sample(uuid, report, display_size) else { continue; };
+                        let at = crate::timing::monotonic_nanos() / 1_000_000;
+                        let touch_trace = last_touch_trace.is_none_or(|last| at.saturating_sub(last) >= 1000).then_some(at);
                         let before = touch_logged;
-                        handle_hid_report(
-                            payload,
+                        handle_touch_sample(
+                            sample,
                             &touch_tx,
                             display_size,
                             &touch_surface,
@@ -3678,7 +4017,7 @@ fn spawn_event_dispatcher(
                         if let Some(at) = touch_trace {
                             last_touch_trace = Some(at);
                             crate::emit_media_trace(at, "hid_touch_in",
-                                &format!("RTSP#{} bytes={} mapped={}", control.trace_id(), payload.len(), touch_logged != before));
+                                &format!("RTSP#{} bytes={} mapped={}", control.trace_id(), report.len(), touch_logged != before));
                         }
                     }
                 }
@@ -3840,8 +4179,8 @@ impl TouchSurface {
 enum TouchContact { Idle, Ignored, Active(u32,u32) }
 
 /// Map receiver HID pixels into the local input canvas. Actions use Android DOWN/MOVE/UP.
-fn handle_hid_report(
-    report: &[u8],
+fn handle_touch_sample(
+    sample: crate::consumer_hid::TouchSample,
     touch_tx: &mpsc::UnboundedSender<TouchInput>,
     display: (u32, u32),
     surface: &TouchSurface,
@@ -3849,53 +4188,12 @@ fn handle_hid_report(
     contact: &mut TouchContact,
     logged: &mut u32,
 ) {
-    if report.len() < 5 {
-        // Media reports are decoded by ConsumerHid, including device IDs and key edges.
-        return;
-    }
     // 每次触摸都读当前编码分辨率：手机可能把请求的分辨率压缩后回报，
     // 用旧快照会让触摸整体偏移（越靠边越明显）。
     let target = *target_size.lock();
     let target = (target.0.max(2), target.1.max(2));
 
-    // 两种报告布局：
-    //  ① **每指 6 字节** `[index][touch][X u16LE][Y u16LE]`，最多 2 指（12 字节）——
-    //     苹果触摸描述符 / WinPlay 都是这个（WinPlay: TOUCH_CONTACTS=2、BYTES_PER_FINGER=6）。
-    //  ② 旧的 5 字节 `[tip][X u16LE][Y u16LE]`（cardeck 奥迪实测）。
-    // 之前只按 ② 解析，于是把 6 字节布局里的 `report[0]`（触点 index=0）当成按下位 →
-    // 永远判成"未按下" → 触摸被整段丢弃（现场 2026-10-23 23:35 定位）。
-    let (pressed, x_raw, y_raw) = if report.len() >= 6 && report.len() % 6 == 0 {
-        // 取第一个真正的指（跳过 index 非 0 或未按下的）
-        let mut picked = None;
-        for finger in report.chunks_exact(6) {
-            if finger[1] & 0x01 != 0 {
-                picked = Some(finger);
-                break;
-            }
-        }
-        match picked {
-            Some(f) => (
-                true,
-                u16::from_le_bytes([f[2], f[3]]) as u32,
-                u16::from_le_bytes([f[4], f[5]]) as u32,
-            ),
-            // 全部手指都抬起：沿用上次坐标发 UP（坐标本身对抬起不重要）
-            None => {
-                let f = &report[..6];
-                (
-                    false,
-                    u16::from_le_bytes([f[2], f[3]]) as u32,
-                    u16::from_le_bytes([f[4], f[5]]) as u32,
-                )
-            }
-        }
-    } else {
-        (
-            report[0] & 0x01 != 0,
-            u16::from_le_bytes([report[1], report[2]]) as u32,
-            u16::from_le_bytes([report[3], report[4]]) as u32,
-        )
-    };
+    let crate::consumer_hid::TouchSample { pressed, x: x_raw, y: y_raw } = sample;
     if matches!(contact, TouchContact::Ignored) {
         if !pressed { *contact = TouchContact::Idle; }
         return;

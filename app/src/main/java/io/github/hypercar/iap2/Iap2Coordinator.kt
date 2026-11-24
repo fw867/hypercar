@@ -42,12 +42,46 @@ data class CarPlayEndpoint(
     val airplayRouteBinding: AirplayRouteBinding? = if (requiresBoundAirplayRoute) AirplayRouteBinding() else null,
     /** A replay can retain the current credentials while advertising the previous hotspot's address. */
     val replayedWifiConfiguration: Iap2Messages.WifiConfiguration? = null,
+    /** Queued reports expire on a same-socket DETECT, including copies made by the endpoint inbox. */
+    val sourceGeneration: Iap2EndpointGeneration? = null,
 ) {
     val verifiedAirplayNetworkHandle: Long? get() = airplayRouteBinding?.networkHandle
+    internal val sourceIsCurrent: Boolean get() = sourceGeneration?.isCurrent != false
+
+    internal fun whileSourceCurrent(action: () -> Unit): Boolean =
+        sourceGeneration?.runIfCurrent(action) ?: run { action(); true }
 
     /** Only this peer's current Wi-Fi parameters can start or replace an Android request. */
     internal fun canRequestHotspot(current: BluetoothHotspot?): Boolean =
-        !fromInvite && !proactive && current != null && bluetoothHotspot == current && current.ssid == ssid
+        sourceIsCurrent && !fromInvite && !proactive && current != null && bluetoothHotspot == current && current.ssid == ssid
+}
+
+/** A logical control generation on one physical RFCOMM socket. EOF alone leaves accepted reports usable. */
+class Iap2EndpointGeneration internal constructor(private val current: () -> Boolean = { true }) {
+    @Volatile private var retired = false
+    internal val isCurrent: Boolean get() = !retired && current()
+
+    @Synchronized internal fun retire() { retired = true }
+
+    @Synchronized internal fun runIfCurrent(action: () -> Unit): Boolean {
+        if (!isCurrent) return false
+        action()
+        return true
+    }
+}
+
+/** One physical RFCOMM worker's current accepted endpoint. */
+internal class Iap2RfcommEndpointState {
+    @Volatile private var source: Iap2EndpointGeneration? = null
+
+    val hasCurrentEndpoint: Boolean get() = source?.isCurrent == true
+
+    fun accepted(endpoint: CarPlayEndpoint) {
+        val generation = endpoint.sourceGeneration ?: return
+        if ((!endpoint.ssid.isNullOrBlank() || endpoint.ipAddresses.isNotEmpty()) && generation.isCurrent) {
+            source = generation
+        }
+    }
 }
 
 /** Copies of one address report share its first successful Network verification. */

@@ -24,6 +24,16 @@ class EndpointScopeTest {
         assertEquals("2001:db8::1", EndpointScope.onNetwork("2001:db8::1", null))
         assertEquals("fec0::1", EndpointScope.onNetwork("fec0::1", null))
     }
+
+    @Test fun comparisonOnOneNetworkAcceptsNamedAndNumericScopeForTheSamePeer() {
+        assertTrue(EndpointScope.sameAddressOnNetwork("fe80::1%wlan1", "FE80::1%17"))
+        assertTrue(EndpointScope.sameAddressOnNetwork("fe80:0:0:0:0:0:0:1%wlan1", "fe80::1"))
+        assertTrue(EndpointScope.sameAddressOnNetwork("::ffff:192.168.1.206", "192.168.1.206"))
+        assertTrue(EndpointScope.sameAddressOnNetwork("192.168.001.020", "192.168.1.20"))
+        assertFalse(EndpointScope.sameAddressOnNetwork("fe80::1%wlan1", "fe80::2%17"))
+        assertFalse(EndpointScope.sameAddressOnNetwork("fe80:::1", "fe80:::1"))
+        assertFalse(EndpointScope.sameAddressOnNetwork("receiver.local", "receiver.local"))
+    }
     @Test(expected = IOException::class) fun missingScopeCannotFallThroughToAnotherNetwork() {
         EndpointScope.onNetwork("fe80::1", null)
     }

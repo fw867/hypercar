@@ -18,7 +18,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::crypto::{chacha_open, chacha_seal, nonce64};
 
@@ -104,6 +104,10 @@ pub struct RtspMessage {
 }
 
 impl RtspMessage {
+    pub(crate) fn is_empty_server_error(&self) -> bool {
+        self.status() == 500 && self.body.is_empty()
+    }
+
     pub fn is_response(&self) -> bool {
         self.first_line.starts_with("RTSP/") || self.first_line.starts_with("HTTP/1.0 ") || self.first_line.starts_with("HTTP/1.1 ")
     }
@@ -216,6 +220,7 @@ pub struct RtspChannel {
     pending: PendingMap,
     hud_replies: HudReplies,
     reader: tokio::task::JoinHandle<()>,
+    reader_done: Arc<tokio::sync::Notify>,
     closed: AtomicBool,
     pub(crate) nbt_recorded: tokio::sync::Mutex<bool>,
     pub(crate) udp_media: crate::udp_keepalive::MediaActivity,
@@ -225,61 +230,126 @@ pub struct RtspChannel {
     pub(crate) buffered_cleanup_pending: AtomicBool,
     pub(crate) buffered_commands: tokio::sync::Mutex<()>,
     session_uri: Arc<std::sync::OnceLock<crate::rtsp_uri::SessionUri>>,
-    mbux_session: MbuxSession,
+    session_header: Arc<SessionHeader>,
     pub(crate) view_areas: SharedViewAreas,
     pub(crate) id9_trace: std::sync::OnceLock<String>,
     first_screen_cseq: std::sync::OnceLock<i32>,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum RtspEndCause { EventClosed, FeedbackFailed, PeerTeardown }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RtspEndCause { EventClosed, ControlClosed, FeedbackFailed, PeerTeardown, PeerTeardownIncomplete }
 
-// Each control connection and its event reader share only a diagnostic decision.
-// Session termination is still owned by the existing Wi-Fi iAP2 end gate.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum SessionEndState {
+    #[default]
+    Live,
+    TeardownPending,
+    Ended(RtspEndCause),
+}
+
+// Each control connection and its event reader share the first end cause.
+// Session termination is owned by the Wi-Fi iAP2 generation's end gate.
 #[derive(Default)]
 struct SessionEnd {
     uri: Arc<std::sync::OnceLock<crate::rtsp_uri::SessionUri>>,
-    mbux_session: MbuxSession,
-    cause: std::sync::OnceLock<RtspEndCause>,
+    session_header: Arc<SessionHeader>,
+    state: watch::Sender<SessionEndState>,
 }
 
 impl SessionEnd {
-    fn observe_request(&self, msg: &RtspMessage) {
-        let Some(request) = msg.first_line.strip_prefix("TEARDOWN ") else { return; };
+    fn matches_teardown(&self, msg: &RtspMessage) -> bool {
+        let Some(request) = msg.first_line.strip_prefix("TEARDOWN ") else { return false; };
         // A stream list (even an empty one) is distinct from our zero-body session TEARDOWN.
-        if !msg.body.is_empty() { return; }
+        if !msg.body.is_empty() || !msg.cseq().is_some_and(|cseq| cseq >= 0) { return false; }
         let mut line = request.split_ascii_whitespace();
-        let (Some(target), Some("RTSP/1.0"), None) = (line.next(), line.next(), line.next()) else { return; };
-        if target != "/" && !self.uri.get().is_some_and(|uri| uri.as_str() == target) { return; }
-        if let (Some(raw), Some(store)) = (msg.headers.get("session"), self.mbux_session.get()) {
+        let (Some(target), Some("RTSP/1.0"), None) = (line.next(), line.next(), line.next()) else { return false; };
+        let Some(uri) = self.uri.get() else { return false; };
+        if target != "/" && uri.as_str() != target { return false; }
+        if let Some(raw) = msg.headers.get("session") {
             let received = raw.split(';').next().unwrap_or("").trim();
-            if store.lock().id.as_deref().is_some_and(|current| current != received) { return; }
+            return self.session_header.state.lock().id.as_deref() == Some(received);
         }
-        let _ = self.cause.set(RtspEndCause::PeerTeardown);
+        true
+    }
+
+    fn begin_teardown(&self) {
+        self.transition(SessionEndState::Live, SessionEndState::TeardownPending);
+    }
+
+    fn record_end(&self, cause: RtspEndCause) {
+        self.transition(SessionEndState::Live, SessionEndState::Ended(cause));
+    }
+
+    fn finish_teardown(&self, cause: RtspEndCause) {
+        self.transition(SessionEndState::TeardownPending, SessionEndState::Ended(cause));
+    }
+
+    fn transition(&self, previous: SessionEndState, next: SessionEndState) {
+        self.state.send_if_modified(|state| {
+            if *state != previous { return false; }
+            *state = next;
+            true
+        });
     }
 }
 
-#[derive(PartialEq)]
-enum RequestPurpose { Ordinary, SessionSetup, FeedbackAfterTimeout }
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum FeedbackFailure { Timeout, Rejected, EmptyServerError }
+
+#[derive(Clone, Copy, PartialEq)]
+enum RequestPurpose { Ordinary, SessionSetup, FeedbackRetry(FeedbackFailure) }
 
 impl RtspEndCause {
     fn detail(self) -> &'static str {
         match self {
             Self::EventClosed => "事件通道关闭",
+            Self::ControlClosed => "控制通道关闭",
             Self::FeedbackFailed => "控制保活失败",
             Self::PeerTeardown => "车机主动结束",
+            Self::PeerTeardownIncomplete => "车机请求结束，应答未完成",
         }
     }
 }
 
 #[derive(Default)]
-struct MbuxHeaderState {
+struct SessionHeaderState {
     id: Option<String>,
     // Ordinary transactions already have pending waiters. Remember recent asynchronous
     // writes too, so an unrelated or expired CSeq cannot replace the current identifier.
     async_cseqs: VecDeque<i32>,
 }
-type MbuxSession = Arc<std::sync::OnceLock<Mutex<MbuxHeaderState>>>;
+
+#[derive(Default)]
+struct SessionHeader {
+    state: Mutex<SessionHeaderState>,
+    mbux: AtomicBool,
+}
+
+impl SessionHeader {
+    fn observe_response(&self, msg: &RtspMessage, cseq: i32, pending: Option<&PendingReply>, trace_id: u64) {
+        let mbux = self.mbux.load(Ordering::Relaxed);
+        if !mbux && !pending.is_some_and(|reply| reply.is_setup) { return; }
+
+        let mut state = self.state.lock();
+        let async_reply = state.async_cseqs.iter().position(|&seq| seq == cseq)
+            .and_then(|pos| state.async_cseqs.remove(pos));
+        let Some(raw) = msg.headers.get("session") else { return; };
+        let id = raw.split(';').next().unwrap_or("").trim();
+        let accepted = (pending.is_some() || async_reply.is_some()) && (200..300).contains(&msg.status())
+            && !id.is_empty() && id.bytes().all(|b| b.is_ascii_graphic());
+        let changed = accepted && state.id.as_deref() != Some(id);
+        if changed { state.id = Some(id.to_owned()); }
+        drop(state);
+
+        if mbux {
+            crate::emit_log(&format!("MBUX-SESSION RTSP#{trace_id} CSeq={cseq} status={} RX Session={:?} retained={accepted}",
+                msg.status(), raw.chars().take(256).collect::<String>()));
+        } else if changed {
+            crate::emit_log(&format!("RTSP-SESSION RTSP#{trace_id} CSeq={cseq} SETUP status={} carry=enabled", msg.status()));
+        }
+    }
+}
+
 type HudReplies = Arc<Mutex<VecDeque<(i32, HudPostTrace)>>>;
 
 #[derive(Clone, Copy)]
@@ -329,11 +399,43 @@ impl Drop for TransactionGuard<'_> {
 
 impl RtspChannel {
     pub(crate) fn session_is_live(&self) -> bool {
-        !self.is_closed() && self.session_end.cause.get().is_none()
+        !self.is_closed() && *self.session_end.state.borrow() == SessionEndState::Live
     }
 
     pub(crate) fn end_detail(&self, fallback: RtspEndCause) -> &'static str {
-        self.session_end.cause.get().copied().unwrap_or(fallback).detail()
+        match *self.session_end.state.borrow() {
+            SessionEndState::Ended(cause) => cause.detail(),
+            _ => fallback.detail(),
+        }
+    }
+
+    pub(crate) fn record_feedback_failure(&self) {
+        self.session_end.record_end(RtspEndCause::FeedbackFailed);
+    }
+
+    pub(crate) fn peer_teardown_pending(&self) -> bool {
+        *self.session_end.state.borrow() == SessionEndState::TeardownPending
+    }
+
+    pub(crate) async fn wait_for_peer_teardown(&self) -> RtspEndCause {
+        let mut end = self.session_end.state.subscribe();
+        let is_teardown = |state: &SessionEndState| matches!(state,
+            SessionEndState::Ended(RtspEndCause::PeerTeardown | RtspEndCause::PeerTeardownIncomplete));
+        let _ = end.wait_for(|state| *state == SessionEndState::TeardownPending || is_teardown(state)).await;
+        // The reader normally completes the ACK within one second. Bound the
+        // wait even if the reader was cancelled or never reached that write.
+        if tokio::time::timeout(Duration::from_secs(2), end.wait_for(is_teardown)).await.is_err() {
+            self.session_end.finish_teardown(RtspEndCause::PeerTeardownIncomplete);
+        }
+        let state = *end.borrow();
+        match state {
+            SessionEndState::Ended(cause) => cause,
+            _ => RtspEndCause::PeerTeardownIncomplete,
+        }
+    }
+
+    pub(crate) async fn wait_for_control_close(&self) {
+        if !self.is_closed() { self.reader_done.notified().await; }
     }
 
     pub(crate) fn spawn_event(&self, read: OwnedReadHalf, write: OwnedWriteHalf,
@@ -369,16 +471,19 @@ impl RtspChannel {
         let hud_replies: HudReplies = Arc::default();
         let (inbound_tx, inbound) = mpsc::unbounded_channel();
         let trace_id = CHANNEL_IDS.fetch_add(1, Ordering::Relaxed);
-        let session_uri = Arc::default();
-        let mbux_session = MbuxSession::default();
+        let session_uri = Arc::<std::sync::OnceLock<crate::rtsp_uri::SessionUri>>::default();
+        let session_header = Arc::new(SessionHeader::default());
         let session_end = event.as_ref().map(|(_, end)| end.clone())
-            .unwrap_or_else(|| Arc::new(SessionEnd { uri: Arc::clone(&session_uri), mbux_session: mbux_session.clone(), cause: Default::default() }));
+            .unwrap_or_else(|| Arc::new(SessionEnd {
+                uri: session_uri.clone(), session_header: session_header.clone(), ..Default::default()
+            }));
         let event_trace = event.map(|(observe, _)| {
             observe(trace_id, "open");
             Arc::new(EventTrace { id: trace_id, observe, closed: AtomicBool::new(false) })
         });
 
-        let reader = crate::callback_context::spawn(reader_loop(
+        let reader_done: Arc<tokio::sync::Notify> = Arc::default();
+        let read = reader_loop(
             read,
             write.clone(),
             cipher.clone(),
@@ -387,11 +492,16 @@ impl RtspChannel {
             inbound_tx,
             trace_id,
             reply,
-            mbux_session.clone(),
+            session_header.clone(),
             view_areas.clone(),
             event_trace.clone(),
             session_end.clone(),
-        ));
+        );
+        let done = reader_done.clone();
+        let reader = crate::callback_context::spawn(async move {
+            read.await;
+            done.notify_one();
+        });
 
         let this = Arc::new(Self {
             trace_id,
@@ -403,6 +513,7 @@ impl RtspChannel {
             pending,
             hud_replies,
             reader,
+            reader_done,
             closed: AtomicBool::new(false),
             nbt_recorded: tokio::sync::Mutex::new(false),
             udp_media: Default::default(),
@@ -412,7 +523,7 @@ impl RtspChannel {
             buffered_cleanup_pending: AtomicBool::new(false),
             buffered_commands: Default::default(),
             session_uri,
-            mbux_session,
+            session_header,
             view_areas,
             cluster_display: Default::default(),
             id9_trace: std::sync::OnceLock::new(),
@@ -429,11 +540,11 @@ impl RtspChannel {
 
     pub fn trace_id(&self) -> u64 { self.trace_id }
     pub(crate) fn enable_mbux_session_header(&self) {
-        self.mbux_session.get_or_init(Default::default);
+        self.session_header.mbux.store(true, Ordering::Relaxed);
     }
 
     fn session_header_line(&self) -> String {
-        self.mbux_session.get().and_then(|session| session.lock().id.clone())
+        self.session_header.state.lock().id.as_deref()
             .map(|id| format!("Session: {id}\r\n")).unwrap_or_default()
     }
     pub(crate) fn set_session_uri(&self,uri:crate::rtsp_uri::SessionUri)->Result<(),String> {
@@ -473,8 +584,8 @@ impl RtspChannel {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) async fn request_feedback(&self, previous_timeout: bool) -> Result<RtspMessage, RequestError> {
-        let purpose = if previous_timeout { RequestPurpose::FeedbackAfterTimeout } else { RequestPurpose::Ordinary };
+    pub(crate) async fn request_feedback(&self, previous_failure: Option<FeedbackFailure>) -> Result<RtspMessage, RequestError> {
+        let purpose = previous_failure.map_or(RequestPurpose::Ordinary, RequestPurpose::FeedbackRetry);
         self.request_resolved("POST", "/feedback", &[], "application/octet-stream", &[],
             Duration::from_secs(3), None, purpose).await
     }
@@ -500,7 +611,9 @@ impl RtspChannel {
         let cseq = self.next_cseq();
         if feedback {
             crate::emit_media_trace(crate::timing::monotonic_nanos() / 1_000_000, "feedback_queued",
-                &format!("RTSP#{} CSeq={cseq} afterTimeout={}", self.trace_id, purpose == RequestPurpose::FeedbackAfterTimeout));
+                &format!("RTSP#{} CSeq={cseq} afterRejection={} afterTimeout={}", self.trace_id,
+                    matches!(purpose, RequestPurpose::FeedbackRetry(FeedbackFailure::Rejected | FeedbackFailure::EmptyServerError)),
+                    purpose == RequestPurpose::FeedbackRetry(FeedbackFailure::Timeout)));
         }
         let result = self.request_transaction(method, path, body, content_type, extra_headers,
             timeout, written, purpose, deadline, cseq).await;
@@ -538,15 +651,12 @@ impl RtspChannel {
             crate::emit_log(&format!("RTSP#{} TXQ CSeq={cseq} {method} {path} body={}B encrypted={} timeout={}ms", self.trace_id, body.len(), encrypted, timeout.as_millis()));
         }
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().insert(cseq, PendingReply { tx, trace_head: id9_kind.is_some() });
         let mut transaction = TransactionGuard { channel: self, cseq, writing: false };
 
-        let lock_writer = || tokio::time::timeout_at(deadline, self.write.lock());
-        let lock_error = |_| format!("RTSP 等待写锁超时 CSeq={cseq} {method} {path}");
-        // Only MBUX snapshots a peer-assigned header in wire order.
-        let mbux_writer = if self.mbux_session.get().is_some() {
-            Some(lock_writer().await.map_err(lock_error)?)
-        } else { None };
+        // Snapshot after taking the writer so queued requests can use the latest SETUP reply.
+        let mut w = tokio::time::timeout_at(deadline, self.write.lock()).await
+            .map_err(|_| format!("RTSP 等待写锁超时 CSeq={cseq} {method} {path}"))?;
+        if self.is_closed() { return Err(RequestError::Other("控制通道已关闭".into())); }
         let session_header = if extra_headers.iter().any(|(key,_)| key.eq_ignore_ascii_case("session")) {
             String::new()
         } else { self.session_header_line() };
@@ -577,8 +687,7 @@ impl RtspChannel {
         }
 
         {
-            let mut w = match mbux_writer { Some(writer) => writer, None => lock_writer().await.map_err(lock_error)? };
-            if self.is_closed() { return Err(RequestError::Other("控制通道已关闭".into())); }
+            self.pending.lock().insert(cseq, PendingReply { tx, trace_head: id9_kind.is_some(), is_setup: method == "SETUP" });
             transaction.writing = true;
             // 心跳与 RECORD 可并发等待应答；加密 nonce 的分配顺序必须等于上线路序。
             let wire = {
@@ -603,6 +712,7 @@ impl RtspChannel {
             }
             transaction.writing = false;
         }
+        drop(w);
         if let Some(written) = written { let _ = written.send(()); }
 
         if matches!(kind, Some("AUDIO_SETUP" | "MEDIA_SETUP")) {
@@ -616,7 +726,7 @@ impl RtspChannel {
         }
         let result = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok((msg, raw_head))) => {
-                if self.mbux_session.get().is_some() && trace && !msg.headers.contains_key("session") {
+                if self.session_header.mbux.load(Ordering::Relaxed) && trace && !msg.headers.contains_key("session") {
                     crate::emit_log(&format!("MBUX-SESSION RTSP#{} CSeq={cseq} {method} {path} status={} RX Session=absent TX Session={:?}",
                         self.trace_id, msg.status(), session_header.trim_end().strip_prefix("Session: ")));
                 }
@@ -631,12 +741,16 @@ impl RtspChannel {
                 Err(format!("控制通道已关闭（等待 CSeq={cseq} {method} {path}）").into())
             }
             Err(_) => {
-                if purpose == RequestPurpose::FeedbackAfterTimeout {
-                    let _ = self.session_end.cause.set(RtspEndCause::FeedbackFailed);
-                }
                 Err(RequestError::ReplyTimeout(format!("RTSP 超时（{timeout:?}，CSeq={cseq} {method} {path}）")))
             }
         };
+        if let RequestPurpose::FeedbackRetry(previous) = purpose {
+            let transport_confirmed = result.as_ref().is_ok_and(|reply| reply.status() == 200 ||
+                (previous == FeedbackFailure::EmptyServerError && reply.is_empty_server_error()));
+            if !transport_confirmed {
+                self.record_feedback_failure();
+            }
+        }
         if path == "/info" || method == "RECORD" {
             if let Some(trace) = self.id9_trace.get() {
                 let outcome = match &result {
@@ -697,8 +811,8 @@ impl RtspChannel {
             if replies.len() >= 256 { replies.pop_front(); }
             replies.push_back((cseq, hud));
         }
-        if let Some(store) = self.mbux_session.get() {
-            let mut state = store.lock();
+        if self.session_header.mbux.load(Ordering::Relaxed) {
+            let mut state = self.session_header.state.lock();
             if state.async_cseqs.len() >= 128 { state.async_cseqs.pop_front(); }
             state.async_cseqs.push_back(cseq);
         }
@@ -745,6 +859,7 @@ impl RtspChannel {
         self.closed.store(true, Ordering::Release);
         self.reader.abort();
         self.pending.lock().clear();
+        self.reader_done.notify_one();
     }
 
     pub fn is_closed(&self) -> bool { self.closed.load(Ordering::Acquire) || self.reader.is_finished() }
@@ -784,6 +899,7 @@ type SharedCipher = Arc<Mutex<Option<ControlCipher>>>;
 struct PendingReply {
     tx: oneshot::Sender<(RtspMessage, Option<Vec<u8>>)>,
     trace_head: bool,
+    is_setup: bool,
 }
 type PendingMap = Arc<Mutex<HashMap<i32, PendingReply>>>;
 
@@ -796,7 +912,7 @@ async fn reader_loop(
     inbound_tx: mpsc::UnboundedSender<RtspMessage>,
     trace_id: u64,
     reply: Option<CommandReply>,
-    mbux_session: MbuxSession,
+    session_header: Arc<SessionHeader>,
     view_areas: SharedViewAreas,
     event_trace: Option<Arc<EventTrace>>,
     session_end: Arc<SessionEnd>,
@@ -814,7 +930,7 @@ async fn reader_loop(
             Ok(0) => {
                 if let Some(trace) = &event_trace {
                     // Capture read order before diagnostics or queued event dispatch can yield.
-                    let _ = session_end.cause.set(RtspEndCause::EventClosed);
+                    session_end.record_end(RtspEndCause::EventClosed);
                     trace.close("peer_eof");
                 }
                 crate::emit_log(&format!("RTSP#{trace_id}: 对端 EOF，未完成事务={}，残留密文={}B 明文={}B", pending.lock().len(), raw.len(), plain.len()));
@@ -857,10 +973,10 @@ async fn reader_loop(
 
         // 2) 切出完整 RTSP 消息并派发
         let messages = match parse_rtsp_messages_with(stream, |message, head| {
-            session_end.observe_request(&message);
+            let teardown = session_end.matches_teardown(&message);
             let capture = message.is_response() && message.cseq().is_some_and(|cseq|
                 pending.lock().get(&cseq).is_some_and(|p| p.trace_head));
-            (message, capture.then(|| head.to_vec()))
+            (message, capture.then(|| head.to_vec()), teardown)
         }) {
             Ok(messages) => messages,
             Err(error) => {
@@ -869,24 +985,16 @@ async fn reader_loop(
                 break;
             }
         };
-        for (msg, raw_head) in messages {
+        // Publish the pending end only for a batch we can dispatch. Before waking
+        // any response waiter, pause media recovery until TEARDOWN is acknowledged.
+        if messages.iter().any(|(_, _, teardown)| *teardown) {
+            session_end.begin_teardown();
+        }
+        for (msg, raw_head, teardown) in messages {
             if msg.is_response() {
                 if let Some(c) = msg.cseq() {
                     let reply = pending.lock().remove(&c);
-                    if let Some(store) = mbux_session.get() {
-                        let mut state = store.lock();
-                        let async_reply = state.async_cseqs.iter().position(|seq| *seq == c)
-                            .and_then(|pos| state.async_cseqs.remove(pos));
-                        if let Some(raw) = msg.headers.get("session") {
-                            let id = raw.split(';').next().unwrap_or("").trim();
-                            let accepted = (reply.is_some() || async_reply.is_some()) && (200..300).contains(&msg.status())
-                                && !id.is_empty() && id.bytes().all(|b| b.is_ascii_graphic());
-                            if accepted { state.id = Some(id.to_owned()); }
-                            drop(state);
-                            crate::emit_log(&format!("MBUX-SESSION RTSP#{trace_id} CSeq={c} status={} RX Session={:?} retained={accepted}",
-                                msg.status(), raw.chars().take(256).collect::<String>()));
-                        }
-                    }
+                    session_header.observe_response(&msg, c, reply.as_ref(), trace_id);
                     if let Some(reply) = reply {
                         let _ = reply.tx.send((msg, raw_head));
                     } else {
@@ -923,6 +1031,26 @@ async fn reader_loop(
                     if let Err(error) = respond(&write, &cipher, protocol, cseq, status, reason, &[]).await {
                         crate::emit_log(&format!("RTSP#{trace_id}: rejection write failed CSeq={cseq:?} status={status}: {error}"));
                     }
+                    continue;
+                }
+                if teardown || session_end.matches_teardown(&msg) {
+                    session_end.begin_teardown();
+                    let cause = match tokio::time::timeout(Duration::from_secs(1), respond_ok(&write, &cipher, protocol, cseq, &[])).await {
+                        Ok(Ok(())) => {
+                            crate::emit_log(&format!("RTSP#{trace_id}: peer TEARDOWN ACK written CSeq={cseq:?} status=200"));
+                            let _ = inbound_tx.send(msg);
+                            RtspEndCause::PeerTeardown
+                        }
+                        Ok(Err(error)) => {
+                            crate::emit_log(&format!("RTSP#{trace_id}: peer TEARDOWN ACK failed CSeq={cseq:?}: {error}"));
+                            RtspEndCause::PeerTeardownIncomplete
+                        }
+                        Err(_) => {
+                            crate::emit_log(&format!("RTSP#{trace_id}: peer TEARDOWN ACK timeout CSeq={cseq:?}"));
+                            RtspEndCause::PeerTeardownIncomplete
+                        }
+                    };
+                    session_end.finish_teardown(cause);
                     continue;
                 }
                 let body = reply.as_ref().and_then(|f| f(&msg)).unwrap_or_default();
@@ -962,6 +1090,7 @@ async fn reader_loop(
         }
     }
     // 读循环退出：唤醒所有等待者
+    if event_trace.is_some() { session_end.record_end(RtspEndCause::EventClosed); }
     crate::emit_log(&format!("RTSP#{trace_id} IN summary requests={inbound_requests} rejected={rejected_requests} accepted_samples={accepted_trace}/32 rejected_samples={rejected_trace}/32; iAP delivery counted separately"));
     pending.lock().clear();
 }
@@ -1535,16 +1664,16 @@ mod cancellation_tests {
     #[tokio::test]
     async fn end_detail_event_eof_before_second_feedback_timeout() {
         let (control, _peer) = pair().await;
-        assert!(matches!(control.request_feedback(false).await, Err(RequestError::ReplyTimeout(_))));
+        assert!(matches!(control.request_feedback(None).await, Err(RequestError::ReplyTimeout(_))));
         let _queued = event_eof_with_queued_request(&control).await;
-        assert!(matches!(control.request_feedback(true).await, Err(RequestError::ReplyTimeout(_))));
+        assert!(matches!(control.request_feedback(Some(FeedbackFailure::Timeout)).await, Err(RequestError::ReplyTimeout(_))));
         assert_eq!(control.end_detail(RtspEndCause::FeedbackFailed), "事件通道关闭");
     }
 
     #[tokio::test]
     async fn end_detail_second_feedback_timeout_before_event_eof() {
         let (control, _peer) = pair().await;
-        for retry in [false, true] {
+        for retry in [None, Some(FeedbackFailure::Timeout)] {
             assert!(matches!(control.request_feedback(retry).await, Err(RequestError::ReplyTimeout(_))));
         }
         let _queued = event_eof_with_queued_request(&control).await;
@@ -1559,7 +1688,7 @@ mod cancellation_tests {
         let _queued = event_eof_with_queued_request(&old).await;
         assert_eq!(old.end_detail(RtspEndCause::FeedbackFailed), "事件通道关闭");
         assert_eq!(new.end_detail(RtspEndCause::FeedbackFailed), "控制保活失败");
-        assert!(matches!(new.request_feedback(true).await, Err(RequestError::ReplyTimeout(_))));
+        assert!(matches!(new.request_feedback(Some(FeedbackFailure::Timeout)).await, Err(RequestError::ReplyTimeout(_))));
         assert_eq!(new.end_detail(RtspEndCause::EventClosed), "控制保活失败");
         assert_eq!(old.end_detail(RtspEndCause::FeedbackFailed), "事件通道关闭");
     }
@@ -1578,9 +1707,49 @@ mod cancellation_tests {
         control.set_session_uri(crate::rtsp_uri::SessionUri::new("127.0.0.1", 42).unwrap()).unwrap();
         send_peer_teardown(&mut peer, "rtsp://127.0.0.1/42", &[], 10).await;
         assert!(!control.is_closed());
-        assert!(matches!(control.request_feedback(true).await, Err(RequestError::ReplyTimeout(_))));
+        assert!(matches!(control.request_feedback(Some(FeedbackFailure::Timeout)).await, Err(RequestError::ReplyTimeout(_))));
         let _queued = event_eof_with_queued_request(&control).await;
         assert_eq!(control.end_detail(RtspEndCause::FeedbackFailed), "车机主动结束");
+    }
+
+    #[tokio::test]
+    async fn event_eof_cannot_strand_pending_control_teardown() {
+        let (control, mut peer) = pair().await;
+        control.set_session_uri(crate::rtsp_uri::SessionUri::new("127.0.0.1", 42).unwrap()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let event_socket = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (event_peer, _) = listener.accept().await.unwrap();
+        let (read, write) = event_socket.into_split();
+        let (_event, mut inbound) = control.spawn_event(read, write, None, Arc::new(|_, _| {}));
+        let writer = control.write.lock().await;
+        peer.write_all(b"TEARDOWN / RTSP/1.0\r\nCSeq: 77\r\n\r\n").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !control.peer_teardown_pending() { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        control.record_feedback_failure();
+        drop(event_peer);
+        assert!(tokio::time::timeout(Duration::from_secs(1), inbound.recv()).await.unwrap().is_none());
+        drop(writer);
+        let ack = read_request(&mut peer).await;
+        assert_eq!((ack.status(), ack.cseq()), (200, Some(77)));
+        tokio::time::timeout(Duration::from_secs(1), control.wait_for_peer_teardown()).await
+            .expect("acknowledged TEARDOWN must finish after the other socket closes");
+        assert_eq!(control.end_detail(RtspEndCause::FeedbackFailed), "车机主动结束");
+    }
+
+    #[tokio::test]
+    async fn closing_reader_during_teardown_has_a_bounded_end() {
+        let (control, mut peer) = pair().await;
+        control.set_session_uri(crate::rtsp_uri::SessionUri::new("127.0.0.1", 42).unwrap()).unwrap();
+        let _writer = control.write.lock().await;
+        peer.write_all(b"TEARDOWN / RTSP/1.0\r\nCSeq: 77\r\n\r\n").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !control.peer_teardown_pending() { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        control.close();
+        tokio::time::timeout(Duration::from_secs(3), control.wait_for_peer_teardown()).await
+            .expect("cancelled RTSP reader must not strand the pending end");
+        assert_eq!(control.end_detail(RtspEndCause::FeedbackFailed), "车机请求结束，应答未完成");
     }
 
     #[tokio::test]
@@ -1596,7 +1765,7 @@ mod cancellation_tests {
         let (r, w) = socket.into_split();
         let (_event, mut inbound) = old.spawn_event(r, w, None, Arc::new(|_, _| {}));
         old.enable_mbux_session_header();
-        old.mbux_session.get().unwrap().lock().id = Some("current".into());
+        old.session_header.state.lock().id = Some("current".into());
         let stream = crate::bplist::Value::dict(vec![("type", crate::bplist::Value::int(110))]);
         let body = crate::bplist::encode(&crate::bplist::Value::dict(vec![("streams", crate::bplist::Value::array(vec![stream]))]));
         send_peer_teardown(&mut peer, "rtsp://127.0.0.1/41", &body, 1).await;
@@ -1604,14 +1773,21 @@ mod cancellation_tests {
         peer.write_all(b"TEARDOWN / RTSP/1.0\r\nCSeq: 3\r\nSession: retired\r\n\r\n").await.unwrap();
         assert_eq!(read_request(&mut peer).await.status(), 200);
         assert_eq!(old.end_detail(RtspEndCause::EventClosed), "事件通道关闭");
-        send_peer_teardown(&mut peer, "rtsp://127.0.0.1/41", &[], 4).await;
+        peer.write_all(b"TEARDOWN / RTSP/1.0\r\nCSeq: 4\r\nSession: current;timeout=30\r\n\r\n").await.unwrap();
+        let ack = read_request(&mut peer).await;
+        assert_eq!((ack.status(), ack.cseq()), (200, Some(4)));
         peer.shutdown().await.unwrap();
         for seq in 1..=4 { assert_eq!(inbound.recv().await.unwrap().cseq(), Some(seq)); }
         assert!(inbound.recv().await.is_none());
         assert_eq!(old.end_detail(RtspEndCause::EventClosed), "车机主动结束");
         send_peer_teardown(&mut new_peer, "rtsp://127.0.0.1/41", &[], 4).await;
+        new_peer.write_all(b"TEARDOWN / RTSP/1.0\r\nCSeq: 5\r\nSession: retired\r\n\r\n").await.unwrap();
+        assert_eq!(read_request(&mut new_peer).await.status(), 200);
+        new_peer.write_all(b"TEARDOWN / RTSP/1.0\r\n\r\n").await.unwrap();
+        assert_eq!(read_request(&mut new_peer).await.status(), 200);
         assert_eq!(new.end_detail(RtspEndCause::FeedbackFailed), "控制保活失败");
-        send_peer_teardown(&mut new_peer, "/", &[], 5).await;
+        send_peer_teardown(&mut new_peer, "/", &[], 6).await;
+        new.wait_for_peer_teardown().await;
         assert_eq!(new.end_detail(RtspEndCause::EventClosed), "车机主动结束");
     }
 
@@ -1697,6 +1873,73 @@ mod cancellation_tests {
     }
 
     #[tokio::test]
+    async fn session_header_is_negotiated_by_setup_and_scoped_to_its_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (channel, mut peer) = pair_on(&listener).await;
+        let responder = crate::callback_context::spawn(async move {
+            for (method, status, headers, expected) in [
+                ("SETUP", 200, "", None),
+                ("POST", 200, "Session: premature\r\n", None),
+                ("SETUP", 400, "Session: rejected\r\n", None),
+                ("SETUP", 200, "Session: bad id\r\n", None),
+                ("SETUP", 200, "sEsSiOn: learned-1;timeout=60\r\n", None),
+                ("RECORD", 200, "Session: unrelated-command\r\n", Some("learned-1")),
+                ("SETUP", 200, "Session: learned-2\r\n", Some("learned-1")),
+            ] {
+                let request = read_request(&mut peer).await;
+                assert_eq!(request.first_line.split_ascii_whitespace().next(), Some(method));
+                assert_eq!(request.headers.get("session").map(String::as_str), expected);
+                if headers.is_empty() {
+                    peer.write_all(b"RTSP/1.0 200 OK\r\nCSeq: 9999\r\nSession: unsolicited\r\n\r\n").await.unwrap();
+                }
+                let cseq = request.cseq().unwrap();
+                peer.write_all(format!("RTSP/1.0 {status} Reply\r\nCSeq: {cseq}\r\n{headers}\r\n").as_bytes()).await.unwrap();
+            }
+            let request = read_request(&mut peer).await;
+            assert_eq!(request.headers.get("session").map(String::as_str), Some("learned-2"));
+        });
+        for method in ["SETUP", "POST", "SETUP", "SETUP", "SETUP", "RECORD", "SETUP"] {
+            channel.request(method, "/", &[], "", &[], Duration::from_secs(2)).await.unwrap();
+        }
+        channel.post_fire_and_forget("/command", &[], "").await.unwrap();
+        responder.await.unwrap();
+
+        let (reconnected, mut peer) = pair_on(&listener).await;
+        reconnected.post_fire_and_forget("/command", &[], "").await.unwrap();
+        assert!(!read_request(&mut peer).await.headers.contains_key("session"));
+    }
+
+    #[tokio::test]
+    async fn queued_record_uses_session_header_learned_while_waiting_for_writer() {
+        let (channel, mut peer) = pair().await;
+        let setup = crate::callback_context::spawn({
+            let channel = channel.clone();
+            async move { channel.request("SETUP", "/setup", &[], "", &[], Duration::from_secs(2)).await }
+        });
+        let setup_request = read_request(&mut peer).await;
+        let writer = channel.write.lock().await;
+        let record = channel.request("RECORD", "/", &[], "", &[], Duration::from_secs(2));
+        tokio::pin!(record);
+        tokio::select! {
+            biased;
+            _ = &mut record => panic!("RECORD completed before it could write"),
+            _ = std::future::ready(()) => {}
+        }
+        let cseq = setup_request.cseq().unwrap();
+        peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nSession: queued\r\n\r\n").as_bytes()).await.unwrap();
+        assert_eq!(setup.await.unwrap().unwrap().status(), 200);
+        drop(writer);
+
+        let (reply, ()) = tokio::join!(record, async {
+            let request = read_request(&mut peer).await;
+            assert_eq!(request.headers.get("session").map(String::as_str), Some("queued"));
+            let cseq = request.cseq().unwrap();
+            peer.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        assert_eq!(reply.unwrap().status(), 200);
+    }
+
+    #[tokio::test]
     async fn mercedes_session_header_is_learned_only_from_success_on_this_control_socket() {
         for enabled in [true, false, true] {
             let (channel, mut peer) = pair().await;
@@ -1724,7 +1967,7 @@ mod cancellation_tests {
                 assert_eq!(request.headers.get("session").map(String::as_str), enabled.then_some("Async"));
             });
             for _ in 0..4 {
-                channel.request("SETUP", "/", &[], "", &[], Duration::from_secs(2)).await.unwrap();
+                channel.request("POST", "/command", &[], "", &[], Duration::from_secs(2)).await.unwrap();
             }
             channel.post_fire_and_forget("/command", b"iap", "application/octet-stream").await.unwrap();
             received.await.unwrap();

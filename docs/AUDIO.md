@@ -25,7 +25,11 @@
 
 `AUDIO-PACING` 的 `firstMediaMonoNs` 标记当前流首次有媒体 PCM 在混音队列中的时间。此前的漏拍记入 `startup_silence_recoveries`、`startup_silence_skipped_frames` 和 `startup_max_late_us`。此后的漏拍继续用 `recoveries`、`skipped_source_frames` 和 `max_late_us`，即使播放中途队列变空。`wake` 仍保留整个统计窗口的原始唤醒峰值。
 
-设置「画面与声音 → 音频格式」提供自动、PCM、AAC优先，下次连接生效。自动保持旧车型的PCM48k首选；ID9只尝试/info明确声明的媒体输出格式，PCM48不可用但声明AAC48时用AAC。AAC优先只在type102/media/output声明AAC48时尝试，否则保留可用PCM路径；仅AAC44的车机本次仍不支持。DiPlay已实测AAC协商成功、约47包/秒，用户确认出声；不等于ID9实车验证。参考[CarPToCarL](https://github.com/jjuugk/CarPToCarL)的AAC裸帧和RTP约定，编码/发送实现位于Rust核心。
+设置「画面与声音 → 音频格式」提供自动、PCM、AAC 优先，下次连接生效。通用实时音频自动模式按 PCM 48 kHz、AAC 48 kHz、PCM 44.1 kHz、AAC 44.1 kHz 的顺序尝试 `/info` 已声明的媒体输出格式，最后保留 PCM 48 kHz 兼容回退。CarWith 优先匹配 `MEDIA_INIT` 的源采样率。ID9、适用专用音频路径的 MBUX 和 ID6 继续使用各自的能力门控。手动设置沿用原候选规则，缓冲音频仍按本轮声明判断是否启用。DiPlay 已实测 AAC 协商成功并确认出声，约 47 包/秒。AAC 裸帧及 RTP 实现参考了 [CarPToCarL](https://github.com/jjuugk/CarPToCarL)。
+
+音频延迟按流类型、角色、采样率、位深、声道数和编码匹配 `audioLatencies`。省略的字段匹配任意值，采用首条有效的匹配记录。实时媒体和缓冲媒体的延迟下限分别为 300 ms 和 1000 ms。独立语音和导航分别按实际协商的 24 kHz 与 48 kHz 单声道 Opus 匹配，缺少有效记录时仍发送 0 ms。
+
+实时媒体绑定本地控制端口后，在 SETUP 声明 `supportsHighAccuracyTimestamps`。接收端拒绝该提议时可保留控制端口并重试原字段。`AUDIO-FEEDBACK` 根据当前会话、流类型、`streamConnectionID` 和当前音频归属关联 `/feedback` 中的 `sampleTime`、`timestampRawNs`。`rateHz` 是接收端采样率估计，`sampleClockOffsetNs` 是相对于本次观测初始样本的偏差，采用接收端原始时钟。两项只用于诊断。
 
 AirPlay PCM 使用 SPF352，约 136.36 包/秒，16-bit 大端样本。TTS 参与闪避混音；持续全零样本不会一直保持“播放中”。
 
@@ -67,7 +71,7 @@ OPUS使用随APK静态链接的libopus，输入仍为48k立体声，编码前下
 
 独立 ID6 档案只接受 NBT Evo 身份，并按本轮 `/info` 的 media 输出能力选择 AAC-LC 44.1 kHz、48 kHz 或 PCM 48 kHz；缺失声明不猜测格式。手动 PCM 选择仍受输出能力限制。顺序为屏幕 TCP、音频 SETUP、单次成功 RECORD，失败不能伪装激活。
 
-采集/混音保持 48 kHz；仅 AAC 44.1 kHz 发送端做保留相位的流式重采样。MediaCodec、SETUP 与 RTP 样本时钟采用实际协商采样率，AAC 每包 1024 帧；资源接管丢弃旧缓存，归还时保留采样率重建编码器。该分支不改变 MGU/ID9 的默认格式和激活顺序；实车音画仍待验证。
+ID6 的采集以 48 kHz 为基准，协商 AAC 44.1 kHz 时使用保留相位的流式重采样。MediaCodec、SETUP 与 RTP 样本时钟采用实际协商采样率，AAC 每包 1024 帧。资源接管时丢弃旧缓存，归还时按协商采样率重建编码器。实车音画仍待验证。
 
 ## 资源归属与恢复
 

@@ -123,7 +123,7 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
                 t.mediaKeyEvents["last_$kind"] = event
                 true
             }
-            "feedback_queued" -> if (event.detail.endsWith("afterTimeout=true")) {
+            "feedback_queued" -> if (event.detail.endsWith("afterTimeout=true") || " afterRejection=true " in event.detail) {
                 t.mediaKeyEvents["last_feedback_retry"] = event
                 true
             } else t.mediaKeyEvents.putIfAbsent("first_feedback_queued", event) == null

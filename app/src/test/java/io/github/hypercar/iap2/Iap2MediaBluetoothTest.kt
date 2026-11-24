@@ -39,7 +39,7 @@ class Iap2MediaBluetoothTest {
         val signatureBody:ByteArray=Iap2Csm.param(0,byteArrayOf(1)),
         val communicationsBody:ByteArray=byteArrayOf(),
         val identificationExchange:ByteArray?=null, val afterGreetings:ByteArray?=null,
-        val controlVersion: Int? = null, val silentChallenge: Boolean = false,
+        var controlVersion: Int? = null, val silentChallenge: Boolean = false,
         val wifiReply:ByteArray=wifiCredentials("fixture-ap"),
         val signChallenge: ((ByteArray) -> ByteArray)? = null) : Iap2LinkChannel {
         val queue=ArrayDeque<ByteArray>()
@@ -50,11 +50,17 @@ class Iap2MediaBluetoothTest {
         var time=1_000_000L
         var open=true
         var endWhenEmpty=false
+        override var linkGeneration = 0L
+        var nextReady: (() -> Unit)? = null
+        var closeCount = 0
         override val isAlive get()=open
-        override fun awaitReady(timeoutMillis:Long)=true
+        override fun awaitReady(timeoutMillis:Long): Boolean {
+            nextReady?.also { nextReady = null }?.invoke()
+            return open
+        }
         override fun peerMaxControlPayload()=65525
         override val peerControlVersion get() = controlVersion
-        override fun close(){open=false}
+        override fun close(){closeCount++;open=false}
         override fun recvControl(timeoutMillis:Long):ByteArray? {
             if(queue.isNotEmpty())return queue.removeFirst()
             time+=timeoutMillis*1_000_000
@@ -99,6 +105,36 @@ class Iap2MediaBluetoothTest {
             Iap2Csm.param(6, byteArrayOf(0xea.toByte(), 3, 0x4c, 0)) +
             Iap2Csm.param(7, byteArrayOf(0xea.toByte(), 0, 0x4e, 0x0d, 0x4c, 1)) +
             Iap2Csm.group(10, Iap2Csm.u8(0, 1), Iap2Csm.string(1, "de.bmw.a4a.pairing")))
+
+    @Test fun detectRenegotiatesBluetoothBusinessOrderUsingTheNewControlVersion() {
+        val keys = KeyPairGenerator.getInstance("EC").apply { initialize(ECGenParameterSpec("secp256r1")) }
+            .generateKeyPair()
+        for ((before, after) in listOf(2 to 1, 1 to 2)) {
+            val channel = Channel(identificationExchange = appsIdentification(), controlVersion = before,
+                signChallenge = { challenge ->
+                    Signature.getInstance("NONEwithECDSAinP1363Format").run {
+                        initSign(keys.private)
+                        update(challenge)
+                        sign()
+                    }
+                })
+            val session = Iap2SenderSession(channel, {}, pairedReceiver = true, bondedBmwInbound = true,
+                nanoTime = { channel.time }, verifyMfi3Certificate = { keys.public as ECPublicKey })
+            session.run(10_000)
+            val originalMessages = channel.sent.size
+            channel.queue += byteArrayOf()
+            channel.endWhenEmpty = true
+            channel.nextReady = { channel.controlVersion = after }
+            session.pumpIncomingForever()
+
+            val secondRound = channel.sent.drop(originalMessages)
+            val order = if (after == 1) listOf(0xaa00, 0xaa02, 0xaa05, 0x1d00, 0x1d02)
+                else listOf(0x1d00, 0x1d02, 0xaa00, 0xaa02, 0xaa05)
+            assertEquals(order, secondRound.take(5))
+            assertEquals(1, secondRound.count { it == 0x4e0c })
+            assertEquals(0, channel.closeCount)
+        }
+    }
     @Test fun onlyPairedAppsV1RequiresVerifiedCertificateOnTheIdentificationFirstPath() {
         for ((paired, version) in listOf(true to 1, true to 2, false to 1)) {
             val channel = Channel(identificationExchange = appsIdentification(), controlVersion = version)
@@ -113,6 +149,30 @@ class Iap2MediaBluetoothTest {
                 assertTrue(0xaa05 in channel.sent)
             }
         }
+    }
+
+    @Test fun outboundPairedAppsV1StillRequiresVerifiedAuthenticationAfterDetect() {
+        val keys = KeyPairGenerator.getInstance("EC").apply { initialize(ECGenParameterSpec("secp256r1")) }
+            .generateKeyPair()
+        var validSignature = true
+        val channel = Channel(identificationExchange = appsIdentification(), controlVersion = 1,
+            signChallenge = { challenge ->
+                if (validSignature) Signature.getInstance("NONEwithECDSAinP1363Format").run {
+                    initSign(keys.private)
+                    update(challenge)
+                    sign()
+                } else ByteArray(64)
+            })
+        val session = Iap2SenderSession(channel, {}, pairedReceiver = true,
+            nanoTime = { channel.time }, verifyMfi3Certificate = { keys.public as ECPublicKey })
+        session.run(10_000)
+        assertEquals(1, channel.sent.count { it == 0xaa05 })
+        val originalMessages = channel.sent.size
+        validSignature = false
+        channel.linkGeneration++
+        channel.endWhenEmpty = true
+        assertThrows(java.io.IOException::class.java) { session.pumpIncomingForever() }
+        assertEquals(listOf(0xaa00, 0xaa02, 0xaa04), channel.sent.drop(originalMessages))
     }
 
     @Test fun earlyAuthenticatedWirelessV1ContinuesWifiAndOrdinaryAppsWaits() {
@@ -704,6 +764,42 @@ class Iap2MediaBluetoothTest {
         assertEquals(latePassword, late.passphrase)
         assertTrue(late.ipAddresses.isEmpty())
         assertEquals(0, late.airPlayPort)
+    }
+
+    @Test fun detectDropsDeferredCredentialsFromTheOldBluetoothControlGeneration() = runTest {
+        val peer = "00:11:22:33:44:55"
+        val ssid = "fixture-ap"
+        val selectedPassword = "selected-passphrase"
+        val stalePassword = "stale-passphrase"
+        val lost = CarWifiRequestIdentity(ssid, "fixture-pass")
+        val history = Iap2WifiCredentialHistory().forReceiver(peer)
+        var time = 11_999L
+        val inbox = CarHotspotReconnect.EndpointInbox(nowMillis = { time },
+            hasFreshCredentials = { it.bluetoothHotspot?.peer == peer && it.passphrase != null })
+        val identification = Iap2Csm.encode(0x1d01, Iap2Csm.param(6, byteArrayOf(0x57, 3, 0x43, 1, 0x68, 0)) +
+            Iap2Csm.param(7, byteArrayOf(0x57, 2)))
+        val channel = Channel(identificationExchange = identification,
+            wifiReply = wifiCredentials(ssid, selectedPassword) + wifiCredentials(ssid, stalePassword))
+        inbox.beginWifiRecovery(lost, 12_000)
+        val sender = Iap2SenderSession(channel, {}, receiverAddress = peer, profile = HeadUnitProfiles.WINPLAY,
+            nanoTime = { channel.time }, wifiHistory = history, publishEndpoint = { propose ->
+                propose()?.let { update ->
+                    inbox.offer(update.endpoint, onDeferredAccept = update.commitDeferred, onAccept = update.commit).also {
+                        if (it && update.endpoint.passphrase == selectedPassword) time = 12_001
+                    }
+                } == true
+            })
+        assertEquals(selectedPassword, sender.run(10_000).passphrase)
+        val selected = checkNotNull(inbox.awaitReplacementCredentials(lost, 12_000))
+
+        // The reader has processed DETECT while the old business worker is still unwinding.
+        channel.linkGeneration++
+        inbox.finishRecoveryJoin()
+
+        assertNull(inbox.poll())
+        assertEquals(selectedPassword, inbox.newestCredentials(selected).passphrase)
+        val addressOnly = Iap2Messages.StartSession(7300, null, null, null, listOf("192.168.5.3"), null)
+        assertEquals(selectedPassword, history.resolve(addressOnly, null)?.credential?.passphrase)
     }
 
     @Test fun rejected5703DoesNotOverwriteHistoryOrHideTheNext4301Address() = runTest {

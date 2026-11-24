@@ -56,6 +56,7 @@ mod udp_keepalive;
 mod buffered_ownership;
 mod buffered_control;
 mod wifi_iap2;
+mod iap2_tunnel;
 mod auth_setup;
 mod display_layout;
 mod receiver_ui;
@@ -314,7 +315,9 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendIap
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeMarkWifiIap2Ready(
     _env: JNIEnv, _class: JClass, id: jlong, ready: jboolean,
-) { wifi_iap2::mark_ready(id as u64, ready != JNI_FALSE); }
+) -> jboolean {
+    if id > 0 && wifi_iap2::mark_ready(id as u64, ready != JNI_FALSE) { JNI_TRUE } else { JNI_FALSE }
+}
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeCanKeepWifiSession(
     _env: JNIEnv, _class: JClass,

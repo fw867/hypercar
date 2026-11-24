@@ -6,6 +6,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.SystemClock
 import android.provider.Settings
+import io.github.hypercar.iap2.WifiIap2Bridge
 import io.github.hypercar.navigation.AmapLinkNavigation
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.settings.SettingsStore
@@ -80,6 +81,11 @@ internal object MapDiagnostics {
                 else -> "OTHER"
             }
             emit(token, "MAP-NET: network=$network transport=$kind validated=${caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)} internet=${caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)} dnsCount=${lp?.dnsServers?.size} gatewayPresent=${lp?.routes?.any { it.isDefaultRoute && it.gateway?.isAnyLocalAddress == false }} privateDnsActive=${lp?.isPrivateDnsActive}")
+        }
+        if (probe) {
+            val fix = WifiIap2Bridge.vehicleLocation.value
+            val age = fix?.let { ((System.nanoTime() / 1_000_000 - it.receivedAtMillis).coerceAtLeast(0) / 1_000).toString() }
+            emit(token, "MAP-LOC: carFixValid=${fix != null} carFixSource=wifi-iap2 carFixAgeS=${age ?: "unknown"}")
         }
         if (probe && ShizukuTools.isReady) {
             // Only bounded current state; never persist raw dumps (which may contain exact locations).

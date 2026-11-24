@@ -3,15 +3,84 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::bplist::Value;
 
 #[derive(Clone, Default)]
-struct Globals { page: u32, size: usize, count: usize, id: u8, min: i32 }
+struct Globals { page: u32, size: usize, count: usize, id: u8, min: i32, max: Option<i64> }
 struct Field { id: u8, offset: usize, size: usize, count: usize, variable: bool, relative: bool, controller: bool, min: i32, usages: Vec<u32> }
 #[derive(Default)]
 struct Device {
     fields: Vec<Field>,
     has_ids: bool,
     touch_reports: BTreeSet<u8>,
+    touch_fields: BTreeMap<(u8, usize), TouchFields>,
     report_bits: HashMap<u8, usize>,
     pressed: HashMap<u8, BTreeSet<u32>>,
+}
+
+#[derive(Clone, Copy)]
+struct TouchField { offset: usize, size: usize, min: i64, max: Option<i64> }
+
+impl TouchField {
+    fn read(self, bytes: &[u8]) -> i64 {
+        let value = read_bits(bytes, self.offset, self.size);
+        if self.min >= 0 { return i64::from(value); }
+        let shift = 32 - self.size;
+        i64::from(((value << shift) as i32) >> shift)
+    }
+
+    fn pixel(self, bytes: &[u8], extent: u32, max: i64) -> u32 {
+        let value = self.read(bytes).clamp(self.min, max) - self.min;
+        let range = max - self.min;
+        let last_pixel = extent.saturating_sub(1);
+        if self.min == 0 && range == i64::from(extent) { return (value as u32).min(last_pixel); }
+        ((value as u64 * u64::from(last_pixel) + (range as u64 / 2)) / range as u64) as u32
+    }
+}
+
+#[derive(Default)]
+struct TouchFields {
+    tip: Option<TouchField>,
+    touch: Option<TouchField>,
+    x: Option<TouchField>,
+    y: Option<TouchField>,
+    ambiguous: bool,
+}
+
+impl TouchFields {
+    fn set(&mut self, usage: u32, field: TouchField) {
+        let slot = match usage {
+            0xd0042 => &mut self.tip,
+            0xd0033 => &mut self.touch,
+            0x10030 => &mut self.x,
+            0x10031 => &mut self.y,
+            _ => return,
+        };
+        self.ambiguous |= slot.replace(field).is_some();
+    }
+
+    fn sample(&self, bytes: &[u8], display: (u32, u32)) -> Option<TouchSample> {
+        let (tip, x, y) = (self.tip.or(self.touch)?, self.x?, self.y?);
+        let (max_x, max_y) = (x.max?, y.max?);
+        if self.ambiguous || max_x <= x.min || max_y <= y.min { return None; }
+        Some(TouchSample { pressed: tip.read(bytes) != 0, x: x.pixel(bytes, display.0, max_x), y: y.pixel(bytes, display.1, max_y) })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TouchSample { pub pressed: bool, pub x: u32, pub y: u32 }
+
+impl TouchSample {
+    // Legacy receivers report pixels as either a single five-byte contact or six bytes per finger.
+    pub(crate) fn legacy(report: &[u8]) -> Option<Self> {
+        if report.len() < 5 { return None; }
+        let contact = if report.len() % 6 == 0 {
+            let finger = report.chunks_exact(6).find(|f| f[1] & 1 != 0).unwrap_or(&report[..6]);
+            &finger[1..]
+        } else { report };
+        Some(Self {
+            pressed: contact[0] & 1 != 0,
+            x: u32::from(u16::from_le_bytes([contact[1], contact[2]])),
+            y: u32::from(u16::from_le_bytes([contact[3], contact[4]])),
+        })
+    }
 }
 
 pub const CONSOLE_BACK: u32 = 0x30001;
@@ -95,7 +164,8 @@ mod tests {
             Value::dict(vec![("uuid",id.clone()),("hidDescriptor",Value::Data(all))]),
         ]))]));
         assert_eq!(h.report(Some(&id), &[1,1,0xb5,0,0xb6,0]), None);
-        assert_eq!(h.touch_payload(Some(&id), &[1,1,0xb5,0,0xb6,0]), &[1,0xb5,0,0xb6,0]);
+        assert_eq!(h.touch_sample(Some(&id), &[1,1,0xb5,0,0xb6,0], (2662,812)),
+            Some(TouchSample { pressed:true, x:0xb5, y:0xb6 }));
         assert_eq!(h.report(Some(&id), &[2,4,0,0,0]), Some(vec![0x30001]));
         assert_eq!(h.report(Some(&id), &[3,4]), Some(vec![0xb5]));
         assert_eq!(h.report(Some(&id), &[2,4,0,0,0]), Some(vec![]));
@@ -111,11 +181,33 @@ mod tests {
         ]))]));
         assert_eq!(h.report(Some(&touch), &[0xb5]), None);
         assert_eq!(h.report(Some(&touch), &[1,0xb6,0,0xb5,0]), None);
-        assert_eq!(h.touch_payload(Some(&touch), &[1,0xb6,0,0xb5,0]), &[1,0xb6,0,0xb5,0]);
+        assert_eq!(h.touch_sample(Some(&touch), &[1,0xb6,0,0xb5,0], (2662,812)),
+            Some(TouchSample { pressed:true, x:0xb6, y:0xb5 }));
         assert_eq!(h.report(Some(&knob), &[1,0]), Some(vec![0x30002]));
         assert_eq!(h.report(None, &[2,0]), Some(vec![]));
         assert_eq!(h.report(None, &[0xb5]), Some(vec![]));
         assert_eq!(h.report(Some(&Value::int(9)), &[0xb6]), Some(vec![]));
+    }
+
+    #[test]
+    fn finger_collections_use_the_active_contacts_signed_axes_and_reject_short_reports() {
+        let mut descriptor = vec![0x05,0x0d,0x09,4,0xa1,1,0x85,7];
+        let finger = [
+            0x05,0x0d,0x09,0x22,0xa1,2,0x09,0x42,0x15,0,0x25,1,0x75,1,0x95,1,0x81,2,
+            0x75,7,0x95,1,0x81,1,0x05,1,0x09,0x30,0x09,0x31,
+            0x16,0,0xff,0x26,0xff,0,0x75,16,0x95,2,0x81,2,0xc0,
+        ];
+        descriptor.extend(finger);
+        descriptor.extend(finger);
+        descriptor.push(0xc0);
+        let id = Value::int(1);
+        let hid = ConsumerHid::from_info(&Value::dict(vec![("hidDevices", Value::array(vec![
+            Value::dict(vec![("uuid", id.clone()), ("hidDescriptor", Value::Data(descriptor))]),
+        ]))]));
+        let report = [7,0,0,0,0,0,1,0x80,0xff,0x80,0];
+        assert_eq!(hid.touch_sample(Some(&id), &report, (200,200)), Some(TouchSample { pressed:true, x:50, y:150 }));
+        assert_eq!(hid.touch_sample(Some(&id), &report[..10], (200,200)), None);
+        assert_eq!(hid.touch_sample(None, &report[..10], (200,200)), None);
     }
     #[test]
     fn ambiguous_and_unknown_devices_cannot_inject_media_or_touch_from_a_control_report() {
@@ -262,13 +354,20 @@ mod tests {
 }
 fn qualified(v: u32, page: u32) -> u32 { if v>0xffff { v } else { (page<<16)|v } }
 
+fn read_bits(bytes: &[u8], offset: usize, size: usize) -> u32 {
+    (0..size).fold(0, |value, i| {
+        let bit = offset + i;
+        value | (u32::from((bytes[bit / 8] >> (bit % 8)) & 1) << i)
+    })
+}
+
 impl Device {
     fn parse(bytes: &[u8]) -> Option<Self> {
         if bytes.len()>4096 { return None; }
         let (mut at, mut g, mut stack) = (0, Globals::default(), Vec::new());
         let (mut usages, mut range) = (Vec::new(), None);
         let mut device = Self::default();
-        let mut application = 0;
+        let (mut application, mut finger, mut next_finger) = (0, 0, 0);
         let mut collections = Vec::new();
         while at<bytes.len() {
             let prefix=bytes[at]; at+=1;
@@ -276,9 +375,11 @@ impl Device {
             let size=match prefix&3 {3=>4,n=>n as usize};
             let data=bytes.get(at..at+size)?; at+=size;
             let value=data.iter().enumerate().fold(0u32,|v,(i,b)|v|((*b as u32)<<(8*i)));
+            let signed = || match size { 1 => value as i8 as i32, 2 => value as i16 as i32, _ => value as i32 };
             match ((prefix>>2)&3, prefix>>4) {
                 (1,0)=>g.page=value,
-                (1,1)=>g.min=match size {1=>value as u8 as i8 as i32,2=>value as u16 as i16 as i32,_=>value as i32},
+                (1,1)=>g.min=signed(),
+                (1,2)=>g.max=Some(if g.min<0 { i64::from(signed()) } else { i64::from(value) }),
                 (1,7)=>g.size=value as usize,
                 (1,8)=>{if value==0||value>255{return None;} g.id=value as u8;device.has_ids=true;},
                 (1,9)=>g.count=value as usize,
@@ -291,12 +392,13 @@ impl Device {
                     if end<start || end-start>512{return None;} usages.extend(start..=end);
                 },
                 (0,10)=>{
-                    collections.push(application);
-                    if value == 1 { application = usages.first().copied().unwrap_or(0); }
+                    collections.push((application, finger));
+                    if value == 1 { application = usages.first().copied().unwrap_or(0); finger = 0; }
+                    if usages.first() == Some(&0xd0022) { next_finger += 1; finger = next_finger; }
                     usages.clear();range=None;
                 },
                 (0,12)=>{
-                    application = collections.pop()?;
+                    (application, finger) = collections.pop()?;
                     usages.clear();range=None;
                 },
                 (0,8)=>{
@@ -307,6 +409,15 @@ impl Device {
                     let controller = application == MULTI_AXIS_CONTROLLER;
                     if application >> 16 == 0x0d {
                         device.touch_reports.insert(g.id);
+                        if application == 0xd0004 && value & 7 == 2 {
+                            for (index, &usage) in usages.iter().take(g.count).enumerate() {
+                                if matches!(usage, 0xd0042 | 0xd0033 | 0x10030 | 0x10031) {
+                                    device.touch_fields.entry((g.id, finger)).or_default().set(usage, TouchField {
+                                        offset: offset + index*g.size, size: g.size, min: i64::from(g.min), max: g.max,
+                                    });
+                                }
+                            }
+                        }
                     } else if value&1==0 && usages.iter().any(|u|u>>16==0x0c ||
                         controller && matches!(u,0x90001|0x10030|0x10031|0x10038)) {
                         device.fields.push(Field{id:g.id,offset,size:g.size,count:g.count,
@@ -359,7 +470,7 @@ impl Device {
         let mut rotation = Vec::new();
         for f in self.fields.iter().filter(|f|f.id==id) {
             for i in 0..f.count {
-                let value=(0..f.size).fold(0u32,|v,b|{let bit=f.offset+i*f.size+b;v|((((body[bit/8]>>(bit%8))&1) as u32)<<b)});
+                let value=read_bits(body, f.offset+i*f.size, f.size);
                 let usage=if f.variable {
                     if value==0 {continue;} f.usages.get(i).or_else(||f.usages.last()).copied()
                 } else {
@@ -470,13 +581,25 @@ impl ConsumerHid {
         if let Some(uuid) = uuid { return identity(uuid); }
         if self.advertised.len() != 1 { return None; }
         let (id, device) = self.devices.iter().next()?;
-        (bytes.len() < 5 || device.matches_report_length(bytes)).then(|| id.clone())
+        // A known touch Report ID still identifies a truncated report. Keep it
+        // on the descriptor path so an old pixel-layout fallback cannot tap.
+        (bytes.len() < 5 || device.is_touch_report(bytes) || device.matches_report_length(bytes)).then(|| id.clone())
     }
 
-    /// The existing touch decoder expects coordinates to start after any HID report ID.
-    pub fn touch_payload<'a>(&self, uuid: Option<&Value>, bytes: &'a [u8]) -> &'a [u8] {
-        let device = self.layout_id(uuid, bytes).and_then(|id| self.devices.get(&id));
-        if device.is_some_and(|d| d.has_ids && d.is_touch_report(bytes)) { &bytes[1..] } else { bytes }
+    pub(crate) fn touch_sample(&self, uuid: Option<&Value>, bytes: &[u8], display: (u32, u32)) -> Option<TouchSample> {
+        let Some(device) = self.layout_id(uuid, bytes).and_then(|id| self.devices.get(&id)) else {
+            return TouchSample::legacy(bytes);
+        };
+        let (id, body) = if device.has_ids { let (&id, body) = bytes.split_first()?; (id, body) } else { (0, bytes) };
+        if !device.touch_reports.contains(&id) || body.len() * 8 < *device.report_bits.get(&id)? { return None; }
+        let mut released = None;
+        for (_, fields) in device.touch_fields.range((id, 0)..=(id, usize::MAX)) {
+            if let Some(sample) = fields.sample(body, display) {
+                if sample.pressed { return Some(sample); }
+                released.get_or_insert(sample);
+            }
+        }
+        released.or_else(|| TouchSample::legacy(body))
     }
 
     /// Some = control report consumed (including releases). None = forward to the touch decoder.

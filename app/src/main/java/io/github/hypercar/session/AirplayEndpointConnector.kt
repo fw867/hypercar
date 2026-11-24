@@ -1,6 +1,8 @@
 package io.github.hypercar.session
 
 import io.github.hypercar.iap2.CarPlayEndpoint
+import io.github.hypercar.iap2.Iap2EndpointGeneration
+import io.github.hypercar.net.EndpointScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -14,6 +16,7 @@ internal suspend fun <P, T> handOffControlSocket(
     closeUnclaimed: () -> Unit,
     checkCurrent: () -> Unit,
     prepare: () -> P,
+    sourceGeneration: () -> Iap2EndpointGeneration? = { null },
     start: (P, transfer: (() -> T) -> T) -> T,
 ): T {
     val context = currentCoroutineContext()
@@ -27,7 +30,11 @@ internal suspend fun <P, T> handOffControlSocket(
                 synchronized(credentialCommitLock) {
                     context.ensureActive()
                     checkCurrent()
-                    transferred = true
+                    // Claim ownership atomically with DETECT. Native startup can
+                    // wait for the previous engine, so run it outside the epoch lock.
+                    val generation = sourceGeneration()
+                    if (generation == null) transferred = true
+                    else if (!generation.runIfCurrent { transferred = true }) throw AirplayEndpointChanged()
                     adopt()
                 }
             }
@@ -37,8 +44,29 @@ internal suspend fun <P, T> handOffControlSocket(
     }
 }
 
-internal data class AirplayTarget(val host: String, val port: Int, val verifiedNetworkHandle: Long? = null) {
+internal class AirplayEndpointChanged : CancellationException()
+
+internal data class AirplayTarget(val host: String, val port: Int, val verifiedNetworkHandle: Long? = null,
+    val sourceGeneration: Iap2EndpointGeneration? = null) {
     init { require(host.isNotBlank() && port in 1..65535) }
+    val sourceIsCurrent: Boolean get() = sourceGeneration?.isCurrent != false
+    fun allowsNetwork(networkHandle: Long): Boolean =
+        verifiedNetworkHandle == null || verifiedNetworkHandle == networkHandle
+
+    // A connector owns one bound Network. A report can add verification to that
+    // route, but must not change the peer, explicit scope, port or verified Network.
+    fun sameRoute(other: AirplayTarget): Boolean =
+        port == other.port &&
+            (verifiedNetworkHandle == null || other.verifiedNetworkHandle == null ||
+                verifiedNetworkHandle == other.verifiedNetworkHandle) &&
+            (host == other.host || host.substringAfter('%', "") == other.host.substringAfter('%', "") &&
+                EndpointScope.sameAddressOnNetwork(host, other.host))
+
+    fun withRouteEvidence(report: AirplayTarget): AirplayTarget = copy(
+        verifiedNetworkHandle = report.verifiedNetworkHandle ?: verifiedNetworkHandle,
+        sourceGeneration = report.sourceGeneration ?: sourceGeneration,
+    )
+
     override fun toString() = "$host:$port"
 }
 
@@ -47,6 +75,7 @@ internal fun CarPlayEndpoint.verifiedAirplayEndpoint(
     boundSsid: String?, networkHandle: Long, retiredAddresses: Set<String> = emptySet(),
     hasMatchingCredentials: Boolean = false, isOnLink: (String) -> Boolean,
 ): CarPlayEndpoint? {
+    if (!sourceIsCurrent) return null
     if (!requiresBoundAirplayRoute) return this
     val binding = airplayRouteBinding ?: return null
     if (binding.networkHandle?.let { it != networkHandle } == true) return null
@@ -67,8 +96,12 @@ internal class AirplayEndpointHints(private val defaultPort: Int = 7000) {
         lastInvitation = identity
         return invited(host)
     }
-    fun advertised(target: AirplayTarget): AirplayTarget { advertised[target.host] = target; return target }
-    fun invited(host: String): AirplayTarget = advertised[host] ?: AirplayTarget(host, defaultPort)
+    fun advertised(target: AirplayTarget): AirplayTarget {
+        advertised[EndpointScope.addressKey(target.host) ?: target.host] = target
+        return target
+    }
+    fun invited(host: String): AirplayTarget = advertised[EndpointScope.addressKey(host) ?: host]
+        ?.takeIf { it.sourceIsCurrent } ?: AirplayTarget(host, defaultPort)
 }
 
 /** Transport-only recovery. Does not pair, stop iAP2, or treat discovery as activation. */
@@ -79,10 +112,14 @@ internal class AirplayEndpointConnector<T>(
     private val close: (T) -> Unit,
     private val invalidate: (AirplayTarget) -> Unit,
     private val updates: () -> List<AirplayTarget>,
-    private val discover: suspend () -> List<AirplayTarget>,
+    private val discover: suspend (remainingMillis: Long) -> List<AirplayTarget>,
     private val pause: suspend () -> Unit,
+    private val networkHandle: Long? = null,
 ) {
     data class Connected<T>(val target: AirplayTarget, val socket: T)
+
+    private fun availableTargets(targets: List<AirplayTarget>): List<AirplayTarget> =
+        targets.filter { it.sourceIsCurrent && (networkHandle == null || it.allowsNetwork(networkHandle)) }.distinct()
 
     private suspend fun checkCurrent() {
         currentCoroutineContext().ensureActive()
@@ -91,53 +128,67 @@ internal class AirplayEndpointConnector<T>(
 
     suspend fun connect(initial: List<AirplayTarget>, windowMillis: Long): Connected<T>? {
         val deadline = now() + windowMillis
-        var candidates = initial.distinct()
-        var discovered = false
+        var candidates = availableTargets(initial)
+        var nextDiscoveryAt = now()
         var attempted = false
         val invalidated = mutableSetOf<AirplayTarget>()
         retry@ while (candidates.isNotEmpty()) {
             checkCurrent()
             if (attempted && now() >= deadline) return null
-            val fresh = updates().distinct()
+            val fresh = availableTargets(updates())
             if (fresh.isNotEmpty()) candidates = fresh
             for (target in candidates) {
                 checkCurrent()
+                if (!target.sourceIsCurrent) continue
                 if (attempted && now() >= deadline) return null
                 attempted = true
                 val socket = open(target)
                 if (socket != null) {
-                    try { checkCurrent() } catch (cancelled: CancellationException) {
-                        close(socket)
-                        throw cancelled
+                    var accepted = false
+                    try {
+                        checkCurrent()
+                        val arrived = availableTargets(updates())
+                        checkCurrent()
+                        if (now() >= deadline) return null
+                        val report = arrived.firstOrNull(target::sameRoute)
+                        if (arrived.isNotEmpty() && (report == null || !target.sourceIsCurrent)) {
+                            candidates = arrived
+                            continue@retry
+                        }
+                        val selected = report?.let(target::withRouteEvidence) ?: target
+                        if (!target.sourceIsCurrent || !selected.sourceIsCurrent) continue
+                        accepted = true
+                        return Connected(selected, socket)
+                    } finally {
+                        if (!accepted) close(socket)
                     }
-                    val arrived = updates().distinct()
-                    if (arrived.isNotEmpty() && target !in arrived) {
-                        close(socket)
-                        candidates = arrived
-                        continue@retry
-                    }
-                    return Connected(target, socket)
                 }
                 checkCurrent()
-                if (invalidated.add(target)) invalidate(target)
+                if (target.sourceIsCurrent && invalidated.add(target)) invalidate(target)
                 // Fresh invitation/iAP2 parameters take precedence over old fallback ports.
-                val arrived = updates().distinct()
+                val arrived = availableTargets(updates())
                 if (arrived.isNotEmpty() && arrived != candidates) { candidates = arrived; continue@retry }
             }
             checkCurrent()
-            val arrived = updates().distinct()
+            val arrived = availableTargets(updates())
             if (arrived.isNotEmpty() && arrived != candidates) { candidates = arrived; continue }
-            if (!discovered) {
-                discovered = true
-                val resolved = discover().distinct()
+            val beforeDiscovery = now()
+            if (beforeDiscovery >= deadline) return null
+            if (beforeDiscovery >= nextDiscoveryAt) {
+                val resolved = availableTargets(discover(deadline - beforeDiscovery))
                 checkCurrent()
-                val newest = updates().distinct()
-                if (newest.isNotEmpty()) { candidates = newest; continue }
-                if (resolved.isNotEmpty()) { candidates = resolved; continue }
+                nextDiscoveryAt = now() + DISCOVERY_RETRY_INTERVAL_MILLIS
+                val newest = availableTargets(updates())
+                if (newest.isNotEmpty() && newest != candidates) { candidates = newest; continue }
+                if (newest.isEmpty() && resolved.isNotEmpty() && resolved != candidates) { candidates = resolved; continue }
             }
             if (now() >= deadline) return null
             pause()
         }
         return null
+    }
+
+    private companion object {
+        const val DISCOVERY_RETRY_INTERVAL_MILLIS = 400L
     }
 }

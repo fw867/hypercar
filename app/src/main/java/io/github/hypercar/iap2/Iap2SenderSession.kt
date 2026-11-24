@@ -16,6 +16,12 @@ interface Iap2LinkChannel {
     /** 等待链路层协商完成（NORMAL）。 */
     fun awaitReady(timeoutMillis: Long): Boolean
 
+    val linkGeneration: Long get() = 0L
+    fun awaitReadyGeneration(timeoutMillis: Long): Long? =
+        if (awaitReady(timeoutMillis)) linkGeneration else null
+
+    fun endpointGeneration(expected: Long): Iap2EndpointGeneration = Iap2EndpointGeneration { linkGeneration == expected }
+
     /** 对端协商的最大控制载荷（已扣除帧头与校验和）；协商前为 null。 */
     fun peerMaxControlPayload(): Int?
 
@@ -100,16 +106,20 @@ class Iap2SenderSession(
     private val wifiHistory: Iap2WifiCredentialHistory.Receiver = Iap2WifiCredentialHistory.Receiver(),
     private val publishEndpoint: (Iap2EndpointProposal) -> Boolean = { propose ->
         propose()?.let { update ->
-            update.commit()
-            onEndpoint(update.endpoint)
-        } != null
+            update.endpoint.whileSourceCurrent { update.commit() }.also {
+                if (it && update.endpoint.sourceIsCurrent) onEndpoint(update.endpoint)
+            }
+        } == true
     },
 ) {
     private var parser = Iap2Csm.Parser()
     private val media = Iap2MediaSession(log, onMediaKey)
     private val nowPlaying = Iap2NowPlayingSession(nowPlayingProvider, log)
     private var navigation = RouteGuidanceSession(log)
-    private val subscriptions = Iap2StatusSubscriptions(log = log, deviceName = deviceName)
+    private val callStateSource = context?.let { Iap2CallStateSource() }
+    private val subscriptions = Iap2StatusSubscriptions(log = log, deviceName = deviceName,
+        callState = { callStateSource?.snapshot() ?: Iap2CallSample.Unavailable },
+        observeCalls = { callStateSource?.setSubscribed(it) })
     private var phaseName = "IDLE"
     private var phaseStarted = nanoTime()
     private var tracedReceivedFrames = 0
@@ -163,7 +173,7 @@ class Iap2SenderSession(
     private var eaProtocols: List<Iap2Messages.EaProtocol> = emptyList()
 
     /** 车机是否回过 0xEA03（EA 会话确认）；没回过才有必要重发 0xEA00。 */
-    private val eaSessions = Iap2EaSessions()
+    private var eaSessions = Iap2EaSessions()
 
     /** 保活期「等不到热点凭据」时的重探节奏（见 [pokeWhileWaiting]）。 */
     private var lastPokeNanos = 0L
@@ -176,6 +186,13 @@ class Iap2SenderSession(
     @Volatile
     private var peerIdentification: Iap2Messages.Identification? = null
     private var authenticatedAppsV1Early = false
+    // Keep the MFi policy across DETECT on this physical socket.
+    private var verifiedAppsV1Required = false
+    private var linkGeneration = 0L
+    private var endpointGeneration = channel.endpointGeneration(linkGeneration)
+    private var bringUpTimeoutMillis = 60_000L
+
+    private class LinkRestart : IOException()
 
     private companion object {
         /** MFi 挑战阶梯（长度, 首次试探窗口）：DiPlay/Audi/BMW 双端实测顺序。 */
@@ -238,18 +255,48 @@ class Iap2SenderSession(
      * @throws IOException 识别/链路超时（链路本身不可用）
      */
     fun run(timeoutMillis: Long = 60_000L): CarPlayEndpoint {
-        enterPhase("LINK_NEGOTIATION")
-        val deadline = nanoTime() + timeoutMillis * 1_000_000L
-        if (!channel.awaitReady(remainingMillis(deadline))) {
-            throw IOException("iAP2 链路协商超时")
+        bringUpTimeoutMillis = timeoutMillis
+        try {
+            return bringUp(restarting = false)
+        } catch (error: Exception) {
+            subscriptions.reset()
+            throw error
         }
+    }
+
+    private fun bringUp(restarting: Boolean): CarPlayEndpoint {
+        val timeoutMillis = bringUpTimeoutMillis
+        val deadline = nanoTime() + timeoutMillis * 1_000_000L
+        var freshLink = restarting
+        while (true) {
+            if (freshLink) resetBusinessLink()
+            enterPhase("LINK_NEGOTIATION")
+            linkGeneration = channel.awaitReadyGeneration(remainingMillis(deadline))
+                ?: throw IOException("iAP2 链路协商超时")
+            endpointGeneration = channel.endpointGeneration(linkGeneration)
+            try {
+                return runBusiness(deadline, freshLink || linkGeneration > 0)
+            } catch (_: LinkRestart) {
+                freshLink = true
+                if (remainingMillis(deadline) == 0L) throw IOException("iAP2 链路重协商超时")
+            }
+        }
+    }
+
+    private fun runBusiness(deadline: Long, restarting: Boolean): CarPlayEndpoint {
         log("iap2 link ready peerMaxControl=${channel.peerMaxControlPayload()}")
 
-        // The control descriptor lets paired BMW v1 links authenticate before the peer identifies its role.
-        val authFirst = bondedBmwInbound && pairedReceiver && profile.protocolProfileId.startsWith("bmw_") && channel.peerControlVersion == 1
+        // xiap2 0xa6814/0x4db24 runs the role callback again after a new SYN/ACK.
+        val verifyEarly = verifiedAppsV1Required ||
+            bondedBmwInbound && pairedReceiver && profile.protocolProfileId.startsWith("bmw_")
+        // A paired outbound MGU may switch between the ordinary Apps and CarPlay
+        // identities. If its policy is still unknown, identify before sending AA05.
+        val needsIdentification = pairedReceiver && profile.protocolProfileId == "bmw_id85"
+        val authFirst = channel.peerControlVersion == 1 && (verifyEarly || restarting && !needsIdentification)
         if (authFirst) {
             enterPhase("MFI_EXCHANGE")
-            authenticatePairedAppsV1(null, deadline)
+            if (verifyEarly) authenticatePairedAppsV1(null, deadline)
+            else authenticateCompatibility(null, receiverAddress.orEmpty(), deadline)
         }
 
         // ---- 识别 ----
@@ -257,6 +304,7 @@ class Iap2SenderSession(
         send(Iap2MessageIds.START_IDENTIFICATION)
         val identFrame = expect(Iap2MessageIds.IDENTIFICATION_INFORMATION, deadline)
         val ident = Iap2Messages.parseIdentification(identFrame.body)
+        rememberAppsAuthenticationPolicy(ident)
         if (authFirst) log("MGU-AUTH: v1 identification ordinaryApps=${isBmwAppsOnly(ident)} wirelessCarPlay=${isCarPlayProfileB(ident)}")
         authenticatedAppsV1Early = authFirst
         peerIdentification = ident
@@ -272,7 +320,7 @@ class Iap2SenderSession(
         val identityText = listOfNotNull(ident.name, ident.model, ident.manufacturer).joinToString(" ").lowercase()
         if (!authFirst) {
             enterPhase("MFI_EXCHANGE")
-            if (channel.peerControlVersion == 1 && usesMguReentry(ident) && isBmwAppsOnly(ident)) {
+            if (channel.peerControlVersion == 1 && verifiedAppsV1Required) {
                 authenticatePairedAppsV1(ident, deadline)
             } else {
                 authenticateCompatibility(ident, identityText, deadline)
@@ -558,6 +606,10 @@ class Iap2SenderSession(
             ident.declaresReceive(Iap2MessageIds.CARPLAY_AVAILABILITY) == false &&
             ident.eaProtocols.isNotEmpty() && ident.eaProtocols.all { it.name.startsWith("de.bmw.a4a.", ignoreCase = true) }
 
+    private fun rememberAppsAuthenticationPolicy(ident: Iap2Messages.Identification) {
+        if (usesMguReentry(ident) && isBmwAppsOnly(ident)) verifiedAppsV1Required = true
+    }
+
     private fun logWirelessCarPlayProfile(ident: Iap2Messages.Identification) {
         val declaresWifi = ident.declaresSend(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION) == true
         val declaresStart = ident.declaresSend(Iap2MessageIds.CARPLAY_START_SESSION) == true
@@ -591,6 +643,21 @@ class Iap2SenderSession(
      *  - 媒体库请求在取帧时处理，未知消息按 ID 限流记录。
      */
     fun pumpIncomingForever() {
+        try {
+            while (true) {
+                try {
+                    pumpCurrentLink()
+                    return
+                } catch (_: LinkRestart) {
+                    bringUp(restarting = true)
+                }
+            }
+        } finally {
+            subscriptions.reset()
+        }
+    }
+
+    private fun pumpCurrentLink() {
         enterPhase("MAINTAIN_LINK")
         log("SESSION 保活中（链路保持打开，持续处理配件消息）")
         log("HUD: transport=Bluetooth peer_start_route=${peerIdentification?.declaresSend(0x5200)} peer_route_update=${peerIdentification?.declaresReceive(0x5201)}; absent declaration is not a subscription")
@@ -640,6 +707,7 @@ class Iap2SenderSession(
 
     /** 每个消息 id 的原始体只记一次（车机私有消息的结构/长度只能靠它定谳）。 */
     private fun dumpBodyOnce(frame: Iap2Csm.Frame) {
+        if (frame.messageId in 0x4154..0x4156 || frame.messageId in 0xfffa..0xfffc) return
         if (!bodyDumped.add(frame.messageId)) return
         if (frame.body.isEmpty()) return
         val shown = if (frame.body.size <= BODY_DUMP_BYTES) frame.body else frame.body.copyOf(BODY_DUMP_BYTES)
@@ -708,6 +776,7 @@ class Iap2SenderSession(
      */
     private fun handleReidentification(frame: Iap2Csm.Frame) {
         val ident = Iap2Messages.parseIdentification(frame.body)
+        rememberAppsAuthenticationPolicy(ident)
         peerIdentification = ident
         navigation.declareReceiveSupport(ident.acceptsRouteGuidance)
         subscriptions.identify(ident.model, ident.manufacturer)
@@ -787,6 +856,7 @@ class Iap2SenderSession(
 
     private fun publishWifiConfiguration(configuration: Iap2Messages.WifiConfiguration, start: Iap2Messages.StartSession?): Boolean =
         publishEndpoint {
+            if (channel.linkGeneration != linkGeneration) return@publishEndpoint null
             if (wifiHistory.isRetiredRecoveryCredential(configuration.ssid, configuration.passphrase)) return@publishEndpoint null
             val sameHotspot = wifi?.let { it.ssid == configuration.ssid && it.passphrase == configuration.passphrase } != false
             val endpoint = endpointOf(start.takeIf { sameHotspot }, configuration).copy(densoOutbackWifi = densoOutback)
@@ -811,6 +881,7 @@ class Iap2SenderSession(
         val previousWifi = wifi
         var replayedPassword = false
         val accepted = publishEndpoint {
+            if (channel.linkGeneration != linkGeneration) return@publishEndpoint null
             val resolved = wifiHistory.resolve(parsed, previousWifi) ?: return@publishEndpoint null
             replayedPassword = resolved.replayedPassword
             val remember = { wifiHistory.commitStart(resolved) }
@@ -882,6 +953,7 @@ class Iap2SenderSession(
             requiresBoundAirplayRoute = startSession != null && startSession.wirelessAp == null,
             airplayRouteBinding = startSession?.airplayRouteBinding,
             replayedWifiConfiguration = startSession?.replayedWifiConfiguration,
+            sourceGeneration = endpointGeneration,
         )
 
     // ---- MFi 挑战 ----
@@ -916,13 +988,17 @@ class Iap2SenderSession(
         log("MGU-AUTH: signature=verified tx=0xaa05")
     }
 
-    private fun authenticateCompatibility(ident: Iap2Messages.Identification, identityText: String, deadline: Long) {
+    private fun authenticateCompatibility(ident: Iap2Messages.Identification?, identityText: String, deadline: Long) {
         val certificate = requestCertificate(ident, deadline)
         log("iap2 certificate source=${if(certificate.cached) "cache" else "rx-AA01"} bytes=${certificate.frame.body.size}; trust unverified")
         val mfiResult = try {
-            runMfiChallenge(deadline, receiverKey = MfiLengthMemory.receiverKey(identityText, receiverAddress))
+            runMfiChallenge(
+                deadline,
+                receiverKey = MfiLengthMemory.receiverKey(identityText, receiverAddress),
+                certificateParamBytes = certificate.parameterBytes,
+            )
         } catch (error: IOException) {
-            if (usesId9MinimalBootstrap() && error !is InterruptedIOException) MfiCertificateCache.forget(context,receiverAddress)
+            if (usesId9MinimalBootstrap() && error !is InterruptedIOException && error !is LinkRestart) MfiCertificateCache.forget(context,receiverAddress)
             throw error
         }
         ensureActive("MFi 结果发送前")
@@ -942,7 +1018,15 @@ class Iap2SenderSession(
         ReceiverProfile.classifyWifiGen(it.sendIds,it.receiveIds)==ReceiverProfile.WifiGen.NEW
     }==true
 
-    private data class CertificateExchange(val frame: Iap2Csm.Frame, val serial: ByteArray?, val cached: Boolean = false)
+    private data class CertificateExchange(
+        val frame: Iap2Csm.Frame,
+        val serial: ByteArray?,
+        val cached: Boolean = false,
+    ) {
+        val parameterBytes = Iap2Csm.nonEmptyParameter(frame.body, 0)
+            ?.let { it.value.size + Iap2Csm.PARAM_HEADER_BYTES }
+            ?: throw IOException("MFi 证书缺少完整参数")
+    }
 
     /** A serial cache hit reuses a real certificate; a miss still fetches AA01 within the original deadline. */
     private fun requestCertificate(ident: Iap2Messages.Identification?, deadline: Long): CertificateExchange {
@@ -957,10 +1041,7 @@ class Iap2SenderSession(
                 Iap2MessageIds.MFI_AUTHENTICATION_FAILED, Iap2MessageIds.IDENTIFICATION_REJECTED), deadline)
                 ?: throw IOException("等待 MFi 证书超时")
             when (frame.messageId) {
-                Iap2MessageIds.MFI_CERTIFICATE -> {
-                    if (!Iap2Csm.hasNonEmptyParameter(frame.body, 0)) throw IOException("MFi 证书缺少完整参数")
-                    return CertificateExchange(frame,serial)
-                }
+                Iap2MessageIds.MFI_CERTIFICATE -> return CertificateExchange(frame, serial)
                 Iap2MessageIds.ACCESSORY_AUTHENTICATION_SERIAL_NUMBER -> {
                     val received=MfiCertificateCache.serial(frame.body) ?: throw IOException("MFi 序列号缺少完整参数")
                     if (serial!=null && !serial.contentEquals(received)) throw IOException("MFi 证书交换期间序列号改变")
@@ -987,11 +1068,23 @@ class Iap2SenderSession(
     private fun runMfiChallenge(
         deadline: Long,
         receiverKey: String,
+        certificateParamBytes: Int,
     ): MfiResult {
         val baseline = MFI_ATTEMPTS.map { it.first }
         val windowOf = MFI_ATTEMPTS.toMap()
         val memory = MfiLengthMemory.load(context, receiverKey)
-        val order = MfiLengthMemory.orderAttempts(baseline, memory)
+        val certificatePreference = mfiChallengeLengthForCertificateParam(certificateParamBytes)
+        // Hard disconnects still rotate the established ladder. With no usable success, move the
+        // certificate's preferred length to the front and retain the other candidates in order.
+        val candidates = if (memory.lastDisconnected !in baseline &&
+            (memory.succeeded == null || memory.succeeded in memory.rejected)
+        ) {
+            listOf(certificatePreference) + baseline.filterNot { it == certificatePreference }
+        } else {
+            baseline
+        }
+        val order = MfiLengthMemory.orderAttempts(candidates, memory)
+        log("iap2 MFi AA02 certificateParamBytes=$certificateParamBytes certificatePreferred=${certificatePreference}B")
         if (!memory.isEmpty) {
             log(
                 "iap2 MFi 按车机记忆（$receiverKey）：${MfiLengthMemory.describe(memory)}" +
@@ -1188,6 +1281,7 @@ class Iap2SenderSession(
                 channel.sendHudControl(part, awaitAck, messageId)
             } else channel.sendControl(part, awaitAck)
             if (!sent) {
+                ensureCurrentLink()
                 throw IOException("iAP2 链路在发送 0x${messageId.toString(16)} 时关闭")
             }
             offset = end
@@ -1282,6 +1376,7 @@ class Iap2SenderSession(
      * （保持到达顺序：暂存 > 新解析），再读新帧。
      */
     private fun recvFrame(timeoutMillis: Long): Iap2Csm.Frame? {
+        ensureCurrentLink()
         while (pendingFrames.isNotEmpty()) {
             val frame = pendingFrames.removeFirst()
             if (frame.messageId == Iap2MessageIds.IDENTIFICATION_REJECTED) throw IOException("车机拒绝 iAP2 设备识别")
@@ -1295,6 +1390,7 @@ class Iap2SenderSession(
     private fun recvNewFrame(timeoutMillis: Long): Iap2Csm.Frame? {
         val deadline = nanoTime() + timeoutMillis.coerceAtLeast(0) * 1_000_000L
         while (true) {
+            ensureCurrentLink()
             media.diagnosticsTick()
             if (Thread.currentThread().isInterrupted || channel.isCancelled) throw InterruptedIOException("iAP2 接收已取消")
             if (receivedFrames.isNotEmpty()) {
@@ -1317,21 +1413,12 @@ class Iap2SenderSession(
             if (remaining <= 0) return null
             serviceControlUpdates()
             val bytes = channel.recvControl(minOf(remaining, if (nowPlaying.hasFileWork) 100L else 1_000L))
+            ensureCurrentLink()
             if (bytes == null) {
                 if (!channel.isAlive || nanoTime() >= deadline) return null
                 continue
             }
-            if (bytes.isEmpty()) {
-                parser = Iap2Csm.Parser()
-                receivedFrames.clear()
-                pendingFrames.clear()
-                media.restartLink()
-                nowPlaying.restartLink()
-                subscriptions.restartLink()
-                navigation = RouteGuidanceSession(log)
-                log("iap2 LINK DETECT restart: 清除旧 CSM 分片；保留 RFCOMM 和当前业务等待")
-                return null
-            }
+            if (bytes.isEmpty()) throw LinkRestart()
             val frames = parser.offer(bytes)
             for (frame in frames) {
                 if (tracedReceivedFrames++ < 192) {
@@ -1342,6 +1429,31 @@ class Iap2SenderSession(
                 receivedFrames += frame
             }
         }
+    }
+
+    private fun resetBusinessLink() {
+        parser = Iap2Csm.Parser()
+        receivedFrames.clear()
+        pendingFrames.clear()
+        pendingOverflowLogged = false
+        peerIdentification = null
+        authenticatedAppsV1Early = false
+        wifi = null
+        lastStartSession = null
+        densoOutback = false
+        endpointEmitted = false
+        startSessionRawLogged = false
+        lastLateStartSessionSignature = null
+        greetingsSent = false
+        eaProtocols = emptyList()
+        eaSessions = Iap2EaSessions()
+        lastPokeNanos = 0
+        pokeCount = 0
+        media.reset()
+        nowPlaying.reset()
+        subscriptions.reset()
+        navigation = RouteGuidanceSession(log)
+        log("iap2 LINK DETECT restart: 清除旧控制会话及订阅，等待同一 RFCOMM 上重新协商")
     }
 
     private fun serviceControlUpdates() {
@@ -1403,6 +1515,11 @@ class Iap2SenderSession(
     private fun ensureActive(stage: String) {
         if (Thread.currentThread().isInterrupted || channel.isCancelled) throw InterruptedIOException("iAP2 已取消（$stage）")
         if (!channel.isAlive) throw IOException("iAP2 链路已关闭（$stage）：${channel.closeReason ?: "未知原因"}")
+        ensureCurrentLink()
+    }
+
+    private fun ensureCurrentLink() {
+        if (channel.linkGeneration != linkGeneration) throw LinkRestart()
     }
 }
 

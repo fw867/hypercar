@@ -225,9 +225,68 @@ async fn observe_control(socket: Arc<UdpSocket>, peer_ip: Option<IpAddr>, label:
 pub(crate) struct FeedbackTrace {
     layout: String,
     repeats: u64,
+    clock_target: Option<(ClockTarget, u64)>,
+    clock: SampleClock,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ClockTarget {
+    pub(crate) rtsp: u64,
+    pub(crate) stream_id: i64,
+    pub(crate) stream_type: i64,
+    pub(crate) rate: u32,
+}
+
+#[derive(Default)]
+struct SampleClock {
+    previous: Option<(u32, u64)>,
+    origin_ns: u64,
+    frames_since_origin: u64,
+}
+
+impl SampleClock {
+    fn estimate(&mut self, stream: &Value, nominal_rate: u32) -> Option<(f64, i128)> {
+        let sample = u32::try_from(stream.get("sampleTime")?.as_int()?).ok()?;
+        let raw_ns = u64::try_from(stream.get("timestampRawNs")?.as_int()?).ok().filter(|n| *n != 0)?;
+        let Some((previous_sample, previous_ns)) = self.previous else {
+            self.reset(sample, raw_ns);
+            return None;
+        };
+        let Some(elapsed_ns) = raw_ns.checked_sub(previous_ns) else {
+            // Ignore reordered replies within the estimation window. Re-anchor
+            // after a large backward step so a restarted receiver clock recovers.
+            if previous_ns - raw_ns > 10_000_000_000 { self.reset(sample, raw_ns); }
+            return None;
+        };
+        if elapsed_ns < 100_000_000 { return None; }
+        let frames = u64::from(sample.wrapping_sub(previous_sample));
+        let rate = frames as f64 * 1e9 / elapsed_ns as f64;
+        let nominal = f64::from(nominal_rate);
+        if elapsed_ns > 10_000_000_000 || !(0.95 * nominal..=1.05 * nominal).contains(&rate) {
+            self.reset(sample, raw_ns);
+            return None;
+        }
+        self.previous = Some((sample, raw_ns));
+        self.frames_since_origin += frames;
+        // Phase relative to the first observed sample at nominal rate. The
+        // receiver's raw ticks have no shared epoch with the phone's clock.
+        let nominal_ns = i128::from(self.frames_since_origin) * 1_000_000_000 / i128::from(nominal_rate);
+        Some((rate, i128::from(raw_ns - self.origin_ns) - nominal_ns))
+    }
+
+    fn reset(&mut self, sample: u32, raw_ns: u64) {
+        *self = Self { previous: Some((sample, raw_ns)), origin_ns: raw_ns, frames_since_origin: 0 };
+    }
 }
 
 impl FeedbackTrace {
+    pub(crate) fn set_clock_target(&mut self, target: Option<(ClockTarget, u64)>) {
+        if self.clock_target != target {
+            self.clock_target = target;
+            self.clock = Default::default();
+        }
+    }
+
     pub(crate) fn observe(&mut self, rtsp: u64, cseq: Option<i32>, body: &[u8]) -> Option<String> {
         let mut layout = String::new();
         let mut rows = Vec::new();
@@ -235,6 +294,16 @@ impl FeedbackTrace {
         else if body.len() > 65536 { layout.push_str("body_over_64KiB"); }
         else if let Ok(plist) = bplist::parse(body) {
             if let Some(streams) = plist.get("streams").and_then(Value::as_array) {
+                let estimate = self.clock_target.and_then(|(target, _)| {
+                    if target.rtsp != rtsp || target.rate == 0 { return None; }
+                    let mut matching = streams.iter().filter(|stream| {
+                        stream.get("type").and_then(Value::as_int) == Some(target.stream_type)
+                            && stream.get("streamConnectionID").and_then(Value::as_int) == Some(target.stream_id)
+                    });
+                    let stream = matching.next()?;
+                    if matching.next().is_some() { return None; }
+                    self.clock.estimate(stream, target.rate).map(|estimate| (target, estimate))
+                });
                 layout.push_str("no_audio_stream");
                 for stream in streams {
                     let Some(kind @ 100..=103) = stream.get("type").and_then(Value::as_int) else { continue; };
@@ -258,6 +327,11 @@ impl FeedbackTrace {
                         };
                         layout.push(if number.is_some() { '+' } else { '-' });
                         row.push_str(&format!(" {field}={}", number.as_deref().unwrap_or("NA")));
+                    }
+                    if let Some((_, (rate, offset))) = estimate.filter(|(target, _)|
+                        kind == target.stream_type && id == Some(target.stream_id)) {
+                        layout.push_str(" clock");
+                        row.push_str(&format!(" rateHz={rate:.3} sampleClockOffsetNs={offset}"));
                     }
                     rows.push(row);
                 }
@@ -415,5 +489,42 @@ mod tests {
                 None => assert!(line.contains("type=102 streamConnectionID=unknown attribution=unknown")),
             }
         }
+    }
+
+    #[test]
+    fn high_accuracy_feedback_tracks_only_the_current_unique_stream_and_handles_sample_wrap() {
+        let body = |rows: &[(i64, i64, i64)]| bplist::encode(&Value::dict(vec![
+            ("streams", Value::array(rows.iter().map(|&(id, sample, raw)| Value::dict(vec![
+                ("type", Value::int(102)), ("streamConnectionID", Value::int(id)),
+                ("sampleTime", Value::int(sample)), ("timestampRawNs", Value::int(raw)),
+            ])).collect())),
+        ]));
+        let mut trace = FeedbackTrace::default();
+        trace.set_clock_target(Some((ClockTarget { rtsp: 3, stream_id: 91, stream_type: 102, rate: 48_000 }, 0)));
+        let start = (1i64 << 32) - 24_000;
+        let raw = 9_007_199_254_740_995;
+        assert!(!trace.observe(3, Some(1), &body(&[(91, start, raw)])).unwrap().contains("rateHz="));
+        let line = trace.observe(3, Some(2), &body(&[(91, 24_048, raw + 1_000_000_000)])).unwrap();
+        assert!(line.contains("rateHz=48048.000 sampleClockOffsetNs=-1000000"), "{line}");
+        let duplicate = trace.observe(3, Some(3), &body(&[(91, 72_096, raw + 2_000_000_000); 2])).unwrap();
+        assert!(!duplicate.contains("rateHz="));
+        trace.set_clock_target(Some((ClockTarget { rtsp: 3, stream_id: 92, stream_type: 102, rate: 48_000 }, 1)));
+        let retired = trace.observe(3, Some(4), &body(&[(91, 72_096, raw + 2_000_000_000)])).unwrap();
+        assert!(!retired.contains("rateHz="));
+        let replaced = trace.observe(3, Some(5), &body(&[(92, 72_096, raw + 2_000_000_000)])).unwrap();
+        assert!(!replaced.contains("rateHz="));
+        let implausible = trace.observe(3, Some(6), &body(&[(92, 2, raw + 3_000_000_000)])).unwrap();
+        assert!(!implausible.contains("rateHz="));
+    }
+
+    #[test]
+    fn high_accuracy_feedback_recovers_after_a_receiver_clock_reset() {
+        let stream = |sample, raw| Value::dict(vec![("sampleTime", Value::int(sample)), ("timestampRawNs", Value::int(raw))]);
+        let mut clock = SampleClock::default();
+        assert_eq!(clock.estimate(&stream(48_000, 30_000_000_000), 48_000), None);
+        assert_eq!(clock.estimate(&stream(1, 29_000_000_000), 48_000), None);
+        assert_eq!(clock.estimate(&stream(96_000, 31_000_000_000), 48_000), Some((48_000.0, 0)));
+        assert_eq!(clock.estimate(&stream(0, 1_000_000_000), 48_000), None);
+        assert_eq!(clock.estimate(&stream(48_000, 2_000_000_000), 48_000), Some((48_000.0, 0)));
     }
 }

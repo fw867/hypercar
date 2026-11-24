@@ -230,6 +230,7 @@ pub struct AudioOut {
     sync: Option<std::sync::Arc<UdpSocket>>,
     control_observer: Option<crate::audio_diagnostics::ControlObserver>,
     pub(crate) pacing_id: Option<crate::audio_pacing::StreamId>,
+    pub(crate) high_accuracy_timestamps: bool,
     pub(crate) io_costs: Option<crate::audio_pacing::AudioIoCosts>,
     resume_trace: Option<AudioResumeTrace>,
     /** 流密钥（pair-verify 派生，32 字节）。 */
@@ -286,6 +287,7 @@ impl AudioOut {
             sync: sync.map(std::sync::Arc::new),
             control_observer: None,
             pacing_id: None,
+            high_accuracy_timestamps: false,
             io_costs: None,
             resume_trace: None,
             key: stream_key,
