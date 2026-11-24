@@ -90,6 +90,8 @@ pub struct EngineConfig {
     #[serde(default)]
     pub bmw_box_bootstrap: bool,
     #[serde(default)]
+    pub skip_bluetooth_handoff: bool,
+    #[serde(default)]
     pub head_unit_profile: String,
     #[serde(default)]
     pub mbux_screen_bootstrap: bool,
@@ -443,6 +445,7 @@ pub async fn run_engine(
         keep_alive_stats: cfg.keep_alive_stats,
         request_receiver_stats: cfg.request_receiver_stats,
         bmw_box_bootstrap: cfg.bmw_box_bootstrap,
+        skip_bluetooth_handoff: cfg.skip_bluetooth_handoff,
         head_unit_profile: cfg.head_unit_profile.clone(),
         mbux_screen_bootstrap: cfg.mbux_screen_bootstrap,
         id9_screen_bootstrap: cfg.id9_screen_bootstrap,

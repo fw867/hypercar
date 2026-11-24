@@ -382,11 +382,13 @@ object SettingsStore {
         receiverBluetoothMac: String? = null,
         carWithSource: Boolean = carWithMode,
         receiverModel: String? = null,
+        headUnitProfile: io.github.hypercar.headunit.HeadUnitProfile,
     ): String {
         fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
         // 触摸兜底空间：车机档案若给了 touchDisplay 就用它；否则用设置里的
         // 屏幕推送分辨率（与视频编码一致）。真车 /info 有尺寸时仍优先 /info。
-        val profile = io.github.hypercar.headunit.HeadUnitProfiles.current().connectionPolicy()
+        val profile = headUnitProfile.connectionPolicy()
+        val selectedProfileId = profile.id
         val profileTouch = profile.touchDisplay
         val fallbackW = width.coerceAtLeast(2) / 2 * 2
         val fallbackH = height.coerceAtLeast(2) / 2 * 2
@@ -407,7 +409,7 @@ object SettingsStore {
             append("\"device_name\":").append(org.json.JSONObject.quote(io.github.hypercar.bluetooth.LocalDeviceName.snapshot())).append(",")
             append("\"car_ip\":\"").append(esc(carIp)).append("\",")
             append("\"airplay_port\":").append(airplayPort).append(",")
-            append("\"head_unit_profile\":").append(org.json.JSONObject.quote(profile.id)).append(",")
+            append("\"head_unit_profile\":").append(org.json.JSONObject.quote(profile.protocolProfileId)).append(",")
             if (profile.mbuxMediaCompat && !receiverModel.isNullOrBlank()) {
                 append("\"receiver_model\":").append(org.json.JSONObject.quote(receiverModel)).append(",")
             }
@@ -426,15 +428,16 @@ object SettingsStore {
             append("\"enable_audio\":true,")
             append("\"carwith_microphone\":").append(carWithSource).append(",")
             append("\"video_codec\":\"").append(VideoCodecPolicy.forHardware(videoCodec, VideoHardwareCapabilities.hevcEncoderAvailable)).append("\",")
-            append("\"bmw_capabilities\":").append(profile.id.startsWith("bmw_")).append(",")
+            append("\"bmw_capabilities\":").append(profile.protocolProfileId.startsWith("bmw_")).append(",")
             append("\"audio_codec\":\"").append(audioCodec).append("\",")
             append("\"self_microphone_asr\":").append(carVoiceRecognition && !carWithMode).append(",")
             append("\"keep_alive_stats\":").append(keepAliveStats).append(",")
             append("\"request_receiver_stats\":").append(debugLogEnabled).append(",")
             append("\"bmw_box_bootstrap\":").append(io.github.hypercar.headunit.ReceiverCompatibility.useBmwBootstrap(
-                headUnitProfileId, io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(receiverBluetoothMac))).append(",")
+                selectedProfileId, io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(receiverBluetoothMac))).append(",")
+            append("\"skip_bluetooth_handoff\":").append(profile.skipBluetoothHandoff).append(",")
             append("\"desktop_receiver\":").append(io.github.hypercar.headunit.ReceiverCompatibility.isDesktopReceiver(
-                headUnitProfileId, io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(receiverBluetoothMac))).append(",")
+                selectedProfileId, io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(receiverBluetoothMac))).append(",")
             append("\"identity_path\":\"").append(esc(identityPath)).append("\"")
             io.github.hypercar.session.PairingEvidence.receiverKey(receiverBluetoothMac)?.let {
                 append(",\"receiver_id\":\"").append(it).append("\"")

@@ -107,6 +107,7 @@ private val FpsOptions = listOf(30, 60)
 private enum class SettingsPage(val title: String) {
     Main("设置"),
     Car("我的车机"),
+    HeadUnitPicker("选择车机档案"),
     Display("画面与声音"),
     Permissions("权限与后台"),
     Advanced("高级设置"),
@@ -131,7 +132,12 @@ fun SettingsScreen(
     val page = SettingsPage.entries.firstOrNull { it.name == pageName }
         ?.takeUnless { it == SettingsPage.Developer && !showDeveloperMenu } ?: SettingsPage.Main
     fun open(destination: SettingsPage) { pageName = destination.name }
-    BackHandler(enabled = page != SettingsPage.Main) { open(page.parent) }
+    BackHandler(enabled = page != SettingsPage.Main && page != SettingsPage.HeadUnitPicker) { open(page.parent) }
+
+    if (page == SettingsPage.HeadUnitPicker) {
+        HeadUnitPickerScreen(connected = linkConnected, modifier = modifier, onClose = { open(SettingsPage.Car) })
+        return
+    }
 
     Column(modifier = modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 8.dp)) {
         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -173,7 +179,7 @@ fun SettingsScreen(
                     }
                     SettingsPage.Car -> {
                         AutoConnectSection(startup)
-                        HeadUnitSection(connected = linkConnected)
+                        HeadUnitSection(connected = linkConnected, onOpenPicker = { open(SettingsPage.HeadUnitPicker) })
                         TargetCarSection()
                     }
                     SettingsPage.Display -> {
@@ -194,6 +200,7 @@ fun SettingsScreen(
                         if (developerMode) DeveloperModeSection(showDeveloperMenu)
                     }
                     SettingsPage.Developer -> DeveloperMenuSection()
+                    SettingsPage.HeadUnitPicker -> Unit
                 }
                 Spacer(Modifier.height(8.dp))
             }
@@ -1526,213 +1533,43 @@ private fun agoText(atMillis: Long): String {
 
 /* ---------- 车机档案（品牌/型号） ---------- */
 
-/**
- * 车机档案选择：把品牌差异收敛到 `headunit/HeadUnitProfile.kt` 的档案里。
- *
- * 用户只需选「哪台车机」，其余行为（是否校验 deviceID、端口策略、
- * 0x4300/0xEA00/0x4E0E/0xAE01 的支持情况、触摸像素空间）由档案给出，
- * 新增品牌不需要改这里，只在 [io.github.hypercar.headunit.HeadUnitProfiles.all] 注册。
- */
 @Composable
-private fun HeadUnitSection(connected: Boolean = false) {
-    val context = androidx.compose.ui.platform.LocalContext.current
-    var selectedId by rememberSaveable { mutableStateOf(SettingsStore.headUnitProfileId) }
-    var expanded by rememberSaveable { mutableStateOf(false) }
-    // 远程档案（GitHub 下发）：新增车型不用发版，点一下就能拉到
-    val scope = androidx.compose.runtime.rememberCoroutineScope()
-    var refreshing by remember { mutableStateOf(false) }
-    var refreshNote by remember { mutableStateOf<String?>(null) }
-    var remoteBump by remember { mutableStateOf(0) }
-    // 读一下 remoteBump：远程档案更新后强制重组，重新取 all（否则列表还是旧的）
-    remoteBump
-    val profiles = io.github.hypercar.headunit.HeadUnitProfiles.all
-    val current = io.github.hypercar.headunit.HeadUnitProfiles.byId(selectedId)
-
-    fun applyProfile(profile: io.github.hypercar.headunit.HeadUnitProfile) {
-        SettingsStore.headUnitProfileId = profile.id
-        // 换车机型号时清除「目标车机」：上一台的名字/MAC 留着，
-        // 新车型会因「目标对不上」直接失败，而用户常常忘了改（现场反馈）。
-        HyperCarRepo.updateTargetCar(null, null)
-        io.github.hypercar.settings.SettingsRevision.bump()
-        selectedId = profile.id
-    }
-
+private fun HeadUnitSection(connected: Boolean, onOpenPicker: () -> Unit) {
+    val selection = remember(SettingsRevision.value) { io.github.hypercar.headunit.HeadUnitProfiles.selection() }
+    val current = selection.profile ?: selection.lockedProfile
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        SectionLabel(text = "车机型号")
-        GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp)) {
-            Box {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 140.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .clickable(enabled = !connected) { expanded = true }
-                        .padding(vertical = 18.dp, horizontal = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    CarBrandBadge(current.id, current.label, size = 48.dp)
-                    Spacer(Modifier.width(12.dp))
-                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                text = current.label,
-                                modifier = Modifier.weight(1f),
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = if (connected) TextSecondary else ElectricCyan,
-                            )
-                            if (!current.verified) {
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = "未实测",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = AmberWarning,
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(6.dp))
-                                        .background(AmberWarning.copy(alpha = 0.12f))
-                                        .padding(horizontal = 6.dp, vertical = 2.dp),
-                                )
-                            }
-                        }
-                        Text(current.model, style = MaterialTheme.typography.labelMedium, color = TextSecondary)
-                        Text(
-                            text = current.notes,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary,
-                        )
+        SectionLabel(text = "车机档案")
+        GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .clickable(enabled = !connected, onClick = onOpenPicker)
+                    .padding(vertical = 16.dp, horizontal = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                CarBrandBadge(current?.id.orEmpty(), selection.label, size = 48.dp)
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(selection.label, color = TextPrimary, style = MaterialTheme.typography.titleMedium)
+                    current?.model?.takeIf { it.isNotBlank() }?.let {
+                        Text(it, color = TextSecondary, style = MaterialTheme.typography.bodySmall)
                     }
-                    Text(
-                        text = "▾",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = if (connected) TextSecondary.copy(alpha = 0.4f) else ElectricCyan,
-                    )
-                }
-                DropdownMenu(
-                    expanded = expanded && !connected,
-                    onDismissRequest = { expanded = false },
-                    // 列表加外框 + 实底：默认菜单与背景几乎同色，条目之间分不清边界（现场反馈）
-                    modifier = Modifier.width(320.dp),
-                    shape = RoundedCornerShape(14.dp),
-                    containerColor = SurfaceInset,
-                    border = androidx.compose.foundation.BorderStroke(1.dp, StrokeGlass),
-                ) {
-                    profiles.forEachIndexed { index, profile ->
-                        // 车型之间加分隔线：原来几条连成一片，分不清边界
-                        if (index > 0) HorizontalDivider(color = StrokeGlass)
-                        DropdownMenuItem(
-                            modifier = Modifier.background(if (profile.id == selectedId) ElectricCyan.copy(alpha = 0.08f) else Color.Transparent),
-                            leadingIcon = { CarBrandBadge(profile.id, profile.label, size = 42.dp) },
-                            trailingIcon = {
-                                if (profile.id == selectedId) Icon(Icons.Rounded.Check, contentDescription = "已选择", tint = ElectricCyan, modifier = Modifier.size(20.dp))
-                            },
-                            text = {
-                                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                    Text(
-                                        text = profile.label,
-                                        style = MaterialTheme.typography.titleSmall,
-                                        color = if (profile.id == selectedId) ElectricCyan else TextPrimary,
-                                    )
-                                    Text(
-                                        text = buildString {
-                                            append(profile.model)
-                                            if (io.github.hypercar.headunit.RemoteProfiles.isRemote(profile.id)) append(" · 远程")
-                                            if (!profile.verified) append(" · 待实车复核")
-                                        },
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = TextSecondary,
-                                    )
-                                    Text(
-                                        text = profile.notes,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = TextSecondary,
-                                        maxLines = 2,
-                                        overflow = TextOverflow.Ellipsis,
-                                    )
-                                }
-                            },
-                            onClick = {
-                                applyProfile(profile)
-                                expanded = false
-                            },
-                        )
+                    val description = selection.blockReason ?: current?.notes.orEmpty()
+                    if (description.isNotBlank()) {
+                        Text(description, style = MaterialTheme.typography.bodySmall,
+                            color = if (selection.blockReason == null) TextSecondary else AmberWarning)
                     }
-                    // ---- 远程档案：GitHub 下发（新增车型不用发版）----
-                    HorizontalDivider(color = StrokeGlass)
-                    DropdownMenuItem(
-                        text = {
-                            Column {
-                                Text(
-                                    text = if (refreshing) "正在更新车型列表…" else "从 GitHub 更新车型列表",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = if (refreshing) TextSecondary else ElectricCyan,
-                                )
-                                Text(
-                                    text = refreshNote ?: run {
-                                        val at = SettingsStore.remoteProfilesFetchedAt
-                                        val count = io.github.hypercar.headunit.RemoteProfiles.cached().size
-                                        if (at <= 0L) {
-                                            "尚未更新过（仅内置 ${io.github.hypercar.headunit.HeadUnitProfiles.builtin.size} 个）"
-                                        } else {
-                                            "已缓存 $count 个远程档案 · ${agoText(at)}"
-                                        }
-                                    },
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = if (refreshNote?.startsWith("失败") == true) {
-                                        AmberWarning
-                                    } else {
-                                        TextSecondary
-                                    },
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            }
-                        },
-                        onClick = {
-                            if (!refreshing) {
-                                refreshing = true
-                                refreshNote = "正在下载…"
-                                scope.launch {
-                                    val result = runCatching {
-                                        io.github.hypercar.headunit.RemoteProfiles.refresh(context)
-                                    }
-                                    refreshing = false
-                                    refreshNote = result.fold(
-                                        onSuccess = { n -> "成功：$n 个档案（新车型已在上方列表）" },
-                                        onFailure = { e -> "失败：${e.message ?: "网络不可用"}（继续用缓存）" },
-                                    )
-                                    if (result.isSuccess) {
-                                        remoteBump++
-                                        io.github.hypercar.settings.SettingsRevision.bump()
-                                        expanded = false
-                                    }
-                                }
-                            }
-                        },
-                    )
                 }
+                Text("›", color = if (connected) TextSecondary else ElectricCyan,
+                    style = MaterialTheme.typography.titleLarge)
             }
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = if (connected) {
-                    "连接中不可切换：先点「断开连接」再改（iAP2 握手已按当前档案走完）。"
-                } else {
-                    "切换后「下次连接」生效。"
-                },
-                style = MaterialTheme.typography.labelSmall,
-                color = AmberWarning.copy(alpha = 0.85f),
-            )
+        }
+        if (connected) {
+            Text("断开连接后可切换车机档案", color = TextSecondary, style = MaterialTheme.typography.bodySmall)
         }
     }
 }
 
-
-
-
-
-
-
-
-/** Shared by first-use onboarding and settings, refreshed after grants/installations. */
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CarSourceSection(
     startup: io.github.hypercar.session.StartupReadiness,

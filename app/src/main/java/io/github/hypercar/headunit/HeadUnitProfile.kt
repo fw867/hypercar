@@ -25,10 +25,9 @@ data class HeadUnitProfile(
     val notes: String,
 
     /**
-     * 是否已有本项目实车验证或用户明确反馈的实车验证。
+     * 是否已有对应接收端的连接实测记录或明确反馈。
      *
-     * false 的档案（如奥迪）只有二手结论支撑，设置页会打「未实测」角标：
-     * 免得用户以为是"官方支持"，也提醒后续贡献者优先补实测。
+     * 尚无实测的档案在设置页显示「未实测」角标。
      */
     val verified: Boolean = true,
 
@@ -92,6 +91,11 @@ data class HeadUnitProfile(
 
     /** 首次连接引导里这个车机额外要提示的一句；null = 不提。 */
     val pairingHint: String? = null,
+
+    /** 远程档案生效所需的最低 App versionCode，含本版本。 */
+    val minVersionCode: Int? = null,
+
+    val listing: HeadUnitListing = HeadUnitListing(),
 ) {
     /** Pin ID6 to its own audio-first bootstrap; stale caches cannot mix receiver strategies.
      * Mercedes keeps the MB_D-PP reference policy, including MB_E-P models. */
@@ -106,6 +110,9 @@ data class HeadUnitProfile(
     /** Current Mercedes media proposals reflect the implemented H.264/UDP sender. */
     val mbuxMediaCompat: Boolean get() = id == "mercedes_mbux"
 
+    val protocolProfileId: String get() = if (id == HeadUnitProfiles.MOTORCYCLE_ID) "bmw_id85" else id
+    val skipBluetoothHandoff: Boolean get() = id == HeadUnitProfiles.MOTORCYCLE_ID
+
     fun screenResourceLifecycleEnabled(userEnabled: Boolean): Boolean =
         id == "mercedes_mbux" || useScreenResourceLifecycle || userEnabled
 }
@@ -114,13 +121,17 @@ data class HeadUnitProfile(
  * 内置档案表。新增品牌：在这里加一个 `val`，并在 [all] 里注册。
  */
 object HeadUnitProfiles {
+    internal const val MOTORCYCLE_ID = "motorcycle_generic"
+
 
     /** 宝马 iD8.5（MGU-86 / MGU-55）：真车实测过的那一套。 */
     val BMW_ID85 = HeadUnitProfile(
         id = "bmw_id85",
         label = "BMW",
         model = "ID7-ID8.5",
-        notes = "兼容 MGU-86 / MGU-55；由车机发起 CarPlay，保留系统蓝牙音频连接。首次连接请在 iDrive 确认授权。",
+        listing = HeadUnitListing(brandId = "bmw", brandName = "宝马 BMW", platformName = "MGU",
+            aliases = listOf("MGU-55", "MGU-86", "iDrive 7", "iDrive 8", "iDrive 8.5", "ID7", "ID8", "ID8.5")),
+        notes = "由车机发起无线 CarPlay，按 MGU 流程从蓝牙交接到 Wi-Fi。",
         validatesDeviceId = false,
         // ↓ 这三项 2026-10-25 现场 A/B 恢复为 0.27 值：0.27 有 CarPlay 图标，停发后图标消失
         sendCarPlayAvailability = true,
@@ -140,11 +151,23 @@ object HeadUnitProfiles {
         pairingHint = "首次要在 iDrive 里把这个设备选成 CarPlay 手机（车机会弹确认）",
     )
 
+    val MOTORCYCLE = BMW_ID85.copy(
+        id = MOTORCYCLE_ID,
+        label = "通用摩托车",
+        model = "突破者 M2PRO",
+        listing = HeadUnitListing(category = HeadUnitCategory.MOTORCYCLE, brandId = "alienrider",
+            brandName = "突破者 AlienRider", vehicleModels = listOf("M2PRO"), aliases = listOf("BREAK OUT")),
+        notes = "沿用 BMW 连接流程，保留蓝牙并跳过车机蓝牙交接命令。",
+        pairingHint = "在车机上选择 Apple CarPlay，使用已有的手机配对连接。",
+    )
+
     /** NBT Evo has its own stream order; never apply this to MGU or IDC23. */
     val BMW_ID6 = HeadUnitProfile(
         id = "bmw_id6", label = "BMW ID6", model = "NBT Evo",
-        notes = "NBT Evo 试验配置：按车机声明选择音频，音频先建立，再单次激活会话。保留系统蓝牙音频；尚未实车验证，旋钮输入仍待适配。",
-        verified = false, sendCarPlayAvailability = true,
+        listing = HeadUnitListing(brandId = "bmw", brandName = "宝马 BMW", platformName = "NBT Evo",
+            aliases = listOf("iDrive 6")),
+        notes = "按 NBT Evo 的声明协商音频，音频与主屏就绪后激活会话。",
+        sendCarPlayAvailability = true,
         openEaSessions = false, sendTransportIdentifier = false,
         dropProfilesBeforeIap2 = false, allowOutboundIap2 = false,
         requireAirplayActivation = true,
@@ -152,13 +175,14 @@ object HeadUnitProfiles {
         pairingHint = "适用于 NBT Evo，先在车机确认 Apple CarPlay 授权；MGU 和 IDC23 请使用各自配置。",
     )
 
-    /** IDC23 is kept separate from the existing MGU policy; media compatibility remains experimental. */
+    /** IDC23 uses its own handshake and screen setup order. */
     val BMW_ID9 = HeadUnitProfile(
         id = "bmw_id9",
         label = "BMW ID9",
         model = "IDC23（ID9）",
-        notes = "IDC23 系列试验配置：保留系统蓝牙音频，接受本轮车机会话参数和 IPv6 端点。按主屏声明、HID、屏幕建链后再激活；AAC 音频仍在适配，尚未实车验证。",
-        verified = false,
+        listing = HeadUnitListing(brandId = "bmw", brandName = "宝马 BMW", platformName = "IDC23",
+            aliases = listOf("iDrive 9")),
+        notes = "支持 IPv6 端点，主屏与 HID 就绪后激活会话。",
         validatesDeviceId = false,
         sendCarPlayAvailability = true,
         openEaSessions = false,
@@ -173,7 +197,7 @@ object HeadUnitProfiles {
         useScreenResourceLifecycle = true,
         id9ScreenBootstrap = true,
         fallbackAirplayPorts = listOf(7000),
-        pairingHint = "先在车机确认 Apple CarPlay 授权；此配置仍在适配中，尚未验证音视频正常。",
+        pairingHint = "先在车机确认 Apple CarPlay 授权，等待车机发起连接。",
     )
 
     /**
@@ -199,9 +223,8 @@ object HeadUnitProfiles {
         id = "generic",
         label = "通用（0.27）",
         model = "任意车机 / 未知车型",
-        notes = "0.27 基线 + cardeck 通用序列：0x4300/0xEA00/0x4E0E 全发，发 iAP2 前先断 HFP/A2DP，" +
-            "不主动拆链；端点先查 mDNS `_airplay._tcp`，拿不到退 7000。" +
-            "与 0.27 只差两处：档案 A 不拆链（拆链会丢 CarPlay 图标）、mDNS 优先（0.27 写死 7000，遇 455 连不上）。",
+        listing = HeadUnitListing(category = HeadUnitCategory.GENERAL),
+        notes = "适用于未单独适配的车型。优先通过 mDNS 发现端点，找不到时尝试 7000 端口。",
         verified = true,
         sendCarPlayAvailability = true,
         openEaSessions = true,
@@ -219,7 +242,8 @@ object HeadUnitProfiles {
         id = "winplay",
         label = "WinPlay",
         model = "PC AirPlay 接收端",
-        notes = "接收端会校验 deviceID（SETUP 必须带本机真实蓝牙 MAC）；控制面优先采用 mDNS 公告端口，1.25 使用 17000，旧版 7000 兜底。",
+        listing = HeadUnitListing(category = HeadUnitCategory.RECEIVER, aliases = listOf("Windows", "DiPlay")),
+        notes = "控制端口优先采用 mDNS 公告，接收端校验手机真实蓝牙 MAC。",
         validatesDeviceId = true,
         sendCarPlayAvailability = false,
         openEaSessions = false,
@@ -234,7 +258,7 @@ object HeadUnitProfiles {
     )
 
     /**
-     * 奥迪基础档案：对照 CarDeck 503ed37；尚未完成本项目实车验证。
+     * 奥迪 MIB3 档案：有实车连接反馈，兼容 mDNS 和晚到的端点。
      * 6318 可能只给 Wi-Fi 凭据，端点由 mDNS 发现；9310 的 0x4301 可能晚到。
      * 0x4300 / 0x4E0E 只发送，不等待 ACK；EA 仅打开车机声明的协议。
      * 音频配置保护不等于断开 RFCOMM，控制链路需保留以接收后续通知。
@@ -243,9 +267,9 @@ object HeadUnitProfiles {
     val AUDI_MIB3 = HeadUnitProfile(
         id = "audi_mib3",
         label = "Audi MIB3",
-        model = "MMI 6318 / 9310 / 3315（参考记录）",
-        notes = "未实车验证：保留蓝牙控制链路，兼容仅 mDNS 发现端点及晚到的 0x4301；按车机声明打开 EA 会话。",
-        verified = false,
+        model = "MMI 6318 / 9310 / 3315",
+        listing = HeadUnitListing(brandId = "audi", brandName = "奥迪 Audi", platformName = "MIB3"),
+        notes = "保留蓝牙控制链路，支持通过 mDNS 发现端点和处理晚到的 0x4301。",
         validatesDeviceId = false,
         sendCarPlayAvailability = true,
         openEaSessions = true,
@@ -261,7 +285,9 @@ object HeadUnitProfiles {
         id = "volkswagen_mib",
         label = "大众 Volkswagen",
         model = "VW4131 / VW4211（ID.7 / 帕萨特 2025）",
-        notes = "网友实车反馈连接正常：先选定目标车机并连接车机 Wi-Fi，保持蓝牙与广播，等待车机本轮邀请；不使用无邀请的主动直连。",
+        listing = HeadUnitListing(brandId = "volkswagen", brandName = "大众 Volkswagen", platformName = "MIB",
+            vehicleModels = listOf("ID.7", "帕萨特 2025"), aliases = listOf("Passat 2025")),
+        notes = "选定目标车机后，保持蓝牙和车机 Wi-Fi，等待本轮 CarPlay 邀请。",
         verified = true,
         sendCarPlayAvailability = true,
         openEaSessions = false,
@@ -283,8 +309,8 @@ object HeadUnitProfiles {
         id = "mercedes_mbux",
         label = "奔驰 Mercedes-Benz",
         model = "MBUX（MB_D-PP / MB_E-P）",
-        notes = "奔驰统一试验路径：MB_D-PP、MB_E-P 均按 MB_D-PP 参考策略，每次会话仅激活一次 RECORD，音频加入和屏幕重建不重复激活；保留蓝牙。尺寸和音频按车机协商，音视频仍待实车验证。",
-        verified = false,
+        listing = HeadUnitListing(brandId = "mercedes", brandName = "奔驰 Mercedes-Benz", platformName = "MBUX"),
+        notes = "保留蓝牙，画面和音频按车机声明协商，整轮会话只发送一次 RECORD。",
         validatesDeviceId = false,
         sendCarPlayAvailability = true,
         openEaSessions = false,
@@ -301,11 +327,12 @@ object HeadUnitProfiles {
         mbuxScreenBootstrap = false,
         fallbackAirplayPorts = listOf(7000),
         touchDisplay = null,
-        pairingHint = "在车机确认 Apple CarPlay，接受 Wi-Fi 连接提示；MB_D-PP 与 MB_E-P 使用统一奔驰路径，音视频尚待实车验证。",
+        pairingHint = "在车机确认 Apple CarPlay，并按提示连接车机 Wi-Fi。",
     )
 
     /** 内置档案（出厂就有的，断网也一定在）。宝马排第一：它是默认档案。 */
-    val builtin: List<HeadUnitProfile> = listOf(BMW_ID85, BMW_ID6, BMW_ID9, GENERIC, WINPLAY, AUDI_MIB3, VOLKSWAGEN, MERCEDES_MBUX)
+    val builtin: List<HeadUnitProfile> =
+        listOf(BMW_ID85, BMW_ID6, BMW_ID9, GENERIC, MOTORCYCLE, WINPLAY, AUDI_MIB3, VOLKSWAGEN, MERCEDES_MBUX)
 
     /**
      * 全部可用档案 = 内置 + 远程（GitHub 下发的 `profiles/headunits.json`）。
@@ -314,7 +341,12 @@ object HeadUnitProfiles {
      * 没拉过/拉失败就是纯 [builtin]，行为与以前完全一致。
      */
     val all: List<HeadUnitProfile>
-        get() = RemoteProfiles.merge(builtin, RemoteProfiles.cached(), RemoteProfiles.cachedSchema())
+        get() = catalog().profiles
+
+    internal fun catalog(): RemoteProfiles.Catalog = RemoteProfiles.mergeCatalog(builtin, RemoteProfiles.cached())
+
+    internal fun selection(): RemoteProfiles.Selection =
+        catalog().select(SettingsStore.headUnitProfileId.ifBlank { BMW_ID85.id })
 
     /** 按 id 取档案；未知/空值回落到宝马（默认车型）。 */
     fun byId(id: String?): HeadUnitProfile =

@@ -59,6 +59,9 @@ fun HomeScreen(
     val autoConnect = remember(io.github.hypercar.settings.SettingsRevision.value) {
         io.github.hypercar.settings.SettingsStore.autoConnect
     }
+    val selection = io.github.hypercar.headunit.HeadUnitProfiles.selection()
+    val profileId = (selection.profile ?: selection.lockedProfile)?.id.orEmpty()
+    val startBlockReason = (listOfNotNull(selection.blockReason) + startup.manualIssues).joinToString("；")
     // 权限检查卡在两种布局里共用
     @Composable
     fun Checklist() {
@@ -111,8 +114,8 @@ fun HomeScreen(
                 ) {
                     Setup()
                     StatusHeroCard(
-                        startEnabled = startup.manualReady,
-                        startBlockReason = startup.manualIssues.joinToString("；"),
+                        startEnabled = startup.manualReady && selection.profile != null,
+                        startBlockReason = startBlockReason,
                         link = snapshot.link,
                         connectionAttemptId = snapshot.connectionAttemptId,
                         autoConnectEnabled = autoConnect,
@@ -120,8 +123,8 @@ fun HomeScreen(
                         onStopClick = onStop,
                         onToggleAutoConnect = onToggleAutoConnect,
                         autoConnectToggleEnabled = startup.automaticReady || autoConnect,
-                        profileLabel = io.github.hypercar.headunit.HeadUnitProfiles.current().label,
-                        profileId = io.github.hypercar.headunit.HeadUnitProfiles.current().id,
+                        profileLabel = selection.label,
+                        profileId = profileId,
                     )
                     StatGrid(
                         snapshot = snapshot,
@@ -155,8 +158,8 @@ fun HomeScreen(
                 Setup()
                 // 第一张卡：实时步骤（Negotiating 时显示 link.step）
                 StatusHeroCard(
-                    startEnabled = startup.manualReady,
-                    startBlockReason = startup.manualIssues.joinToString("；"),
+                    startEnabled = startup.manualReady && selection.profile != null,
+                    startBlockReason = startBlockReason,
                     link = snapshot.link,
                     connectionAttemptId = snapshot.connectionAttemptId,
                     autoConnectEnabled = autoConnect,
@@ -164,8 +167,8 @@ fun HomeScreen(
                     onStopClick = onStop,
                     onToggleAutoConnect = onToggleAutoConnect,
                     autoConnectToggleEnabled = startup.automaticReady || autoConnect,
-                        profileLabel = io.github.hypercar.headunit.HeadUnitProfiles.current().label,
-                        profileId = io.github.hypercar.headunit.HeadUnitProfiles.current().id,
+                    profileLabel = selection.label,
+                    profileId = profileId,
                 )
                 // 四枚状态芯片改成 2×2：原来单行横滑，Shizuku 在窄屏上被挤出屏幕
                 StatGrid(
@@ -204,13 +207,13 @@ private fun degradedChipHint(snapshot: SessionSnapshot): String? = when {
  */
 @Composable
 internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
+    val headUnit = io.github.hypercar.headunit.HeadUnitProfiles.selection().profile ?: return
     GlassPanel(
         modifier = modifier.fillMaxWidth(),
         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 14.dp, bottom = 14.dp),
     ) {
         // 车机档案：品牌/型号决定这套协议按谁的习惯跑，引导里必须点名，
         // 否则用户不知道自己选的对不对（设置里可改）。
-        val headUnit = io.github.hypercar.headunit.HeadUnitProfiles.current()
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
                 text = "3. 首次车机配对",

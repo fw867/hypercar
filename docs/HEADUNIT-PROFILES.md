@@ -1,6 +1,6 @@
 # 车机档案与验证范围
 
-更新：2026-11-16。所有车型统一在 [profiles/headunits.json](../profiles/headunits.json) 下发，App 按 ID 选择，不维护独立车型 JSON。
+更新于 2026-11-24。远程档案由 [profiles/headunits.json](../profiles/headunits.json) 下发。
 
 当前编码策略：所有档案默认HEVC优先，保留显式H.264选择；手机缺少硬件HEVC Main/Surface编码器，或本轮会话未明确启用HEVC时使用H.264。ID9、MBUX兼容档案不再按车型强制移除HEVC，其余认证、启动顺序、音频和缓冲能力策略保持。旧章节的“ID9关闭HEVC/默认H.264”为当时验证阶段记录，当前规则见[视频策略](VIDEO-STREAM-REVIEW.md)。这不构成所有车型HEVC实车通过的结论。
 
@@ -8,24 +8,25 @@
 
 ## 内置策略
 
-| ID | 断 HFP/A2DP | 出站 iAP2 | 要求本轮激活 | 特殊门槛 | 验证范围 |
-|---|---|---|---|---|---|
-| bmw_id85 | false | false | true | 允许用户开启已配对 Wi-Fi 主动恢复 | MGU-55 实车基准；不能代表所有 iDrive |
-| bmw_id6 | false | false | true | NBT Evo 身份校验；屏幕 TCP、声明内音频先就绪，再单次成功 RECORD | 实验档案；AAC 44.1/48 kHz，实车待验证 |
-| bmw_id9 | false | true | true | 新鲜0x4301；主屏/HID/视频TCP在RECORD前就绪；不继承MGU的SAP | ID9实车待验证；AAC48已接通并通过DiPlay出声测试 |
-| generic | true | true | false | 通用模板 | verified 不代表所有车型经过测试 |
-| winplay | false | true | false | deviceID 校验；7000端口 | PC 联调，不等于真实车机 |
-| audi_mib3 | true | true | false | mDNS 优先、兼容晚到端点 | 本项目未完成奥迪实车验证 |
-| volkswagen_mib | false | true | true | 当前目标 Wi-Fi 广播；必须新鲜 ctrl 邀请；禁用无邀请捷径 | 用户转述连接正常，未逐项验证功能 |
-| mercedes_mbux | false | true | true | 本轮 iAP2 端点；单次 RECORD 后协商屏幕/音频；关闭旧屏幕前置实验 | MB_D-PP 与 MB_E-P 统一使用 MB_D-PP 参考策略，未实车验证 |
+| ID | iAP2 前主动断开 HFP/A2DP | 出站 iAP2 | 要求本轮激活 | 连接特点 |
+|---|---|---|---|---|
+| bmw_id85 | false | false | true | 由车机发起连接，支持恢复已配对车机的热点 |
+| bmw_id6 | false | false | true | 校验 NBT Evo 身份，音频和屏幕就绪后激活会话 |
+| bmw_id9 | false | true | true | 支持 IPv6，主屏、HID、视频 TCP 在 RECORD 前就绪 |
+| generic | true | true | false | 优先通过 mDNS 找端点，找不到时尝试 7000 端口 |
+| motorcycle_generic | false | false | true | 沿用 BMW 连接流程，跳过 `disableBluetooth` |
+| winplay | false | true | false | 校验 deviceID，优先使用 mDNS 公告端口 |
+| audi_mib3 | true | true | false | mDNS 优先，兼容晚到的端点 |
+| volkswagen_mib | false | true | true | 在当前目标 Wi-Fi 广播，等待本轮 ctrl 邀请 |
+| mercedes_mbux | false | true | true | 使用本轮 iAP2 端点，单次 RECORD 后协商屏幕与音频 |
 
 MGU BMW/generic/Audi 启用0x4300、EA及0x4E0E；大众/奔驰启用0x4300、0x4E0E但不主动打开EA；WinPlay关闭三项。ID6 仅启用0x4300，不套用MGU的EA、传输标识及SAP引导；nbtAudioFirst只允许ID6启用，禁止与ID9/MBUX前置策略混用。全部回复电源更新，不因CarPlay窗口关闭就主动中止。音频配置保护只涉及HFP/A2DP，不能因此提前断掉RFCOMM控制链。
 
-默认及未知ID回退BMW，新增档案不自动切换用户选择。档案ID不同，连接参数不能因同名Wi-Fi混用。真实接收端身份与UI所选档案需同时记录。
+首次使用默认选 BMW。已选档案被移除或受版本限制时，保留选择和配对，等待用户重选或升级后再连接。档案 ID 不同，连接参数不能因同名 Wi-Fi 混用。真实接收端身份与 UI 所选档案需同时记录。
 
 ## 配置字段与覆盖
 
-当前发布schema=11。覆盖门槛按档案区分：bmw_id6需要schema11，mercedes_mbux需要schema10，bmw_id9需要schema9，其余内置档案继续接受schema8，避免旧奔驰缓存恢复已移除的屏幕前置策略，同时保留其它档案已有有效覆盖；低于该档案门槛的缓存仅能追加新ID。缺省字段继承同ID内置值，新ID继承BMW模板；显式false通常是有效覆盖；奔驰例外：mbuxScreenBootstrap/id9ScreenBootstrap固定false，useScreenResourceLifecycle固定true，解析、合并和引擎配置均按统一策略处理。touchDisplay/pairingHint空字符串可清除。导出保留策略及schema，刷新失败保留缓存并继续执行schema隔离。
+当前发布 schema 为 13。连接策略的覆盖门槛沿用原值：`bmw_id85` 需 12，`bmw_id6` 需 11，`mercedes_mbux` 需 10，`bmw_id9` 需 9，其余内置档案需 8。schema 13 以前的同 ID 远程档案使用当前内置说明，并保留有效的连接参数。新 ID 的连接参数默认继承 BMW 模板。`touchDisplay` 或 `pairingHint` 传空字符串可清除对应说明或兜底值。
 
 | 字段组 | 内容 |
 |---|---|
@@ -33,14 +34,23 @@ MGU BMW/generic/Audi 启用0x4300、EA及0x4E0E；大众/奔驰启用0x4300、0x
 | 激活/发现 | preferMdnsAirplay、requireAirplayActivation、allowProactiveWifiSession、advertiseOnCurrentWifi、requireFreshCtrlInvite、fallbackAirplayPorts |
 | 画面 | touchDisplay、useScreenResourceLifecycle、mbuxScreenBootstrap、id9ScreenBootstrap |
 | 说明 | id、label、model、notes、verified、pairingHint |
+| 选择页 | category、brandId、brandName、vehicleModels、platformName、aliases |
 
 useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关，不改用户偏好。奔驰为true时设置页显示档案已启用且不可在该行关闭。旧 keepIap2AliveOnly 已移除，不恢复旧行为。
+
+「设置 → 我的车机 → 车机档案」按品牌浏览，也可以搜索车型、车机系统和别名。多个车型可以共用一个档案 ID，按 `vehicleModels` 填写即可。同一汽车品牌的条目共用 `brandId` 和 `brandName`。其他分类使用 `category` 的 `motorcycle`、`general` 或 `receiver`。新条目缺少品牌信息时仍可搜索，也会列在「未分类」。
+
+### 远程档案的最低 App 版本
+
+把带版本门槛的条目放在顶层 `versionedProfiles` 数组，每条填写正整数 `minVersionCode`。App 使用安装编号比较，`versionCode >= minVersionCode` 时生效。例如「通用摩托车」的远程条目要求 `10716`（`0.1.0.620`）及以上。
+
+旧版 App 仍读取 `profiles`，因此这个数组用于无需版本门槛的条目。新版从缓存加载时也会检查版本。未达门槛时，远程新增条目不会出现，同 ID 的远程覆盖会回退到已有条目。能否覆盖内置档案仍需同时满足 `_schema`。同 ID 有多个符合条件的条目时，采用最后一条，`versionedProfiles` 排在 `profiles` 之后。
 
 ## 大众
 
 参考 mcarplay 的 VW4131/VW4211（ID.7、帕萨特2025）线索。必须明确目标车机才在当前Wi-Fi提前广播，不据此写入成功配对历史。ctrl邀请须属于当前Network且在20秒内，控制连接前后复核；过期候选关闭。20秒是兼容性经验，不是协议常量。失败后保留广播及蓝牙，等待新邀请，不能复用已消耗邀请。
 
-2026-11-07 按用户转述将verified设为true，仅表示已有连接正常反馈，不证明所有大众车型/固件、音频、方向盘和语音都正常。另一个无声反馈接收端自报CarLetter；现象与修正见[音频](AUDIO.md)。
+CarLetter 接收端的音频处理见[音频](AUDIO.md)。
 
 ## 奥迪
 

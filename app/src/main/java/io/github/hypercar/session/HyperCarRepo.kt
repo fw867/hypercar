@@ -12,6 +12,9 @@ import android.net.ConnectivityManager
 import android.net.Network
 import io.github.hypercar.net.SessionSocketLease
 import io.github.hypercar.headunit.HeadUnitActivationPolicy
+import io.github.hypercar.headunit.HeadUnitProfile
+import io.github.hypercar.headunit.HeadUnitProfiles
+import io.github.hypercar.headunit.RemoteProfiles
 import android.net.NetworkRequest
 import android.net.NetworkCapabilities
 import android.os.ParcelFileDescriptor
@@ -292,8 +295,9 @@ object HyperCarRepo {
     @Volatile private var fallbackToRemember: io.github.hypercar.net.PhoneIdentitySnapshot.Identity? = null
 
     /** 当前车机档案（设置里可切换；每次连接重新读取）。 */
-    private val headUnitProfile: io.github.hypercar.headunit.HeadUnitProfile
-        get() = io.github.hypercar.headunit.HeadUnitProfiles.current()
+    @Volatile private var sessionProfile: HeadUnitProfile? = null
+    private val headUnitProfile: HeadUnitProfile
+        get() = sessionProfile ?: HeadUnitProfiles.current()
 
     /** 相对 [sessionStageStart] 的毫秒数，用于阶段日志前缀。 */
     private fun stageMs(): Long =
@@ -876,6 +880,9 @@ object HyperCarRepo {
             log("CONNECT: 已在连接/已连接，忽略重复触发")
             return
         }
+        val selection = connectionProfile() ?: return
+        val profile = checkNotNull(selection.profile)
+        sessionProfile = profile
         // 手动/自动发起连接都算"用户想要连"，清掉断开标记与重连倒计时
         userDisconnectRequested = false
         reconnectJob?.cancel()
@@ -896,9 +903,8 @@ object HyperCarRepo {
         lastConnectInviteNudgeAt = 0L
         lastHandoffInviteNudgeAt = 0L
         io.github.hypercar.carui.MusicNotificationListener.sync(context)
-        val profile = headUnitProfile
         connectionAttemptId = connectionDiagnostics.begin(source,
-            "${profile.id} remote=${io.github.hypercar.headunit.RemoteProfiles.isRemote(profile.id)} " +
+            "${profile.id} remote=${selection.remote} " +
                 "activation=${profile.requireAirplayActivation} outbound=${profile.allowOutboundIap2} " +
                 "profileGuard=${profile.dropProfilesBeforeIap2}", SystemClock.uptimeMillis())
         aclObservedAt?.let { recordAclObservation(connectionAttemptId, true, it) }
@@ -980,6 +986,24 @@ object HyperCarRepo {
     }
 
     private val targetCarChanges = Any()
+
+    internal suspend fun selectHeadUnitProfile(profileId: String, expectedTargetMac: String?, keepTarget: Boolean): String? =
+        autoConnectChanges.withLock {
+            synchronized(targetCarChanges) {
+                if (hasCurrentSession) return@synchronized "连接中，请断开后再切换档案"
+                val selection = HeadUnitProfiles.catalog().select(profileId)
+                selection.blockReason?.let { return@synchronized it }
+                if (SettingsStore.headUnitProfileId == profileId) return@synchronized null
+                val target = SettingsStore.targetCarMac
+                if (!target.orEmpty().equals(expectedTargetMac.orEmpty(), ignoreCase = true)) {
+                    return@synchronized "目标车机已变化，请重新确认"
+                }
+                val targetName = SettingsStore.targetCarName
+                SettingsStore.headUnitProfileId = profileId
+                updateTargetCar(target.takeIf { keepTarget }, targetName.takeIf { keepTarget })
+                null
+            }
+        }
 
     private fun cachedHotspotMatchesTarget(): Boolean =
         hotspotHandoff.matchesTarget(SettingsStore.targetCarMac, established = sessionHadLink)
@@ -1172,10 +1196,18 @@ object HyperCarRepo {
     private val standbyEndpoint = AtomicReference<CarPlayEndpoint?>(null)
     @Volatile private var iap2WifiHistory = Iap2WifiCredentialHistory()
 
-    private var coordinatorProfile: io.github.hypercar.headunit.HeadUnitProfile? = null
+    private var coordinatorProfile: HeadUnitProfile? = null
 
-    private fun coordinatorFor(context: Context): Iap2Coordinator {
-        val profile = headUnitProfile
+    private fun connectionProfile(): RemoteProfiles.Selection? {
+        val selection = HeadUnitProfiles.selection()
+        val reason = selection.blockReason ?: return selection
+        stopStandbyListening(standbyReady = false)
+        log("PROFILE: 阻止新连接：$reason")
+        push(link = LinkState.Failed(reason))
+        return null
+    }
+
+    private fun coordinatorFor(context: Context, profile: HeadUnitProfile): Iap2Coordinator {
         val existing = iap2
         if (existing != null && coordinatorProfile == profile) return existing
         existing?.stop()
@@ -1187,9 +1219,11 @@ object HyperCarRepo {
             targetMac = { SettingsStore.targetCarMac },
             preferredMac = { aclCarMac },
             deviceMacProvider = BluetoothMac::resolve,
-            dropProfilesBeforeIap2 = profile.dropProfilesBeforeIap2,
-            allowOutboundIap2 = profile.allowOutboundIap2,
-            profileId = profile.id,
+            profile = profile,
+            canStartSession = {
+                val activeProfile = sessionProfile?.takeIf { sessionLive.get() }
+                (activeProfile ?: HeadUnitProfiles.selection().profile) == profile
+            },
             onInboundSession = { attempt, peer, at -> connectionDiagnostics.rfcommAccepted(attempt, peer, at) },
             diagnosticAttempt = { connectionAttemptId.takeIf { sessionLive.get() } ?: 0L },
             wifiCredentialHistory = { iap2WifiHistory },
@@ -1199,6 +1233,7 @@ object HyperCarRepo {
 
     private fun startStandbyListening() {
         if (!automaticConnectionAllowed || hasCurrentSession) return
+        val profile = connectionProfile()?.profile ?: return
         appContext()?.let { io.github.hypercar.carui.MusicNotificationListener.sync(it) }
         val context = appContext() ?: return
         if (StartupRequirements.read(context).automaticStandbyIssues.isNotEmpty()) {
@@ -1206,7 +1241,7 @@ object HyperCarRepo {
             return
         }
         startWifiReconnectMonitor(context)
-        val coordinator = coordinatorFor(context)
+        val coordinator = coordinatorFor(context, profile)
         coordinator.start { propose ->
             synchronized(iap2EndpointChanges) {
                 if (iap2 !== coordinator) return@start false
@@ -1232,6 +1267,7 @@ object HyperCarRepo {
     /** Keep the same SDP/SCN, but never run a handshake or outbound probe during cooldown. */
     private fun startIdentityOnly() {
         if (!keepIdleIdentity || hasCurrentSession) return
+        val profile = connectionProfile()?.profile ?: return
         val context = appContext() ?: return
         stopWifiReconnectMonitor()
         reconnectJob?.cancel()
@@ -1239,7 +1275,7 @@ object HyperCarRepo {
         CarProfileGuard.stop()
         iap2WifiHistory = Iap2WifiCredentialHistory()
         standbyEndpoint.set(null)
-        val coordinator = coordinatorFor(context)
+        val coordinator = coordinatorFor(context, profile)
         coordinator.keepIdentityOnly()
         io.github.hypercar.carui.MusicNotificationListener.sync(context)
         if (coordinator.isRunning) {
@@ -1275,7 +1311,7 @@ object HyperCarRepo {
     private fun receiverForEngine(): String? {
         val active = iap2?.activePeerAddress
         val desktop = io.github.hypercar.headunit.ReceiverCompatibility.isDesktopReceiver(
-            SettingsStore.headUnitProfileId,
+            headUnitProfile.id,
             io.github.hypercar.iap2.Iap2Peer.softwareIdentityFor(active),
         )
         val selected = PairingEvidence.receiverMac(active, sessionReceiverMac, wifiReceiverMac, desktop)
@@ -1674,7 +1710,7 @@ object HyperCarRepo {
             // WinPlay 就是拿它和「目标蓝牙设备」（Windows 里配对的经典蓝牙地址）比，
             // 不一致直接对会话级 SETUP 回 403（cpStack.ts 的 deviceFilter）。
             // 所以这里明确区分「真实 MAC」和「伪 MAC」，伪 MAC 时把后果写进日志。
-            val coordinator = coordinatorFor(context)
+            val coordinator = coordinatorFor(context, headUnitProfile)
             val phoneIdentity = coordinator.identityForSession()
             val deviceMac = phoneIdentity.address
             val usesFallbackPhoneIdentity = deviceMac == SettingsStore.stableDeviceId
@@ -1711,7 +1747,7 @@ object HyperCarRepo {
             // `GET /ctrl-int/1/connect` 邀请手机，**邀请成功才下发 0x4301**。
             // 若等 0x4301 才去入网，双方互等（旧实现就是这样，真车上永远拿不到端点）。
             val controlServiceName = io.github.hypercar.net.ControlServiceName.forProfile(
-                p.id, io.github.hypercar.bluetooth.LocalDeviceName.snapshot())
+                p.protocolProfileId, io.github.hypercar.bluetooth.LocalDeviceName.snapshot())
             val advertiser = CarPlayCtrlAdvertiser(context, { deviceMac }, ::log, onDiagnostic = { event, port ->
                 if (event == CarPlayCtrlAdvertiser.Event.INVITED && invited.compareAndSet(false, true)) {
                     caffProbe.cancel()
@@ -1861,14 +1897,14 @@ object HyperCarRepo {
                         }
                     },
                     preparationKey = preparation@{
-                        if (!manual && p.id != "bmw_id85") return@preparation null
+                        if (!manual && p.protocolProfileId != "bmw_id85") return@preparation null
                         val target = SettingsStore.targetCarMac
                         val allowed = sessionLive.get() && connectionAttemptId == discoveryAttempt && !userDisconnectRequested
                         val listening = coordinator.isListening
                         if (!allowed || !listening || (!manual && target.isNullOrBlank() && boundNetwork != null)) return@preparation null
                         runCatching {
                             val devices = android.bluetooth.BluetoothAdapter.getDefaultAdapter()?.bondedDevices.orEmpty()
-                            ReconnectDiscoverability.preparationKey(p.id, manual, target, listening, allowed, SettingsStore.pairedCars) { mac ->
+                            ReconnectDiscoverability.preparationKey(p.protocolProfileId, manual, target, listening, allowed, SettingsStore.pairedCars) { mac ->
                                 devices.firstOrNull { it.address.equals(mac, ignoreCase = true) }?.let { device ->
                                     runCatching { device.name }.getOrNull().orEmpty()
                                 }
@@ -2183,7 +2219,8 @@ object HyperCarRepo {
                         val json = SettingsStore.engineConfigJson(apHostFinal, port, deviceMac, identityPath,
                             receiverBluetoothMac = receiver, carWithSource = sessionCarWithMode,
                             receiverModel = coordinator.activePeerAddress?.takeIf { it.equals(receiver, ignoreCase = true) }
-                                ?.let { io.github.hypercar.iap2.Iap2Peer.modelFor(it) } ?: mdnsEndpoint?.model)
+                                ?.let { io.github.hypercar.iap2.Iap2Peer.modelFor(it) } ?: mdnsEndpoint?.model,
+                            headUnitProfile = headUnitProfile)
                         log("SESSION-ORIGIN: ctrlInvite=${advertiser.lastInvitation != null} endpointFromInvite=${endpoint.fromInvite} " +
                             "bluetoothSession=${coordinator.isSessionActive} knownWifi=${wifiReceiverMac != null} network=$boundNetwork")
                         log("CORE +${stageMs()}ms 引擎配置：$json")
@@ -2541,6 +2578,7 @@ object HyperCarRepo {
         sessionIdentity = null
         sessionWifiSsid = null
         wifiStationSnapshot = null
+        sessionProfile = null
         appContext()?.let { io.github.hypercar.carui.MusicNotificationListener.sync(it) }
     }
 
@@ -2739,7 +2777,7 @@ object HyperCarRepo {
         finally { carWifiRequests.unlock() }
         // Resolve before opening the control TCP socket; optional shell metadata must not
         // delay the first SETUP on an already accepted receiver connection.
-        if (network != null && headUnitProfile.id == "bmw_id85" &&
+        if (network != null && headUnitProfile.protocolProfileId == "bmw_id85" &&
             wifiStationSnapshot?.let { it.first == attempt && it.second == network } != true) {
             val mac = try { wifiStationMac(context, network) }
             catch (cancelled: CancellationException) { throw cancelled }
@@ -3843,7 +3881,7 @@ object HyperCarRepo {
             SettingsStore.receiverViewport = (width to height).takeIf { width >= 320 && height >= 240 }
             if (sessionLive.get() && width in 320..8192 && height in 240..8192) {
                 // receiverForEngine froze the actual peer for this AirPlay session.
-                val key = PairingEvidence.canvasKey(headUnitProfile.id, sessionReceiverMac)
+                val key = PairingEvidence.canvasKey(headUnitProfile.protocolProfileId, sessionReceiverMac)
                 if (key != null) SettingsStore.rememberCarWithCanvas(key, width, height)
                 log("CARWITH-SIZE: receiver=${width}x$height canvas_cache=${if (key != null) "saved" else "no_session_identity"}")
             }
@@ -4921,7 +4959,7 @@ object HyperCarRepo {
         fun current() = sessionLive.get() && carWithEntries.current(diagnosticId)
         if (!current()) return false
         // Known-Wi-Fi wakes run before resumeKnownCarNetwork populates wifiReceiverMac.
-        val profile = headUnitProfile.id
+        val profile = headUnitProfile.protocolProfileId
         val key = PairingEvidence.canvasKey(profile, iap2?.activePeerAddress,
             wakePeer, wifiReceiverMac, aclCarMac, SettingsStore.targetCarMac)
             ?: if (profile in setOf("bmw_id85", "bmw_id9")) {
@@ -4930,7 +4968,7 @@ object HyperCarRepo {
         val cached = PairingEvidence.cachedCanvas(key, SettingsStore::carWithCanvas)
         val canvas = cached ?: (1920 to 1080)
         val config = org.json.JSONObject(SettingsStore.engineConfigJson("127.0.0.1", 0, deviceMac, "",
-            carWithSource = true)).put("width", canvas.first).put("height", canvas.second)
+            carWithSource = true, headUnitProfile = headUnitProfile)).put("width", canvas.first).put("height", canvas.second)
             .put("carwith_cached_canvas", cached != null)
             .put("carwith_navigation_enabled", carWithHudNavigationAllowed).toString()
         log("CARWITH: 源端预热画布 ${canvas.first}x${canvas.second} canvas_cache=" +

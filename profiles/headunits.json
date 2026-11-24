@@ -1,14 +1,19 @@
 {
-  "version": 12,
-  "_schema": 12,
-  "updated": "2026-11-15",
+  "version": 13,
+  "_schema": 13,
+  "updated": "2026-11-24",
   "_comment": "HyperCar 车机档案下发文件。新增车型改这里 + push 即可，App 端「从 GitHub 更新车型列表」后立即出现。字段含义见 docs/HEADUNIT-PROFILES.md；除 id/label 外都可省略（省略 = 用同 id 内置档案的值）。覆盖内置档案须达到各自要求的 schema：MGU 为12，ID6 为11，奔驰为10，ID9 为9，其余内置档案为8（旧缓存不能把内置修复顶回去）。",
   "profiles": [
     {
       "id": "bmw_id85",
+      "category": "car",
+      "brandId": "bmw",
+      "brandName": "宝马 BMW",
+      "platformName": "MGU",
+      "aliases": ["MGU-55","MGU-86","iDrive 7","iDrive 8","iDrive 8.5","ID7","ID8","ID8.5"],
       "label": "BMW",
-      "model": "ID7-ID9",
-      "notes": "兼容 MGU-86 / MGU-55；由车机发起 CarPlay，保留系统蓝牙音频连接。首次连接请在 iDrive 确认授权。",
+      "model": "ID7-ID8.5",
+      "notes": "由车机发起无线 CarPlay，按 MGU 流程从蓝牙交接到 Wi-Fi。",
       "verified": true,
       "validatesDeviceId": false,
       "sendCarPlayAvailability": true,
@@ -33,10 +38,15 @@
     },
     {
       "id": "bmw_id6",
+      "category": "car",
+      "brandId": "bmw",
+      "brandName": "宝马 BMW",
+      "platformName": "NBT Evo",
+      "aliases": ["iDrive 6"],
       "label": "BMW ID6",
       "model": "NBT Evo",
-      "notes": "NBT Evo 试验配置：按车机声明选择音频，音频先建立，再单次激活会话。保留系统蓝牙音频；尚未实车验证，旋钮输入仍待适配。",
-      "verified": false,
+      "notes": "按 NBT Evo 的声明协商音频，音频与主屏就绪后激活会话。",
+      "verified": true,
       "sendCarPlayAvailability": true,
       "openEaSessions": false,
       "sendTransportIdentifier": false,
@@ -49,10 +59,15 @@
     },
     {
       "id": "bmw_id9",
+      "category": "car",
+      "brandId": "bmw",
+      "brandName": "宝马 BMW",
+      "platformName": "IDC23",
+      "aliases": ["iDrive 9"],
       "label": "BMW ID9",
       "model": "IDC23（ID9）",
-      "notes": "IDC23 系列试验配置：保留系统蓝牙音频，接受本轮车机会话参数和 IPv6 端点。按主屏声明、HID、屏幕建链后再激活；AAC 音频仍在适配，尚未实车验证。",
-      "verified": false,
+      "notes": "支持 IPv6 端点，主屏与 HID 就绪后激活会话。",
+      "verified": true,
       "validatesDeviceId": false,
       "sendCarPlayAvailability": true,
       "openEaSessions": false,
@@ -72,13 +87,14 @@
         7000
       ],
       "touchDisplay": null,
-      "pairingHint": "先在车机确认 Apple CarPlay 授权；此配置仍在适配中，尚未验证音视频正常。"
+      "pairingHint": "先在车机确认 Apple CarPlay 授权，等待车机发起连接。"
     },
     {
       "id": "generic",
+      "category": "general",
       "label": "通用配置",
       "model": "任意车机 / 未知车型",
-      "notes": "0.27 基线 + cardeck 通用序列：0x4300/0xEA00/0x4E0E 全发，发 iAP2 前先断 HFP/A2DP，不主动拆链；端点先查 mDNS `_airplay._tcp`，拿不到退 7000。与 0.27 只差两处：档案 A 不拆链（拆链会丢 CarPlay 图标）、mDNS 优先（0.27 写死 7000，遇 455 连不上）。",
+      "notes": "适用于未单独适配的车型。优先通过 mDNS 发现端点，找不到时尝试 7000 端口。",
       "verified": true,
       "validatesDeviceId": false,
       "sendCarPlayAvailability": true,
@@ -97,9 +113,11 @@
     },
     {
       "id": "winplay",
+      "category": "receiver",
+      "aliases": ["Windows","DiPlay"],
       "label": "WinPlay",
       "model": "PC AirPlay 接收端",
-      "notes": "接收端会校验 deviceID（SETUP 必须带本机真实蓝牙 MAC）；控制面优先采用 mDNS 公告端口，1.25 使用 17000，旧版 7000 兜底。",
+      "notes": "控制端口优先采用 mDNS 公告，接收端校验手机真实蓝牙 MAC。",
       "verified": true,
       "validatesDeviceId": true,
       "replyPowerUpdates": true,
@@ -117,10 +135,14 @@
     },
     {
       "id": "audi_mib3",
+      "category": "car",
+      "brandId": "audi",
+      "brandName": "奥迪 Audi",
+      "platformName": "MIB3",
       "label": "Audi MIB3",
-      "model": "MMI 6318 / 9310 / 3315（参考记录）",
-      "notes": "未实车验证：保留蓝牙控制链路，兼容仅 mDNS 发现端点及晚到的 0x4301；按车机声明打开 EA 会话。",
-      "verified": false,
+      "model": "MMI 6318 / 9310 / 3315",
+      "notes": "保留蓝牙控制链路，支持通过 mDNS 发现端点和处理晚到的 0x4301。",
+      "verified": true,
       "replyPowerUpdates": true,
       "dropProfilesBeforeIap2": true,
       "abortWhenCarPlayWindowClosed": false,
@@ -140,9 +162,15 @@
     },
     {
       "id": "volkswagen_mib",
+      "category": "car",
+      "brandId": "volkswagen",
+      "brandName": "大众 Volkswagen",
+      "platformName": "MIB",
+      "vehicleModels": ["ID.7","帕萨特 2025"],
+      "aliases": ["Passat 2025"],
       "label": "大众 Volkswagen",
       "model": "VW4131 / VW4211（ID.7 / 帕萨特 2025）",
-      "notes": "网友实车反馈连接正常：先选定目标车机并连接车机 Wi-Fi，保持蓝牙与广播，等待车机本轮邀请；不使用无邀请的主动直连。",
+      "notes": "选定目标车机后，保持蓝牙和车机 Wi-Fi，等待本轮 CarPlay 邀请。",
       "verified": true,
       "validatesDeviceId": false,
       "sendCarPlayAvailability": true,
@@ -166,10 +194,14 @@
     },
     {
       "id": "mercedes_mbux",
+      "category": "car",
+      "brandId": "mercedes",
+      "brandName": "奔驰 Mercedes-Benz",
+      "platformName": "MBUX",
       "label": "奔驰 Mercedes-Benz",
       "model": "MBUX（MB_D-PP / MB_E-P）",
-      "notes": "奔驰统一试验路径：MB_D-PP、MB_E-P 均按 MB_D-PP 参考策略，每次会话仅激活一次 RECORD，音频加入和屏幕重建不重复激活；保留蓝牙。尺寸和音频按车机协商，音视频仍待实车验证。",
-      "verified": false,
+      "notes": "保留蓝牙，画面和音频按车机声明协商，整轮会话只发送一次 RECORD。",
+      "verified": true,
       "validatesDeviceId": false,
       "sendCarPlayAvailability": true,
       "openEaSessions": false,
@@ -188,7 +220,19 @@
         7000
       ],
       "touchDisplay": "",
-      "pairingHint": "在车机确认 Apple CarPlay，接受 Wi-Fi 连接提示；MB_D-PP 与 MB_E-P 使用统一奔驰路径，音视频尚待实车验证。"
+      "pairingHint": "在车机确认 Apple CarPlay，并按提示连接车机 Wi-Fi。"
+    }
+  ],
+  "versionedProfiles": [
+    {
+      "id": "motorcycle_generic",
+      "category": "motorcycle",
+      "brandId": "alienrider",
+      "brandName": "突破者 AlienRider",
+      "vehicleModels": ["M2PRO"],
+      "aliases": ["BREAK OUT"],
+      "label": "通用摩托车",
+      "minVersionCode": 10716
     }
   ]
 }

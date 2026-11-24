@@ -27,7 +27,7 @@ class RemoteProfilesTest {
             assertTrue("schema=$schema", merged.single { it.id == mgu.id }.useScreenResourceLifecycle)
             assertFalse(RemoteProfiles.canOverrideBuiltin(mgu.id, schema))
         }
-        assertEquals(12, RemoteProfiles.SCHEMA)
+        assertEquals(13, RemoteProfiles.SCHEMA)
         assertTrue(RemoteProfiles.canOverrideBuiltin(mgu.id, 12))
         assertEquals(stale, RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(stale), 12)
             .single { it.id == mgu.id })
@@ -47,7 +47,7 @@ class RemoteProfilesTest {
             .single { it.id == "volkswagen_mib" }
         assertEquals(HeadUnitProfiles.VOLKSWAGEN, effective)
         assertTrue(effective.verified)
-        assertFalse(HeadUnitProfiles.MERCEDES_MBUX.verified)
+        assertTrue(HeadUnitProfiles.MERCEDES_MBUX.verified)
     }
 
     @Test fun cachedSchemaSixCannotDisableAudiHandshakeMessages() {
@@ -95,7 +95,8 @@ class RemoteProfilesTest {
 
     @Test fun newProfileUsesBmwTemplateForOmittedPolicies() {
         val parsed = RemoteProfiles.parse("""[{"id":"new_car","label":"New car"}]""").single()
-        assertEquals(HeadUnitProfiles.BMW_ID85.copy(id = "new_car", label = "New car"), parsed)
+        assertEquals(HeadUnitProfiles.BMW_ID85.copy(id = "new_car", label = "New car", verified = false,
+            listing = HeadUnitListing()), parsed)
     }
 
     @Test fun id9BootstrapIsInheritedAndCannotBeDisabledBySchemaEightCache() {
@@ -137,6 +138,102 @@ class RemoteProfilesTest {
         assertEquals(override, merged.first())
     }
 
+    @Test fun oldVerificationCopyCannotHideTheCurrentResultOrChangeTransportOverrides() {
+        val audi = HeadUnitProfiles.AUDI_MIB3
+        val stale = audi.copy(label = "自定义奥迪", notes = "未实车验证", verified = false,
+            model = "旧说明", pairingHint = "旧引导", allowOutboundIap2 = false)
+        val updated = audi.copy(label = stale.label, allowOutboundIap2 = false)
+        assertEquals(updated, RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(stale), 12)
+            .single { it.id == audi.id })
+        assertEquals(stale, RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(stale), 13)
+            .single { it.id == audi.id })
+    }
+
+    @Test fun outdatedNotesCannotReplaceTheCurrentDescriptionForAnAlreadyVerifiedProfile() {
+        val vw = HeadUnitProfiles.VOLKSWAGEN
+        val cached = vw.copy(notes = "旧说明", preferMdnsAirplay = false)
+        assertEquals(cached.copy(notes = vw.notes), RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(cached), 12)
+            .single { it.id == vw.id })
+        assertEquals(cached, RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(cached), 13)
+            .single { it.id == vw.id })
+    }
+
+    @Test fun appVersionGatesRemoteAdditionsAndOverridesEvenWhenRestoredFromCache() {
+        val raw = """{"profiles":[{"id":"legacy_extra","label":"Legacy"}],"versionedProfiles":[
+            {"id":"bmw_id85","label":"New BMW","minVersionCode":10716},
+            {"id":"legacy_extra","label":"Updated extra","minVersionCode":10716},
+            {"id":"versioned_extra","label":"New receiver","minVersionCode":10716}
+        ]}"""
+        val cached = RemoteProfiles.parse(raw)
+        fun effectiveAt(versionCode: Int, schema: Int = RemoteProfiles.SCHEMA) =
+            RemoteProfiles.merge(HeadUnitProfiles.builtin, cached, schema, versionCode).associateBy { it.id }
+        val older = effectiveAt(10715)
+        assertEquals(HeadUnitProfiles.BMW_ID85, older.getValue("bmw_id85"))
+        assertEquals("Legacy", older.getValue("legacy_extra").label)
+        assertFalse("versioned_extra" in older)
+        for (eligible in listOf(10716, 10717)) {
+            val effective = effectiveAt(eligible)
+            assertEquals("New BMW", effective.getValue("bmw_id85").label)
+            assertEquals("Updated extra", effective.getValue("legacy_extra").label)
+            assertEquals("New receiver", effective.getValue("versioned_extra").label)
+            assertEquals(HeadUnitProfiles.BMW_ID85, effectiveAt(eligible, schema = 11).getValue("bmw_id85"))
+        }
+    }
+
+    @Test fun invalidVersionRequirementsCannotEnableRemoteEntries() {
+        val raw = """{"profiles":[{"id":"legacy"}],"versionedProfiles":[
+            {"id":"missing"},{"id":"invalid","minVersionCode":"10716"},
+            {"id":"fractional","minVersionCode":10716.9},{"id":"zero","minVersionCode":0},
+            {"id":"negative","minVersionCode":-1},{"id":"overflow","minVersionCode":2147483648},
+            {"id":"valid","minVersionCode":10716}
+        ]}"""
+        assertEquals(listOf("legacy", "valid"), RemoteProfiles.parse(raw).map { it.id })
+    }
+
+    @Test fun eachCatalogUsesItsOwnSchemaAndCountsOnlyAppliedRemoteEntries() {
+        val old = RemoteProfiles.parseSnapshot("""{"_schema":11,"profiles":[
+            {"id":"bmw_id85","label":"Old override"},{"id":"active_extra"},
+            {"id":"active_extra","label":"Duplicate extra"}
+        ],"versionedProfiles":[{"id":"locked_extra","minVersionCode":10717}]}""")
+        val fresh = RemoteProfiles.parseSnapshot("""{"_schema":12,"profiles":[
+            {"id":"bmw_id85","label":"Fresh override"}
+        ]}""")
+        val oldCatalog = RemoteProfiles.mergeCatalog(HeadUnitProfiles.builtin, old, 10716)
+        val freshCatalog = RemoteProfiles.mergeCatalog(HeadUnitProfiles.builtin, fresh, 10716)
+        assertEquals(setOf("active_extra"), oldCatalog.remoteIds)
+        assertEquals(HeadUnitProfiles.BMW_ID85, oldCatalog.select("bmw_id85").profile)
+        assertEquals(setOf("bmw_id85"), freshCatalog.remoteIds)
+        assertEquals("Fresh override", freshCatalog.select("bmw_id85").profile?.label)
+    }
+
+    @Test fun remoteOnlySelectionCanBeLockedOrRemovedWithoutFallingBackToBmw() {
+        val updates = RemoteProfiles.parseSnapshot("""{"_schema":12,"versionedProfiles":[
+            {"id":"remote_car","label":"Remote Car","minVersionCode":10716},
+            {"id":"remote_car","label":"New Remote Car","minVersionCode":10717},
+            {"id":"bmw_id85","minVersionCode":10717}
+        ]}""")
+        val older = RemoteProfiles.mergeCatalog(HeadUnitProfiles.builtin, updates, 10715)
+        assertNull(older.select("remote_car").profile)
+        assertEquals("Remote Car", older.select("remote_car").label)
+        assertTrue(older.select("remote_car").blockReason.orEmpty().contains("10716"))
+        assertEquals(HeadUnitProfiles.BMW_ID85, older.select("bmw_id85").profile)
+        assertNull(older.select("bmw_id85").blockReason)
+        assertNull(older.select("removed_car").profile)
+        assertNotNull(older.select("removed_car").blockReason)
+        val eligible = RemoteProfiles.mergeCatalog(HeadUnitProfiles.builtin, updates, 10716)
+        assertEquals("Remote Car", eligible.select("remote_car").profile?.label)
+        assertNull(eligible.select("remote_car").blockReason)
+    }
+
+    @Test fun exportKeepsGatedEntriesInvisibleToLegacyReaders() {
+        val plain = HeadUnitProfiles.GENERIC
+        val gated = HeadUnitProfiles.MOTORCYCLE.copy(minVersionCode = 10716)
+        val raw = RemoteProfiles.encode(listOf(plain, gated))
+        assertEquals(plain.id, JSONObject(raw).getJSONArray("profiles").getJSONObject(0).getString("id"))
+        assertEquals(1, JSONObject(raw).getJSONArray("profiles").length())
+        assertEquals(listOf(plain, gated), RemoteProfiles.parse(raw))
+    }
+
     @Test fun exportPreservesAllPoliciesAndCanBeMergedAgain() {
         val profiles = HeadUnitProfiles.builtin + HeadUnitProfiles.WINPLAY.copy(
             id = "custom", requireAirplayActivation = true,
@@ -154,14 +251,24 @@ class RemoteProfilesTest {
         val config = listOf(File("../profiles/headunits.json"), File("profiles/headunits.json"))
             .first { it.isFile }.readText()
         assertEquals(RemoteProfiles.SCHEMA, JSONObject(config).getInt("_schema"))
+        val legacyList = JSONObject(config).getJSONArray("profiles")
+        assertFalse((0 until legacyList.length()).any {
+            legacyList.getJSONObject(it).getString("id") == HeadUnitProfiles.MOTORCYCLE_ID
+        })
+        assertFalse((0 until legacyList.length()).any {
+            legacyList.getJSONObject(it).has("minVersionCode")
+        })
         val remote = RemoteProfiles.parse(config).associateBy { it.id }
         assertEquals(HeadUnitProfiles.builtin.map { it.id }.toSet(), remote.keys)
+        assertTrue(HeadUnitProfiles.builtin.all { it.verified })
+        assertTrue(remote.values.all { it.verified })
+        assertEquals(10716, remote.getValue(HeadUnitProfiles.MOTORCYCLE_ID).minVersionCode)
         for (builtin in HeadUnitProfiles.builtin) {
             // Display copy may differ, transport and lifecycle policies must not drift.
             val actual = remote.getValue(builtin.id)
             assertEquals(builtin.id, builtin.copy(
                 label = actual.label, model = actual.model, notes = actual.notes,
-                pairingHint = actual.pairingHint,
+                pairingHint = actual.pairingHint, minVersionCode = actual.minVersionCode,
             ), actual)
         }
     }

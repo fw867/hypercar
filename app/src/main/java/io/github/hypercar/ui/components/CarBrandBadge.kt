@@ -11,6 +11,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.DirectionsCar
 import androidx.compose.material.icons.rounded.DesktopWindows
+import androidx.compose.material.icons.rounded.TwoWheeler
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -29,6 +30,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import io.github.hypercar.headunit.HeadUnitProfiles
 import io.github.hypercar.ui.theme.ElectricCyan
 import io.github.hypercar.ui.theme.StrokeGlass
 import io.github.hypercar.ui.theme.SurfaceInset
@@ -47,18 +49,24 @@ fun CarBrandBadge(profileId: String, label: String, modifier: Modifier = Modifie
         "winplay" in identity || "diplay" in identity -> "desktop"
         else -> "generic"
     }
+    val icon = when {
+        profileId == HeadUnitProfiles.MOTORCYCLE_ID -> Icons.Rounded.TwoWheeler
+        brand == "desktop" -> Icons.Rounded.DesktopWindows
+        brand == "generic" -> Icons.Rounded.DirectionsCar
+        else -> null
+    }
     val dark = LocalAppPalette.current.dark
     val frame = if (framed) Modifier.background(
-        if (brand == "generic" || brand == "desktop") SurfaceInset else Color(0xFF17202C), RoundedCornerShape(12.dp))
+        if (icon != null) SurfaceInset else Color(0xFF17202C), RoundedCornerShape(12.dp))
         .border(1.dp, StrokeGlass.copy(alpha = 0.65f), RoundedCornerShape(12.dp)).padding(6.dp) else Modifier
     Box(
         modifier.size(size).then(frame).semantics {
-            contentDescription = if (brand == "generic" || brand == "desktop") label else "$brand 品牌标识"
+            contentDescription = if (icon != null) label else "$brand 品牌标识"
         },
         contentAlignment = Alignment.Center,
     ) {
-        if (brand == "generic" || brand == "desktop") {
-            Icon(if (brand == "desktop") Icons.Rounded.DesktopWindows else Icons.Rounded.DirectionsCar,
+        if (icon != null) {
+            Icon(icon,
                 contentDescription = null, tint = ElectricCyan, modifier = Modifier.size(size * 0.54f))
         } else if (brand == "BMW") {
             Image(painterResource(if (framed || dark) R.drawable.ic_brand_bmw_light else R.drawable.ic_brand_bmw),

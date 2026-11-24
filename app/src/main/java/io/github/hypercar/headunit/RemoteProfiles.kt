@@ -2,13 +2,13 @@
 
 import android.content.Context
 
+import io.github.hypercar.BuildConfig
 import io.github.hypercar.settings.SettingsStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
+import java.util.Locale
 
 /**
  * 远程车机档案：从 GitHub 拉一份 JSON，**新增车型不用发版**。
@@ -37,7 +37,8 @@ object RemoteProfiles {
      * 规则：**`_schema` 低于本档案要求版本的条目，只能新增车型，不能覆盖该内置档案**
      * ——这样"修内置档案"必须显式升 schema 才会生效，旧缓存不会把修复顶回去。
      */
-    const val SCHEMA = 12
+    const val SCHEMA = 13
+    private const val PROFILE_DESCRIPTIONS_SCHEMA = 13
 
     /** 档案列表地址（raw.githubusercontent.com，改 `main` 为其它分支即可灰度）。 */
     const val DEFAULT_URL =
@@ -48,43 +49,20 @@ object RemoteProfiles {
         SettingsStore.remoteProfilesUrl.ifBlank { DEFAULT_URL }
 
     /**
-     * 解析结果缓存：设置页每次重组都会调 [cached]，重复 parse 几百字节
-     * 虽然不贵，但没必要——按原始 JSON 串做一次记忆化。
+     * 原始 JSON、档案和 schema 一起发布。刷新与建链可能在不同线程。
      */
-    private var memoRaw: String? = null
-    private var memoList: List<HeadUnitProfile> = emptyList()
-    private var memoSchema: Int = 0
+    @Volatile private var memo: Pair<String, Parsed>? = null
 
-    /** 上次拉取到的远程档案（解析失败时返回空表，不抛异常）。 */
-    fun cached(): List<HeadUnitProfile> {
-        ensureParsed()
-        return memoList
-    }
-
-    /** 上次拉取到的远程配置的 `_schema`（0 = 旧格式/未声明）。 */
-    fun cachedSchema(): Int {
-        ensureParsed()
-        return memoSchema
-    }
-
-    private fun ensureParsed() {
+    internal fun cached(): Parsed {
         val raw = SettingsStore.remoteHeadUnitProfilesJson
-        if (raw.isBlank()) {
-            memoRaw = raw
-            memoList = emptyList()
-            memoSchema = 0
-            return
-        }
-        if (raw == memoRaw) return
-        val parsed = runCatching { parseRaw(raw) }.getOrDefault(Parsed(0, emptyList()))
-        memoRaw = raw
-        memoList = parsed.profiles
-        memoSchema = parsed.schema
+        memo?.takeIf { it.first == raw }?.let { return it.second }
+        val parsed = runCatching { parseSnapshot(raw) }.getOrDefault(Parsed(0, emptyList()))
+        memo = raw to parsed
+        return parsed
     }
 
-    /** 只有实际参与合并的远程档案才显示「远程」角标。 */
-    fun isRemote(id: String): Boolean = cached().any { it.id == id } &&
-        (canOverrideBuiltin(id, cachedSchema()) || HeadUnitProfiles.builtin.none { it.id == id })
+    private fun HeadUnitProfile.supportsAppVersion(appVersionCode: Int): Boolean =
+        minVersionCode?.let { appVersionCode >= it } ?: true
 
     /** MGU resource lifecycle changed in schema 12; preserve other profiles' cache contracts. */
     internal fun canOverrideBuiltin(id: String, schema: Int): Boolean =
@@ -106,28 +84,67 @@ object RemoteProfiles {
         builtin: List<HeadUnitProfile>,
         remote: List<HeadUnitProfile>,
         remoteSchema: Int = SCHEMA,
-    ): List<HeadUnitProfile> {
-        if (remote.isEmpty()) return builtin.map { it.connectionPolicy() }
-        val remoteById = remote.associateBy { it.id }
-        val merged =
-            builtin.map { base ->
-                val fromRemote = remoteById[base.id]
-                (if (fromRemote != null && canOverrideBuiltin(base.id, remoteSchema)) fromRemote else base).connectionPolicy()
-            }
-        val builtinIds = builtin.map { it.id }.toSet()
-        return merged + remote.filter { it.id !in builtinIds }
+        appVersionCode: Int = BuildConfig.VERSION_CODE,
+    ): List<HeadUnitProfile> = mergeCatalog(builtin, Parsed(remoteSchema, remote), appVersionCode).profiles
+
+    internal data class Selection(
+        val profile: HeadUnitProfile?,
+        val lockedProfile: HeadUnitProfile? = null,
+        val remote: Boolean = false,
+    ) {
+        val label: String get() = profile?.label ?: lockedProfile?.label ?: "档案不可用"
+        val blockReason: String? get() = when {
+            profile != null -> null
+            lockedProfile != null -> "所选车机档案需要 App 安装编号 ${lockedProfile.minVersionCode} 或更高，请升级或重新选择"
+            else -> "所选车机档案已不可用，请在「我的车机」重新选择"
+        }
     }
 
-    /** 从 [url] 拉取并落盘；返回本次拿到的档案数（失败抛异常，由调用方展示）。 */
+    internal data class Catalog(
+        val profiles: List<HeadUnitProfile>,
+        val remoteIds: Set<String>,
+        private val locked: Map<String, HeadUnitProfile>,
+    ) {
+        fun select(id: String): Selection {
+            val profile = profiles.firstOrNull { it.id == id }
+            return if (profile != null) Selection(profile, remote = id in remoteIds) else Selection(null, locked[id])
+        }
+    }
+
+    internal fun mergeCatalog(
+        builtin: List<HeadUnitProfile>,
+        remote: Parsed,
+        appVersionCode: Int = BuildConfig.VERSION_CODE,
+    ): Catalog {
+        val builtinIds = builtin.map { it.id }.toSet()
+        val applicable = remote.profiles.filter {
+            it.supportsAppVersion(appVersionCode) && (it.id !in builtinIds || canOverrideBuiltin(it.id, remote.schema))
+        }.associateBy { it.id }
+        val active = builtin.map { base ->
+            val update = applicable[base.id] ?: return@map base.connectionPolicy()
+            val current = when {
+                remote.schema >= PROFILE_DESCRIPTIONS_SCHEMA -> update
+                base.verified && !update.verified ->
+                    update.copy(model = base.model, notes = base.notes, verified = true, pairingHint = base.pairingHint)
+                else -> update.copy(notes = base.notes)
+            }
+            current.connectionPolicy()
+        } + applicable.values.filter { it.id !in builtinIds }
+        val locked = remote.profiles.filterNot { it.supportsAppVersion(appVersionCode) }
+            .groupBy { it.id }.mapValues { (_, profiles) -> profiles.minBy { checkNotNull(it.minVersionCode) } }
+        return Catalog(active, applicable.keys, locked)
+    }
+
+    /** 从 [url] 拉取并落盘；返回当前版本实际应用的远程档案数。 */
     suspend fun refresh(context: Context): Int = withContext(Dispatchers.IO) {
         val body = httpGet(context, url())
         // 先解析再落盘：解析不了就保持旧缓存，避免把设置页搞成空列表
-        val parsed = parseRaw(body)
+        val parsed = parseSnapshot(body)
         require(parsed.profiles.isNotEmpty()) { "配置里没有任何档案" }
         SettingsStore.remoteHeadUnitProfilesJson = body
         SettingsStore.remoteProfilesFetchedAt = System.currentTimeMillis()
-        memoRaw = null // 让 cached() 重新解析
-        parsed.profiles.size
+        memo = body to parsed
+        mergeCatalog(HeadUnitProfiles.builtin, parsed).remoteIds.size
     }
 
     private fun httpGet(
@@ -156,7 +173,7 @@ object RemoteProfiles {
      * 兼容两种顶层形态：`[ {...}, {...} ]` 或 `{ "profiles": [ ... ] }`
      * （带 `version`/`_schema` 之类元信息时用后者更自然）。
      */
-    fun parse(raw: String): List<HeadUnitProfile> = parseRaw(raw).profiles
+    fun parse(raw: String): List<HeadUnitProfile> = parseSnapshot(raw).profiles
 
     /** 解析结果（含顶层 `_schema`；旧格式没写就按 0 处理）。 */
     data class Parsed(
@@ -164,31 +181,39 @@ object RemoteProfiles {
         val profiles: List<HeadUnitProfile>,
     )
 
-    private fun parseRaw(raw: String): Parsed {
+    internal fun parseSnapshot(raw: String): Parsed {
         val trimmed = raw.trim()
-        if (trimmed.startsWith("[")) {
-            val array = JSONArray(trimmed)
-            return Parsed(0, (0 until array.length()).mapNotNull { i -> array.optJSONObject(i)?.let(::readProfile) })
-        }
+        if (trimmed.startsWith("[")) return Parsed(0, readProfiles(JSONArray(trimmed)))
         val root = JSONObject(trimmed)
         val schema = if (root.has("_schema")) root.optInt("_schema", 0) else root.optInt("schema", 0)
-        val array = root.optJSONArray("profiles") ?: JSONArray()
-        return Parsed(schema, (0 until array.length()).mapNotNull { i -> array.optJSONObject(i)?.let(::readProfile) })
+        val profiles = root.optJSONArray("profiles")?.let { readProfiles(it) }.orEmpty()
+        // Old clients read only "profiles". Keep gated entries in a separate array.
+        val versioned = root.optJSONArray("versionedProfiles")?.let { readProfiles(it, requireVersion = true) }.orEmpty()
+        return Parsed(schema, profiles + versioned)
     }
 
-    private fun readProfile(o: JSONObject): HeadUnitProfile? {
+    private fun readProfiles(array: JSONArray, requireVersion: Boolean = false): List<HeadUnitProfile> =
+        (0 until array.length()).mapNotNull { index ->
+            array.optJSONObject(index)?.let { readProfile(it, requireVersion) }
+        }
+
+    private fun readProfile(o: JSONObject, requireVersion: Boolean): HeadUnitProfile? {
         val id = o.optString("id").trim()
         if (id.isEmpty()) return null
+        val minVersionCode = if (requireVersion || o.has("minVersionCode")) {
+            (o.opt("minVersionCode") as? Number)?.toString()?.toIntOrNull()?.takeIf { it > 0 } ?: return null
+        } else null
         // 默认值取**同 id 的内置档案**（不是一律取宝马）：远程只覆盖它显式写出的字段，
         // 没写的沿用内置值——否则新增的字段（如 dropProfilesBeforeIap2）会被数据类默认值
         // 悄悄覆盖，出现「内置已修好、远程一更新又变回去」的冲突。
-        val defaults = HeadUnitProfiles.builtin.firstOrNull { it.id == id } ?: HeadUnitProfiles.BMW_ID85
+        val builtin = HeadUnitProfiles.builtin.firstOrNull { it.id == id }
+        val defaults = builtin ?: HeadUnitProfiles.BMW_ID85
         return HeadUnitProfile(
             id = id,
             label = o.optString("label").ifBlank { defaults.label },
             model = o.optString("model", defaults.model),
             notes = o.optString("notes", defaults.notes),
-            verified = o.optBoolean("verified", defaults.verified),
+            verified = o.optBoolean("verified", builtin?.verified ?: false),
             validatesDeviceId = o.optBoolean("validatesDeviceId", defaults.validatesDeviceId),
             sendCarPlayAvailability =
                 o.optBoolean("sendCarPlayAvailability", defaults.sendCarPlayAvailability),
@@ -217,7 +242,27 @@ object RemoteProfiles {
             pairingHint = if (o.has("pairingHint")) {
                 o.optString("pairingHint", "").ifBlank { null }
             } else defaults.pairingHint,
+            minVersionCode = minVersionCode,
+            listing = readListing(o, builtin?.listing ?: HeadUnitListing()),
         ).connectionPolicy()
+    }
+
+    private fun readListing(json: JSONObject, fallback: HeadUnitListing): HeadUnitListing {
+        fun readList(key: String, default: List<String>): List<String> {
+            val values = json.optJSONArray(key) ?: return default
+            return (0 until values.length()).mapNotNull { index ->
+                (values.opt(index) as? String)?.trim()?.takeIf { it.isNotEmpty() }
+            }.distinct()
+        }
+        return HeadUnitListing(
+            category = HeadUnitCategory.entries.firstOrNull { it.key == json.optString("category") }
+                ?: fallback.category,
+            brandId = json.optString("brandId", fallback.brandId).trim().lowercase(Locale.ROOT),
+            brandName = json.optString("brandName", fallback.brandName).trim(),
+            vehicleModels = readList("vehicleModels", fallback.vehicleModels),
+            platformName = json.optString("platformName", fallback.platformName).trim(),
+            aliases = readList("aliases", fallback.aliases),
+        )
     }
 
     private fun readPorts(o: JSONObject, fallback: List<Int>): List<Int> {
@@ -228,9 +273,11 @@ object RemoteProfiles {
 
     /** 把档案写回 JSON（导出/调试用；也方便「复制当前配置到剪贴板」这类扩展）。 */
     fun encode(list: List<HeadUnitProfile>): String {
-        val arr = JSONArray()
+        val profiles = JSONArray()
+        val versioned = JSONArray()
         list.forEach { p ->
-            arr.put(
+            val entries = if (p.minVersionCode == null) profiles else versioned
+            entries.put(
                 JSONObject().apply {
                     put("id", p.id)
                     put("label", p.label)
@@ -256,9 +303,18 @@ object RemoteProfiles {
                     put("fallbackAirplayPorts", JSONArray(p.fallbackAirplayPorts))
                     put("touchDisplay", p.touchDisplay ?: "")
                     put("pairingHint", p.pairingHint ?: "")
+                    p.minVersionCode?.let { put("minVersionCode", it) }
+                    put("category", p.listing.category.key)
+                    put("brandId", p.listing.brandId)
+                    put("brandName", p.listing.brandName)
+                    put("vehicleModels", JSONArray(p.listing.vehicleModels))
+                    put("platformName", p.listing.platformName)
+                    put("aliases", JSONArray(p.listing.aliases))
                 },
             )
         }
-        return JSONObject().put("_schema", SCHEMA).put("profiles", arr).toString(2)
+        return JSONObject().put("_schema", SCHEMA).put("profiles", profiles).apply {
+            if (versioned.length() > 0) put("versionedProfiles", versioned)
+        }.toString(2)
     }
 }

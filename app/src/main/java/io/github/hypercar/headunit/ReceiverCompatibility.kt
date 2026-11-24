@@ -15,6 +15,9 @@ internal object ReceiverCompatibility {
             else -> true
         }
     }
-    fun useBmwBootstrap(profileId: String, receiverIdentity: String?): Boolean =
-        profileId.startsWith("bmw") && profileId != "bmw_id9" && profileId != "bmw_id6" && !isDesktopReceiver(profileId, receiverIdentity)
+    fun useBmwBootstrap(selectedProfileId: String, receiverIdentity: String?): Boolean {
+        val usesBmwProtocol = selectedProfileId == HeadUnitProfiles.MOTORCYCLE_ID ||
+            (selectedProfileId.startsWith("bmw") && selectedProfileId != "bmw_id9" && selectedProfileId != "bmw_id6")
+        return usesBmwProtocol && !isDesktopReceiver(selectedProfileId, receiverIdentity)
+    }
 }

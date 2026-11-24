@@ -54,6 +54,7 @@ pub struct AirplayParams {
     pub keep_alive_stats: bool,
     pub request_receiver_stats: bool,
     pub bmw_box_bootstrap: bool,
+    pub skip_bluetooth_handoff: bool,
     pub head_unit_profile: String,
     pub mbux_screen_bootstrap: bool,
     pub id9_screen_bootstrap: bool,
@@ -611,10 +612,13 @@ pub async fn negotiate(
     emit_log(&format!("TIMING: after RECORD/resource response {}",p.pipeline.lock().timing.summary()));
     p.pipeline.lock().control_ready=true;
 
-    let mgu_handoff = box_bootstrap && !p.desktop_receiver && p.bmw_capabilities
+    let request_handoff = should_request_bluetooth_handoff(box_bootstrap, p.desktop_receiver, p.skip_bluetooth_handoff);
+    let mgu_handoff = request_handoff && p.bmw_capabilities
         && (receiver_model == "MGU" || receiver_model.starts_with("MGU-"));
     if box_bootstrap && !p.desktop_receiver {
-        if !mgu_handoff {
+        if p.skip_bluetooth_handoff {
+            emit_log("HANDOFF: disableBluetooth skipped by profile");
+        } else if request_handoff && !mgu_handoff {
             let result=request_bluetooth_handoff(&channel, &p.device_id,
                 || crate::wifi_iap2::is_active(wifi_iap_id), stop.clone()).await;
             match result {
@@ -798,6 +802,10 @@ fn diplay_can_validate_independent_audio_without_enabling_other_desktop_receiver
     assert!(!independent_audio_receiver(true,false,true,false,&info("IDC23")));
     assert!(!independent_audio_receiver(true,true,false,false,&info("NBT")));
     assert!(independent_audio_receiver(true,false,false,false,&info("MGU")));
+}
+
+fn should_request_bluetooth_handoff(box_bootstrap: bool, desktop_receiver: bool, skip: bool) -> bool {
+    box_bootstrap && !desktop_receiver && !skip
 }
 
 /// Request the receiver's CarPlay Bluetooth retirement once. Never disable Android Bluetooth.
@@ -2191,6 +2199,16 @@ mod display_size_tests {
         assert!(!use_box_bootstrap(false, &Value::dict(vec![])));
     }
     #[test]
+    fn motorcycle_keeps_box_bootstrap_without_requesting_bluetooth_handoff() {
+        let info = Value::dict(vec![("model", Value::str("Angle"))]);
+        let box_bootstrap = use_box_bootstrap(true, &info);
+        assert!(box_bootstrap);
+        assert!(!should_request_bluetooth_handoff(box_bootstrap, false, true));
+        assert!(should_request_bluetooth_handoff(box_bootstrap, false, false));
+        assert!(!should_request_bluetooth_handoff(box_bootstrap, true, false));
+        assert!(!should_request_bluetooth_handoff(false, false, false));
+    }
+    #[test]
     fn bluetooth_credential_key_stays_stable_when_receiver_ip_changes() {
         assert_eq!(credential_tag(Some("bt_aabbccddee01"), "172_16_1_1"), "bt_aabbccddee01");
         assert_eq!(credential_tag(Some("bt_aabbccddee01"), "192_168_1_1"), "bt_aabbccddee01");
@@ -2947,7 +2965,7 @@ fn buffered_profile_params_for_test() -> AirplayParams {
         car_ip:"127.0.0.1".into(), airplay_port:7000, device_id:String::new(), device_name:String::new(),
         wifi_mac_address:None, identity_path:String::new(), receiver_id:None, receiver_model:None, receiver_previously_connected:true,
         enable_audio:true, audio_codec:"auto".into(), video_codec:"h264".into(), bmw_capabilities:true,
-        microphone_probe:None, keep_alive_stats:false, request_receiver_stats:false, bmw_box_bootstrap:true, head_unit_profile:"bmw_id9".into(),
+        microphone_probe:None, keep_alive_stats:false, request_receiver_stats:false, bmw_box_bootstrap:true, skip_bluetooth_handoff:false, head_unit_profile:"bmw_id9".into(),
         mbux_screen_bootstrap:false, id9_screen_bootstrap:true, nbt_audio_first:false, mbux_media_compat:false,
         desktop_receiver:false, width:1920, height:720, touch_display:None, touch_rect:None,
         encoder_size:Arc::new(Mutex::new((1920,720))), touch_size:Arc::new(Mutex::new((1920,720))),

@@ -164,20 +164,23 @@ class Id9BluetoothBootstrapTest {
         assertEquals(1,ids.count { it==0x4e0d })
         assertFalse(0x5702 in ids)
     }
-    @Test fun id85LegacyWifiStartsWithTheBoxGreetingSequenceAndDoesNotRepeatWirelessUpdate() {
-        val channel = Channel(legacy = true)
-        Iap2SenderSession(channel,{},deviceName="fixture-phone",onEndpoint={},
-            profile=HeadUnitProfiles.BMW_ID85,nanoTime={channel.time}).run(10_000)
-        val ids = channel.sent.map { it.messageId }
-        assertEquals(listOf(0x4e0c,0x4e0d,0x4e0a,0x4e09,0x4e0b),
-            ids.drop(ids.indexOf(0xaa05)+1).take(5))
-        assertTrue(ids.indexOf(0x5702)>ids.indexOf(0x4e0b))
-        assertEquals(1,ids.count { it==0x4e0d })
-        assertArrayEquals(Iap2Csm.u8(0,1),channel.sent.single { it.messageId==0x4e0d }.body)
-        assertArrayEquals(Iap2Csm.string(0,"fixture-phone"),channel.sent.single { it.messageId==0x4e09 }.body)
+    @Test fun mguAndMotorcycleLegacyWifiUseTheSameBoxGreetings() {
+        for (profile in listOf(HeadUnitProfiles.BMW_ID85, HeadUnitProfiles.MOTORCYCLE)) {
+            val channel = Channel(legacy = true)
+            Iap2SenderSession(channel, {}, deviceName = "fixture-phone", onEndpoint = {},
+                profile = profile, nanoTime = { channel.time }).run(10_000)
+            val ids = channel.sent.map { it.messageId }
+            assertEquals(profile.id, listOf(0x4e0c, 0x4e0d, 0x4e0a, 0x4e09, 0x4e0b),
+                ids.drop(ids.indexOf(0xaa05) + 1).take(5))
+            assertTrue(ids.indexOf(0x5702) > ids.indexOf(0x4e0b))
+            assertEquals(1, ids.count { it == 0x4e0d })
+            assertArrayEquals(Iap2Csm.u8(0, 1), channel.sent.single { it.messageId == 0x4e0d }.body)
+            assertArrayEquals(Iap2Csm.string(0, "fixture-phone"), channel.sent.single { it.messageId == 0x4e09 }.body)
+        }
     }
-    @Test fun onlyId85MovesWirelessUpdateIntoLegacyGreetings() {
-        for (profile in HeadUnitProfiles.builtin.filter { it.id!="bmw_id85" }) {
+    @Test fun otherProtocolsKeepWirelessUpdateAfterLegacyGreetings() {
+        val boxProfiles = setOf(HeadUnitProfiles.BMW_ID85.id, HeadUnitProfiles.MOTORCYCLE.id)
+        for (profile in HeadUnitProfiles.builtin.filter { it.id !in boxProfiles }) {
             val channel = Channel(legacy = true)
             Iap2SenderSession(channel,{},onEndpoint={},profile=profile,nanoTime={channel.time}).run(10_000)
             val ids = channel.sent.map { it.messageId }

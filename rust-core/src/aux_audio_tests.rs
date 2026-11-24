@@ -38,7 +38,7 @@ impl Fixture {
                 wifi_mac_address:None,
             car_ip:"127.0.0.1".into(),airplay_port:7000,device_id:"test".into(),device_name:"Test phone".into(),identity_path:"unused".into(),
             receiver_id:None,receiver_model:None,receiver_previously_connected:true,enable_audio:true,audio_codec:"pcm".into(),video_codec:String::new(),bmw_capabilities:true,microphone_probe:None,keep_alive_stats:false,request_receiver_stats:false,
-            head_unit_profile:"bmw_id85".into(),bmw_box_bootstrap:true,mbux_screen_bootstrap:false,id9_screen_bootstrap:false,nbt_audio_first:false,mbux_media_compat:false,desktop_receiver:false,
+            head_unit_profile:"bmw_id85".into(),bmw_box_bootstrap:true,skip_bluetooth_handoff:false,mbux_screen_bootstrap:false,id9_screen_bootstrap:false,nbt_audio_first:false,mbux_media_compat:false,desktop_receiver:false,
             width:1920,height:720,touch_display:None,touch_rect:None,encoder_size:Arc::new(Mutex::new((1920,720))),touch_size:Arc::new(Mutex::new((1920,720))),
             carwith_display:None,carwith_media_rate:None,carwith_stretch:false,screen_resource_lifecycle:true,pipeline:Arc::new(Mutex::new(crate::pipeline::Pipeline::new())),
         };

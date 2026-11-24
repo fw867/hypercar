@@ -43,13 +43,15 @@ class MercedesMbuxProfileTest {
         assertFalse(profile.validatesDeviceId)
         assertFalse(ReceiverCompatibility.isDesktopReceiver(profile.id, "MB_E-P-4 Mercedes-Benz"))
         assertFalse(ReceiverCompatibility.useBmwBootstrap(profile.id, "MB_E-P-4 Mercedes-Benz"))
-        assertFalse(profile.verified)
+        assertTrue(profile.verified)
     }
 
     @Test fun mbuxKeepsControlOnScreenRejectionWithoutChangingOtherProfilesOrUserSetting() {
         assertTrue(profile.screenResourceLifecycleEnabled(false))
-        for (other in HeadUnitProfiles.builtin.filter { it.id != profile.id && it.id != HeadUnitProfiles.BMW_ID9.id && it.id != HeadUnitProfiles.BMW_ID6.id && it.id != HeadUnitProfiles.BMW_ID85.id }) {
-            assertFalse(other.id, other.screenResourceLifecycleEnabled(false))
+        val lifecycleProfiles = setOf(profile.id, HeadUnitProfiles.BMW_ID9.id, HeadUnitProfiles.BMW_ID6.id,
+            HeadUnitProfiles.BMW_ID85.id, HeadUnitProfiles.MOTORCYCLE.id)
+        for (other in HeadUnitProfiles.builtin) {
+            assertEquals(other.id, other.id in lifecycleProfiles, other.screenResourceLifecycleEnabled(false))
             assertTrue(other.id, other.screenResourceLifecycleEnabled(true))
         }
     }

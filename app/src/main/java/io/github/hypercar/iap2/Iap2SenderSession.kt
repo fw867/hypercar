@@ -246,7 +246,7 @@ class Iap2SenderSession(
         log("iap2 link ready peerMaxControl=${channel.peerMaxControlPayload()}")
 
         // The control descriptor lets paired BMW v1 links authenticate before the peer identifies its role.
-        val authFirst = bondedBmwInbound && pairedReceiver && profile.id.startsWith("bmw_") && channel.peerControlVersion == 1
+        val authFirst = bondedBmwInbound && pairedReceiver && profile.protocolProfileId.startsWith("bmw_") && channel.peerControlVersion == 1
         if (authFirst) {
             enterPhase("MFI_EXCHANGE")
             authenticatePairedAppsV1(null, deadline)
@@ -291,7 +291,7 @@ class Iap2SenderSession(
         // ID8.5 按盒子在设备问候中声明无线可用性；其它档案保留原有 0x5702/0x4E0D 顺序。
         val wifiGen = ReceiverProfile.classifyWifiGen(ident.sendIds, ident.receiveIds)
         val legacyWifiExchange = wifiGen != ReceiverProfile.WifiGen.NEW
-        val boxOrderedGreetings = profile.id == "bmw_id85"
+        val boxOrderedGreetings = profile.protocolProfileId == "bmw_id85"
 
         // ---- MGU／旧路径设备问候；IDC23新式路径已直接发送4300并跳过问候 ----
         // 设备问候必须在 0xAA05 后、订阅/凭据请求前；ID8.5 的完整次序另按盒子抓包校准。
@@ -546,7 +546,7 @@ class Iap2SenderSession(
     }
 
     private fun usesMguReentry(ident: Iap2Messages.Identification): Boolean =
-        pairedReceiver && profile.id == "bmw_id85" && ident.model?.startsWith("MGU-", ignoreCase = true) == true &&
+        pairedReceiver && profile.protocolProfileId == "bmw_id85" && ident.model?.startsWith("MGU-", ignoreCase = true) == true &&
             ident.manufacturer.equals("BMW Group", ignoreCase = true) &&
             (isBmwAppsOnly(ident) ||
                 (ident.declaresReceive(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION) == true &&
@@ -1115,7 +1115,7 @@ class Iap2SenderSession(
         val daylightSaving = if (TimeZone.getDefault().inDaylightTime(Date())) 1 else 0
         // 盒子 MGU-55 抓包：AA05 -> 4E0C/4E0D/4E0A/4E09/4E0B -> 5702。
         // ID9 最小引导仍在上面直接返回；其它档案的问候及正文保持原样。
-        val ids = if (profile.id == "bmw_id85") {
+        val ids = if (profile.protocolProfileId == "bmw_id85") {
             listOf(Iap2MessageIds.DEVICE_UUID_UPDATE, Iap2MessageIds.WIRELESS_CARPLAY_UPDATE,
                 Iap2MessageIds.DEVICE_LANGUAGE_UPDATE, Iap2MessageIds.DEVICE_INFORMATION_UPDATE,
                 Iap2MessageIds.DEVICE_TIME_UPDATE)

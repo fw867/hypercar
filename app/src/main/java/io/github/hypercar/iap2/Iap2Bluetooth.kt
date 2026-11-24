@@ -53,15 +53,8 @@ class Iap2Bluetooth(
     private val targetProvider: () -> String?,
     /** 本机真实蓝牙 MAC（会话里 0x4300/0x4E0C/0x4E0E 用）。 */
     private val bluetoothMacProvider: () -> String,
-    /**
-     * 发 iAP2 前是否主动断开该车机的 HFP/A2DP（车机档案 `dropProfilesBeforeIap2`）。
-     *
-     * 奥迪需要；**宝马不能断**（2026-10-25 现场：断了会把 ACL 一起拽掉，车机反复重连，
-     * 反而不再发起 CarPlay）。
-     */
-    private val dropProfilesBeforeIap2: Boolean = true,
-    private val allowOutboundIap2: Boolean = true,
-    private val profileId: String = "",
+    private val profile: io.github.hypercar.headunit.HeadUnitProfile,
+    private val canStartSession: () -> Boolean,
     private val preferredProvider: () -> String? = { null },
     private val log: (String) -> Unit,
     /** 每次拿到/更新端点即回调（0x5703 凭据与 0x4301 端点都会触发，可能多次）。 */
@@ -72,6 +65,8 @@ class Iap2Bluetooth(
     private val diagnosticAttempt: () -> Long = { 0L },
     private val wifiCredentialHistory: () -> Iap2WifiCredentialHistory = { Iap2WifiCredentialHistory() },
 ) {
+    private val profileId = profile.protocolProfileId
+
     companion object {
         private val HANDSHAKE_IDS = java.util.concurrent.atomic.AtomicLong(0)
         /** 手机侧（我们监听）的 iAP2 服务 UUID；配件端（车机监听）是 …decacaff。 */
@@ -311,11 +306,11 @@ class Iap2Bluetooth(
         val target = targetProvider()
         log(
             "BT: 启动——监听 $SDP_NAME（…cafe，等车机连入）" +
-                (if (allowOutboundIap2) " + 出站尝试车机 iAP2 服务（…caff）" else "，仅被动监听") +
+                (if (profile.allowOutboundIap2) " + 出站尝试车机 iAP2 服务（…caff）" else "，仅被动监听") +
                 if (target != null) {
                     "，目标：$target（只连/只收该设备）"
                 } else {
-                    if (allowOutboundIap2) "（自动：只尝试已配对且声明 iAP2 服务的设备）" else "（等车机发起，不操作其它已配对设备）"
+                    if (profile.allowOutboundIap2) "（自动：只尝试已配对且声明 iAP2 服务的设备）" else "（等车机发起，不操作其它已配对设备）"
                 },
         )
         var lastRegistrationErrorAt: Long? = null
@@ -354,7 +349,7 @@ class Iap2Bluetooth(
             serverThread = this
             start()
         }
-        if (allowOutboundIap2) {
+        if (profile.allowOutboundIap2) {
             Thread({ connectLoop(myGeneration) }, "iap2-bt-client").apply {
                 isDaemon = true
                 clientThread = this
@@ -445,6 +440,10 @@ class Iap2Bluetooth(
         if (!io.github.hypercar.bluetooth.CarTargetPolicy.acceptsIncoming(target, peerAddress)) {
             log("$tag: 忽略非目标设备连入 addr=${peerAddress ?: "?"}（当前目标：$target）")
             rejectSocket(socket, tag, "non-target")
+            return
+        }
+        if (!canStartSession()) {
+            rejectSocket(socket, tag, "profile-no-longer-available")
             return
         }
         cancelBmwProbe("inbound $tag")
@@ -614,14 +613,14 @@ class Iap2Bluetooth(
         while (running && generation.get() == myGeneration) {
             // 会话期间静默：两条 RFCOMM 会互相踩（见 sessionActive 注释）
             val ticket = sessions.ticket()
-            if (ticket == null || sessions.outboundPausedForWifi || sessionActive.get()) {
+            if (ticket == null || sessions.outboundPausedForWifi || sessionActive.get() || !canStartSession()) {
                 sleepQuietly(2_000)
                 continue
             }
             // 首轮先给车机主动连入的机会——但只对「会因此断配置文件」的档案有意义：
             // 宝马档案压根不断 HFP/A2DP（车机自己会在 ACL 连上后 ~4s 连入 iAP2），
             // 等这 8s 只会白白推迟出站探测。
-            if (dropProfilesBeforeIap2 && !inboundGraceDone) {
+            if (profile.dropProfilesBeforeIap2 && !inboundGraceDone) {
                 inboundGraceDone = true
                 val deadline = SystemClock.uptimeMillis() + INBOUND_GRACE_MILLIS
                 while (running && generation.get() == myGeneration &&
@@ -662,9 +661,9 @@ class Iap2Bluetooth(
                 // 文件在线时不开放 iAP2 服务窗口（奥迪 MIB3 实测每 3s 连接失败）。
                 // **宝马档案不做这一步**：它的 HFP/A2DP 在线时照样主动连入 iAP2，而断开
                 // 会连带把 ACL 拽掉（车机反复重连），反而再也不发起 CarPlay。
-                if (!sessions.allowsOutbound(ticket)) break
+                if (!sessions.allowsOutbound(ticket) || !canStartSession()) break
                 val evidence = io.github.hypercar.session.PairingEvidence.read(appContext.filesDir, device.address)
-                if (dropProfilesBeforeIap2 && evidence.mayDropProfiles) {
+                if (profile.dropProfilesBeforeIap2 && evidence.mayDropProfiles) {
                     // 注意：BtProfiles.disconnect 内部会打「自己断开」归因标记——断开
                     // 配置文件（个别 ROM 退到设备级断开）会让系统广播 ACL 断开，接收器
                     // 靠那个标记认出「这是我们干的」，不按「下车」拆会话。
@@ -682,7 +681,7 @@ class Iap2Bluetooth(
                     }
                 } else if (!profileDropSkippedLogged) {
                     profileDropSkippedLogged = true
-                    log("BT-C: 保留 HFP/A2DP：档案允许断开=$dropProfilesBeforeIap2 身份=${evidence.identityPresent} 本车凭证=${evidence.receiverCredentialPresent}；首配/未知状态不主动断配置文件")
+                    log("BT-C: 保留 HFP/A2DP：档案允许断开=${profile.dropProfilesBeforeIap2} 身份=${evidence.identityPresent} 本车凭证=${evidence.receiverCredentialPresent}；首配/未知状态不主动断配置文件")
                 }
                 val socket = tryConnect(device, ticket)
                 if (socket != null) {
@@ -868,6 +867,7 @@ class Iap2Bluetooth(
                 !running -> "not-running"
                 inboundGeneration != null && generation.get() != inboundGeneration -> "stale-worker-generation"
                 !sessions.allows(ticket) -> "stale-session-ticket"
+                !canStartSession() -> "profile-no-longer-available"
                 cafeReservations.pending !== handoff -> "inbound-handoff-superseded"
                 handoff != null && (io.github.hypercar.session.HyperCarRepo.hasAirPlayTransport ||
                     !io.github.hypercar.bluetooth.CarTargetPolicy.acceptsIncoming(targetProvider(), safeAddress(socket.remoteDevice))) ->
@@ -952,10 +952,7 @@ class Iap2Bluetooth(
                     navigationEnabled = { sessions.allows(ticket) && io.github.hypercar.session.HyperCarRepo.hudNavigationAllowed },
                     navigationCue = { io.github.hypercar.navigation.NavigationSources.snapshot() },
                     onMediaKey = { usage -> io.github.hypercar.session.HyperCarRepo.onIap2MediaKey(usage) { sessions.allows(ticket) } },
-                    // **必须显式传当前车机档案**：不传就一直用构造函数默认值 BMW_ID85，
-                    // 设置页切成 通用(0.27)/WinPlay/Audi（或远程下发的档案）后，
-                    // 0x4300 / EA / 0x4E0E / 档案A退场这些差异全都不生效（2026-10-25 定谳）。
-                    profile = io.github.hypercar.headunit.HeadUnitProfiles.current(),
+                    profile = profile,
                 )
             session.run(SESSION_TIMEOUT_MILLIS)
             // Phase 1 完成：进入保活泵，直到链路断开（0x4301 等生命周期消息在此处理）

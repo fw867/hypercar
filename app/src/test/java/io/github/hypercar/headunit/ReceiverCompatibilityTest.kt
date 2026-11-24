@@ -4,10 +4,26 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ReceiverCompatibilityTest {
+    @Test fun motorcycleKeepsTheMguProtocolAndSkipsBluetoothHandoff() {
+        val bmw = HeadUnitProfiles.BMW_ID85
+        val motorcycle = HeadUnitProfiles.builtin.single { it.label == "通用摩托车" }
+        assertTrue(motorcycle.verified)
+        assertNotEquals(bmw.id, motorcycle.id)
+        assertEquals(bmw.id, motorcycle.protocolProfileId)
+        assertTrue(motorcycle.skipBluetoothHandoff)
+        assertTrue(ReceiverCompatibility.useBmwBootstrap(motorcycle.id, "Angle"))
+        assertFalse(ReceiverCompatibility.useBmwBootstrap(motorcycle.id, "DiPlay"))
+        assertEquals(bmw, motorcycle.copy(
+            id = bmw.id, label = bmw.label, model = bmw.model, notes = bmw.notes,
+            verified = bmw.verified, pairingHint = bmw.pairingHint, listing = bmw.listing,
+        ))
+        assertTrue(HeadUnitProfiles.builtin.filter { it.id != motorcycle.id }.none { it.skipBluetoothHandoff })
+    }
+
     @Test fun id9ProfileIsIsolatedFromMguAndMbuxBootstrap() {
         val id9 = HeadUnitProfiles.BMW_ID9
         assertEquals("bmw_id9", id9.id)
-        assertFalse(id9.verified)
+        assertTrue(id9.verified)
         assertTrue(id9.screenResourceLifecycleEnabled(false))
         assertFalse(id9.mbuxScreenBootstrap)
         assertTrue(id9.id9ScreenBootstrap)
@@ -55,5 +71,6 @@ class ReceiverCompatibilityTest {
         assertTrue(ReceiverCompatibility.useBmwBootstrap("bmw_id85", null))
         assertFalse(ReceiverCompatibility.useBmwBootstrap("winplay", null))
         assertFalse(ReceiverCompatibility.useBmwBootstrap("generic", "BMW"))
+        assertFalse(ReceiverCompatibility.useBmwBootstrap("removed_remote_profile", "Angle"))
     }
 }

@@ -7,7 +7,7 @@ class BmwId6ProfileTest {
     @Test fun independentExperimentalProfilePreservesSavedMguAndId9Policies() {
         val p = HeadUnitProfiles.BMW_ID6
         assertEquals("bmw_id6", p.id)
-        assertFalse(p.verified)
+        assertTrue(p.verified)
         assertTrue(p.nbtAudioFirst)
         assertTrue(p.screenResourceLifecycleEnabled(false))
         assertFalse(p.id9ScreenBootstrap)
