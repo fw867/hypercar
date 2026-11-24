@@ -3,6 +3,9 @@ package io.github.hypercar.iap2
 import java.security.SecureRandom
 import java.util.TimeZone
 
+// xiap2 selects 20 bytes when the AA01 certificate parameter (including its TLV header) exceeds 644 bytes.
+private const val MFI_CERTIFICATE_PARAM_THRESHOLD_BYTES = 644
+
 /** One Wi-Fi link per AirPlay generation. All methods run on the bridge's single worker. */
 internal class WifiIap2Protocol(
     private val deviceId: String,
@@ -18,7 +21,6 @@ internal class WifiIap2Protocol(
     private val onPeerSynAccepted: () -> Unit = {},
 ) {
     private val audiMib3 = profileId == "audi_mib3"
-    private val challengeSize = if (audiMib3 || profileId == "bmw_id6") 20 else 32
     private val engine = Iap2LinkEngine(reliableTransport = true, declaredWindow = 32)
     private var parser = Iap2Csm.Parser()
     private val media = Iap2MediaSession(log, onMediaKey)
@@ -53,8 +55,8 @@ internal class WifiIap2Protocol(
         "rx_frames=$receivedFrames tx_frames=$sentFrames $lastRx $lastTx " +
         "${media.diagnosticSummary} rx_5000=$receivedNowPlayingStarts queued_5001=$queuedNowPlayingUpdates " +
         "last_rx_csm=${lastReceivedMessage?.let { "0x${it.toString(16)}" } ?: "none"} " +
-        "last_queued_csm=${lastQueuedMessage?.let { "0x${it.toString(16)}" } ?: "none"}" +
-        (if (audiMib3) " $challengeDiagnostic" else "") + "; link output/queue only, RTSP acceptance separate"
+        "last_queued_csm=${lastQueuedMessage?.let { "0x${it.toString(16)}" } ?: "none"} " +
+        "$challengeDiagnostic; link output/queue only, RTSP acceptance separate"
     private var now = 0L
     private var peerWaitSince: Long? = null
     private var nextPeerWaitLog = 0L
@@ -74,17 +76,15 @@ internal class WifiIap2Protocol(
     init {
         engine.hudLog = log
         engine.deferInitialDetectEcho = audiMib3
-        if (audiMib3) {
-            engine.onPeerAcknowledgement = { ack, lastSent ->
-                val sequence = challengeSequence
-                if (sequence != null && !challengeAcknowledged) {
-                    // Accept only cumulative ACKs that cover AA02 without acknowledging unsent bytes.
-                    val distanceToLastSent = (lastSent - sequence) and 255
-                    val distanceToAck = (ack - sequence) and 255
-                    if (distanceToLastSent < 128 && distanceToAck <= distanceToLastSent) {
-                        challengeAcknowledged = true
-                        log("AUTH AA02 cumulative ACK seq=$sequence peer_ack=$ack")
-                    }
+        engine.onPeerAcknowledgement = { ack, lastSent ->
+            val sequence = challengeSequence
+            if (sequence != null && !challengeAcknowledged) {
+                // Accept only cumulative ACKs that cover AA02 without acknowledging unsent bytes.
+                val distanceToLastSent = (lastSent - sequence) and 255
+                val distanceToAck = (ack - sequence) and 255
+                if (distanceToLastSent < 128 && distanceToAck <= distanceToLastSent) {
+                    challengeAcknowledged = true
+                    log("AUTH AA02 cumulative ACK seq=$sequence peer_ack=$ack")
                 }
             }
         }
@@ -247,24 +247,26 @@ internal class WifiIap2Protocol(
                 send(0xaa00)
             }
             0xaa01 -> if (phase == "CERTIFICATE") {
-                if (!Iap2Csm.hasNonEmptyParameter(frame.body, 0)) {
+                val certificate = Iap2Csm.nonEmptyParameter(frame.body, 0)
+                if (certificate == null) {
                     fail("empty certificate")
                     return
                 }
+                val certificateParamBytes = certificate.value.size + Iap2Csm.PARAM_HEADER_BYTES
+                val challengeSize = if (certificateParamBytes > MFI_CERTIFICATE_PARAM_THRESHOLD_BYTES) 20 else 32
                 phase = "CHALLENGE"
                 deadline = now + 10_000
                 nextWaitLog = now + 2_000
                 val challenge = nonce(challengeSize)
                 require(challenge.size == challengeSize)
+                log("AUTH AA02 selected certificateParamBytes=$certificateParamBytes challengeBytes=$challengeSize")
                 send(0xaa02, Iap2Csm.param(0, challenge))
             }
             0xaa03 -> if (phase == "CHALLENGE") {
-                if (audiMib3) {
-                    challengeResponseReceived = true
-                    log("AUTH AA03 received $challengeDiagnostic")
-                }
+                challengeResponseReceived = true
+                log("AUTH AA03 received $challengeDiagnostic")
                 if (!Iap2Csm.hasNonEmptyParameter(frame.body, 0)) {
-                    fail("empty challenge response")
+                    fail("invalid challenge response parameter")
                     return
                 }
                 send(0xaa05)
@@ -310,10 +312,10 @@ internal class WifiIap2Protocol(
             val end = minOf(frame.size, offset + limit)
             val hudMessageId = if (id == 0x5201 || id == 0x5202) id else 0
             val onSequenceAssigned: ((Int) -> Unit)? =
-                if (audiMib3 && id == 0xaa02 && end == frame.size) {
+                if (id == 0xaa02 && end == frame.size) {
                     { sequence ->
                         challengeSequence = sequence
-                        log("AUTH AA02 challengeBytes=$challengeSize final_seq=$sequence")
+                        log("AUTH AA02 final_seq=$sequence")
                     }
                 } else null
             if (!engine.sendControl(frame.copyOfRange(offset, end), now, hudMessageId = hudMessageId,

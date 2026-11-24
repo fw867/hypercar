@@ -16,6 +16,7 @@ object Iap2Csm {
     const val START = 0x4040
     const val HEADER_BYTES = 6
     const val MAX_FRAME_BYTES = 0xFFFF
+    internal const val PARAM_HEADER_BYTES = 4
 
     data class Frame(
         val messageId: Int,
@@ -156,11 +157,13 @@ object Iap2Csm {
         return params
     }
 
+    fun hasNonEmptyParameter(body: ByteArray, id: Int): Boolean = nonEmptyParameter(body, id) != null
+
     /** Authentication data cannot be accepted from a partial TLV or duplicate parameter. */
-    fun hasNonEmptyParameter(body: ByteArray, id: Int): Boolean {
+    internal fun nonEmptyParameter(body: ByteArray, id: Int): Param? {
         val params = parseParams(body)
-        return params.sumOf { it.value.size + 4 } == body.size &&
-            params.singleOrNull { it.id == id }?.value?.isNotEmpty() == true
+        if (params.sumOf { it.value.size + PARAM_HEADER_BYTES } != body.size) return null
+        return params.singleOrNull { it.id == id }?.takeIf { it.value.isNotEmpty() }
     }
 
     fun u32Bytes(value: Long): ByteArray =

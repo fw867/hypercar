@@ -273,12 +273,12 @@ class WifiIap2ProtocolTest {
         }
     }
 
-    @Test fun audiMib3ChallengeUses20BytesAndSeparatelyTracksAckAndResponse() {
+    @Test fun audiMib3TracksAckAndResponseSeparatelyForItsSelectedChallenge() {
         val car = Car(profileId = "audi_mib3")
         car.start()
         car.message(0x1d01)
         val previousAck = car.ack
-        val challenge = car.message(0xaa01, Iap2Csm.param(0, byteArrayOf(1))).single()
+        val challenge = car.message(0xaa01, Iap2Csm.param(0, ByteArray(908) { 1 })).single()
         assertEquals(0xaa02, challenge.messageId)
         assertArrayEquals(ByteArray(20) { 7 }, Iap2Csm.parseParams(challenge.body).single().value)
         val challengeSequence = car.ack
@@ -293,27 +293,49 @@ class WifiIap2ProtocolTest {
         assertTrue(car.protocol.diagnosticSummary.contains("aa02_ack=true aa03_rx=true"))
     }
 
-    @Test fun bmwId6WifiUses20ByteChallengeAndWaitsForAa03BeforeAa05() {
-        val car = Car(profileId = "bmw_id6")
+    @Test fun bmwMgu103CertificateSelects20BytesAndWaitsForAa03BeforeAa05() {
+        val car = Car(profileId = "bmw_id85")
         assertEquals(listOf(0x1d00), car.start().map { it.messageId })
         assertEquals(listOf(0x1d02, 0xaa00), car.message(0x1d01).map { it.messageId })
 
         val challenge = car.message(0xaa01, Iap2Csm.param(0, ByteArray(908) { 1 })).single()
         assertEquals(0xaa02, challenge.messageId)
         assertArrayEquals(ByteArray(20) { 7 }, Iap2Csm.parseParams(challenge.body).single().value)
+        assertTrue(car.logs.any { "certificateParamBytes=912 challengeBytes=20" in it })
         assertTrue(car.feed(packet(0x40, car.sequence, car.ack)).isEmpty())
         assertEquals("CHALLENGE", car.protocol.diagnosticPhase)
 
         val output = car.message(0xaa03, Iap2Csm.param(0, ByteArray(128) { 9 }))
         assertEquals(listOf(0xaa05), output.filter { it.messageId == 0xaa05 }.map { it.messageId })
         assertEquals(0xaa05, output.first().messageId)
-        assertFalse(car.protocol.failed)
+        assertTrue(car.protocol.ready)
     }
 
-    @Test fun otherWifiProfilesRetain32ByteChallenge() {
-        for (profile in listOf("", "generic", "bmw_id85", "bmw_id9", "mercedes_mbux", "volkswagen_mib")) {
-            Car(profileId = profile).ready()
+    @Test fun wifiChallengeUsesTheSameCertificateBoundaryAcrossProfiles() {
+        for (profile in listOf("", "generic", "bmw_id85", "bmw_id6", "bmw_id9", "audi_mib3",
+            "mercedes_mbux", "volkswagen_mib", "winplay")) {
+            for ((certificateBytes, challengeBytes) in listOf(640 to 32, 641 to 20)) {
+                val car = Car(profileId = profile)
+                car.start()
+                car.message(0x1d01)
+                val body = Iap2Csm.param(0, ByteArray(certificateBytes) { 1 })
+                val challenge = car.message(0xaa01, body).single()
+                assertEquals(0xaa02, challenge.messageId)
+                assertEquals("$profile certificate=$certificateBytes", challengeBytes,
+                    Iap2Csm.parseParams(challenge.body).single().value.size)
+            }
         }
+    }
+
+    @Test fun wifiChallengeCountsOnlyTheCertificateParameter() {
+        val car = Car(profileId = "bmw_id85")
+        car.start()
+        car.message(0x1d01)
+        val body = Iap2Csm.param(1, ByteArray(400) { 1 }) + Iap2Csm.param(0, ByteArray(608) { 1 })
+        val challenge = car.message(0xaa01, body).single()
+        assertEquals(0xaa02, challenge.messageId)
+        assertArrayEquals(ByteArray(32) { 7 }, Iap2Csm.parseParams(challenge.body).single().value)
+        assertTrue(car.logs.any { "certificateParamBytes=612 challengeBytes=32" in it })
     }
 
     @Test fun audiMib3DetectWaitsForFirstScreenSetupAndDoesNotRepeatOnRebuild() {
@@ -887,12 +909,19 @@ class WifiIap2ProtocolTest {
         assertFalse(emptyCertificate.protocol.ready)
         assertTrue(emptyCertificate.message(0xaa03, Iap2Csm.param(0, ByteArray(64))).isEmpty())
 
-        val emptySignature = Car()
-        emptySignature.start(); emptySignature.message(0x1d01)
-        emptySignature.message(0xaa01, Iap2Csm.param(0, byteArrayOf(1)))
-        assertTrue(emptySignature.message(0xaa03, Iap2Csm.param(0, byteArrayOf())).isEmpty())
-        assertTrue(emptySignature.protocol.failed)
-        assertFalse(emptySignature.protocol.ready)
+        val emptySignature = Iap2Csm.param(0, byteArrayOf())
+        val truncatedSignature = Iap2Csm.param(0, byteArrayOf(1)).copyOf(4)
+        for (signature in listOf(emptySignature, truncatedSignature)) {
+            val car = Car()
+            car.start()
+            car.message(0x1d01)
+            car.message(0xaa01, Iap2Csm.param(0, byteArrayOf(1)))
+            assertTrue(car.message(0xaa03, signature).isEmpty())
+            assertTrue(car.protocol.failed)
+            assertFalse(car.protocol.ready)
+            assertTrue(car.protocol.diagnosticSummary.contains("aa03_rx=true"))
+            assertTrue(car.logs.contains("FAILED invalid challenge response parameter"))
+        }
     }
 
     @Test fun splitAndRepeatedDetectionMarkersAreAnsweredWithoutCompetingSyn() {
