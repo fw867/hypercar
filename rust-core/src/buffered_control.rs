@@ -277,6 +277,18 @@ impl BufferedControl {
         Ok(true)
     }
 
+    pub(crate) fn with_packet_ownership<T>(&self, generation: u64, write: impl FnOnce() -> T) -> Option<T> {
+        let owner = self.stream.ownership.borrow();
+        if !owner.owned || owner.losses != generation { return None; }
+        let result = write();
+        drop(owner);
+        Some(result)
+    }
+
+    pub(crate) fn discard_reserved_packet(&mut self) {
+        self.reservation.take();
+    }
+
     pub(crate) async fn packet_written(&mut self, seq: u32, ts: u32) -> io::Result<()> {
         let mut state = self.reservation.take().ok_or_else(|| io::Error::other("unreserved buffered data write"))?;
         state.last_written = Some((seq, ts));

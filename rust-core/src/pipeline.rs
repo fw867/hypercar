@@ -23,6 +23,10 @@ pub struct Pipeline {
     /// Dimensions in the current sender's last successfully written VideoConfig header.
     #[serde(skip)]
     pub screen_config_size: Option<(u32,u32)>,
+    #[serde(skip)]
+    pub(crate) screen_config_generation: u64,
+    #[serde(skip)]
+    pub(crate) touch_modes: std::sync::Weak<parking_lot::Mutex<crate::modes::Modes>>,
     pub generation: u64,
     pub snapshot_sequence: u64,
     pub control_ready: bool,
@@ -47,7 +51,7 @@ pub struct Pipeline {
     pub audio_codec: String,
     pub main_audio_stream_type: Option<i64>,
     #[serde(skip)]
-    pub(crate) main_audio_clock: Option<crate::audio_diagnostics::ClockTarget>,
+    pub(crate) main_audio_feedback: Option<crate::audio_diagnostics::FeedbackSource>,
     pub audio_kbps: u64,
     pub audio_packets_written: u64,
     pub audio_signal_packets: u64,
@@ -66,6 +70,7 @@ impl Pipeline {
         self.keyframe_trace = std::sync::Weak::new();
         self.main_video_connection = None;
         self.main_video_writes = Default::default();
+        self.set_screen_config_size(None);
         if let Some(sample) = self.video_tcp.take() { self.retired_video_tcp = Some(sample); }
     }
 
@@ -75,11 +80,7 @@ impl Pipeline {
     pub(crate) fn observe_main_sender(&mut self, sender: Option<&crate::audio_out::AudioOut>) {
         self.main_audio_stream_type = sender.map(crate::audio_out::AudioOut::stream_type);
         self.audio_codec = sender.map(crate::audio_out::AudioOut::codec_name).unwrap_or("").into();
-        self.main_audio_clock = sender.filter(|sender| sender.high_accuracy_timestamps).and_then(|sender| {
-            let id = sender.pacing_id?;
-            Some(crate::audio_diagnostics::ClockTarget { rtsp: id.rtsp, stream_id: id.stream_id,
-                stream_type: sender.stream_type(), rate: sender.sample_rate() })
-        });
+        self.main_audio_feedback = sender.and_then(crate::audio_out::AudioOut::feedback_source);
     }
 
     /// Allocate the order under the same lock that protects the captured facts.
@@ -113,11 +114,18 @@ impl Pipeline {
         if !self.audio_ready {gaps.push("audio_SETUP");}
         if gaps.is_empty(){"none_observed_receiver_presentation_unconfirmed".into()}else{gaps.join(",")}
     }
+    pub(crate) fn set_screen_config_size(&mut self, size: Option<(u32, u32)>) {
+        if self.screen_config_size != size {
+            self.screen_config_generation = self.screen_config_generation.wrapping_add(1);
+            self.screen_config_size = size;
+        }
+    }
+
     pub fn new() -> Self {
-        Self { keyframe_trace:Default::default(),video_requested_fps:0,display_max_fps:None,video_actual_fps:None,display_size:None, video_format:None, screen_config_size:None, generation: NEXT.fetch_add(1,Ordering::Relaxed), snapshot_sequence:0, control_ready:false, control_trace_id:None, record_accepted:false, resources_accepted:false,
+        Self { keyframe_trace:Default::default(),video_requested_fps:0,display_max_fps:None,video_actual_fps:None,display_size:None, video_format:None, screen_config_size:None, screen_config_generation:0, touch_modes:Default::default(), generation: NEXT.fetch_add(1,Ordering::Relaxed), snapshot_sequence:0, control_ready:false, control_trace_id:None, record_accepted:false, resources_accepted:false,
             screen_setup_accepted:false,video_channel_ready:false,wifi_id:0,
             wifi_iap2:"WAIT_SESSION".into(),screen_owned:None,video_stream:"WAIT_SETUP".into(),
-            video_source_units:0,video_frames_written:0,main_video_connection:None,audio_ready:false,audio_codec:String::new(),main_audio_stream_type:None,main_audio_clock:None,audio_kbps:0,audio_packets_written:0,
+            video_source_units:0,video_frames_written:0,main_video_connection:None,audio_ready:false,audio_codec:String::new(),main_audio_stream_type:None,main_audio_feedback:None,audio_kbps:0,audio_packets_written:0,
             audio_signal_packets:0,ui_requests:0,screen_rebuilds:0,timing:Default::default(),video_tcp:None,main_video_writes:Default::default(),retired_video_tcp:None }
     }
     pub fn effective_fps(&self) -> u32 {

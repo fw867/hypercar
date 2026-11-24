@@ -104,6 +104,7 @@ impl Feed {
 struct Prepared {
     owner: u64, hub: Arc<CarLifeHub>, feed: Arc<Mutex<Feed>>,
     display: crate::carlife::DisplayRequest, microphone: Option<Arc<crate::mic_probe::ProbeControl>>,
+    vehicle_gps: Arc<crate::carlife::vehicle_gps::PendingLocation>,
     stop: Arc<DialStop>, task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Prepared {
@@ -123,13 +124,15 @@ pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
     let display=crate::carlife::DisplayRequest::new(crate::carlife::ReceiverDisplay {
         size: if cfg.carwith_cached_canvas { (cfg.width,cfg.height) } else { (0,0) }, ..Default::default() });
     let microphone=cfg.carwith_microphone.then(||Arc::new(crate::mic_probe::ProbeControl::for_carwith()));
+    let vehicle_gps = Arc::new(crate::carlife::vehicle_gps::PendingLocation::default());
     let config=CarLifeConfig{width:cfg.width,height:cfg.height,fps:cfg.carwith_fps(),bt_address:cfg.device_id.clone(),
-        bt_name:"HyperCar".into(),navigation_updates:cfg.carwith_navigation_enabled,microphone:microphone.clone()};
+        bt_name:"HyperCar".into(),navigation_updates:cfg.carwith_navigation_enabled,microphone:microphone.clone(),
+        vehicle_gps:Some(vehicle_gps.clone())};
     let (hub,mut events)=CarLifeHub::connect(config,"127.0.0.1".into(),stop.clone(),Some(display.clone()),
         move |startup| crate::reopen_carwith_entry(owner, startup))?;
     let feed=Arc::new(Mutex::new(Feed::default()));let sink=feed.clone();
     let task=tokio::spawn(async move {while let Some(event)=events.recv().await {sink.lock().receive(event);}});
-    slot.current=Some(Prepared{owner,hub:Arc::new(hub),feed,display,microphone,stop,task});
+    slot.current=Some(Prepared{owner,hub:Arc::new(hub),feed,display,microphone,vehicle_gps,stop,task});
     drop(slot);
     crate::emit_log(&format!("CARWITH-SOURCE: owner={owner} seven-channel service prepared independently of AirPlay"));
     Ok(())
@@ -157,6 +160,12 @@ pub(crate) fn stop(owner:u64) {
 pub(crate) fn diagnostic_phase(owner: u64) -> Option<Arc<crate::carlife::DiagnosticPhase>> {
     SOURCE.lock().current.as_ref().filter(|source| source.owner == owner)
         .map(|source| source.stop.diagnostic_phase())
+}
+pub(crate) fn publish_vehicle_gps(owner: u64, tunnel: u64, fields: Option<[i64; 25]>) {
+    let slot = SOURCE.lock();
+    if let Some(source) = slot.current.as_ref().filter(|source| source.owner == owner) {
+        source.vehicle_gps.update(tunnel, fields);
+    }
 }
 pub(crate) fn replay(owner:u64) {
     let slot=SOURCE.lock();
@@ -377,7 +386,7 @@ mod tests {
             }
             while let Ok((event, origin)) = events.try_recv() {
                 let delivered = match event {
-                    CarLifeEvent::VideoReplay => crate::engine::SourceEvent::ResetVideoSource,
+                    CarLifeEvent::VideoReplay => crate::engine::SourceEvent::ReplayVideoSource,
                     CarLifeEvent::VideoFrame { pts_us, data } => {
                         if crate::screen::annexb_nals(&data).iter().any(|n| n[0] & 31 == 5) {
                             assert_eq!(origin, expected);

@@ -9,21 +9,24 @@ internal class RouteGuidanceSession(private val log: (String) -> Unit) {
     private var previous: NavigationCue? = null
     private var published = false
     private val publishedComponents = mutableSetOf<Int>()
+    private val publishedCurrentRoad = mutableSetOf<Int>()
     private var previousEnabled = false
     private var nextUpdate = 0L
     private var nextHeartbeat = 0L
     private var dirty = false
     private var diagnostic: String? = null
     private var receiveSupport: Boolean? = null
+    private var currentRoadLimits = emptyMap<Int, Int>()
 
-    fun declareReceiveSupport(supported: Boolean?) {
-        if (receiveSupport == supported) return
-        if (receiveSupport == false || supported == false) {
+    fun declareReceiveSupport(supported: Boolean?, roadLimits: Map<Int, Int> = emptyMap()) {
+        if (receiveSupport == supported && currentRoadLimits == roadLimits) return
+        if (receiveSupport == false || supported == false || currentRoadLimits != roadLimits) {
             // Freshly permitted consumers need the maneuver again before any reference.
             dirty = true
             nextUpdate = 0
         }
         receiveSupport = supported
+        currentRoadLimits = roadLimits
         log("HUD: 0x1d01 receive_52xx=${supported?.toString() ?: "unknown"}")
     }
 
@@ -41,6 +44,7 @@ internal class RouteGuidanceSession(private val log: (String) -> Unit) {
         if (frame.messageId == 0x5203) {
             subscribers.remove(component)
             publishedComponents.remove(component)
+            publishedCurrentRoad.remove(component)
             log("HUD: unsubscribe component=$component")
         } else {
             if (component !in subscribers && subscribers.size >= 4) return true
@@ -88,6 +92,21 @@ internal class RouteGuidanceSession(private val log: (String) -> Unit) {
                     *listOfNotNull(current.nextRoad.takeIf(String::isNotEmpty)?.let { Iap2Csm.string(4, it) }).toTypedArray()))
             }
             val fields = mutableListOf(Iap2Csm.u16(0, component), Iap2Csm.u8(1, current?.state ?: 0))
+            if (current?.state == 1) {
+                val road = currentRoadLimits[component]?.let { currentRoadField(current.currentRoad, it) }
+                if (road != null) {
+                    fields += road
+                    publishedCurrentRoad.add(component)
+                } else if (publishedCurrentRoad.remove(component)) {
+                    // Clear the earlier value once even if a new identification withdrew the limit.
+                    fields += Iap2Csm.string(0x03, "")
+                }
+                current.remainingTimeSeconds?.takeIf { it >= 0 }?.let { fields += Iap2Csm.u64(0x06, it) }
+                current.remainingDistanceMeters?.takeIf { it in 0..0xffff_ffffL }?.let { fields += Iap2Csm.u32(0x07, it) }
+            } else if (current?.state != 5) {
+                // Replanning is temporary. Keep the published road until an active update can replace or clear it.
+                publishedCurrentRoad.remove(component)
+            }
             // Index zero is the single CURRENT maneuver, overwritten before publishing its reference.
             fields += Iap2Csm.u16(0x0e, if (hasManeuver) 1 else 0)
             fields += Iap2Csm.param(0x0d, if (hasManeuver) byteArrayOf(0, 0) else byteArrayOf())
@@ -105,5 +124,14 @@ internal class RouteGuidanceSession(private val log: (String) -> Unit) {
         nextUpdate = now + 1000
         nextHeartbeat = now + 10_000
         return frames
+    }
+
+    private fun currentRoadField(road: String, limit: Int): ByteArray? {
+        if (limit <= 1) return null
+        val utf8 = road.replace('\u0000', ' ').trim().encodeToByteArray()
+        // Bound the whole C string, including its NUL, without splitting a UTF-8 character.
+        var end = minOf(utf8.size, minOf(limit, 512) - 1)
+        while (end in 1 until utf8.size && utf8[end].toInt() and 0xc0 == 0x80) end--
+        return if (end == 0) null else Iap2Csm.param(0x03, utf8.copyOf(end + 1).also { it[end] = 0 })
     }
 }

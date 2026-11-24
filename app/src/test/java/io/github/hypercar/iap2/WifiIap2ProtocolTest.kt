@@ -225,6 +225,7 @@ class WifiIap2ProtocolTest {
         var nowPlaying = Iap2NowPlaying()
         val vehicleUpdates = mutableListOf<Iap2VehicleStatus>()
         val locationUpdates = mutableListOf<Iap2VehicleLocation?>()
+        val wheelSpeedUpdates = mutableListOf<Iap2WheelSpeed?>()
         val transportReadiness = mutableListOf<Boolean>()
         var acceptReadiness = true
         var navigationAllowed = false
@@ -232,7 +233,8 @@ class WifiIap2ProtocolTest {
         val protocol = WifiIap2Protocol("test-device", { logs += it }, { size -> ByteArray(size) { 7 } },
             navigationEnabled = { navigationAllowed }, navigationCue = { navigationCue }, deviceName = deviceName, onMediaKey = mediaKeys::add,
             nowPlayingProvider = { nowPlaying }, onVehicleStatus = vehicleUpdates::add, profileId = profileId,
-            onVehicleLocation = { locationUpdates.add(it) }, onTransportReady = { ready ->
+            onVehicleLocation = { locationUpdates.add(it) }, onWheelSpeed = { wheelSpeedUpdates.add(it) },
+            onTransportReady = { ready ->
                 transportReadiness.add(ready)
                 !ready || acceptReadiness
             })
@@ -464,7 +466,7 @@ class WifiIap2ProtocolTest {
         val declaration = locationMessages + locationComponent(17, 18, 20)
         car.ready(declaration)
         val start = car.authenticationOutput.single { it.messageId == 0xfffa }
-        assertArrayEquals(byteArrayOf(0, 4, 0, 1, 0, 4, 0, 2), start.body)
+        assertArrayEquals(byteArrayOf(0, 4, 0, 1, 0, 4, 0, 2, 0, 4, 0, 4), start.body)
         assertTrue(car.authenticationOutput.indexOf(start) > car.authenticationOutput.indexOfFirst { it.messageId == 0xaa05 })
         assertEquals(listOf(0x1d02), car.message(0x1d01, declaration).map { it.messageId })
         val stop = car.message(0x1d01, locationMessages).single { it.messageId == 0xfffc }
@@ -476,13 +478,67 @@ class WifiIap2ProtocolTest {
         val component = locationComponent(17, 18)
         val incomplete = listOf(locationMessages, component, Iap2Csm.u16(6, 0xfffb) + component,
             Iap2Csm.u16(7, 0xfffa) + Iap2Csm.u16(6, 0xfffb) + component,
-            locationMessages + locationComponent(20), locationMessages + component + component,
+            locationMessages + locationComponent(19), locationMessages + component + component,
             locationMessages + component + byteArrayOf(0))
         for (identity in incomplete) {
             val car = Car()
             car.ready(identity)
             assertTrue(car.authenticationOutput.none { it.messageId == 0xfffa })
         }
+    }
+
+    @Test fun declaredWheelSpeedWorksWithoutGnssAndClearsOnExpiryOrWithdrawal() {
+        val car = Car()
+        val speed = Iap2Csm.string(0, "\$PASCD,1.000,C,R,0,2,0.00,1.500,0.25,1.250*50\r\n")
+        val declaration = locationMessages + locationComponent(20)
+        car.ready(declaration) { car.message(0xfffb, speed) }
+        assertTrue(car.wheelSpeedUpdates.isEmpty())
+        assertArrayEquals(Iap2Csm.param(4, byteArrayOf()), car.authenticationOutput.single { it.messageId == 0xfffa }.body)
+
+        for (sentence in listOf("\$PASCD,1.000,C,R,0,2,0.00,1.500,0.25,1.250*00",
+            "\$PASCD,1.000,C,R,0,3,0.00,1.500,0.25,1.250*51", "\$PASCD,1.000,C,R,0,2,0.25,1.500,0.00,1.250*50",
+            "\$PASCD,1.000,C,R,0,1,0.00,-1.250*4D", "\$PASCD,1.000,C,R,0,99,0.00,1.250*51")) {
+            car.message(0xfffb, Iap2Csm.string(0, sentence))
+        }
+        assertTrue(car.wheelSpeedUpdates.isEmpty())
+        car.message(0xfffb, speed)
+        assertEquals(1.250, checkNotNull(car.wheelSpeedUpdates.single()).metersPerSecond, 0.0)
+        assertTrue(car.locationUpdates.isEmpty())
+        assertTrue(car.logs.any { "fixValid=false wheelSpeedValid=true wheelSpeedMps=1.25" in it })
+        assertFalse(car.logs.any { "PASCD," in it })
+        car.time += 5_001
+        car.protocol.advance(car.time)
+        assertNull(car.wheelSpeedUpdates.last())
+
+        car.message(0xfffb, speed)
+        car.message(0x1d01, locationMessages + locationComponent(17))
+        assertNull(car.wheelSpeedUpdates.last())
+        val count = car.wheelSpeedUpdates.size
+        car.message(0xfffb, speed)
+        assertEquals(count, car.wheelSpeedUpdates.size)
+    }
+
+    @Test fun gnssInvalidationAndWheelSpeedExpiryAreIndependent() {
+        val car = Car()
+        val speed = Iap2Csm.string(0, "\$PASCD,17877.092,C,P,0,2,0.00,0.000,0.16,0.000*54\r\n")
+        val fix = Iap2Csm.string(0, "\$GPGGA,225833.00,3719.951324,N,12201.808796,W,1,09,0.6,69.8,M,-27.0,M,,*6F")
+        car.ready(locationMessages + locationComponent(17, 18, 20))
+        car.message(0xfffb, fix + speed)
+        assertNotNull(car.locationUpdates.last())
+        assertEquals(0.0, checkNotNull(car.wheelSpeedUpdates.last()).metersPerSecond, 0.0)
+        car.message(0xfffb, Iap2Csm.string(0, "\$GPRMC,225834.00,V,,,,,,,060813,,,N*7B"))
+        assertNull(car.locationUpdates.last())
+        assertNotNull(car.wheelSpeedUpdates.last())
+        car.message(0xfffb, fix)
+        car.time += 5_001
+        car.protocol.advance(car.time)
+        assertNull(car.wheelSpeedUpdates.last())
+        assertNotNull(car.locationUpdates.last())
+
+        car.message(0xfffb, speed)
+        car.ready(locationMessages + locationComponent(17))
+        assertNull(car.wheelSpeedUpdates.last())
+        assertNull(car.locationUpdates.last())
     }
 
     @Test fun locationUpdatesUseRepeatedNmeaFieldsAndExpireOnInvalidFixOrRestart() {
@@ -766,11 +822,16 @@ class WifiIap2ProtocolTest {
 
     @Test fun genericWifiLinkSendsUnchangedHudHeartbeatThenOneClear() {
         val car = Car(profileId = "generic")
-        car.ready()
+        car.ready(Iap2Csm.group(30, Iap2Csm.u16(0, 77), Iap2Csm.u16(2, 64)))
         car.navigationAllowed = true
-        car.navigationCue = io.github.hypercar.navigation.NavigationCue("右转", 2, 100)
+        car.navigationCue = io.github.hypercar.navigation.NavigationCue("右转", 2, 100,
+            currentRoad = "测试路", remainingDistanceMeters = 1200, remainingTimeSeconds = 60)
         val first = car.message(0x5200, Iap2Csm.u16(0, 77))
         assertEquals(listOf(0x5202, 0x5201), first.map { it.messageId })
+        val fields = Iap2Csm.parseParams(first.last().body).associate { it.id to it.value }
+        assertArrayEquals("测试路\u0000".encodeToByteArray(), fields[0x03])
+        assertArrayEquals(Iap2Csm.u64Bytes(60), fields[0x06])
+        assertArrayEquals(Iap2Csm.u32Bytes(1200), fields[0x07])
         car.time += 10_000
         val heartbeat = car.message(0x4154).filter { it.messageId in 0x5201..0x5202 }.single()
         assertEquals(0x5201, heartbeat.messageId)
@@ -781,8 +842,129 @@ class WifiIap2ProtocolTest {
         assertEquals(0x5201, clear.messageId)
         assertArrayEquals(byteArrayOf(0, 77), Iap2Csm.parseParams(clear.body).first().value)
         assertArrayEquals(byteArrayOf(0), Iap2Csm.parseParams(clear.body).single { it.id == 1 }.value)
+        assertTrue(Iap2Csm.parseParams(clear.body).none { it.id in setOf(0x03, 0x06, 0x07) })
         car.time += 10_000
         assertTrue(car.message(0x4154).none { it.messageId in 0x5201..0x5202 })
+    }
+
+    @Test fun lateIdentificationClearsRoadOnceForTheComponentThatLostItsLimit() {
+        val car = Car(profileId = "generic")
+        val receive = Iap2Csm.u16(Iap2Messages.IDENT_RECEIVE_IDS, 0x5201)
+        fun roadLimit(id: Int) = Iap2Csm.group(30, Iap2Csm.u16(0, id), Iap2Csm.u16(2, 64))
+        fun updates(frames: List<Iap2Csm.Frame>) = frames.filter { it.messageId == 0x5201 }.associate { frame ->
+            val fields = Iap2Csm.parseParams(frame.body).associateBy { it.id }
+            fields.getValue(0).asU16List().single() to fields
+        }
+        car.ready(receive + roadLimit(77) + roadLimit(78))
+        car.navigationAllowed = true
+        car.navigationCue = io.github.hypercar.navigation.NavigationCue("右转", 2, 100, currentRoad = "测试路")
+        val road = "测试路\u0000".encodeToByteArray()
+        for (id in 77..79) {
+            val first = updates(car.message(0x5200, Iap2Csm.u16(0, id))).getValue(id)
+            if (id < 79) assertArrayEquals(road, first.getValue(0x03).value)
+            else assertFalse(first.containsKey(0x03))
+        }
+
+        val changed = updates(car.message(0x1d01, receive + roadLimit(78)))
+        assertArrayEquals(byteArrayOf(1), changed.getValue(77).getValue(1).value)
+        assertArrayEquals(byteArrayOf(0), changed.getValue(77)[0x03]?.value)
+        assertArrayEquals(road, changed.getValue(78).getValue(0x03).value)
+        assertFalse(changed.getValue(79).containsKey(0x03))
+
+        car.time += 10_000
+        val heartbeat = updates(car.message(0x4154))
+        assertFalse(heartbeat.getValue(77).containsKey(0x03))
+        assertArrayEquals(road, heartbeat.getValue(78).getValue(0x03).value)
+        assertArrayEquals(road, updates(car.message(0x1d01, receive + roadLimit(77) + roadLimit(78)))
+            .getValue(77).getValue(0x03).value)
+    }
+
+    @Test fun replanningKeepsThePendingRoadClearUntilTheRouteResumes() {
+        val car = Car(profileId = "generic")
+        val receive = Iap2Csm.u16(Iap2Messages.IDENT_RECEIVE_IDS, 0x5201)
+        val roadLimit = Iap2Csm.group(30, Iap2Csm.u16(0, 77), Iap2Csm.u16(2, 64))
+        fun fields(frames: List<Iap2Csm.Frame>) = frames.filter { it.messageId == 0x5201 }.associate { frame ->
+            val fields = Iap2Csm.parseParams(frame.body).associateBy { it.id }
+            fields.getValue(0).asU16List().single() to fields.mapValues { it.value.value }
+        }
+        car.ready(receive + roadLimit)
+        car.navigationAllowed = true
+        val active = io.github.hypercar.navigation.NavigationCue("右转", 2, 100, currentRoad = "测试路")
+        car.navigationCue = active
+        val start = fields(car.message(0x5200, Iap2Csm.u16(0, 77))).getValue(77)
+        assertArrayEquals("测试路\u0000".encodeToByteArray(), start[0x03])
+        val other = fields(car.message(0x5200, Iap2Csm.u16(0, 78))).getValue(78)
+        assertFalse(other.containsKey(0x03))
+
+        car.navigationCue = io.github.hypercar.navigation.AmapNotificationParser.parse(listOf("正在重新规划路线"), true)
+        car.time += 1000
+        val replanning = fields(car.message(0x4154))
+        assertArrayEquals(byteArrayOf(5), replanning.getValue(77)[1])
+        assertFalse(replanning.getValue(77).containsKey(0x03))
+
+        car.navigationCue = active.copy(currentRoad = "")
+        car.time += 1000
+        val resumed = fields(car.message(0x4154))
+        assertArrayEquals(byteArrayOf(1), resumed.getValue(77)[1])
+        assertArrayEquals(byteArrayOf(0), resumed.getValue(77)[0x03])
+        assertFalse(resumed.getValue(78).containsKey(0x03))
+
+        car.time += 10_000
+        val heartbeat = fields(car.message(0x4154))
+        assertEquals(setOf(77, 78), heartbeat.keys)
+        assertTrue(heartbeat.values.none { it.containsKey(0x03) })
+    }
+
+    @Test fun amapLinkReplanningWinsUntilTheNextFullGuidanceSample() {
+        val car = Car(profileId = "generic")
+        car.ready(Iap2Csm.u16(Iap2Messages.IDENT_RECEIVE_IDS, 0x5201) +
+            Iap2Csm.group(30, Iap2Csm.u16(0, 77), Iap2Csm.u16(2, 64)))
+        car.navigationAllowed = true
+        val link = io.github.hypercar.navigation.AmapLinkNavigationState()
+        val notifications = io.github.hypercar.navigation.NavigationCueStore()
+        val linkToken = link.begin()
+        val notificationGeneration = notifications.generation()
+        val replan = requireNotNull(io.github.hypercar.navigation.AmapNotificationParser.parse(listOf("正在重新规划路线"), true))
+        fun type4(road: String) = org.json.JSONObject()
+            .put("curManeuverID", 3).put("segmentRemainDist", 100).put("curRouteName", road)
+        fun send(id: Int, body: ByteArray = byteArrayOf()): List<Iap2Csm.Frame> {
+            car.navigationCue = link.hudSnapshot(car.time, notifications.timedSnapshot(car.time))
+            return car.message(id, body).filter { it.messageId in 0x5201..0x5202 }
+        }
+        fun field(frames: List<Iap2Csm.Frame>, id: Int) = Iap2Csm.parseParams(frames.single { it.messageId == 0x5201 }.body)
+            .singleOrNull { it.id == id }?.value
+
+        car.time += 1000
+        assertTrue(link.accept(linkToken, 4, type4("旧路"), car.time))
+        notifications.put(notificationGeneration, "navigation", replan, car.time - 500)
+        val first = send(0x5200, Iap2Csm.u16(0, 77))
+        assertArrayEquals("旧路\u0000".encodeToByteArray(), field(first, 0x03))
+
+        car.time += 1000
+        val replannedAt = car.time
+        notifications.put(notificationGeneration, "navigation", replan, replannedAt)
+        val replanning = send(0x4154)
+        assertEquals(listOf(0x5201), replanning.map { it.messageId })
+        assertArrayEquals(byteArrayOf(5), field(replanning, 1))
+
+        car.time += 1000
+        notifications.remove("navigation")
+        assertTrue(link.accept(linkToken, 5, org.json.JSONObject().put("maneuverID", 2), car.time))
+        assertTrue(send(0x4154).isEmpty()) // A partial turn hint cannot republish the old route.
+
+        car.time += 1000
+        assertTrue(link.accept(linkToken, 4, type4(""), car.time))
+        notifications.put(notificationGeneration, "navigation", replan, replannedAt)
+        val resumed = send(0x4154)
+        assertEquals(listOf(0x5202, 0x5201), resumed.map { it.messageId })
+        assertArrayEquals(byteArrayOf(1), field(resumed, 1))
+        assertArrayEquals(byteArrayOf(0), field(resumed, 0x03))
+
+        car.time += 1000
+        assertTrue(link.accept(linkToken, 200, org.json.JSONObject().put("isArrived", true), car.time))
+        notifications.put(notificationGeneration, "navigation", replan, car.time + 1)
+        car.time += 1
+        assertArrayEquals(byteArrayOf(2), field(send(0x4154), 1))
     }
 
     @Test fun communicationsReplyDoesNotClaimUnimplementedPhoneControlsOrInventSimState() {

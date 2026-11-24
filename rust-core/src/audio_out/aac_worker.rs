@@ -18,6 +18,7 @@ struct Input {
 pub(super) struct AacTiming {
     pub ts: u32,
     pub recover_until: Option<Instant>,
+    pub rtp_generation: Option<u64>,
 }
 
 #[derive(Default)]
@@ -41,6 +42,9 @@ impl AacInput {
         while !pcm.is_empty() {
             let take = pcm.len().min(AU_SAMPLES - self.partial.len());
             let start = self.timing.get_or_insert(timing);
+            // The AU may contain PCM prepared on both sides of a handover even
+            // when the worker admitted the blocks under one current ownership generation.
+            if start.rtp_generation != timing.rtp_generation { start.rtp_generation = None; }
             if let Some(deadline) = timing.recover_until {
                 start.recover_until = Some(start.recover_until.map_or(deadline, |old| old.min(deadline)));
             }
@@ -163,7 +167,7 @@ mod tests {
     #[test]
     fn aac_timeline_preserves_source_positions_across_gaps_and_recovery() {
         let mark = Instant::now();
-        let packet = |ts, recover_until| AacTiming { ts, recover_until };
+        let packet = |ts, recover_until| AacTiming { ts, recover_until, rtp_generation: None };
         let mut pcm = AacInput::default();
         let mut ready = Vec::new();
         pcm.prepare(&[1; 352 * CHANNELS], packet(0, None), &mut ready);
@@ -182,6 +186,20 @@ mod tests {
     }
 
     #[test]
+    fn aac_feedback_skips_a_frame_prepared_across_ownership_generations() {
+        let timing = |ts, rtp_generation| AacTiming { ts, recover_until: None, rtp_generation };
+        let mut pcm = AacInput::default();
+        let mut ready = Vec::new();
+        pcm.prepare(&[1; AU_SAMPLES / 2], timing(0, Some(0)), &mut ready);
+        pcm.prepare(&[2; AU_SAMPLES / 2], timing((crate::aac::FRAMES / 2) as u32, Some(1)), &mut ready);
+        assert_eq!(ready.len(), AU_SAMPLES);
+        assert_eq!(pcm.submitted.pop_front(), Some(timing(0, None)));
+
+        pcm.prepare(&[3; AU_SAMPLES], timing(crate::aac::FRAMES as u32, Some(1)), &mut ready);
+        assert_eq!(pcm.submitted.pop_front(), Some(timing(crate::aac::FRAMES as u32, Some(1))));
+    }
+
+    #[test]
     fn stalled_encoder_never_blocks_submission_and_old_generation_is_discarded() {
         let owner = BufferedOwnership::default();
         owner.publish(true);
@@ -195,7 +213,7 @@ mod tests {
             Ok(vec![vec![pcm[0] as u8]])
         }).unwrap();
         let timeout = std::time::Duration::from_secs(1);
-        let timing = AacTiming { ts: 0, recover_until: None };
+        let timing = AacTiming { ts: 0, recover_until: None, rtp_generation: None };
         assert!(worker.submit(0, &[1; AU_SAMPLES], timing).unwrap());
         begun.recv_timeout(timeout).unwrap();
         assert!(worker.try_output().unwrap().is_none());

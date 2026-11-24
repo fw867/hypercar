@@ -46,8 +46,10 @@ internal object AmapNavigation {
 
     fun clear() { store.clear() }
 
-    fun snapshot(now: Long = SystemClock.elapsedRealtime()): NavigationCue? {
+    fun snapshot(now: Long = SystemClock.elapsedRealtime()): NavigationCue? = timedSnapshot(now)?.cue
+
+    fun timedSnapshot(now: Long): TimedNavigationCue? {
         if (!HyperCarRepo.hudNavigationAllowed) { clear(); return null }
-        return store.snapshot(now)
+        return store.timedSnapshot(now)
     }
 }

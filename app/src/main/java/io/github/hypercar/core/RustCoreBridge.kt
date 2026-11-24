@@ -78,12 +78,15 @@ object RustCoreBridge {
     /**
      * 车机 HID 触摸回调（Rust 工作线程调用，实现方需自行切主线程）。
      *
-     * action：0=DOWN、1=UP、2=MOVE；x/y 已换算到编码画布像素（与 VideoConfig 画布一致）。
+     * 坐标已换算到编码画布像素（与 VideoConfig 画布一致）。
      * 与 [EventListener] 分开注册：触摸是高频事件，且 UI 层可能在会话中途重建。
      */
     interface TouchListener {
-        fun onTouch(action: Int, x: Int, y: Int)
+        /** Android action with any pointer index and ordered [id, x, y] triples. */
+        fun onTouchFrame(engineGeneration: Long, screenGrant: Long, action: Int, pointers: IntArray)
     }
+
+    external fun nativeTouchGrantCurrent(engineGeneration: Long, screenGrant: Long): Boolean
 
     // Native GlobalRefs own callback lifetimes; do not keep an unused second Kotlin cache.
     fun setListener(listener: EventListener?) = nativeSetListener(listener)
@@ -131,6 +134,7 @@ object RustCoreBridge {
     external fun nativeSetWifiIap2Phase(id: Long, phase: String)
     external fun nativeCanKeepWifiSession(): Boolean
     external fun nativeSendIap2(id: Long, bytes: ByteArray, hudMessageId: Int, hudSerial: Long): Boolean
+    external fun nativePublishCarWithGps(id: Long, fields: LongArray?)
     external fun nativeWifiIap2PeerSyn(id: Long)
     external fun nativeSendWifiIap2Detect(id: Long): Boolean
 

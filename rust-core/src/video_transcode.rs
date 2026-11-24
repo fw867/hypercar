@@ -9,11 +9,120 @@ pub trait Codec: Send {
     fn drain(&mut self)->io::Result<Vec<Unit>>;
 }
 type Factory = Box<dyn FnMut(VideoCodec,VideoCodec,(u32,u32),(u32,u32),u32,&[u8])->io::Result<Box<dyn Codec>> + Send>;
+
+#[derive(Default)]
+struct SourceCadence {
+    window: Option<CadenceWindow>,
+    sparse_run: Option<(u64, u8)>,
+    consecutive_over_limit: u8,
+    consecutive_within_limit: u8,
+    confirmed_above: Option<u32>,
+}
+
+enum CadenceChange {
+    Above(f64),
+    Within,
+}
+
+struct CadenceWindow {
+    first_us: u64,
+    last_us: u64,
+    intervals: u32,
+}
+
+impl SourceCadence {
+    fn clear_window(&mut self) {
+        self.window = None;
+        self.sparse_run = None;
+        self.consecutive_over_limit = 0;
+        self.consecutive_within_limit = 0;
+    }
+
+    fn exceeds(&self, limit: u32) -> bool {
+        self.confirmed_above.is_some_and(|fps| fps >= limit)
+    }
+
+    fn observe(&mut self, received_us: u64, limit: u32) -> Option<CadenceChange> {
+        const WINDOW_US: u64 = 500_000;
+        const JITTER_US: u64 = 5_000;
+        const OVER_LIMIT_WINDOWS: u8 = 2;
+        const RECOVERY_WINDOWS: u8 = 3;
+        if received_us == 0 { return None; }
+
+        let next_window = CadenceWindow { first_us: received_us, last_us: received_us, intervals: 0 };
+        if let Some(last_us) = self.window.as_ref().map(|window| window.last_us) {
+            let fps = u64::from(limit.max(1));
+            let min_frame_gap_us = 1_000_000 / fps;
+            let max_regular_gap_us = 250_000.max(2_000_000 / fps);
+            let max_sparse_gap_us = 2_000_000.max(2 * max_regular_gap_us);
+            match received_us.checked_sub(last_us) {
+                Some(gap_us) if gap_us <= max_sparse_gap_us && self.exceeds(limit) => {
+                    // Recovery can span the regular window's continuity cutoff
+                    // as long as each interval fits the receiver frame rate.
+                    // Round down to allow quantized microsecond timestamps at the cap.
+                    if gap_us >= min_frame_gap_us {
+                        let (first_us, intervals) = self.sparse_run.get_or_insert((last_us, 0));
+                        *intervals += 1;
+                        if *intervals >= RECOVERY_WINDOWS && received_us - *first_us >= WINDOW_US * u64::from(RECOVERY_WINDOWS) {
+                            return self.recover();
+                        }
+                    } else {
+                        self.sparse_run = None;
+                    }
+                    if gap_us > max_regular_gap_us {
+                        self.window = Some(next_window);
+                        self.consecutive_over_limit = 0;
+                        self.consecutive_within_limit = 0;
+                        return None;
+                    }
+                }
+                Some(gap_us) if gap_us <= max_regular_gap_us => {},
+                // A stall or a clock discontinuity cannot join independent bursts.
+                _ => self.clear_window(),
+            }
+        }
+        let Some(window) = self.window.as_mut() else {
+            self.window = Some(next_window);
+            return None;
+        };
+        window.last_us = received_us;
+        window.intervals = window.intervals.saturating_add(1);
+        let elapsed_us = received_us - window.first_us;
+        if elapsed_us < WINDOW_US { return None; }
+        let scaled_intervals = u64::from(window.intervals) * 1_000_000;
+        self.window = Some(next_window);
+        if scaled_intervals <= u64::from(limit) * (elapsed_us + JITTER_US) {
+            self.consecutive_over_limit = 0;
+            if self.exceeds(limit) {
+                self.consecutive_within_limit += 1;
+                if self.consecutive_within_limit >= RECOVERY_WINDOWS {
+                    return self.recover();
+                }
+            }
+            return None;
+        }
+        self.consecutive_within_limit = 0;
+        if self.exceeds(limit) { return None; }
+        self.consecutive_over_limit += 1;
+        if self.consecutive_over_limit < OVER_LIMIT_WINDOWS { return None; }
+        self.confirmed_above = Some(limit);
+        self.clear_window();
+        Some(CadenceChange::Above(scaled_intervals as f64 / elapsed_us as f64))
+    }
+
+    fn recover(&mut self) -> Option<CadenceChange> {
+        self.confirmed_above = None;
+        self.clear_window();
+        Some(CadenceChange::Within)
+    }
+}
+
 pub struct Router {
     fit_oversize_display: bool,
     requested_fps: u32,
     display_max_fps: Option<u32>,
     source_fps: Option<u32>,
+    source_cadence: SourceCadence,
     enabled:bool, fps:u32, factory:Factory, active:Option<Box<dyn Codec>>, failed:bool,
     output_size: Option<(u32,u32)>, target: Option<(u32,u32)>, input_codec: Option<VideoCodec>, vps: Vec<u8>,
     sps:Vec<u8>,pps:Vec<u8>,waiting:bool, submitted:u64,produced:u64,
@@ -24,7 +133,7 @@ pub struct Router {
     last_input:std::time::Instant,
 }
 impl Router {
-    pub fn new(enabled:bool,fps:u32,factory:Factory)->Self {Self {fit_oversize_display:false,requested_fps:fps,display_max_fps:None,source_fps:None,output_size:None,target:None,input_codec:None,vps:vec![],origins:VecDeque::new(),enabled,fps,factory,active:None,failed:false,sps:vec![],pps:vec![],waiting:true,submitted:0,produced:0,progress:std::time::Instant::now(),last_input:std::time::Instant::now()}}
+    pub fn new(enabled:bool,fps:u32,factory:Factory)->Self {Self {fit_oversize_display:false,requested_fps:fps,display_max_fps:None,source_fps:None,source_cadence:SourceCadence::default(),output_size:None,target:None,input_codec:None,vps:vec![],origins:VecDeque::new(),enabled,fps,factory,active:None,failed:false,sps:vec![],pps:vec![],waiting:true,submitted:0,produced:0,progress:std::time::Instant::now(),last_input:std::time::Instant::now()}}
     pub fn for_carwith_profile(profile: Option<&str>, fps: u32, factory: Factory) -> Self {
         let mut router = Self::new(profile.is_some(), fps, factory);
         // CarWith's source is capped at 2560; any receiver may expose a larger display.
@@ -34,19 +143,29 @@ impl Router {
     }
     pub fn reset(&mut self) {
         self.pause();
+        self.source_cadence.clear_window();
         self.failed = false;
         self.input_codec = None;
         self.vps.clear();
         self.sps.clear();
         self.pps.clear();
     }
+    pub fn reset_source(&mut self) {
+        self.source_fps = None;
+        self.source_cadence = SourceCadence::default();
+        self.reset();
+    }
+
     pub fn set_target(&mut self, target: Option<(u32,u32)>, max_fps: Option<u32>) {
         if self.target != target || self.display_max_fps != max_fps {
             self.reset();
             self.target = target;
             self.display_max_fps = max_fps;
             self.fps = self.requested_fps.min(max_fps.unwrap_or(self.requested_fps));
-        } else { self.pause(); }
+        } else {
+            self.source_cadence.clear_window();
+            self.pause();
+        }
     }
 
     pub fn set_source_fps(&mut self, fps: Option<u32>) {
@@ -56,7 +175,8 @@ impl Router {
     }
 
     fn needs_rate_conversion(&self) -> bool {
-        self.display_max_fps.is_some() && self.source_fps.is_none_or(|source| source > self.fps)
+        self.display_max_fps.is_some() && (self.source_fps.is_none_or(|source| source > self.fps) ||
+            self.source_cadence.exceeds(self.fps))
     }
     fn output_canvas(&self, source: (u32,u32)) -> (u32,u32) {
         self.target.filter(|&(w,h)| needs_stretch(source, (w,h)) ||
@@ -74,6 +194,7 @@ impl Router {
     pub fn pause(&mut self) {self.active=None;self.output_size=None;self.waiting=true;self.submitted=0;self.produced=0;}
     pub fn discard_backlog(&mut self) {
         self.pause();
+        self.source_cadence.clear_window();
         self.vps.clear();
         self.sps.clear();
         self.pps.clear();
@@ -106,9 +227,23 @@ impl Router {
             Err(e)=>{self.fail(e);vec![]}
         }
     }
+
+    pub(crate) fn input_for_screen(&mut self, hevc_allowed: bool, pts: u64, data: Vec<u8>,
+        codec: VideoCodec, origin: FrameOrigin) -> (Vec<Unit>, bool) {
+        let was_passthrough = self.active.is_none() && !self.needs_rate_conversion();
+        let units = self.input(hevc_allowed, pts, data, codec, origin);
+        // An already running resize or codec conversion already applies the paced output clock.
+        let resync_screen = was_passthrough && self.needs_rate_conversion();
+        (units, resync_screen)
+    }
+
     pub fn input(&mut self, hevc_allowed:bool, pts:u64,data:Vec<u8>,codec:VideoCodec,origin:FrameOrigin)->Vec<Unit> {
+        // Encrypted CarWith assigns this monotonic timestamp at socket ingress.
+        // Falling back to pump time is appropriate only for the output PTS.
+        let received_us = pts;
+        let pts = if pts == 0 { crate::timing::monotonic_nanos() / 1_000 } else { pts };
         // Keep an unsupported HEVC source tagged for ScreenSender's explicit session rejection.
-        if !self.enabled || (!hevc_allowed && (codec == VideoCodec::Hevc || (self.target.is_none() && !self.needs_rate_conversion()))) {
+        if !self.enabled || (!hevc_allowed && (codec == VideoCodec::Hevc || (self.target.is_none() && self.display_max_fps.is_none()))) {
             if self.input_codec.is_some() { self.reset(); }
             return vec![Unit { pts, data, codec, origin }];
         }
@@ -118,6 +253,7 @@ impl Router {
         }
         let mut changed = false;
         let mut idr = false;
+        let mut picture = false;
         let mut has_sps = false;
         let mut has_pps = false;
         let mut has_vps = codec == VideoCodec::H264;
@@ -126,17 +262,37 @@ impl Router {
                 VideoCodec::H264 => match nal.first().map(|v| v & 31) {
                     Some(7) => (&mut self.sps, &mut has_sps),
                     Some(8) => (&mut self.pps, &mut has_pps),
-                    kind => { idr |= kind == Some(5); continue; }
+                    kind => { picture |= matches!(kind, Some(1..=5)); idr |= kind == Some(5); continue; }
                 },
                 VideoCodec::Hevc => match crate::hevc::nal_type(nal) {
                     Some(32) => (&mut self.vps, &mut has_vps),
                     Some(33) => (&mut self.sps, &mut has_sps),
                     Some(34) => (&mut self.pps, &mut has_pps),
-                    kind => { idr |= matches!(kind, Some(16..=21)); continue; }
+                    kind => { picture |= matches!(kind, Some(0..=31)); idr |= matches!(kind, Some(16..=21)); continue; }
                 },
             };
             *seen = true;
             if slot.as_slice() != nal { *slot = nal.to_vec(); changed = true; }
+        }
+        if self.display_max_fps.is_some() && origin == FrameOrigin::Live && picture {
+            let was_paced = self.needs_rate_conversion();
+            match self.source_cadence.observe(received_us, self.fps) {
+                Some(CadenceChange::Above(observed_fps)) => {
+                    crate::emit_log(&format!("CARWITH-TRANSCODE: observed_live_fps={observed_fps:.1} encoder_ack_fps={:?} target_fps={} force_pacing=true", self.source_fps, self.fps));
+                    if !was_paced && self.active.is_none() {
+                        // A fresh over-limit period may reopen hardware once, after a
+                        // synchronized passthrough frame actually ended the last failure.
+                        if !self.waiting { self.failed = false; }
+                        self.pause();
+                    }
+                }
+                Some(CadenceChange::Within) if !self.needs_rate_conversion() && self.waiting && !idr => {
+                    // Withheld access units broke the reference chain. Ask for fresh sync
+                    // even if the failed codec is still latched for this configuration.
+                    crate::emit_force_keyframe();
+                }
+                _ => {}
+            }
         }
         if changed { self.pause(); }
         let mut configured = Vec::new();
@@ -320,6 +476,279 @@ pub fn hardware_factory()->Factory {Box::new(|codec,output,(w,h),(tw,th),fps,csd
             router.set_target(Some((1920,1080)), None);
             assert_eq!(router.input(false,4,frame.clone(),VideoCodec::H264, FrameOrigin::Live)[0].data,frame);
         }
+    }
+
+    #[test]
+    fn sustained_live_rate_overrides_a_low_ack_and_waits_for_sync() {
+        let (mut router, opens) = router(true, false);
+        router.set_target(Some((1920, 1080)), Some(30));
+        router.set_source_fps(Some(30));
+        let start = 1_000_000;
+        let keyframe = avc(true);
+        assert_eq!(router.input(false, start, keyframe.clone(), VideoCodec::H264, FrameOrigin::Live)[0].data, keyframe);
+
+        // The source ACKs 30 fps, but continues delivering 60 fps from the socket.
+        for index in 1..60 {
+            router.input(false, start + index * 1_000_000 / 60, avc(false), VideoCodec::H264, FrameOrigin::Live);
+        }
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+        assert!(router.input(false, start + 1_050_000, avc(false), VideoCodec::H264, FrameOrigin::Live).is_empty(),
+            "stop passing through once sustained excess is confirmed");
+        assert_eq!(opens.load(Ordering::SeqCst), 0, "wait for the next IDR before decoding");
+        router.set_source_fps(Some(30));
+        let frames = router.input(false, start + 1_067_000, keyframe, VideoCodec::H264, FrameOrigin::Live);
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].data.is_empty(), "the access unit must pass through the paced converter");
+
+        // Reinstalling the screen and replaying the current source doesn't change its cadence.
+        router.set_target(Some((1920, 1080)), Some(30));
+        router.reset();
+        assert!(router.needs_rate_conversion());
+        router.set_source_fps(Some(24));
+        assert!(router.needs_rate_conversion());
+
+        // A new CarWith source starts with a clean measurement.
+        router.reset_source();
+        router.set_source_fps(Some(30));
+        let frame = avc(true);
+        assert_eq!(router.input(false, start, frame.clone(), VideoCodec::H264, FrameOrigin::Live)[0].data, frame);
+    }
+
+    #[test]
+    fn compliant_live_rate_resumes_same_source_at_idr_after_pacer_creation_fails() {
+        let opened = Arc::new(AtomicUsize::new(0));
+        let count = opened.clone();
+        let mut router = Router::new(true, 30, Box::new(move |_, _, _, _, _, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("hardware unavailable"))
+        }));
+        router.set_target(Some((1920, 1080)), Some(30));
+        router.set_source_fps(Some(30));
+
+        let codec = VideoCodec::H264;
+        let live = FrameOrigin::Live;
+        let start = 1_000_000;
+        let idr = avc(true);
+        assert_eq!(router.input(false, start, idr.clone(), codec, live)[0].data, idr);
+        for index in 1..=66 {
+            router.input(false, start + index * 1_000_000 / 60, avc(false), codec, live);
+        }
+        assert!(router.needs_rate_conversion());
+        for pts in [2_117_000, 2_134_000, 2_151_000] {
+            assert!(router.input(false, pts, idr.clone(), codec, live).is_empty());
+        }
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+
+        let steady = 2_151_000;
+        // A single compliant window is not enough to resume unpaced video.
+        for index in 1..=16 {
+            assert!(router.input(false, steady + index * 1_000_000 / 30, idr.clone(), codec, live).is_empty());
+        }
+        assert!(router.needs_rate_conversion());
+        for index in 17..=65 {
+            assert!(router.input(false, steady + index * 1_000_000 / 30, avc(false), codec, live).is_empty(),
+                "discarded access units make passthrough unsafe until the next IDR");
+        }
+        let resumed = router.input(false, steady + 66 * 1_000_000 / 30, idr.clone(), codec, live);
+        assert_eq!(resumed.len(), 1, "stable cadence should allow same-source passthrough");
+        assert_eq!(resumed[0].data, idr);
+        assert_eq!(opened.load(Ordering::SeqCst), 1, "do not reopen hardware while awaiting synchronization");
+    }
+
+    #[test]
+    fn newly_confirmed_excess_retries_pacing_once_after_live_passthrough_recovers() {
+        let opened = Arc::new(AtomicUsize::new(0));
+        let count = opened.clone();
+        let mut router = Router::new(true, 30, Box::new(move |_, output, _, _, _, _| {
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(io::Error::other("hardware temporarily unavailable"));
+            }
+            Ok(Box::new(Fake { output, fail: false, pending: vec![] }))
+        }));
+        router.set_target(Some((1920, 1080)), Some(30));
+        router.set_source_fps(Some(30));
+        let live = FrameOrigin::Live;
+        let codec = VideoCodec::H264;
+        let idr = avc(true);
+        router.input(false, 1_000_000, idr.clone(), codec, live);
+        for index in 1..=66 {
+            router.input(false, 1_000_000 + index * 1_000_000 / 60, avc(false), codec, live);
+        }
+        assert!(router.input(false, 2_117_000, idr.clone(), codec, live).is_empty());
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+        for index in 1..=66 {
+            assert!(router.input(false, 2_117_000 + index * 1_000_000 / 30, avc(false), codec, live).is_empty());
+        }
+        let resumed = router.input(false, 4_350_000, idr.clone(), codec, live);
+        assert_eq!(resumed[0].data, idr);
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+
+        for index in 1..=66 {
+            router.input(false, 4_350_000 + index * 1_000_000 / 60, avc(false), codec, live);
+        }
+        assert!(router.needs_rate_conversion());
+        assert_eq!(opened.load(Ordering::SeqCst), 1, "wait for a fresh IDR");
+        let paced = router.input(false, 5_467_000, idr.clone(), codec, live);
+        assert_eq!(opened.load(Ordering::SeqCst), 2, "renewed excess warrants one new open");
+        assert_eq!(paced.len(), 1);
+        assert!(paced[0].data.is_empty(), "output came from the paced converter");
+        router.input(false, 5_484_000, idr, codec, live);
+        assert_eq!(opened.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn repeated_sparse_live_frames_recover_but_separate_bursts_do_not() {
+        let mut router = Router::new(true, 30, Box::new(|_, _, _, _, _, _|
+            Err(io::Error::other("hardware unavailable"))));
+        router.set_target(Some((1920, 1080)), Some(30));
+        router.set_source_fps(Some(30));
+        let live = FrameOrigin::Live;
+        let codec = VideoCodec::H264;
+        let idr = avc(true);
+        router.input(false, 1_000_000, idr.clone(), codec, live);
+        for index in 1..=66 {
+            router.input(false, 1_000_000 + index * 1_000_000 / 60, avc(false), codec, live);
+        }
+        assert!(router.input(false, 2_117_000, idr.clone(), codec, live).is_empty());
+        for burst in 0..8 {
+            let start = 3_000_000 + burst * 600_000;
+            for pts in [start, start + 16_667] {
+                assert!(router.input(false, pts, avc(false), codec, live).is_empty());
+            }
+            assert!(router.needs_rate_conversion(), "isolated bursts cannot supply sparse cadence evidence");
+        }
+
+        for index in 0..12 {
+            assert!(router.input(false, 8_000_000 + index * 1_000_000 / 3, avc(false), codec, live).is_empty(),
+                "wait for live synchronization after the compliant sparse run");
+        }
+        let resumed = router.input(false, 12_000_000, idr.clone(), codec, live);
+        assert_eq!(resumed.len(), 1, "continuous 3 fps must be eligible for recovery");
+        assert_eq!(resumed[0].data, idr);
+    }
+
+    #[test]
+    fn sparse_live_cadence_with_jitter_recovers_at_idr_after_a_fresh_run() {
+        assert_sparse_live_cadence_recovers_at_idr(240_000, 260_000);
+        assert_sparse_live_cadence_recovers_at_idr(124_000, 276_000);
+    }
+
+    fn assert_sparse_live_cadence_recovers_at_idr(short_gap: u64, long_gap: u64) {
+        let opened = Arc::new(AtomicUsize::new(0));
+        let count = opened.clone();
+        let mut router = Router::new(true, 30, Box::new(move |_, _, _, _, _, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::other("hardware unavailable"))
+        }));
+        router.set_target(Some((1920, 1080)), Some(30));
+        router.set_source_fps(Some(30));
+        let codec = VideoCodec::H264;
+        let live = FrameOrigin::Live;
+        let idr = avc(true);
+        router.input_for_screen(false, 1_000_000, idr.clone(), codec, live);
+        for index in 1..=66 {
+            router.input_for_screen(false, 1_000_000 + index * 1_000_000 / 60, avc(false), codec, live);
+        }
+        let mut pts = 2_117_000;
+        assert!(router.input_for_screen(false, pts, idr.clone(), codec, live).0.is_empty());
+        assert!(router.needs_rate_conversion());
+
+        let jittered_gaps = [short_gap, long_gap, short_gap, long_gap, short_gap];
+        for gap in jittered_gaps {
+            pts += gap;
+            assert!(router.input_for_screen(false, pts, idr.clone(), codec, live).0.is_empty());
+        }
+        pts += 2_100_000;
+        assert!(router.input_for_screen(false, pts, avc(false), codec, live).0.is_empty());
+        for gap in jittered_gaps {
+            pts += gap;
+            assert!(router.input_for_screen(false, pts, idr.clone(), codec, live).0.is_empty());
+        }
+        assert!(router.needs_rate_conversion(), "the long stall separated the two runs");
+
+        for gap in [long_gap, short_gap, long_gap] {
+            pts += gap;
+            let (units, resync_screen) = router.input_for_screen(false, pts, avc(false), codec, live);
+            assert!(units.is_empty(), "recovery must still wait for an IDR");
+            assert!(!resync_screen);
+        }
+        assert!(!router.needs_rate_conversion(), "a stable sparse cadence should recover with {short_gap}/{long_gap} us gaps");
+        let (units, resync_screen) = router.input_for_screen(false, pts + short_gap, idr.clone(), codec, live);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].data, idr);
+        assert!(!resync_screen);
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn confirmed_excess_resyncs_screen_only_when_replacing_passthrough() {
+        for (target, already_transcoding) in [((1920, 1080), false), ((1280, 960), true)] {
+            let (mut router, opened) = router(true, false);
+            router.set_target(Some(target), Some(30));
+            router.set_source_fps(Some(30));
+            let live = FrameOrigin::Live;
+            let codec = VideoCodec::H264;
+            let (_, resync) = router.input_for_screen(false, 1_000_000, avc(true), codec, live);
+            assert!(!resync);
+            assert_eq!(opened.load(Ordering::SeqCst), usize::from(already_transcoding));
+            let mut screen_resyncs = 0;
+            for index in 1..=66 {
+                let (units, resync) = router.input_for_screen(false, 1_000_000 + index * 1_000_000 / 60, avc(false), codec, live);
+                screen_resyncs += usize::from(resync);
+                if already_transcoding { assert_eq!(units.len(), 1, "the running converter kept producing"); }
+            }
+            assert!(router.needs_rate_conversion());
+            assert_eq!(screen_resyncs, usize::from(!already_transcoding));
+            assert_eq!(opened.load(Ordering::SeqCst), usize::from(already_transcoding));
+        }
+    }
+
+    #[test]
+    fn fps_cap_without_receiver_dimensions_detects_small_sustained_overshoot() {
+        let opened = Arc::new(AtomicUsize::new(0));
+        let count = opened.clone();
+        let mut router = Router::new(true, 30, Box::new(move |_, output, source, target, fps, _| {
+            assert_eq!(source, target);
+            assert_eq!(fps, 30);
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(Fake { output, fail: false, pending: vec![] }))
+        }));
+        router.set_target(None, Some(60));
+        router.set_source_fps(Some(30));
+        for index in 0..40 {
+            router.input(false, 1_000_000 + index * 1_000_000 / 31, avc(index == 0), VideoCodec::H264, FrameOrigin::Live);
+        }
+        assert!(router.needs_rate_conversion());
+        assert_eq!(opened.load(Ordering::SeqCst), 0, "await a fresh source IDR");
+        router.input(false, 2_300_000, avc(true), VideoCodec::H264, FrameOrigin::Live);
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cached_frames_and_a_short_burst_do_not_override_a_compliant_live_rate() {
+        let (mut router, opens) = router(true, false);
+        router.set_target(Some((1920, 1080)), Some(30));
+        router.set_source_fps(Some(30));
+        let start = 1_000_000;
+        let keyframe = avc(true);
+        router.input(false, start, keyframe.clone(), VideoCodec::H264, FrameOrigin::Live);
+        for index in 1..=60 {
+            let pts = start + index * 1_000_000 / 30;
+            router.input(false, pts - 2, vec![0,0,0,1,0x68,1], VideoCodec::H264, FrameOrigin::Live);
+            router.input(false, pts - 1, avc(false), VideoCodec::H264, FrameOrigin::Cached);
+            router.input(false, pts, avc(false), VideoCodec::H264, FrameOrigin::Live);
+        }
+        for index in 1..=24 {
+            router.input(false, start + 2_000_000 + index * 2_000, avc(false), VideoCodec::H264, FrameOrigin::Live);
+        }
+        // Drain pause breaks the measurement window. The stream resumed at 30 fps.
+        for index in 0..60 {
+            router.input(false, start + 3_000_000 + index * 1_000_000 / 30, avc(false), VideoCodec::H264, FrameOrigin::Live);
+        }
+        let frames = router.input(false, start + 5_000_000, keyframe.clone(), VideoCodec::H264, FrameOrigin::Live);
+        assert_eq!(frames[0].data, keyframe);
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
     }
 
     #[test]

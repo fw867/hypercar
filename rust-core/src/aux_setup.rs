@@ -82,13 +82,25 @@ async fn open_at(control:&Arc<RtspChannel>,factory:&Arc<dyn SocketProvider>,host
     }
     let id=crate::airplay::random_positive_i64();
     let body=setup(info,kind,id);
-    let result=async {
+    let result: Result<AudioOut, String> = async {
         let reply=control.request("SETUP",&crate::rtsp_uri::audio_uri(host,port),&body,"application/x-apple-binary-plist",&[],Duration::from_secs(8)).await.map_err(|e|e.to_string())?;
         let (data_port,control_port)=response(&reply,kind,id)?;
         control.udp_media.set(kind.stream_type(), true);
         let data=factory.open_udp(host,data_port).ok_or("cannot open audio data socket")?;
-        let sync=match control_port {Some(port)=>Some(factory.open_udp(host,port).ok_or("cannot open audio control socket")?),None=>None};
-        AudioOut::new_opus(data,sync,crate::airplay::stream_key(shared,id as u64),kind.rate(),kind.spf(),kind.stream_type() as u8).map_err(|e|e.to_string())
+        let sync = match control_port {
+            Some(port) => match factory.open_udp(host, port) {
+                Some(socket) => Some(socket),
+                None => {
+                    crate::audio_diagnostics::D4Trace::start(control.trace_id(), id, kind.stream_type() as u8, port, false);
+                    return Err("cannot open audio control socket".into());
+                }
+            },
+            None => None,
+        };
+        let mut output = AudioOut::new_opus(data,sync,crate::airplay::stream_key(shared,id as u64),kind.rate(),kind.spf(),kind.stream_type() as u8)
+            .map_err(|e| e.to_string())?;
+        output.observe_d4(control.trace_id(), id, control_port.unwrap_or(0));
+        Ok(output)
     }.await;
     match result {
         Ok(out)=>Ok(out),

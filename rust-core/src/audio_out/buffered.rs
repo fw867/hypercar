@@ -2,7 +2,7 @@
 use crate::buffered_control::BufferedControl;
 use crate::crypto::{chacha_seal, nonce64};
 use std::{io, time::Duration};
-use tokio::{io::AsyncWriteExt, net::TcpStream};
+use tokio::net::TcpStream;
 
 const RECORD_OVERHEAD: usize = 2 + 12 + 16 + 8;
 const WRITE_TIMEOUT: Duration = Duration::from_millis(250);
@@ -19,6 +19,8 @@ pub(super) struct BufferedTransport {
     priming_bytes: u32,
     pub(super) written: u64,
     pub(super) payload_bytes: u64,
+    #[cfg(test)]
+    before_record_write: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl BufferedTransport {
@@ -31,6 +33,8 @@ impl BufferedTransport {
             buffer_bytes,
             written: 0,
             payload_bytes: 0,
+            #[cfg(test)]
+            before_record_write: None,
             priming_bytes: 0,
         }
     }
@@ -63,7 +67,7 @@ impl BufferedTransport {
         rate: u32,
         expected_generation: u64,
     ) -> io::Result<bool> {
-        let (mut data, mut control) = self.endpoint.take().ok_or_else(closed)?;
+        let (data, mut control) = self.endpoint.take().ok_or_else(closed)?;
         let length = record_length(raw.len(), self.buffer_bytes)?;
         let priming = !control.playing();
         if priming && u32::from(length) > self.buffer_bytes - self.priming_bytes {
@@ -85,12 +89,19 @@ impl BufferedTransport {
             .checked_add(1)
             .ok_or_else(|| io::Error::other("type 103 packet counter exhausted"))?;
         let packet = frame(key, raw, self.sequence, timestamp, nonce, rate, length)?;
+        #[cfg(test)]
+        if let Some(handover) = self.before_record_write.take() { handover(); }
         let start = crate::timing::monotonic_nanos();
-        tokio::time::timeout(WRITE_TIMEOUT, data.write_all(&packet))
+        let written = tokio::time::timeout(WRITE_TIMEOUT, write_record(&data, &control, &packet, expected_generation))
             .await
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::TimedOut, "type 103 audio TCP write stalled")
             })??;
+        if !written {
+            control.discard_reserved_packet();
+            self.endpoint = Some((data, control));
+            return Ok(false);
+        }
         self.written = next;
         self.payload_bytes = self.payload_bytes.saturating_add(raw.len() as u64);
         if priming {
@@ -106,6 +117,24 @@ impl BufferedTransport {
         self.endpoint = Some((data, control));
         Ok(true)
     }
+}
+
+async fn write_record(data: &TcpStream, control: &BufferedControl, record: &[u8], generation: u64) -> io::Result<bool> {
+    let mut written = 0;
+    while written < record.len() {
+        data.writable().await?;
+        // The watch guard is held only over a nonblocking syscall, never over a wait.
+        match control.with_packet_ownership(generation, || data.try_write(&record[written..])) {
+            None if written == 0 => return Ok(false),
+            // A truncated record cannot be followed by another on this transport.
+            None => return Err(io::Error::other("type 103 ownership changed during a partial TCP record")),
+            Some(Ok(0)) => return Err(io::Error::new(io::ErrorKind::WriteZero, "type 103 audio TCP write returned zero")),
+            Some(Ok(n)) => written += n,
+            Some(Err(error)) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Some(Err(error)) => return Err(error),
+        }
+    }
+    Ok(true)
 }
 
 pub(super) fn closed() -> io::Error {
@@ -218,6 +247,38 @@ pub(super) mod tests {
             peer.write_all(response.as_bytes()).await.unwrap();
             peer.write_all(&body).await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn tcp_generation_is_checked_again_after_reserving_the_record() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut car, _) = listener.accept().await.unwrap();
+        let (control, channel, peer) = control_pair(48000).await;
+        let start = tokio::spawn(accept_start(peer));
+        let owner = channel.buffered_ownership.clone();
+        let handover = owner.clone();
+        let mut out = BufferedTransport::new(data, control, 100_000);
+        out.before_record_write = Some(Box::new(move || {
+            handover.publish(false);
+            handover.publish(true);
+        }));
+
+        assert!(!out.send(&[7; 32], &[11, 11], 0, 48000, 0).await.unwrap());
+        let received = tokio::time::timeout(Duration::from_secs(1), async {
+            while !out.send(&[7; 32], &[22, 22], 1024, 48000, 1).await.unwrap() {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(car.read_u16().await.unwrap(), 40);
+            let mut record = [0; 38];
+            car.read_exact(&mut record).await.unwrap();
+            record
+        }).await.unwrap();
+        assert_eq!(&received[30..38], &0u64.to_le_bytes());
+        let plain = crate::crypto::chacha_open(&[7; 32], &nonce64(0), &received[12..30], &received[4..12]).unwrap();
+        assert_eq!(plain, [22, 22]);
+        assert_eq!(out.written, 1);
+        start.abort();
     }
 
     #[tokio::test]

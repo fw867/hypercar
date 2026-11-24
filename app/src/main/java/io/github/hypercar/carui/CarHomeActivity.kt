@@ -6,7 +6,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.ui.unit.dp
 import android.os.Bundle
 import android.os.SystemClock
-import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.View
 import android.widget.FrameLayout
@@ -118,26 +117,15 @@ class CarHomeActivity : ComponentActivity() {
         super.onDestroy()
     }
 
-    /** Rust HID → UI: DOWN/UP/MOVE/CANCEL, coordinates are already in D1 canvas pixels. */
-    fun dispatchCarTouch(action: Int, x: Float, y: Float) {
+    internal fun dispatchCarTouch(frame: CarTouchFrame) {
         val now = SystemClock.uptimeMillis()
-        val a = when (action) {
-            0 -> MotionEvent.ACTION_DOWN
-            1 -> MotionEvent.ACTION_UP
-            2 -> MotionEvent.ACTION_MOVE
-            3 -> MotionEvent.ACTION_CANCEL
-            else -> return
-        }
-        if (a == MotionEvent.ACTION_DOWN) downTime = now
-        val ev = MotionEvent.obtain(
-            if (a == MotionEvent.ACTION_DOWN) now else downTime,
-            now,
-            a,
-            x,
-            y,
-            0,
-        )
-        ev.setSource(InputDevice.SOURCE_TOUCHSCREEN)
+        if (frame.masked == MotionEvent.ACTION_DOWN) downTime = now
+        if (downTime == 0L) return
+        dispatchCarEvent(frame.obtain(downTime, now), frame.action, frame.x.toFloat(), frame.y.toFloat())
+    }
+
+    private fun dispatchCarEvent(ev: MotionEvent, action: Int, x: Float, y: Float) {
+        val masked = ev.actionMasked
         if (touchLogs++ < 12) {
             HyperCarRepo.log("CARUI: dispatch($action $x,$y) display=${display?.displayId}")
         }
@@ -147,7 +135,7 @@ class CarHomeActivity : ComponentActivity() {
             window.decorView.postInvalidateOnAnimation()
         }
         ev.recycle()
-        if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) downTime = 0L
+        if (masked == MotionEvent.ACTION_UP || masked == MotionEvent.ACTION_CANCEL) downTime = 0L
     }
 
     companion object {

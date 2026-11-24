@@ -419,7 +419,7 @@ mod tests {
         assert_eq!(frame_diagnostic(&[0xff,0x55,2,0,0xee,0x10]),"link=detect_or_unparsed");
     }
     fn incoming(data: Vec<u8>) -> crate::rtsp::RtspMessage {
-        crate::rtsp::RtspMessage { received_at: std::time::Instant::now(), first_line:"POST /command RTSP/1.0".into(),headers:Default::default(),body:data }
+        crate::rtsp::RtspMessage { received_at: std::time::Instant::now(), hid_screen_grant: None, first_line:"POST /command RTSP/1.0".into(),headers:Default::default(),body:data }
     }
     fn iap(data:Vec<u8>)->Vec<u8> {
         bplist::encode(&Value::dict(vec![("type",Value::str("iAPSendMessage")),("params",Value::dict(vec![("data",Value::Data(data))]))]))

@@ -199,6 +199,7 @@ object Iap2Messages {
         val vehicleStatusFields: Set<Int> = emptySet(),
         val acceptsRouteGuidance: Boolean? = null,
         val locationNmeaTypes: Set<Int> = emptySet(),
+        val currentRoadLimits: Map<Int, Int> = emptyMap(),
     ) {
         /** 车机是否声明会发某消息；null = 未提供清单（未知）。 */
         fun declaresSend(messageId: Int): Boolean? = sendIds?.contains(messageId)
@@ -279,6 +280,7 @@ object Iap2Messages {
             receiveIds = receiveIds,
             acceptsRouteGuidance = routeGuidance,
             locationNmeaTypes = locationTypes,
+            currentRoadLimits = if (whole) currentRoadLimits(params) else emptyMap(),
             eaProtocols = ea,
             hasWirelessCarPlayComponent = firstById[IDENT_WIRELESS_CARPLAY_COMPONENT] != null,
             hidComponents = params.filter { it.id == 0x12 }.take(32).mapNotNull { component ->
@@ -296,14 +298,27 @@ object Iap2Messages {
         )
     }
 
+    private fun currentRoadLimits(params: List<Iap2Csm.Param>): Map<Int, Int> =
+        params.asSequence().filter { it.id == 30 }.mapNotNull { component ->
+            val fields = Iap2Csm.parseParams(component.value)
+            if (fields.sumOf { it.value.size + Iap2Csm.PARAM_HEADER_BYTES } != component.value.size) return@mapNotNull null
+            val id = fields.singleOrNull { it.id == 0 }?.takeIf { it.value.size == 2 }
+                ?.asU16List()?.singleOrNull() ?: return@mapNotNull null
+            val limit = fields.singleOrNull { it.id == 2 }?.takeIf { it.value.size == 2 }
+                ?.asU16List()?.singleOrNull()
+            id to limit
+        }.groupBy({ it.first }, { it.second }).mapNotNull { (id, limits) ->
+            limits.singleOrNull()?.takeIf { it > 1 }?.let { id to it }
+        }.toMap()
+
     private fun locationNmeaTypes(body: ByteArray): Set<Int> {
         val fields = Iap2Csm.parseParams(body)
         if (fields.sumOf { it.value.size + Iap2Csm.PARAM_HEADER_BYTES } != body.size) return emptySet()
         if (fields.singleOrNull { it.id == 0 }?.value?.size != 2) return emptySet()
         val name = fields.singleOrNull { it.id == 1 } ?: return emptySet()
         if (name.value.lastOrNull() != 0.toByte() || name.asStringOrNull().isNullOrBlank()) return emptySet()
-        // AIS R32 95-19/95-86: component flags 17/18 select request flags 1/2 (GGA/RMC).
-        return (17..18).mapNotNull { id ->
+        // Component flags 17/18/20 select GGA, RMC and PASCD respectively.
+        return listOf(17, 18, 20).mapNotNull { id ->
             (id - 16).takeIf { fields.singleOrNull { it.id == id }?.value?.isEmpty() == true }
         }.toSet()
     }

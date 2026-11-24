@@ -96,6 +96,62 @@ class RouteGuidanceSessionTest {
         assertFalse(fields(frames[1]).containsKey(7)) // segment total is NOT route remaining distance
     }
 
+    @Test fun activeRouteCarriesRemainingTimeAndDistanceWithoutChangingNextTurnDistance() {
+        val s = RouteGuidanceSession {}
+        val active = cue.copy(maneuver = null, currentRoad = "测试路", remainingTimeSeconds = 256, remainingDistanceMeters = 1200)
+        s.handle(start(42))
+        val update = fields(s.updates(0, true, active).single())
+        assertArrayEquals(byteArrayOf(0, 0, 0, 0, 0, 0, 1, 0), update[0x06])
+        assertArrayEquals(byteArrayOf(0, 0, 4, 0xb0.toByte()), update[0x07])
+        assertFalse(update.containsKey(0x03)) // No declared road name limit.
+        assertFalse(update.containsKey(0x0a)) // The route total cannot substitute for a missing maneuver.
+        val maneuver = fields(s.updates(1000, true, active.copy(maneuver = cue.maneuver)).last())
+        assertArrayEquals(byteArrayOf(0, 0, 1, 0x2c), maneuver[0x0a])
+        val stopped = fields(s.updates(2000, true, active.copy(state = 2)).single())
+        assertFalse(stopped.keys.any { it in setOf(0x03, 0x06, 0x07) })
+        val invalid = fields(s.updates(3000, true, active.copy(remainingTimeSeconds = -1, remainingDistanceMeters = 0x1_0000_0000)).single())
+        assertFalse(invalid.keys.any { it in setOf(0x06, 0x07) })
+    }
+
+    @Test fun currentRoadMatchesTheSubscribedComponentsUtf8Limit() {
+        fun component(id: Int, limit: Int) = Iap2Csm.group(30,
+            Iap2Csm.u16(0, id), Iap2Csm.string(1, "RouteGuidance"), Iap2Csm.u16(2, limit))
+        val peer = Iap2Messages.parseIdentification(Iap2Csm.u16(7, 0x5201) +
+            component(42, 8) + component(43, 11) + component(44, 8) + component(44, 12))
+        assertEquals(mapOf(42 to 8, 43 to 11), peer.currentRoadLimits)
+        val s = RouteGuidanceSession {}
+        s.declareReceiveSupport(peer.acceptsRouteGuidance, peer.currentRoadLimits)
+        for (id in 42..44) s.handle(start(id))
+        val road = cue.copy(currentRoad = "东街🧭\u0000路")
+        val routeUpdates = s.updates(0, true, road).filter { it.messageId == 0x5201 }.map(::fields)
+        assertArrayEquals("东街\u0000".encodeToByteArray(), routeUpdates[0][0x03])
+        assertArrayEquals("东街🧭\u0000".encodeToByteArray(), routeUpdates[1][0x03])
+        assertFalse(routeUpdates[2].containsKey(0x03))
+        val cleared = s.updates(1000, true, road.copy(state = 0))
+        assertTrue(cleared.all { !fields(it).containsKey(0x03) })
+    }
+
+    @Test fun missingCurrentRoadClearsOnlyComponentsThatReceivedIt() {
+        val s = RouteGuidanceSession {}
+        s.declareReceiveSupport(true, mapOf(42 to 64))
+        s.handle(start(42))
+        s.handle(start(43))
+        fun routeUpdates(now: Long, currentRoad: String) =
+            s.updates(now, true, cue.copy(currentRoad = currentRoad))
+                .filter { it.messageId == 0x5201 }.map(::fields)
+
+        assertTrue(routeUpdates(0, "").none { it.containsKey(0x03) })
+        val named = routeUpdates(1000, "测试路")
+        assertArrayEquals("测试路\u0000".encodeToByteArray(), named[0][0x03])
+        assertFalse(named[1].containsKey(0x03))
+
+        val cleared = routeUpdates(2000, "")
+        assertArrayEquals(byteArrayOf(0), cleared[0][0x03])
+        assertArrayEquals(byteArrayOf(1), cleared[0][1])
+        assertFalse(cleared[1].containsKey(0x03))
+        assertTrue(routeUpdates(12_000, "").none { it.containsKey(0x03) })
+    }
+
     @Test fun subscriptionWithoutSourceWaitsWithoutInventingInitialGuidance() {
         val s = RouteGuidanceSession {}; s.handle(start(42))
         assertTrue(s.updates(0, true, null).isEmpty())

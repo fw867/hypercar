@@ -68,7 +68,7 @@ mod wire_compat;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;
 
-use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JShortArray, JString};
+use jni::objects::{GlobalRef, JByteArray, JClass, JLongArray, JObject, JShortArray, JString};
 use jni::sys::{jboolean, jint, jlong, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 use once_cell::sync::Lazy;
@@ -105,8 +105,10 @@ struct EngineHandle {
     /// 自绘界面投喂给引擎的视频帧 / 音频 PCM（nativePushVideoFrame / nativePushAudioPcm）
     source_tx: mpsc::UnboundedSender<engine::SourceEvent>,
     carwith_source: bool,
+    carwith_source_owner: Option<u64>,
     /// 手机实际编码尺寸（触摸坐标目标）。与 /info 的 encoder_size 分开。
     touch_size: Arc<parking_lot::Mutex<(u32, u32)>>,
+    pipeline: Arc<parking_lot::Mutex<pipeline::Pipeline>>,
 }
 
 // JNI start/stop must serialize even while ENGINE is temporarily taken for shutdown.
@@ -324,6 +326,22 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeCanKeep
 ) -> jboolean { if wifi_iap2::can_keep_session() { JNI_TRUE } else { JNI_FALSE } }
 
 #[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePublishCarWithGps(
+    env: JNIEnv, _obj: JObject, id: jlong, fields: JLongArray,
+) {
+    if id <= 0 || !wifi_iap2::is_active(id as u64) { return; }
+    let owner = ENGINE.lock().as_ref().and_then(|engine| engine.carwith_source_owner);
+    let Some(owner) = owner else { return; };
+    let fix = if fields.is_null() { None } else {
+        let mut sample = [0; 25];
+        if env.get_array_length(&fields).ok() != Some(sample.len() as i32) ||
+            env.get_long_array_region(&fields, 0, &mut sample).is_err() { return; }
+        Some(sample)
+    };
+    carwith_source::publish_vehicle_gps(owner, id as u64, fix);
+}
+
+#[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSetWifiIap2Phase(
     mut env: JNIEnv, _class: JClass, id: jlong, phase: JString,
 ) {
@@ -405,27 +423,40 @@ fn call_listener(method: &str, f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::err
     let _ = with_env(|env| f(env, global.as_obj()));
 }
 
-/// Rust → Kotlin 触摸回调（action: 0=DOWN 1=UP 2=MOVE；坐标为编码画布像素）。
-///
-/// 在 Rust 工作线程调用：`with_env` 会按需 attach（daemon）并清掉 Pending 异常。
-/// 没有装监听器时直接丢弃——这样「只连车机、不跑界面」的路径也能安全工作。
-pub(crate) fn emit_touch(action: u32, x: u32, y: u32) {
+/// All self-rendered gestures use the same generation-aware callback.
+fn emit_touch_frame(generation: u64, input: TouchInput) {
+    let Some(grant) = input.grant.as_ref() else { return };
     let guard = TOUCH_LISTENER.read();
     let Some(global) = guard.as_ref() else { return };
-    let obj = global.as_obj();
-    let _ = with_env(|env| {
+    let single = airplay::TouchPoint { id: 0, x: input.x, y: input.y };
+    let input_points = if input.pointers.is_empty() { std::slice::from_ref(&single) } else { &input.pointers };
+    let mut points = [0; 16 * 3];
+    let Some(points) = points.get_mut(..input_points.len() * 3) else { return };
+    for (dst, point) in points.chunks_exact_mut(3).zip(input_points) {
+        dst.copy_from_slice(&[point.id as jint, point.x as jint, point.y as jint]);
+    }
+    let _ = with_env(|env| env.with_local_frame(2, |env| {
+        let packed = env.new_int_array(points.len() as i32)?;
+        env.set_int_array_region(&packed, 0, points)?;
         env.call_method(
-            obj,
-            "onTouch",
-            "(III)V",
-            &[
-                (action as jint).into(),
-                (x as jint).into(),
-                (y as jint).into(),
-            ],
-        )
-        .map(|_| ())
-    });
+            global.as_obj(), "onTouchFrame", "(JJI[I)V",
+            &[(generation as jlong).into(), (grant.generation as jlong).into(), (input.action as jint).into(), (&packed).into()],
+        ).map(|_| ())
+    }));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeTouchGrantCurrent(
+    _env: JNIEnv, _class: JClass, generation: jlong, grant: jlong,
+) -> jboolean {
+    let pipeline = {
+        let engine = ENGINE.lock();
+        let Some(engine) = engine.as_ref().filter(|engine| engine.voice_input.token == generation as u64 &&
+            !engine.shutdown.requested()) else { return JNI_FALSE };
+        engine.pipeline.clone()
+    };
+    let modes = pipeline.lock().touch_modes.upgrade();
+    if modes.is_some_and(|modes| modes.lock().can_restore_screen(grant as u64)) { JNI_TRUE } else { JNI_FALSE }
 }
 
 // ---------------------------------------------------------------- socket 供给器
@@ -544,7 +575,7 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSetList
     };
 }
 
-/// 装/卸车机触摸监听器（Rust 每收到一条 HID 触摸就回调 `onTouch(action,x,y)`）。
+/// 装/卸车机触摸监听器（自绘界面的 HID 手势通过 `onTouchFrame` 回调）。
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSetTouchListener(
     env: JNIEnv,
@@ -678,11 +709,13 @@ fn native_start_impl(
 
     let (source_tx, source_rx) = mpsc::unbounded_channel::<engine::SourceEvent>();
     let carwith_source = cfg.carlife_source;
+    let carwith_source_owner = carwith_source.then_some(cfg.carwith_source_owner);
     let carwith_touch_source = cfg.carlife_source.then(|| source_tx.clone());
     let (touch_tx, mut touch_rx) = mpsc::unbounded_channel::<TouchInput>();
     let (key_tx, key_rx) = mpsc::unbounded_channel::<u32>();
     let voice_input=voice_key::Input::new(key_tx.clone());
     cfg.input_generation=voice_input.token;
+    let touch_generation = voice_input.token;
     // 车机 HID 触摸 → Kotlin：airplay::handle_hid_report 只负责换算坐标与边沿，
     // 投递到这里后由独立任务回调监听器（P1 喂 Compose 首页，P2 注入 D2）。
     // 通道随引擎重建；监听器是独立 GlobalRef，不随引擎重启丢失。
@@ -691,7 +724,7 @@ fn native_start_impl(
             if let Some(source) = &carwith_touch_source {
                 let _ = source.send(engine::SourceEvent::CarWithTouch(t));
             } else {
-                emit_touch(t.action, t.x, t.y);
+                emit_touch_frame(touch_generation, t);
             }
         }
     }));
@@ -703,6 +736,8 @@ fn native_start_impl(
         cfg.height.max(2),
     )));
     let touch_size_engine = touch_size.clone();
+    let pipeline = Arc::new(parking_lot::Mutex::new(pipeline::Pipeline::new()));
+    let engine_pipeline = pipeline.clone();
     let receiver_audio_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let generation_for_engine = receiver_audio_generation.clone();
     let shutdown = Arc::new(shutdown::EngineShutdown::new());
@@ -724,6 +759,7 @@ fn native_start_impl(
             source_rx,
             stop_run,
             touch_size_engine,
+            engine_pipeline,
             generation_for_engine,
         )
         .await;
@@ -752,7 +788,9 @@ fn native_start_impl(
         abort,
         source_tx,
         carwith_source,
+        carwith_source_owner,
         touch_size,
+        pipeline,
     });
 
     emit_log("nativeStart: 引擎任务已派生");

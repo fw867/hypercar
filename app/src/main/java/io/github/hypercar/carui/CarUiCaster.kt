@@ -55,6 +55,7 @@ object CarUiCaster {
 
     private val main = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var touchListener: CastTouchListener? = null
 
     private var caster: SpikeCaster? = null
     private var encoderTargetFps = 0
@@ -363,19 +364,60 @@ object CarUiCaster {
      * serialize listener installation with old-display teardown.
      */
     private fun installTouchListener() {
-        RustCoreBridge.setTouchListener(object : RustCoreBridge.TouchListener {
-            override fun onTouch(action: Int, x: Int, y: Int) {
-                if (MapController.onTouch(action, x, y)) return
-                main.post {
-                    val act = CarHomeActivity.instance
-                    if (act == null) {
-                        HyperCarRepo.log("CARUI: touch drop（home instance=null）($x,$y)")
-                    } else {
-                        act.dispatchCarTouch(action, x.toFloat(), y.toFloat())
-                    }
+        touchListener?.retire()
+        val next = CastTouchListener()
+        touchListener = next
+        RustCoreBridge.setTouchListener(next)
+    }
+
+    private class CastTouchListener : RustCoreBridge.TouchListener {
+        @Volatile private var retired = false
+        private val gesture = CarTouchGesture()
+
+        override fun onTouchFrame(engineGeneration: Long, screenGrant: Long, action: Int, pointers: IntArray) {
+            val frame = CarTouchFrame.fromNative(action, pointers) ?: return
+            val page = MapController.touchPageStamp()
+            val grant = CarTouchGesture.Grant(engineGeneration, screenGrant)
+            fun grantCurrent() = !retired && RustCoreBridge.nativeTouchGrantCurrent(engineGeneration, screenGrant)
+            main.post {
+                if (retired) return@post
+                gesture.dispatch(frame, grant, grantCurrent() && MapController.touchPageStamp() == page) {
+                    targetForDown(page, ::grantCurrent)
                 }
             }
-        })
+        }
+
+        fun retire() {
+            retired = true
+            main.post { gesture.cancel() }
+        }
+
+        private fun targetForDown(page: CarTouchPage.Stamp, grantCurrent: () -> Boolean): CarTouchGesture.Target? {
+            if (CarReceiverUi.state.value.screenOwned == false) return null
+            fun samePage() = MapController.touchPageStamp() == page
+            if (page.map) {
+                if (!MapController.fullscreenInputActive) return null
+                val mapDisplay = MapController.fullscreenDisplayId.takeIf { it > 0 } ?: return null
+                fun sameMap() = samePage() && MapController.fullscreenInputActive &&
+                    mapDisplay == MapController.fullscreenDisplayId
+                return CarTouchGesture.Target(
+                    isCurrent = { sameMap() && CarReceiverUi.state.value.screenOwned != false },
+                    send = { MapController.onTouch(it, page, grantCurrent) },
+                    cancel = { frame ->
+                        if (sameMap()) MapController.onTouch(frame, page, grantCurrent)
+                        else MapController.cancelFullscreenTouch(page)
+                    },
+                )
+            }
+            val activity = CarHomeActivity.instance?.takeIf { it.display?.displayId == displayId } ?: return null
+            return CarTouchGesture.Target(
+                isCurrent = {
+                    activity === CarHomeActivity.instance && samePage() &&
+                        activity.display?.displayId == displayId && CarReceiverUi.state.value.screenOwned != false
+                },
+                send = activity::dispatchCarTouch,
+            )
+        }
     }
 
     /** Retire synchronously; all cleanup stays off the UI thread. */
@@ -393,7 +435,11 @@ object CarUiCaster {
         if (!running && displayId < 0 && caster == null) return
         // Await surface detachment before destroying encoders; keep the map/navigation alive.
         release("map") { MapController.stop() }
-        release("touch") { RustCoreBridge.setTouchListener(null) }
+        release("touch") {
+            touchListener?.retire()
+            touchListener = null
+            RustCoreBridge.setTouchListener(null)
+        }
         if (displayId > 0) release("display") { SpikeShell.releaseDisplay(displayId) }
         displayId = -1
         displayService = null

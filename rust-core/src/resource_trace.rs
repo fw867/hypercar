@@ -350,7 +350,7 @@ mod tests {
     }
 
     fn reply(status: u16, body: Vec<u8>) -> RtspMessage {
-        RtspMessage { received_at: std::time::Instant::now(), first_line: format!("RTSP/1.0 {status} Test"), headers: HashMap::new(), body }
+        RtspMessage { received_at: std::time::Instant::now(), hid_screen_grant: None, first_line: format!("RTSP/1.0 {status} Test"), headers: HashMap::new(), body }
     }
 
     #[test]

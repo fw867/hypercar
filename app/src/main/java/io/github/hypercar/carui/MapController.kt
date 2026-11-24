@@ -2,10 +2,12 @@ package io.github.hypercar.carui
 
 import android.content.Context
 import android.os.SystemClock
+import android.view.MotionEvent
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.spike.SpikeCaster
 import io.github.hypercar.spike.SpikeShell
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
@@ -33,9 +35,9 @@ object MapController {
     @Volatile private var fullscreenRequested = false
     internal val fullscreenInputActive get() = mapActive && fullscreenRequested
 
-    @Volatile
-    var mapActive: Boolean = false
-        private set
+    private val touchPage = CarTouchPage()
+    val mapActive: Boolean get() = touchPage.snapshot().map
+    internal fun touchPageStamp() = touchPage.snapshot()
 
     private var downX = 0
     private var downY = 0
@@ -44,6 +46,7 @@ object MapController {
     private var downAt = 0L
     private var moved = false
     private var exitGesture = false
+    private var suppressedGesture = false
     private var wakingControl = false
     private var pressedOverlay: MapHomeOverlay? = null
     private var pressedControl: MapControl? = null
@@ -55,6 +58,8 @@ object MapController {
     // Accessed only by touchExecutor, including cancellation on a receiver limit change.
     private var injectedDownAt: Long? = null
     private var injectedDisplay = -1
+    private var injectedCancel: CarTouchFrame? = null
+    private var injectedPage: CarTouchPage.Stamp? = null
 
     suspend fun init(context: Context, home: SpikeCaster) = transitions.withLock {
         appContext = context.applicationContext
@@ -121,7 +126,7 @@ object MapController {
             pressedOverlay = null
             overlay.attach(MapPreview.supportsLayoutReset(id))
             if (provider == MapProvider.AMAP) imeDiagnostics = MapImeDiagnostics(id)
-            mapActive = true
+            touchPage.showMap(true)
             return "ok display=$id（保留${provider.label}任务）"
         } catch (e: Exception) {
             cleanupFailed("全屏切换失败: ${e.message}")
@@ -133,8 +138,9 @@ object MapController {
         if (!mapActive) return "not active"
         stopImeDiagnostics()
         // Attach the card surface before releasing the encoder surface, without restarting the app.
+        touchPage.showMap(false)
+        finishFullscreenTouch()
         MapPreview.resumePreview()
-        mapActive = false
         mapDisplayId = -1
         mapCaster?.setPushing(false)
         homeCaster?.setSuspended(false)
@@ -157,8 +163,9 @@ object MapController {
     private suspend fun cleanupFailed(reason: String) {
         stopImeDiagnostics()
         HyperCarRepo.log("CARUI-MAP: $reason")
+        touchPage.showMap(false)
+        finishFullscreenTouch()
         MapPreview.resumePreview()
-        mapActive = false
         mapDisplayId = -1
         mapOverlay?.close()
         mapOverlay = null
@@ -176,9 +183,23 @@ object MapController {
 
     internal fun cancelMapGesture() {
         MapPreview.cancelCardGesture()
+        cancelFullscreenTouch()
+    }
+
+    internal fun cancelFullscreenTouch(page: CarTouchPage.Stamp? = null) = touchExecutor.execute {
+        if (page == null || injectedPage == page) cancelInjectedTouch()
+    }
+
+    private fun cancelInjectedTouch() {
+        injectedDownAt?.let { inject(injectedDisplay, MotionEvent.ACTION_CANCEL, 0, 0, it, injectedCancel) }
+    }
+
+    private suspend fun finishFullscreenTouch() {
+        val finished = CompletableDeferred<Unit>()
         touchExecutor.execute {
-            injectedDownAt?.let { inject(injectedDisplay, 3, 0, 0, it) }
+            try { cancelInjectedTouch() } finally { finished.complete(Unit) }
         }
+        finished.await()
     }
 
     internal fun overlayKey(key: CarConsoleKey): Boolean {
@@ -205,12 +226,27 @@ object MapController {
      * 高德界面实时跟手触摸：DOWN/MOVE/UP 立即异步注入 D2（mode=ASYNC），不再等松手重放。
      * 顶部下滑退出；右侧工具栏的手势由本层消费，避免同时点到地图。
      */
-    fun onTouch(action: Int, x: Int, y: Int): Boolean {
-        if (!mapActive) return false
+    internal fun onTouch(frame: CarTouchFrame, page: CarTouchPage.Stamp, grantCurrent: () -> Boolean): Boolean {
+        if (!page.map || touchPage.snapshot() != page) return false
         val caster = mapCaster ?: return true
         val dId = mapDisplayId
         if (dId <= 0) return true
-        when (action) {
+        val action = frame.action
+        val x = frame.x
+        val y = frame.y
+        val masked = frame.masked
+        fun enqueue(injectEvent: () -> Unit) = touchExecutor.execute {
+            touchPage.dispatch(page) {
+                if (grantCurrent()) injectEvent()
+                else if (injectedPage == page) cancelInjectedTouch()
+            }
+        }
+        if (masked == MotionEvent.ACTION_DOWN) suppressedGesture = false
+        if (suppressedGesture) {
+            if (masked == MotionEvent.ACTION_UP || masked == MotionEvent.ACTION_CANCEL) suppressedGesture = false
+            return true
+        }
+        when (masked) {
             0 -> {
                 downX = x
                 downY = y
@@ -230,7 +266,7 @@ object MapController {
                 if (wakingControl || pressedControl != null) return true
                 if (!exitGesture) {
                     val dt = downAt
-                    touchExecutor.execute { inject(dId, 0, x, y, dt) }
+                    enqueue { inject(dId, action, x, y, dt, frame, page) }
                 }
             }
             2 -> {
@@ -255,8 +291,23 @@ object MapController {
                 if (now - lastMoveInjectAt >= 8L) {
                     lastMoveInjectAt = now
                     val dt = downAt
-                    touchExecutor.execute { inject(dId, 2, x, y, dt) }
+                    enqueue { inject(dId, action, x, y, dt, frame, page) }
                 }
+            }
+            MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_POINTER_UP -> {
+                moved = true
+                if (wakingControl || pressedControl != null || exitGesture) {
+                    pressedOverlay?.cancelDrag()
+                    pressedOverlay = null
+                    mapOverlay?.peek()
+                    pressedControl = null
+                    wakingControl = false
+                    exitGesture = false
+                    suppressedGesture = true
+                    return true
+                }
+                val dt = downAt
+                enqueue { inject(dId, action, x, y, dt, frame, page) }
             }
             1 -> {
                 mapOverlay?.peek()
@@ -285,17 +336,17 @@ object MapController {
                         requestExit()
                     } else {
                         val dt = downAt
-                        touchExecutor.execute {
-                            inject(dId, 0, x, y, dt)
-                            inject(dId, 1, x, y, dt)
+                        enqueue {
+                            inject(dId, 0, x, y, dt, page = page)
+                            inject(dId, 1, x, y, dt, page = page)
                             tapDiagnostics?.tap()
                         }
                     }
                     return true
                 }
                 val dt = downAt
-                touchExecutor.execute {
-                    inject(dId, 1, x, y, dt)
+                enqueue {
+                    inject(dId, action, x, y, dt, frame, page)
                     tapDiagnostics?.tap()
                 }
             }
@@ -311,22 +362,35 @@ object MapController {
                 exitGesture = false
                 moved = false
                 val dt = downAt
-                touchExecutor.execute { inject(dId, 3, x, y, dt) }
+                touchExecutor.execute {
+                    if (injectedPage == page) inject(dId, action, x, y, dt, frame, page)
+                }
             }
         }
         return true
     }
 
-    private fun inject(displayId: Int, action: Int, x: Int, y: Int, downTimeMs: Long) {
-        if (CarReceiverUi.state.value.limits.blockMapApp && action != 3) return
-        if (action != 0 && (injectedDisplay != displayId || injectedDownAt != downTimeMs)) return
-        val result = SpikeShell.motion(displayId, action, x, y, downTimeMs)
-        if (action == 0 && result.startsWith("OK")) {
+    private fun inject(displayId: Int, action: Int, x: Int, y: Int, downTimeMs: Long,
+                       frame: CarTouchFrame? = null, page: CarTouchPage.Stamp? = null) {
+        val masked = action and MotionEvent.ACTION_MASK
+        if (CarReceiverUi.state.value.limits.blockMapApp && masked != MotionEvent.ACTION_CANCEL) return
+        if (masked != MotionEvent.ACTION_DOWN && (injectedDisplay != displayId || injectedDownAt != downTimeMs)) return
+        val result = if (frame == null) {
+            SpikeShell.motion(displayId, action, x, y, downTimeMs)
+        } else {
+            val event = frame.obtain(downTimeMs, SystemClock.uptimeMillis())
+            try { SpikeShell.touchEvent(displayId, event) } finally { event.recycle() }
+        }
+        if (masked == MotionEvent.ACTION_DOWN && result.startsWith("OK")) {
             injectedDisplay = displayId
             injectedDownAt = downTimeMs
-        } else if (action == 1 || action == 3) {
+            injectedPage = page
+        } else if (masked == MotionEvent.ACTION_UP || masked == MotionEvent.ACTION_CANCEL) {
             injectedDownAt = null
+            injectedPage = null
         }
+        if (result.startsWith("OK")) injectedCancel = frame?.cancelAfter()
+        if (injectedDownAt == null) injectedCancel = null
         if (!result.startsWith("OK")) {
             if (touchLogs++ < 12) {
                 HyperCarRepo.log("CARUI-MAP: motion($action $x,$y) display=$displayId 失败: $result")
@@ -339,10 +403,11 @@ object MapController {
     /** Stop projection only; retain the map display, task, route and native camera. */
     suspend fun stop() = transitions.withLock {
         fullscreenRequested = false
+        touchPage.showMap(false)
+        finishFullscreenTouch()
         stopImeDiagnostics()
         runCatching { MapPreview.suspendProjection() }
             .onFailure { HyperCarRepo.log("CARUI-MAP: 分离地图输出失败 ${it.message}") }
-        mapActive = false
         mapCaster?.setPushing(false)
         mapOverlay?.close()
         mapOverlay = null

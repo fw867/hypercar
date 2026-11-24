@@ -18,10 +18,14 @@ pub(crate) struct Display {
     height: i32,
     safe: [i32; 4],
     encoder_fps: i32,
+    initial_map: bool,
 }
 
 fn kind(d: &Value) -> Option<i64> { d.get("type")?.as_int() }
-fn same_uuid(a: &str, b: &str) -> bool { a.eq_ignore_ascii_case(b) }
+fn same_uuid(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b) || uuid::Uuid::parse_str(a).ok()
+        .zip(uuid::Uuid::parse_str(b).ok()).is_some_and(|(a, b)| a == b)
+}
 
 impl Display {
     pub(crate) fn declared(info: &Value) -> Option<Self> {
@@ -65,7 +69,13 @@ impl Display {
         let left = ((x * width as i64 + w - 1)/w) as i32;
         let top = ((y * height as i64 + h - 1)/h) as i32;
         let safe = [left,top,((x+rw)*width as i64/w) as i32-left,((y+rh)*height as i64/h) as i32-top];
-        (safe[2]>=64 && safe[3]>=48).then_some(Self {uuid,width,height,safe, encoder_fps: airplay::display_max_fps(d).unwrap_or(2).min(2) as i32})
+        let mut urls = d.as_dict()?.iter().filter(|(key, _)| key.as_str() == Some("initialURL"));
+        let initial_map = urls.next().and_then(|(_, value)| value.as_str()) == Some(MAP_URL)
+            && urls.next().is_none();
+        (safe[2]>=64 && safe[3]>=48).then_some(Self {
+            uuid, width, height, safe, encoder_fps: airplay::display_max_fps(d).unwrap_or(2).min(2) as i32,
+            initial_map,
+        })
     }
 
     pub(crate) fn source_available(&self) -> bool {
@@ -149,6 +159,7 @@ impl MapSource for Encoder {
 #[derive(Default, Clone)]
 struct Request { grant: Option<Arc<AtomicBool>>, keyframe: u64 }
 
+#[derive(Default)]
 pub(crate) struct Commands { ids: Vec<String>, active: Option<(String, watch::Sender<Request>)> }
 impl Drop for Commands {
     fn drop(&mut self) {
@@ -159,18 +170,32 @@ impl Drop for Commands {
 }
 impl Commands {
     pub(crate) fn new(info: &Value, reply: &Value, session: Arc<ScreenSession>, tasks: &mut Vec<tokio::task::JoinHandle<()>>) -> Self {
+        Self::with_source(info, reply, session, tasks, Display::source_available, Encoder::open)
+    }
+
+    fn with_source<S: MapSource>(info: &Value, reply: &Value, session: Arc<ScreenSession>,
+        tasks: &mut Vec<tokio::task::JoinHandle<()>>, available: fn(&Display) -> bool,
+        open_source: fn(&Display) -> Option<S>,
+    ) -> Self {
         let ids: Vec<_> = info.get("displays").and_then(Value::as_array).into_iter().flatten()
             .filter(|d| kind(d)==Some(111)).filter_map(|d| uuid_text(d.get("uuid")))
             .filter(|id| !same_uuid(id, &session.uuid)).collect();
         let enabled = reply.get("enabledFeatures").and_then(Value::as_array)
             .is_some_and(|f| f.iter().any(|v| v.as_str()==Some("altScreen")));
-        let display = session.control.cluster_display.get().filter(|d| d.source_available()).cloned();
-        crate::emit_log(&format!("CLUSTER: /info type111_ids={} peer_enabled={} request_listener={} source=AMap_MAP_PREVIEW",
-            ids.len(),enabled,display.is_some()));
+        let display = session.control.cluster_display.get().filter(|d|
+            enabled && ids.iter().any(|id| same_uuid(id, &d.uuid)) && available(d)
+        ).cloned();
+        crate::emit_log(&format!("CLUSTER: /info type111_ids={} peer_enabled={} request_listener={} initial_map={} source=AMap_MAP_PREVIEW",
+            ids.len(),enabled,display.is_some(),display.as_ref().is_some_and(|d| d.initial_map)));
         let active = display.map(|d| {
-            let (tx,rx) = watch::channel(Request::default());
+            // Seed once, before control events are dispatched. A later stop or
+            // content selection revokes the same grant as an explicit showUI.
+            let (tx,rx) = watch::channel(Request {
+                grant: d.initial_map.then(|| Arc::new(AtomicBool::new(true))),
+                ..Default::default()
+            });
             let id = d.uuid.clone();
-            tasks.push(crate::callback_context::spawn(run(d,session,rx,Encoder::open)));
+            tasks.push(crate::callback_context::spawn(run(d,session,rx,open_source)));
             (id,tx)
         });
         Self {ids,active}
@@ -377,12 +402,107 @@ mod tests {
     impl MapSource for FixtureMap {
         fn sample(&self, _: Sample) -> Option<Vec<u8>> { Some(SAMPLE.to_vec()) }
     }
+
+    fn startup_info(url: Option<&str>) -> Value {
+        let mut instrument = vec![
+            ("type", Value::int(111)), ("uuid", Value::str(AUX)),
+            ("widthPixels", Value::int(64)), ("heightPixels", Value::int(48)),
+        ];
+        if let Some(url) = url { instrument.push(("initialURL", Value::str(url))); }
+        Value::dict(vec![("displays", Value::array(vec![display(110, MAIN), Value::dict(instrument)]))])
+    }
+
+    fn accepted_alt_screen() -> Value {
+        Value::dict(vec![("enabledFeatures", Value::array(vec![Value::str("altScreen")]))])
+    }
+
+    #[tokio::test]
+    async fn initial_map_starts_after_current_main_idr_without_show_ui() {
+        exercise_initial_map(false).await;
+    }
+
+    #[tokio::test]
+    async fn early_stop_ui_cancels_the_initial_map_until_an_explicit_show_ui() {
+        exercise_initial_map(true).await;
+    }
+
+    async fn exercise_initial_map(stop_before_main: bool) {
+        use crate::screen_resource::tests::{Fixture, read, reply};
+        use tokio::{io::AsyncReadExt, net::{TcpListener, TcpStream}, time::timeout};
+        let mut f = Fixture::new(crate::modes::Modes::initial()).await;
+        Arc::get_mut(&mut f.session).unwrap().uuid = MAIN.into();
+        let info = startup_info(Some(MAP_URL));
+        let session_reply = accepted_alt_screen();
+        let selected = Offer::AwaitingDisplays.resolve(&info, &session_reply).unwrap();
+        f.session.control.cluster_display.set(selected).unwrap();
+        let mut workers = Vec::new();
+        let commands = Commands::with_source(&info, &session_reply, f.session.clone(), &mut workers,
+            |_| true, |_| Some(FixtureMap));
+        if stop_before_main {
+            assert!(commands.handle("stopUI", &command(AUX, MAP_URL)));
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (_peer, _) = listener.accept().await.unwrap();
+        let mut main = ScreenSender::new(socket.into_split().1, ScreenCipher::ChaCha([1;32]), 64, 48, false);
+        main.attach_diagnostics(f.session.params.pipeline.clone(), 47);
+        main.send_video_annexb(&[0,0,1,0x41,9], 1000).await.unwrap();
+        let mut byte = [0];
+        assert!(timeout(Duration::from_millis(50), f.car.read(&mut byte)).await.is_err());
+        main.send_video_annexb(SAMPLE, 2000).await.unwrap();
+        if stop_before_main {
+            assert!(timeout(Duration::from_millis(50), f.car.read(&mut byte)).await.is_err());
+            assert!(commands.handle("showUI", &command(AUX, MAP_URL)));
+        }
+        let setup = timeout(Duration::from_secs(2), read(&mut f.car)).await.unwrap();
+        assert!(setup.first_line.starts_with("SETUP "));
+        let body = bplist::parse(&setup.body).unwrap();
+        let aux = setup_stream::select(&body, 111, false).unwrap();
+        assert_eq!(aux.get("uuid").and_then(Value::as_str), Some(AUX));
+        reply(&mut f.car, &setup, 400, &[]).await;
+        drop(commands);
+        workers.pop().unwrap().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_negotiated_available_auxiliary_map_can_seed_the_initial_request() {
+        use crate::screen_resource::tests::Fixture;
+        for (url, accepted, available, expected) in [
+            (None, true, true, Some(false)),
+            (Some("maps:/car/instrumentcluster/map?x=1"), true, true, Some(false)),
+            (Some(MAP_URL), false, true, None),
+            (Some(MAP_URL), true, false, None),
+            (Some(MAP_URL), true, true, Some(true)),
+        ] {
+            let mut f = Fixture::new(crate::modes::Modes::initial()).await;
+            Arc::get_mut(&mut f.session).unwrap().uuid = MAIN.into();
+            let info = startup_info(url);
+            let reply = if accepted { accepted_alt_screen() } else { Value::Null };
+            f.session.control.cluster_display.set(Display::declared(&info).unwrap()).unwrap();
+            let mut workers = Vec::new();
+            let available: fn(&Display) -> bool = if available { |_| true } else { |_| false };
+            let commands = Commands::with_source(&info, &reply, f.session.clone(), &mut workers,
+                available, |_| Some(FixtureMap));
+            assert_eq!(commands.active.as_ref().map(|(_, tx)| tx.borrow().grant.is_some()), expected);
+            drop(commands);
+            for worker in workers { worker.await.unwrap(); }
+        }
+    }
+
+    #[test]
+    fn ambiguous_initial_url_does_not_grant_the_map() {
+        let mut instrument = display(111, AUX);
+        let Value::Dict(fields) = &mut instrument else { unreachable!() };
+        fields.push((Value::str("initialURL"), Value::str(MAP_URL)));
+        fields.push((Value::str("initialURL"), Value::str("")));
+        assert!(!declared(vec![display(110, MAIN), instrument]).unwrap().initial_map);
+    }
     #[tokio::test]
     async fn requested_cluster_setup_waits_for_a_frame_on_the_current_main_connection() {
         use crate::screen_resource::tests::{Fixture, read, reply};
         use tokio::{io::AsyncReadExt, net::{TcpListener, TcpStream}, time::timeout};
         let mut f = Fixture::new(crate::modes::Modes::initial()).await;
-        let display = Display { width:64, height:48, safe:[0,0,64,48], uuid:AUX.into(), encoder_fps:2 };
+        let display = Display { width:64, height:48, safe:[0,0,64,48], uuid:AUX.into(), encoder_fps:2, initial_map:false };
         let (tx,rx) = watch::channel(Request::default());
         let commands = Commands { ids:vec![AUX.into()], active:Some((AUX.into(),tx)) };
         let worker = tokio::spawn(run(display, f.session.clone(), rx, |_| Some(FixtureMap)));
@@ -438,7 +558,7 @@ mod tests {
     async fn independent_avc_frame_is_written_with_its_own_connection_key() {
         use tokio::{io::AsyncReadExt, net::{TcpListener, TcpStream}};
         let sample = SAMPLE;
-        let display = Display { width:64, height:48, safe:[0,0,64,48], uuid:AUX.into(), encoder_fps:2 };
+        let display = Display { width:64, height:48, safe:[0,0,64,48], uuid:AUX.into(), encoder_fps:2, initial_map:false };
         assert!(first_idr(sample, &display));
         assert!(!first_idr(sample, &aux()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -479,6 +599,7 @@ mod tests {
         assert_eq!(declared(vec![display(110,MAIN), limited]).unwrap().encoder_fps,1);
         for entries in [vec![display(110,MAIN)],vec![display(111,AUX)],
             vec![display(110,MAIN),display(111,MAIN)],vec![display(110,MAIN),display(111,"no uuid")],
+            vec![display(110,MAIN),display(111,&MAIN.replace('-', ""))],
             vec![display(110,MAIN),display(111,AUX),display(111,AUX)]] { assert!(declared(entries).is_none()); }
         let area = Value::dict(vec![("widthPixels",Value::int(900)),("heightPixels",Value::int(600)),
             ("safeArea",Value::dict(vec![("originXPixels",Value::int(40)),("originYPixels",Value::int(60)),

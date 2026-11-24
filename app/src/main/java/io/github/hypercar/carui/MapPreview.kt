@@ -80,8 +80,16 @@ object MapPreview {
                         val result = SpikeShell.touchEvent(packet.binding.displayId, packet.event)
                         if (result.startsWith("OK")) {
                             injectedTouch?.event?.recycle()
-                            injectedTouch = if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL)
-                                null else CardTouch(packet.binding, MotionEvent.obtainNoHistory(packet.event))
+                            val remaining = when (action) {
+                                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> null
+                                MotionEvent.ACTION_POINTER_UP -> {
+                                    val (width, height) = packet.binding.width to packet.binding.height
+                                    CarTouchFrame.fromView(packet.event, width, height, width, height)
+                                        ?.cancelAfter()?.obtain(packet.event.downTime, packet.event.eventTime)
+                                }
+                                else -> MotionEvent.obtainNoHistory(packet.event)
+                            }
+                            injectedTouch = remaining?.let { CardTouch(packet.binding, it) }
                             if (action == MotionEvent.ACTION_DOWN && touchLogs++ < 6) {
                                 HyperCarRepo.log("MAP-CARD-TOUCH: DOWN display=${packet.binding.displayId} local=(${packet.event.x.toInt()},${packet.event.y.toInt()}) canvas=${packet.binding.width}x${packet.binding.height}")
                             }

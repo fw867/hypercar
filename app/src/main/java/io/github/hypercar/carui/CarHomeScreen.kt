@@ -1075,19 +1075,7 @@ private fun ProjectedMediaPanel(
             factory = { context ->
                 android.view.TextureView(context).apply {
                     setOnTouchListener { view, event ->
-                        val action = when (event.actionMasked) {
-                            android.view.MotionEvent.ACTION_DOWN -> 0
-                            android.view.MotionEvent.ACTION_MOVE -> 2
-                            android.view.MotionEvent.ACTION_UP -> 1
-                            android.view.MotionEvent.ACTION_CANCEL -> 3
-                            else -> -1
-                        }
-                        val texture = surfaceTexture
-                        if (texture != null && action >= 0 && view.width > 0 && view.height > 0) {
-                            projection.touch(
-                                texture, action, event.x / view.width, event.y / view.height, event.downTime,
-                            )
-                        }
+                        surfaceTexture?.let { projection.touch(it, event, view.width, view.height) }
                         true
                     }
                     surfaceTextureListener = object : android.view.TextureView.SurfaceTextureListener {

@@ -70,8 +70,9 @@ internal object NavigationSources {
     fun snapshot(): NavigationCue? {
         // Local map guidance must survive when a receiver has no HUD subscription/support.
         if (!HyperCarRepo.hudNavigationAllowed) return null
-        return if (HyperCarRepo.carWithHudNavigationAllowed) CarWithNavigation.snapshot()
-            else AmapLinkNavigation.snapshot() ?: AmapNavigation.snapshot()
+        if (HyperCarRepo.carWithHudNavigationAllowed) return CarWithNavigation.snapshot()
+        val now = SystemClock.elapsedRealtime()
+        return AmapLinkNavigation.hudSnapshot(now, AmapNavigation.timedSnapshot(now))
     }
     fun clear() { AmapNavigation.clear(); AmapLinkNavigation.clear(); CarWithNavigation.clear(); AmapLinkProbe.stop() }
 }

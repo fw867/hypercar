@@ -14,6 +14,8 @@ object WifiIap2Bridge {
     val vehicleStatus = liveVehicleStatus.asStateFlow()
     private val liveVehicleLocation = MutableStateFlow<Iap2VehicleLocation?>(null)
     val vehicleLocation = liveVehicleLocation.asStateFlow()
+    private val liveWheelSpeed = MutableStateFlow<Iap2WheelSpeed?>(null)
+    val wheelSpeed = liveWheelSpeed.asStateFlow()
 
     @Synchronized fun start(id: Long, deviceId: String, deviceName: String, profileId: String) {
         active?.close()
@@ -50,13 +52,21 @@ object WifiIap2Bridge {
     }
 
     @Synchronized private fun publishVehicleLocation(worker: Worker, location: Iap2VehicleLocation?) {
-        if (active === worker && !worker.closed) liveVehicleLocation.value = location
+        if (active !== worker || worker.closed) return
+        liveVehicleLocation.value = location
+        RustCoreBridge.nativePublishCarWithGps(worker.id, location?.carLifeGpsFields(System.currentTimeMillis()))
+    }
+
+    @Synchronized private fun publishWheelSpeed(worker: Worker, speed: Iap2WheelSpeed?) {
+        if (active === worker && !worker.closed) liveWheelSpeed.value = speed
     }
 
     @Synchronized private fun clearVehicle(worker: Worker) {
         if (active !== worker) return
         liveVehicleStatus.value = Iap2VehicleStatus()
         liveVehicleLocation.value = null
+        RustCoreBridge.nativePublishCarWithGps(worker.id, null)
+        liveWheelSpeed.value = null
     }
 
     private sealed interface Input {
@@ -76,7 +86,8 @@ object WifiIap2Bridge {
             onVehicleStatus = { publishVehicle(this, it) },
             onMediaKey = { usage -> HyperCarRepo.onIap2MediaKey(usage) { isCurrent(id) } },
             profileId = profileId, onPeerSynAccepted = { RustCoreBridge.nativeWifiIap2PeerSyn(id) },
-            onVehicleLocation = { publishVehicleLocation(this, it) }, callStateSource = Iap2CallStateSource(),
+            onVehicleLocation = { publishVehicleLocation(this, it) }, onWheelSpeed = { publishWheelSpeed(this, it) },
+            callStateSource = Iap2CallStateSource(),
             onTransportReady = { RustCoreBridge.nativeMarkWifiIap2Ready(id, it) })
         val thread = Thread({
             var lastPhase = ""

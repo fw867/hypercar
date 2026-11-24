@@ -17,6 +17,7 @@ internal class WifiIap2Protocol(
     profileId: String = "",
     private val onPeerSynAccepted: () -> Unit = {},
     onVehicleLocation: (Iap2VehicleLocation?) -> Unit = {},
+    onWheelSpeed: (Iap2WheelSpeed?) -> Unit = {},
     callStateSource: Iap2CallStateSource? = null,
     private val onTransportReady: (Boolean) -> Boolean = { true },
 ) {
@@ -26,7 +27,7 @@ internal class WifiIap2Protocol(
     private val media = Iap2MediaSession(log, onMediaKey)
     private val nowPlaying = Iap2NowPlayingSession(nowPlayingProvider, log, initializeArtworkWithEmptyFile = true)
     private val vehicle = Iap2VehicleStatusSession(onVehicleStatus, log)
-    private val location = Iap2VehicleLocationSession(onVehicleLocation)
+    private val location = Iap2VehicleLocationSession(onVehicleLocation, onWheelSpeed)
     private var identification: Iap2Messages.Identification? = null
     private var authenticated = false
     private var navigation = RouteGuidanceSession(log)
@@ -231,10 +232,13 @@ internal class WifiIap2Protocol(
         if (id == Iap2MessageIds.LOCATION_INFORMATION) {
             if (phase == "READY") {
                 val wasFixed = location.hasFix
+                val hadWheelSpeed = location.wheelSpeed != null
                 location.receive(frame.body, now)
                 locationFrames++
-                if (locationFrames <= 3 || locationFrames % 60 == 0L || location.hasFix != wasFixed) {
-                    log("GPS: RX id=0xfffb count=$locationFrames bytes=${frame.body.size} fixValid=${location.hasFix}")
+                val wheelSpeed = location.wheelSpeed
+                if (locationFrames <= 3 || locationFrames % 60 == 0L || location.hasFix != wasFixed ||
+                    (wheelSpeed != null) != hadWheelSpeed) {
+                    log("GPS: RX id=0xfffb count=$locationFrames bytes=${frame.body.size} fixValid=${location.hasFix} wheelSpeedValid=${wheelSpeed != null} wheelSpeedMps=${wheelSpeed?.metersPerSecond ?: "unknown"}")
                 }
             }
             return
@@ -319,7 +323,7 @@ internal class WifiIap2Protocol(
         }
         val peer = Iap2Messages.parseIdentification(body)
         identification = peer
-        navigation.declareReceiveSupport(peer.acceptsRouteGuidance)
+        navigation.declareReceiveSupport(peer.acceptsRouteGuidance, peer.currentRoadLimits)
         subscriptions.identify(peer.model, peer.manufacturer)
         media.identify(peer.hidComponents)
         send(0x1d02)

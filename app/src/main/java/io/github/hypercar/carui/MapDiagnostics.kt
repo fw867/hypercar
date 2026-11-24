@@ -84,8 +84,12 @@ internal object MapDiagnostics {
         }
         if (probe) {
             val fix = WifiIap2Bridge.vehicleLocation.value
-            val age = fix?.let { ((System.nanoTime() / 1_000_000 - it.receivedAtMillis).coerceAtLeast(0) / 1_000).toString() }
-            emit(token, "MAP-LOC: carFixValid=${fix != null} carFixSource=wifi-iap2 carFixAgeS=${age ?: "unknown"}")
+            val speed = WifiIap2Bridge.wheelSpeed.value
+            val now = System.nanoTime() / 1_000_000
+            val fixAge = fix?.let { (now - it.receivedAtMillis).coerceAtLeast(0) / 1_000 }
+            val speedAge = speed?.let { (now - it.receivedAtMillis).coerceAtLeast(0) / 1_000 }
+            emit(token, "MAP-LOC: carFixValid=${fix != null} carFixSource=wifi-iap2 carFixAgeS=${fixAge ?: "unknown"} " +
+                "carWheelSpeedMps=${speed?.metersPerSecond ?: "unknown"} carWheelSpeedAgeS=${speedAge ?: "unknown"}")
         }
         if (probe && ShizukuTools.isReady) {
             // Only bounded current state; never persist raw dumps (which may contain exact locations).

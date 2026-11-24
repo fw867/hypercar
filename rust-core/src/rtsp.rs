@@ -97,6 +97,8 @@ impl ControlCipher {
 pub struct RtspMessage {
     /// Local monotonic time when the complete message was parsed, before CSeq dispatch.
     pub received_at: std::time::Instant,
+    /// Local screen grant observed when the event reader accepted a HID report.
+    pub(crate) hid_screen_grant: Option<u64>,
     /// 应答："RTSP/1.0 200 OK"；请求："POST /command RTSP/1.0"。
     pub first_line: String,
     pub headers: HashMap<String, String>,
@@ -184,6 +186,7 @@ fn parse_rtsp_messages_with<T>(buf: &mut Vec<u8>, mut collect: impl FnMut(RtspMe
         let body = buf[head_end + 4..total].to_vec();
         let message = RtspMessage {
             received_at: std::time::Instant::now(),
+            hid_screen_grant: None,
             first_line,
             headers,
             body,
@@ -877,7 +880,7 @@ impl Drop for RtspChannel {
     }
 }
 
-pub type CommandReply = Arc<dyn Fn(&RtspMessage) -> Option<Vec<u8>> + Send + Sync>;
+pub type CommandReply = Arc<dyn Fn(&mut RtspMessage) -> Option<Vec<u8>> + Send + Sync>;
 pub type EventObserver = Arc<dyn Fn(u64, &str) + Send + Sync>;
 struct EventTrace {
     id: u64,
@@ -990,7 +993,7 @@ async fn reader_loop(
         if messages.iter().any(|(_, _, teardown)| *teardown) {
             session_end.begin_teardown();
         }
-        for (msg, raw_head, teardown) in messages {
+        for (mut msg, raw_head, teardown) in messages {
             if msg.is_response() {
                 if let Some(c) = msg.cseq() {
                     let reply = pending.lock().remove(&c);
@@ -1053,7 +1056,7 @@ async fn reader_loop(
                     session_end.finish_teardown(cause);
                     continue;
                 }
-                let body = reply.as_ref().and_then(|f| f(&msg)).unwrap_or_default();
+                let body = reply.as_ref().and_then(|f| f(&mut msg)).unwrap_or_default();
                 let ui_type = if msg.first_line.contains("/command") {
                     crate::bplist::parse(&msg.body).ok().and_then(|v| match v.get("type").and_then(crate::bplist::Value::as_str) {
                         Some("requestUI") => Some("requestUI"),
@@ -1116,6 +1119,7 @@ mod ingress_metadata_tests {
         for (kind,expected) in [("futureCommand",501),("iAPSendMessage",200)] {
             let message=RtspMessage {
                 received_at: std::time::Instant::now(),
+                hid_screen_grant: None,
                 first_line:"POST /command RTSP/1.0".into(),headers:HashMap::new(),
                 body:encode(&Value::dict(vec![("type",Value::str(kind)),("params",Value::dict(vec![
                     ("data",Value::Data(b"PRIVATE_PAYLOAD".to_vec())),("url",Value::str("scheme:PRIVATE_URL")),
@@ -1129,7 +1133,7 @@ mod ingress_metadata_tests {
             assert!(!note.contains("PRIVATE"));
             assert!(!note.contains("scheme:"));
         }
-        let message=RtspMessage {received_at: std::time::Instant::now(),first_line:"POST /PRIVATE_URL?secret=PRIVATE RTSP/1.0".into(),headers:HashMap::new(),body:b"PRIVATE_BODY".to_vec()};
+        let message=RtspMessage {received_at: std::time::Instant::now(),hid_screen_grant:None,first_line:"POST /PRIVATE_URL?secret=PRIVATE RTSP/1.0".into(),headers:HashMap::new(),body:b"PRIVATE_BODY".to_vec()};
         let note=inbound_command_metadata(&message);
         assert!(note.contains("target=other"));
         assert!(!note.contains("PRIVATE"));
@@ -1218,7 +1222,7 @@ mod tests {
             ("safeArea", rect(20, 650))]);
         let info = Value::dict(vec![("viewAreas", Value::array(vec![rect(0, 800), cropped]))]);
         let areas = ViewAreas::new(&info, 800, 480, Some("Main"), true, false);
-        let event = |uuid, index| RtspMessage { received_at: std::time::Instant::now(), first_line: "POST /command RTSP/1.0".into(),
+        let event = |uuid, index| RtspMessage { received_at: std::time::Instant::now(), hid_screen_grant: None, first_line: "POST /command RTSP/1.0".into(),
             headers: HashMap::new(), body: encode(&Value::dict(vec![("type", Value::str("updateViewArea")),
                 ("params", Value::dict(vec![("uuid", Value::str(uuid)), ("viewAreaIndex", Value::int(index))]))])) };
         let layout = validate_inbound_command(&event("main", 1), Some(&areas)).unwrap().unwrap();
@@ -1241,7 +1245,7 @@ mod tests {
             let modes=Arc::new(Mutex::new(crate::modes::Modes::from_info(&Value::dict(vec![]),true,true)));
             let before=modes.lock().diagnostics();
             let reply_modes=modes.clone();
-            let reply=Arc::new(move |request: &RtspMessage| {
+            let reply=Arc::new(move |request: &mut RtspMessage| {
                 let command=crate::bplist::parse(&request.body).ok()?;
                 reply_modes.lock().response(&command, &Default::default()).map(|reply| reply.body)
             });

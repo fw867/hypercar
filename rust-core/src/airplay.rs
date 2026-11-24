@@ -87,9 +87,40 @@ pub struct AirplayParams {
 }
 
 /// 车机触摸（已是编码画布坐标）。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TouchInput {
     pub action: u32,
+    pub x: u32,
+    pub y: u32,
+    pub pointers: Vec<TouchPoint>,
+    pub(crate) grant: Option<TouchGrant>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TouchGrant {
+    modes: std::sync::Weak<Mutex<crate::modes::Modes>>,
+    pub(crate) generation: u64,
+}
+
+impl TouchGrant {
+    pub(crate) fn new(modes: &Arc<Mutex<crate::modes::Modes>>, generation: u64) -> Self {
+        Self { modes: Arc::downgrade(modes), generation }
+    }
+
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        self.generation == other.generation && self.modes.ptr_eq(&other.modes)
+    }
+
+    pub(crate) fn with_current<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
+        let modes = self.modes.upgrade()?;
+        let current = modes.lock();
+        current.can_restore_screen(self.generation).then(action)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TouchPoint {
+    pub id: u32,
     pub x: u32,
     pub y: u32,
 }
@@ -436,6 +467,7 @@ pub async fn negotiate(
         crate::modes::Modes::from_info_with_audio_policy(&info, p.enable_audio, false, true)
     } else { crate::modes::Modes::from_info(&info, p.enable_audio, box_bootstrap) };
     let modes = Arc::new(Mutex::new(initial_modes));
+    p.pipeline.lock().touch_modes = Arc::downgrade(&modes);
     let screen_owned = Arc::new(std::sync::atomic::AtomicBool::new(modes.lock().screen_owned()));
     let audio_owned = Arc::new(std::sync::atomic::AtomicBool::new(modes.lock().audio_owned()));
     channel.buffered_ownership.publish(modes.lock().audio_owned());
@@ -472,6 +504,7 @@ pub async fn negotiate(
         if !message.first_line.contains("/command") { return None; }
         let command = bplist::parse(&message.body).ok()?;
         let mut modes = reply_modes.lock();
+        capture_hid_screen_grant(message, &command, &modes);
         if command.get("type").and_then(Value::as_str) == Some("requestUI")
             && crate::receiver_ui::main_target(&command, Some(&reply_display)) { modes.request_ui(); }
         let response = modes.response(&command, &reply_audio_generation);
@@ -552,7 +585,7 @@ pub async fn negotiate(
         p.screen_resource_lifecycle.then(|| screen_session.clone()),
         touch_tx,
         key_tx,
-        crate::consumer_hid::ConsumerHid::for_session(wifi_iap_id, &info),
+        crate::consumer_hid::ConsumerHid::for_session(wifi_iap_id, &info, &main_screen_id),
         limited_ui,
         Some(main_screen_id),
         // 触摸的「显示空间」分母，优先级：
@@ -2087,7 +2120,7 @@ mod display_size_tests {
     fn handle_hid_report(report: &[u8], touch_tx: &mpsc::UnboundedSender<TouchInput>, display: (u32,u32),
         surface: &TouchSurface, target_size: &Arc<Mutex<(u32,u32)>>, contact: &mut TouchContact, logged: &mut u32) {
         let sample = crate::consumer_hid::TouchSample::legacy(report).unwrap();
-        handle_touch_sample(sample, touch_tx, display, surface, target_size, contact, logged);
+        handle_touch_sample(sample, touch_tx, display, surface, target_size, contact, logged, true, None);
     }
 
     #[tokio::test]
@@ -2127,13 +2160,66 @@ mod display_size_tests {
         assert!(hid.report(Some(&id), &report).is_none());
         let sample = hid.touch_sample(Some(&id), &report, (2000, 1000)).unwrap();
         handle_touch_sample(sample, &tx, (2000, 1000),
-            &TouchSurface::Display, &source, &mut contact, &mut logged);
+            &TouchSurface::Display, &source, &mut contact, &mut logged, true, None);
         let touch = rx.try_recv().unwrap();
         assert_eq!((touch.action, touch.x, touch.y), (0, 1000, 250));
     }
 
+    fn touch_contacts(device: &str, points: &[(u32, u32, u32)]) -> MultiTouchReport {
+        MultiTouchReport {
+            source: (device.to_owned(), 0),
+            contacts: points.iter().map(|&(id, x, y)| (
+                TouchIdentity::Identifier(id),
+                crate::consumer_hid::TouchSample { pressed: true, x, y },
+            )).collect(),
+        }
+    }
+
     #[test]
-    fn hid_mapping_tracks_actual_carwith_source_without_changing_receiver_coordinates() {
+    fn multi_touch_keeps_android_ids_and_pointer_up_index_when_hid_slots_reorder() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut touch = TouchContacts::new(tx);
+        let viewport = Some(TouchMapping::new((0, 0, 100, 100), (100, 100)));
+        let drain = |rx: &mut mpsc::UnboundedReceiver<TouchInput>| {
+            std::iter::from_fn(|| rx.try_recv().ok()).map(|input| (
+                input.action, input.x, input.pointers.iter().map(|p| p.id).collect::<Vec<_>>(),
+            )).collect::<Vec<_>>()
+        };
+        touch.update(touch_contacts("main", &[(9, 20, 10), (4, 70, 60)]), viewport, false);
+        assert_eq!(drain(&mut rx), vec![(0, 20, vec![0]), (261, 70, vec![0, 1])]);
+        touch.update(touch_contacts("main", &[(4, 71, 60), (9, 21, 10)]), viewport, false);
+        assert_eq!(drain(&mut rx), vec![(2, 21, vec![0, 1])]);
+        touch.update(touch_contacts("main", &[(4, 74, 60)]), viewport, false);
+        assert_eq!(drain(&mut rx), vec![(6, 21, vec![0, 1])]);
+        touch.update(touch_contacts("main", &[]), viewport, false);
+        assert_eq!(drain(&mut rx), vec![(1, 74, vec![1])]);
+    }
+
+    #[test]
+    fn multi_touch_captures_source_and_cancels_on_viewport_change_without_restarting_held_fingers() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut touch = TouchContacts::new(tx);
+        let viewport = Some(TouchMapping::new((10, 10, 80, 80), (80, 80)));
+        touch.update(touch_contacts("main", &[(1, 8, 10), (2, 20, 20)]), viewport, true);
+        let down = rx.try_recv().unwrap();
+        assert_eq!((down.action, down.x, down.pointers.len()), (0, 10, 1));
+        // The first contact entered dead space and cannot start by sliding in.
+        touch.update(touch_contacts("main", &[(1, 50, 50), (2, 8, 20)]), viewport, true);
+        let moved = rx.try_recv().unwrap();
+        assert_eq!((moved.action, moved.x, moved.pointers.len()), (2, 0, 1));
+        assert_eq!(touch.update(touch_contacts("other", &[]), viewport, true), 0);
+        assert_eq!(touch.update(touch_contacts("main", &[(2, 20, 20)]), None, true), 1);
+        assert_eq!(rx.try_recv().unwrap().action, 3);
+        assert_eq!(touch.update(touch_contacts("main", &[(2, 20, 20)]), viewport, true), 0);
+        touch.update(touch_contacts("main", &[]), viewport, true);
+        touch.update(touch_contacts("main", &[(2, 20, 20)]), viewport, true);
+        assert_eq!(rx.try_recv().unwrap().action, 0);
+        drop(touch);
+        assert_eq!(rx.try_recv().unwrap().action, 3);
+    }
+
+    #[test]
+    fn held_single_touch_cancels_before_using_replacement_carwith_canvas() {
         let (tx,mut rx)=mpsc::unbounded_channel();
         let source=Arc::new(Mutex::new((1280,372)));
         let mut down=TouchContact::Idle;let mut logged=0;
@@ -2142,8 +2228,14 @@ mod display_size_tests {
         let touch=rx.try_recv().unwrap();assert_eq!((touch.action,touch.x,touch.y),(0,640,186));
         *source.lock()=(1920,720); // A negotiated source change is applied once, at the HID mapper.
         handle_hid_report(&report,&tx,(2732,794),&TouchSurface::Display,&source,&mut down,&mut logged);
-        let touch=rx.try_recv().unwrap();assert_eq!((touch.action,touch.x,touch.y),(2,960,360));
+        let touch=rx.try_recv().unwrap();assert_eq!((touch.action,touch.x,touch.y),(3,640,186));
+        handle_hid_report(&report,&tx,(2732,794),&TouchSurface::Display,&source,&mut down,&mut logged);
+        assert!(rx.try_recv().is_err());
         let release=[0,0,0x56,0x05,0x8d,0x01];
+        handle_hid_report(&release,&tx,(2732,794),&TouchSurface::Display,&source,&mut down,&mut logged);
+        assert!(rx.try_recv().is_err());
+        handle_hid_report(&report,&tx,(2732,794),&TouchSurface::Display,&source,&mut down,&mut logged);
+        let touch=rx.try_recv().unwrap();assert_eq!((touch.action,touch.x,touch.y),(0,960,360));
         handle_hid_report(&release,&tx,(2732,794),&TouchSurface::Display,&source,&mut down,&mut logged);
         assert_eq!(rx.try_recv().unwrap().action,1);
         // A stretched 16:9 source on a wide receiver still maps both axes independently.
@@ -2212,30 +2304,167 @@ mod display_size_tests {
         replacement.send_config(&native).await.unwrap();
         assert_eq!(touch(true,176,283), Some((0,88,255)));
         replacement.reset_source();
-        assert_eq!(touch(false,0,0), Some((1,88,255)));
+        assert_eq!(touch(false,0,0), Some((3,88,255)));
         assert_eq!(touch(true,176,283), None);
         replacement.send_config(&native).await.unwrap();
         assert_eq!(touch(true,176,283), None);
         assert_eq!(touch(false,176,283), None);
         *source.lock() = (1280,372);
         assert_eq!(touch(true,176,284), Some((0,44,128)));
+        replacement.send_config(&native).await.unwrap();
+        assert_eq!(touch(true,176,284), Some((2,44,128)));
+        replacement.reset_source();
+        replacement.send_config(&native).await.unwrap();
+        // Config disappeared and returned before the next HID report.
+        assert_eq!(touch(true,176,284), Some((3,44,128)));
+        assert_eq!(touch(true,176,284), None);
+        assert_eq!(touch(false,176,284), None);
+        assert_eq!(touch(true,176,284), Some((0,44,128)));
+    }
+
+    #[test]
+    fn single_touch_cancels_at_resource_loss_and_waits_for_physical_release() {
+        use crate::consumer_hid::TouchSample;
+        let mut modes = crate::modes::Modes::initial();
+        modes.request_ui();
+        let resource = Value::dict(vec![("resources", Value::array(vec![Value::dict(vec![
+            ("resourceID", Value::int(1)), ("transferType", Value::int(3)),
+            ("transferPriority", Value::int(500)), ("unborrowConstraint", Value::int(100)),
+        ])]))]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut contact = TouchContact::Idle;
+        let mut multi = TouchContacts::new(tx.clone());
+        let mut grant = modes.screen_grant_generation();
+        let mut logged = 0;
+        let target = Arc::new(Mutex::new((1920, 720)));
+        let mut handle = |modes: &crate::modes::Modes, pressed: Option<bool>| {
+            let owned = sync_touch_grant(modes, &mut grant, &mut contact, &mut multi, &tx);
+            if let Some(pressed) = pressed {
+                handle_touch_sample(TouchSample { pressed, x: 88, y: 255 },
+                    &tx, (1920, 720), &TouchSurface::Display, &target, &mut contact, &mut logged, owned, None);
+            }
+            rx.try_recv().ok().map(|t| (t.action, t.x, t.y))
+        };
+
+        assert_eq!(handle(&modes, Some(true)), Some((0, 88, 255)));
+        assert!(modes.change(&resource));
+        assert!(!modes.screen_owned());
+        assert_eq!(handle(&modes, None), Some((3, 88, 255)));
+        assert_eq!(handle(&modes, Some(true)), None);
+        assert_eq!(handle(&modes, Some(false)), None);
+        // A new finger placed while the car owns the main screen stays suppressed.
+        assert_eq!(handle(&modes, Some(true)), None);
+        modes.request_ui();
+        assert!(modes.screen_owned());
+        assert_eq!(handle(&modes, Some(true)), None);
+        assert_eq!(handle(&modes, Some(false)), None);
+        assert_eq!(handle(&modes, Some(true)), Some((0, 88, 255)));
+        // Resource messages may both be applied before the dispatcher reads the next HID report.
+        assert!(modes.change(&resource));
+        modes.request_ui();
+        assert!(modes.screen_owned());
+        assert_eq!(handle(&modes, Some(false)), Some((3, 88, 255)));
+        assert_eq!(handle(&modes, Some(true)), Some((0, 88, 255)));
+        assert_eq!(handle(&modes, Some(false)), Some((1, 88, 255)));
+    }
+
+    #[tokio::test]
+    async fn queued_hid_does_not_click_after_the_event_reader_applies_a_take_and_return() {
+        use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
+
+        async fn request(peer: &mut TcpStream, cseq: i32, command: Value) {
+            let body = bplist::encode(&command);
+            let header = format!("POST /command RTSP/1.0\r\nCSeq: {cseq}\r\nContent-Length: {}\r\n\r\n", body.len());
+            peer.write_all(header.as_bytes()).await.unwrap();
+            peer.write_all(&body).await.unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(1), async {
+                let mut buffer = Vec::new();
+                let mut chunk = [0; 1024];
+                loop {
+                    let bytes = peer.read(&mut chunk).await.unwrap();
+                    assert!(bytes > 0);
+                    buffer.extend_from_slice(&chunk[..bytes]);
+                    if let Some(reply) = crate::rtsp::parse_rtsp_messages(&mut buffer).unwrap().pop() {
+                        break reply;
+                    }
+                }
+            }).await.unwrap();
+            assert_eq!(result.cseq(), Some(cseq));
+            assert_eq!(result.status(), 200);
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _control_peer = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (phone, _) = listener.accept().await.unwrap();
+        let (read, write) = phone.into_split();
+        let (control, _control_input) = RtspChannel::spawn(read, write, None);
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (phone, _) = listener.accept().await.unwrap();
+        let (read, write) = phone.into_split();
+        let modes = Arc::new(Mutex::new(crate::modes::Modes::initial()));
+        modes.lock().request_ui();
+        let reply_modes = modes.clone();
+        let reply: crate::rtsp::CommandReply = Arc::new(move |message| {
+            let command = bplist::parse(&message.body).ok()?;
+            let mut modes = reply_modes.lock();
+            capture_hid_screen_grant(message, &command, &modes);
+            if command.get("type").and_then(Value::as_str) == Some("requestUI") { modes.request_ui(); }
+            modes.response(&command, &Default::default()).map(|reply| reply.body)
+        });
+        let (_event, inbound) = control.spawn_event(read, write, Some(reply.clone()), Arc::new(|_, _| {}));
+        let report = |pressed, x| Value::dict(vec![
+            ("type", Value::str("hidSendReport")), ("hidReport", Value::Data(vec![pressed, x, 0, 100, 0])),
+        ]);
+        request(&mut peer, 1, report(1, 20)).await;
+        request(&mut peer, 2, report(0, 20)).await;
+        request(&mut peer, 3, Value::dict(vec![
+            ("type", Value::str("changeModes")), ("params", Value::dict(vec![("resources", Value::array(vec![Value::dict(vec![
+                ("resourceID", Value::int(1)), ("transferType", Value::int(3)),
+                ("transferPriority", Value::int(500)), ("unborrowConstraint", Value::int(100)),
+            ])]))])),
+        ])).await;
+        assert!(!modes.lock().screen_owned());
+        request(&mut peer, 4, report(1, 30)).await;
+        request(&mut peer, 5, Value::dict(vec![("type", Value::str("requestUI"))])).await;
+        assert!(modes.lock().screen_owned());
+        request(&mut peer, 6, report(0, 30)).await;
+        request(&mut peer, 7, report(1, 40)).await;
+        request(&mut peer, 8, report(0, 40)).await;
+
+        // The dispatcher first sees the old HID messages after the newer grant is already live.
+        let (_ui, ui_rx) = mpsc::unbounded_channel();
+        let (touch, mut touch_rx) = mpsc::unbounded_channel();
+        let (keys, _key_rx) = mpsc::unbounded_channel();
+        let info = Value::dict(vec![]);
+        let dispatcher = spawn_event_dispatcher(inbound, ui_rx, reply, control,
+            Arc::new(Mutex::new(crate::pipeline::Pipeline::new())),
+            crate::cluster_screen::Commands::default(), 0, modes, None, touch, keys,
+            crate::consumer_hid::ConsumerHid::for_session(0, &info, "main"),
+            crate::receiver_ui::LimitedUi::from_info(&info), Some("main".into()),
+            (1920, 720), TouchSurface::Display, Arc::new(Mutex::new((1920, 720))), Arc::default());
+        for action in [0, 1] {
+            let input = tokio::time::timeout(Duration::from_secs(1), touch_rx.recv()).await.unwrap().unwrap();
+            assert_eq!((input.action, input.x, input.y), (action, 40, 100));
+        }
+        assert!(touch_rx.try_recv().is_err());
+        dispatcher.abort();
     }
 
     #[test]
     fn mgu55_touch_viewport_requires_the_confirmed_receiver_and_carwith_profile() {
         let pipeline = Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
-        pipeline.lock().screen_config_size = Some((2560,744));
+        pipeline.lock().set_screen_config_size(Some((2560,744)));
         for (model,name,carwith_profile) in [
             ("MGU-55","BMW",false), ("MGU-55","DiPlay",true), ("MGU-55","WinPlay",true),
             ("MGU-86","BMW",true), ("IDC23","BMW",true), ("MB_D-PP","Mercedes",true),
         ] {
             let info = Value::dict(vec![("model",Value::str(model)),("name",Value::str(name))]);
             let surface = TouchSurface::for_receiver(&info,carwith_profile,(2736,800),None,&pipeline);
-            assert_eq!(surface.viewport((2736,800)),Some((0,0,2736,800)));
+            assert_eq!(surface.mapping((2736,800), (1280,720)).map(|mapping| mapping.viewport), Some((0,0,2736,800)));
         }
         let info = Value::dict(vec![("model",Value::str("MGU-55"))]);
         let surface = TouchSurface::for_receiver(&info,true,(0,0),Some((10,20,1610,920)),&pipeline);
-        assert_eq!(surface.viewport((1920,1080)),Some((10,20,1600,900)));
+        assert_eq!(surface.mapping((1920,1080), (1280,720)).map(|mapping| mapping.viewport), Some((10,20,1600,900)));
     }
     #[test]
     fn media_latency_diagnostics_preserve_raw_values_and_mark_missing_entries() {
@@ -3749,20 +3978,23 @@ async fn run_feedback(
     let mut audio_trace = crate::audio_diagnostics::FeedbackTrace::default();
     let mut video_trace = crate::video_feedback::FeedbackTrace::default();
     let audio_ownership = channel.buffered_ownership.subscribe();
-    let audio_target = || {
+    let audio_snapshot = || {
         let ownership = *audio_ownership.borrow();
-        pipeline.lock().main_audio_clock.filter(|target| ownership.owned && target.rtsp == channel.trace_id())
-            .map(|target| (target, ownership.losses))
+        let snapshot = pipeline.lock().main_audio_feedback.as_ref()
+            .filter(|source| ownership.owned && source.target.rtsp == channel.trace_id())
+            .map(|source| source.snapshot(ownership.losses));
+        let current = audio_ownership.borrow();
+        snapshot.filter(|_| current.owned && current.losses == ownership.losses)
     };
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let rtsp = channel.trace_id();
         let target = crate::video_feedback::FeedbackTarget::current(&pipeline.lock(), rtsp);
-        let clock_target = audio_target();
+        let audio_before_queue = audio_snapshot();
         match channel.request_feedback(previous_failure).await {
             Ok(reply) if reply.status() == 200 => {
                 if let Some(id) = wifi_iap_id { crate::wifi_iap2::feedback(id, true); }
-                audio_trace.set_clock_target(clock_target.filter(|target| Some(*target) == audio_target()));
+                audio_trace.set_observation_snapshots(audio_before_queue, audio_snapshot());
                 if let Some(line) = audio_trace.observe(rtsp, reply.cseq(), &reply.body) { emit_log(&line); }
                 if let (Some(target), Some(cseq)) = (target, reply.cseq()) {
                     let now_ms = crate::timing::monotonic_nanos() / 1_000_000;
@@ -3849,6 +4081,8 @@ fn spawn_event_dispatcher(
         }
         let mut bad_commands = 0usize;
         let mut contact = TouchContact::Idle;
+        let mut multi_touch = TouchContacts::new(touch_tx.clone());
+        let mut touch_grant = modes.lock().screen_grant_generation();
         let mut seen_commands: Vec<String> = Vec::new();
         let mut hid_reports: u64 = 0;
         let mut touch_logged: u32 = 0;
@@ -3856,7 +4090,7 @@ fn spawn_event_dispatcher(
         let mut other_lines: u64 = 0;
         let mut control_ui_open = true;
         loop {
-            let (msg, from_control) = tokio::select! {
+            let (mut msg, from_control) = tokio::select! {
                 _ = stop.notified() => return,
                 m = control_ui.recv(), if control_ui_open => match m {
                     Some(m) if control.session_is_live() => (m, true),
@@ -3905,7 +4139,8 @@ fn spawn_event_dispatcher(
             let cmd_type = command.get("type").and_then(Value::as_str).unwrap_or("");
             // The event reader applies requestUI when answering. The control reader already
             // sent its empty ACK, so apply the same screen arbitration once before dispatch.
-            if from_control && cmd_type == "requestUI" { apply_receiver_modes(&msg); }
+            if from_control && cmd_type == "requestUI" { apply_receiver_modes(&mut msg); }
+            sync_touch_grant(&modes.lock(), &mut touch_grant, &mut contact, &mut multi_touch, &touch_tx);
             // 事件通道是「车机 → 手机」的唯一通道（触摸/HID/命令）。它是否在工作，
             // 现场只能靠日志判断，所以每类命令第一次出现时记一行（之后不刷屏）。
             if !seen_commands.iter().any(|c| c == cmd_type) {
@@ -4001,19 +4236,33 @@ fn spawn_event_dispatcher(
                             }
                             continue;
                         }
-                        let Some(sample) = consumer_hid.touch_sample(uuid, report, display_size) else { continue; };
                         let at = crate::timing::monotonic_nanos() / 1_000_000;
                         let touch_trace = last_touch_trace.is_none_or(|last| at.saturating_sub(last) >= 1000).then_some(at);
                         let before = touch_logged;
-                        handle_touch_sample(
-                            sample,
-                            &touch_tx,
-                            display_size,
-                            &touch_surface,
-                            &target_size,
-                            &mut contact,
-                            &mut touch_logged,
-                        );
+                        let decoded = consumer_hid.multi_touch_samples(uuid, report, display_size);
+                        let state = modes.lock();
+                        let owned = sync_touch_grant(&state, &mut touch_grant, &mut contact, &mut multi_touch, &touch_tx);
+                        // A delayed report still carries physical press/release state, but it
+                        // cannot dispatch coordinates after ownership was taken and returned.
+                        let owned = owned && msg.hid_screen_grant == Some(touch_grant);
+                        let grant = owned.then(|| TouchGrant::new(&modes, touch_grant));
+                        match decoded {
+                            Ok(Some(report)) if matches!(contact, TouchContact::Idle) => {
+                                let mapping = owned.then(|| touch_surface.mapping(display_size, *target_size.lock())).flatten();
+                                if multi_touch.source.is_none() { multi_touch.grant = grant; }
+                                let mapped = multi_touch.update(report, mapping, matches!(touch_surface, TouchSurface::Mgu55(_)));
+                                touch_logged = touch_logged.wrapping_add(mapped);
+                            }
+                            Ok(None) if multi_touch.source.is_none() => {
+                                let Some(sample) = consumer_hid.touch_sample(uuid, report, display_size) else { continue; };
+                                handle_touch_sample(
+                                    sample, &touch_tx, display_size, &touch_surface, &target_size,
+                                    &mut contact, &mut touch_logged, owned, grant,
+                                );
+                            }
+                            _ => continue,
+                        }
+                        drop(state);
                         if let Some(at) = touch_trace {
                             last_touch_trace = Some(at);
                             crate::emit_media_trace(at, "hid_touch_in",
@@ -4160,25 +4409,191 @@ impl TouchSurface {
         Self::Display
     }
 
-    fn viewport(&self, (dw,dh): (u32,u32)) -> Option<(u32,u32,u32,u32)> {
-        match *self {
-            Self::Display => Some((0,0,dw,dh)),
-            Self::DesktopWindow(l,t,r,b) => Some((l,t,r.saturating_sub(l).max(1),b.saturating_sub(t).max(1))),
+    fn mapping(&self, (dw, dh): (u32, u32), target: (u32, u32)) -> Option<TouchMapping> {
+        let (dw, dh) = (dw.max(1), dh.max(1));
+        let (viewport, config_generation) = match *self {
+            Self::Display => ((0, 0, dw, dh), 0),
+            Self::DesktopWindow(l, t, r, b) => ((l, t, r.saturating_sub(l).max(1), b.saturating_sub(t).max(1)), 0),
             Self::Mgu55(ref pipeline) => {
-                let (w,h) = pipeline.lock().screen_config_size?;
+                let pipeline = pipeline.lock();
+                let (w,h) = pipeline.screen_config_size?;
                 if w == 0 || h == 0 { return None; }
                 // Confirmed MGU-55 presentation for an encoded canvas fitting the display.
-                if w <= dw && h <= dh { Some(((dw-w)/2,(dh-h)/2,w,h)) }
-                else { Some((0,0,dw,dh)) }
+                let viewport = if w <= dw && h <= dh { ((dw-w)/2, (dh-h)/2, w, h) }
+                    else { (0, 0, dw, dh) };
+                (viewport, pipeline.screen_config_generation)
             }
+        };
+        Some(TouchMapping { config_generation, ..TouchMapping::new(viewport, target) })
+    }
+}
+
+#[derive(Clone)]
+enum TouchContact {
+    Idle,
+    Ignored,
+    Active { x: u32, y: u32, mapping: TouchMapping, grant: Option<TouchGrant> },
+}
+
+impl TouchContact {
+    fn cancel(&mut self, sender: &mpsc::UnboundedSender<TouchInput>) {
+        if let Self::Active { x, y, grant, .. } = self {
+            let _ = sender.send(TouchInput { action: 3, x: *x, y: *y, pointers: Vec::new(), grant: grant.clone() });
+            *self = Self::Ignored;
         }
     }
 }
 
-#[derive(Clone, Copy)]
-enum TouchContact { Idle, Ignored, Active(u32,u32) }
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TouchMapping {
+    viewport: (u32, u32, u32, u32),
+    target: (u32, u32),
+    config_generation: u64,
+}
 
-/// Map receiver HID pixels into the local input canvas. Actions use Android DOWN/MOVE/UP.
+impl TouchMapping {
+    fn new(viewport: (u32, u32, u32, u32), (width, height): (u32, u32)) -> Self {
+        Self { viewport, target: (width.max(2), height.max(2)), config_generation: 0 }
+    }
+
+    fn contains(self, x: u32, y: u32) -> bool {
+        let (left, top, width, height) = self.viewport;
+        (left..left.saturating_add(width)).contains(&x) && (top..top.saturating_add(height)).contains(&y)
+    }
+
+    fn point(self, id: u32, x: u32, y: u32) -> TouchPoint {
+        let (left, top, width, height) = self.viewport;
+        let scale = |raw: u32, origin, extent, target| {
+            let offset = raw.saturating_sub(origin);
+            (u64::from(offset) * u64::from(target) / u64::from(extent)).min(u64::from(target - 1)) as u32
+        };
+        TouchPoint { id, x: scale(x, left, width, self.target.0), y: scale(y, top, height, self.target.1) }
+    }
+}
+
+use crate::consumer_hid::{MultiTouchReport, TouchIdentity};
+
+struct TouchContacts {
+    sender: mpsc::UnboundedSender<TouchInput>,
+    grant: Option<TouchGrant>,
+    source: Option<(String, u8)>,
+    mapping: Option<TouchMapping>,
+    active: Vec<(TouchIdentity, TouchPoint)>,
+    ignored: Vec<TouchIdentity>,
+    suppressed: bool,
+}
+
+impl TouchContacts {
+    fn new(sender: mpsc::UnboundedSender<TouchInput>) -> Self {
+        Self { sender, grant: None, source: None, mapping: None, active: Vec::new(), ignored: Vec::new(), suppressed: false }
+    }
+
+    fn send(&self, action: u32, changed: usize) {
+        let point = self.active[changed].1;
+        let pointers = self.active.iter().map(|(_, point)| *point).collect();
+        let _ = self.sender.send(TouchInput { action, x: point.x, y: point.y, pointers, grant: self.grant.clone() });
+    }
+
+    fn cancel(&mut self) {
+        if !self.active.is_empty() { self.send(3, 0); }
+        self.active.clear();
+        self.suppressed = true;
+    }
+
+    fn update(&mut self, report: MultiTouchReport, mapping: Option<TouchMapping>, exclude_dead_space: bool) -> u32 {
+        if self.source.as_ref().is_some_and(|source| source != &report.source) { return 0; }
+        if self.source.is_none() && !report.contacts.is_empty() {
+            self.source = Some(report.source);
+            self.mapping = mapping;
+        }
+        let mut count = 0;
+        if mapping.is_none() || self.mapping != mapping && self.source.is_some() {
+            count += u32::from(!self.active.is_empty());
+            self.cancel();
+        }
+        if let Some(mapping) = mapping.filter(|_| !self.suppressed) {
+            count += self.apply_contacts(&report.contacts, mapping, exclude_dead_space);
+        }
+        if report.contacts.is_empty() {
+            self.source = None;
+            self.grant = None;
+            self.mapping = None;
+            self.ignored.clear();
+            self.suppressed = false;
+        }
+        count
+    }
+
+    fn apply_contacts(&mut self, contacts: &[(TouchIdentity, crate::consumer_hid::TouchSample)],
+        mapping: TouchMapping, exclude_dead_space: bool) -> u32 {
+        let mut events = 0;
+        let mut moved = false;
+        self.ignored.retain(|id| contacts.iter().any(|(contact, _)| contact == id));
+        // Slots may be reordered in the report. Android pointer order follows the gesture.
+        for (identity, point) in &mut self.active {
+            if let Some((_, sample)) = contacts.iter().find(|(id, _)| id == identity) {
+                let next = mapping.point(point.id, sample.x, sample.y);
+                moved |= next != *point;
+                *point = next;
+            }
+        }
+        for index in (0..self.active.len()).rev() {
+            if !contacts.iter().any(|(id, _)| *id == self.active[index].0) {
+                let action = if self.active.len() == 1 { 1 } else { 6 | (index as u32) << 8 };
+                self.send(action, index);
+                self.active.remove(index);
+                events += 1;
+            }
+        }
+        for (identity, sample) in contacts {
+            if self.active.iter().any(|(id, _)| id == identity) || self.ignored.contains(identity) { continue; }
+            if exclude_dead_space && !mapping.contains(sample.x, sample.y) {
+                self.ignored.push(*identity);
+                continue;
+            }
+            let pointer_id = (0..32).find(|id| self.active.iter().all(|(_, point)| point.id != *id))
+                .expect("validated HID report has at most 16 contacts");
+            let index = self.active.len();
+            self.active.push((*identity, mapping.point(pointer_id, sample.x, sample.y)));
+            self.send(if index == 0 { 0 } else { 5 | (index as u32) << 8 }, index);
+            events += 1;
+        }
+        if events == 0 && moved {
+            self.send(2, 0);
+            events += 1;
+        }
+        events
+    }
+}
+
+impl Drop for TouchContacts {
+    fn drop(&mut self) { self.cancel(); }
+}
+
+fn capture_hid_screen_grant(message: &mut crate::rtsp::RtspMessage, command: &Value, modes: &crate::modes::Modes) {
+    if command.get("type").and_then(Value::as_str) == Some("hidSendReport") {
+        message.hid_screen_grant = modes.screen_owned().then(|| modes.screen_grant_generation());
+    }
+}
+
+fn sync_touch_grant(
+    modes: &crate::modes::Modes,
+    observed: &mut u64,
+    contact: &mut TouchContact,
+    multi: &mut TouchContacts,
+    sender: &mpsc::UnboundedSender<TouchInput>,
+) -> bool {
+    let current = modes.screen_grant_generation();
+    let owned = modes.screen_owned();
+    if !owned || *observed != current {
+        contact.cancel(sender);
+        if multi.source.is_some() { multi.cancel(); }
+    }
+    *observed = current;
+    owned
+}
+
+/// Map receiver HID pixels into the local input canvas. Actions use Android DOWN/MOVE/UP/CANCEL.
 fn handle_touch_sample(
     sample: crate::consumer_hid::TouchSample,
     touch_tx: &mpsc::UnboundedSender<TouchInput>,
@@ -4187,50 +4602,47 @@ fn handle_touch_sample(
     target_size: &Arc<Mutex<(u32, u32)>>,
     contact: &mut TouchContact,
     logged: &mut u32,
+    owned: bool,
+    grant: Option<TouchGrant>,
 ) {
-    // 每次触摸都读当前编码分辨率：手机可能把请求的分辨率压缩后回报，
-    // 用旧快照会让触摸整体偏移（越靠边越明显）。
+    // Read the negotiated canvas for new contacts. A held contact cannot change its mapping.
     let target = *target_size.lock();
-    let target = (target.0.max(2), target.1.max(2));
-
     let crate::consumer_hid::TouchSample { pressed, x: x_raw, y: y_raw } = sample;
     if matches!(contact, TouchContact::Ignored) {
         if !pressed { *contact = TouchContact::Idle; }
         return;
     }
-    let (tw,th) = target;
     let (dw,dh) = (display.0.max(1), display.1.max(1));
-    let Some((left,top,width,height)) = surface.viewport((dw,dh)) else {
-        // A reset or a new screen TCP sender invalidates the previous config.
-        if let TouchContact::Active(x,y) = *contact {
-            let _ = touch_tx.send(TouchInput { action: 1, x, y });
-        }
+    let mapping = owned.then(|| surface.mapping((dw, dh), target)).flatten();
+    let Some(mapping) = mapping.filter(|current| !matches!(*contact, TouchContact::Active {
+        mapping, ..
+    } if mapping != *current)) else {
+        // A screen take, a config reset or a replacement sender invalidates a held press.
+        contact.cancel(touch_tx);
         *contact = if pressed { TouchContact::Ignored } else { TouchContact::Idle };
         return;
     };
     if matches!(surface, TouchSurface::Mgu55(_)) && matches!(contact, TouchContact::Idle) && pressed
-        && (!(left..left+width).contains(&x_raw) || !(top..top+height).contains(&y_raw)) {
+        && !mapping.contains(x_raw, y_raw) {
         *contact = TouchContact::Ignored;
         return;
     }
-    let scale = |raw: u32, origin, extent, target| {
-        let offset = raw.saturating_sub(origin);
-        (u64::from(offset) * u64::from(target) / u64::from(extent)).min(u64::from(target - 1)) as u32
-    };
-    let x = scale(x_raw,left,width,tw);
-    let y = scale(y_raw,top,height,th);
-    let action = match (*contact, pressed) {
+    let TouchPoint { x, y, .. } = mapping.point(0, x_raw, y_raw);
+    let action = match (&*contact, pressed) {
         (TouchContact::Idle, true) => 0,
-        (TouchContact::Active(..), true) => 2,
-        (TouchContact::Active(..), false) => 1,
+        (TouchContact::Active { .. }, true) => 2,
+        (TouchContact::Active { .. }, false) => 1,
         _ => return,
     };
-    *contact = if pressed { TouchContact::Active(x,y) } else { TouchContact::Idle };
+    *contact = if pressed { TouchContact::Active { x, y, mapping, grant: grant.clone() } }
+        else { TouchContact::Idle };
     *logged = logged.wrapping_add(1);
     if *logged <= 5 || *logged % 200 == 0 {
+        let (left,top,width,height) = mapping.viewport;
+        let (tw,th) = mapping.target;
         crate::emit_log(&format!("TOUCH: 车机({x_raw},{y_raw}) 空间 {dw}x{dh} 画面 ({left},{top}) {width}x{height} → 画布 {tw}x{th} = ({x},{y})（第 {logged} 次）"));
     }
-    let _ = touch_tx.send(TouchInput { action, x, y });
+    let _ = touch_tx.send(TouchInput { action, x, y, pointers: Vec::new(), grant });
 }
 // ---------------------------------------------------------------- 工具
 

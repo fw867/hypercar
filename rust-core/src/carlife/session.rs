@@ -20,8 +20,20 @@ pub(super) fn canvas_for_receiver(width:u32,height:u32)->(u32,u32) {
     (even(width),even(height))
 }
 
-#[derive(Default)]
-pub(super) struct TouchGesture {active:bool, last:(u32,u32)}
+#[derive(Clone, Default)]
+pub(super) struct TouchGesture {
+    active: bool,
+    last: (u32, u32),
+    primary_id: Option<u32>,
+    secondary: Option<(u32, (u32, u32))>,
+    compound: bool,
+}
+
+const TOUCH_CANCEL: u32 = 3;
+const TOUCH_POINTER_DOWN: u32 = 5;
+const TOUCH_POINTER_UP: u32 = 6;
+const TOUCH_SECOND_INDEX: u32 = 1 << 8;
+
 impl TouchGesture {
     pub fn accept(&mut self,action:u32,x:u32,y:u32,size:(u32,u32))->Option<Vec<u8>> {
         if size.0<2 || size.1<2 {return None;}
@@ -37,6 +49,118 @@ impl TouchGesture {
         proto::varint(&mut body,1,self.last.0 as u64);
         proto::varint(&mut body,2,self.last.1 as u64);
         Some(build_cmd_frame(kind,&body))
+    }
+
+    pub(super) fn accept_report(&mut self, report: &crate::airplay::TouchInput, size: (u32, u32)) -> Vec<Vec<u8>> {
+        let action = report.action & 0xff;
+        if action == TOUCH_CANCEL || size.0 < 2 || size.1 < 2 {
+            return self.release();
+        }
+
+        if report.pointers.is_empty() {
+            if self.compound {
+                // A legacy report cannot move either pointer of a compound gesture.
+                // A fresh DOWN ends the old gesture before starting a single touch.
+                if action == TOUCH_DOWN {
+                    let mut frames = self.release();
+                    frames.extend(self.accept(action, report.x, report.y, size));
+                    return frames;
+                }
+                return if action == TOUCH_UP { self.finish_compound(TOUCH_UP, self.last) } else { Vec::new() };
+            }
+            return self.accept(action, report.x, report.y, size).into_iter().collect();
+        }
+
+        let point = |p: &crate::airplay::TouchPoint| (p.x.min(size.0 - 1), p.y.min(size.1 - 1));
+        if action == TOUCH_DOWN {
+            let mut frames = self.release();
+            let first = &report.pointers[0];
+            self.primary_id = Some(first.id);
+            frames.extend(self.accept(TOUCH_DOWN, first.x, first.y, size));
+            return frames;
+        }
+        if !self.active { return Vec::new(); }
+
+        let primary = report.pointers.iter().find(|p| Some(p.id) == self.primary_id).map(point);
+        let changed = report.pointers.get((report.action >> 8) as usize);
+        match action {
+            TOUCH_POINTER_DOWN if self.secondary.is_none() => {
+                let (Some(primary), Some(other)) = (primary, changed.filter(|p| Some(p.id) != self.primary_id)) else {
+                    return Vec::new();
+                };
+                self.last = primary;
+                self.secondary = Some((other.id, point(other)));
+                self.compound = true;
+                vec![Self::compound_frame(TOUCH_POINTER_DOWN | TOUCH_SECOND_INDEX, primary, self.secondary.map(|(_, p)| p))]
+            }
+            TOUCH_MOVE => {
+                let Some(primary) = primary else { return Vec::new(); };
+                if !self.compound {
+                    return self.accept(TOUCH_MOVE, primary.0, primary.1, size).into_iter().collect();
+                }
+                let secondary = if let Some((id, _)) = self.secondary {
+                    let Some(p) = report.pointers.iter().find(|p| p.id == id).map(point) else { return Vec::new(); };
+                    self.secondary = Some((id, p));
+                    Some(p)
+                } else { None };
+                self.last = primary;
+                vec![Self::compound_frame(TOUCH_MOVE, primary, secondary)]
+            }
+            TOUCH_POINTER_UP => {
+                let (Some((second_id, old_second)), Some(released), Some(primary)) = (self.secondary, changed, primary) else {
+                    return Vec::new();
+                };
+                let second = report.pointers.iter().find(|p| p.id == second_id).map(point).unwrap_or(old_second);
+                if released.id == second_id {
+                    self.last = primary;
+                    self.secondary = None;
+                    vec![Self::compound_frame(TOUCH_POINTER_UP | TOUCH_SECOND_INDEX, primary, Some(second))]
+                } else if Some(released.id) == self.primary_id {
+                    // CarLife receivers follow a single remaining MOVE with pointer ID 0.
+                    // Close the old ID 1 before continuing that finger as the new primary.
+                    self.primary_id = Some(second_id);
+                    self.secondary = None;
+                    self.last = second;
+                    vec![Self::compound_frame(TOUCH_POINTER_UP, primary, Some(second)),
+                        Self::compound_frame(TOUCH_UP, second, None), Self::compound_frame(TOUCH_DOWN, second, None)]
+                } else { Vec::new() }
+            }
+            TOUCH_UP if self.compound => self.finish_compound(TOUCH_UP, primary.unwrap_or(self.last)),
+            TOUCH_UP => {
+                let up = self.accept(TOUCH_UP, 0, 0, size);
+                *self = Self::default();
+                up.into_iter().collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    pub(super) fn release(&mut self) -> Vec<Vec<u8>> {
+        if !self.active { return Vec::new(); }
+        // A forced release must cancel even a one-finger tap so a held control cannot fire.
+        self.finish_compound(TOUCH_CANCEL, self.last)
+    }
+
+    fn finish_compound(&mut self, action: u32, primary: (u32, u32)) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        if let Some((_, second)) = self.secondary {
+            frames.push(Self::compound_frame(TOUCH_POINTER_UP | TOUCH_SECOND_INDEX, primary, Some(second)));
+        }
+        frames.push(Self::compound_frame(action, primary, None));
+        *self = Self::default();
+        frames
+    }
+
+    fn compound_frame(action: u32, primary: (u32, u32), secondary: Option<(u32, u32)>) -> Vec<u8> {
+        let mut body = Vec::new();
+        proto::varint(&mut body, 1, u64::from(action));
+        proto::varint(&mut body, 2, u64::from(primary.0));
+        proto::varint(&mut body, 3, u64::from(primary.1));
+        if let Some((x, y)) = secondary {
+            proto::varint(&mut body, 4, u64::from(x));
+            proto::varint(&mut body, 5, u64::from(y));
+        }
+        build_cmd_frame(0x68001, &body)
     }
 }
 
@@ -62,6 +186,7 @@ pub(super) struct Session {
     matched: bool,
     navigation_requested: bool,
     navigation_started: bool,
+    vehicle_gps_subscribed: bool,
 }
 
 impl Default for Session {
@@ -72,7 +197,7 @@ impl Default for Session {
             #[cfg(test)]
             probe_reset_written: false,
             proof_ok: false, admitted: false, features_requested: false, features_sent: false,
-            rsa: None, seed: None, ready: false, init_sent: false, init_fps: None, fallback_init: None, declared_display: None, started: false, matched: false, navigation_requested: false, navigation_started: false }
+            rsa: None, seed: None, ready: false, init_sent: false, init_fps: None, fallback_init: None, declared_display: None, started: false, matched: false, navigation_requested: false, navigation_started: false, vehicle_gps_subscribed: false }
     }
 }
 
@@ -86,12 +211,30 @@ fn navigation_subscription()->Vec<u8> {
 }
 impl Session {
     pub(super) fn navigation_ready(&self) -> bool { self.proof_ok && self.admitted && self.ready }
+    fn vehicle_gps_ready(&self) -> bool {
+        self.vehicle_gps_subscribed && self.started && self.navigation_ready()
+    }
     pub fn encrypt(&self, bytes: &[u8]) -> Result<Vec<u8>, String> { crypt(bytes, self.seed.as_deref(), true) }
     pub fn decrypt(&self, bytes: &[u8]) -> Result<Vec<u8>, String> { crypt(bytes, self.seed.as_deref(), false) }
 
     fn receive(&mut self, kind: u32, body: &[u8], cfg: &CarLifeConfig) -> Result<Vec<Action>, String> {
         let mut out = Vec::new();
         match kind {
+            // The phone can ask before admission. The fix itself is gated on the encrypted session.
+            0x10031 if cfg.vehicle_gps.is_some() => {
+                let mut gps_module = Vec::new();
+                proto::varint(&mut gps_module, 1, 0);
+                proto::varint(&mut gps_module, 2, 1);
+                let mut modules = Vec::new();
+                proto::varint(&mut modules, 1, 1);
+                proto::bytes(&mut modules, 2, &gps_module);
+                out.push((0x18032, modules));
+                emit_log("CARWITH-GPS: capability reply 0x18032 module=0 flag=1");
+            }
+            0x10033 | 0x10034 if cfg.vehicle_gps.is_some() && first_int(body, 1) == Some(0) => {
+                self.vehicle_gps_subscribed = kind == 0x10033 && first_int(body, 2) == Some(1);
+                emit_log(&format!("CARWITH-GPS: subscription 0x{kind:x} active={}", self.vehicle_gps_subscribed));
+            }
             CMD_VERSION_MATCH_STATUS => {
                 if self.matched || first_int(body, 1) != Some(1) { return Err("protocol version rejected/duplicate".into()); }
                 self.matched = true;
@@ -267,11 +410,13 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
     log::info!(target: "carwith_probe", "CMD TX written id=0x{CMD_HU_PROTOCOL_VERSION:x}");
     let mut buf=Vec::new(); let mut chunk=[0;4096];
     let mut display_updates = requested.subscribe();
-    let mut last_reset: Option<tokio::time::Instant> = None;
+    let mut next_reset = tokio::time::Instant::now();
     #[cfg(test)]
     { state.lock().probe_reset = Some(reset_request.clone()); }
     let mut navigation_diagnostics = super::navigation::Diagnostics::default();
     let mut rx_log = super::log_sampling::CommandRx::default();
+    let mut next_gps = tokio::time::Instant::now();
+    let mut gps_sent = 0_u64;
     loop {
         let started=state.lock().started;
         // An already initialized handset can ACK another INIT with its old size.
@@ -289,17 +434,39 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
                 return Ok(());
             }
         }
+        let gps = cfg.vehicle_gps.as_ref().filter(|_| state.lock().vehicle_gps_ready());
         let read = tokio::select! {
-            _ = display_updates.changed() => continue,
-            _ = reset_request.notified(), if started => {
-                // mcarplay CarLifeSession.requestKeyFrame: CMD 0x1800B, not CTRL or START.
-                if last_reset.map(|t| t.elapsed() >= Duration::from_secs(1)).unwrap_or(true) {
-                    if !send_cmd(&mut wr, 0x1800b, &[]).await { return Err("CarWith RESET write failed".into()); }
-                    #[cfg(test)]
-                    { state.lock().probe_reset_written = true; }
-                    last_reset = Some(tokio::time::Instant::now());
-                    emit_log("CARWITH-HS: TX 0x1800b VIDEO_ENCODER_RESET (keyframe request)");
+            _ = tokio::time::sleep_until(next_gps), if gps.is_some() => {
+                if let Some(payload) = gps.and_then(|pending| pending.take()) {
+                    let encrypted = state.lock().encrypt(&payload)?;
+                    let written = tokio::time::timeout(Duration::from_millis(250),
+                        send_cmd(&mut wr, super::vehicle_gps::GPS_MESSAGE, &encrypted)).await;
+                    if !matches!(written, Ok(true)) {
+                        emit_log("CARWITH-GPS: 0x18010 command write failed");
+                        return Err("CarWith GPS command write failed".into());
+                    }
+                    gps_sent += 1;
+                    if gps_sent <= 3 || gps_sent % 30 == 0 {
+                        emit_log(&format!("CARWITH-GPS: TX 0x18010 count={gps_sent} payload={}B wire={}B",
+                            payload.len(), encrypted.len()));
+                    }
                 }
+                next_gps = tokio::time::Instant::now() + super::vehicle_gps::MIN_INTERVAL;
+                continue;
+            }
+            _ = display_updates.changed() => continue,
+            _ = async {
+                // Leave the single Notify permit pending through the cooldown.
+                // The command socket can still read and handle other work meanwhile.
+                if next_reset > tokio::time::Instant::now() { tokio::time::sleep_until(next_reset).await; }
+                reset_request.notified().await;
+            }, if started => {
+                // mcarplay CarLifeSession.requestKeyFrame: CMD 0x1800B, not CTRL or START.
+                if !send_cmd(&mut wr, 0x1800b, &[]).await { return Err("CarWith RESET write failed".into()); }
+                #[cfg(test)]
+                { state.lock().probe_reset_written = true; }
+                next_reset = tokio::time::Instant::now() + Duration::from_secs(1);
+                emit_log("CARWITH-HS: TX 0x1800b VIDEO_ENCODER_RESET (keyframe request)");
                 continue;
             }
             result = async {
@@ -365,12 +532,94 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
     }
 }
 
+async fn write_touch_frames(
+    stream: &mut TcpStream, state: &Shared, frames: Vec<Vec<u8>>, grant: Option<&crate::airplay::TouchGrant>,
+) -> std::io::Result<bool> {
+    let wire = {
+        let session = state.lock();
+        if !session.started { return Ok(false); }
+        let mut wire = Vec::new();
+        for frame in frames {
+            let (kind, body, _) = read_cmd_frame(&frame).expect("locally encoded touch frame");
+            let encrypted = session.encrypt(&body).map_err(std::io::Error::other)?;
+            wire.extend(build_cmd_frame(kind, &encrypted));
+        }
+        wire
+    };
+    if wire.is_empty() { return Ok(true); }
+    let Some(grant) = grant else { stream.write_all(&wire).await?; return Ok(true); };
+    let mut written = 0;
+    while written < wire.len() {
+        // A queued report can outlive its grant even while this socket waits for space.
+        stream.writable().await?;
+        match grant.with_current(|| stream.try_write(&wire[written..])) {
+            None if written == 0 => return Ok(false),
+            // Do not continue a partially written old frame or leave a truncated frame
+            // in a live stream. Ending CTRL forces its normal transport cleanup.
+            None => return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "touch grant revoked during CTRL write")),
+            Some(Ok(0)) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Some(Ok(count)) => written += count,
+            Some(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Some(Err(error)) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
 pub(super) async fn control(mut stream: TcpStream, queue: Arc<Mutex<Vec<QueuedControl>>>, state: Shared, stop: Arc<Notify>) {
     let mut sent=0u64;
     let mut last_selector: Option<(u64, std::time::Instant)> = None;
+    let mut gesture = TouchGesture::default();
+    let mut gesture_grant: Option<crate::airplay::TouchGrant> = None;
     loop {
+        if gesture_grant.as_ref().is_some_and(|grant| grant.with_current(|| ()).is_none()) {
+            if write_touch_frames(&mut stream, &state, gesture.release(), None).await.is_err() { return; }
+            gesture_grant = None;
+        }
         let frame={let mut q=queue.lock(); if q.is_empty(){None}else{Some(q.remove(0))}};
         if let Some(packet)=frame {
+            if let Some(input) = packet.touch {
+                if packet.expires.is_some_and(|at| std::time::Instant::now() >= at) { continue; }
+                match input {
+                    QueuedTouch::Release => {
+                        if write_touch_frames(&mut stream, &state, gesture.release(), None).await.is_err() { return; }
+                        gesture_grant = None;
+                    }
+                    QueuedTouch::Report(report, size) => {
+                        let same_grant = match (gesture_grant.as_ref(), report.grant.as_ref()) {
+                            (Some(old), Some(new)) => old.same_as(new),
+                            (None, None) => true,
+                            _ => false,
+                        };
+                        if report.action & 0xff == TOUCH_CANCEL {
+                            if same_grant {
+                                if write_touch_frames(&mut stream, &state, gesture.release(), None).await.is_err() { return; }
+                                gesture_grant = None;
+                            }
+                            continue;
+                        }
+                        if report.grant.as_ref().is_some_and(|grant| grant.with_current(|| ()).is_none()) { continue; }
+                        if gesture.active && !same_grant {
+                            if write_touch_frames(&mut stream, &state, gesture.release(), None).await.is_err() { return; }
+                            gesture_grant = None;
+                        }
+                        let mut next = gesture.clone();
+                        let frames = next.accept_report(&report, size);
+                        if frames.is_empty() { continue; }
+                        match write_touch_frames(&mut stream, &state, frames, report.grant.as_ref()).await {
+                            Ok(true) => {
+                                gesture = next;
+                                gesture_grant = if gesture.active { report.grant } else { None };
+                                sent += 1;
+                                if sent <= 8 || sent % 60 == 0 { emit_log(&format!("CARWITH-TOUCH: encrypted CTRL report #{sent}")); }
+                            }
+                            Ok(false) => {}
+                            Err(_) => return,
+                        }
+                    }
+                }
+                continue;
+            }
             let Some((kind, body, _)) = read_cmd_frame(&packet.bytes) else {continue};
             let hard_key = if kind == CTRL_CAR_HARD_KEY_CODE { first_int(&body, 1) } else { None };
             let selector = hard_key.filter(|&code| matches!(code, SELECTOR_PREVIOUS | SELECTOR_NEXT));
@@ -452,6 +701,7 @@ mod tests {
             queue.lock().push(QueuedControl {
                 bytes: build_cmd_frame(0x68008, &[8, code]),
                 expires: None,
+                touch: None,
             });
         }
         let started = tokio::time::Instant::now();
@@ -473,7 +723,6 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let hub = CarLifeHub {
             stop: Arc::new(DialStop::default()),
-            touch_state: Arc::new(Mutex::new(TouchGesture::default())),
             touch_tx: tx,
             encoder_size: Arc::new(Mutex::new((1920, 720))),
             keyframe_request: Arc::new(Notify::new()),
@@ -500,7 +749,7 @@ mod tests {
     #[tokio::test]
     async fn voice_start_uses_ctrl_protobuf_and_has_an_expiry() {
         let (tx,mut rx)=mpsc::unbounded_channel();
-        let hub=CarLifeHub{stop:Arc::new(DialStop::default()),touch_state:Arc::new(Mutex::new(TouchGesture::default())),touch_tx:tx,
+        let hub=CarLifeHub{stop:Arc::new(DialStop::default()),touch_tx:tx,
             encoder_size:Arc::new(Mutex::new((1920,720))),keyframe_request:Arc::new(Notify::new())};
         {
             let expected=33;
@@ -512,7 +761,29 @@ mod tests {
         }
     }
     use tokio::net::TcpListener;
-    fn cfg()->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:60,navigation_updates:false,microphone:None,bt_address:"00:11:22:33:44:55".into(),bt_name:"HyperCar".into()}}
+    fn cfg()->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:60,navigation_updates:false,microphone:None,vehicle_gps:None,bt_address:"00:11:22:33:44:55".into(),bt_name:"HyperCar".into()}}
+
+    #[test]
+    fn vehicle_gps_requires_this_command_sessions_gps_subscription_and_encryption() {
+        let mut session = Session::default();
+        let mut config = cfg();
+        assert!(session.receive(0x10031, &[], &config).unwrap().is_empty());
+        config.vehicle_gps = Some(Arc::new(super::super::vehicle_gps::PendingLocation::default()));
+        assert_eq!(session.receive(0x10031, &[], &config).unwrap(),
+            vec![(0x18032, vec![8, 1, 18, 4, 8, 0, 16, 1])]);
+        session.receive(0x10033, &[8, 1, 16, 1], &config).unwrap();
+        assert!(!session.vehicle_gps_subscribed);
+        session.receive(0x10033, &[8, 0, 16, 1], &config).unwrap();
+        assert!(!session.vehicle_gps_ready());
+        session.proof_ok = true;
+        session.admitted = true;
+        session.ready = true;
+        session.started = true;
+        assert!(session.vehicle_gps_ready());
+        session.receive(0x10034, &[8, 0], &config).unwrap();
+        assert!(!session.vehicle_gps_ready());
+        assert!(!Session::default().vehicle_gps_ready());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn pause_at_canvas_deadline_prevents_reopen_and_next_port_dial() {
@@ -676,6 +947,107 @@ mod tests {
         assert!(gesture.accept(TOUCH_UP,0,0,(1280,372)).is_none());
     }
 
+    #[test]
+    fn carwith_touch_sends_both_pointer_positions_and_rebases_the_remaining_finger() {
+        fn event(action: u32, points: &[(u32, u32, u32)]) -> crate::airplay::TouchInput {
+            let pointers = points.iter().map(|&(id, x, y)| crate::airplay::TouchPoint { id, x, y }).collect();
+            crate::airplay::TouchInput { action, x: 0, y: 0, pointers, grant: None }
+        }
+        fn composite(frame: &[u8]) -> (u64, u64, u64, Option<u64>, Option<u64>) {
+            let (kind, body, _) = read_cmd_frame(frame).unwrap();
+            assert_eq!(kind, 0x68001);
+            (first_int(&body, 1).unwrap(), first_int(&body, 2).unwrap(), first_int(&body, 3).unwrap(),
+                first_int(&body, 4), first_int(&body, 5))
+        }
+
+        let mut gesture = TouchGesture::default();
+        let size = (300, 200);
+        let down = gesture.accept_report(&event(0, &[(5, 40, 60)]), size);
+        assert_eq!(read_cmd_frame(&down[0]).unwrap().0, 0x68002);
+        let second = gesture.accept_report(&event(261, &[(5, 40, 60), (9, 80, 120)]), size);
+        assert_eq!(composite(&second[0]), (261, 40, 60, Some(80), Some(120)));
+        let moved = gesture.accept_report(&event(2, &[(5, 35, 55), (9, 310, 125)]), size);
+        assert_eq!(composite(&moved[0]), (2, 35, 55, Some(299), Some(125)));
+        let primary_up = gesture.accept_report(&event(6, &[(5, 35, 55), (9, 95, 125)]), size);
+        assert_eq!(primary_up.iter().map(|frame| composite(frame)).collect::<Vec<_>>(), vec![
+            (6, 35, 55, Some(95), Some(125)), (1, 95, 125, None, None), (0, 95, 125, None, None),
+        ]);
+        let moved = gesture.accept_report(&event(2, &[(9, 100, 125)]), size);
+        assert_eq!(composite(&moved[0]), (2, 100, 125, None, None));
+        let cancelled = gesture.release();
+        assert_eq!(composite(&cancelled[0]), (3, 100, 125, None, None));
+        assert!(gesture.release().is_empty());
+    }
+
+    #[test]
+    fn carwith_touch_single_finger_cancel_cannot_send_a_legacy_up() {
+        use crate::airplay::{TouchInput, TouchPoint};
+        let point = TouchPoint { id: 8, x: 40, y: 60 };
+        let report = |action| TouchInput { action, x: point.x, y: point.y, pointers: vec![point], grant: None };
+        let mut gesture = TouchGesture::default();
+        let size = (300, 200);
+
+        gesture.accept_report(&report(TOUCH_DOWN), size);
+        let ended = gesture.accept_report(&report(TOUCH_CANCEL), size);
+        assert_eq!(ended.len(), 1);
+        let (kind, body, _) = read_cmd_frame(&ended[0]).unwrap();
+        assert_eq!(kind, 0x68001);
+        assert_eq!(first_int(&body, 1), Some(u64::from(TOUCH_CANCEL)));
+        assert_eq!(first_int(&body, 2), Some(40));
+        assert_eq!(first_int(&body, 3), Some(60));
+        assert!(gesture.accept_report(&report(TOUCH_UP), size).is_empty());
+
+        gesture.accept_report(&report(TOUCH_DOWN), size);
+        let up = gesture.accept_report(&report(TOUCH_UP), size);
+        assert_eq!(read_cmd_frame(&up[0]).unwrap().0, 0x68003);
+    }
+
+    #[test]
+    fn carwith_touch_release_lifts_the_secondary_before_cancelling_the_primary() {
+        use crate::airplay::{TouchInput, TouchPoint};
+        let primary = TouchPoint { id: 2, x: 15, y: 20 };
+        let second = TouchPoint { id: 7, x: 200, y: 110 };
+        let mut gesture = TouchGesture::default();
+        let size = (300, 200);
+        gesture.accept_report(&TouchInput { action: 0, x: 15, y: 20, pointers: vec![primary], grant: None }, size);
+        gesture.accept_report(&TouchInput { action: 261, x: 200, y: 110, pointers: vec![primary, second], grant: None }, size);
+        let ended = gesture.release();
+        assert_eq!(ended.len(), 2);
+        let (kind, pointer_up, _) = read_cmd_frame(&ended[0]).unwrap();
+        assert_eq!(kind, 0x68001);
+        assert_eq!(first_int(&pointer_up, 1), Some(262));
+        assert_eq!(first_int(&pointer_up, 4), Some(200));
+        let (kind, cancel, _) = read_cmd_frame(&ended[1]).unwrap();
+        assert_eq!(kind, 0x68001);
+        assert_eq!(first_int(&cancel, 1), Some(3));
+        assert!(gesture.release().is_empty());
+    }
+
+    #[test]
+    fn carwith_touch_legacy_down_closes_a_previous_compound_gesture() {
+        use crate::airplay::{TouchInput, TouchPoint};
+        let first = TouchPoint { id: 1, x: 30, y: 50 };
+        let second = TouchPoint { id: 4, x: 150, y: 80 };
+        let size = (300, 200);
+        let mut gesture = TouchGesture::default();
+        gesture.accept_report(&TouchInput {
+            action: TOUCH_DOWN, x: first.x, y: first.y, pointers: vec![first], grant: None,
+        }, size);
+        gesture.accept_report(&TouchInput {
+            action: TOUCH_POINTER_DOWN | TOUCH_SECOND_INDEX, x: second.x, y: second.y,
+            pointers: vec![first, second], grant: None,
+        }, size);
+        let next = gesture.accept_report(&TouchInput {
+            action: TOUCH_DOWN, x: 190, y: 45, pointers: vec![], grant: None,
+        }, size);
+        let frames: Vec<_> = next.iter().map(|f| read_cmd_frame(f).unwrap()).collect();
+        assert_eq!(frames.iter().map(|f| f.0).collect::<Vec<_>>(), [0x68001, 0x68001, 0x68002]);
+        assert_eq!(first_int(&frames[0].1, 1), Some(u64::from(TOUCH_POINTER_UP | TOUCH_SECOND_INDEX)));
+        assert_eq!(first_int(&frames[1].1, 1), Some(u64::from(TOUCH_CANCEL)));
+        assert_eq!(first_int(&frames[2].1, 1), Some(190));
+        assert_eq!(first_int(&frames[2].1, 2), Some(45));
+    }
+
     #[test] fn channel_admission_never_skips_proof_features_or_encryption() {
         let mut s=prepared();
         assert_eq!(s.receive(CMD_MD_AUTHEN_RESULT,&proto_authen_result_payload(true),&cfg()).unwrap().len(),1);
@@ -793,13 +1165,24 @@ mod tests {
         let size = Arc::new(Mutex::new((1280, 720)));
         let task = tokio::spawn(run(stream, events, size.clone(), DisplayRequest::new(ReceiverDisplay::default()), cfg(), state.clone(), reset.clone(), true));
         assert_eq!(next(&mut phone).await, CMD_HU_PROTOCOL_VERSION);
+        phone.write_all(&build_cmd_frame(CMD_VERSION_MATCH_STATUS, &proto_authen_result_payload(true))).await.unwrap();
+        assert_eq!(next(&mut phone).await, CMD_HU_STATISTIC_INFO);
         reset.notify_one();
         assert!(tokio::time::timeout(Duration::from_millis(30), next(&mut phone)).await.is_err());
-        state.lock().started = true;
-        phone.write_all(&build_cmd_frame(0x10022, &[])).await.unwrap();
+        state.lock().init_sent = true;
+        phone.write_all(&build_cmd_frame(CMD_VIDEO_ENCODER_INIT_DONE, &proto_encoder_info_payload(1280, 720, 30))).await.unwrap();
+        assert_eq!(next(&mut phone).await, CMD_VIDEO_ENCODER_START);
         assert_eq!(tokio::time::timeout(Duration::from_secs(1), next(&mut phone)).await.unwrap(), 0x1800b);
         reset.notify_one();
         assert!(tokio::time::timeout(Duration::from_millis(30), next(&mut phone)).await.is_err());
+        // The recovery request can arrive after the first RESET produced an IDR
+        // but before the command cooldown ends. Multiple requests use one slot.
+        reset.notify_one();
+        reset.notify_one();
+        phone.write_all(&build_cmd_frame(CMD_FOREGROUND, &[])).await.unwrap();
+        assert_eq!(tokio::time::timeout(Duration::from_millis(500), next(&mut phone)).await.unwrap(), CMD_HU_GO_TO_FOREGROUND);
+        assert_eq!(tokio::time::timeout(Duration::from_secs(2), next(&mut phone)).await.unwrap(), 0x1800b);
+        assert!(tokio::time::timeout(Duration::from_millis(1100), next(&mut phone)).await.is_err());
         drop(phone);
         assert!(tokio::time::timeout(Duration::from_secs(1), task).await.unwrap().unwrap().is_err());
     }
@@ -1006,7 +1389,7 @@ mod navigation_tests {
 #[cfg(test)]
 mod navigation_subscription_tests {
     use super::*;
-    fn config(enabled:bool)->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:30,navigation_updates:enabled,microphone:None,bt_address:String::new(),bt_name:String::new()}}
+    fn config(enabled:bool)->CarLifeConfig {CarLifeConfig{width:1280,height:720,fps:30,navigation_updates:enabled,microphone:None,vehicle_gps:None,bt_address:String::new(),bt_name:String::new()}}
     fn ready()->Session {let mut s=Session::default();s.proof_ok=true;s.admitted=true;s.ready=true;s.init_sent=true;s}
     #[test] fn capability_query_ack_then_start_only_once() {
         let mut s=ready();let c=config(true);

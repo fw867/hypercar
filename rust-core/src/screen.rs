@@ -276,7 +276,7 @@ impl ScreenSender {
             p.video_tcp = Some(snapshot);
             p.main_video_writes = std::sync::Arc::downgrade(&writes);
             p.main_video_connection = None;
-            p.screen_config_size = None;
+            p.set_screen_config_size(None);
             p.video_format = None;
         }
         self.tcp_monitor=Some(crate::tcp_diagnostics::TcpMonitor::start(self.w.as_ref().as_raw_fd(),connection_id,pipeline.clone()));
@@ -287,7 +287,7 @@ impl ScreenSender {
         if let Some((pipeline,id)) = &self.tcp_diagnostics {
             let mut p = pipeline.lock();
             if p.video_tcp.as_ref().is_some_and(|tcp| tcp.connection_id == *id) {
-                p.screen_config_size = header_size;
+                p.set_screen_config_size(header_size);
                 p.video_format = sps_size.map(|(width,height)| crate::pipeline::VideoFormat {
                     width, height, codec: self.codec.as_str()
                 });

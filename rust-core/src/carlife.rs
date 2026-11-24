@@ -6,6 +6,7 @@
 
 pub(crate) mod navigation;
 mod session;
+pub(crate) mod vehicle_gps;
 mod log_sampling;
 mod video;
 pub(crate) mod microphone;
@@ -146,6 +147,7 @@ pub struct CarLifeConfig {
     pub fps: u32,
     pub navigation_updates: bool,
     pub microphone: Option<Arc<crate::mic_probe::ProbeControl>>,
+    pub(crate) vehicle_gps: Option<Arc<vehicle_gps::PendingLocation>>,
     /// `HU_INFO` 里 required 的 `btaddress`（车机蓝牙 MAC）。
     pub bt_address: String,
     /// `HU_INFO` 里 required 的 `btname`（车机蓝牙名）。
@@ -153,7 +155,16 @@ pub struct CarLifeConfig {
 }
 
 /// Authenticated seven-channel CarWith gateway with video/audio events and touch input.
-struct QueuedControl { bytes:Vec<u8>, expires:Option<std::time::Instant> }
+struct QueuedControl {
+    bytes: Vec<u8>,
+    expires: Option<std::time::Instant>,
+    touch: Option<QueuedTouch>,
+}
+
+enum QueuedTouch {
+    Report(crate::airplay::TouchInput, (u32, u32)),
+    Release,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReceiverDisplay {
@@ -235,7 +246,6 @@ static LAST_DIALER: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None
 
 pub struct CarLifeHub {
     stop: Arc<DialStop>,
-    touch_state: Arc<Mutex<session::TouchGesture>>,
     touch_tx: mpsc::UnboundedSender<QueuedControl>,
     /// 当前编码分辨率共享单元（与 AirPlay 协商/触摸换算共用）。
     encoder_size: Arc<Mutex<(u32, u32)>>,
@@ -269,8 +279,6 @@ impl CarLifeHub {
         let (touch_tx, mut touch_rx) = mpsc::unbounded_channel::<QueuedControl>();
         let encoder_size = Arc::new(Mutex::new((cfg.width.max(2),cfg.height.max(2))));
         let requested = requested.unwrap_or_else(|| DisplayRequest::new(ReceiverDisplay::default()));
-        let touch_state=Arc::new(Mutex::new(session::TouchGesture::default()));
-        let round_touch=touch_state.clone();
         let queue = Arc::new(Mutex::new(Vec::<QueuedControl>::new()));
         let queue_fill=queue.clone(); let stop_fill=stop.clone();
         tokio::spawn(async move {
@@ -331,7 +339,6 @@ impl CarLifeHub {
                 first_round_pending = false;
                 emit_log("CARWITH-HS: all seven channels connected; start fresh 4.1 handshake");
                 queue.lock().clear();
-                *round_touch.lock()=session::TouchGesture::default();
                 let _ = events_task.send(CarLifeEvent::SourceReset { cache_cleared: None });
                 let state=session::Shared::new(Mutex::new(session::Session::default()));
                 // Keep a probe RESET permit local to these seven sockets if this round terminates.
@@ -379,27 +386,30 @@ impl CarLifeHub {
                 tokio::select! { biased; _=stop.cancelled()=>return, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
             }
         }));
-        Ok((Self {stop:hub_stop,touch_state,touch_tx,encoder_size,keyframe_request},event_rx))
+        Ok((Self {stop:hub_stop,touch_tx,encoder_size,keyframe_request},event_rx))
     }
 
     pub fn request_keyframe(&self) {
         self.keyframe_request.notify_one();
     }
 
-    /// 外部（AirPlay 事件通道）注入触摸 → CarLife CTRL 通道 TOUCH_ACTION。
+    /// Single-point input used by the source transport probes.
+    #[cfg(test)]
     pub fn inject_touch(&self, action: u32, x: u32, y: u32) {
-        let size=*self.encoder_size.lock();
-        if let Some(frame)=self.touch_state.lock().accept(action,x,y,size) {
-            let _=self.touch_tx.send(QueuedControl{bytes:frame,expires:None});
-        }
+        self.inject_touch_report(&crate::airplay::TouchInput { action, x, y, pointers: Vec::new(), grant: None });
+    }
+
+    pub(crate) fn inject_touch_report(&self, report: &crate::airplay::TouchInput) {
+        let size = *self.encoder_size.lock();
+        let _ = self.touch_tx.send(QueuedControl {
+            bytes: Vec::new(), expires: None, touch: Some(QueuedTouch::Report(report.clone(), size)),
+        });
     }
 
     /// A media subscriber can disappear while a finger is down; the source survives it.
     pub fn release_touch(&self) {
-        let size=*self.encoder_size.lock();
-        if let Some(bytes)=self.touch_state.lock().accept(TOUCH_UP,0,0,size) {
-            let _=self.touch_tx.send(QueuedControl{bytes,expires:Some(std::time::Instant::now()+Duration::from_secs(1))});
-        }
+        let expires = Some(std::time::Instant::now() + Duration::from_secs(1));
+        let _ = self.touch_tx.send(QueuedControl { bytes: Vec::new(), expires, touch: Some(QueuedTouch::Release) });
     }
 
     fn queue_hard_key(&self, code: u64, lifetime: Duration) -> bool {
@@ -408,6 +418,7 @@ impl CarLifeHub {
         self.touch_tx.send(QueuedControl {
             bytes: build_cmd_frame(CTRL_CAR_HARD_KEY_CODE, &body),
             expires: Some(std::time::Instant::now() + lifetime),
+            touch: None,
         }).is_ok()
     }
 
@@ -1000,17 +1011,97 @@ fn read_varint(bytes: &[u8]) -> (Option<u64>, usize) {
 #[cfg(test)]
 mod input_lease_tests {
     use super::*;
-    #[test] fn detaching_media_releases_finger_once_without_destroying_source() {
-        let (tx,mut rx)=mpsc::unbounded_channel();
-        let hub=Arc::new(CarLifeHub{stop:Arc::new(DialStop::default()),touch_state:Arc::new(Mutex::new(session::TouchGesture::default())),
-            touch_tx:tx,encoder_size:Arc::new(Mutex::new((1920,720))),keyframe_request:Arc::new(Notify::new())});
-        hub.inject_touch(TOUCH_DOWN,33,44);
-        assert_eq!(read_cmd_frame(&rx.try_recv().unwrap().bytes).unwrap().0,0x68002);
+    use tokio::net::TcpListener;
+    use crate::airplay::{TouchGrant, TouchInput};
+
+    fn hub() -> (Arc<CarLifeHub>, mpsc::UnboundedReceiver<QueuedControl>) {
+        let (touch_tx, rx) = mpsc::unbounded_channel();
+        (Arc::new(CarLifeHub {
+            stop: Arc::new(DialStop::default()), touch_tx, encoder_size: Arc::new(Mutex::new((1920, 720))),
+            keyframe_request: Arc::new(Notify::new()),
+        }), rx)
+    }
+
+    async fn read_ctrl(peer: &mut TcpStream, state: &session::Shared) -> (u32, Vec<u8>) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut header = [0; 8];
+            peer.read_exact(&mut header).await.unwrap();
+            let mut body = vec![0; u16::from_be_bytes([header[0], header[1]]) as usize];
+            peer.read_exact(&mut body).await.unwrap();
+            let kind = u32::from_be_bytes(header[4..8].try_into().unwrap());
+            (kind, state.lock().decrypt(&body).unwrap())
+        }).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn detaching_media_releases_finger_once_without_destroying_source() {
+        let (hub, mut rx) = hub();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let state = session::microphone_test_session();
+        let writer = tokio::spawn(session::control(socket, queue.clone(), state.clone(), Arc::new(Notify::new())));
+        let touch = |action, x, y| hub.inject_touch_report(&TouchInput { action, x, y, pointers: vec![], grant: None });
+        touch(TOUCH_DOWN, 33, 44);
+        touch(TOUCH_MOVE, 45, 67);
+        queue.lock().extend(std::iter::from_fn(|| rx.try_recv().ok()));
+        assert_eq!(read_ctrl(&mut peer, &state).await.0, 0x68002);
+        assert_eq!(read_ctrl(&mut peer, &state).await.0, 0x68004);
         drop(crate::carwith_source::InputLease(hub.clone()));
-        assert_eq!(read_cmd_frame(&rx.try_recv().unwrap().bytes).unwrap().0,0x68003);
-        hub.release_touch();assert!(rx.try_recv().is_err());
-        hub.inject_touch(TOUCH_DOWN,55,66);
-        assert_eq!(read_cmd_frame(&rx.try_recv().unwrap().bytes).unwrap().0,0x68002);
+        hub.release_touch();
+        touch(TOUCH_UP, 0, 0);
+        touch(TOUCH_DOWN, 55, 66);
+        queue.lock().extend(std::iter::from_fn(|| rx.try_recv().ok()));
+        assert_eq!(read_ctrl(&mut peer, &state).await, (0x68001, vec![8, 3, 16, 45, 24, 67]));
+        assert_eq!(read_ctrl(&mut peer, &state).await.0, 0x68002);
+        writer.abort();
+    }
+
+    #[tokio::test]
+    async fn carwith_writer_discards_a_queued_click_and_cancels_a_sent_down_after_screen_return() {
+        use crate::bplist::Value;
+        let (hub, mut rx) = hub();
+        let modes = Arc::new(Mutex::new(crate::modes::Modes::initial()));
+        let stamp = || TouchGrant::new(&modes, modes.lock().screen_grant_generation());
+        let handover = || {
+            let mut state = modes.lock();
+            let borrow = Value::dict(vec![("resources", Value::array(vec![Value::dict(vec![
+                ("resourceID", Value::int(1)), ("transferType", Value::int(3)),
+                ("transferPriority", Value::int(500)), ("unborrowConstraint", Value::int(100)),
+            ])]))]);
+            assert!(state.change(&borrow));
+            assert!(!state.screen_owned());
+            state.request_ui();
+            assert!(state.screen_owned());
+        };
+        let touch = |action, x, grant: &TouchGrant| hub.inject_touch_report(&TouchInput {
+            action, x, y: 100, pointers: vec![], grant: Some(grant.clone()),
+        });
+        let old = stamp();
+        touch(TOUCH_DOWN, 20, &old);
+        touch(TOUCH_UP, 20, &old);
+        handover();
+        let current = stamp();
+        touch(TOUCH_DOWN, 40, &current);
+        let queue = Arc::new(Mutex::new(std::iter::from_fn(|| rx.try_recv().ok()).collect()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let state = session::microphone_test_session();
+        let writer = tokio::spawn(session::control(socket, queue.clone(), state.clone(), Arc::new(Notify::new())));
+        assert_eq!(read_ctrl(&mut peer, &state).await, (0x68002, vec![8, 40, 16, 100]));
+
+        touch(TOUCH_UP, 40, &current);
+        handover();
+        let next = stamp();
+        touch(TOUCH_DOWN, 60, &next);
+        touch(TOUCH_UP, 60, &next);
+        queue.lock().extend(std::iter::from_fn(|| rx.try_recv().ok()));
+        assert_eq!(read_ctrl(&mut peer, &state).await, (0x68001, vec![8, 3, 16, 40, 24, 100]));
+        assert_eq!(read_ctrl(&mut peer, &state).await, (0x68002, vec![8, 60, 16, 100]));
+        assert_eq!(read_ctrl(&mut peer, &state).await, (0x68003, vec![8, 60, 16, 100]));
+        writer.abort();
     }
 }
 

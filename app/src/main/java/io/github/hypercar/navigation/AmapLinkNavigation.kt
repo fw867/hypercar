@@ -8,10 +8,18 @@ internal class AmapLinkNavigationState {
     private var cue: NavigationCue? = null
     private var rawManeuver: Int? = null
     private var updated = 0L
+    private var fullGuidanceAt = 0L
+    private var replanning: TimedNavigationCue? = null
     private var initialLanes: Pair<Long, List<NavigationLane>>? = null
-    @Synchronized fun begin(): Long { token = ++counter; cue = null; rawManeuver = null; initialLanes = null; return token }
+    @Synchronized fun begin(): Long {
+        token = ++counter
+        cue = null; rawManeuver = null; initialLanes = null; replanning = null
+        return token
+    }
     @Synchronized fun clear(source: Long? = null) {
-        if (source == null || source != 0L && source == token) { token = 0; cue = null; rawManeuver = null; initialLanes = null }
+        if (source == null || source != 0L && source == token) {
+            token = 0; cue = null; rawManeuver = null; initialLanes = null; replanning = null
+        }
     }
     @Synchronized fun accept(source: Long, type: Int, data: org.json.JSONObject?, now: Long): Boolean {
         if (source == 0L || source != token) return false
@@ -77,6 +85,12 @@ internal class AmapLinkNavigationState {
             }
             else -> return false
         }
+        if (type == 4) {
+            fullGuidanceAt = now
+            replanning = replanning?.takeIf { it.updatedAt > now }
+        } else if (next.state != 1) {
+            replanning = null
+        }
         cue = next; updated = now
         return true
     }
@@ -85,6 +99,18 @@ internal class AmapLinkNavigationState {
         val current = cue ?: return null
         // An explicit stop remains authoritative over an old notification. Lost live updates clear the arrow.
         return if (current.state == 1 && now - updated !in 0..15_000) NavigationCue("", null, null, state = 0) else current
+    }
+
+    @Synchronized fun hudSnapshot(now: Long, notification: TimedNavigationCue?): NavigationCue? {
+        val link = snapshot(now) ?: return notification?.cue
+        if (link.state != 1) return link
+        // A new notification can supersede the last complete route. A partial turn or
+        // lane hint cannot end replanning, even if the notification has been removed.
+        val latest = replanning?.updatedAt ?: fullGuidanceAt
+        if (notification?.cue?.state == 5 && notification.updatedAt > latest) {
+            replanning = notification
+        }
+        return replanning?.cue ?: link
     }
     private fun integer(value: Any?, maximum: Long): Long? {
         if (value !is Number) return null
@@ -111,4 +137,5 @@ internal object AmapLinkNavigation {
     fun clear() = state.clear()
     fun accept(token: Long, type: Int, data: org.json.JSONObject?, now: Long) = state.accept(token, type, data, now)
     fun snapshot(): NavigationCue? = state.snapshot(android.os.SystemClock.elapsedRealtime())
+    fun hudSnapshot(now: Long, notification: TimedNavigationCue?) = state.hudSnapshot(now, notification)
 }

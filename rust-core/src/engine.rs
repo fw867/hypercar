@@ -32,6 +32,7 @@ pub enum SourceEvent {
     RequestCarWithKeyFrame,
     EncoderFrameRate(u32),
     ResetVideoSource,
+    ReplayVideoSource,
     VideoBacklogDropped { frames: usize, bytes: usize, oldest_ms: u64 },
     RequestHostUi,
     RequestViewArea(crate::display_layout::ViewRequest),
@@ -183,11 +184,11 @@ pub async fn run_engine(
     mut source_rx: mpsc::UnboundedReceiver<SourceEvent>,
     shutdown: Arc<crate::shutdown::EngineShutdown>,
     touch_size: Arc<Mutex<(u32, u32)>>,
+    pipeline: Arc<Mutex<crate::pipeline::Pipeline>>,
     receiver_audio_generation: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<(), String> {
     let stop = shutdown.signal.clone();
     let mut tasks = EngineTasks::default();
-    let pipeline=Arc::new(Mutex::new(crate::pipeline::Pipeline::new()));
     pipeline.lock().video_requested_fps = cfg.carwith_fps();
     emit_state("negotiating", "AirPlay 会话启动");
     // 触摸/按键通道：CarPlay 事件通道把车机操作送到这里，P1 起交给自绘 UI 处理。
@@ -244,7 +245,7 @@ pub async fn run_engine(
                                 let _=atx.send(SourceEvent::AudioStop{tts:true});
                                 let _=atx.send(SourceEvent::VoiceAudioStop);
                             }
-                            CarLifeEvent::VideoReplay => {let _=vtx.send(SourceEvent::ResetVideoSource);}
+                            CarLifeEvent::VideoReplay => {let _=vtx.send(SourceEvent::ReplayVideoSource);}
                             CarLifeEvent::Navigation(update) => crate::emit_carwith_navigation(navigation_token,update.as_ref()),
                             CarLifeEvent::VideoFrame { pts_us, data } => {
                                 let _ = vtx.send(SourceEvent::VideoFrameTagged { pts_us, data, codec:crate::video_format::VideoCodec::H264, origin });
@@ -328,7 +329,7 @@ pub async fn run_engine(
                             if let Some(hub) = &carwith_hub { hub.request_keyframe(); }
                         }
                         Some(SourceEvent::CarWithTouch(t)) => {
-                            if let Some(hub) = &carwith_hub { hub.inject_touch(t.action,t.x,t.y); }
+                            if let Some(hub) = &carwith_hub { hub.inject_touch_report(&t); }
                         }
                         Some(SourceEvent::CancelSelfAsr(id)) => {
                             if let Some(mic)=&microphone_cancel {mic.cancel_asr(id);}
@@ -632,6 +633,22 @@ fn merge_auxiliary_teardown(streams: &mut Vec<crate::bplist::Value>, pending: &[
 
 pub use crate::aux_audio::MainCommand;
 
+fn refresh_main_pcm_ownership(
+    output: Option<&AudioOut>, auxiliary: &crate::aux_audio::Input, mixed_generation: &mut Option<u64>,
+    media_mix: &mut VecDeque<i16>, media_remain: &mut PcmToStereo,
+) -> Option<crate::buffered_ownership::Ownership> {
+    let state = output.and_then(AudioOut::rtp_ownership)
+        .or_else(|| auxiliary.buffered_owner.get().map(|owner| *owner.borrow()))?;
+    // First SETUP can adopt media prepared at the same mixer rate. A prior
+    // take, including one before SETUP, invalidates both queued PCM and its resampler.
+    if !state.owned || mixed_generation.map_or(state.losses != 0, |old| old != state.losses) {
+        media_mix.clear();
+        media_remain.clear();
+    }
+    *mixed_generation = Some(state.losses);
+    Some(state)
+}
+
 async fn audio_pump(
     stop_a:Arc<Notify>, stats:Arc<Mutex<AudioPumpStat>>, claims:mpsc::Sender<(PlaybackIntent,std::time::Instant)>,
     audio_out_rx:tokio::sync::oneshot::Receiver<AudioOut>, audio_rx:mpsc::UnboundedReceiver<SourceEvent>,
@@ -685,15 +702,6 @@ async fn audio_pump(
             tts_mix.clear(); tts_remain.clear();
             voice.mix.clear(); voice.remain.clear();
             duck_hold = 0;
-        }
-        // Keep the input cutoff across a 103 -> 102 recovery. Old CarWith PCM
-        // can already be in the dispatch queue when ownership returns.
-        let buffered = auxiliary.buffered_owner.get().map(|rx| *rx.borrow());
-        let generation = buffered.map(|state| state.losses);
-        if generation != mixed_generation || buffered.is_some_and(|state| !state.owned) {
-            media_mix.clear();
-            media_remain.clear();
-            mixed_generation = generation;
         }
         // An installed stream can inherit PCM already queued at the same mixer rate.
         if !media_mix.is_empty() { pacing.note_media_queued(); }
@@ -830,7 +838,13 @@ async fn audio_pump(
                             stats.lock().playing=true;last_audio_at=Some(std::time::Instant::now());
                         }
                         if route!=crate::aux_audio::Route::Mix {continue;}
-                    } else if paused || buffered.is_some_and(|state| !state.accepts_pcm(received_at)) {continue;}
+                    } else {
+                        // Observe at dequeue. The take and return may both occur
+                        // while select is suspended, with old audio still in transit.
+                        let ownership = refresh_main_pcm_ownership(out.as_ref(), &auxiliary,
+                            &mut mixed_generation, &mut media_mix, &mut media_remain);
+                        if paused || ownership.is_some_and(|state| !state.accepts_pcm(received_at)) { continue; }
+                    }
                     let (fmt, remain, mix) = if tts {
                         (&mut tts_fmt, &mut tts_remain, &mut tts_mix)
                     } else {
@@ -880,6 +894,11 @@ async fn audio_pump(
                 }
             }
             scheduled = tick.tick() => {
+                let ownership = refresh_main_pcm_ownership(out.as_ref(), &auxiliary,
+                    &mut mixed_generation, &mut media_mix, &mut media_remain);
+                let generation = ownership.map(|state| state.losses);
+                // Keep this snapshot through mixing and encoding, including any awaits.
+                let rtp_generation = ownership.filter(|state| state.owned).map(|state| state.losses);
                 let now=tokio::time::Instant::now();
                 let defer_voice = hold_mixed_voice && !out.as_ref().is_some_and(AudioOut::owns_audio);
                 voice.update_hold(now, defer_voice);
@@ -958,7 +977,7 @@ async fn audio_pump(
                         Err(std::io::Error::other("buffered playback control failed"))
                     } else {
                         let current_due = crate::audio_pacing::current_pcm_due(scheduled.into_std(), missed, mix_rate);
-                        a.send_main_tick(mixed, generation, recovery_deadline, current_due).await
+                        a.send_main_tick(mixed, generation, recovery_deadline, current_due, rtp_generation).await
                     };
                     pacing.costs.send_us = pacing.costs.send_us.max(send_started.elapsed().as_micros());
                     if let Some(costs) = a.io_costs.take() {
@@ -1141,12 +1160,19 @@ pub(crate) async fn video_pump(
                         emit_log(&format!("VIDEO-QUEUE: recovery conn={:?} dropped_frames={frames} dropped_bytes={bytes} oldest_ms={oldest_ms}; waiting for live sync", s.connection_id()));
                     }
                 }
-                Some(SourceEvent::ResetVideoSource) => {
+                Some(event @ (SourceEvent::ResetVideoSource | SourceEvent::ReplayVideoSource)) => {
                     encoder_size = None; pending_size = None;
-                    converter.set_source_fps(None); converter.reset();converted.clear();
+                    let fresh_source = matches!(event, SourceEvent::ResetVideoSource);
+                    if fresh_source {
+                        converter.reset_source();
+                    } else {
+                        converter.reset();
+                    }
+                    converted.clear();
                     waiting_for_live_sync = recovering_backlog;
                     if let Some(s) = sender.as_mut() { s.reset_source(); }
-                    emit_log("CARWITH-VIDEO: fresh source round; waiting for current configuration and IDR");
+                    let path = if fresh_source { "fresh source round" } else { "cached replay in current source round" };
+                    emit_log(&format!("CARWITH-VIDEO: {path}; waiting for current configuration and IDR"));
                 }
                 Some(SourceEvent::EncoderFrameRate(rate)) => converter.set_source_fps(Some(rate)),
                 Some(SourceEvent::EncoderResolution { width, height }) => {
@@ -1183,8 +1209,16 @@ pub(crate) async fn video_pump(
                             let allowed=sender.as_ref().map(|s|s.hevc_allowed()).unwrap_or(false);
                             // Do not initialize a codec until the current screen transport is installed.
                             if sender.is_none() {before_ready_units+=1;continue;}
-                            let pts=if pts_us==0 {crate::timing::monotonic_nanos()/1000}else{pts_us};
-                            for unit in converter.input(allowed,pts,data,codec,origin) {
+                            let (units, resync_screen) = converter.input_for_screen(allowed, pts_us, data, codec, origin);
+                            if resync_screen {
+                                if let Some(s) = sender.as_mut() {
+                                    s.reset_source();
+                                    s.note_keyframe_request("live_fps_limit");
+                                }
+                                if let Some(owner) = source_owner { crate::carwith_source::request_fresh_video(owner); }
+                                else { crate::emit_force_keyframe(); }
+                            }
+                            for unit in units {
                                 converted.push_back(SourceEvent::VideoFrameTagged {pts_us:unit.pts,data:unit.data,codec:unit.codec,origin:unit.origin});
                             }
                             continue;
@@ -2048,6 +2082,76 @@ mod main_audio_command_tests {
         }).await.expect("fresh playback must reach the receiver");
         task.abort();
         let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn native_realtime_mixer_retires_queued_and_delayed_pcm_on_take_and_return() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Instant;
+
+        let before = Instant::now();
+        for kind in [100, 102] {
+            for queued in [true, false] {
+                let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                socket.connect(peer.local_addr().unwrap()).await.unwrap();
+                let owner = crate::buffered_ownership::BufferedOwnership::default();
+                let gate = Arc::new(AtomicBool::new(false));
+                owner.publish_with_gate(&gate, true);
+                let mut out = AudioOut::new(socket, None, [7; 32], kind);
+                out.set_ownership(gate.clone());
+                out.observe_main_stream(23, 70, 0, Instant::now(), &owner, None);
+                if kind == 102 { out.echo_pcm_through_aac_worker(&owner); }
+                let input = Arc::new(crate::aux_audio::Input::default());
+                let (ready, rx) = tokio::sync::oneshot::channel();
+                let (events, audio) = mpsc::unbounded_channel();
+                let (_commands, cmd) = mpsc::unbounded_channel();
+                let (claims, _claimed) = mpsc::channel(4);
+                assert!(ready.send(out).is_ok());
+                let task = crate::callback_context::spawn(audio_pump(Arc::default(), Arc::default(),
+                    claims, rx, audio, cmd, input, test_pipeline()));
+                let enqueue = |sample: i16, count, received_at| {
+                    events.send(SourceEvent::AudioData { tts: false, rate: 48000, channels: 2,
+                        received_at, data: sample.to_le_bytes().repeat(count) }).unwrap();
+                };
+                let mut wire = [0; 8192];
+                let decode = |packet: &[u8]| {
+                    let n = packet.len();
+                    let nonce = u64::from_le_bytes(packet[n - 8..].try_into().unwrap());
+                    let payload = crate::crypto::chacha_open(&[7; 32], &crate::crypto::nonce64(nonce),
+                        &packet[12..n - 8], &packet[4..12]).unwrap();
+                    payload.chunks_exact(2).map(|s| i16::from_be_bytes([s[0], s[1]])).collect::<Vec<_>>()
+                };
+
+                // Receive a packet from the real mixer before changing ownership. The
+                // large first block leaves less than half a second queued in the mixer.
+                let initial = if queued { -901 } else { 0 };
+                enqueue(initial, 40_000, before);
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        let n = peer.recv(&mut wire).await.unwrap();
+                        if decode(&wire[..n]).contains(&initial) { break; }
+                    }
+                }).await.expect("the pre-handover stream must reach the receiver");
+                while peer.try_recv(&mut wire).is_ok() {}
+                owner.publish_with_gate(&gate, false);
+                owner.publish_with_gate(&gate, true);
+                if !queued { enqueue(-902, 4096, before); }
+                enqueue(300, 4096, Instant::now());
+
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        let n = peer.recv(&mut wire).await.unwrap();
+                        let samples = decode(&wire[..n]);
+                        assert!(samples.iter().all(|&s| matches!(s, 0 | 300)),
+                            "stale media reached type {kind} after handover (queued={queued})");
+                        if samples.contains(&300) { break; }
+                    }
+                }).await.expect("fresh playback must resume");
+                task.abort();
+                let _ = task.await;
+            }
+        }
     }
 
     #[tokio::test]

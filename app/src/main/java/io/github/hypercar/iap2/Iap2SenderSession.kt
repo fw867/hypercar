@@ -308,7 +308,7 @@ class Iap2SenderSession(
         if (authFirst) log("MGU-AUTH: v1 identification ordinaryApps=${isBmwAppsOnly(ident)} wirelessCarPlay=${isCarPlayProfileB(ident)}")
         authenticatedAppsV1Early = authFirst
         peerIdentification = ident
-        navigation.declareReceiveSupport(ident.acceptsRouteGuidance)
+        navigation.declareReceiveSupport(ident.acceptsRouteGuidance, ident.currentRoadLimits)
         subscriptions.identify(ident.model, ident.manufacturer)
         media.identify(ident.hidComponents)
         onIdentification(ident)
@@ -778,7 +778,7 @@ class Iap2SenderSession(
         val ident = Iap2Messages.parseIdentification(frame.body)
         rememberAppsAuthenticationPolicy(ident)
         peerIdentification = ident
-        navigation.declareReceiveSupport(ident.acceptsRouteGuidance)
+        navigation.declareReceiveSupport(ident.acceptsRouteGuidance, ident.currentRoadLimits)
         subscriptions.identify(ident.model, ident.manufacturer)
         media.identify(ident.hidComponents)
         onIdentification(ident)
@@ -1400,7 +1400,7 @@ class Iap2SenderSession(
                     // Late identity can be queued by a Wi-Fi/credential wait. Its capability
                     // boundary must precede the following StartHID, not wait for the keepalive pump.
                     val ident = Iap2Messages.parseIdentification(frame.body)
-                    navigation.declareReceiveSupport(ident.acceptsRouteGuidance)
+                    navigation.declareReceiveSupport(ident.acceptsRouteGuidance, ident.currentRoadLimits)
                     subscriptions.identify(ident.model, ident.manufacturer)
                     media.identify(ident.hidComponents)
                 }

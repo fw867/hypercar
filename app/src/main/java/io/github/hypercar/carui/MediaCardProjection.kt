@@ -2,6 +2,8 @@ package io.github.hypercar.carui
 
 import android.content.Context
 import android.graphics.SurfaceTexture
+import android.os.SystemClock
+import android.view.MotionEvent
 import android.view.Surface
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.spike.SpikeDisplay
@@ -23,8 +25,9 @@ internal class MediaCardProjection(context: Context, private val packageName: St
     val expandedWindowReady = MutableStateFlow(false)
     val stabilizeExpandedWindow = ShortVideoApps.isSupported(packageName)
 
-    private val input = ProjectionSurfaceInput<Request> { id, action, x, y, downTime ->
-        SpikeShell.motion(id, action, x, y, downTime)
+    private val input = ProjectionSurfaceInput<Request> { id, frame, downTime ->
+        val event = frame.obtain(downTime, SystemClock.uptimeMillis())
+        try { SpikeShell.touchEvent(id, event).startsWith("OK") } finally { event.recycle() }
     }
     private val desired get() = input.desired
     private enum class CloseReason { UserDismissed, ViewDisposed }
@@ -171,16 +174,15 @@ internal class MediaCardProjection(context: Context, private val packageName: St
         scope.launch { changes.withLock { releaseDisplay() } }
     }
 
-    fun touch(texture: SurfaceTexture, action: Int, x: Float, y: Float, downTime: Long) {
+    fun touch(texture: SurfaceTexture, event: MotionEvent, viewWidth: Int, viewHeight: Int) {
         val display = attachment?.takeIf { isCurrent(it.request) && it.request.texture === texture } ?: return
         if (!allowsInteraction(CarReceiverUi.state.value.limits)) {
             cancelTouch()
             return
         }
         val viewport = display.request.size
-        val px = (x * viewport.width).toInt().coerceIn(0, viewport.width - 1)
-        val py = (y * viewport.height).toInt().coerceIn(0, viewport.height - 1)
-        input.touch(display.request, display.displayId, action, px, py, downTime)
+        val frame = CarTouchFrame.fromView(event, viewWidth, viewHeight, viewport.width, viewport.height) ?: return
+        input.touch(display.request, display.displayId, frame, event.downTime)
     }
 
     fun allowsInteraction(limits: UiLimits) = limits.allowsProjection(packageName, dialer)

@@ -1,8 +1,8 @@
 //! Receiver feedback and retransmission of already sealed realtime main audio RTP.
 use crate::{bplist::{self, Value}, buffered_ownership::Ownership, emit_log, timing::monotonic_nanos};
 use parking_lot::Mutex;
-use std::{collections::VecDeque, net::{IpAddr, SocketAddr}, sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}}, time::{Duration, Instant}};
-use tokio::{net::UdpSocket, sync::watch};
+use std::{collections::VecDeque, io, net::{IpAddr, SocketAddr}, sync::{Arc, Weak, atomic::{AtomicBool, AtomicU64, Ordering}}, time::{Duration, Instant}};
+use tokio::{net::UdpSocket, sync::{mpsc, watch}};
 
 const CACHE_PACKETS: usize = 32;
 const PCM_CACHE_PACKETS: usize = 72;
@@ -221,12 +221,181 @@ async fn observe_control(socket: Arc<UdpSocket>, peer_ip: Option<IpAddr>, label:
     }
 }
 
+const D4_LOG_INTERVAL_NS: u64 = 10_000_000_000;
+const D4_REPORTS_MAX_PENDING: usize = 4;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct D4Counts {
+    attempted: u64,
+    sent: u64,
+    would_block: u64,
+    enobufs: u64,
+    refused: u64,
+    other: u64,
+    short: u64,
+    last_errno: Option<i32>,
+}
+
+impl D4Counts {
+    fn record(&mut self, result: &io::Result<usize>, bytes: usize) -> bool {
+        self.attempted += 1;
+        match result {
+            Ok(written) if *written == bytes => { self.sent += 1; return false; }
+            Ok(_) => { self.short += 1; self.last_errno = None; }
+            Err(error) => {
+                self.last_errno = error.raw_os_error();
+                match self.last_errno {
+                    Some(libc::ENOBUFS) => self.enobufs += 1,
+                    Some(libc::ECONNREFUSED) => self.refused += 1,
+                    _ if error.kind() == io::ErrorKind::WouldBlock => self.would_block += 1,
+                    _ => self.other += 1,
+                }
+            }
+        }
+        true
+    }
+}
+
+#[derive(Debug)]
+struct D4Report {
+    mono_ns: u64,
+    counts: D4Counts,
+}
+
+impl D4Report {
+    fn log(self, label: &str) {
+        let D4Report { mono_ns, counts: c } = self;
+        emit_log(&format!("AUDIO-D4: {label} monoNs={mono_ns} attempted={} sent={} writeErrors={} wouldBlock={} enobufs={} connectionRefused={} other={} shortWrite={} lastErrno={:?}",
+            c.attempted, c.sent, c.attempted - c.sent, c.would_block, c.enobufs, c.refused, c.other, c.short, c.last_errno));
+    }
+}
+
+pub(crate) struct D4Trace {
+    reports: mpsc::Sender<D4Report>,
+    final_report: Option<mpsc::OwnedPermit<D4Report>>,
+    counts: D4Counts,
+    last_report_ns: u64,
+    last_queued_attempts: u64,
+    saw_error: bool,
+}
+
+impl D4Trace {
+    pub(crate) fn start(rtsp: u64, stream_id: i64, kind: u8, peer_port: u16, socket_available: bool) -> Option<Self> {
+        let label = format!("RTSP#{rtsp} type={kind} streamConnectionID={stream_id} peerControlPort={peer_port}");
+        let mono = monotonic_nanos();
+        if !socket_available {
+            let reason = if peer_port == 0 { "no_control_port" } else { "socket_unavailable" };
+            emit_log(&format!("AUDIO-D4: {label} monoNs={mono} state={reason} attempted=0 sent=0 writeErrors=0"));
+            return None;
+        }
+        emit_log(&format!("AUDIO-D4: {label} monoNs={mono} state=ready"));
+        Some(Self::drain_reports(mono, move |report| report.log(&label)))
+    }
+
+    fn drain_reports(mono: u64, log: impl Fn(D4Report) + Send + 'static) -> Self {
+        let (trace, mut reports) = Self::report_queue(mono);
+        crate::callback_context::spawn(async move {
+            while let Some(report) = reports.recv().await {
+                log(report);
+            }
+        });
+        trace
+    }
+
+    fn report_queue(mono_ns: u64) -> (Self, mpsc::Receiver<D4Report>) {
+        let (reports, receiver) = mpsc::channel(D4_REPORTS_MAX_PENDING);
+        // A slow log consumer can drop intermediate snapshots. Reserve one slot
+        // so retiring a stream can always enqueue its latest totals without waiting.
+        let final_report = reports.clone().try_reserve_owned().expect("fresh D4 report queue has space");
+        (Self { reports, final_report: Some(final_report), counts: D4Counts::default(),
+            last_report_ns: mono_ns, last_queued_attempts: 0, saw_error: false }, receiver)
+    }
+
+    pub(crate) fn written(&mut self, result: &io::Result<usize>, bytes: usize) {
+        self.written_at(result, bytes, monotonic_nanos());
+    }
+
+    fn written_at(&mut self, result: &io::Result<usize>, bytes: usize, now: u64) {
+        let failed = self.counts.record(result, bytes);
+        // Capture the first failure immediately. Persistent failures and healthy
+        // traffic share the same bounded reporting interval.
+        if self.counts.attempted == 1 || failed && !self.saw_error ||
+            now.saturating_sub(self.last_report_ns) >= D4_LOG_INTERVAL_NS {
+            self.last_report_ns = now;
+            if self.reports.try_send(D4Report { mono_ns: now, counts: self.counts }).is_ok() {
+                self.last_queued_attempts = self.counts.attempted;
+            }
+        }
+        self.saw_error |= failed;
+    }
+}
+
+impl Drop for D4Trace {
+    fn drop(&mut self) {
+        if self.counts.attempted != self.last_queued_attempts {
+            if let Some(permit) = self.final_report.take() {
+                let _ = permit.send(D4Report { mono_ns: monotonic_nanos(), counts: self.counts });
+            }
+        }
+    }
+}
+
+/// One atomic read pairs the last original media write with its ownership
+/// generation. The reserved value also prevents stale comparisons after overflow.
+#[derive(Debug)]
+pub(crate) struct RtpPosition(AtomicU64);
+
+impl Default for RtpPosition {
+    fn default() -> Self { Self(AtomicU64::new(u64::MAX)) }
+}
+
+impl RtpPosition {
+    pub(crate) fn record(&self, losses: u64, timestamp: u32) {
+        if losses < u64::from(u32::MAX) {
+            self.0.store((losses << 32) | u64::from(timestamp), Ordering::Release);
+        }
+    }
+
+    fn read(&self, losses: u64) -> Option<u32> {
+        let packed = self.0.load(Ordering::Acquire);
+        (packed != u64::MAX && packed >> 32 == losses).then_some(packed as u32)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FeedbackSource {
+    pub(crate) target: ClockTarget,
+    pub(crate) high_accuracy: bool,
+    pub(crate) position: Weak<RtpPosition>,
+}
+
+pub(crate) struct FeedbackSnapshot {
+    source: FeedbackSource,
+    losses: u64,
+    written_rtp: Option<u32>,
+    mono_ns: u64,
+}
+
+impl FeedbackSource {
+    pub(crate) fn snapshot(&self, losses: u64) -> FeedbackSnapshot {
+        let written_rtp = self.position.upgrade().and_then(|position| position.read(losses));
+        FeedbackSnapshot { source: self.clone(), losses, written_rtp, mono_ns: monotonic_nanos() }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RtpObservation {
+    written: u32,
+    mono_ns: u64,
+}
+
 #[derive(Default)]
 pub(crate) struct FeedbackTrace {
     layout: String,
     repeats: u64,
     clock_target: Option<(ClockTarget, u64)>,
     clock: SampleClock,
+    comparison: Option<(ClockTarget, RtpObservation, RtpObservation)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,11 +449,26 @@ impl SampleClock {
 }
 
 impl FeedbackTrace {
-    pub(crate) fn set_clock_target(&mut self, target: Option<(ClockTarget, u64)>) {
+    fn set_clock_target(&mut self, target: Option<(ClockTarget, u64)>) {
         if self.clock_target != target {
             self.clock_target = target;
             self.clock = Default::default();
         }
+    }
+
+    pub(crate) fn set_observation_snapshots(&mut self, before: Option<FeedbackSnapshot>, after: Option<FeedbackSnapshot>) {
+        let matching = before.zip(after).filter(|(before, after)| {
+            before.losses == after.losses && before.source.target == after.source.target &&
+                before.source.position.ptr_eq(&after.source.position)
+        });
+        self.set_clock_target(matching.as_ref().and_then(|(before, _)| {
+            before.source.high_accuracy.then_some((before.source.target, before.losses))
+        }));
+        self.comparison = matching.and_then(|(before, after)| {
+            Some((before.source.target,
+                RtpObservation { written: before.written_rtp?, mono_ns: before.mono_ns },
+                RtpObservation { written: after.written_rtp?, mono_ns: after.mono_ns }))
+        });
     }
 
     pub(crate) fn observe(&mut self, rtsp: u64, cseq: Option<i32>, body: &[u8]) -> Option<String> {
@@ -296,13 +480,21 @@ impl FeedbackTrace {
             if let Some(streams) = plist.get("streams").and_then(Value::as_array) {
                 let estimate = self.clock_target.and_then(|(target, _)| {
                     if target.rtsp != rtsp || target.rate == 0 { return None; }
-                    let mut matching = streams.iter().filter(|stream| {
-                        stream.get("type").and_then(Value::as_int) == Some(target.stream_type)
-                            && stream.get("streamConnectionID").and_then(Value::as_int) == Some(target.stream_id)
-                    });
-                    let stream = matching.next()?;
-                    if matching.next().is_some() { return None; }
+                    let stream = unique_stream(streams, target)?;
                     self.clock.estimate(stream, target.rate).map(|estimate| (target, estimate))
+                });
+                let comparison = self.comparison.and_then(|(target, sent_before, sent_after)| {
+                    if target.rtsp != rtsp || target.rate == 0 { return None; }
+                    let stream = unique_stream(streams, target)?;
+                    let rate = f64::from(target.rate);
+                    if feedback_rate(stream).is_some_and(|rate_field| !(0.95 * rate..=1.05 * rate).contains(&rate_field)) {
+                        return None;
+                    }
+                    let received = u32::try_from(stream.get("sampleTime")?.as_int()?).ok()?;
+                    let before_delta = sent_before.written.wrapping_sub(received) as i32;
+                    let after_delta = sent_after.written.wrapping_sub(received) as i32;
+                    if [before_delta, after_delta].contains(&i32::MIN) { return None; }
+                    Some((target, sent_before, sent_after, before_delta, after_delta))
                 });
                 layout.push_str("no_audio_stream");
                 for stream in streams {
@@ -320,7 +512,8 @@ impl FeedbackTrace {
                     };
                     layout.push_str(&format!(" {kind}/{id:?}"));
                     for field in ["sr", "mediaTime", "wallTime", "sampleTime", "timestamp", "timestampRawNs"] {
-                        let number = match stream.get(field) {
+                        let value = if field == "sr" { feedback_rate_value(stream) } else { stream.get(field) };
+                        let number = match value {
                             Some(Value::Int(n)) => Some(n.to_string()),
                             Some(Value::Real(n)) if n.is_finite() => Some(n.to_string()),
                             _ => None,
@@ -332,6 +525,12 @@ impl FeedbackTrace {
                         kind == target.stream_type && id == Some(target.stream_id)) {
                         layout.push_str(" clock");
                         row.push_str(&format!(" rateHz={rate:.3} sampleClockOffsetNs={offset}"));
+                    }
+                    if let Some((_, before, after, ahead_before, ahead_after)) = comparison.filter(|(target, ..)|
+                        kind == target.stream_type && id == Some(target.stream_id)) {
+                        layout.push_str(" rtp_comparison");
+                        row.push_str(&format!(" beforeQueueMonoNs={} afterObservationMonoNs={} writtenRtpBeforeQueue={} writtenRtpAfterObservation={} writtenAheadFramesBeforeQueue={ahead_before} writtenAheadFramesAfterObservation={ahead_after}",
+                            before.mono_ns, after.mono_ns, before.written, after.written));
                     }
                     rows.push(row);
                 }
@@ -349,6 +548,31 @@ impl FeedbackTrace {
         } else { rows.join(" | ") };
         Some(format!("AUDIO-FEEDBACK: RTSP#{rtsp} CSeq={cseq:?} monoNs={} bodyBytes={} {detail}", monotonic_nanos(), body.len()))
     }
+}
+
+fn unique_stream(streams: &[Value], target: ClockTarget) -> Option<&Value> {
+    let mut matches = streams.iter().filter(|stream| {
+        stream.get("type").and_then(Value::as_int) == Some(target.stream_type) &&
+            stream.get("streamConnectionID").and_then(Value::as_int) == Some(target.stream_id)
+    });
+    let stream = matches.next()?;
+    matches.next().is_none().then_some(stream)
+}
+
+fn rate_number(value: &Value) -> Option<f64> {
+    match value {
+        Value::Int(rate) if *rate > 0 => Some(*rate as f64),
+        Value::Real(rate) if rate.is_finite() && *rate > 0.0 => Some(*rate),
+        _ => None,
+    }
+}
+
+fn feedback_rate_value(stream: &Value) -> Option<&Value> {
+    ["sr", "sampleRate"].into_iter().filter_map(|key| stream.get(key)).find(|value| rate_number(value).is_some())
+}
+
+fn feedback_rate(stream: &Value) -> Option<f64> {
+    feedback_rate_value(stream).and_then(rate_number)
 }
 
 #[cfg(test)]
@@ -473,6 +697,110 @@ mod tests {
         assert!(trace.observe(1, None, &body).is_none());
         assert!(FeedbackTrace::default().observe(2, Some(1), &body).unwrap().contains("RTSP#2"));
         assert!(trace.observe(1, None, b"broken").unwrap().contains("invalid_plist streamConnectionID=unknown attribution=unknown"));
+    }
+
+    #[test]
+    fn feedback_reports_diplay_sample_rate_as_the_rtp_clock_rate() {
+        let body = bplist::encode(&Value::dict(vec![("streams", Value::array(vec![Value::dict(vec![
+            ("type", Value::int(100)), ("streamConnectionID", Value::int(42)),
+            ("sampleRate", Value::int(48_000)), ("sampleTime", Value::int(73_728)),
+        ])]))]));
+        let line = FeedbackTrace::default().observe(1, Some(1), &body).unwrap();
+        assert!(line.contains("sr=48000"), "{line}");
+    }
+
+    #[test]
+    fn d4_write_totals_distinguish_udp_errors_and_do_not_count_short_writes_as_sent() {
+        let mut counts = D4Counts::default();
+        assert!(!counts.record(&Ok(20), 20));
+        assert!(counts.record(&Ok(19), 20));
+        for errno in [libc::EAGAIN, libc::ENOBUFS, libc::ECONNREFUSED, libc::EPIPE] {
+            assert!(counts.record(&Err(io::Error::from_raw_os_error(errno)), 20));
+        }
+        assert_eq!((counts.attempted, counts.sent, counts.short, counts.would_block, counts.enobufs, counts.refused, counts.other),
+            (6, 1, 1, 1, 1, 1, 1));
+        assert_eq!(counts.last_errno, Some(libc::EPIPE));
+    }
+
+    #[test]
+    fn d4_keeps_final_totals_when_periodic_reports_fill_the_queue() {
+        let start = monotonic_nanos();
+        let (mut trace, mut reports) = D4Trace::report_queue(start);
+        let sent = Ok(20);
+        let refused = Err(io::Error::from_raw_os_error(libc::ECONNREFUSED));
+        trace.written_at(&sent, 20, start);
+        trace.written_at(&refused, 20, start + 1);
+        trace.written_at(&sent, 20, start + 2);
+        trace.written_at(&sent, 20, start + D4_LOG_INTERVAL_NS + 1);
+        trace.written_at(&sent, 20, start + 2 * D4_LOG_INTERVAL_NS + 1);
+        drop(trace);
+
+        let attempts: Vec<_> = std::iter::from_fn(|| reports.try_recv().ok()).map(|report| {
+            (report.counts.attempted, report.counts.sent, report.counts.refused)
+        }).collect();
+        assert_eq!(attempts, vec![(1, 1, 0), (2, 1, 1), (4, 3, 1), (5, 4, 1)]);
+        assert_eq!(reports.try_recv().unwrap_err(), mpsc::error::TryRecvError::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn d4_drains_final_totals_with_the_retired_engines_callback_context() {
+        use crate::callback_context::{current, sync_scope, Context};
+
+        let owner = Context::new(None);
+        let owner_generation = owner.generation;
+        let start = monotonic_nanos();
+        let (seen, mut observations) = mpsc::unbounded_channel();
+        let mut trace = sync_scope(owner, || D4Trace::drain_reports(start, move |report| {
+            seen.send((current().map(|context| context.generation), report.counts.attempted)).unwrap();
+        }));
+        trace.written_at(&Ok(20), 20, start);
+        trace.written_at(&Ok(20), 20, start + 1);
+        // Retire the old stream before the single-threaded runtime first polls its log task.
+        sync_scope(Context::new(None), || drop(trace));
+
+        let observed = async {
+            let mut rows = Vec::new();
+            while let Some(report) = observations.recv().await { rows.push(report); }
+            rows
+        };
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(1), observed).await.unwrap(),
+            [(Some(owner_generation), 1), (Some(owner_generation), 2)]);
+    }
+
+    #[test]
+    fn feedback_compares_both_sides_of_the_request_only_for_the_same_stream_and_ownership() {
+        let position = Arc::new(RtpPosition::default());
+        let source = FeedbackSource { target: ClockTarget { rtsp: 1, stream_id: 42, stream_type: 100, rate: 48_000 },
+            high_accuracy: false, position: Arc::downgrade(&position) };
+        let row = |id, rate| Value::dict(vec![("type", Value::int(100)), ("streamConnectionID", Value::int(id)),
+            ("sampleRate", Value::int(rate)), ("sampleTime", Value::int(i64::from(u32::MAX) - 99))]);
+        let body = |rows| bplist::encode(&Value::dict(vec![("streams", Value::array(rows))]));
+        let mut trace = FeedbackTrace::default();
+
+        position.record(7, u32::MAX - 119);
+        let before = source.snapshot(7);
+        position.record(7, 100);
+        let after = source.snapshot(7);
+        let (before_ns, after_ns) = (before.mono_ns, after.mono_ns);
+        trace.set_observation_snapshots(Some(before), Some(after));
+        let line = trace.observe(1, Some(1), &body(vec![row(42, 48_000), row(43, 48_000)])).unwrap();
+        assert!(line.contains("writtenAheadFramesBeforeQueue=-20 writtenAheadFramesAfterObservation=200"), "{line}");
+        assert!(line.contains(&format!("beforeQueueMonoNs={before_ns} afterObservationMonoNs={after_ns}")), "{line}");
+        assert_eq!(line.matches("writtenRtpBeforeQueue=").count(), 1);
+        for invalid in [vec![row(42, 16_000)], vec![row(42, 48_000), row(42, 48_000)], vec![row(43, 48_000)]] {
+            assert!(!trace.observe(1, Some(2), &body(invalid)).unwrap().contains("writtenRtpBeforeQueue="));
+        }
+
+        let before = source.snapshot(7);
+        position.record(8, 200);
+        trace.set_observation_snapshots(Some(before), Some(source.snapshot(8)));
+        assert!(trace.comparison.is_none());
+        assert!(source.snapshot(7).written_rtp.is_none());
+        let replacement = Arc::new(RtpPosition::default());
+        replacement.record(8, 400);
+        let reused_id = FeedbackSource { position: Arc::downgrade(&replacement), ..source.clone() };
+        trace.set_observation_snapshots(Some(source.snapshot(8)), Some(reused_id.snapshot(8)));
+        assert!(trace.comparison.is_none());
     }
 
     #[test]

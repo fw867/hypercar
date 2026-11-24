@@ -1,5 +1,10 @@
 package io.github.hypercar.iap2
 
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+import java.time.format.DateTimeParseException
+import java.time.format.ResolverStyle
+
 /** A vehicle GNSS fix for in-process consumers. Received time uses the Wi-Fi worker's monotonic clock. */
 data class Iap2VehicleLocation(
     val latitudeDegrees: Double,
@@ -8,16 +13,30 @@ data class Iap2VehicleLocation(
     val altitudeMeters: Double? = null,
     val speedMetersPerSecond: Double? = null,
     val bearingDegrees: Double? = null,
+    val utc: LocalDateTime? = null,
+    val fixQuality: Int = 1,
+    val satellitesUsed: Int = 0,
+    val hdop: Double? = null,
 ) {
     override fun toString(): String = "Iap2VehicleLocation(receivedAtMillis=$receivedAtMillis)"
 }
 
+internal const val LOCATION_WHEEL_SPEED_SELECTOR = 4
+
+/** Independent of GNSS and stamped on the Wi-Fi worker's monotonic clock. */
+data class Iap2WheelSpeed(val metersPerSecond: Double, val receivedAtMillis: Long)
+
 /** Owned by one authenticated Wi-Fi control link. Raw NMEA never leaves this class. */
-internal class Iap2VehicleLocationSession(private val onLocation: (Iap2VehicleLocation?) -> Unit) {
+internal class Iap2VehicleLocationSession(
+    private val onLocation: (Iap2VehicleLocation?) -> Unit,
+    private val onWheelSpeed: (Iap2WheelSpeed?) -> Unit,
+) {
     private var requested = emptySet<Int>()
     private var fix: Iap2VehicleLocation? = null
     private var fixTime: String? = null
     val hasFix: Boolean get() = fix != null
+    var wheelSpeed: Iap2WheelSpeed? = null
+        private set
 
     fun subscribe(peer: Iap2Messages.Identification): List<Iap2Csm.Frame> {
         val next = peer.locationNmeaTypes
@@ -47,23 +66,33 @@ internal class Iap2VehicleLocationSession(private val onLocation: (Iap2VehicleLo
     }
 
     fun expire(now: Long) {
-        val previous = fix ?: return
-        if (now - previous.receivedAtMillis >= FIX_LIFETIME_MILLIS) clearFix()
+        fix?.let { if (now - it.receivedAtMillis >= FIX_LIFETIME_MILLIS) clearFix() }
+        wheelSpeed?.let { if (now - it.receivedAtMillis >= SPEED_LIFETIME_MILLIS) clearWheelSpeed() }
     }
 
     fun reset() {
         requested = emptySet()
         clearFix()
+        clearWheelSpeed()
     }
 
     private fun receiveSentence(sentence: String, now: Long) {
-        if (sentence.length !in 9..MAX_SENTENCE_LENGTH || sentence[0] != '$') return
+        val wheelSentence = sentence.startsWith("\$PASCD,")
+        if (wheelSentence && LOCATION_WHEEL_SPEED_SELECTOR !in requested) return
+        val limit = if (wheelSentence) MAX_PARAM_BYTES - 1 else MAX_SENTENCE_LENGTH
+        if (sentence.length !in 9..limit || sentence[0] != '$') return
         val star = sentence.lastIndexOf('*')
         if (star != sentence.length - 3) return
-        val checksum = sentence.substring(star + 1).toIntOrNull(16) ?: return
+        val high = sentence[star + 1].digitToIntOrNull(16) ?: return
+        val low = sentence[star + 2].digitToIntOrNull(16) ?: return
+        val checksum = (high shl 4) or low
         val payload = sentence.substring(1, star)
         if (payload.fold(0) { total, char -> total xor char.code } != checksum) return
         val fields = payload.split(',')
+        if (wheelSentence) {
+            receiveWheelSpeed(fields, now)
+            return
+        }
         val header = fields[0]
         if (header.length != 5 || header.take(2) !in GPS_TALKERS) return
         val kind = when (header.substring(2)) { "GGA" -> 1; "RMC" -> 2; else -> return }
@@ -86,9 +115,33 @@ internal class Iap2VehicleLocationSession(private val onLocation: (Iap2VehicleLo
             ?.takeIf { it >= 0 }?.times(1852.0 / 3600.0)
         val course = if (gga) previous?.bearingDegrees else finiteNumber(fields[8])?.takeIf { it >= 0 && it < 360 }
         fixTime = utc
-        val next = Iap2VehicleLocation(lat, lon, now, altitude, speed, course)
+        val dateTime = if (gga) previous?.utc else nmeaUtc(fields[9], utc)
+        val satellitesUsed = if (gga) fields[7].toIntOrNull()?.takeIf { it in 0..128 } ?: 0
+            else previous?.satellitesUsed ?: 0
+        val hdop = if (gga) finiteNumber(fields[8])?.takeIf { it in 0.0..100.0 } else previous?.hdop
+        val next = Iap2VehicleLocation(lat, lon, now, altitude, speed, course,
+            dateTime, quality ?: previous?.fixQuality ?: 1, satellitesUsed, hdop)
         fix = next
         onLocation(next)
+    }
+
+    private fun receiveWheelSpeed(fields: List<String>, now: Long) {
+        // Verified $PASCD variant: monotonic seconds, C, gear, 0, count, then offset and m/s pairs.
+        val count = fields.getOrNull(5)?.toIntOrNull()?.takeIf { it in 1..MAX_WHEEL_SAMPLES } ?: return
+        if (fields.size != 6 + count * 2 || fields[2] != "C" || fields[4] != "0" ||
+            fields[3].singleOrNull()?.let { it in "PRND" } != true ||
+            finiteNumber(fields[1])?.let { it >= 0 } != true) return
+        var lastOffset = 0.0
+        var lastSpeed = 0.0
+        for (index in 0 until count) {
+            val offset = finiteNumber(fields[6 + index * 2])?.takeIf { it >= lastOffset } ?: return
+            val speed = finiteNumber(fields[7 + index * 2])?.takeIf { it >= 0 } ?: return
+            lastOffset = offset
+            lastSpeed = speed
+        }
+        val sample = Iap2WheelSpeed(lastSpeed, now)
+        wheelSpeed = sample
+        onWheelSpeed(sample)
     }
 
     private fun clearFix() {
@@ -96,6 +149,12 @@ internal class Iap2VehicleLocationSession(private val onLocation: (Iap2VehicleLo
         if (fix == null) return
         fix = null
         onLocation(null)
+    }
+
+    private fun clearWheelSpeed() {
+        if (wheelSpeed == null) return
+        wheelSpeed = null
+        onWheelSpeed(null)
     }
 
     private fun coordinate(value: String, direction: String, digits: Int, positive: String, negative: String, max: Int): Double? {
@@ -111,13 +170,25 @@ internal class Iap2VehicleLocationSession(private val onLocation: (Iap2VehicleLo
 
     private fun finiteNumber(value: String): Double? = value.takeIf(DECIMAL::matches)?.toDoubleOrNull()?.takeIf(Double::isFinite)
 
+    private fun nmeaUtc(date: String, time: String): LocalDateTime? {
+        if (date.length != 6 || !date.all { it in '0'..'9' }) return null
+        return try {
+            LocalDateTime.parse(date + time.take(6), UTC_DATE_TIME)
+        } catch (_: DateTimeParseException) {
+            null
+        }
+    }
+
     private companion object {
         val UTC_TIME = Regex("(?:[01][0-9]|2[0-3])[0-5][0-9](?:[0-5][0-9]|60)(?:\\.[0-9]+)?")
+        val UTC_DATE_TIME = DateTimeFormatter.ofPattern("ddMMuuHHmmss").withResolverStyle(ResolverStyle.STRICT)
         val DECIMAL = Regex("-?[0-9]+(?:\\.[0-9]+)?")
         val GPS_TALKERS = setOf("GP", "GN", "GA", "GB", "BD", "GL", "GQ")
         const val MAX_BODY_BYTES = 4096
         const val MAX_PARAM_BYTES = 1024
         const val MAX_SENTENCE_LENGTH = 160
+        const val MAX_WHEEL_SAMPLES = 32
         const val FIX_LIFETIME_MILLIS = 10_000
+        const val SPEED_LIFETIME_MILLIS = 5_000
     }
 }
