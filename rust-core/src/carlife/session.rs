@@ -4,6 +4,8 @@ use crate::emit_state;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use rsa::pkcs8::EncodePublicKey;
 use sha2::Digest;
+use super::protocol_selection::Progress;
+use std::sync::atomic::Ordering;
 
 pub(super) type Shared = Arc<Mutex<Session>>;
 
@@ -15,8 +17,8 @@ impl SystemVoiceTarget {
     pub(super) fn clear(&self) { *self.0.lock() = std::sync::Weak::new(); }
     pub(super) fn epoch(&self) -> Option<u64> {
         let state=self.0.lock().upgrade()?;
-        let epoch=state.lock().voice_epoch;
-        Some(epoch)
+        let session=state.lock();
+        session.is_system_plain().then_some(session.voice_epoch)
     }
     pub(super) fn queue(&self, key: u64) -> bool {
         let Some(epoch)=self.epoch() else { return false; };
@@ -34,6 +36,8 @@ impl SystemVoiceTarget {
 
 #[cfg(test)]
 mod video_packet_probe;
+#[cfg(test)]
+mod auto_protocol_tests;
 #[cfg(test)]
 pub(super) use video_packet_probe::VideoPacketProbe;
 
@@ -198,12 +202,13 @@ pub(super) struct Session {
     challenge: String,
     info: Option<(String, String, String)>,
     proof_ok: bool,
+    pub(super) protocol_progress: Arc<Progress>,
     admitted: bool,
     features_requested: bool,
     features_sent: bool,
     feature_ack: bool,
     feature_deadline: Option<tokio::time::Instant>,
-    rsa: Option<rsa::RsaPrivateKey>,
+    rsa: Option<Arc<rsa::RsaPrivateKey>>,
     seed: Option<Vec<u8>>,
     ready: bool,
     init_sent: bool,
@@ -215,6 +220,8 @@ pub(super) struct Session {
     fallback_init: Option<(u32,u32)>,
     declared_display: Option<(u32,u32)>,
     pub started: bool,
+    pub(super) video_start_written: Arc<Notify>,
+    pub(super) video_sync_received: Option<watch::Sender<bool>>,
     matched: bool,
     navigation_requested: bool,
     navigation_started: bool,
@@ -232,8 +239,8 @@ impl Default for Session {
             probe_reset: None,
             #[cfg(test)]
             probe_reset_written: false,
-            proof_ok: false, admitted: false, features_requested: false, features_sent: false, feature_ack: false, feature_deadline: None,
-            rsa: None, seed: None, ready: false, init_sent: false, init_fps: None, init_canvas: None, reconfigure_request: Arc::new(Notify::new()), encoder_epoch: 0, encoder_actual: None, fallback_init: None, declared_display: None, started: false, matched: false, navigation_requested: false, navigation_started: false, vehicle_gps_subscribed: false, voice_epoch: 0, voice_request: Arc::new(Notify::new()), voice_lease: None, voice_pending: std::collections::VecDeque::new() }
+            proof_ok: false, protocol_progress: Arc::new(Progress::default()), admitted: false, features_requested: false, features_sent: false, feature_ack: false, feature_deadline: None,
+            rsa: None, seed: None, ready: false, init_sent: false, init_fps: None, init_canvas: None, reconfigure_request: Arc::new(Notify::new()), encoder_epoch: 0, encoder_actual: None, fallback_init: None, declared_display: None, started: false, video_start_written:Arc::new(Notify::new()), video_sync_received:None, matched: false, navigation_requested: false, navigation_started: false, vehicle_gps_subscribed: false, voice_epoch: 0, voice_request: Arc::new(Notify::new()), voice_lease: None, voice_pending: std::collections::VecDeque::new() }
     }
 }
 
@@ -241,6 +248,61 @@ impl Default for Session {
 pub(super) fn microphone_test_session()->Shared { let mut s=Session::default();s.started=true;s.proof_ok=true;s.admitted=true;s.ready=true;s.seed=Some(vec![7;16]);Arc::new(Mutex::new(s)) }
 
 type Action = (u32, Vec<u8>);
+
+enum CryptoWork {
+    GenerateKey,
+    DecryptSeed { key: Arc<rsa::RsaPrivateKey>, encoded: String },
+}
+
+enum CommandCrypto {
+    PublicKey { key: Arc<rsa::RsaPrivateKey>, encoded: String },
+    Seed(Vec<u8>),
+}
+
+impl CryptoWork {
+    fn execute(self) -> Result<CommandCrypto, String> {
+        match self {
+            Self::GenerateKey => {
+                #[cfg(test)]
+                let started = {
+                    log::info!(target: "carwith_probe", "RSA-2048 keygen begin");
+                    std::time::Instant::now()
+                };
+                let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).map_err(|e| e.to_string())?;
+                #[cfg(test)]
+                log::info!(target: "carwith_probe", "RSA-2048 keygen done duration_us={}", started.elapsed().as_micros());
+                let der = key.to_public_key().to_public_key_der().map_err(|e| e.to_string())?;
+                let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, der.as_bytes());
+                Ok(CommandCrypto::PublicKey { key: Arc::new(key), encoded })
+            }
+            Self::DecryptSeed { key, encoded } => {
+                let encrypted = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+                    .map_err(|e| e.to_string())?;
+                let seed = key.decrypt(rsa::Pkcs1v15Encrypt, &encrypted).map_err(|e| e.to_string())?;
+                if !matches!(seed.len(), 16 | 24 | 32) { return Err("invalid AES seed length".into()); }
+                Ok(CommandCrypto::Seed(seed))
+            }
+        }
+    }
+}
+
+fn is_authentication_command(kind: u32) -> bool {
+    matches!(kind, CMD_MD_AUTHEN_RESPONSE | CMD_MD_RSA_KEY_REQUEST | CMD_MD_AES_SEED | CMD_MD_ENCRYPT_READY)
+}
+
+fn observe_buffered_authentication(progress: &Progress, mut buffered: &[u8]) {
+    // The AES seed cannot be installed before authentication is observed, so
+    // only the pre-key stream needs this lookahead. Leave validation and all
+    // protocol side effects in their original wire order.
+    if progress.authentication.load(Ordering::Relaxed) { return; }
+    while let Some((kind, _, consumed)) = cmd_frame_parts(buffered) {
+        if is_authentication_command(kind) {
+            progress.authentication.store(true, Ordering::Relaxed);
+            return;
+        }
+        buffered = &buffered[consumed..];
+    }
+}
 fn navigation_subscription()->Vec<u8> {
     let mut module=Vec::new();proto::varint(&mut module,1,0);
     let mut list=Vec::new();proto::varint(&mut list,1,1);proto::bytes(&mut list,2,&module);list
@@ -256,7 +318,12 @@ impl Session {
         match self.dialect {
             CarLifeDialect::CarWithEncrypted41 => self.proof_ok && self.admitted && self.ready,
             CarLifeDialect::SystemPlain30 => self.started && self.matched && self.info.is_some() && self.init_sent,
+            CarLifeDialect::SystemAuto => false,
         }
+    }
+    #[cfg(test)]
+    pub(super) fn protocol_evidence(&self) -> super::protocol_selection::Evidence {
+        self.protocol_progress.evidence()
     }
     pub(super) fn is_system_plain(&self) -> bool { self.dialect == CarLifeDialect::SystemPlain30 }
     pub(super) fn media_ready(&self) -> bool {
@@ -274,7 +341,7 @@ impl Session {
         self.encoder_epoch=self.encoder_epoch.wrapping_add(1).max(1);
         self.started=false;self.features_sent=false;self.feature_ack=false;self.feature_deadline=None;
         self.init_sent=false;self.init_fps=None;self.init_canvas=None;self.fallback_init=None;
-        self.receive(u32::MAX,&[],cfg)
+        self.receive_prepared(u32::MAX, &[], cfg, None)
     }
     fn feature_timeout(&self) -> Option<tokio::time::Instant> {
         self.feature_deadline.filter(|_| !self.init_sent)
@@ -304,15 +371,57 @@ impl Session {
     pub fn encrypt(&self, bytes: &[u8]) -> Result<Vec<u8>, String> { crypt(bytes, self.seed.as_deref(), true) }
     pub fn decrypt(&self, bytes: &[u8]) -> Result<Vec<u8>, String> { crypt(bytes, self.seed.as_deref(), false) }
 
+    fn observe_command(&self, kind: u32, body: &[u8]) {
+        if is_authentication_command(kind) {
+            self.protocol_progress.authentication.store(true, Ordering::Relaxed);
+        }
+        if kind == CMD_VERSION_MATCH_STATUS && matches!(first_int(body, 1), Some(0 | 2)) {
+            self.protocol_progress.version_rejected.store(true, Ordering::Relaxed);
+        }
+    }
+
+    // Take only the inputs the background job needs. A timed-out job can
+    // neither hold the session lock nor publish a result to a retired round.
+    fn crypto_work(&self, kind: u32, body: &[u8]) -> Result<Option<CryptoWork>, String> {
+        if self.is_system_plain() { return Ok(None); }
+        match kind {
+            CMD_MD_RSA_KEY_REQUEST => {
+                if !self.features_sent || self.rsa.is_some() { return Err("RSA request out of order".into()); }
+                Ok(Some(CryptoWork::GenerateKey))
+            }
+            CMD_MD_AES_SEED => {
+                if self.seed.is_some() { return Err("duplicate seed".into()); }
+                let key = self.rsa.clone().ok_or("seed before RSA")?;
+                let encoded = pb_first_string(body, 1).ok_or("missing seed")?;
+                Ok(Some(CryptoWork::DecryptSeed { key, encoded }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    #[cfg(test)]
     fn receive(&mut self, kind: u32, body: &[u8], cfg: &CarLifeConfig) -> Result<Vec<Action>, String> {
+        self.observe_command(kind, body);
+        let crypto = self.crypto_work(kind, body)?.map(CryptoWork::execute).transpose()?;
+        self.receive_prepared(kind, body, cfg, crypto)
+    }
+
+    fn receive_prepared(&mut self, kind: u32, body: &[u8], cfg: &CarLifeConfig, crypto: Option<CommandCrypto>) -> Result<Vec<Action>, String> {
         let mut out = Vec::new();
         let plain = self.dialect == CarLifeDialect::SystemPlain30;
-        // Public/OEM CarLife has no proprietary challenge/admission/content crypto steps.
-        // Reject those messages explicitly so a plaintext round never acquires an AES seed.
-        if plain && matches!(kind, CMD_MD_AUTHEN_RESPONSE | CMD_MD_AUTHEN_RESULT | CMD_MD_RSA_KEY_REQUEST | CMD_MD_AES_SEED | CMD_MD_ENCRYPT_READY) {
+        // Admission alone does not imply CONTENT_ENCRYPTION. A plaintext round
+        // still cannot accept a challenge proof or acquire an AES seed.
+        if plain && is_authentication_command(kind) {
             return Err("encrypted handshake message in SystemPlain30".into());
         }
         match kind {
+            CMD_MD_AUTHEN_RESULT if plain => {
+                if !self.matched || self.info.is_none() || first_int(body,1)!=Some(1) {
+                    return Err("plaintext admission rejected/out of order".into());
+                }
+                self.admitted=true;
+                out.push((CMD_HU_MD_AUTH_RESULT_ACK,vec![]));
+            }
             CMD_VERSION_MATCH_STATUS if plain => {
                 if first_int(body, 1) != Some(1) { return Err("protocol version rejected".into()); }
                 if !self.matched { out.push((CMD_HU_STATISTIC_INFO, proto_statistic_payload())); }
@@ -385,28 +494,17 @@ impl Session {
                 self.features_requested = true;
             }
             CMD_MD_RSA_KEY_REQUEST => {
-                if !self.features_sent || self.rsa.is_some() { return Err("RSA request out of order".into()); }
-                #[cfg(test)]
-                let keygen_started = {
-                    log::info!(target: "carwith_probe", "RSA-2048 keygen begin");
-                    std::time::Instant::now()
+                let Some(CommandCrypto::PublicKey { key, encoded }) = crypto else {
+                    return Err("RSA key result missing".into());
                 };
-                let key = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).map_err(|e| e.to_string())?;
-                #[cfg(test)]
-                log::info!(target: "carwith_probe", "RSA-2048 keygen done duration_us={}", keygen_started.elapsed().as_micros());
-                let der = key.to_public_key().to_public_key_der().map_err(|e| e.to_string())?;
-                let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, der.as_bytes());
                 let mut payload = Vec::new(); proto::string(&mut payload, 1, &encoded);
                 self.rsa = Some(key);
                 out.push((CMD_HU_RSA_PUBLIC_KEY, payload));
             }
             CMD_MD_AES_SEED => {
-                if self.seed.is_some() { return Err("duplicate seed".into()); }
-                let key = self.rsa.as_ref().ok_or("seed before RSA")?;
-                let encoded = pb_first_string(body, 1).ok_or("missing seed")?;
-                let encrypted = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded).map_err(|e| e.to_string())?;
-                let seed = key.decrypt(rsa::Pkcs1v15Encrypt, &encrypted).map_err(|e| e.to_string())?;
-                if !matches!(seed.len(), 16 | 24 | 32) { return Err("invalid AES seed length".into()); }
+                let Some(CommandCrypto::Seed(seed)) = crypto else {
+                    return Err("AES seed result missing".into());
+                };
                 self.seed = Some(seed);
                 out.push((CMD_HU_AES_ACK, vec![]));
             }
@@ -593,6 +691,19 @@ async fn write_system_voice(wr:&mut tokio::net::tcp::OwnedWriteHalf, state:&Shar
     Ok(())
 }
 
+/// A stream of foreground/keepalive messages must not keep an automatic probe
+/// half-open forever. Authentication allows the longer budget, never plaintext.
+pub(super) async fn handshake_deadline(progress: &Progress) {
+    let start = tokio::time::Instant::now();
+    tokio::time::sleep_until(start + Duration::from_secs(8)).await;
+    let stage = progress.evidence();
+    if stage.started {return std::future::pending().await;}
+    if stage.authentication {
+        tokio::time::sleep_until(start + Duration::from_secs(30)).await;
+        if progress.evidence().started {return std::future::pending().await;}
+    }
+}
+
 pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLifeEvent>,
     size: Arc<Mutex<(u32,u32)>>, requested: DisplayRequest, cfg: CarLifeConfig, state: Shared, reset_request: Arc<Notify>, can_reopen_display: bool) -> Result<(),String> {
     let (mut rd, mut wr) = stream.into_split();
@@ -609,6 +720,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
     let mut rx_log = super::log_sampling::CommandRx::default();
     let reconfigure_request=state.lock().reconfigure_request.clone();
     let voice_request = state.lock().voice_request.clone();
+    let protocol_progress = state.lock().protocol_progress.clone();
     let mut next_gps = tokio::time::Instant::now();
     let mut gps_sent = 0_u64;
     loop {
@@ -669,7 +781,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
                 let actions = {
                     let mut session = state.lock();
                     session.declared_display = (display.size.0 >= 2 && display.size.1 >= 2).then_some(display.size);
-                    session.receive(u32::MAX, &[], &timer_cfg)?
+                    session.receive_prepared(u32::MAX, &[], &timer_cfg, None)?
                 };
                 for (id, body) in actions {
                     let wire = state.lock().encrypt(&body)?;
@@ -718,23 +830,39 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
         let n=read.map_err(|e|e.to_string())?;
         if n==0 { return Err("CarWith command EOF".into()); }
         buf.extend_from_slice(&chunk[..n]);
+        observe_buffered_authentication(&protocol_progress, &buf);
         while let Some((kind, payload, consumed)) = read_cmd_frame(&buf) {
             // Production RX diagnostics below run after processing, which can include key generation.
             #[cfg(test)]
             log::info!(target: "carwith_probe", "CMD RX complete id=0x{kind:x} wire_bytes={consumed}");
             buf.drain(..consumed);
-            let payload=state.lock().decrypt(&payload)?;
+            let (payload, crypto_work) = {
+                let session = state.lock();
+                let decoded = session.decrypt(&payload)?;
+                session.observe_command(kind, &decoded);
+                let work = session.crypto_work(kind, &decoded);
+                (decoded, work)
+            };
             let display=*requested.borrow();
             let (w, h) = display.size;
             let declared = (w >= 2 && h >= 2).then_some((w, h));
             let mut cfg_copy=cfg.clone();
             cfg_copy.fps = display.effective_fps(cfg.fps);
-            let session=state.clone(); let decoded=payload.clone();
-            let actions=tokio::task::spawn_blocking(move || {
-                let mut session = session.lock();
+            let actions = async {
+                let crypto = if let Some(work) = crypto_work? {
+                    let mut worker = tokio::task::JoinSet::new();
+                    worker.spawn_blocking(move || work.execute());
+                    Some(worker.join_next().await.expect("one crypto job").map_err(|error| error.to_string())??)
+                } else {
+                    None
+                };
+                let mut session = state.lock();
                 session.declared_display = declared;
-                session.receive(kind,&decoded,&cfg_copy)
-            }).await.map_err(|e|e.to_string())??;
+                session.receive_prepared(kind, &payload, &cfg_copy, crypto)
+            }.await.map_err(|error| {
+                emit_log(&format!("CARLIFE-PROTOCOL: RX rejected id=0x{kind:x} bytes={} mode={:?}: {error}",payload.len(),cfg.dialect));
+                error
+            })?;
             let status={let s=state.lock(); (s.proof_ok,s.admitted,s.ready)};
             if matches!(kind, super::navigation::NEXT_TURN | super::navigation::ASSISTANT) {
                 let trace=navigation_diagnostics.observe("CMD",kind,consumed-8,Some(payload.len()));
@@ -764,6 +892,8 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
                     emit_log(&format!("CARWITH-SIZE: receiver={width}x{height} request={}x{} cap=2560x2560 requested_fps={} effective_fps={}",first_int(&body,1).unwrap_or(0),first_int(&body,2).unwrap_or(0),cfg.fps,first_int(&body,3).unwrap_or(0)));
                 }
                 if id==CMD_VIDEO_ENCODER_START {
+                    protocol_progress.started.store(true, Ordering::Relaxed);
+                    state.lock().video_start_written.notify_one();
                     emit_log("CARWITH-NAV: authenticated CMD/DATA monitoring 0x10030; dashboard card alone does not confirm HUD output");
                     let _=events.send(CarLifeEvent::Handshake);
                     emit_state("carlife_active", if cfg.dialect == CarLifeDialect::SystemPlain30 { "System CarLife 3.0 plaintext video START sent" } else { "CarWith proof/admission/encryption complete; video START sent" });
@@ -995,11 +1125,11 @@ mod tests {
 
     #[test]
     fn console_keys_use_only_the_active_source_and_never_seek_tracks() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let queue=Arc::new(Mutex::new(Vec::new()));
         let hub = CarLifeHub {
             system_voice: None,
             stop: Arc::new(DialStop::default()),
-            touch_tx: tx,
+            input_queue: queue.clone(),
             encoder_size: Arc::new(Mutex::new((1920, 720))),
             keyframe_request: Arc::new(Notify::new()),
         };
@@ -1013,26 +1143,26 @@ mod tests {
             assert_eq!(local_keys.pop(), Some(key));
             crate::engine::route_display_key(Some(&hub), key, |k| local_keys.push(k));
             assert!(local_keys.is_empty(), "CarWith console key leaked to the local display");
-            let packet = rx.try_recv().expect("CarWith CTRL packet");
+            let packet = queue.lock().remove(0);
             assert!(packet.expires.is_some());
             assert_eq!(packet.bytes, [0, 2, 0, 0, 0, 6, 128, 8, 8, wire_code]);
         }
         crate::engine::route_display_key(Some(&hub), 0xb5, |k| local_keys.push(k));
         assert_eq!(local_keys, [0xb5]);
-        assert!(rx.try_recv().is_err());
+        assert!(queue.lock().is_empty());
     }
 
     #[tokio::test]
     async fn voice_start_uses_ctrl_protobuf_and_has_an_expiry() {
-        let (tx,mut rx)=mpsc::unbounded_channel();
-        let hub=CarLifeHub{system_voice:None,stop:Arc::new(DialStop::default()),touch_tx:tx,
+        let queue=Arc::new(Mutex::new(Vec::new()));
+        let hub=CarLifeHub{system_voice:None,stop:Arc::new(DialStop::default()),input_queue:queue.clone(),
             encoder_size:Arc::new(Mutex::new((1920,720))),keyframe_request:Arc::new(Notify::new())};
         {
             assert!(hub.system_voice_epoch().is_none());
             assert!(!hub.system_voice_key(0x22));
             let expected=33;
             hub.voice_start();
-            let packet=rx.recv().await.unwrap();
+            let packet=queue.lock().remove(0);
             assert!(packet.expires.unwrap()>std::time::Instant::now());
             let (kind,body,_)=read_cmd_frame(&packet.bytes).unwrap();
             assert_eq!(kind,0x68008);assert_eq!(first_int(&body,1),Some(expected));

@@ -2,7 +2,7 @@ package io.github.hypercar.session
 
 import io.github.hypercar.net.CarNetworkReuse
 
-/** Source decisions use the attempt's snapshot; the two CarLife engines are distinct. */
+/** Entry lifecycle uses the attempt snapshot; wire protocol is negotiated separately in Rust. */
 internal object CarLifeSourcePolicy {
     fun isGateway(source: String) = source == "carwith" || source == "system_carlife"
     fun shouldReopen(source: String, startup: Boolean) =

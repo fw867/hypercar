@@ -5127,11 +5127,19 @@ object HyperCarRepo {
                 if (!current()) return@launch
                 val version = runCatching {
                     val pkg=if (sessionSystemCarLife) StartupRequirements.systemCarLifePackage(context) else StartupRequirements.CARWITH_PACKAGE
+                    if (sessionSystemCarLife) {
+                        val installed=StartupRequirements.SYSTEM_CARLIFE_PACKAGES.mapNotNull { candidate ->
+                            runCatching { context.packageManager.getPackageInfo(candidate,0).let { info ->
+                                "$candidate=${info.versionName}/${info.longVersionCode}"
+                            } }.getOrNull()
+                        }.joinToString(",").ifBlank { "unknown" }
+                        log("CARLIFE-ENGINES: entry_package=$pkg installed_packages=[$installed]; package version is not negotiated protocol; see CARLIFE-PROTOCOL")
+                    }
                     pkg?.let { context.packageManager.getPackageInfo(it, 0).let { info -> "${info.versionName}/${info.longVersionCode}" } } ?: "unknown"
                 }.getOrDefault("unknown")
                 log("CARWITH-START: attempt=$diagnosticId version=$version $result")
                 kotlinx.coroutines.delay(6_000)
-                if (current() && !sessionSystemCarLife) CarWithStartupDiagnostics.collect(launchTime) { evidence ->
+                if (current()) CarWithStartupDiagnostics.collect(launchTime) { evidence ->
                     if (current()) log("CARWITH-START: attempt=$diagnosticId $evidence")
                 }
             } catch (cancelled: CancellationException) {

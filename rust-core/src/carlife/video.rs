@@ -10,6 +10,25 @@ pub(super) struct AccessUnit {
     pub codec: VideoCodec,
 }
 
+/// A picture that can start the screen sender after a source reset.
+pub(super) fn is_configured_sync(codec: VideoCodec, data: &[u8]) -> bool {
+    let nals = crate::screen::annexb_nals(data);
+    match codec {
+        VideoCodec::H264 => {
+            let find = |kind| nals.iter().copied().find(|nal| nal[0] & 31 == kind);
+            let (Some(sps), Some(pps), Some(_)) = (find(7), find(8), find(5)) else { return false; };
+            sps.len() >= 4 && sps.len() <= u16::MAX as usize &&
+                pps.len() >= 2 && pps.len() <= u16::MAX as usize
+        }
+        VideoCodec::Hevc => {
+            let find = |kind| nals.iter().copied().find(|nal| crate::hevc::nal_type(nal) == Some(kind));
+            let (Some(vps), Some(sps), Some(pps)) = (find(32), find(33), find(34)) else { return false; };
+            nals.iter().any(|nal| matches!(crate::hevc::nal_type(nal), Some(19..=21))) &&
+                crate::hevc::build_config(vps, sps, pps).is_some()
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct VideoParser {
     buffer: Vec<u8>,

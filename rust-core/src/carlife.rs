@@ -1,11 +1,13 @@
 //! Local CarWith/CarLife transport. Xiaomi requires seven owned channels and an
-//! authenticated CONTENT_ENCRYPTION handshake. System CarLife uses public 3.0
-//! with CMD ownership and independently reconnecting plaintext channel supervisors.
+//! authenticated CONTENT_ENCRYPTION handshake. System CarLife probes this flow
+//! and public 3.0 in isolated rounds; package versions never determine encryption.
 //! CMD/CTRL/DATA use 8-byte headers; VIDEO/MEDIA/TTS/VR use 12-byte headers.
 //! CarWith DATA is port 9440. Do not mix generic CarLife assumptions with this path.
 
 pub(crate) mod navigation;
 mod session;
+mod protocol_selection;
+use protocol_selection::RoundEnd;
 pub(crate) mod vehicle_gps;
 mod log_sampling;
 mod video;
@@ -21,7 +23,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 
 use crate::engine::CarLifeEvent;
 use crate::emit_log;
@@ -65,7 +67,7 @@ const CMD_MD_AUTHEN_RESULT: u32 = 0x0001_004B;
 const CMD_MD_FEATURE_CONFIG_REQUEST: u32 = 0x0001_0051;
 const CMD_HU_FEATURE_CONFIG_RESPONSE: u32 = 0x0001_8052;
 const CMD_MD_EXIT: u32 = 0x0001_0059;
-// ---- CONTENT_ENCRYPTION（CarWith 需要；公版 CarLife 没有这几步）----
+// ---- CONTENT_ENCRYPTION（协商能力，不由 Android 包名/版本决定）----
 const CMD_MD_RSA_KEY_REQUEST: u32 = 0x0001_006A;
 const CMD_MD_AES_SEED: u32 = 0x0001_006C;
 const CMD_MD_ENCRYPT_READY: u32 = 0x0001_006E;
@@ -145,6 +147,8 @@ pub enum CarLifeDialect {
     #[default]
     CarWithEncrypted41,
     SystemPlain30,
+    /// Automatic selection is resolved to a concrete dialect before a round starts.
+    SystemAuto,
 }
 
 #[derive(Clone)]
@@ -256,7 +260,7 @@ static LAST_DIALER: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None
 
 pub struct CarLifeHub {
     stop: Arc<DialStop>,
-    touch_tx: mpsc::UnboundedSender<QueuedControl>,
+    input_queue: Arc<Mutex<Vec<QueuedControl>>>,
     system_voice: Option<Arc<session::SystemVoiceTarget>>,
     /// 当前编码分辨率共享单元（与 AirPlay 协商/触摸换算共用）。
     encoder_size: Arc<Mutex<(u32, u32)>>,
@@ -284,40 +288,36 @@ impl CarLifeHub {
         cfg: CarLifeConfig, md_host: String, ports: [u16; 7], stop: Arc<DialStop>, requested: Option<DisplayRequest>,
         reopen_source: impl Fn(bool) + Send + 'static,
     ) -> Result<(Self, mpsc::UnboundedReceiver<CarLifeEvent>), String> {
-        let system_voice = (cfg.dialect == CarLifeDialect::SystemPlain30).then(|| Arc::new(session::SystemVoiceTarget::default()));
+        let system_voice = (cfg.dialect != CarLifeDialect::CarWithEncrypted41).then(|| Arc::new(session::SystemVoiceTarget::default()));
         let voice_target = system_voice.clone();
         let keyframe_request = Arc::new(Notify::new());
         let reset_request = keyframe_request.clone();
         let (events, event_rx) = mpsc::unbounded_channel();
-        let (touch_tx, mut touch_rx) = mpsc::unbounded_channel::<QueuedControl>();
         let encoder_size = Arc::new(Mutex::new((cfg.width.max(2),cfg.height.max(2))));
         let requested = requested.unwrap_or_else(|| DisplayRequest::new(ReceiverDisplay::default()));
         let queue = Arc::new(Mutex::new(Vec::<QueuedControl>::new()));
-        let queue_fill=queue.clone(); let stop_fill=stop.clone();
-        tokio::spawn(async move {
-            loop { tokio::select! {
-                _=stop_fill.cancelled()=>return,
-                value=touch_rx.recv()=>match value {
-                    Some(value)=>{ let mut q=queue_fill.lock(); if q.len()>=256 {q.remove(0);} q.push(value); }
-                    None=>return,
-                }
-            }}
-        });
+        // One synchronous bounded queue: a round retirement clears every accepted
+        // input under the same lock, with no unconsumed forwarding-channel backlog.
+        let input_queue=queue.clone();
         let events_task=events.clone(); let size=encoder_size.clone(); let config=cfg.clone();
         let hub_stop = stop.clone();
         let mut last_dialer = LAST_DIALER.lock();
         let previous = last_dialer.take();
         *last_dialer = Some(tokio::spawn(async move {
             if let Some(previous) = previous { let _ = previous.await; }
+            let automatic=config.dialect==CarLifeDialect::SystemAuto;
+            let mut selection=protocol_selection::Selection::new(config.dialect);
+            let mut config=config;
             let mut throttle=DialLogThrottle::new();
             let mut startup_refusals = 0;
             let mut first_round_pending = true;
             let mut can_reopen_display = true;
             loop {
+                config.dialect=selection.current();
                 // Own all seven sockets together. A failed/closed CMD invalidates the whole round.
                 let mut sockets=Vec::new();
                 for (index, port) in ports.into_iter().enumerate() {
-                    if config.dialect == CarLifeDialect::SystemPlain30 && index > 0 { break; }
+                    if (automatic || config.dialect == CarLifeDialect::SystemPlain30) && index > 0 { break; }
                     let Some(result) = stop.dial(&md_host, port).await else { return; };
                     match result {
                         Ok(socket) => {
@@ -344,17 +344,26 @@ impl CarLifeHub {
                         }
                     }
                 }
-                if sockets.len()!=if config.dialect == CarLifeDialect::SystemPlain30 { 1 } else { ports.len() } {
+                if sockets.len()!=if automatic || config.dialect == CarLifeDialect::SystemPlain30 { 1 } else { ports.len() } {
                     drop(sockets);
                     tokio::select! { biased; _=stop.cancelled()=>return, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
                     continue;
                 }
                 if stop.is_retired() { return; }
                 first_round_pending = false;
-                emit_log(if config.dialect == CarLifeDialect::SystemPlain30 { "CARLIFE-HS: CMD connected; start public 3.0 handshake and owned channel supervisors" } else { "CARWITH-HS: all seven channels connected; start fresh 4.1 handshake" });
+                emit_log(if config.dialect == CarLifeDialect::SystemPlain30 { "CARLIFE-HS: CMD connected; start public 3.0 handshake and owned channel supervisors" } else if automatic {"CARLIFE-HS: CMD connected; probe 4.1 handshake with owned channel supervisors"} else { "CARWITH-HS: all seven channels connected; start fresh 4.1 handshake" });
+                emit_log(&format!("CARLIFE-PROTOCOL: mode={:?} automatic={automatic}; package version is not protocol version",config.dialect));
                 queue.lock().clear();
                 let _ = events_task.send(CarLifeEvent::SourceReset { cache_cleared: None });
-                let state=session::Shared::new(Mutex::new(session::Session::new(config.dialect)));
+                let mut round = session::Session::new(config.dialect);
+                let video_sync_received = if automatic {
+                    let (ready, observed) = watch::channel(false);
+                    round.video_sync_received = Some(ready);
+                    Some(observed)
+                } else { None };
+                let protocol_progress = round.protocol_progress.clone();
+                let video_start_written = round.video_start_written.clone();
+                let state = session::Shared::new(Mutex::new(round));
                 if let Some(target) = &voice_target { target.bind(&state); }
                 // Keep a probe RESET permit local to these seven sockets if this round terminates.
                 #[cfg(test)]
@@ -364,10 +373,9 @@ impl CarLifeHub {
                 let mut sockets=sockets.into_iter();
                 let cmd=sockets.next().unwrap();
                 let mut children=tokio::task::JoinSet::new();
-                if config.dialect == CarLifeDialect::SystemPlain30 {
-                    // CarPToCarL starts from CMD alone. Every other lane is attempted and
-                    // retained by one supervisor; unavailable/closed lanes reconnect without
-                    // interrupting CMD or consuming the handshake's ACK deadline.
+                if automatic || config.dialect == CarLifeDialect::SystemPlain30 {
+                    // Attempt the secondary lanes without making their availability a
+                    // precondition for CMD. Plaintext lanes also reconnect independently.
                     let initial_barrier=Arc::new(tokio::sync::Barrier::new(7));
                     for (index, lane) in [SystemLane::Video, SystemLane::Media, SystemLane::Tts,
                         SystemLane::Vr, SystemLane::Ctrl, SystemLane::Data].into_iter().enumerate() {
@@ -396,17 +404,35 @@ impl CarLifeHub {
                 children.spawn(async move { session::control(ctrl,q,cipher,stop_ctrl).await; });
                 children.spawn(session::data(sockets.next().unwrap(),state.clone(),events_task.clone()));
                 }
-                let outcome=tokio::select! {
+                let (outcome, cause) = tokio::select! {
                     biased;
                     _=stop.cancelled()=>{children.shutdown().await; return;},
-                    _=children.join_next()=>Err("CarWith media/control channel closed".into()),
-                    result=session::run(cmd,events_task.clone(),size.clone(),requested.clone(),config.clone(),state.clone(),reset_request.clone(),can_reopen_display)=>result,
+                    result=session::run(cmd,events_task.clone(),size.clone(),requested.clone(),config.clone(),state.clone(),reset_request.clone(),can_reopen_display && !automatic)=>(result, RoundEnd::Command),
+                    _=children.join_next()=>(Err("CarWith media/control channel closed".into()), RoundEnd::Transport),
+                    _=video_start_deadline(video_start_written, video_sync_received.clone()) =>
+                        (Err("VIDEO missing a sync picture after START".into()), RoundEnd::VideoStartup),
+                    _=session::handshake_deadline(&protocol_progress), if automatic =>
+                        (Err("automatic CarLife handshake deadline; no complete source handshake".into()), RoundEnd::Command),
                 };
                 if let Some(target) = &voice_target { target.clear(); }
                 children.abort_all(); while children.join_next().await.is_some() {}
                 queue.lock().clear();
                 if let Some(mic) = config.microphone.as_ref() { mic.request(false); }
                 let _ = events_task.send(CarLifeEvent::Navigation(None));
+                if stop.is_retired() {return;}
+                let mut evidence = protocol_progress.evidence();
+                evidence.video_sync = video_sync_received.as_ref().is_some_and(|ready| *ready.borrow());
+                if evidence.started {
+                    emit_log(&format!("CARLIFE-PROTOCOL: START sent mode={:?} authentication={} video_sync={}",config.dialect,evidence.authentication,evidence.video_sync));
+                }
+                if automatic {
+                    // Every owned lane has stopped. Invalidate formats and replay
+                    // state before waiting for a new CMD, even in the same mode.
+                    let _=events_task.send(CarLifeEvent::SourceReset {cache_cleared:None});
+                }
+                if selection.round_ended(evidence, cause) {
+                    emit_log(&format!("CARLIFE-PROTOCOL: previous mode={:?}; next fresh round={:?}; old children and queued input retired",config.dialect,selection.current()));
+                }
                 if outcome.is_ok() {
                     // All producers for the old round have exited. Flush their queued events
                     // and the replay cache before letting a reattached engine see the waiting period.
@@ -419,7 +445,7 @@ impl CarLifeHub {
                 tokio::select! { biased; _=stop.cancelled()=>return, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
             }
         }));
-        Ok((Self {stop:hub_stop,touch_tx,system_voice,encoder_size,keyframe_request},event_rx))
+        Ok((Self {stop:hub_stop,input_queue,system_voice,encoder_size,keyframe_request},event_rx))
     }
 
     pub fn request_keyframe(&self) {
@@ -434,7 +460,7 @@ impl CarLifeHub {
 
     pub(crate) fn inject_touch_report(&self, report: &crate::airplay::TouchInput) {
         let size = *self.encoder_size.lock();
-        let _ = self.touch_tx.send(QueuedControl {
+        let _ = self.enqueue_control(QueuedControl {
             bytes: Vec::new(), expires: None, touch: Some(QueuedTouch::Report(report.clone(), size)),
         });
     }
@@ -442,17 +468,24 @@ impl CarLifeHub {
     /// A media subscriber can disappear while a finger is down; the source survives it.
     pub fn release_touch(&self) {
         let expires = Some(std::time::Instant::now() + Duration::from_secs(1));
-        let _ = self.touch_tx.send(QueuedControl { bytes: Vec::new(), expires, touch: Some(QueuedTouch::Release) });
+        let _ = self.enqueue_control(QueuedControl { bytes: Vec::new(), expires, touch: Some(QueuedTouch::Release) });
     }
 
     fn queue_hard_key(&self, code: u64, lifetime: Duration) -> bool {
         let mut body = Vec::new();
         proto::varint(&mut body, 1, code);
-        self.touch_tx.send(QueuedControl {
+        self.enqueue_control(QueuedControl {
             bytes: build_cmd_frame(CTRL_CAR_HARD_KEY_CODE, &body),
             expires: Some(std::time::Instant::now() + lifetime),
             touch: None,
-        }).is_ok()
+        })
+    }
+    fn enqueue_control(&self, value:QueuedControl) -> bool {
+        let mut queue=self.input_queue.lock();
+        if self.stop.is_retired() {return false;}
+        if queue.len()>=256 {queue.remove(0);}
+        queue.push(value);
+        true
     }
 
     pub fn system_voice_epoch(&self) -> Option<u64> {
@@ -476,7 +509,7 @@ impl CarLifeHub {
     }
 
     pub fn voice_start(&self) {
-        if self.system_voice.is_some() { let _ = self.system_voice_key(0x21); return; }
+        if self.system_voice_epoch().is_some() { let _ = self.system_voice_key(0x21); return; }
         let queued = self.queue_hard_key(0x21, Duration::from_secs(2));
         emit_log(&format!("VOICE-KEY: CarWith key=0x21 queued={queued} (not recognition confirmation)"));
     }
@@ -512,9 +545,20 @@ impl Drop for CarLifeHub {
 #[derive(Clone, Copy)]
 enum SystemLane { Video, Media, Tts, Vr, Ctrl, Data }
 
+async fn video_start_deadline(start_written: Arc<Notify>, sync_received: Option<watch::Receiver<bool>>) {
+    let Some(mut sync_received) = sync_received else { return std::future::pending().await; };
+    start_written.notified().await;
+    let ready = matches!(tokio::time::timeout(Duration::from_secs(8), sync_received.wait_for(|ready| *ready)).await, Ok(Ok(_)));
+    if ready {
+        // Once video starts, plaintext lane recovery remains independent.
+        std::future::pending::<()>().await;
+    }
+}
+
 async fn supervise_system_lane(host:String, port:u16, lane:SystemLane, cfg:CarLifeConfig,
     state:session::Shared, events:mpsc::UnboundedSender<CarLifeEvent>,
     queue:Arc<Mutex<Vec<QueuedControl>>>, stop:Arc<DialStop>, initial_barrier:Arc<tokio::sync::Barrier>) {
+    let progress = state.lock().protocol_progress.clone();
     let mut first_attempt=true;
     loop {
         if stop.is_retired() { return; }
@@ -553,6 +597,12 @@ async fn supervise_system_lane(host:String, port:u16, lane:SystemLane, cfg:CarLi
                 }
                 SystemLane::Media | SystemLane::Tts => { let _=events.send(CarLifeEvent::AudioStop{tts:matches!(lane,SystemLane::Tts)}); }
                 _=>{}
+            }
+            // Before authentication, a secondary socket can be reopened without
+            // losing the CMD probe. After authentication, retire the whole round.
+            if cfg.dialect == CarLifeDialect::CarWithEncrypted41 &&
+                progress.evidence().authentication {
+                return;
             }
         }
         tokio::select! { biased; _=stop.cancelled()=>return, _=tokio::time::sleep(Duration::from_millis(250))=>{} }
@@ -604,6 +654,11 @@ fn build_cmd_frame(service_type: u32, payload: &[u8]) -> Vec<u8> {
 
 /// 从缓冲切一条 CMD/CTRL 帧：返回 (service_type, payload, 消费字节数)。
 fn read_cmd_frame(buf: &[u8]) -> Option<(u32, Vec<u8>, usize)> {
+    let (kind, payload, consumed) = cmd_frame_parts(buf)?;
+    Some((kind, payload.to_vec(), consumed))
+}
+
+fn cmd_frame_parts(buf: &[u8]) -> Option<(u32, &[u8], usize)> {
     if buf.len() < 8 {
         return None;
     }
@@ -613,7 +668,7 @@ fn read_cmd_frame(buf: &[u8]) -> Option<(u32, Vec<u8>, usize)> {
     if buf.len() < total {
         return None;
     }
-    Some((service_type, buf[8..total].to_vec(), total))
+    Some((service_type, &buf[8..total], total))
 }
 
 /// 媒体帧（12 字节头）：`[u32 BE len][u32 BE timestamp][u32 BE type][payload]`。CarWith VIDEO 时间为 Unix 秒。
@@ -794,6 +849,12 @@ async fn handle_media_client(
 ) {
     let (mut rd, mut wr) = stream.into_split();
     let is_video = matches!(kind, MediaKind::Video);
+    let mut first_sync = if is_video {
+        encryption.as_ref().and_then(|state| state.lock().video_sync_received.clone())
+            .filter(|ready| !*ready.borrow())
+    } else {
+        None
+    };
     let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
     let mut chunk = [0u8; 65536];
     let mut rate: u32 = 44_100;   // CarLife 音乐默认 44100Hz（实测 43~44 块/秒 × 4096B）
@@ -956,9 +1017,13 @@ async fn handle_media_client(
                                             emit_log(&format!("CARWITH-VIDEO: AU#{access_units} codec={} bytes={} nals={types:?} sourceUnixSeconds={ts_ms}; AirPlay PTS=monotonic",codec.as_str(),data.len()));
                                         }
                                     }
+                                    let first_picture = first_sync.is_some() && video::is_configured_sync(codec, &data);
                                     let _ = events.send(CarLifeEvent::VideoFrameTagged {
                                         pts_us: crate::timing::monotonic_nanos() / 1000, data, codec,
                                     });
+                                    if first_picture {
+                                        if let Some(ready) = first_sync.take() { ready.send_replace(true); }
+                                    }
                                 }
                             } else {
                                 let _ = events.send(CarLifeEvent::VideoFrame {
@@ -1133,13 +1198,34 @@ mod input_lease_tests {
     use tokio::net::TcpListener;
     use crate::airplay::{TouchGrant, TouchInput};
 
-    fn hub() -> (Arc<CarLifeHub>, mpsc::UnboundedReceiver<QueuedControl>) {
-        let (touch_tx, rx) = mpsc::unbounded_channel();
+    struct Pending(Arc<Mutex<Vec<QueuedControl>>>);
+    impl Pending {
+        fn try_recv(&mut self) -> Result<QueuedControl,()> {
+            let mut queue=self.0.lock();
+            if queue.is_empty() {Err(())}else{Ok(queue.remove(0))}
+        }
+    }
+    fn hub() -> (Arc<CarLifeHub>, Pending) {
+        let input_queue=Arc::new(Mutex::new(Vec::new()));
+        let pending=Pending(input_queue.clone());
         (Arc::new(CarLifeHub {
             system_voice: None,
-            stop: Arc::new(DialStop::default()), touch_tx, encoder_size: Arc::new(Mutex::new((1920, 720))),
+            stop: Arc::new(DialStop::default()), input_queue, encoder_size: Arc::new(Mutex::new((1920, 720))),
             keyframe_request: Arc::new(Notify::new()),
-        }), rx)
+        }), pending)
+    }
+    #[test]
+    fn round_retirement_clears_all_accepted_input_without_a_forwarding_backlog() {
+        let (hub,mut pending)=hub();
+        for _ in 0..300 {hub.inject_touch(TOUCH_DOWN,10,20);}
+        assert_eq!(hub.input_queue.lock().len(),256);
+        hub.input_queue.lock().clear();
+        assert!(pending.try_recv().is_err());
+        hub.voice_start();
+        assert_eq!(pending.try_recv().unwrap().bytes[4..8],CTRL_CAR_HARD_KEY_CODE.to_be_bytes());
+        hub.stop.cancel();
+        hub.inject_touch(TOUCH_DOWN,10,20);
+        assert!(pending.try_recv().is_err());
     }
 
     async fn read_ctrl(peer: &mut TcpStream, state: &session::Shared) -> (u32, Vec<u8>) {

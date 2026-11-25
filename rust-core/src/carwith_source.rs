@@ -127,7 +127,7 @@ pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
     let vehicle_gps = Arc::new(crate::carlife::vehicle_gps::PendingLocation::default());
     let system=cfg.system_carlife_source;
     let config=CarLifeConfig{
-        dialect:if system {crate::carlife::CarLifeDialect::SystemPlain30} else {crate::carlife::CarLifeDialect::CarWithEncrypted41},
+        dialect:if system {crate::carlife::CarLifeDialect::SystemAuto} else {crate::carlife::CarLifeDialect::CarWithEncrypted41},
         manufacturer:if system {cfg.hu_manufacturer.clone()} else {String::new()},
         model:if system {cfg.hu_model.clone()} else {String::new()},
         width:cfg.width,height:cfg.height,fps:cfg.carwith_fps(),

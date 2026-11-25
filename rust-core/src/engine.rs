@@ -323,7 +323,7 @@ pub async fn run_engine(
                     Some(crate::voice_key::RESET)=>{voice.reset();system_voice.reset();voice_epoch=None;},
                     Some(key)=>{
                         if let Some(action)=crate::voice_key::action(key) {
-                            if system_voice_enabled {
+                            if system_voice_enabled && input_hub.as_ref().and_then(|hub|hub.system_voice_epoch()).is_some() {
                                 let epoch=input_hub.as_ref().and_then(|hub|hub.system_voice_epoch());
                                 if epoch!=voice_epoch {system_voice.reset();voice_epoch=epoch;}
                                 if epoch.is_none() {continue;}
