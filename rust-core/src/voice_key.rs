@@ -1,4 +1,5 @@
 //! Internal key messages, not wire usages. Siri actions: prewarm=1, down=2, up=3.
+pub mod system;
 pub const HID_UP: u32 = 0x100cf;
 pub const RESET: u32 = 0x20000;
 pub fn message(action: i64) -> Option<u32> { match action {1..=3=>Some(0x20000+action as u32),_=>None} }

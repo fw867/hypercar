@@ -25,6 +25,15 @@ class StartupReadinessTest {
         assertFalse(carWith.copy(carWithInstalled = false, shizukuReady = true).manualReady)
     }
 
+    @Test fun systemCarLifeDoesNotRequireXiaomiPackageOrShizuku() {
+        val system=ready.copy(source="system_carlife",shizukuReady=false,carWithInstalled=false)
+        assertTrue(system.manualReady)
+        assertTrue(system.automaticReady)
+        assertFalse(system.copy(overlayAllowed=false).automaticReady)
+        assertFalse(system.copy(wifiEnabled=false).manualReady)
+        assertFalse(system.copy(missingPermissions=listOf("附近设备")).manualReady)
+    }
+
     @Test fun requiredPermissionRevocationBlocksBothEntries() {
         for (permission in listOf("附近设备", "通知", "定位")) {
             val blocked = ready.copy(missingPermissions = listOf(permission))

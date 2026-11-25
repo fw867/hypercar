@@ -306,6 +306,7 @@ object SettingsStore {
      *  · "car_ui"   —— 本 App 自绘车机首页（当前默认，地图卡 + 音乐卡 + Dock）
      *  · "carwith"  —— 走小米 CarWith：拉起它的 CarLife 入口，由 CarWith 自己建显示/编码，
      *                 我们只做 CarLife 通道 → AirPlay 的转发（需装 CarWith + 小米版 CarLife）
+     *  · "system_carlife" —— 手机 CarLife+（三星/荣耀等），用户开启无线连接后接入本地引擎
      */
     var carSource: String
         get() = p().getString("car_source", "car_ui") ?: "car_ui"
@@ -316,6 +317,8 @@ object SettingsStore {
 
     /** 是否 CarWith 模式。 */
     val carWithMode: Boolean get() = carSource == "carwith"
+    val systemCarLifeMode: Boolean get() = carSource == "system_carlife"
+    val carLifeMode: Boolean get() = io.github.hypercar.session.CarLifeSourcePolicy.isGateway(carSource)
 
     // The retired self-rendered speech experiment also gates incoming native callbacks.
     val carVoiceRecognition: Boolean get() = false
@@ -391,9 +394,10 @@ object SettingsStore {
         width: Int = videoWidth,
         height: Int = videoHeight,
         receiverBluetoothMac: String? = null,
-        carWithSource: Boolean = carWithMode,
+        carWithSource: Boolean = carLifeMode,
         receiverModel: String? = null,
         headUnitProfile: io.github.hypercar.headunit.HeadUnitProfile,
+        systemCarLifeSource: Boolean = systemCarLifeMode,
     ): String {
         fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
         // 触摸兜底空间：车机档案若给了 touchDisplay 就用它；否则用设置里的
@@ -426,6 +430,14 @@ object SettingsStore {
             }
             // CarWith 模式：视频/音频源改由本机 CarLife（CarWith）提供（2026-11-03）
             append("\"carlife_source\":").append(if (carWithSource) "true" else "false").append(",")
+            append("\"system_carlife_source\":").append(carWithSource && systemCarLifeSource).append(",")
+            if (carWithSource && systemCarLifeSource) {
+                io.github.hypercar.session.CarLifeSourcePolicy.huIdentity(receiverBluetoothMac,targetCarMac,targetCarName,pairedCars)?.let { hu ->
+                    append("\"hu_bt_address\":").append(org.json.JSONObject.quote(hu.address)).append(",")
+                    append("\"hu_bt_name\":").append(org.json.JSONObject.quote(hu.name)).append(",")
+                    append("\"hu_manufacturer\":\"HyperCar\",\"hu_model\":\"HyperCar HU\",")
+                }
+            }
             append("\"mbux_screen_bootstrap\":").append(profile.mbuxScreenBootstrap).append(",")
             append("\"id9_screen_bootstrap\":").append(profile.id9ScreenBootstrap).append(",")
             append("\"nbt_audio_first\":").append(profile.nbtAudioFirst).append(",")
@@ -437,11 +449,13 @@ object SettingsStore {
             append("\"touch_display_h\":").append(tdH).append(",")
             append("\"fps\":").append(plan.fps).append(",")
             append("\"enable_audio\":true,")
-            append("\"carwith_microphone\":").append(carWithSource).append(",")
+            // Public CarLife+ keeps its phone microphone, as in the reference.
+            // The existing Xiaomi car-microphone bridge remains unchanged.
+            append("\"carwith_microphone\":").append(carWithSource && !systemCarLifeSource).append(",")
             append("\"video_codec\":\"").append(VideoCodecPolicy.forHardware(videoCodec, VideoHardwareCapabilities.hevcEncoderAvailable)).append("\",")
             append("\"bmw_capabilities\":").append(profile.protocolProfileId.startsWith("bmw_")).append(",")
             append("\"audio_codec\":\"").append(audioCodec).append("\",")
-            append("\"self_microphone_asr\":").append(carVoiceRecognition && !carWithMode).append(",")
+            append("\"self_microphone_asr\":").append(carVoiceRecognition && !carWithSource).append(",")
             append("\"keep_alive_stats\":").append(keepAliveStats).append(",")
             append("\"request_receiver_stats\":").append(debugLogEnabled).append(",")
             append("\"bmw_box_bootstrap\":").append(io.github.hypercar.headunit.ReceiverCompatibility.useBmwBootstrap(

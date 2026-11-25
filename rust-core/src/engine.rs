@@ -107,6 +107,16 @@ pub struct EngineConfig {
     #[serde(default)]
     pub carlife_source: bool,
     #[serde(default)]
+    pub system_carlife_source: bool,
+    #[serde(default)]
+    pub hu_bt_address: String,
+    #[serde(default)]
+    pub hu_bt_name: String,
+    #[serde(default)]
+    pub hu_manufacturer: String,
+    #[serde(default)]
+    pub hu_model: String,
+    #[serde(default)]
     pub carwith_source_owner: u64,
     #[serde(default)]
     pub carwith_cached_canvas: bool,
@@ -287,19 +297,39 @@ pub async fn run_engine(
     let key_stop=stop.clone();
     let input_hub=carwith_hub.clone();
     let carwith_voice=cfg.carlife_source;
+    let system_voice_enabled=cfg.carlife_source && cfg.system_carlife_source;
     let voice_auxiliary_input=auxiliary_input.clone();
     tasks.spawn(async move {
         let mut voice=crate::voice_key::VoiceKey::default();
+        let mut system_voice=crate::voice_key::system::SystemVoiceKey::default();
+        let mut voice_epoch=None;
+        let system_clock=tokio::time::Instant::now();
+        let send_system_voice=|epoch:Option<u64>,keys:Vec<u64>| {
+            for key in keys {
+                let Some(epoch)=epoch else {return false};
+                let queued=input_hub.as_ref().is_some_and(|hub| hub.system_voice_key_for_epoch(epoch,key));
+                if !queued {return false;}
+                if key==0x21 {voice_auxiliary_input.mark_user_intent();}
+            }
+            true
+        };
         let clock=std::time::Instant::now();
         loop {
+            let deadline=system_voice.deadline().map(|at|system_clock+Duration::from_millis(at));
             tokio::select! {
                 biased;
                 _=key_stop.notified()=>return,
                 key=key_rx.recv()=>match key {
-                    Some(crate::voice_key::RESET)=>voice.reset(),
+                    Some(crate::voice_key::RESET)=>{voice.reset();system_voice.reset();voice_epoch=None;},
                     Some(key)=>{
                         if let Some(action)=crate::voice_key::action(key) {
-                            if voice.receive(action,clock.elapsed().as_millis() as u64) {
+                            if system_voice_enabled {
+                                let epoch=input_hub.as_ref().and_then(|hub|hub.system_voice_epoch());
+                                if epoch!=voice_epoch {system_voice.reset();voice_epoch=epoch;}
+                                if epoch.is_none() {continue;}
+                                let keys=system_voice.receive(action,system_clock.elapsed().as_millis() as u64);
+                                if !send_system_voice(epoch,keys) {system_voice.reset();}
+                            } else if voice.receive(action,clock.elapsed().as_millis() as u64) {
                                 crate::emit_log(&format!("VOICE-KEY: action=Start source={}",if voice_probe.is_some() {"car-microphone-probe"} else if carwith_voice {"CarWith"} else {"phone-assistant"}));
                                 if let Some(probe) = voice_probe.as_ref() {
                                     probe.toggle();
@@ -312,6 +342,12 @@ pub async fn run_engine(
                         }
                     },
                     None=>return,
+                },
+                _=async {tokio::time::sleep_until(deadline.unwrap()).await}, if deadline.is_some()=>{
+                    let epoch=input_hub.as_ref().and_then(|hub|hub.system_voice_epoch());
+                    if epoch!=voice_epoch {system_voice.reset();voice_epoch=epoch;continue;}
+                    let keys=system_voice.advance(system_clock.elapsed().as_millis() as u64);
+                    if !send_system_voice(epoch,keys) {system_voice.reset();}
                 }
             }
         }

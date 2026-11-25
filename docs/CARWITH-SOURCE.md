@@ -1,5 +1,7 @@
 # CarWith 画面与音频源
 
+本文描述小米 CarWith。新增的第三种来源见[系统 CarLife+](SYSTEM-CARLIFE-SOURCE.md)，不替换本文的 4.1 加密协议路径。
+
 更新：2026-11-07。可选源依赖已安装且启用的 com.miui.carlink；自绘 UI 使用另一套虚拟屏源。连接、AirPlay资源与输出泵共用，不能通过切来源绕过车机激活。
 
 ## 本机七通道

@@ -65,6 +65,11 @@
         </intent>
         <intent><action android:name="android.speech.RecognitionService" /></intent>
         <package android:name="com.miui.carlink" />
+        <package android:name="com.samsung.android.carlink" />
+        <package android:name="com.samsung.android.smartcarlink" />
+        <package android:name="com.baidu.carlife.samsung" />
+        <package android:name="com.baidu.carlife.honor" />
+        <package android:name="com.baidu.carlife" />
         <package android:name="com.miui.voiceassist" />
         <package android:name="moe.shizuku.privileged.api" />
         <package android:name="com.autonavi.minimap" />

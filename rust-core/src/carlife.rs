@@ -1,6 +1,6 @@
-//! Local CarWith/CarLife transport. The active Android source uses seven loopback
-//! channels, fresh per-round state and the authenticated CONTENT_ENCRYPTION
-//! handshake in session.rs. Retired generic listener/discovery paths have been removed.
+//! Local CarWith/CarLife transport. Xiaomi requires seven owned channels and an
+//! authenticated CONTENT_ENCRYPTION handshake. System CarLife uses public 3.0
+//! with CMD ownership and independently reconnecting plaintext channel supervisors.
 //! CMD/CTRL/DATA use 8-byte headers; VIDEO/MEDIA/TTS/VR use 12-byte headers.
 //! CarWith DATA is port 9440. Do not mix generic CarLife assumptions with this path.
 
@@ -140,8 +140,18 @@ pub const TOUCH_MOVE: u32 = 2;
     const PROTOCOL_MAJOR: u32 = 4;   // mcarplay 实测：CarWith 用 4.1
     const PROTOCOL_MINOR: u32 = 1;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CarLifeDialect {
+    #[default]
+    CarWithEncrypted41,
+    SystemPlain30,
+}
+
 #[derive(Clone)]
 pub struct CarLifeConfig {
+    pub dialect: CarLifeDialect,
+    pub manufacturer: String,
+    pub model: String,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -247,6 +257,7 @@ static LAST_DIALER: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None
 pub struct CarLifeHub {
     stop: Arc<DialStop>,
     touch_tx: mpsc::UnboundedSender<QueuedControl>,
+    system_voice: Option<Arc<session::SystemVoiceTarget>>,
     /// 当前编码分辨率共享单元（与 AirPlay 协商/触摸换算共用）。
     encoder_size: Arc<Mutex<(u32, u32)>>,
     keyframe_request: Arc<Notify>,
@@ -273,6 +284,8 @@ impl CarLifeHub {
         cfg: CarLifeConfig, md_host: String, ports: [u16; 7], stop: Arc<DialStop>, requested: Option<DisplayRequest>,
         reopen_source: impl Fn(bool) + Send + 'static,
     ) -> Result<(Self, mpsc::UnboundedReceiver<CarLifeEvent>), String> {
+        let system_voice = (cfg.dialect == CarLifeDialect::SystemPlain30).then(|| Arc::new(session::SystemVoiceTarget::default()));
+        let voice_target = system_voice.clone();
         let keyframe_request = Arc::new(Notify::new());
         let reset_request = keyframe_request.clone();
         let (events, event_rx) = mpsc::unbounded_channel();
@@ -303,7 +316,8 @@ impl CarLifeHub {
             loop {
                 // Own all seven sockets together. A failed/closed CMD invalidates the whole round.
                 let mut sockets=Vec::new();
-                for port in ports {
+                for (index, port) in ports.into_iter().enumerate() {
+                    if config.dialect == CarLifeDialect::SystemPlain30 && index > 0 { break; }
                     let Some(result) = stop.dial(&md_host, port).await else { return; };
                     match result {
                         Ok(socket) => {
@@ -330,17 +344,18 @@ impl CarLifeHub {
                         }
                     }
                 }
-                if sockets.len()!=ports.len() {
+                if sockets.len()!=if config.dialect == CarLifeDialect::SystemPlain30 { 1 } else { ports.len() } {
                     drop(sockets);
                     tokio::select! { biased; _=stop.cancelled()=>return, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
                     continue;
                 }
                 if stop.is_retired() { return; }
                 first_round_pending = false;
-                emit_log("CARWITH-HS: all seven channels connected; start fresh 4.1 handshake");
+                emit_log(if config.dialect == CarLifeDialect::SystemPlain30 { "CARLIFE-HS: CMD connected; start public 3.0 handshake and owned channel supervisors" } else { "CARWITH-HS: all seven channels connected; start fresh 4.1 handshake" });
                 queue.lock().clear();
                 let _ = events_task.send(CarLifeEvent::SourceReset { cache_cleared: None });
-                let state=session::Shared::new(Mutex::new(session::Session::default()));
+                let state=session::Shared::new(Mutex::new(session::Session::new(config.dialect)));
+                if let Some(target) = &voice_target { target.bind(&state); }
                 // Keep a probe RESET permit local to these seven sockets if this round terminates.
                 #[cfg(test)]
                 let reset_request = if std::env::var_os("HC_PROBE_VIDEO_RECOVERY").is_some() {
@@ -349,6 +364,22 @@ impl CarLifeHub {
                 let mut sockets=sockets.into_iter();
                 let cmd=sockets.next().unwrap();
                 let mut children=tokio::task::JoinSet::new();
+                if config.dialect == CarLifeDialect::SystemPlain30 {
+                    // CarPToCarL starts from CMD alone. Every other lane is attempted and
+                    // retained by one supervisor; unavailable/closed lanes reconnect without
+                    // interrupting CMD or consuming the handshake's ACK deadline.
+                    let initial_barrier=Arc::new(tokio::sync::Barrier::new(7));
+                    for (index, lane) in [SystemLane::Video, SystemLane::Media, SystemLane::Tts,
+                        SystemLane::Vr, SystemLane::Ctrl, SystemLane::Data].into_iter().enumerate() {
+                        children.spawn(supervise_system_lane(md_host.clone(), ports[index+1], lane,
+                            config.clone(), state.clone(), events_task.clone(), queue.clone(), stop.clone(),initial_barrier.clone()));
+                    }
+                    tokio::select! {
+                        biased;
+                        _=stop.cancelled()=>{children.shutdown().await;return;},
+                        _=initial_barrier.wait()=>{}
+                    }
+                } else {
                 for (stream,kind,label) in [
                     (sockets.next().unwrap(),MediaKind::Video,"VIDEO"),
                     (sockets.next().unwrap(),MediaKind::Media,"MEDIA"),
@@ -364,12 +395,14 @@ impl CarLifeHub {
                 let ctrl=sockets.next().unwrap(); let q=queue.clone(); let cipher=state.clone(); let stop_ctrl=stop.signal.clone();
                 children.spawn(async move { session::control(ctrl,q,cipher,stop_ctrl).await; });
                 children.spawn(session::data(sockets.next().unwrap(),state.clone(),events_task.clone()));
+                }
                 let outcome=tokio::select! {
                     biased;
                     _=stop.cancelled()=>{children.shutdown().await; return;},
                     _=children.join_next()=>Err("CarWith media/control channel closed".into()),
                     result=session::run(cmd,events_task.clone(),size.clone(),requested.clone(),config.clone(),state.clone(),reset_request.clone(),can_reopen_display)=>result,
                 };
+                if let Some(target) = &voice_target { target.clear(); }
                 children.abort_all(); while children.join_next().await.is_some() {}
                 queue.lock().clear();
                 if let Some(mic) = config.microphone.as_ref() { mic.request(false); }
@@ -386,7 +419,7 @@ impl CarLifeHub {
                 tokio::select! { biased; _=stop.cancelled()=>return, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
             }
         }));
-        Ok((Self {stop:hub_stop,touch_tx,encoder_size,keyframe_request},event_rx))
+        Ok((Self {stop:hub_stop,touch_tx,system_voice,encoder_size,keyframe_request},event_rx))
     }
 
     pub fn request_keyframe(&self) {
@@ -422,7 +455,28 @@ impl CarLifeHub {
         }).is_ok()
     }
 
+    pub fn system_voice_epoch(&self) -> Option<u64> {
+        if self.stop.is_retired() { return None; }
+        self.system_voice.as_ref().and_then(|target| target.epoch())
+    }
+
+    pub fn system_voice_key_for_epoch(&self, epoch:u64, key:u64) -> bool {
+        let queued = matches!(key, 0x21 | 0x22) && !self.stop.is_retired() &&
+            self.system_voice.as_ref().is_some_and(|target| target.queue_for_epoch(epoch,key));
+        emit_log(&format!("VOICE-KEY: System CMD 0x68008 epoch={epoch} key=0x{key:x} queued={queued} (recognition unconfirmed)"));
+        queued
+    }
+
+    /// System's current CMD connection owns these short-lived VR_START/VR_STOP requests.
+    pub fn system_voice_key(&self, key: u64) -> bool {
+        let queued = matches!(key, 0x21 | 0x22) && !self.stop.is_retired() &&
+            self.system_voice.as_ref().is_some_and(|target| target.queue(key));
+        emit_log(&format!("VOICE-KEY: System CMD 0x68008 key=0x{key:x} queued={queued} (recognition unconfirmed)"));
+        queued
+    }
+
     pub fn voice_start(&self) {
+        if self.system_voice.is_some() { let _ = self.system_voice_key(0x21); return; }
         let queued = self.queue_hard_key(0x21, Duration::from_secs(2));
         emit_log(&format!("VOICE-KEY: CarWith key=0x21 queued={queued} (not recognition confirmation)"));
     }
@@ -452,6 +506,56 @@ impl CarLifeHub {
 impl Drop for CarLifeHub {
     fn drop(&mut self) {
         self.stop.cancel();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SystemLane { Video, Media, Tts, Vr, Ctrl, Data }
+
+async fn supervise_system_lane(host:String, port:u16, lane:SystemLane, cfg:CarLifeConfig,
+    state:session::Shared, events:mpsc::UnboundedSender<CarLifeEvent>,
+    queue:Arc<Mutex<Vec<QueuedControl>>>, stop:Arc<DialStop>, initial_barrier:Arc<tokio::sync::Barrier>) {
+    let mut first_attempt=true;
+    loop {
+        if stop.is_retired() { return; }
+        // Attempt the actual owned connection, never a disposable readiness probe.
+        let socket = match tokio::time::timeout(Duration::from_millis(250), stop.dial(&host, port)).await {
+            Ok(Some(Ok(socket))) => Some(socket),
+            Ok(None) => return,
+            _ => None,
+        };
+        if first_attempt {
+            first_attempt=false;
+            tokio::select! { biased; _=stop.cancelled()=>return, _=initial_barrier.wait()=>{} }
+        }
+        if let Some(socket) = socket {
+            if matches!(lane,SystemLane::Video) { state.lock().request_reconfigure(); }
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => return,
+                _ = async {
+                    match lane {
+                        SystemLane::Video => handle_media_client(socket,events.clone(),MediaKind::Video,"VIDEO",Some(state.clone()),stop.diagnostic_phase()).await,
+                        SystemLane::Media => handle_media_client(socket,events.clone(),MediaKind::Media,"MEDIA",Some(state.clone()),stop.diagnostic_phase()).await,
+                        SystemLane::Tts => handle_media_client(socket,events.clone(),MediaKind::Tts,"TTS",Some(state.clone()),stop.diagnostic_phase()).await,
+                        SystemLane::Vr => if let Some(mic)=cfg.microphone.clone() {
+                            microphone::run(socket,state.clone(),mic,stop.signal.clone(),events.clone(),stop.diagnostic_phase()).await;
+                        } else { drain_stream(socket,state.clone(),events.clone(),stop.diagnostic_phase()).await; },
+                        SystemLane::Ctrl => session::control(socket,queue.clone(),state.clone(),stop.signal.clone()).await,
+                        SystemLane::Data => session::data(socket,state.clone(),events.clone()).await,
+                    }
+                } => {}
+            }
+            match lane {
+                SystemLane::Vr => {
+                    if let Some(mic)=cfg.microphone.as_ref() { mic.request(false); }
+                    let _=events.send(CarLifeEvent::VoiceAudioStop);
+                }
+                SystemLane::Media | SystemLane::Tts => { let _=events.send(CarLifeEvent::AudioStop{tts:matches!(lane,SystemLane::Tts)}); }
+                _=>{}
+            }
+        }
+        tokio::select! { biased; _=stop.cancelled()=>return, _=tokio::time::sleep(Duration::from_millis(250))=>{} }
     }
 }
 
@@ -629,14 +733,25 @@ fn proto_statistic_payload() -> Vec<u8> {
 /// ```
 /// 之前这里塞的是**手机侧**的全套字段（还把 24 号当成 carlifeversion 放 "7.0.0"，
 /// 那是 MD_INFO 的语义），并且缺了 required 的 btaddress —— MD 解析必然异常。
-fn proto_hu_info_payload(bt_address: &str, bt_name: &str) -> Vec<u8> {
+fn proto_hu_info_payload(cfg: &CarLifeConfig) -> Vec<u8> {
     let mut out = Vec::with_capacity(96);
     proto::string(&mut out, 1, "Android"); // os
-    proto::string(&mut out, 13, "HyperCar"); // manufacturer
-    proto::string(&mut out, 14, "HyperCar HU"); // model
+    if cfg.dialect==CarLifeDialect::SystemPlain30 {
+        // Legacy OEM parsers also inspect the Android device identity fields.
+        // Do not claim an unrelated reference handset board or receiver identity.
+        proto::string(&mut out,2,"unknown");
+        proto::string(&mut out,3,"unknown");
+        proto::string(&mut out,4,if cfg.manufacturer.is_empty(){"HyperCar"}else{&cfg.manufacturer});
+        proto::string(&mut out,5,"arm64-v8a");
+        proto::string(&mut out,6,"arm64-v8a");
+        proto::string(&mut out,7,if cfg.model.is_empty(){"HyperCar HU"}else{&cfg.model});
+        proto::string(&mut out,8,&format!("{}x{}",cfg.width,cfg.height));
+    }
+    proto::string(&mut out, 13, if cfg.manufacturer.is_empty() { "HyperCar" } else { &cfg.manufacturer }); // manufacturer
+    proto::string(&mut out, 14, if cfg.model.is_empty() { "HyperCar HU" } else { &cfg.model }); // model
     proto::string(&mut out, 19, "14"); // release
-    proto::string(&mut out, 23, bt_address); // btaddress（required）
-    proto::string(&mut out, 24, bt_name); // btname（required）
+    proto::string(&mut out, 23, &cfg.bt_address); // btaddress（required）
+    proto::string(&mut out, 24, &cfg.bt_name); // btname（required）
     out
 }
 
@@ -792,7 +907,11 @@ async fn handle_media_client(
                     emit_log(&format!("CARWITH-MEDIA: 9240 rx={marker} service=0x{service_type:x} frame={}", channel_stats.frames));
                 }
             }
-            if service_type == VIDEO_DATA && encryption.as_ref().is_some_and(|s| !s.lock().started) {
+            if encryption.as_ref().is_some_and(|s| {
+                let s=s.lock();
+                (service_type==VIDEO_DATA && !s.started) ||
+                    (s.is_system_plain() && matches!(service_type,MEDIA_DATA|TTS_DATA) && !s.media_ready())
+            }) {
                 continue; // A landing-page frame is not proof of a completed CarWith handshake.
             }
             // Xiaomi mixed MEDIA_DATA remains PCM; video, TTS and audio INIT use AES-ECB.
@@ -1017,6 +1136,7 @@ mod input_lease_tests {
     fn hub() -> (Arc<CarLifeHub>, mpsc::UnboundedReceiver<QueuedControl>) {
         let (touch_tx, rx) = mpsc::unbounded_channel();
         (Arc::new(CarLifeHub {
+            system_voice: None,
             stop: Arc::new(DialStop::default()), touch_tx, encoder_size: Arc::new(Mutex::new((1920, 720))),
             keyframe_request: Arc::new(Notify::new()),
         }), rx)

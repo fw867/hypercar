@@ -11,6 +11,7 @@
 | [连接诊断](HANDSHAKE-DIAGNOSTICS.md) | 按阶段、事务与通道定位失败 |
 | [车型档案](HEADUNIT-PROFILES.md) | 统一配置、覆盖及各车型证据 |
 | [CarWith源](CARWITH-SOURCE.md) | 本机七通道、认证加密及视频入流 |
+| [系统 CarLife+ 源](SYSTEM-CARLIFE-SOURCE.md) | 第三种画面来源、公开协议与使用边界 |
 | [自绘界面](CARUI-REDESIGN.md) | 首页、音乐与应用能力 |
 | [地图与键盘](MAP-PROVIDERS.md) | 地图任务、全屏、返回按钮及IME |
 | [视频与触摸](VIDEO-STREAM-REVIEW.md) | 真实尺寸、资源及端点生命周期 |

@@ -19,6 +19,8 @@ data class StartupReadiness(
         when (source) {
             "car_ui" -> if (!shizukuReady) add("安装、启动 Shizuku 并授权 HyperCar")
             "carwith" -> if (!carWithInstalled) add("安装并启用系统 CarWith（com.miui.carlink）")
+            // User starts the phone's own WLAN connection screen; no Xiaomi dependency.
+            "system_carlife" -> Unit
             else -> add("选择车机画面来源")
         }
     }

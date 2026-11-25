@@ -125,9 +125,15 @@ pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
         size: if cfg.carwith_cached_canvas { (cfg.width,cfg.height) } else { (0,0) }, ..Default::default() });
     let microphone=cfg.carwith_microphone.then(||Arc::new(crate::mic_probe::ProbeControl::for_carwith()));
     let vehicle_gps = Arc::new(crate::carlife::vehicle_gps::PendingLocation::default());
-    let config=CarLifeConfig{width:cfg.width,height:cfg.height,fps:cfg.carwith_fps(),bt_address:cfg.device_id.clone(),
-        bt_name:"HyperCar".into(),navigation_updates:cfg.carwith_navigation_enabled,microphone:microphone.clone(),
-        vehicle_gps:Some(vehicle_gps.clone())};
+    let system=cfg.system_carlife_source;
+    let config=CarLifeConfig{
+        dialect:if system {crate::carlife::CarLifeDialect::SystemPlain30} else {crate::carlife::CarLifeDialect::CarWithEncrypted41},
+        manufacturer:if system {cfg.hu_manufacturer.clone()} else {String::new()},
+        model:if system {cfg.hu_model.clone()} else {String::new()},
+        width:cfg.width,height:cfg.height,fps:cfg.carwith_fps(),
+        bt_address:if system && !cfg.hu_bt_address.is_empty() {cfg.hu_bt_address.clone()} else {cfg.device_id.clone()},
+        bt_name:if system && !cfg.hu_bt_name.is_empty() {cfg.hu_bt_name.clone()} else {"HyperCar".into()},
+        navigation_updates:cfg.carwith_navigation_enabled,microphone:microphone.clone(),vehicle_gps:Some(vehicle_gps.clone())};
     let (hub,mut events)=CarLifeHub::connect(config,"127.0.0.1".into(),stop.clone(),Some(display.clone()),
         move |startup| crate::reopen_carwith_entry(owner, startup))?;
     let feed=Arc::new(Mutex::new(Feed::default()));let sink=feed.clone();

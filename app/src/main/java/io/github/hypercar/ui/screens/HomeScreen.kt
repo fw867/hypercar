@@ -195,6 +195,7 @@ fun HomeScreen(
  */
 private fun degradedChipHint(snapshot: SessionSnapshot): String? = when {
     snapshot.shizukuReady -> null
+    io.github.hypercar.settings.SettingsStore.systemCarLifeMode -> "CarLife+ 无需 Shizuku"
     io.github.hypercar.settings.SettingsStore.carWithMode -> "CarWith 无需 Shizuku"
     else -> "自绘 UI 必须安装、启动并授权"
 }
