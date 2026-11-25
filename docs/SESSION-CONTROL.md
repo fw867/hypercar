@@ -24,6 +24,10 @@ BMW默认不主动拨iAP2、不主动断HFP/A2DP。其它档案依赖自身策�
 
 从 0.1.0.600 起，同一目标宝马的 Wi-Fi 已绑定、当前网络的 ctrl 广播和 TCP 监听都就绪时，给车机 15 秒主动连入的机会，避免手机在短 ACL 窗口内发起另一轮 SDP 或 RFCOMM。计时以目标 HFP/A2DP 连续在线为准，掉线重算；持续在线但无入站或邀请时仍保留一次标准 CAFF 出站。这是应用层的避让策略，不是对系统 SDP 双记录解析的修复。
 
+热点重接按车机身份与精确 SSID 记录上次成功 AirPlay 会话所用的 AP BSSID。记录只来自该会话实际使用的 Network；系统隐藏 BSSID 时，经 Shizuku 读取的 Wi-Fi 状态还须匹配该 Network 的本地 IP。下次入网只有当前 30 秒内的扫描同时匹配 SSID 与该 BSSID，才优先构造精确 AP 请求；本轮车机标识与扫描核验得到的 AP 优先于历史记录。没有记录、旧 AP 不在新鲜扫描中或元数据不可用时沿用原流程，不凭缓存地址盲连。`WIFI-AP-MEMORY` 表示记忆结果，`WIFI-JOIN` 的 `remembered_ap_matched` 表示本次核验命中。首次升级需一次成功连接才能建立记录；系统批准仍由 ROM 决定，不能保证完全不弹确认框。
+
+历史 AP 精确请求最多先尝试 4 秒。若扫描后 AP 已变化、精确请求未成功且没有已交付的网络关联，在本轮车机/凭据仍有效时仅回退一次 SSID 请求；日志为 `remembered_ap_fallback=ssid`。已交付的热点请求（包括等 DHCP/网络属性就绪的关联）不为此回退而拆除，当前已可复用的热点仍优先走原快路径。本轮已核验的车机 AP 提示和无历史提示的普通请求保持原等待规则。
+
 复测时保留手机和车机原有配对及 Wi-Fi 配置，记下车机弹窗的时间。按 `attempt` 对齐以下证据：
 
 - `BT-CAFF` 是手机主动出站；`BT-ACCEPT: entry=BT-S` 是车机主动入站。用 `acceptedUptimeMs` 关联接管该 socket 的 `BT-WORKER`，再按 `handshake` 对照 `HS#` 的 iAP2 时序。仅有 SDP UUID 或 socket accept 不等于进入 iAP2。

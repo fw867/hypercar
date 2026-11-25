@@ -1,14 +1,21 @@
-//! BMW assistant/navigation output negotiation; resource ownership is managed by the caller.
+//! Assistant/navigation output negotiation; resource ownership is managed by the caller.
 use std::{sync::Arc,time::Duration};
 use crate::{airplay::{AirplayParams,SocketProvider},audio_out::AudioOut,bplist::{self,Value},rtsp::{RtspChannel,RtspMessage}};
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum Kind { Speech, Navigation }
+/// Preserve each successful cleanup ACK when the other step needs retrying.
+#[derive(Debug,Default,Clone,Copy)]
+pub struct CloseState {
+    unducked:bool,
+    torn_down:bool,
+}
 #[derive(Debug)]
 pub struct OpenError {
     pub message:String,
     /// True only when no receiver mutation occurred, or all required cleanup ACKs arrived.
     pub cleanup_confirmed:bool,
+    pub cleanup_state:CloseState,
 }
 impl std::fmt::Display for OpenError {
     fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {f.write_str(&self.message)}
@@ -71,13 +78,14 @@ async fn duck(control:&Arc<RtspChannel>,enabled:bool)->Result<(),String> {
     ack(&reply)
 }
 async fn open_at(control:&Arc<RtspChannel>,factory:&Arc<dyn SocketProvider>,host:&str,port:u16,shared:&[u8;32],info:&Value,kind:Kind)->Result<AudioOut,OpenError> {
-    if !supports(info,kind){return Err(OpenError{message:format!("{} output format unsupported",kind.label()),cleanup_confirmed:true});}
+    if !supports(info,kind){return Err(OpenError{message:format!("{} output format unsupported",kind.label()),cleanup_confirmed:true,cleanup_state:CloseState::default()});}
     // Fail before muting the receiver or allocating its stream if local Opus is unavailable.
-    let _preflight=crate::opus_encode::OpusEncoder::new(kind.rate(),kind.spf()).map_err(|e|OpenError{message:format!("Opus preflight: {e}"),cleanup_confirmed:true})?;
+    let _preflight=crate::opus_encode::OpusEncoder::new(kind.rate(),kind.spf()).map_err(|e|OpenError{message:format!("Opus preflight: {e}"),cleanup_confirmed:true,cleanup_state:CloseState::default()})?;
     if kind==Kind::Navigation {
         if let Err(error)=duck(control,true).await {
             let cleanup=duck(control,false).await;
-            return Err(OpenError{message:format!("duck failed: {error}; unduck cleanup={cleanup:?}"),cleanup_confirmed:cleanup.is_ok()});
+            return Err(OpenError{message:format!("duck failed: {error}; unduck cleanup={cleanup:?}"),cleanup_confirmed:cleanup.is_ok(),
+                cleanup_state:CloseState{unducked:cleanup.is_ok(),torn_down:true}}); // SETUP was never attempted.
         }
     }
     let id=crate::airplay::random_positive_i64();
@@ -105,17 +113,23 @@ async fn open_at(control:&Arc<RtspChannel>,factory:&Arc<dyn SocketProvider>,host
     match result {
         Ok(out)=>Ok(out),
         // Even a malformed 200 or lost reply may have allocated a receiver stream.
-        Err(error)=>{let cleanup=close(control,kind).await;Err(OpenError{message:format!("{} SETUP failed: {error}; cleanup={cleanup:?}",kind.label()),cleanup_confirmed:cleanup.is_ok()})}
+        Err(error)=>{
+            let mut cleanup_state=CloseState::default();
+            let cleanup=close(control,kind,&mut cleanup_state).await;
+            Err(OpenError{message:format!("{} SETUP failed: {error}; cleanup={cleanup:?}",kind.label()),cleanup_confirmed:cleanup.is_ok(),cleanup_state})
+        }
     }
 }
-pub async fn close(control:&Arc<RtspChannel>,kind:Kind)->Result<(),String> {
+pub async fn close(control:&Arc<RtspChannel>,kind:Kind,state:&mut CloseState)->Result<(),String> {
     // Caller drops/stops AudioOut first. Firmware restores duck before retiring AltAudio.
-    let unduck=if kind==Kind::Navigation {duck(control,false).await}else{Ok(())};
+    let unduck=if kind==Kind::Navigation && !state.unducked {duck(control,false).await}else{Ok(())};
+    if unduck.is_ok() {state.unducked=true;}
     let body=bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![("type",Value::int(kind.stream_type()))])]))]));
     control.udp_media.set(kind.stream_type(), false);
-    let teardown=match control.request("TEARDOWN","/",&body,"application/x-apple-binary-plist",&[],Duration::from_secs(3)).await {
+    let teardown=if state.torn_down {Ok(())}else{match control.request("TEARDOWN","/",&body,"application/x-apple-binary-plist",&[],Duration::from_secs(3)).await {
         Ok(reply)=>ack(&reply),Err(error)=>Err(error.to_string()),
-    };
+    }};
+    if teardown.is_ok() {state.torn_down=true;}
     match (unduck,teardown){(Ok(()),Ok(()))=>Ok(()),(a,b)=>Err(format!("unduck={a:?}; teardown={b:?}"))}
 }
 
@@ -204,7 +218,7 @@ mod tests {
         let m=next(&mut peer,&mut buf).await;reply(&mut peer,&m,Some(Value::dict(vec![("status",Value::int(1))]))).await;
         let m=next(&mut peer,&mut buf).await;assert_eq!(bplist::parse(&m.body).unwrap().get("type").and_then(Value::as_str),Some("unduckAudio"));reply(&mut peer,&m,None).await;
         assert!(task.await.unwrap().err().unwrap().cleanup_confirmed);
-        let task=tokio::spawn(async move{close(&c,Kind::Navigation).await});
+        let task=tokio::spawn(async move{close(&c,Kind::Navigation,&mut CloseState::default()).await});
         let m=next(&mut peer,&mut buf).await;reply(&mut peer,&m,Some(Value::dict(vec![("status",Value::int(1))]))).await;
         let m=next(&mut peer,&mut buf).await;assert!(m.first_line.starts_with("TEARDOWN / "));reply(&mut peer,&m,None).await;
         assert!(task.await.unwrap().is_err());
@@ -228,7 +242,7 @@ mod tests {
             if bad_echo{fields.push(("streamConnectionID",Value::int(-1)));}
             reply(&mut peer,&m,Some(Value::dict(vec![("streams",Value::array(vec![Value::dict(fields)]))]))).await;
             let close_task=if fail||bad_echo {None}else {
-                let out=task.take().unwrap().await.unwrap().unwrap();drop(out);let cc=c.clone();Some(tokio::spawn(async move{close(&cc,kind).await}))
+                let out=task.take().unwrap().await.unwrap().unwrap();drop(out);let cc=c.clone();Some(tokio::spawn(async move{close(&cc,kind,&mut CloseState::default()).await}))
             };
             if kind==Kind::Navigation {let m=next(&mut peer,&mut buf).await;let v=bplist::parse(&m.body).unwrap();assert_eq!(v.get("type").and_then(Value::as_str),Some("unduckAudio"));reply(&mut peer,&m,None).await;}
             let m=next(&mut peer,&mut buf).await;assert!(m.first_line.starts_with("TEARDOWN / "));reply(&mut peer,&m,cleanup_failure.then(||Value::dict(vec![("status",Value::int(1))]))).await;

@@ -171,6 +171,17 @@ object SettingsStore {
         knownCarNetworks = knownCarNetworks + "$ssid|${mac.uppercase(java.util.Locale.ROOT)}"
     }
 
+    internal fun carHotspotBssid(receiver: String?, ssid: String): String? {
+        val key = io.github.hypercar.net.CarWifiApMemory.key(receiver, ssid) ?: return null
+        return io.github.hypercar.net.CarWifiApMemory.normalize(p().getString(key, null))
+    }
+
+    internal fun rememberCarHotspotBssid(receiver: String, ssid: String, bssid: String) {
+        val key = io.github.hypercar.net.CarWifiApMemory.key(receiver, ssid) ?: return
+        val ap = io.github.hypercar.net.CarWifiApMemory.normalize(bssid) ?: return
+        p().edit().putString(key, ap).apply()
+    }
+
     /**
      * 配对身份（AirPlay pair-setup 的长期身份）**备份**，格式与 `controller_identity.txt` 相同：
      * `pairingId hex私钥`。

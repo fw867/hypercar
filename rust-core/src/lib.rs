@@ -747,7 +747,9 @@ fn native_start_impl(
     let stop_result = shutdown.clone();
     let touch_tx_engine = touch_tx.clone();
     let key_tx_engine = key_tx.clone();
-    let engine_task = TOKIO_RT.spawn(callback_context::inherit(async move {
+    let mut engine_context = callback_context::current().expect("nativeStart callback context");
+    engine_context.audio_shutdown = Some(shutdown.clone());
+    let engine_task = callback_context::sync_scope(engine_context, || TOKIO_RT.spawn(callback_context::inherit(async move {
         let _completion = completion;
         let result = engine::run_engine(
             cfg,
@@ -767,7 +769,7 @@ fn native_start_impl(
             emit_log(&format!("引擎退出: {e}"));
             if !stop_result.requested() { emit_state("failed", e); }
         }
-    }));
+    })));
     let abort = engine_task.abort_handle();
     // panic 隔离看门狗：Cargo 已去掉 panic = "abort"，任务内 panic 由 tokio 捕获在
     // JoinHandle 里。这里把它报成「会话失败」并留日志，而不是让进程无声消失。

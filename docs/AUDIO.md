@@ -25,7 +25,7 @@
 
 `AUDIO-PACING` 的 `firstMediaMonoNs` 标记当前流首次有媒体 PCM 在混音队列中的时间。此前的漏拍记入 `startup_silence_recoveries`、`startup_silence_skipped_frames` 和 `startup_max_late_us`。此后的漏拍继续用 `recoveries`、`skipped_source_frames` 和 `max_late_us`，即使播放中途队列变空。`wake` 仍保留整个统计窗口的原始唤醒峰值。
 
-设置「画面与声音 → 音频格式」提供自动、PCM、AAC 优先，下次连接生效。通用实时音频自动模式按 PCM 48 kHz、AAC 48 kHz、PCM 44.1 kHz、AAC 44.1 kHz 的顺序尝试 `/info` 已声明的媒体输出格式，最后保留 PCM 48 kHz 兼容回退。CarWith 优先匹配 `MEDIA_INIT` 的源采样率。ID9、适用专用音频路径的 MBUX 和 ID6 继续使用各自的能力门控。手动设置沿用原候选规则，缓冲音频仍按本轮声明判断是否启用。DiPlay 已实测 AAC 协商成功并确认出声，约 47 包/秒。AAC 裸帧及 RTP 实现参考了 [CarPToCarL](https://github.com/jjuugk/CarPToCarL)。
+设置「画面与声音 → 音频格式」提供自动、PCM、AAC 优先，下次连接生效。通用实时音频自动模式按 PCM 48 kHz、AAC 48 kHz、PCM 44.1 kHz、AAC 44.1 kHz 的顺序尝试本轮 `/info` 已声明的媒体输出格式，适用于 ID9/MBUX 等严格声明路径。PCM 选项只尝试已声明的 PCM48/PCM44.1；AAC 优先先尝试已声明的 AAC48/AAC44.1，再尝试 PCM48/PCM44.1。非严格路径保留最后的未声明 PCM48 历史兼容探测，严格路径不增加该探测。CarWith 继续优先匹配 `MEDIA_INIT` 源采样率；NBT 保留 AAC44.1、AAC48、PCM48 的原顺序并追加已声明的 PCM44.1。缓冲媒体回退顺序和各平台的 RECORD 顺序保留。DiPlay 已实测 AAC 协商成功并确认出声，约 47 包/秒。AAC 裸帧及 RTP 实现参考了 [CarPToCarL](https://github.com/jjuugk/CarPToCarL)。
 
 音频延迟按流类型、角色、采样率、位深、声道数和编码匹配 `audioLatencies`。省略的字段匹配任意值，采用首条有效的匹配记录。实时媒体和缓冲媒体的延迟下限分别为 300 ms 和 1000 ms。独立语音和导航分别按实际协商的 24 kHz 与 48 kHz 单声道 Opus 匹配，缺少有效记录时仍发送 0 ms。
 
@@ -43,7 +43,7 @@ CarWith新增`CARWITH-CHANNEL`诊断：MEDIA、TTS及VR每5秒输出接收字节
 
 ## 573：BMW ID8.5 独立 SIRI / 导航输出
 
-以下路径依据 xiap2 及 libAirPlay 固件实现。盒子的两轮成功日志未测试 SIRI 和导航。MGU/BMW ID8.5 及 DiPlay 按本轮 `/info` 声明启用对应的辅助流。BMW ID9 使用 CarWith 时，仅当车机声明 101/default 输出支持 bit30，且 9241 已收到导航 PCM，才申请导航状态并建立独立流。ID9 的实车播报和音量恢复待复测。
+以下路径依据 xiap2 及 libAirPlay 固件实现。盒子的两轮成功日志未测试 SIRI 和导航。独立导航对全部车机档案及画面来源按本轮 `/info` 能力启用：同一条 `audioFormats` 记录须声明 `type=101`、`audioType=default` 且 `audioOutputFormats` 含 bit30（Opus48k 单声道）。独立助手/SIRI 同样不再限制档案，要求同一条记录的 `type=100`、`audioType=speechRecognition`、`audioOutputFormats` bit29（Opus24k 单声道），麦克风输入声明不代替输出声明。只有收到对应 PCM 才申请资源并建立独立流；语音仍经过主音频借用、暂停/关闭、语音流释放、结束资源确认和按原编码/采样率恢复媒体。未声明对应输出格式时沿用媒体混音；SETUP 拒绝时确认清理并恢复媒体后只回退一次，清理未完成则保留有界 PCM 等待，资源归属拒绝不绕过。新增覆盖范围的实车播报、语音和音量恢复仍待复测。
 
 | 输入类别 | AirPlay流 | 编码与时钟 | 生命周期 |
 |---|---|---|---|
@@ -57,7 +57,7 @@ OPUS使用随APK静态链接的libopus，输入仍为48k立体声，编码前下
 
 媒体泵确认暂停并关闭旧socket后才切SIRI。退出先停止独立发送，TEARDOWN和资源归还确认后再恢复原PCM/AAC媒体，使用新连接ID/密钥；恢复被拒有界重试，仍失败则保留待恢复状态，由新媒体开始/新源触发。清理失败保留lease和阶段，避免永远卡Speaking或重复开启冲突type100；结束中的SETUP在关闭预算后进入最终会话TEARDOWN列表。导航不暂停媒体泵，两个辅助worker的RTSP等待不会阻塞媒体节拍。
 
-未声明对应能力或独立SETUP被拒且已确认清理时，可回退原媒体混音；资源拒绝/无法确认清理则不绕过授权播放。新INIT清旧队列，正常STOP排尾，过期tick只淘汰同一源代次样本，避免旧流丢弃新回复。`AUX-AUDIO`记录每类流建立、清理/恢复、发包和队列计数；本地发送与测试通过仍需实车确认听感和互操作。
+未声明对应能力或独立SETUP被拒且已确认清理时，可回退原媒体混音；资源拒绝/无法确认清理则不绕过授权播放。音量恢复与流 TEARDOWN 分别保存成功应答，失败重试只补未完成步骤，避免重复关闭已释放的流或重复恢复音量；降低音量阶段失败且未发送 SETUP 时，只补音量恢复，不关闭未分配的流，不将任意 404 当作清理成功。新INIT清旧队列，正常STOP排尾，过期tick只淘汰同一源代次样本，避免旧流丢弃新回复。`AUX-AUDIO`记录每类流建立、清理/恢复、发包和队列计数；本地发送与测试通过仍需实车确认听感和互操作。
 
 ### 自绘高德分流与DiPlay验证
 
@@ -69,9 +69,9 @@ OPUS使用随APK静态链接的libopus，输入仍为48k立体声，编码前下
 
 ## ID6 / NBT Evo 实验路径
 
-独立 ID6 档案只接受 NBT Evo 身份，并按本轮 `/info` 的 media 输出能力选择 AAC-LC 44.1 kHz、48 kHz 或 PCM 48 kHz；缺失声明不猜测格式。手动 PCM 选择仍受输出能力限制。顺序为屏幕 TCP、音频 SETUP、单次成功 RECORD，失败不能伪装激活。
+独立 ID6 档案只接受 NBT Evo 身份，并按本轮 `/info` 的 media 输出能力依次选择 AAC-LC 44.1 kHz、AAC-LC 48 kHz、PCM 48 kHz、PCM 44.1 kHz；缺失声明不猜测格式。手动 PCM 只尝试声明的 PCM 两采样率。顺序为屏幕 TCP、音频 SETUP、单次成功 RECORD，失败不能伪装激活。
 
-ID6 的采集以 48 kHz 为基准，协商 AAC 44.1 kHz 时使用保留相位的流式重采样。MediaCodec、SETUP 与 RTP 样本时钟采用实际协商采样率，AAC 每包 1024 帧。资源接管时丢弃旧缓存，归还时按协商采样率重建编码器。实车音画仍待验证。
+ID6 的采集以 48 kHz 为基准，媒体协商 44.1 kHz 时使用保留相位的流式重采样。MediaCodec、SETUP 与 RTP 样本时钟采用实际协商采样率，AAC 每包 1024 帧、PCM 每包 352 帧。资源接管时丢弃旧缓存，归还时按协商采样率重建编码器。实车音画仍待验证。
 
 ## 资源归属与恢复
 
@@ -104,6 +104,11 @@ peak=0、rms=0 表示输入为零；active=false 优先核实播放器是否真�
 先核实播放器、源幅度与实际路由，再看音频归属、资源应答和 RTP。`AUDIO` 日志的 owner_phone、blocked_samples 与实际发包数区分门控、源静音及发送失败；`AUDIO-RESOURCE` 记录申请、拒绝和过期。RTSP 或 UDP 写入不是扬声器出声确认。语音麦克风见[输入与语音](INPUT-AND-VOICE.md)，测试边界见[验证](VALIDATION.md)。
 
 实现：`ShellPlaybackAudio`、`CarAudioCapture`、`audio_resource.rs`、`audio_out.rs`、`modes.rs`、`engine.rs`。
+
+AAC 后台编码线程使用创建它的引擎退出计数。即使 pump 已退出，编码器的
+`stop/delete` 尚未完成时也不能确认旧引擎完全退出。释放 AudioOut 只断开
+输入/输出队列，不在实时音频线程执行阻塞 join；编码器析构完成后由工作线程
+释放计数。编码异常、满输出队列及 panic 同样按此顺序清理。
 
 
 ## 644 输入收音实验

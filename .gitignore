@@ -27,6 +27,10 @@ keystore.properties
 .DS_Store
 *.log
 
+# 本地工作计划
+/docs/superpowers/plans/
+/docs/reviews/
+
 # 图标生成脚本的预览输出（tools/icon/out/，脚本本身入库）
 /tools/icon/out/
 

@@ -101,6 +101,7 @@ class WifiJoiner(
         alreadyAssociated: suspend () -> Network? = { null },
         credentialsCurrent: () -> Boolean = { true },
         submitRequest: (() -> Unit) -> Boolean = { request -> request(); true },
+        rememberedBssid: String? = null,
         deviceIdentifierHint: () -> String? = { null }): JoinResult {
         lastFailureReason = null
         // Password length alone cannot distinguish WEP from valid 10/13/26-character WPA2.
@@ -137,7 +138,8 @@ class WifiJoiner(
             WifiApHint.resolve(ssid, deviceIdentifierHint,
                 scan = { ShizukuTools.exec("cmd wifi list-scan-results", 3_000).out },
                 startScan = { ShizukuTools.exec("cmd wifi start-scan", 3_000); Unit },
-                now = SystemClock::elapsedRealtime)
+                now = SystemClock::elapsedRealtime,
+                rememberedBssid = { rememberedBssid })
         } else null
         currentCoroutineContext().ensureActive()
         if (!credentialsCurrent()) {
@@ -148,9 +150,19 @@ class WifiJoiner(
             diagnose("复核扫描期间已连接的车机热点，跳过 requestNetwork")
             return JoinResult.Joined(it)
         }
-        diagnose("scan_hint=${hint != null} freq=${hint?.frequency ?: 0} age_s=${hint?.ageSeconds ?: -1.0}; no AP address logged")
+        diagnose("scan_hint=${hint != null} freq=${hint?.frequency ?: 0} age_s=${hint?.ageSeconds ?: -1.0} " +
+            "remembered_ap=${CarWifiApMemory.normalize(rememberedBssid) != null} " +
+            "remembered_ap_matched=${hint != null && hint.bssid == CarWifiApMemory.normalize(rememberedBssid)}; no AP address logged")
         requestIdentity = CarWifiRequestIdentity(ssid, psk)
-        return joinViaSpecifier(ssid, psk, hint, verifiedFallback, credentialsCurrent, submitRequest)
+        val admission = WifiApRetry.Admission({ maySubmitRequest() && credentialsCurrent() }, submitRequest)
+        return WifiApRetry.join(hint, SPECIFIER_WAIT_MS, admission::isCurrent, { currentNetwork != null }) { selected, waitMs ->
+            if (hint?.fromMemory == true && selected == null) {
+                diagnose("remembered_ap_fallback=ssid reason=exact_request_failed; no live association replaced")
+                lastFailureReason = null
+            }
+            joinViaSpecifier(ssid, psk, selected, verifiedFallback, credentialsCurrent, admission::submit, waitMs)
+                as? JoinResult.Joined
+        } ?: JoinResult.Failed
     }
 
     /**
@@ -165,7 +177,7 @@ class WifiJoiner(
      * 拿不到句柄（框弹不出/用户拒绝/超时）一律返回 Failed，由调用方降级到「绑定当前网络」。
      */
     private suspend fun joinViaSpecifier(ssid: String, psk: String, hint: WifiApHint?, verifiedFallback: suspend () -> Network?,
-        credentialsCurrent: () -> Boolean, submitRequest: (() -> Unit) -> Boolean): JoinResult =
+        credentialsCurrent: () -> Boolean, submitRequest: (() -> Unit) -> Boolean, timeoutMs: Long): JoinResult =
         withContext(Dispatchers.IO) {
             val specifier = WifiNetworkSpecifier.Builder().apply {
                 setSsid(ssid)
@@ -190,7 +202,7 @@ class WifiJoiner(
                 .setNetworkSpecifier(specifier)
                 .build()
 
-            val network = awaitSpecifierHandle(request, specifier, ssid, hint, SPECIFIER_WAIT_MS, verifiedFallback,
+            val network = awaitSpecifierHandle(request, specifier, ssid, hint, timeoutMs, verifiedFallback,
                 credentialsCurrent, submitRequest)
                 ?: return@withContext JoinResult.Failed
             val caps = connectivityManager.getNetworkCapabilities(network)

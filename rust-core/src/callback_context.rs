@@ -8,10 +8,13 @@ static NEXT: AtomicU64 = AtomicU64::new(1);
 pub struct Context {
     pub listener: Option<GlobalRef>,
     pub generation: u64,
+    // Inherited by negotiation/rebuild tasks so detached codec workers retire
+    // with their original engine, even after a newer JNI listener is installed.
+    pub audio_shutdown: Option<std::sync::Arc<crate::shutdown::EngineShutdown>>,
 }
 impl Context {
     pub fn new(listener: Option<GlobalRef>) -> Self {
-        Self { listener, generation: NEXT.fetch_add(1, Ordering::Relaxed) }
+        Self { listener, generation: NEXT.fetch_add(1, Ordering::Relaxed), audio_shutdown: None }
     }
 }
 tokio::task_local! { static CURRENT: Option<Context>; }

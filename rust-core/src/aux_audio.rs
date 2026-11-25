@@ -1,4 +1,4 @@
-//! Independent BMW speech and navigation audio stream lifecycle.
+//! Independent speech and navigation audio stream lifecycle.
 use std::{collections::VecDeque,sync::{Arc,atomic::{AtomicBool,AtomicU8,AtomicU64,Ordering}},time::Duration};
 use parking_lot::Mutex;
 use tokio::sync::{mpsc,oneshot,Notify};
@@ -492,6 +492,7 @@ impl Session {
 #[derive(Default)]
 struct Cleanup {
     lease:Option<Lease>,close:bool,retire_media:bool,restore:bool,
+    close_state:crate::aux_setup::CloseState,
     shared_input: Option<(InputStream, i64)>,
     main_transition: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
@@ -503,7 +504,7 @@ impl Cleanup {
             self.retire_media=false;
         }
         if self.close {
-            if let Err(error)=crate::aux_setup::close(&session.control,kind).await {crate::emit_log(&format!("AUX-AUDIO: {:?} pending stream cleanup: {error}",kind));return false;}
+            if let Err(error)=crate::aux_setup::close(&session.control,kind,&mut self.close_state).await {crate::emit_log(&format!("AUX-AUDIO: {:?} pending stream cleanup: {error}",kind));return false;}
             self.close=false;allocated[index(kind)].store(false,Ordering::Release);
         }
         if let Some((input, id)) = self.shared_input {
@@ -541,6 +542,7 @@ async fn start(kind:Kind,session:&Session,input:&Input,commands:&mpsc::Unbounded
         }
     }
     allocated[index(kind)].store(true,Ordering::Release);
+    cleanup.close_state=crate::aux_setup::CloseState::default(); // A new stream lifecycle, not a cleanup retry.
     match crate::aux_setup::open(&session.control,&session.factory,&session.params,&session.shared,&session.info,kind).await {
         Ok(mut output)=>{
             if !lease.valid(session) {
@@ -555,10 +557,11 @@ async fn start(kind:Kind,session:&Session,input:&Input,commands:&mpsc::Unbounded
         }
         Err(error)=>{
             cleanup.close=!error.cleanup_confirmed;
+            cleanup.close_state=error.cleanup_state;
             if error.cleanup_confirmed {allocated[index(kind)].store(false,Ordering::Release);}
             let cleaned=cleanup.run(kind,session,commands,allocated,false).await;
             if cleaned {Err(StartError::Failed(error.to_string()))}
-            else if kind == Kind::Navigation && session.params.head_unit_profile == "bmw_id9" {
+            else if kind == Kind::Navigation {
                 Err(StartError::AwaitNavigationCleanup(error.to_string()))
             }
             else {Err(StartError::Refused(format!("cleanup/recovery pending: {error}")))}

@@ -24,6 +24,31 @@ class WifiApHintTest {
         assertNull(WifiApHint.fromScan(scan,"Beam Pro 2","3e:af:6d:8e:33:09"))
     }
 
+    @Test fun rememberedSuccessfulApDisambiguatesSameNameOnlyWithFreshScan() {
+        val other = scan.replace("3e:af:6d:8e:33:09", "3e:af:6d:8e:33:0a")
+        val remembered = "3E:AF:6D:8E:33:09"
+        assertEquals("3e:af:6d:8e:33:09",
+            WifiApHint.fromScan(scan + "\n" + other, "Beam Pro", null, remembered)!!.bssid)
+        assertTrue(WifiApHint.fromScan(scan + "\n" + other, "Beam Pro", null, remembered)!!.fromMemory)
+        assertNull(WifiApHint.fromScan(other + "\n" + other.replace("33:0a", "33:0b"),
+            "Beam Pro", null, remembered))
+        assertNull(WifiApHint.fromScan(scan.replace("2.203", "30.001") + "\n" + other + "\n" +
+            other.replace("33:0a", "33:0b"), "Beam Pro", null, remembered))
+        assertNull(WifiApHint.fromScan(scan + "\n" + other, "another SSID", null, remembered))
+        // A newly corroborated peer hint wins over historical AP information.
+        assertEquals("3e:af:6d:8e:33:0a",
+            WifiApHint.fromScan(scan + "\n" + other, "Beam Pro", "3e:af:6d:8e:33:0a", remembered)!!.bssid)
+        assertFalse(WifiApHint.fromScan(scan + "\n" + other, "Beam Pro", "3e:af:6d:8e:33:0a", remembered)!!.fromMemory)
+    }
+
+    @Test fun rememberedApDoesNotPreventFallbackWhenCarChangesItsAp() {
+        assertEquals("3e:af:6d:8e:33:09",
+            WifiApHint.fromScan(scan, "Beam Pro", null, "3e:af:6d:8e:33:ff")!!.bssid)
+        assertFalse(WifiApHint.fromScan(scan, "Beam Pro", null, "3e:af:6d:8e:33:ff")!!.fromMemory)
+        assertNull(WifiApHint.fromScan(scan + "\n" + scan.replace("33:09", "33:0a"),
+            "Beam Pro", null, "01:af:6d:8e:33:09"))
+    }
+
     @Test fun prefersTheApMatchingTheDeviceIdentifier() {
         val older="  3e:af:6d:8e:33:09       5745        -38             9.500    Beam Pro                          [WPA2-PSK][ESS]"
         val newer="  3e:af:6d:8e:33:0a        5745        -52             0.500    Beam Pro                          [WPA2-PSK][ESS]"

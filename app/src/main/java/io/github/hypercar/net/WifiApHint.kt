@@ -3,13 +3,14 @@ package io.github.hypercar.net
 import kotlinx.coroutines.CancellationException
 
 /** A recent scan can identify an AP; an iAP2 device identifier alone cannot. */
-internal data class WifiApHint(val bssid: String, val frequency: Int, val ageSeconds: Double) {
+internal data class WifiApHint(val bssid: String, val frequency: Int, val ageSeconds: Double,
+    val fromMemory: Boolean = false) {
     companion object {
         private val row = Regex("^\\s*([0-9a-fA-F:]{17})\\s+(\\d+)\\s+(-?\\d+)\\s+([0-9.]+)\\s+(.*?)\\s{2,}\\[.*$")
         internal const val MAX_SCAN_AGE_SECONDS = 30.0
         internal const val SCAN_WAIT_MS = 2_400L
 
-        fun fromScan(text: String, ssid: String, deviceIdentifierCandidate: String?): WifiApHint? {
+        fun fromScan(text: String, ssid: String, deviceIdentifierCandidate: String?, rememberedBssid: String? = null): WifiApHint? {
             if (ssid.isBlank()) return null
             val preferred = CarNetworkReuse.mac(deviceIdentifierCandidate)?.takeIf { usable(it) }
             val candidates = text.lineSequence().mapNotNull { line ->
@@ -26,6 +27,9 @@ internal data class WifiApHint(val bssid: String, val frequency: Int, val ageSec
             // Prefer only a corroborated device/AP match. Without one, multiple BSSIDs sharing
             // an SSID are ambiguous; scan age alone does not identify the intended receiver.
             candidates.filter { it.bssid == preferred }.minByOrNull { it.ageSeconds }?.let { return it }
+            // History only disambiguates APs present in this fresh, exact-SSID scan.
+            val remembered = CarWifiApMemory.normalize(rememberedBssid)
+            candidates.filter { it.bssid == remembered }.minByOrNull { it.ageSeconds }?.let { return it.copy(fromMemory = true) }
             return candidates.groupBy { it.bssid }.values.singleOrNull()?.minByOrNull { it.ageSeconds }
         }
 
@@ -36,10 +40,11 @@ internal data class WifiApHint(val bssid: String, val frequency: Int, val ageSec
             scan: suspend () -> String,
             startScan: suspend () -> Unit,
             now: () -> Long,
+            rememberedBssid: () -> String? = { null },
         ): WifiApHint? {
             suspend fun lookup(): WifiApHint? {
                 val text = scan()
-                return fromScan(text, ssid, deviceIdentifier()) // identity may arrive during the scan
+                return fromScan(text, ssid, deviceIdentifier(), rememberedBssid()) // identity may arrive during the scan
             }
             return try {
                 lookup() ?: run {

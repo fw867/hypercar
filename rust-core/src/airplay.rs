@@ -818,43 +818,26 @@ pub(crate) async fn activate_screen_before_handoff(
     Ok(retry_screen)
 }
 
-pub(crate) fn independent_audio_kinds(p: &AirplayParams, info: &Value) -> &'static [crate::aux_setup::Kind] {
+pub(crate) fn independent_audio_kinds(_p: &AirplayParams, info: &Value) -> &'static [crate::aux_setup::Kind] {
     use crate::aux_setup::{supports, Kind};
-    // This receiver's CarWith rate watch is present as soon as its source is attached,
-    // even if 9240 has never sent INIT. Only the navigation worker consumes 9241.
-    if p.head_unit_profile == "bmw_id9" {
-        if !p.nbt_audio_first && !p.desktop_receiver
-            && p.carwith_media_rate.is_some() && supports(info, Kind::Navigation) {
-            return &[Kind::Navigation];
-        }
-        return &[];
+    // Navigation has the same format and resource lifecycle for every PCM source.
+    // Only this session's declared output capability authorizes its independent lane.
+    let navigation = supports(info, Kind::Navigation);
+    // Speech still borrows/restores main audio through SpeechResource. Select
+    // that implemented lane from its exact output declaration, not identity.
+    let speech = supports(info, Kind::Speech);
+    match (speech, navigation) {
+        (true, true) => &[Kind::Speech, Kind::Navigation],
+        (true, false) => &[Kind::Speech],
+        (false, true) => &[Kind::Navigation],
+        (false, false) => &[],
     }
-    if independent_audio_receiver(p.bmw_capabilities,p.nbt_audio_first,p.id9_screen_bootstrap,p.desktop_receiver,info) {
-        &[Kind::Speech, Kind::Navigation]
-    } else {
-        &[]
-    }
-}
-
-fn independent_audio_receiver(bmw:bool,nbt:bool,id9:bool,desktop:bool,info:&Value)->bool {
-    !nbt && !id9 && ((bmw && !desktop) || is_diplay_receiver(info))
 }
 
 pub(crate) fn is_diplay_receiver(info: &Value) -> bool {
     ["name", "model", "manufacturer"].into_iter().any(|key|
         info.get(key).and_then(Value::as_str).is_some_and(|v| v.to_ascii_lowercase().contains("diplay")))
 }
-#[test]
-fn diplay_can_validate_independent_audio_without_enabling_other_desktop_receivers() {
-    let info=|model| Value::dict(vec![("model",Value::str(model))]);
-    assert!(independent_audio_receiver(true,false,false,true,&info("DiPlay")));
-    assert!(independent_audio_receiver(false,false,false,true,&info("DiPlay")));
-    assert!(!independent_audio_receiver(false,false,false,true,&info("WinPlay")));
-    assert!(!independent_audio_receiver(true,false,true,false,&info("IDC23")));
-    assert!(!independent_audio_receiver(true,true,false,false,&info("NBT")));
-    assert!(independent_audio_receiver(true,false,false,false,&info("MGU")));
-}
-
 fn should_request_bluetooth_handoff(box_bootstrap: bool, desktop_receiver: bool, skip: bool) -> bool {
     box_bootstrap && !desktop_receiver && !skip
 }
@@ -2589,7 +2572,7 @@ mod display_size_tests {
         assert_eq!(media_setup_candidates(&both,"auto",true,true,Some(&rx)).await,[Aac,Pcm,Aac441]);
         tx.send_replace(None);
         assert_eq!(media_setup_candidates(&both,"auto",false,true,Some(&rx)).await,[Pcm,Aac,Aac441]);
-        assert_eq!(media_setup_candidates(&both,"auto",false,true,None).await,[Pcm,Aac]);
+        assert_eq!(media_setup_candidates(&both,"auto",false,true,None).await,[Pcm,Aac,Aac441]);
     }
 
     #[test]
@@ -2614,7 +2597,7 @@ mod display_size_tests {
             }
         }
         assert_eq!(audio_candidates(&info, "auto", false), [AudioCodec::Pcm, AudioCodec::Aac, AudioCodec::Aac441]);
-        assert_eq!(audio_candidates(&info, "auto", true), [AudioCodec::Pcm, AudioCodec::Aac]);
+        assert_eq!(audio_candidates(&info, "auto", true), [AudioCodec::Pcm, AudioCodec::Aac, AudioCodec::Aac441]);
     }
     #[test]
     fn aac_setup_and_candidates_follow_declared_media_output_before_pcm_default() {
@@ -2652,7 +2635,7 @@ mod display_size_tests {
             format(102, "media", "audioOutputFormats", 1 << 22),
         ]))]);
         assert_eq!(audio_candidates(&info, "auto", false), [Pcm441, Aac441, Pcm]);
-        assert!(audio_candidates(&info, "auto", true).is_empty());
+        assert_eq!(audio_candidates(&info, "auto", true), [Pcm441, Aac441]);
     }
     #[test]
     fn desktop_info_overrides_bmw_bootstrap_without_weakening_real_car_grants() {
@@ -3473,6 +3456,11 @@ pub(crate) async fn buffered_fallback_candidates(p: &AirplayParams, info: &Value
     let strict = p.id9_screen_bootstrap || (p.mbux_media_compat && !p.desktop_receiver);
     let mut candidates = media_setup_candidates(info, &p.audio_codec, false, strict, p.carwith_media_rate.as_ref()).await;
     candidates.retain(|codec| declares_media(info, *codec));
+    // Before general 44.1 selection, strict/no-source recovery appended AAC44.1
+    // then PCM44.1 after its 48 kHz candidates. Preserve that recovery order.
+    if strict && p.carwith_media_rate.is_none() {
+        candidates.sort_by_key(|codec| match codec { AudioCodec::Aac441 => 1, AudioCodec::Pcm441 => 2, _ => 0 });
+    }
     // A receiver can declare only a 44.1 kHz fallback, even without a CarWith source.
     for codec in [AudioCodec::Aac441, AudioCodec::Pcm441] {
         if (p.audio_codec != "pcm" || codec.stream_type() == 100) && declares_media(info, codec)
@@ -3514,16 +3502,93 @@ async fn media_setup_candidates(info: &Value, preference: &str, nbt: bool, stric
     plan
 }
 fn nbt_audio_candidates(info: &Value, preference: &str) -> Vec<AudioCodec> {
-    let candidates = if preference=="pcm" { vec![AudioCodec::Pcm] }
-        else {vec![AudioCodec::Aac441,AudioCodec::Aac,AudioCodec::Pcm]};
+    let candidates = if preference=="pcm" { vec![AudioCodec::Pcm,AudioCodec::Pcm441] }
+        else {vec![AudioCodec::Aac441,AudioCodec::Aac,AudioCodec::Pcm,AudioCodec::Pcm441]};
     candidates.into_iter().filter(|codec|declares_media(info,*codec)).collect()
+}
+
+#[cfg(test)]
+mod capability_audio_selection_tests {
+    use super::*;
+    use crate::aux_setup::Kind;
+    fn format(kind: i64, role: &str, direction: &str, bits: i64) -> Value {
+        Value::dict(vec![("type",Value::int(kind)),("audioType",Value::str(role)),(direction,Value::int(bits))])
+    }
+    fn info(formats: Vec<Value>) -> Value { Value::dict(vec![("audioFormats",Value::array(formats))]) }
+
+    #[test]
+    fn speech_requires_declared_output_for_every_profile() {
+        let output = info(vec![format(100,"speechRecognition","audioOutputFormats",1<<29)]);
+        let mut p = buffered_profile_params_for_test();
+        for profile in ["bmw_id85","bmw_id9","bmw_id6","mercedes_mbux","generic","desktop","remote"] {
+            p.head_unit_profile=profile.into();
+            p.bmw_capabilities=profile.starts_with("bmw_");
+            p.id9_screen_bootstrap=profile=="bmw_id9";
+            p.nbt_audio_first=profile=="bmw_id6";
+            p.desktop_receiver=profile=="desktop";
+            assert_eq!(independent_audio_kinds(&p,&output), &[Kind::Speech], "{profile}");
+            for wrong in [info(vec![]), info(vec![format(100,"speechRecognition","audioInputFormats",1<<29)]),
+                info(vec![format(100,"media","audioOutputFormats",1<<29)]),
+                info(vec![format(101,"speechRecognition","audioOutputFormats",1<<29)]),
+                info(vec![format(100,"speechRecognition","audioOutputFormats",1<<28)]),
+                info(vec![format(100,"speechRecognition","audioOutputFormats",-1)])] {
+                assert!(independent_audio_kinds(&p,&wrong).is_empty(), "{profile}");
+            }
+        }
+    }
+
+    #[test]
+    fn declared_44100_formats_survive_strict_nbt_and_user_preferences() {
+        use AudioCodec::*;
+        let only441=info(vec![format(100,"media","audioOutputFormats",1<<11),format(102,"media","audioOutputFormats",1<<22)]);
+        for strict in [false,true] {
+            let mut auto=vec![Pcm441,Aac441];
+            let mut pcm=vec![Pcm441];
+            let mut aac=vec![Aac441,Pcm441];
+            if !strict {auto.push(Pcm);pcm.push(Pcm);aac.push(Pcm);}
+            assert_eq!(audio_candidates(&only441,"auto",strict), auto);
+            assert_eq!(audio_candidates(&only441,"pcm",strict), pcm);
+            assert_eq!(audio_candidates(&only441,"aac",strict), aac);
+        }
+        assert_eq!(nbt_audio_candidates(&only441,"auto"), [Aac441,Pcm441]);
+        assert_eq!(nbt_audio_candidates(&only441,"pcm"), [Pcm441]);
+        let all=info(vec![format(100,"media","audioOutputFormats",(1<<11)|(1<<15)),format(102,"media","audioOutputFormats",(1<<22)|(1<<23))]);
+        for strict in [false,true] {
+            assert_eq!(audio_candidates(&all,"auto",strict), [Pcm,Aac,Pcm441,Aac441]);
+            assert_eq!(audio_candidates(&all,"aac",strict), [Aac,Aac441,Pcm,Pcm441]);
+            assert_eq!(audio_candidates(&all,"pcm",strict), [Pcm,Pcm441]);
+        }
+        assert_eq!(nbt_audio_candidates(&all,"auto"), [Aac441,Aac,Pcm,Pcm441]);
+        let invalid=info(vec![format(100,"media","audioInputFormats",1<<11),format(102,"default","audioOutputFormats",1<<22)]);
+        assert!(audio_candidates(&invalid,"auto",true).is_empty());
+        assert!(nbt_audio_candidates(&invalid,"auto").is_empty());
+    }
+
+    #[tokio::test]
+    async fn buffered_recovery_retains_existing_order_and_carwith_rate_ranking() {
+        use AudioCodec::*;
+        let formats=info(vec![format(100,"media","audioOutputFormats",(1<<11)|(1<<15)),
+            format(102,"media","audioOutputFormats",(1<<22)|(1<<23))]);
+        let mut p=buffered_profile_params_for_test();
+        for preference in ["auto","aac"] {
+            p.audio_codec=preference.into();
+            assert_eq!(buffered_fallback_candidates(&p,&formats).await, [Aac,Pcm,Aac441,Pcm441]);
+        }
+        p.audio_codec="pcm".into();
+        assert_eq!(buffered_fallback_candidates(&p,&formats).await, [Pcm,Pcm441]);
+        p.audio_codec="auto".into();
+        let only441=info(vec![format(100,"media","audioOutputFormats",1<<11),format(102,"media","audioOutputFormats",1<<22)]);
+        assert_eq!(buffered_fallback_candidates(&p,&only441).await, [Aac441,Pcm441]);
+        let (_tx,rx)=tokio::sync::watch::channel(Some(44100));
+        p.carwith_media_rate=Some(rx);
+        assert_eq!(buffered_fallback_candidates(&p,&only441).await, [Pcm441,Aac441]);
+    }
 }
 fn audio_candidates(info: &Value, preference: &str, strict: bool) -> Vec<AudioCodec> {
     use AudioCodec::*;
     let ordered: &[_] = match preference {
-        "pcm" => &[Pcm],
-        "aac" => &[Aac, Pcm],
-        _ if strict => &[Pcm, Aac],
+        "pcm" => &[Pcm, Pcm441],
+        "aac" => &[Aac, Aac441, Pcm, Pcm441],
         _ => &[Pcm, Aac, Pcm441, Aac441],
     };
     let mut candidates: Vec<_> = ordered.iter().copied().filter(|&codec| declares_media(info, codec)).collect();

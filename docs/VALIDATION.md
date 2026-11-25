@@ -1,5 +1,22 @@
 # 验证记录与边界
 
+## Android 独立原生测试的退出方式
+
+Windows 下用 `tools/run-android-native-tests.ps1` 运行已编译的 arm64 原生测试：
+
+```powershell
+# 设置 ANDROID_HOME / ANDROID_NDK_HOME，或显式传入 -AdbPath / -NdkPath。
+.\tools\run-android-native-tests.ps1 -TestBinary '<test executable>' -Serial '<adb serial>' -TestArguments @('engine::', '--test-threads=1')
+```
+
+启动器会创建隔离的设备临时目录，并仅为测试子进程加载退出适配库。
+适配库原样保留退出状态，使用 `_Exit(status)` 避开 Codec2 进程全局缓冲池
+对象析构与 detached 维护线程之间的 mutex 竞态；测试函数局部资源及运行时
+仍按正常 Rust 规则析构，panic/abort 信号不拦截。它不编译进 APK，也不用于
+验证 C/C++ 全局析构。需要核验原始系统退出行为时加 `-PlatformTeardown`。
+首次定位的系统栈和应用 AAC 工作线程清理修复见
+[排查记录](superpowers/plans/2026-11-25-native-mutex-exit.md)。
+
 ## 2026-11-22 所有档案的 CarWith 超宽原生尺寸输出（604 同批）
 
 审查并rebase合并PR #64（a16da48），其原修改只把ID9的超宽策略扩展到ID8.5。随后将Router::for_carwith_profile的适用条件统一为profile.is_some()：所有本地或动态车机档案在CarWith模式均使用同一规则，主屏任一边>2560时即使源比例接近也尝试按主屏真实尺寸转码。<=2560仍沿用3%比例差规则；None自绘不启用CarWith转码。源端请求上限、源画布、触摸映射、失败锁存回源及资源释放保持现有路径。

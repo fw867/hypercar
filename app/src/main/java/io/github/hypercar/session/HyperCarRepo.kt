@@ -2638,6 +2638,34 @@ object HyperCarRepo {
 
     // ---------------------------------------------------------------- WiFi
 
+    /** Learn only from a successful current engine's Network, never from a scan or receiver MAC. */
+    private suspend fun rememberSuccessfulHotspotBssid(context: Context, receiver: String, ssid: String,
+        network: Network, attempt: Long, engine: Long) {
+        fun current() = sessionLive.get() && streaming && connectionAttemptId == attempt &&
+            engineCallbacks.current() == engine && sessionSockets?.network == network && boundNetwork == network &&
+            (sessionWifiSsid ?: joinedSsid) == ssid
+        if (!current()) return
+        val cm = context.getSystemService(ConnectivityManager::class.java) ?: return
+        val caps = cm.getNetworkCapabilities(network) ?: return
+        if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return
+        val addresses = cm.getLinkProperties(network)?.linkAddresses?.mapNotNull { it.address.hostAddress }?.toSet().orEmpty()
+        if (addresses.isEmpty()) return
+        val info = caps.transportInfo as? android.net.wifi.WifiInfo
+        var ap = io.github.hypercar.net.CarWifiApMemory.normalize(info?.bssid)
+        if (ap == null && ShizukuTools.isReady) {
+            val status = ShizukuTools.exec("timeout 2 cmd wifi status", 3_000)
+            if (status.code == 0) ap = io.github.hypercar.net.CarWifiApMemory.fromStatus(status.out, addresses)
+        }
+        autoConnectChanges.withLock {
+            if (!current() || cm.getLinkProperties(network)?.linkAddresses?.mapNotNull { it.address.hostAddress }?.toSet() != addresses)
+                return@withLock
+            if (ap != null) {
+                SettingsStore.rememberCarHotspotBssid(receiver, ssid, ap)
+                log("WIFI-AP-MEMORY: 成功会话的 AP 已记住，下次需新鲜扫描核验；不记录 AP 地址")
+            } else log("WIFI-AP-MEMORY: 本轮未取得可靠 AP 地址，保留原记录")
+        }
+    }
+
     private suspend fun wifiStationMac(context: Context, network: Network): String? {
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return null
         val caps = cm.getNetworkCapabilities(network) ?: return null
@@ -3007,6 +3035,8 @@ object HyperCarRepo {
             push(link = LinkState.Negotiating("连接车机局域网，首次请确认系统提示"))
             log("WIFI: 加入热点 $ssid，方式=HyperCar 专用局域网（最多60s）；其它 App 保留系统互联网")
             when (val result = joiner.joinCarHotspotSilently(ssid, psk,
+                rememberedBssid = SettingsStore.carHotspotBssid(
+                    currentBluetoothHotspot(attempt)?.peer ?: sessionReceiverMac ?: wifiReceiverMac ?: SettingsStore.targetCarMac, ssid),
                 alreadyAssociated = {
                     ensureCurrent()
                     if (replacingCredentials) null
@@ -3144,6 +3174,7 @@ object HyperCarRepo {
             log("CAR-WIFI-RESUME: 尝试重新接入已配对车机的专用 Wi-Fi")
             val result = withTimeoutOrNull(12_000) {
                 joiner.joinCarHotspotSilently(credentials.ssid, credentials.passphrase,
+                    rememberedBssid = SettingsStore.carHotspotBssid(receiver, credentials.ssid),
                     submitRequest = { request -> restoreBlockReason() == null && submitRequest(request) })
             }
             val network = (result as? WifiJoiner.JoinResult.Joined)?.network
@@ -3871,7 +3902,13 @@ object HyperCarRepo {
                                 }
                             }
                             val rememberedSsid = sessionWifiSsid ?: joinedSsid
-                            if (!rememberedSsid.isNullOrBlank()) SettingsStore.rememberCarNetwork(rememberedSsid, mac)
+                            if (!rememberedSsid.isNullOrBlank()) {
+                                SettingsStore.rememberCarNetwork(rememberedSsid, mac)
+                                val network = sessionSockets?.network
+                                if (context != null && network != null) scope.launch {
+                                    rememberSuccessfulHotspotBssid(context, mac, rememberedSsid, network, diagnosticId, callbackOwner)
+                                }
+                            }
                             val from = when {
                                 mac.equals(iap2?.activePeerAddress, true) -> "当前 iAP2 对端"
                                 mac.equals(sessionReceiverMac, true) -> "本轮凭证身份"
