@@ -2335,7 +2335,8 @@ object HyperCarRepo {
                         sessionUiJob = null
                     }
                     CarUiCaster.stopAsync()
-                    DexCaster.stopAsync()
+                    // DeX 只在本次会话确实用过时才清理，避免普通自绘模式连带释放。
+                    if (sessionSourceIsDex || DexCaster.running) DexCaster.stopAsync()
                     MusicBridge.onCarDisconnected()
                     // Every failed activation consumes its invitation. CAS preserves a newer
                     // invitation arriving during negotiation, even from the same address.
@@ -2596,7 +2597,7 @@ object HyperCarRepo {
         sessionUiJob?.cancel()
         sessionUiJob = null
         CarUiCaster.stopAsync()
-        DexCaster.stopAsync()
+        if (sessionSourceIsDex || DexCaster.running) DexCaster.stopAsync()
         // 在解绑网络、结束蓝牙旧会话之前完成有界业务退出；断网/EOF 路径只强制清理。
         runCatching {
             if (graceful) log("SESSION-CLOSE: graceful completed=${RustCoreBridge.nativeStopGracefully()}")
@@ -4724,6 +4725,14 @@ object HyperCarRepo {
             val ctx = appContext()
             if (ctx == null) {
                 log("DEX-DBG: 上下文为空")
+                return@launch
+            }
+            // 调试入口与会话互斥：投屏中再起一编码器会往同一条 native 视频链路送帧，还会抢触摸回调。
+            if (!io.github.hypercar.carui.DexSessionPolicy.canStartDebugDex(
+                    sessionLive.get(), streaming, DexCaster.running, CarUiCaster.running,
+                )
+            ) {
+                log("DEX-DBG: 会话进行中（来源=${SettingsStore.carSource}），跳过调试启动")
                 return@launch
             }
             val msg = runCatching { DexCaster.start(ctx) }

@@ -42,6 +42,9 @@ object DexCaster {
     private val main = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    /** 与 CarUiCaster 一致：启动/停止串行化，并用会话代次挡住旧任务清理新会话。 */
+    private val lifecycle = SessionResourceLifecycle()
+
     private var caster: SpikeCaster? = null
     @Volatile private var displayId = -1
     private var width = 1920
@@ -72,6 +75,13 @@ object DexCaster {
             runCatching { RustCoreBridge.nativeSetVideoSize(width, height) }
             return "已经在跑（display=$displayId，${width}x$height）"
         }
+        val ticket = lifecycle.ticket()
+        return lifecycle.start(ticket, current, ::stopLocked) {
+            startLocked(context.applicationContext) { lifecycle.isCurrent(ticket) && current() }
+        } ?: "会话已停止，取消 DeX 启动"
+    }
+
+    private suspend fun startLocked(context: Context, current: () -> Boolean): String {
         val plan = SettingsStore.encodingPlan.encoderCandidates().firstOrNull()
             ?: return "没有可用的编码方案"
         width = plan.width
@@ -173,7 +183,7 @@ object DexCaster {
             if (overlayId > 0 && !created.startsWith("OK")) {
                 next.stop()
                 caster = null
-                releaseOverlayDisplay()
+                releaseOverlayDisplayNow()
                 return "叠加视图镜像失败: $created（overlay=$overlayId）"
             }
             id = if (overlayId > 0) {
@@ -399,14 +409,6 @@ object DexCaster {
         }
     }
 
-    private fun releaseOverlayDisplay() {
-        if (!overlayMode) return
-        overlayMode = false
-        scope.launch {
-            runCatching { ShizukuTools.exec("settings put global overlay_display_devices \"\"", 4_000) }
-        }
-    }
-
 
     private fun holdCpuAwake(context: Context) {
         runCatching {
@@ -420,10 +422,18 @@ object DexCaster {
     }
 
     fun stopAsync() {
-        scope.launch { stopLocked() }
+        val retired = lifecycle.retire()
+        scope.launch { lifecycle.stop(retired, ::stopLocked) }
     }
 
-    private fun stopLocked() {
+    /**
+     * 只清理属于 DeX 会话的资源。普通自绘模式的断开流程也会转到这里，所以：
+     *  - 没起过 DeX（没有任何 DeX 资源）就直接返回，不碰共享的音频采集与触摸回调；
+     *  - shell 用户服务是共享的（地图卡片、高德投射也在用），不在这里解绑，
+     *    否则会把正在保留的地图屏和导航任务一起销毁。
+     */
+    private suspend fun stopLocked() {
+        if (!DexSessionPolicy.ownsResources(running, displayId, mirrorDisplayId, caster != null, overlayMode)) return
         release("audio") { CarAudioCapture.stop() }
         release("touch") { RustCoreBridge.setTouchListener(null) }
         if (mirrorDisplayId > 0) {
@@ -432,15 +442,14 @@ object DexCaster {
         }
         if (displayId > 0 && !overlayMode) release("display") { SpikeShell.releaseDisplay(displayId) }
         displayId = -1
-        if (overlayMode) releaseOverlayDisplay()
+        // 叠加屏是全局设置：必须在串行区内同步清掉，否则会删掉下一轮刚建的屏。
+        if (overlayMode) releaseOverlayDisplayNow()
         release("encoder") { caster?.stop() }
         caster = null
         running = false
         release("wake lock") { cpuLock?.takeIf { it.isHeld }?.release() }
         cpuLock = null
-        // 会话结束就解绑 user service：否则 Shizuku 的 :spike 进程会一直留着（还会缓存旧设置）。
-        release("shell") { SpikeShell.disconnect() }
-        HyperCarRepo.log("DEX: 投屏已停止（DeX 屏、编码器与 shell 服务已释放）")
+        HyperCarRepo.log("DEX: 投屏已停止（DeX 屏与编码器已释放，共享 shell 服务保留）")
     }
 
     private inline fun release(resource: String, block: () -> Unit) {
