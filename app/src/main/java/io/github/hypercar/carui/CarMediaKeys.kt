@@ -5,16 +5,17 @@ import android.view.KeyEvent
 
 internal object CarMediaKeys {
     fun requestsPlayback(usage: Int, state: Int?): Boolean =
-        usage == 0xB0 || (usage == 0xCD && (state == PlaybackState.STATE_PAUSED || state == PlaybackState.STATE_STOPPED))
+        usage == 0xB0 || usage == 0xB9 || (usage == 0xCD && (state == PlaybackState.STATE_PAUSED || state == PlaybackState.STATE_STOPPED))
 
     fun keyCode(usage: Int): Int = when (usage) {
-        0xB0 -> KeyEvent.KEYCODE_MEDIA_PLAY
+        // The reference box treats Consumer B9 as Play (rather than Stop).
+        0xB0, 0xB9 -> KeyEvent.KEYCODE_MEDIA_PLAY
         0xB1 -> KeyEvent.KEYCODE_MEDIA_PAUSE
         0xB3 -> KeyEvent.KEYCODE_MEDIA_FAST_FORWARD
         0xB4 -> KeyEvent.KEYCODE_MEDIA_REWIND
         0xB5 -> KeyEvent.KEYCODE_MEDIA_NEXT
         0xB6 -> KeyEvent.KEYCODE_MEDIA_PREVIOUS
-        0xB7, 0xB9 -> KeyEvent.KEYCODE_MEDIA_STOP
+        0xB7 -> KeyEvent.KEYCODE_MEDIA_STOP
         0xCD -> KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
         else -> 0
     }

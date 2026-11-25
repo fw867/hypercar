@@ -23,6 +23,16 @@ class CarHotspotReconnectTest {
     private val receiver = "02:11:22:33:44:AA"
     private val other = "02:11:22:33:44:BB"
 
+    @Test fun pendingJoinRetriesWhenOnlyTheAuthenticationModeChanges() {
+        val hotspot = checkNotNull(BluetoothHotspot.fromPeer(receiver, "CAR-WIFI"))
+        val inbox = CarHotspotReconnect.EndpointInbox(hasFreshCredentials = { it.canRequestHotspot(hotspot) })
+        val old = CarPlayEndpoint(hotspot.ssid, "password", 0, null, null, null, emptyList(), null,
+            bluetoothHotspot = hotspot, wifiSecurityType = 2)
+        inbox.offer(old.copy(wifiSecurityType = 4))
+        assertTrue(inbox.shouldRetryJoin(old))
+        assertFalse(inbox.shouldRetryJoin(old.copy(wifiSecurityType = 4)))
+    }
+
     @Test
     fun manualReconnectToASelectedPairedCarMayRestoreWifi() {
         assertNull(CarHotspotReconnect.credentialBlockReason(receiver, receiver.lowercase(), paired = true, desktop = false))

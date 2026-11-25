@@ -3107,10 +3107,7 @@ const CONTROLLER_FEATURES: &[&str] = &[
     "h.264Level5.1",
     "enhancedSiri",
     "hevc",
-    "sessionManagement",
-    "logTransfer",
     "iAPChannel",
-    "vehicleStateProtocol",
     "videoPlayback",
 ];
 
@@ -3123,11 +3120,10 @@ fn session_features(mbux: bool, id9: bool, media_compat: bool) -> Vec<Value> {
 
 // Codec preference is capability-gated across every profile. Keep all other profile
 // compatibility switches independent. UDP Main/MainHigh are not MainBuffered.
-fn video_session_features(mbux:bool,id9:bool,compat:bool,bmw:bool,prefer_hevc:bool)->Vec<Value> {
+fn video_session_features(mbux:bool,id9:bool,compat:bool,_bmw:bool,prefer_hevc:bool)->Vec<Value> {
     let mut features:Vec<_>=session_features(mbux,id9,compat).into_iter().filter(|feature| {
         let name=feature.as_str().unwrap_or("");
-        (name!="hevc" || prefer_hevc) &&
-        !(bmw && matches!(name,"sessionManagement"|"logTransfer"|"vehicleStateProtocol"))
+        name!="hevc" || prefer_hevc
     }).collect();
     if prefer_hevc && !features.iter().any(|f|f.as_str()==Some("hevc")) {features.push(Value::str("hevc"));}
     features
@@ -3166,6 +3162,21 @@ fn bmw_capabilities_match_implemented_paths_and_hevc_is_opt_in() {
     assert!(negotiated_hevc(true,&accepted));
     assert!(!negotiated_hevc(false,&accepted));
     assert!(!negotiated_hevc(true,&Value::dict(vec![])));
+}
+
+#[test]
+fn every_profile_omits_unimplemented_controller_features() {
+    for mbux in [false,true] { for id9 in [false,true] { for compat in [false,true] { for bmw in [false,true] {
+        for proposed in [session_features(mbux,id9,compat), video_session_features(mbux,id9,compat,bmw,true)] {
+            for absent in ["sessionManagement", "logTransfer", "vehicleStateProtocol"] {
+                assert!(!proposed.iter().any(|f| f.as_str() == Some(absent)), "unsupported {absent} profile={mbux}/{id9}/{compat}/{bmw}");
+            }
+            assert!(proposed.iter().any(|f| f.as_str() == Some("viewAreas")));
+            if !mbux { for present in ["uiContext", "focusTransfer", "iAPChannel", "videoPlayback"] {
+                assert!(proposed.iter().any(|f| f.as_str() == Some(present)));
+            }}
+        }
+    }}}}
 }
 
 fn build_session_setup(device_id: &str, device_name: &str, timing_port: u16, encrypted: bool, mbux: bool, id9: bool, media_compat: bool, request_receiver_stats: bool) -> Vec<u8> {

@@ -30,6 +30,8 @@ internal class WifiJoinDiagnostics(
     private val wifi = context.applicationContext.getSystemService(WifiManager::class.java)
     private var previousStation: String? = null
     private var removeListener: (() -> Unit)? = null
+    @Volatile private var failureCode: Int? = null
+    val failureStage: String? get() = failureCode?.let(::failureReason)
 
     fun log(message: String) = output("request_id=$id elapsed_ms=${SystemClock.elapsedRealtime() - started} $message")
 
@@ -54,7 +56,11 @@ internal class WifiJoinDiagnostics(
     @RequiresApi(34)
     private fun listenForFailure(wifi: WifiManager, specifier: WifiNetworkSpecifier, isCurrent: () -> Boolean): () -> Unit {
         val listener = WifiManager.LocalOnlyConnectionFailureListener { failed, code ->
-            if (isCurrent() && failed == specifier) log("framework_failure=${failureReason(code)} code=$code")
+            if (isCurrent() && failed == specifier) {
+                failureCode = code
+                log("framework_failure=${failureReason(code)} code=$code")
+                scanCache("framework_failure")
+            }
         }
         wifi.addLocalOnlyConnectionFailureListener(Executor { it.run() }, listener)
         return { wifi.removeLocalOnlyConnectionFailureListener(listener) }
@@ -107,8 +113,12 @@ internal class WifiJoinDiagnostics(
     private fun scanCache(phase: String) {
         val snapshot = runCatching {
             val scans = wifi?.scanResults ?: return@runCatching "unavailable"
-            val newest = scans.filter { it.SSID == target }.maxOfOrNull { it.timestamp }
-            "entries=${scans.size} target_seen=${newest != null} newest_age_ms=${newest?.let { (SystemClock.elapsedRealtime() - it / 1000).coerceAtLeast(0) }}"
+            val matches = scans.filter { it.SSID == target }
+            val newest = matches.maxOfOrNull { it.timestamp }
+            // Only protocol characteristics, never SSIDs, BSSIDs or raw vendor capability strings.
+            "entries=${scans.size} target_seen=${newest != null} newest_age_ms=${newest?.let { (SystemClock.elapsedRealtime() - it / 1000).coerceAtLeast(0) }} " +
+                "target_frequencies=${matches.map { it.frequency }.distinct().sorted()} " +
+                "target_psk=${matches.any { it.capabilities.orEmpty().contains("PSK") }} target_sae=${matches.any { it.capabilities.orEmpty().contains("SAE") }}"
         }.getOrElse { "unavailable=${it.javaClass.simpleName}" }
         log("scan_cache phase=$phase $snapshot")
     }
@@ -116,6 +126,7 @@ internal class WifiJoinDiagnostics(
     fun close() {
         runCatching { removeListener?.invoke() }.onFailure { log("failure_listener_remove_error=${it.javaClass.simpleName}") }
         removeListener = null
+        failureCode?.let { log("failure_summary stage=${failureReason(it)} code=$it; framework category only, not peer rejection cause") }
         station()
         scanCache("end_request")
     }

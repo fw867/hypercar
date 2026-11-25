@@ -262,6 +262,28 @@ class Iap2MediaBluetoothTest {
         assertTrue(0x4c01 in channel.sent)
         assertEquals(listOf(0x1d02, 0x1d02, 0x5702), channel.sent.filter { it in setOf(0x1d02, 0xea00, 0x5702) })
         assertEquals(listOf("fixture-ap"), endpoints.map { it.ssid })
+        assertEquals(2, endpoints.single().wifiSecurityType)
+        assertEquals(6, endpoints.single().wifiChannel)
+    }
+
+    @Test fun newHotspotCapabilitiesSurviveAddressOnlyReportsAndDoNotRestoreOldSecurity() {
+        val channel = Channel()
+        val endpoints = mutableListOf<CarPlayEndpoint>()
+        val sender = Iap2SenderSession(channel, {}, onEndpoint = endpoints::add,
+            receiverAddress = "00:11:22:33:44:55", profile = HeadUnitProfiles.WINPLAY, nanoTime = { channel.time })
+        sender.run(10_000)
+        channel.queue += Iap2Csm.encode(0x5703,
+            Iap2Csm.string(1, "new-ap") + Iap2Csm.string(2, "new-password") +
+                Iap2Csm.u8(3, 4) + Iap2Csm.u8(4, 157)) +
+            Iap2Csm.encode(0x4301, Iap2Csm.group(1, Iap2Csm.string(3, "192.168.6.2")) +
+                Iap2Csm.u32(Iap2Messages.START_SESSION_AIRPLAY_PORT, 7200))
+        channel.endWhenEmpty = true
+        sender.pumpIncomingForever()
+        for (endpoint in endpoints.takeLast(2)) {
+            assertEquals("new-ap", endpoint.ssid)
+            assertEquals(4, endpoint.wifiSecurityType)
+            assertEquals(157, endpoint.wifiChannel)
+        }
     }
 
     @Test fun returningMguCarPlayConnectionRequestsCredentialsWithoutOpeningEa() {

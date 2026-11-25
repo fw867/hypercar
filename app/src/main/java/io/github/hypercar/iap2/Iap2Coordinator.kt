@@ -44,8 +44,16 @@ data class CarPlayEndpoint(
     val replayedWifiConfiguration: Iap2Messages.WifiConfiguration? = null,
     /** Queued reports expire on a same-socket DETECT, including copies made by the endpoint inbox. */
     val sourceGeneration: Iap2EndpointGeneration? = null,
+    /** Security/channel from the same current iAP2 hotspot credentials, never from a route alone. */
+    val wifiSecurityType: Int? = null,
+    val wifiChannel: Int? = null,
 ) {
     val verifiedAirplayNetworkHandle: Long? get() = airplayRouteBinding?.networkHandle
+    internal fun matchesHotspotRequest(next: CarPlayEndpoint, associated: Boolean = false): Boolean =
+        ssid?.let { name -> passphrase?.let { password ->
+            io.github.hypercar.net.CarWifiRequestIdentity(name, password, wifiSecurityType)
+                .matchesRequest(next.ssid, next.passphrase, next.wifiSecurityType, associated)
+        } } == true
     internal val sourceIsCurrent: Boolean get() = sourceGeneration?.isCurrent != false
 
     internal fun whileSourceCurrent(action: () -> Unit): Boolean =

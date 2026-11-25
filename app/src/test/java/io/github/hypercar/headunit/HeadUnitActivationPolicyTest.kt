@@ -4,6 +4,18 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class HeadUnitActivationPolicyTest {
+    @Test fun motorcycleAudioExperimentUsesTheSelectedProfileNotItsBmwProtocolAlias() {
+        val motorcycle = HeadUnitProfiles.MOTORCYCLE.connectionPolicy()
+        assertEquals("bmw_id85", motorcycle.protocolProfileId)
+        assertFalse(motorcycle.airplayAudioEnabled)
+        assertTrue(motorcycle.skipBluetoothHandoff)
+        assertTrue(motorcycle.useScreenResourceLifecycle)
+        for (profile in HeadUnitProfiles.builtin.filter { it.id != motorcycle.id }) {
+            assertTrue(profile.id, profile.connectionPolicy().airplayAudioEnabled)
+        }
+        assertFalse(motorcycle.copy(label = "Remote motorcycle", notes = "cached profile").airplayAudioEnabled)
+    }
+
     @Test fun volkswagenRequiresActivationAndKeepsItsInvitationGate() {
         val vw = HeadUnitProfiles.VOLKSWAGEN
         assertTrue(vw.verified)

@@ -954,6 +954,8 @@ class Iap2SenderSession(
             airplayRouteBinding = startSession?.airplayRouteBinding,
             replayedWifiConfiguration = startSession?.replayedWifiConfiguration,
             sourceGeneration = endpointGeneration,
+            wifiSecurityType = (wifi ?: startSession?.wirelessAp)?.securityType,
+            wifiChannel = (wifi ?: startSession?.wirelessAp)?.channel,
         )
 
     // ---- MFi 挑战 ----

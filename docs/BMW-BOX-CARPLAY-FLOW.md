@@ -270,6 +270,8 @@ CarWith 源通过已建立的 CarLife CTRL 连接发送 0x68008；返回、确�
 
 直接读取 ELF 的 0xb1a68 映射表，每项为四个小端 16 位数。盒子还映射了 Consumer 0223/0225（Linux 0xAC/0x9F，主页/前进）、Button 01（0x1C，确认）。另有一个媒体键语义差异：固件 B9 和 B0 均映射到 Linux 0xCF（播放），App 的 CarMediaKeys 将 B9 和 B7 均派发为 MEDIA_STOP。两轮 BMW 成功摘要均无 B9 报告，留存的 BMW 媒体组件也只声明 B0/B5/B6。
 
+2026-11-25（626 同一未提交批次）再次从原始 ELF 核对：0xb1ac8 为 Consumer B0→0xCF，0xb1ae8 为 B7→0x80，0xb1af0 为 B9→0xCF。按用户要求以盒子行为为准，App 将 B9 改为显式 Play，并走 B0 相同的播放音频请求；B7 保持 Stop。这是盒子兼容映射，不把标准 HID Random Play 的名称改称 Stop，亦不据此宣称 BMW 实车已发送 B9。
+
 ### 5001 的字段差异
 
 两轮盒子在 WLAN 收到的 5000 均为 196 字节，回出的 5001 均为 224 字节（均为链路整帧）。现存摘要只留前 16 字节。下表用 18:11 BMW 的完整请求字段日志，对照固件首次回复函数中的 getSubPara 和 addSubPara。字段号为十进制。表中“可写”代表该固件存在加入该字段的路径，实际值或是否带封面还取决于当时源状态。

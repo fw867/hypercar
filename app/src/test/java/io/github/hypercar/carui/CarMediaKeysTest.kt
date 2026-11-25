@@ -6,6 +6,15 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CarMediaKeysTest {
+    @Test fun boxB9RequestsPlaybackAndNeverStopsThePlayer() {
+        assertEquals(KeyEvent.KEYCODE_MEDIA_PLAY, CarMediaKeys.keyCode(0xB9))
+        assertTrue(CarMediaKeys.requestsPlayback(0xB9, PlaybackState.STATE_PAUSED))
+        assertTrue(CarMediaKeys.requestsPlayback(0xB9, null))
+        assertEquals(KeyEvent.KEYCODE_MEDIA_STOP, CarMediaKeys.keyCode(0xB7))
+        var delivered = 0
+        assertEquals("selected-session", CarMediaKeys.dispatch(0xB9, { delivered = it; true }, { fail("duplicate dispatch") }))
+        assertEquals(KeyEvent.KEYCODE_MEDIA_PLAY, delivered)
+    }
     @Test fun onlyExplicitPlayOrAKnownResumeToggleClaimsAudio() {
         assertTrue(CarMediaKeys.requestsPlayback(0xB0, PlaybackState.STATE_PLAYING))
         assertTrue(CarMediaKeys.requestsPlayback(0xCD, PlaybackState.STATE_PAUSED))

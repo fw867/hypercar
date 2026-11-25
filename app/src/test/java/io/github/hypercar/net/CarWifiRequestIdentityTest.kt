@@ -4,6 +4,16 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CarWifiRequestIdentityTest {
+    @Test fun pendingSecurityChangeReplacesRequestButAvailableSameHotspotSurvives() {
+        val identity = CarWifiRequestIdentity("car", "password", 2)
+        assertTrue(identity.requiresCredentialUpdate("car", "password", 4))
+        assertFalse(identity.requiresCredentialUpdate("car", "password", 4, associated = true))
+        assertFalse(identity.requiresCredentialUpdate("car", "password", 3))
+        assertFalse(identity.requiresCredentialUpdate("car", "password", null))
+        assertTrue(identity.requiresCredentialUpdate("other", "password", 4, associated = true))
+        assertTrue(identity.requiresCredentialUpdate("car", "new-password", 4, associated = true))
+        assertFalse(CarWifiRequestIdentity("car", "password").requiresCredentialUpdate("car", "password", 2))
+    }
     @Test fun onlyAnExplicitDifferentSsidAllowsReplacingAnAvailableAssociation() {
         val identity = CarWifiRequestIdentity("car", "secret")
         assertFalse(identity.requiresDifferentHotspot("car"))

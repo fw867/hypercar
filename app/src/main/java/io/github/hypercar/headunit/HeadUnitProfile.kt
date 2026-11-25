@@ -113,6 +113,9 @@ data class HeadUnitProfile(
     val protocolProfileId: String get() = if (id == HeadUnitProfiles.MOTORCYCLE_ID) "bmw_id85" else id
     val skipBluetoothHandoff: Boolean get() = id == HeadUnitProfiles.MOTORCYCLE_ID
 
+    /** Issue #115: isolate the M2PRO audio SETUP rejection without changing screen arbitration. */
+    val airplayAudioEnabled: Boolean get() = id != HeadUnitProfiles.MOTORCYCLE_ID
+
     fun screenResourceLifecycleEnabled(userEnabled: Boolean): Boolean =
         id == "mercedes_mbux" || useScreenResourceLifecycle || userEnabled
 }
@@ -157,7 +160,7 @@ object HeadUnitProfiles {
         model = "突破者 M2PRO",
         listing = HeadUnitListing(category = HeadUnitCategory.MOTORCYCLE, brandId = "alienrider",
             brandName = "突破者 AlienRider", vehicleModels = listOf("M2PRO"), aliases = listOf("BREAK OUT")),
-        notes = "沿用 BMW 连接流程，保留蓝牙并跳过车机蓝牙交接命令。",
+        notes = "沿用 BMW 连接流程，保留蓝牙并跳过车机蓝牙交接命令。当前测试版不传输声音，用于验证 M2PRO 连接稳定性。",
         pairingHint = "在车机上选择 Apple CarPlay，使用已有的手机配对连接。",
     )
 

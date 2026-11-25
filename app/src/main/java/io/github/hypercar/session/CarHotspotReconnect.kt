@@ -26,7 +26,25 @@ internal object CarHotspotReconnect {
     private const val KEY_ALIAS = "bmw-local-wifi"
     private const val NONCE_BYTES = 12
 
-    class Credentials(val ssid: String, val passphrase: String)
+    class Credentials(val ssid: String, val passphrase: String, val securityType: Int? = null) {
+        internal fun encode(): ByteArray = ByteArrayOutputStream().apply {
+            DataOutputStream(this).use {
+                it.writeUTF(ssid)
+                it.writeUTF(passphrase)
+                it.writeInt(securityType ?: -1)
+            }
+        }.toByteArray()
+
+        companion object {
+            internal fun decode(bytes: ByteArray): Credentials = DataInputStream(ByteArrayInputStream(bytes)).use {
+                val ssid = it.readUTF()
+                val password = it.readUTF()
+                // Previous records end immediately after the password.
+                val security = if (it.available() == 0) null else it.readInt().takeIf { value -> value >= 0 }
+                Credentials(ssid, password, security)
+            }
+        }
+    }
 
     data class HintTransition(
         val mergeFrom: CarPlayEndpoint?,
@@ -177,6 +195,7 @@ internal object CarHotspotReconnect {
                             // provisional until the matching network has actually bound.
                             val route = endpoint.copy(
                                 ssid = future.endpoint.ssid, passphrase = future.endpoint.passphrase,
+                                wifiSecurityType = future.endpoint.wifiSecurityType, wifiChannel = future.endpoint.wifiChannel,
                                 bluetoothHotspot = future.endpoint.bluetoothHotspot,
                                 requiresMatchingAirplayCredentials = true,
                             )
@@ -281,7 +300,7 @@ internal object CarHotspotReconnect {
 
         fun shouldRetryJoin(endpoint: CarPlayEndpoint): Boolean =
             !endpoint.sourceIsCurrent ||
-                credentialsChanged { it.ssid == endpoint.ssid && it.passphrase == endpoint.passphrase }
+                credentialsChanged { endpoint.matchesHotspotRequest(it) }
 
         fun beginWifiRecovery(lost: CarWifiRequestIdentity?, deadlineMillis: Long) = synchronized(lock) {
             if (!closed && wifiRecovery?.deadlineMillis != deadlineMillis) wifiRecovery = WifiRecovery(lost, deadlineMillis)
@@ -477,12 +496,7 @@ internal object CarHotspotReconnect {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, checkNotNull(key(create = true)))
         cipher.updateAAD(peer.encodeToByteArray())
-        val payload = ByteArrayOutputStream().apply {
-            DataOutputStream(this).use {
-                it.writeUTF(credentials.ssid)
-                it.writeUTF(credentials.passphrase)
-            }
-        }.toByteArray()
+        val payload = credentials.encode()
         val ciphertext = cipher.doFinal(payload)
         check(cipher.iv.size == NONCE_BYTES)
         val file = file(context, peer)
@@ -509,7 +523,7 @@ internal object CarHotspotReconnect {
         cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, stored, 0, NONCE_BYTES))
         cipher.updateAAD(peer.encodeToByteArray())
         val decoded = cipher.doFinal(stored, NONCE_BYTES, stored.size - NONCE_BYTES)
-        return DataInputStream(ByteArrayInputStream(decoded)).use { Credentials(it.readUTF(), it.readUTF()) }
+        return Credentials.decode(decoded)
     }
 
     @Synchronized

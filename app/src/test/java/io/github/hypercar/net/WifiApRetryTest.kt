@@ -11,6 +11,40 @@ import org.junit.Test
 class WifiApRetryTest {
     private val history = WifiApHint("3a:f9:f5:c6:8c:3c", 5745, 1.0, fromMemory = true)
 
+    @Test fun channelFallbackSharesOneDeadlineAndExhaustedRequestsNeverRestart() = runTest {
+        for (firstDuration in listOf(12_000L, 60_000L)) {
+            val waits = mutableListOf<Long>()
+            val result = WifiApRetry.join<String>(null, 60_000, { true }, { false }, channelHint = true,
+                now = { testScheduler.currentTime }) { _, wait ->
+                waits += wait
+                if (waits.size == 1) { delay(firstDuration); null } else "full scan"
+            }
+            assertEquals(if (firstDuration == 60_000L) null else "full scan", result)
+            assertEquals(if (firstDuration == 60_000L) listOf(60_000L) else listOf(60_000L, 48_000L), waits)
+        }
+    }
+
+    @Test fun rejectedHintNeverSubmitsAnotherRequest() = runTest {
+        var calls = 0
+        assertNull(WifiApRetry.join<String>(null, 60_000, { true }, { false }, channelHint = true,
+            retryAllowed = { false }) { _, _ -> calls++; null })
+        assertEquals(1, calls)
+    }
+
+    @Test fun protocolChannelFailureFallsBackWithoutWithdrawingDeliveredAssociation() = runTest {
+        for (delivered in listOf(false, true)) {
+            val waits = mutableListOf<Long>()
+            var associated = false
+            val result = WifiApRetry.join<String>(null, 60_000, { true }, { associated }, channelHint = true,
+                now = { testScheduler.currentTime }) { _, wait ->
+                waits += wait
+                if (waits.size == 1) { associated = delivered; null } else "full scan"
+            }
+            assertEquals(if (delivered) null else "full scan", result)
+            assertEquals(if (delivered) listOf(60_000L) else listOf(60_000L, 60_000L), waits)
+        }
+    }
+
     @Test fun disappearedHistoricalApGetsOneUnpinnedFallbackWithinCacheRestoreBudget() = runTest {
         val requests = mutableListOf<Pair<WifiApHint?, Long>>()
         val result = WifiApRetry.join(history, 60_000, { true }, { false }) { hint, wait ->
