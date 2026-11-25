@@ -11,6 +11,18 @@ interface ISpikeShell {
     /** 返回 "OK id=<n> flags=0x<hex>" 或 "ERR ..."。 */
     String createDisplay(IBinder owner, in Surface surface, int width, int height, int dpi, int flags, String name);
 
+    /** 把已有显示（例如系统叠加视图）镜像到给定 Surface，用于把 DeX 桌面送进编码器。 */
+    String createMirrorDisplay(IBinder owner, in Surface surface, int width, int height, int dpi, int sourceDisplayId);
+
+    /** 返回系统叠加视图（模拟辅助显示设备）的 displayId，没有则 -1。 */
+    int findOverlayDisplay();
+
+    /** 该屏能否进桌面模式（反射 WindowManager.isEligibleForDesktopMode）。 */
+    boolean isDesktopEligible(int displayId);
+
+    /** 尝试给这块显示开放系统装饰（IWindowManager.setShouldShowSystemDecors；Android 16 已移除该 setter）。 */
+    boolean setSystemDecors(int displayId, boolean visible);
+
     String releaseDisplay();
 
     /** P2：只释放指定 display（D1 首页与 D2 地图同时存在时用）。 */

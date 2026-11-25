@@ -28,6 +28,7 @@ import io.github.hypercar.bluetooth.DiscoverabilityHandoff
 import io.github.hypercar.bluetooth.SystemDiscoverabilityPrompt
 import io.github.hypercar.autowake.HyperCarService
 import io.github.hypercar.carui.CarUiCaster
+import io.github.hypercar.carui.DexCaster
 import io.github.hypercar.carui.MusicBridge
 import io.github.hypercar.core.AudioStats
 import io.github.hypercar.core.LinkState
@@ -355,6 +356,8 @@ object HyperCarRepo {
     private var reconnectJob: Job? = null
     private var sessionUiJob: Job? = null
     @Volatile private var sessionCarWithMode = false
+    /** 连接开始时冻结的 DeX 源标记：会话中改设置不影响本条链路。 */
+    @Volatile private var sessionSourceIsDex = false
     @Volatile private var sessionIdentity: PairingIdentityFiles.Location? = null
     private var automaticResumeJob: Job? = null
     private val automaticModeRequest = AtomicLong()
@@ -899,6 +902,7 @@ object HyperCarRepo {
         sessionHadLink = false
         roundSessionBaseline = iap2?.sessionStartCount ?: 0
         sessionCarWithMode = SettingsStore.carWithMode
+        sessionSourceIsDex = SettingsStore.dexMode
         hudSessionEnabled = true
         io.github.hypercar.navigation.NavigationSources.clear()
         sessionIdentity = null
@@ -2321,6 +2325,7 @@ object HyperCarRepo {
                         sessionUiJob = null
                     }
                     CarUiCaster.stopAsync()
+                    DexCaster.stopAsync()
                     MusicBridge.onCarDisconnected()
                     // Every failed activation consumes its invitation. CAS preserves a newer
                     // invitation arriving during negotiation, even from the same address.
@@ -2581,6 +2586,7 @@ object HyperCarRepo {
         sessionUiJob?.cancel()
         sessionUiJob = null
         CarUiCaster.stopAsync()
+        DexCaster.stopAsync()
         // 在解绑网络、结束蓝牙旧会话之前完成有界业务退出；断网/EOF 路径只强制清理。
         runCatching {
             if (graceful) log("SESSION-CLOSE: graceful completed=${RustCoreBridge.nativeStopGracefully()}")
@@ -3907,10 +3913,16 @@ object HyperCarRepo {
                             fun current() = sessionLive.get() && streaming && connectionAttemptId == diagnosticId &&
                                 engineCallbacks.current() == callbackOwner
                             if (!current()) return@launch
-                            val result = runCatching { CarUiCaster.start(ctx, ::current) }
-                                .getOrElse { "启动失败: ${it.javaClass.simpleName}: ${it.message}" }
-                            log("CARUI: $result")
-                            if (CarUiCaster.running) {
+                            val dex = SettingsStore.dexMode
+                            val result = runCatching {
+                                if (dex) DexCaster.start(ctx, ::current) else CarUiCaster.start(ctx, ::current)
+                            }.getOrElse { "启动失败: ${it.javaClass.simpleName}: ${it.message}" }
+                            log(if (dex) "DEX: $result" else "CARUI: $result")
+                            if (dex) {
+                                if (DexCaster.running) {
+                                    connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.UI_STARTED)
+                                }
+                            } else if (CarUiCaster.running) {
                                 connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.UI_STARTED)
                                 io.github.hypercar.navigation.AmapLinkProbe.start(ctx)
                                 CarUiCaster.monitor(ctx, diagnosticId, callbackOwner, ::current)
@@ -3953,7 +3965,8 @@ object HyperCarRepo {
         }
 
         override fun onForceKeyFrame() {
-            io.github.hypercar.carui.CarUiCaster.requestKeyFrame()
+            if (SettingsStore.dexMode) io.github.hypercar.carui.DexCaster.requestKeyFrame()
+            else io.github.hypercar.carui.CarUiCaster.requestKeyFrame()
         }
 
         override fun onDisplaySize(width: Int, height: Int, maxFps: Int) {
@@ -3997,9 +4010,14 @@ object HyperCarRepo {
 
         override fun onMediaKey(usage: Int) {
             if (!sessionLive.get()) return
+            // 车机每上报一个按键都留痕：用来确认 home/recents 到底有没有送到，以及送的是什么 usage。
+            log("CARKEY: usage=0x" + usage.toString(16))
             val consoleKey = io.github.hypercar.carui.CarConsoleKey.fromInput(usage)
             if (consoleKey != null) {
-                if (!sessionCarWithMode) io.github.hypercar.carui.CarUiCaster.onConsoleKey(consoleKey)
+                if (!sessionCarWithMode) {
+                    if (sessionSourceIsDex) io.github.hypercar.carui.DexCaster.onConsoleKey(consoleKey)
+                    else io.github.hypercar.carui.CarUiCaster.onConsoleKey(consoleKey)
+                }
                 return
             }
             appContext()?.let { MusicBridge.onCarMediaKey(it, usage) }
@@ -4690,6 +4708,34 @@ object HyperCarRepo {
      * （logcat 也一起省掉），等下一次有非重复行进来时补一条「已折叠 N 条」。事件回环的历史
      * 故障就是 0.6s 灌了 300 行；有了限流，环形缓冲能把真正的上下文留下来。
      */
+    /** 调试：不连车机直接起 DeX 画面源，验证「虚拟屏 → 编码器」这条路。 */
+    fun debugStartDex() {
+        scope.launch {
+            val ctx = appContext()
+            if (ctx == null) {
+                log("DEX-DBG: 上下文为空")
+                return@launch
+            }
+            val msg = runCatching { DexCaster.start(ctx) }
+                .getOrElse { "ERR ${it.javaClass.simpleName}: ${it.message}" }
+            log("DEX-DBG: $msg")
+        }
+    }
+
+    /** 调试：不连车机也经 Shizuku 建一块虚拟屏，用于验证外部画面源（DeX 等）。 */
+    fun debugCreateDisplay() {
+        scope.launch {
+            val ctx = appContext()
+            if (ctx == null) {
+                log("CARUI-DBG: 上下文为空，跳过建屏")
+                return@launch
+            }
+            val msg = runCatching { CarUiCaster.debugCreateDisplay(ctx) }
+                .getOrElse { "ERR ${it.javaClass.simpleName}: ${it.message}" }
+            log("CARUI-DBG: $msg")
+        }
+    }
+
     fun log(line: String) {
         if (line.startsWith("BT-ACCEPT: ")) ctrlDiscoveryTrace.record("event=rfcomm-inbound " + line.removePrefix("BT-ACCEPT: "))
         val now = SystemClock.elapsedRealtime()

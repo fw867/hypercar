@@ -291,10 +291,18 @@ object SettingsStore {
         get() = p().getInt(KEY_FPS, 60)
         set(v) = p().edit().putInt(KEY_FPS, v.coerceIn(20, 60)).apply()
 
-    /** 车机画面来源（2026-11-03）：
+    /** DeX 渲染宽度（超采样目标，仅 DeX 画面源）：0=跟随画布不超采样，
+     *  1920/2560/3840 分别对应 1080p/2K/4K。比画布大时 DeX 按该宽度渲染、镜像时再降采样，
+     *  文字与图标边缘更锐利；越大越吃 GPU。宽高比与 dpi 都按画布换算，dp 布局不变。 */
+    var dexRenderWidth: Int
+        get() = p().getInt("dex_render_width", 2560).coerceIn(0, 4096)
+        set(v) = p().edit().putInt("dex_render_width", v.coerceIn(0, 4096)).apply()
+
+    /** 车机画面来源：
      *  · "car_ui"   —— 本 App 自绘车机首页（当前默认，地图卡 + 音乐卡 + Dock）
      *  · "carwith"  —— 走小米 CarWith：拉起它的 CarLife 入口，由 CarWith 自己建显示/编码，
      *                 我们只做 CarLife 通道 → AirPlay 的转发（需装 CarWith + 小米版 CarLife）
+     *  · "dex"      —— 三星 DeX 桌面：Shizuku 建叠加视图让 DeX 按桌面模式渲染，再镜像进编码器。
      */
     var carSource: String
         get() = p().getString("car_source", "car_ui") ?: "car_ui"
@@ -306,6 +314,8 @@ object SettingsStore {
     /** 是否 CarWith 模式。 */
     val carWithMode: Boolean get() = carSource == "carwith"
 
+    /** DeX 源：画面由三星 DeX 桌面渲染，走 Shizuku 虚拟屏 + 同一套编码链路。 */
+    val dexMode: Boolean get() = carSource == "dex"
     // The retired self-rendered speech experiment also gates incoming native callbacks.
     val carVoiceRecognition: Boolean get() = false
 

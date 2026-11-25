@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
 import android.util.Log
+import android.view.Display
 import android.view.InputDevice
 import android.view.InputEvent
 import android.view.MotionEvent
@@ -33,6 +34,33 @@ class SpikeShellService : ISpikeShell.Stub {
     @Volatile private var splitCaptureRequested = false
     private val bluetoothDiscovery = ShellBluetoothDiscovery()
     private val wifiSelection = ShellWifiSelection()
+
+    init {
+        // 回收历史遗留的 user service 进程：App 被强制停止/覆盖安装时，Shizuku 不会自动
+        // 回收上一次绑定的 `:spike` 进程，它们各自缓存旧 SharedPreferences 并互相覆盖设置。
+        // 这里在新进程构造时把除自己以外的同名进程收掉（同 UID，shell 有权 kill）。
+        runCatching { reapStaleInstances() }
+            .onFailure { Log.w(TAG, "回收遗留 spike 进程失败: $it") }
+    }
+
+    private fun reapStaleInstances() {
+        val self = android.os.Process.myPid()
+        val expected = "${packageNameOfSelf()}:spike"
+        var killed = 0
+        java.io.File("/proc").listFiles()?.forEach { dir ->
+            val pid = dir.name.toIntOrNull() ?: return@forEach
+            if (pid == self || pid <= 1) return@forEach
+            val cmdline = runCatching { java.io.File(dir, "cmdline").readText().trim { it <= ' ' } }
+                .getOrNull() ?: return@forEach
+            if (!cmdline.endsWith(":spike")) return@forEach
+            if (runCatching { android.os.Process.killProcess(pid) }.isSuccess) killed++
+        }
+        if (killed > 0) Log.i(TAG, "已回收 $killed 个遗留 spike 进程（期望名 $expected）")
+    }
+
+    /** user service 进程的 cmdline 就是 `<packageName>:spike`，自己也是这个进程名。 */
+    private fun packageNameOfSelf(): String =
+        java.io.File("/proc/self/cmdline").readText().trim { it <= ' ' }.substringBefore(":spike")
     override fun startWifiSelection(owner: IBinder, token: String, ssid: String, bssid: String, uid: Int): String {
         if (android.os.Binder.getCallingUid() != uid || appContext?.applicationInfo?.uid != uid)
             return "ERR Wi-Fi request owner mismatch"
@@ -130,9 +158,13 @@ class SpikeShellService : ISpikeShell.Stub {
                         unlink
                     }.getOrNull()
                 }) return "ERR display owner disconnected"
+            // 调用方传 1<<15 表示「不要独立 DisplayGroup」：用来复现开发者选项里
+            // 「模拟辅助显示设备」（overlay 屏）的行为——那类屏上 DeX 会按桌面模式开窗口。
+            val sharedGroup = (flags and (1 shl 15)) != 0
+            val callerFlags = flags and (1 shl 15).inv()
             val base = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION or
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+                (if (sharedGroup) 0 else DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY)
             // 隐藏 flag（AOSP DisplayManager.java）：SUPPORTS_TOUCH=1<<6、
             // TRUSTED=1<<10、OWN_FOCUS=1<<14。OWN_FOCUS 要求 display 同时 TRUSTED。
             val touch = 1 shl 6
@@ -143,13 +175,17 @@ class SpikeShellService : ISpikeShell.Stub {
             // TRUSTED（shell 已具备）；ALWAYS_UNLOCKED 另有权限，部分 ROM 不给，故三级降级。
             val ownGroup = 1 shl 11
             val alwaysUnlocked = 1 shl 12
-            val candidates = intArrayOf(
-                base or flags or touch or ownFocus or trusted or ownGroup or alwaysUnlocked,
-                base or flags or touch or ownFocus or trusted or ownGroup,
-                base or flags or touch or ownFocus or trusted,
-                base or flags or touch or ownFocus,
-                base or flags or touch,
-                base or flags,
+            val candidates = if (sharedGroup) intArrayOf(
+                base or callerFlags or touch or trusted,
+                base or callerFlags or touch,
+                base or callerFlags,
+            ) else intArrayOf(
+                base or callerFlags or touch or ownFocus or trusted or ownGroup or alwaysUnlocked,
+                base or callerFlags or touch or ownFocus or trusted or ownGroup,
+                base or callerFlags or touch or ownFocus or trusted,
+                base or callerFlags or touch or ownFocus,
+                base or callerFlags or touch,
+                base or callerFlags,
             )
 
             var lastError: Throwable? = null
@@ -191,6 +227,156 @@ class SpikeShellService : ISpikeShell.Stub {
             val stack = lastError?.stackTraceToString()?.take(1200).orEmpty()
             return "ERR 全部失败（$lastLabel）: ${lastError?.javaClass?.name}: ${lastError?.message}\n$stack"
         }
+    }
+
+    /**
+     * 把已有显示镜像到给定 Surface。系统「模拟辅助显示设备」（overlay display，type=OVERLAY）
+     * 会被三星 DeX 当成桌面显示器，点击图标就开自由窗口；而 shell 自建的 VIRTUAL 屏做不到。
+     */
+    override fun createMirrorDisplay(
+        owner: IBinder,
+        surface: Surface?,
+        width: Int,
+        height: Int,
+        dpi: Int,
+        sourceDisplayId: Int,
+    ): String {
+        val ctx = appContext ?: return "ERR 没有 Context"
+        if (surface == null) return "ERR surface=null"
+        if (sourceDisplayId < 0) return "ERR source=$sourceDisplayId"
+        synchronized(lock) {
+            if (!displayLease.bind(owner) { callback ->
+                    val death = IBinder.DeathRecipient { callback() }
+                    runCatching {
+                        owner.linkToDeath(death, 0)
+                        val unlink: () -> Unit = { runCatching { owner.unlinkToDeath(death, 0) } }
+                        unlink
+                    }.getOrNull()
+                }) return "ERR display owner disconnected"
+            var lastError: Throwable? = null
+            for (pkg in listOf("com.android.shell", "android")) {
+                val dm = runCatching {
+                    val ctor = DisplayManager::class.java.getDeclaredConstructor(Context::class.java)
+                    ctor.isAccessible = true
+                    ctor.newInstance(PackageOverrideContext(ctx, pkg)) as DisplayManager
+                }.getOrNull() ?: continue
+                try {
+                    val builderClass = Class.forName("android.hardware.display.VirtualDisplayConfig\$Builder")
+                    val builder = builderClass
+                        .getDeclaredConstructor(
+                            String::class.java,
+                            Int::class.javaPrimitiveType,
+                            Int::class.javaPrimitiveType,
+                            Int::class.javaPrimitiveType,
+                        )
+                        .apply { isAccessible = true }
+                        .newInstance("hypercar-dex-mirror", width, height, dpi)
+                    builderClass
+                        .getMethod("setFlags", Int::class.javaPrimitiveType)
+                        .invoke(builder, DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC)
+                    // Android 16 没有「Surface 传给 createVirtualDisplay」的重载：Surface 必须写进 config。
+                    builderClass.getMethod("setSurface", Surface::class.java).invoke(builder, surface)
+                    builderClass
+                        .getMethod("setDisplayIdToMirror", Int::class.javaPrimitiveType)
+                        .invoke(builder, sourceDisplayId)
+                    val config = builderClass.getMethod("build").invoke(builder)
+                    // 各 ROM 的 createVirtualDisplay 重载不一致（AOSP 传 Executor，三星有传 Handler 的），
+                    // 这里把所有 (VirtualDisplayConfig, …, Callback) 候选都试一遍，并把签名写进日志。
+                    val candidates = dm.javaClass.methods.filter { it.name == "createVirtualDisplay" }
+                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
+                    val sigs = candidates.joinToString(" | ") { m ->
+                        "(" + m.parameterTypes.joinToString(",") { it.simpleName } + ")"
+                    }
+                    SpikeReport.add("SHELL", "createVirtualDisplay 候选: $sigs")
+                    var made: VirtualDisplay? = null
+                    var lastFail: Throwable? = null
+                    for (m in candidates) {
+                        val types = m.parameterTypes
+                        if (types.size != 3) continue
+                        if (!types[0].name.endsWith("VirtualDisplayConfig")) continue
+                        if (!types[2].name.endsWith("Callback")) continue
+                        val second: Any? = when (types[1].name) {
+                            "java.util.concurrent.Executor" -> null
+                            "android.os.Handler" -> handler
+                            else -> continue
+                        }
+                        try {
+                            val v = m.invoke(dm, config, second, null) as? VirtualDisplay
+                            if (v != null) {
+                                made = v
+                                break
+                            }
+                        } catch (t: Throwable) {
+                            lastFail = t
+                        }
+                    }
+                    val vd = made ?: return "ERR 镜像建屏失败（候选: $sigs）: " +
+                        "${lastFail?.javaClass?.simpleName}: ${lastFail?.message}"
+                    displays[vd.display.displayId] = vd
+                    displaySizes[vd.display.displayId] = Triple(width, height, dpi)
+                    val msg = "OK mirror id=${vd.display.displayId} src=$sourceDisplayId package=$pkg"
+                    Log.i(TAG, "createMirrorDisplay $msg")
+                    SpikeReport.add("SHELL", "createMirrorDisplay $msg")
+                    return msg
+                } catch (t: Throwable) {
+                    lastError = t
+                }
+            }
+            return "ERR 镜像建屏失败: ${lastError?.javaClass?.name}: ${lastError?.message}"
+        }
+    }
+
+    /** 系统叠加视图（模拟辅助显示设备）的 displayId；没有返回 -1。 */
+    /**
+     * 这块屏能不能进桌面模式：桌面模式的最终判据是
+     * `WindowManager.isEligibleForDesktopMode(displayId)`（需要 INTERNAL_SYSTEM_WINDOW 权限），
+     * 内部就是 `isSystemDecorationsSupported() && isWindowingModeSupported(FREEFORM) && ...`。
+     * 用它做探针，能直接知道某组虚拟屏 flags 到底合不合格。
+     */
+    override fun isDesktopEligible(displayId: Int): Boolean = try {
+        val wm = appContext?.getSystemService(android.view.WindowManager::class.java)
+            ?: return false
+        val m = Class.forName("android.view.WindowManager")
+            .getMethod("isEligibleForDesktopMode", Integer.TYPE)
+        (m.invoke(wm, displayId) as? Boolean) ?: false
+    } catch (t: Throwable) {
+        Log.w(TAG, "isEligibleForDesktopMode($displayId) 失败: $t")
+        false
+    }
+
+    /** 给这块显示开放系统装饰：DisplayWindowSettings 里写入该屏条目，isSystemDecorationsSupported() 才会为真。 */
+    override fun setSystemDecors(displayId: Int, visible: Boolean): Boolean = try {
+        val binder = Class.forName("android.os.ServiceManager")
+            .getMethod("getService", String::class.java)
+            .invoke(null, "window") as? IBinder
+            ?: return false
+        val wm = Class.forName("android.view.IWindowManager\$Stub")
+            .getMethod("asInterface", IBinder::class.java)
+            .invoke(null, binder)
+            ?: return false
+        Class.forName("android.view.IWindowManager")
+            .getMethod("setShouldShowSystemDecors", Integer.TYPE, Boolean::class.javaPrimitiveType)
+            .invoke(wm, displayId, visible)
+        Log.i(TAG, "setShouldShowSystemDecors($displayId, $visible) ok")
+        true
+    } catch (t: Throwable) {
+        Log.w(TAG, "setShouldShowSystemDecors($displayId, $visible) 失败: $t")
+        false
+    }
+
+    /** 壁纸缓冲按这块显示同步：应用进程缺 SET_WALLPAPER_HINTS，shell 身份调得到。 */
+override fun findOverlayDisplay(): Int {
+        val ctx = appContext ?: return -1
+        val dm = runCatching {
+            val ctor = DisplayManager::class.java.getDeclaredConstructor(Context::class.java)
+            ctor.isAccessible = true
+            ctor.newInstance(PackageOverrideContext(ctx, "com.android.shell")) as DisplayManager
+        }.getOrNull() ?: return -1
+        return dm.displays.firstOrNull { d ->
+            d.displayId != Display.DEFAULT_DISPLAY &&
+                !d.name.startsWith("hypercar-") &&
+                (d.name.contains("叠加") || d.name.contains("Overlay", ignoreCase = true))
+        }?.displayId ?: -1
     }
 
     override fun releaseDisplay(): String = synchronized(lock) {
@@ -438,8 +624,17 @@ class SpikeShellService : ISpikeShell.Stub {
         return if (ok) "OK" else "ERR $inputError"
     }
 
+    /** 系统叠加视图等「不是我们建的」显示器不在 displays 表里，但一样可以注入触摸/按键。 */
+    private fun displayKnown(displayId: Int): Boolean {
+        if (displayId <= 0) return false
+        if (displays.containsKey(displayId)) return true
+        return runCatching {
+            appContext?.getSystemService(DisplayManager::class.java)?.getDisplay(displayId) != null
+        }.getOrDefault(false)
+    }
+
     override fun touchEvent(displayId: Int, event: MotionEvent): String = synchronized(lock) {
-        if (!displays.containsKey(displayId)) {
+        if (!displayKnown(displayId)) {
             event.recycle()
             return@synchronized "ERR display=$displayId missing"
         }
@@ -453,7 +648,7 @@ class SpikeShellService : ISpikeShell.Stub {
     }
 
     override fun consoleKey(displayId: Int, keyCode: Int, metaState: Int): String = synchronized(lock) {
-        if (displayId <= 0 || !displays.containsKey(displayId)) return@synchronized "ERR display missing"
+        if (!displayKnown(displayId)) return@synchronized "ERR display missing"
         if (!ensureInput()) return@synchronized "ERR $inputError"
         val downTime = SystemClock.uptimeMillis()
         fun inject(action: Int): Boolean {

@@ -1304,6 +1304,7 @@ private fun ResolutionSection() {
     var widthText by rememberSaveable { mutableStateOf(SettingsStore.videoWidth.toString()) }
     var heightText by rememberSaveable { mutableStateOf(SettingsStore.videoHeight.toString()) }
     var fps by rememberSaveable { mutableStateOf(SettingsStore.videoFps) }
+    var dexRender by rememberSaveable { mutableStateOf(SettingsStore.dexRenderWidth) }
     var videoCodec by rememberSaveable { mutableStateOf(SettingsStore.videoCodec) }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionLabel(text = "分辨率与帧率")
@@ -1360,6 +1361,23 @@ private fun ResolutionSection() {
                 fps = selected
                 SettingsStore.videoFps = selected
             }
+            Spacer(modifier = Modifier.height(12.dp))
+            Text("DeX 渲染分辨率（超采样，下次连接生效）",
+                style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+            Spacer(modifier = Modifier.height(8.dp))
+            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                listOf(0 to "跟随画布", 1920 to "1080p", 2560 to "2K", 3840 to "4K").forEachIndexed { index, (value, label) ->
+                    SegmentedButton(
+                        selected = dexRender == value,
+                        onClick = { dexRender = value; SettingsStore.dexRenderWidth = value },
+                        shape = SegmentedButtonDefaults.itemShape(index = index, count = 4),
+                        label = { Text(label) },
+                    )
+                }
+            }
+            Text("只在「画面来源 = DeX」时生效：DeX 按该宽度渲染，再降采样到车机画布。" +
+                "越大越清晰也越吃 GPU，跟随画布等于关闭超采样。",
+                style = MaterialTheme.typography.bodySmall, color = TextSecondary)
             Spacer(modifier = Modifier.height(12.dp))
             Text("视频编码（下次连接生效）", style = MaterialTheme.typography.bodySmall, color = TextSecondary)
             SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
@@ -1595,12 +1613,20 @@ fun CarSourceSection(
             SectionLabel(text = title)
             GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
                 SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                    listOf("car_ui" to "自绘车机 UI", "carwith" to "CarWith").forEachIndexed { index, (source, label) ->
+                    listOf(
+                        "car_ui" to "自绘车机 UI",
+                        "dex" to "DeX",
+                        "carwith" to "CarWith",
+                    ).forEachIndexed { index, (source, label) ->
                         SegmentedButton(
                             selected = current == source,
-                            enabled = !connected && if (source == "car_ui") startup.shizukuReady else startup.carWithInstalled,
+                            enabled = !connected && when (source) {
+                                "car_ui", "dex" -> startup.shizukuReady
+                                "carwith" -> startup.carWithInstalled
+                                else -> true
+                            },
                             onClick = { selectSource(source) },
-                            shape = SegmentedButtonDefaults.itemShape(index = index, count = 2),
+                            shape = SegmentedButtonDefaults.itemShape(index = index, count = 3),
                             label = { Text(label, style = MaterialTheme.typography.labelMedium) },
                         )
                     }
@@ -1608,6 +1634,7 @@ fun CarSourceSection(
                 Spacer(Modifier.height(8.dp))
                 Text(when {
                     connected -> "断开连接后可切换画面来源。"
+                    current == "dex" -> "把三星 DeX 桌面放到虚拟屏上推给车机：需要 Shizuku，桌面与多窗口由 DeX 自己渲染。"
                     current == "carwith" -> "CarWith 画面按车机屏幕自动换算并按需拉伸，源画面最高 2560×2560，无需手动设置。"
                     !startup.shizukuReady -> "自绘 UI 需先在「权限与后台」完成 Shizuku 授权。"
                     else -> "自绘 UI 使用下方显示设置。"
@@ -1663,6 +1690,20 @@ fun CarSourceSection(
                         ShizukuState.Ready -> onRefreshSetup()
                     }
                 }, modifier = Modifier.fillMaxWidth(), enabled = !connected)
+            }
+            Spacer(Modifier.height(16.dp))
+            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
+            Spacer(Modifier.height(16.dp))
+            Text("DeX 模式", color = TextPrimary, style = MaterialTheme.typography.titleSmall)
+            Text("把三星 DeX 桌面放到虚拟屏上推给车机：桌面、多窗口和任务栏由 DeX 自己渲染，需要 Shizuku 已授权。",
+                color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.height(8.dp))
+            CapsuleButton(if (current == "dex") "已选择 DeX" else "选择 DeX",
+                onClick = { selectSource("dex") }, enabled = !connected && startup.shizukuReady,
+                modifier = Modifier.fillMaxWidth(), filled = current == "dex")
+            if (!startup.shizukuReady) {
+                Text("需要先完成上面的 Shizuku 授权。", color = AmberWarning,
+                    style = MaterialTheme.typography.bodySmall)
             }
             Spacer(Modifier.height(16.dp))
             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))

@@ -11,7 +11,8 @@ internal enum class CarConsoleKey(val keyCode: Int, val metaState: Int = 0) {
     UP(KeyEvent.KEYCODE_DPAD_UP),
     DOWN(KeyEvent.KEYCODE_DPAD_DOWN),
     PREVIOUS(KeyEvent.KEYCODE_TAB, KeyEvent.META_SHIFT_ON),
-    NEXT(KeyEvent.KEYCODE_TAB);
+    NEXT(KeyEvent.KEYCODE_TAB),
+    HOME(KeyEvent.KEYCODE_HOME);
 
     companion object {
         fun fromInput(input: Int): CarConsoleKey? = when (input) {
@@ -23,6 +24,7 @@ internal enum class CarConsoleKey(val keyCode: Int, val metaState: Int = 0) {
             0x30006 -> DOWN
             0x30007 -> PREVIOUS
             0x30008 -> NEXT
+            0x30009 -> HOME
             else -> null
         }
     }

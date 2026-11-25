@@ -55,6 +55,30 @@ object SpikeShell {
     fun updateDisplaySurface(id: Int, surface: Surface?, width: Int, height: Int, dpi: Int): String =
         service?.updateDisplaySurface(id, surface, width, height, dpi) ?: "ERR shell disconnected"
 
+    /** 把已有显示（系统叠加视图）镜像到 Surface，用于让 DeX 桌面进编码器。 */
+    fun createMirrorDisplay(
+        surface: Surface,
+        width: Int,
+        height: Int,
+        dpi: Int,
+        sourceDisplayId: Int,
+    ): String = runCatching {
+        service?.createMirrorDisplay(displayOwner, surface, width, height, dpi, sourceDisplayId)
+            ?: "ERR 未连接"
+    }.getOrElse { "ERR ${it.javaClass.simpleName}: ${it.message}" }
+
+    /** 系统叠加视图的 displayId；没有返回 -1。 */
+    fun findOverlayDisplay(): Int = runCatching { service?.findOverlayDisplay() ?: -1 }.getOrDefault(-1)
+
+    /** 该屏能否进桌面模式（WindowManager.isEligibleForDesktopMode）。 */
+    fun isDesktopEligible(displayId: Int): Boolean = runCatching {
+        service?.isDesktopEligible(displayId) ?: false
+    }.getOrDefault(false)
+
+    /** 尝试给这块显示开放系统装饰（Android 16 已移除该 setter，返回 false 说明不可用）。 */
+    fun setSystemDecors(displayId: Int, visible: Boolean): Boolean =
+        service?.setSystemDecors(displayId, visible) ?: false
+
     fun touchEvent(displayId: Int, event: MotionEvent): String =
         call("touchEvent") { it.touchEvent(displayId, event) }
 
@@ -78,10 +102,37 @@ object SpikeShell {
         }.getOrNull()
     }
 
+    /**
+     * 主动解绑 user service。
+     *
+     * 为什么必须显式解绑：Shizuku 只在这两种情况下回收 `:spike` 进程——App 主动
+     * `unbindUserService()`，或者 App 进程自己死掉。只 bind 不解绑、外加 App 被杀/升级，
+     * 就会在设备上留下孤儿 user service 进程（实测堆到 20 个）。每个孤儿各自持有一份
+     * 内存版 SharedPreferences，谁写一次偏好就把别处的设置覆盖回去，所以必须收掉。
+     */
+    fun disconnect() {
+        val conn = connection
+        val a = args
+        service = null
+        connection = null
+        args = null
+        if (a == null || conn == null) return
+        runCatching { Shizuku.unbindUserService(a, conn, true) }
+            .onSuccess { SpikeReport.add("SHELL", "unbindUserService 已调用") }
+            .onFailure {
+                SpikeReport.add(
+                    "SHELL",
+                    "unbindUserService 异常: ${it.javaClass.simpleName}: ${it.message}",
+                )
+            }
+    }
+
     /** 绑定（幂等）。返回人话结果，写进 spike 报告。 */
     suspend fun connect(context: Context): String {
         return bindMutex.withLock {
             if (isConnected()) return@withLock "已连接"
+            // 上一次绑定的 binder 已死（App 进程被系统回收、Shizuku 重启等）：先解绑再加。
+            if (connection != null) disconnect()
             service = null
             isBinding = true
             try { connectUnlocked(context) } finally { isBinding = false }
@@ -192,14 +243,4 @@ object SpikeShell {
             "ERR $name ${it.javaClass.simpleName}: ${it.message}"
         }
 
-    fun disconnect() {
-        val a = args
-        val c = connection
-        if (a != null && c != null) {
-            runCatching { Shizuku.unbindUserService(a, c, false) }
-        }
-        service = null
-        connection = null
-        args = null
-    }
 }

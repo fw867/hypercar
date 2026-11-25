@@ -107,6 +107,8 @@ pub const CONSOLE_UP: u32 = 0x30005;
 pub const CONSOLE_DOWN: u32 = 0x30006;
 pub const CONSOLE_PREV: u32 = 0x30007;
 pub const CONSOLE_NEXT: u32 = 0x30008;
+/// 车机上报 AC Home（HID Consumer 0x0223）；此前只认 AC Back，home/recents 会被丢掉。
+pub const CONSOLE_HOME: u32 = 0x30009;
 
 const MULTI_AXIS_CONTROLLER: u32 = 0x0001_0008;
 const MAX_ROTATION_STEPS: usize = 16;
@@ -600,6 +602,8 @@ impl Device {
                     down.insert(u & 0xffff);
                 } else if u == 0xc0224 {
                     down.insert(CONSOLE_BACK);
+                } else if u == 0xc0223 {
+                    down.insert(CONSOLE_HOME);
                 } else if f.controller && f.variable {
                     // BMW describes its push axes as signed, absolute and centered at zero.
                     // Wheel is a signed relative delta, including successive identical samples.
