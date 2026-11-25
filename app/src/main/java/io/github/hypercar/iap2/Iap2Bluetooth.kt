@@ -210,7 +210,15 @@ class Iap2Bluetooth(
     private var sessionEndpoints = Iap2RfcommEndpointState()
 
     /** 「是否提供 iAP2 服务」结论缓存（地址→结论）：SDP 查询不便宜，勿每 3s 重查。 */
-    private data class ServiceResult(val revision: Long, val available: Boolean)
+    internal data class ServiceResult(val revision: Long, val available: Boolean, val checkedAt: Long) {
+        fun canReuse(currentRevision: Long, now: Long): Boolean =
+            revision == currentRevision && (available || now - checkedAt in 0 until 10_000L)
+
+        companion object {
+            fun fromProbe(revision: Long, result: String, cached: Boolean, checkedAt: Long): ServiceResult =
+                ServiceResult(revision, result == "present" || cached, checkedAt)
+        }
+    }
     private val iap2ServiceCache = ConcurrentHashMap<String, ServiceResult>()
     private val targetRevision = java.util.concurrent.atomic.AtomicLong()
 
@@ -734,7 +742,7 @@ class Iap2Bluetooth(
             val device = byAddress.getValue(address)
             val found = awaitIap2Service(device)
             if (!found && skippedNoService.add(address)) {
-                log("BT-C: 跳过「${safeName(device) ?: address}」（未发现 iAP2 服务——非 CarPlay 设备，保持其音频连接）")
+                log("BT-C: 暂不尝试「${safeName(device) ?: address}」（尚未确认 iAP2 服务，保持其音频连接）")
             }
             found
         }
@@ -744,28 +752,29 @@ class Iap2Bluetooth(
     /**
      * 设备是否提供配件端 iAP2 服务（…caff）：先读系统 uuids 缓存，缺失再
      * `fetchUuidsWithSdp` 触发一次 SDP 查询并等 `ACTION_UUID` 广播（超时按无服务）。
-     * 结论缓存到下一次 start()/目标切换；旧目标下的在途 SDP 结果不能污染新轮缓存。
+     * 肯定结果缓存到下次 start()/目标切换；否定结果短期缓存，允许稍后重新发现。
      * 权限：调用方已校验 BLUETOOTH_CONNECT；SecurityException 由 runCatching 吸收。
      */
     @SuppressLint("MissingPermission")
     private fun awaitIap2Service(device: BluetoothDevice): Boolean {
         val ticket = sessions.ticket() ?: return false
         val revision = targetRevision.get()
-        iap2ServiceCache[device.address]?.takeIf { it.revision == revision }?.let { return it.available }
+        fun current(): Boolean = targetRevision.get() == revision && sessions.allows(ticket)
+        val previous = iap2ServiceCache[device.address]?.takeIf { it.canReuse(revision, SystemClock.elapsedRealtime()) }
+        if (previous?.available == true) return current()
 
         fun cachedHas(): Boolean =
             runCatching {
                 device.uuids?.any { it.uuid == ACCESSORY_IAP2_UUID } == true
             }.getOrDefault(false)
 
-        if (cachedHas()) {
-            iap2ServiceCache[device.address] = ServiceResult(revision, true)
-            return true
-        }
-        freshIap2Service(device) { sessions.allows(ticket) }
-        val has = cachedHas()
-        iap2ServiceCache[device.address] = ServiceResult(revision, has)
-        return has
+        val cached = cachedHas()
+        if (!cached && previous != null) return false
+        val probe = if (cached) "present" else freshIap2Service(device, ::current)
+        val evidence = ServiceResult.fromProbe(revision, probe, cached || cachedHas(), SystemClock.elapsedRealtime())
+        if (!current()) return false
+        iap2ServiceCache[device.address] = evidence
+        return evidence.available
     }
 
     @SuppressLint("MissingPermission")
@@ -803,15 +812,15 @@ class Iap2Bluetooth(
                 }
                 allowed() && device.fetchUuidsWithSdp()
             }.getOrDefault(false)
-        if (started) {
-            try {
-                latch.await(SDP_PROBE_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-            }
+        return try {
+            if (!started) "not-started"
+            else if (latch.await(SDP_PROBE_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)) result else "timeout"
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            "cancelled"
+        } finally {
+            runCatching { appContext.unregisterReceiver(receiver) }
         }
-        runCatching { appContext.unregisterReceiver(receiver) }
-        return if (started) result else "not-started"
     }
 
     @SuppressLint("MissingPermission")

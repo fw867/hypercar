@@ -5,6 +5,7 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.AtomicFile
 import io.github.hypercar.iap2.CarPlayEndpoint
+import io.github.hypercar.net.CarWifiJoinPolicy
 import io.github.hypercar.net.CarWifiRequestIdentity
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -141,13 +142,16 @@ internal object CarHotspotReconnect {
 
             fun hasRetiredUnknownSelection(): Boolean = lost == null && selected?.sourceIsCurrent == false
 
-            fun replacesLost(endpoint: CarPlayEndpoint): Boolean =
-                lost?.matches(endpoint.ssid, endpoint.passphrase) != true &&
-                    endpoint.replayedWifiConfiguration?.let { lost?.matches(it.ssid, it.passphrase) } != true
+            fun replacesLost(endpoint: CarPlayEndpoint): Boolean {
+                if (endpoint.wifiSecurityType != null && endpoint.passphrase?.let {
+                        CarWifiJoinPolicy.security(endpoint.wifiSecurityType, it) == null
+                    } == true) return false
+                return !matchesLostRequest(lost, endpoint)
+            }
 
             fun matchesSelection(endpoint: CarPlayEndpoint, pinned: CarPlayEndpoint?): Boolean =
                 endpoint.passphrase == null || pinned?.let {
-                    it.ssid == endpoint.ssid && it.passphrase == endpoint.passphrase && it.bluetoothHotspot == endpoint.bluetoothHotspot
+                    it.matchesHotspotRequest(endpoint) && it.bluetoothHotspot == endpoint.bluetoothHotspot
                 } == true
 
             fun defer(endpoint: CarPlayEndpoint, enqueuedAt: Long, commit: (CarPlayEndpoint) -> Unit,
@@ -159,6 +163,14 @@ internal object CarHotspotReconnect {
                     this.followingAddress = followingAddress
                 })
             }
+        }
+
+        private companion object {
+            fun matchesLostRequest(lost: CarWifiRequestIdentity?, endpoint: CarPlayEndpoint): Boolean =
+                lost?.matchesRequest(endpoint.ssid, endpoint.passphrase, endpoint.wifiSecurityType) == true ||
+                    endpoint.replayedWifiConfiguration?.let {
+                        lost?.matchesRequest(it.ssid, it.passphrase, it.securityType)
+                    } == true
         }
 
         private val pending = ArrayDeque<Arrival>()
@@ -391,7 +403,7 @@ internal object CarHotspotReconnect {
                 return@synchronized false
             }
             val latest = latestReceivedCredentials?.takeIf { canQueue(it) && hasFreshCredentials(it) } ?: newestPendingCredentials()
-            if (latest == null || lostCredentials?.matches(latest.ssid, latest.passphrase) == true) {
+            if (latest == null || matchesLostRequest(lostCredentials, latest)) {
                 return@synchronized true
             }
             // Releasing the pending activation wakes the same connect job. It retires the

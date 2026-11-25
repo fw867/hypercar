@@ -1,12 +1,7 @@
 package io.github.hypercar.net
 
-import java.io.ByteArrayOutputStream
-import java.io.DataOutputStream
 import java.net.InetAddress
 import java.net.Inet4Address
-
-/** Board class of the iPhone16,1 / 21F90 identity used in AirPlay SETUP. */
-internal const val CARPLAY_DEVICE_INFO_BOARD = "D83AP"
 
 /** Read-only DNS metadata. Never publishes a partial/malformed datagram or arbitrary TXT values. */
 internal data class MdnsDiagnosticPacket(
@@ -19,7 +14,10 @@ internal data class MdnsDiagnosticPacket(
     /** 网络中广播的 CarPlay 源（实例名不含 _carplay-ctrl._tcp.local 后缀）。 */
     data class CarPlaySource(val instance: String, val host: String, val port: Int,
         val txt: Set<String>, val addresses: Set<InetAddress>)
-    data class Announcement(val instance: String, val host: String, val port: Int, val txt: Set<String>, val addresses: Set<InetAddress>) {
+    data class Announcement(
+        val instance: String, val host: String, val port: Int, val txt: Set<String>, val addresses: Set<InetAddress>,
+        val ttlMillis: Long,
+    ) {
         fun matches(name: String, port: Int, mac: String, version: String, linkAddresses: Set<InetAddress>): Boolean =
             instance == "${name.lowercase()}.$CTRL" && this.port == port &&
                 txt == setOf("id=${mac.lowercase()}", "srcvers=$version") && linkAddresses.containsAll(addresses)
@@ -31,37 +29,6 @@ internal data class MdnsDiagnosticPacket(
     companion object {
         private const val CTRL = "_carplay-ctrl._tcp.local"
         private const val SERVICES = "_services._dns-sd._udp.local"
-        private const val DEVICE_INFO = "_device-info._tcp.local"
-        private const val DEVICE_MODEL = "model=$CARPLAY_DEVICE_INFO_BOARD"
-
-        /** Append to an already validated local NSD packet, preserving DNS compression offsets. */
-        fun withDeviceInfo(bytes: ByteArray, instance: String): ByteArray? {
-            val label = instance.toByteArray(Charsets.UTF_8)
-            if (label.size !in 1..63) return null
-            val additional = ((bytes[10].toInt() and 255) shl 8) or (bytes[11].toInt() and 255)
-            val txt = DEVICE_MODEL.toByteArray(Charsets.US_ASCII)
-            val record = ByteArrayOutputStream().apply {
-                val out = DataOutputStream(this)
-                write(label.size)
-                write(label)
-                DEVICE_INFO.split('.').forEach {
-                    write(it.length)
-                    write(it.toByteArray(Charsets.US_ASCII))
-                }
-                write(0)
-                out.writeShort(16) // TXT
-                out.writeShort(0x8001) // IN, cache flush
-                out.writeInt(4500)
-                out.writeShort(txt.size + 1)
-                write(txt.size)
-                write(txt)
-            }.toByteArray()
-            return (bytes + record).apply {
-                this[10] = ((additional + 1) shr 8).toByte()
-                this[11] = (additional + 1).toByte()
-            }
-        }
-
         private fun reverseName(address: InetAddress): String = if (address is Inet4Address) {
             address.address.reversed().joinToString(".") { (it.toInt() and 255).toString() } + ".in-addr.arpa"
         } else {
@@ -94,7 +61,7 @@ internal data class MdnsDiagnosticPacket(
                     else -> true
                 }
             }) return null
-            return Announcement(instance, host, srv.port, txt.txt, addresses)
+            return Announcement(instance, host, srv.port, txt.txt, addresses, records.minOf { it.ttl } * 1_000)
         }
 
         fun decode(bytes: ByteArray): MdnsDiagnosticPacket? = runCatching {
@@ -187,23 +154,17 @@ internal data class MdnsDiagnosticPacket(
                         var i = start
                         val allowed = mutableListOf<String>()
                         var count = 0
-                        var deviceModel = false
                         while (i < pos) {
                             val len = bytes[i++].toInt() and 255; require(i + len <= pos)
                             val txt = String(bytes, i, len, Charsets.UTF_8); i += len
                             count++
                             if (txt.substringBefore('=').lowercase() in listOf("id", "srcvers")) allowed += safe(txt)
-                            if (txt == DEVICE_MODEL) deviceModel = true
                         }
                         // Do not retain unknown TXT fields or replay packets that contain any.
                         replay = replay.copy(txt = allowed.map { it.lowercase() }.toSet().takeIf { it.size == count }.orEmpty())
                         if (response && ttl > 0 && owner.endsWith(".$CTRL") && allowed.isNotEmpty())
                             srcTxts[owner] = allowed.map { it.lowercase() }.toSet()
-                        when {
-                            service(owner) -> "txt=[${allowed.joinToString(",")}]"
-                            owner.endsWith(".$DEVICE_INFO") && deviceModel && count == 1 -> "txt=[$DEVICE_MODEL]"
-                            else -> null
-                        }
+                        if (service(owner)) "txt=[${allowed.joinToString(",")}]" else null
                     }
                     1, 28 -> {
                         require(n == if (type == 1) 4 else 16)

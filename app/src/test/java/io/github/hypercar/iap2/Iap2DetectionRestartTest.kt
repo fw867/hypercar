@@ -150,6 +150,61 @@ class Iap2DetectionRestartTest {
         assertTrue(link.takeOutput().isEmpty())
     }
 
+    @Test fun staleOrFutureAckDoesNotChangeAFullWifiWindow() {
+        val link = normal(reliable = true)
+        repeat(5) { link.sendControl(Iap2Csm.encode(0x4e09), 3) }
+        val sent = WifiIap2Framing.split(link.takeOutput())
+        assertEquals(4, sent.size)
+        val lastSent = sent.last()[5].toInt() and 255
+        for (invalid in listOf((lastSent - 5) and 255, (lastSent + 1) and 255)) {
+            link.feed(packet(0x40, 40, invalid), 4)
+            assertEquals(4, link.outstandingPackets)
+            assertEquals(1, link.queuedControlPackets)
+            assertTrue(link.takeOutput().isEmpty())
+        }
+        // A duplicate ACK is harmless. A real advancing ACK opens one place.
+        link.feed(packet(0x40, 40, (lastSent - 4) and 255), 5)
+        assertTrue(link.takeOutput().isEmpty())
+        link.feed(packet(0x40, 40, (lastSent - 3) and 255), 6)
+        assertEquals(0, link.queuedControlPackets)
+        assertEquals(1, WifiIap2Framing.split(link.takeOutput()).size)
+        assertEquals(4, link.outstandingPackets)
+        val inbound = Iap2Csm.encode(0x5000)
+        link.feed(packet(0x40, 41, (lastSent - 4) and 255, 10, inbound), 7)
+        assertArrayEquals(inbound, (link.pollEvent() as Iap2LinkEngine.Event.Control).bytes)
+        assertEquals(4, link.outstandingPackets)
+    }
+
+    @Test fun cumulativeAckKeepsUnconfirmedBluetoothPacketsPastPeerReceiveWindowHint() {
+        val link = normal()
+        repeat(20) { link.sendControl(Iap2Csm.encode(0x4e09), 3) }
+        val sent = WifiIap2Framing.split(link.takeOutput())
+        assertEquals(20, sent.size)
+        fun seq(index: Int) = sent[index][5].toInt() and 255
+        link.feed(packet(0x40, 40, seq(0)), 4)
+        link.feed(packet(0x40, 40, seq(14)), 5)
+        assertEquals(5, link.outstandingPackets)
+        link.advanceTime(4003)
+        val retried = WifiIap2Framing.split(link.takeOutput()).single { it.size > 9 }
+        assertEquals(seq(15), retried[5].toInt() and 255)
+    }
+
+    @Test fun cumulativeAckAdvancesThroughSequenceWrap() {
+        val link = normal(reliable = true)
+        for (expected in 101..254) {
+            link.sendControl(Iap2Csm.encode(0x4e09), 3)
+            assertEquals(expected, link.takeOutput()[5].toInt() and 255)
+            link.feed(packet(0x40, 40, expected), 3)
+        }
+        repeat(2) { link.sendControl(Iap2Csm.encode(0x4e09), 3) }
+        val sent = WifiIap2Framing.split(link.takeOutput())
+        assertEquals(listOf(255, 0), sent.map { it[5].toInt() and 255 })
+        link.feed(packet(0x40, 40, 253), 4)
+        assertEquals(2, link.outstandingPackets)
+        link.feed(packet(0x40, 40, 0), 5)
+        assertEquals(0, link.outstandingPackets)
+    }
+
     @Test fun detectDoesNotReviveClosedLink() {
         val link = normal()
         link.feedEof()

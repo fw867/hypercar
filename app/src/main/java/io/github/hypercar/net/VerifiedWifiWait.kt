@@ -8,6 +8,11 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 /** Network callbacks and address/capability publication need not arrive together. */
 internal object VerifiedWifiWait {
+    const val ASSOCIATED_ADDRESS_WAIT_MS = 12_000L
+
+    fun addressBudget(remainingMs: Long, associated: Boolean): Long =
+        remainingMs.coerceIn(0L, if (associated) ASSOCIATED_ADDRESS_WAIT_MS else 3_000L)
+
     suspend fun awaitCallback(
         waitMs: Long,
         now: () -> Long,

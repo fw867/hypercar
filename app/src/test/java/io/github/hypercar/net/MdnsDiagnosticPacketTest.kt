@@ -74,20 +74,16 @@ class MdnsDiagnosticPacketTest {
     private fun sections(decoded: MdnsDiagnosticPacket): List<String> =
         decoded.details.map { it.substringAfter("section=").substringBefore(' ') }
 
-    @Test fun deviceInfoIsAnAdditionalTxtWithoutChangingExistingRecords() {
-        val instance = "手机.Phone"
-        val label = instance.toByteArray()
-        val owner = byteArrayOf(label.size.toByte()) + label + name("_device-info._tcp.local")
-        val base = packet(answers = 1, additional = 1,
-            body = rr(name("phone.local"), 1, byteArrayOf(10, 0, 0, 1)) +
-                rr(name("phone.local"), 28, ByteArray(16)))
-        val expected = base.copyOf().apply { this[11] = 2 } +
-            rr(owner, 16, byteArrayOf(11) + "model=D83AP".toByteArray(), ttl = 4500)
-
-        val enriched = MdnsDiagnosticPacket.withDeviceInfo(base, instance)
-        assertArrayEquals(expected, enriched)
-        assertEquals(1, base[11].toInt())
-        assertNull(MdnsDiagnosticPacket.withDeviceInfo(base, "a".repeat(64)))
+    @Test fun splitSrvProvidesEvidenceWithoutAReplayablePacket() {
+        val owner = name("phone._carplay-ctrl._tcp.local")
+        val srv = rr(owner, 33, byteArrayOf(0, 0, 0, 0, 0x83.toByte(), 0xd5.toByte()) + name("phone.local"))
+        val decoded = MdnsDiagnosticPacket.decode(packet(answers = 1, body = srv))!!
+        val service = decoded.carPlaySources.single()
+        val observation = CtrlSrvObservation(service.instance, service.host, service.port, 1000)
+        assertTrue(observation.matches("Phone", 33749, 999))
+        assertFalse(observation.matches("Phone", 33750, 999))
+        assertFalse(observation.matches("Phone", 33749, 1001))
+        assertNull(decoded.announcement)
     }
 
     @Test fun compressedSrvIncludesPortHostFlushAndGoodbye() {
@@ -150,14 +146,19 @@ class MdnsDiagnosticPacketTest {
         val txt = listOf("id=$mac", "srcvers=$version").flatMap { listOf(it.length.toByte()) + it.toByteArray().toList() }.toByteArray()
         val body = ptr + srv + rr(owner, 16, txt)
         val ip = byteArrayOf(10, 0, 0, 1)
-        val addr = rr(host, 1, ip)
+        val addr = rr(host, 1, ip, ttl = 30)
         val addresses = setOf(java.net.InetAddress.getByAddress(ip))
         val decoded = MdnsDiagnosticPacket.decode(packet(answers = 3, additional = 1, body = body + addr))!!
         val announcement = decoded.announcement!!
         assertEquals("phone.local", announcement.host)
+        assertEquals(30_000L, announcement.ttlMillis)
         assertTrue(announcement.matches("Phone", 33749, mac, version, addresses))
         assertFalse(announcement.matches("Phone", 33750, mac, version, addresses))
         assertFalse(announcement.matches("Phone", 33749, mac, version, emptySet()))
+        val deviceInfo = rr(name("phone._device-info._tcp.local"), 16, byteArrayOf(11) + "model=N71AP".toByteArray())
+        val vendorPacket = MdnsDiagnosticPacket.decode(packet(answers = 4, additional = 1, body = body + deviceInfo + addr))!!
+        assertEquals(33749, vendorPacket.carPlaySources.single().port)
+        assertNull(vendorPacket.announcement)
         for (p in listOf(
             packet(flags = 0, answers = 4, body = body + addr),
             packet(answers = 3, body = body),
@@ -190,11 +191,6 @@ class MdnsDiagnosticPacketTest {
         val reverse = rr(reverse4, 12, host) + rr(reverse6, 12, host)
         val nsec = rr(reverse4, 47, reverse4 + byteArrayOf(0, 2, 0, 8))
         assertNotNull(MdnsDiagnosticPacket.decode(packet(answers = 7, additional = 1, body = main + reverse + nsec))!!.announcement)
-        val base = packet(answers = 7, additional = 1, body = main + reverse + nsec)
-        val enriched = MdnsDiagnosticPacket.withDeviceInfo(base, "Phone")!!
-        val decoded = MdnsDiagnosticPacket.decode(enriched)!!
-        assertTrue(decoded.details.any { it.contains("phone._device-info._tcp.local") && it.contains("model=D83AP") })
-        assertNull(decoded.announcement) // Supplemental copies must never replace the original packet in the replay cache.
         assertNull(MdnsDiagnosticPacket.decode(packet(answers = 6, body = main + rr(name("43.0.0.10.in-addr.arpa"), 12, host)))!!.announcement)
         assertNull(MdnsDiagnosticPacket.decode(packet(answers = 6, body = main + rr(reverse4, 12, name("other.local"))))!!.announcement)
         assertNull(MdnsDiagnosticPacket.decode(packet(answers = 6, body = main + rr(reverse4, 47, reverse4 + byteArrayOf(0, 2, 0, 8))))!!.announcement)

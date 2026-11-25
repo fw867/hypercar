@@ -20,6 +20,8 @@ class AirplayDnsRecordsTest {
             (answers + extra).forEach { out.write(it) }
         }.toByteArray()
     private val instance = "BMW._airplay._tcp.local"
+    private fun pointer(ttl: Int = 120, target: String = instance) =
+        rr("_airplay._tcp.local", 12, ttl, name(target))
     private fun srv(port: Int, ttl: Int = 120) = rr(instance, 33, ttl,
         byteArrayOf(0, 0, 0, 0, (port shr 8).toByte(), port.toByte()) + name("car.local"))
     private fun address(ttl: Int = 120) = rr("car.local", 1, ttl, byteArrayOf(192.toByte(), 168.toByte(), 1, 2))
@@ -134,5 +136,63 @@ class AirplayDnsRecordsTest {
         time = 1000; assertNotNull(records.first())
         records.feed(packet(listOf(address(0))))
         time = 2000; assertNull(records.first())
+    }
+
+    @Test fun ptrGoodbyeWithdrawsOnlyThatInstanceAndReappearanceResolvesTheNewPort() {
+        var time = 0L
+        val records = AirplayDnsRecords { time }
+        val sibling = "Other._airplay._tcp.local"
+        val siblingSrv = rr(sibling, 33, 120, byteArrayOf(0,0,0,0,0x1b,0x59) + name("car.local"))
+        records.feed(packet(listOf(pointer(), srv(7000), pointer(target = sibling), siblingSrv, address())))
+        val matchCar: (AirplayDnsRecords.Endpoint) -> Boolean = { it.instance == instance.lowercase() }
+        assertEquals(7000, records.first(matchCar)?.port)
+
+        records.feed(packet(listOf(pointer(ttl = 0))))
+        assertNull(records.first(matchCar))
+        assertEquals(7001, records.first()?.port)
+
+        time = 1000
+        // Reannouncement arrives before the SRV with the changed port.
+        records.feed(packet(listOf(pointer())))
+        assertNull(records.first(matchCar))
+        assertTrue(records.pendingQuestions().contains(AirplayDnsRecords.Question(instance.lowercase(), 33)))
+        records.feed(packet(listOf(srv(17000))))
+        assertEquals(17000, records.first(matchCar)?.port)
+    }
+
+    @Test fun ptrRescueWithinGraceReactivatesTheCachedService() {
+        var time = 0L
+        val records = AirplayDnsRecords { time }
+        records.feed(packet(listOf(pointer(), srv(7000), address())))
+        records.feed(packet(listOf(pointer(ttl = 0))))
+        assertNull(records.first())
+        time = 999
+        records.feed(packet(listOf(pointer())))
+        time = 1000
+        assertEquals(7000, records.first()?.port)
+    }
+
+    @Test fun expiredPtrDoesNotHideFreshSrvInThePacketBeforeReannouncement() {
+        var time = 0L
+        val records = AirplayDnsRecords { time }
+        records.feed(packet(listOf(pointer(ttl = 1), srv(7000), address())))
+        time = 1000
+        records.feed(packet(listOf(srv(17000))))
+        assertNull(records.first())
+        records.feed(packet(listOf(pointer())))
+        assertEquals(17000, records.first()?.port)
+    }
+
+    @Test fun newerSrvDuringGoodbyeGraceSurvivesForTheNextPtr() {
+        var time = 0L
+        val records = AirplayDnsRecords { time }
+        records.feed(packet(listOf(pointer(), srv(7000), address())))
+        time = 100
+        records.feed(packet(listOf(pointer(ttl = 0))))
+        time = 900
+        records.feed(packet(listOf(srv(17000))))
+        time = 1100
+        records.feed(packet(listOf(pointer())))
+        assertEquals(17000, records.first()?.port)
     }
 }

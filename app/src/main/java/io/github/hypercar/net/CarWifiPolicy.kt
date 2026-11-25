@@ -1,9 +1,23 @@
 package io.github.hypercar.net
 
 import android.net.NetworkCapabilities
+import android.net.LinkProperties
+import android.net.wifi.WifiManager
+import java.net.Inet6Address
+import java.net.InetAddress
 
 /** A Wi-Fi capability alone is not proof that an unvalidated AP belongs to this car. */
 internal object CarWifiPolicy {
+    fun visibleSsid(value: String?): String? =
+        value?.takeUnless { it == WifiManager.UNKNOWN_SSID }?.removeSurrounding("\"")?.takeUnless { it.isBlank() }
+
+    fun hasUsableAddress(link: LinkProperties?): Boolean =
+        link?.linkAddresses?.any { isUsableAddress(it.address) } == true
+
+    fun isUsableAddress(address: InetAddress): Boolean =
+        !address.isAnyLocalAddress && !address.isLoopbackAddress && !address.isMulticastAddress &&
+            (address is Inet6Address || !address.isLinkLocalAddress)
+
     fun canReuse(caps: NetworkCapabilities?, verifiedRequest: Boolean = false): Boolean = caps != null &&
         caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) && safe(
             caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET),

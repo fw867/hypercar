@@ -20,6 +20,26 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CarHotspotReconnectTest {
+    @Test fun recoveryAcceptsNewSecurityWithTheSameSsidAndPassword() = kotlinx.coroutines.test.runTest {
+        val hotspot = checkNotNull(BluetoothHotspot.fromPeer("10:11:22:33:44:55", "CAR-WIFI"))
+        val old = CarPlayEndpoint(hotspot.ssid, "fixture-pass", 0, null, null, null, emptyList(), null,
+            bluetoothHotspot = hotspot, wifiSecurityType = 2)
+        val lost = CarWifiRequestIdentity(hotspot.ssid, "fixture-pass", 2)
+        val inbox = CarHotspotReconnect.EndpointInbox(nowMillis = { 100L },
+            hasFreshCredentials = { it.canRequestHotspot(hotspot) })
+        inbox.beginWifiRecovery(lost, 1_000L)
+        assertFalse(inbox.offer(old))
+        assertFalse(inbox.offer(old.copy(wifiSecurityType = 3)))
+        assertFalse(inbox.offer(old.copy(wifiSecurityType = null)))
+        assertFalse(inbox.offer(old.copy(wifiSecurityType = 1)))
+        val replacement = old.copy(wifiSecurityType = 4)
+        assertFalse(inbox.offer(replacement.copy(
+            replayedWifiConfiguration = Iap2Messages.WifiConfiguration(hotspot.ssid, "fixture-pass", 6, 2))))
+        assertTrue(inbox.offer(replacement))
+        assertSame(replacement, inbox.awaitReplacementCredentials(lost, 1_000L))
+        assertFalse(inbox.offer(old))
+    }
+
     private val receiver = "02:11:22:33:44:AA"
     private val other = "02:11:22:33:44:BB"
 

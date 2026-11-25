@@ -15,8 +15,8 @@ class WifiApRetryTest {
         for (firstDuration in listOf(12_000L, 60_000L)) {
             val waits = mutableListOf<Long>()
             val result = WifiApRetry.join<String>(null, 60_000, { true }, { false }, channelHint = true,
-                now = { testScheduler.currentTime }) { _, wait ->
-                waits += wait
+                now = { testScheduler.currentTime }) { _, budget ->
+                waits += budget.associationWaitMs
                 if (waits.size == 1) { delay(firstDuration); null } else "full scan"
             }
             assertEquals(if (firstDuration == 60_000L) null else "full scan", result)
@@ -36,8 +36,8 @@ class WifiApRetryTest {
             val waits = mutableListOf<Long>()
             var associated = false
             val result = WifiApRetry.join<String>(null, 60_000, { true }, { associated }, channelHint = true,
-                now = { testScheduler.currentTime }) { _, wait ->
-                waits += wait
+                now = { testScheduler.currentTime }) { _, budget ->
+                waits += budget.associationWaitMs
                 if (waits.size == 1) { associated = delivered; null } else "full scan"
             }
             assertEquals(if (delivered) null else "full scan", result)
@@ -47,21 +47,39 @@ class WifiApRetryTest {
 
     @Test fun disappearedHistoricalApGetsOneUnpinnedFallbackWithinCacheRestoreBudget() = runTest {
         val requests = mutableListOf<Pair<WifiApHint?, Long>>()
-        val result = WifiApRetry.join(history, 60_000, { true }, { false }) { hint, wait ->
-            requests += hint to wait
-            if (hint != null) { delay(wait); null } else "new AP"
+        val result = WifiApRetry.join(history, 60_000, { true }, { false }, now = { testScheduler.currentTime }) { hint, budget ->
+            requests += hint to budget.associationWaitMs
+            assertEquals(60_000L, budget.deadlineMillis)
+            if (hint != null) { delay(budget.associationWaitMs); null } else "new AP"
         }
         assertEquals("new AP", result)
-        assertEquals(listOf(history to 4_000L, null to 60_000L), requests)
+        assertEquals(listOf(history to 4_000L, null to 56_000L), requests)
         assertEquals(4_000L, testScheduler.currentTime)
+    }
+
+    @Test fun historicalApAssociatedNearFastDeadlineCanStillWaitForAddresses() = runTest {
+        val now = { testScheduler.currentTime }
+        var associated = false
+        val network = WifiApRetry.join(history, 60_000, { true }, { associated }, now = now) { selected, budget ->
+            assertEquals(history, selected)
+            assertEquals(4_000L, budget.associationWaitMs)
+            delay(3_500)
+            associated = true
+            val remaining = VerifiedWifiWait.addressBudget(budget.deadlineMillis - now(), associated)
+            VerifiedWifiWait.await(remaining, now, { true }) {
+                "same AP".takeIf { now() >= 7_500 }
+            }
+        }
+        assertEquals("same AP", network)
+        assertEquals(7_500L, now())
     }
 
     @Test fun successfulExactJoinAndOrdinaryRequestsNeverCreateExtraRequests() = runTest {
         for (hint in listOf(history, history.copy(fromMemory = false), null)) {
             var calls = 0
-            assertEquals("existing", WifiApRetry.join(hint, 60_000, { true }, { false }) { _, wait ->
+            assertEquals("existing", WifiApRetry.join(hint, 60_000, { true }, { false }) { _, budget ->
                 calls++
-                assertEquals(if (hint?.fromMemory == true) 4_000L else 60_000L, wait)
+                assertEquals(if (hint?.fromMemory == true) 4_000L else 60_000L, budget.associationWaitMs)
                 "existing"
             })
             assertEquals(1, calls)

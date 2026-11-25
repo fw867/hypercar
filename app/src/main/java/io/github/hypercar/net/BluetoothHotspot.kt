@@ -1,5 +1,8 @@
 package io.github.hypercar.net
 
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
+
 /** Hotspot advertised by the current Bluetooth peer in 0x5703 or the wireless group of 0x4301. */
 @ConsistentCopyVisibility
 data class BluetoothHotspot private constructor(val peer: String, val ssid: String) {
@@ -7,6 +10,28 @@ data class BluetoothHotspot private constructor(val peer: String, val ssid: Stri
         fun fromPeer(peer: String?, ssid: String?): BluetoothHotspot? {
             if (peer.isNullOrBlank() || ssid.isNullOrBlank()) return null
             return BluetoothHotspot(peer, ssid)
+        }
+
+        internal suspend fun <N> awaitReadyAssociation(
+            isCurrent: () -> Boolean,
+            observe: suspend () -> Association<N>,
+            isReady: (N) -> Boolean,
+            onPending: () -> Unit = {},
+        ): Association<N> {
+            val absent = Association<N>(false, null)
+            var pending = absent
+            val resolved = withTimeoutOrNull(VerifiedWifiWait.ASSOCIATED_ADDRESS_WAIT_MS) {
+                while (isCurrent()) {
+                    val match = observe()
+                    if (!isCurrent()) break
+                    if (!match.associated || match.network?.let(isReady) == true) return@withTimeoutOrNull match
+                    if (!pending.associated) onPending()
+                    pending = Association(true, null)
+                    delay(250)
+                }
+                absent
+            }
+            return if (isCurrent()) resolved ?: pending else absent
         }
     }
 

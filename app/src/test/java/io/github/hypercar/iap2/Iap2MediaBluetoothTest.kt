@@ -700,6 +700,21 @@ class Iap2MediaBluetoothTest {
         assertNull(history.resolve(replay.copy(wirelessAp = selected), replacement))
     }
 
+    @Test fun retiringWpa2StillAllowsFreshSaeFrom5703And4301() {
+        val history = Iap2WifiCredentialHistory().forReceiver("00:11:22:33:44:55")
+        val wpa2 = Iap2Messages.WifiConfiguration("fixture-ap", "fixture-pass", 6, 2)
+        val sae = wpa2.copy(securityType = 4)
+        history.remember(wpa2)
+        history.retireRecoveryCredential(wpa2.ssid, wpa2.passphrase, wpa2.securityType)
+        assertFalse(history.isRetiredRecoveryCredential(sae.ssid, sae.passphrase, sae.securityType))
+        history.remember(sae)
+        history.remember(wpa2)
+        val route = Iap2Messages.StartSession(7200, null, null, null, listOf("192.168.5.2"), null)
+        assertEquals(sae, history.resolve(route, null)?.credential)
+        assertEquals(sae, history.resolve(route.copy(wirelessAp = sae), null)?.credential)
+        assertNull(history.resolve(route.copy(wirelessAp = wpa2), null))
+    }
+
     @Test fun retired5703AndItsFollowing4301CannotUndoTheRecoveryHandoff() {
         val ssid = "fixture-ap"
         val peer = "00:11:22:33:44:55"

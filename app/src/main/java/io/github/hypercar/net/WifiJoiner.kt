@@ -171,14 +171,15 @@ class WifiJoiner(
         var firstAttempt = true
         diagnose("join_policy declared_security=${securityType ?: "legacy"} selected_security=$security declared_channel=${channel ?: 0} protocol_frequency=${protocolFrequency ?: 0}")
         return WifiApRetry.join(hint, SPECIFIER_WAIT_MS, admission::isCurrent, { currentNetwork != null },
-            channelHint = protocolFrequency != null, retryAllowed = { hintRetryAllowed && isWifiEnabled() }) { selected, waitMs ->
+            channelHint = protocolFrequency != null, retryAllowed = { hintRetryAllowed && isWifiEnabled() },
+            now = SystemClock::uptimeMillis) { selected, budget ->
             val frequency = protocolFrequency.takeIf { firstAttempt }
             if (!firstAttempt) {
                 diagnose("hint_fallback=full_scan reason=hint_request_failed; no live association replaced")
                 lastFailureReason = null
             }
             firstAttempt = false
-            joinViaSpecifier(ssid, psk, security, selected, frequency, verifiedFallback, credentialsCurrent, admission::submit, waitMs)
+            joinViaSpecifier(ssid, psk, security, selected, frequency, verifiedFallback, credentialsCurrent, admission::submit, budget)
                 as? JoinResult.Joined
         } ?: JoinResult.Failed
     }
@@ -196,7 +197,7 @@ class WifiJoiner(
      */
     private suspend fun joinViaSpecifier(ssid: String, psk: String, security: CarWifiJoinPolicy.Security,
         hint: WifiApHint?, protocolFrequency: Int?, verifiedFallback: suspend () -> Network?,
-        credentialsCurrent: () -> Boolean, submitRequest: (() -> Unit) -> Boolean, timeoutMs: Long): JoinResult =
+        credentialsCurrent: () -> Boolean, submitRequest: (() -> Unit) -> Boolean, budget: WifiApRetry.Budget): JoinResult =
         withContext(Dispatchers.IO) {
             val specifier = WifiNetworkSpecifier.Builder().apply {
                 setSsid(ssid)
@@ -225,7 +226,7 @@ class WifiJoiner(
                 .setNetworkSpecifier(specifier)
                 .build()
 
-            val network = awaitSpecifierHandle(request, specifier, ssid, hint, timeoutMs, verifiedFallback,
+            val network = awaitSpecifierHandle(request, specifier, ssid, hint, budget, verifiedFallback,
                 credentialsCurrent, submitRequest, security, hint?.frequency ?: protocolFrequency)
                 ?: return@withContext JoinResult.Failed
             val caps = connectivityManager.getNetworkCapabilities(network)
@@ -241,9 +242,13 @@ class WifiJoiner(
         }
 
     /** 用 specifier 请求拿 Network 句柄；首连时系统确认框的等待时间也算在 [timeoutMs] 内。 */
-    private suspend fun awaitSpecifierHandle(request: NetworkRequest, specifier: WifiNetworkSpecifier, ssid: String, hint: WifiApHint?, timeoutMs: Long,
+    private suspend fun awaitSpecifierHandle(request: NetworkRequest, specifier: WifiNetworkSpecifier, ssid: String, hint: WifiApHint?, budget: WifiApRetry.Budget,
         verifiedFallback: suspend () -> Network?, credentialsCurrent: () -> Boolean,
         submitRequest: (() -> Unit) -> Boolean, security: CarWifiJoinPolicy.Security, frequency: Int?): Network? {
+        val now = SystemClock.uptimeMillis()
+        val timeoutMs = minOf(budget.associationWaitMs, budget.deadlineMillis - now)
+        if (timeoutMs <= 0) return null
+        val callbackDeadline = now + timeoutMs
         val latch = CountDownLatch(1)
         val result = AtomicReference<Network?>(null)
         // 立刻 onUnavailable 与「等到超时」是完全不同的病因，必须分开记
@@ -321,7 +326,6 @@ class WifiJoiner(
             Log.i(TAG, "specifier requestNetwork 失败：${t.message}")
             return null
         }
-        val callbackDeadline = SystemClock.uptimeMillis() + timeoutMs
         fun checkCredentials(): Boolean {
             if (!credentialsCurrent()) throw CredentialsSuperseded()
             return association.owner() === cb
@@ -350,8 +354,10 @@ class WifiJoiner(
             // Do not unregister a potentially live request before checking the actual network.
             // A system Wi-Fi association alone is insufficient: fallback must pass the caller's
             // existing SSID/BSSID/address/route and local-only capability checks.
-            val remaining = (timeoutMs - (SystemClock.elapsedRealtime() - started)).coerceIn(0L, 3_000L)
-            val verified = VerifiedWifiWait.await(remaining, SystemClock::elapsedRealtime,
+            val associated = association.network() != null
+            val deadline = if (associated) budget.deadlineMillis else callbackDeadline
+            val remaining = VerifiedWifiWait.addressBudget(deadline - SystemClock.uptimeMillis(), associated)
+            val verified = VerifiedWifiWait.await(remaining, SystemClock::uptimeMillis,
                 current = ::checkCredentials, probe = {
                     result.get()?.takeIf { ready(it) } ?: verifiedFallback()?.takeIf { ready(it) }
                 })
@@ -407,12 +413,9 @@ class WifiJoiner(
         return network
     }
 
-    private fun ready(network: Network): Boolean =
-        CarWifiPolicy.canReuse(connectivityManager.getNetworkCapabilities(network), ownsLiveRequest(network)) &&
-            connectivityManager.getLinkProperties(network)?.linkAddresses?.any {
-                !it.address.isAnyLocalAddress && !it.address.isLoopbackAddress && !it.address.isMulticastAddress &&
-                    (it.address is java.net.Inet6Address || !it.address.isLinkLocalAddress)
-            } == true
+    private fun ready(network: Network, verifiedSystemHotspot: Boolean = false): Boolean =
+        CarWifiPolicy.canReuse(connectivityManager.getNetworkCapabilities(network), verifiedSystemHotspot || ownsLiveRequest(network)) &&
+            CarWifiPolicy.hasUsableAddress(connectivityManager.getLinkProperties(network))
 
     private fun readiness(network: Network?): String {
         val caps = network?.let(connectivityManager::getNetworkCapabilities)
@@ -430,6 +433,10 @@ class WifiJoiner(
     fun ownsBinding(network: Network): Boolean = boundNetwork.get() == network
 
     fun ownsLiveRequest(network: Network): Boolean = association.owns(network)
+
+    internal fun hotspotIdentityFor(network: Network): CarWifiRequestIdentity? = synchronized(bindLock) {
+        requestIdentity.takeIf { association.owns(network) }
+    }
 
     fun requiresDifferentHotspot(ssid: String?): Boolean = requestIdentity?.requiresDifferentHotspot(ssid) == true
 
@@ -460,11 +467,11 @@ class WifiJoiner(
             requestIdentity?.matches(ssid, passphrase) == true
 
     fun bindProcess(network: Network, verifiedSystemHotspot: Boolean = false): Boolean = synchronized(bindLock) {
-        if (boundNetwork.get() == network && connectivityManager.boundNetworkForProcess == network) return true // 快路径：已绑同一网络
-        if (!CarWifiPolicy.canReuse(connectivityManager.getNetworkCapabilities(network), verifiedSystemHotspot || ownsLiveRequest(network))) {
-            Log.w(TAG, "拒绝复用未验证的系统互联网 Wi-Fi；必须通过局域网请求连接")
+        if (!ready(network, verifiedSystemHotspot)) {
+            Log.w(TAG, "车机 Wi-Fi 地址或网络属性尚未就绪，暂不绑定")
             return false
         }
+        if (boundNetwork.get() == network && connectivityManager.boundNetworkForProcess == network) return true // 快路径：已绑同一网络
         val ok = connectivityManager.bindProcessToNetwork(network)
         if (ok) boundNetwork.set(network)
         ok

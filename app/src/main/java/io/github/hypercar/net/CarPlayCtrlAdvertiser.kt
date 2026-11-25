@@ -292,7 +292,6 @@ class CarPlayCtrlAdvertiser(
             observationAttempts++
             val generation = ++observationGeneration
             mdnsObserver = CtrlMdnsObserver(appContext, epoch.network, generation, log, attemptId,
-                onLocalAnnouncement = { family -> announceDeviceInfo(epoch, listener, generation, family) },
                 trace = traceDiscovery,
                 onLocalSrv = { srv ->
                     synchronized(this) {
@@ -310,34 +309,6 @@ class CarPlayCtrlAdvertiser(
                         (observedPort == null || observedPort == port)) onMdnsObservation(family, observedPort)
                 }
             }.also { it.start() }
-        }
-    }
-
-    private fun announceDeviceInfo(
-        epoch: CtrlInvitationInbox.Epoch<Network>, listener: ServerSocket, generation: Long, family: Int,
-    ): Boolean {
-        fun current() = invites.current === epoch && registeredNetwork == epoch.network &&
-            serverSocket === listener && !listener.isClosed && observationGeneration == generation &&
-            (registration.pending || registration.ready)
-
-        val snapshot = synchronized(this) {
-            if (!current()) return false
-            val name = actualRegisteredName ?: registeredName ?: return false
-            val mac = registeredMac ?: return false
-            MdnsReplaySnapshot(epoch, registration.currentGeneration, listener, mdnsObserver, name, mac,
-                listener.localPort, registrationStartedAt, inviteCount)
-        }
-        return runCatching {
-            snapshot.observer?.resend(snapshot.name, snapshot.port, snapshot.mac, SRCVERS, snapshot.registeredSince,
-                onlyFamily = family) {
-                synchronized(this) {
-                    current() && registration.currentGeneration == snapshot.registrationToken &&
-                        (actualRegisteredName ?: registeredName) == snapshot.name
-                }
-            } == 1
-        }.getOrElse {
-            logCtrl("MDNS-DEVICE-INFO: failed network=${epoch.network} IPv$family error=${it.javaClass.simpleName}:${it.message}")
-            false
         }
     }
 

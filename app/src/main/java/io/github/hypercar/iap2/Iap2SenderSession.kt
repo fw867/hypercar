@@ -857,8 +857,12 @@ class Iap2SenderSession(
     private fun publishWifiConfiguration(configuration: Iap2Messages.WifiConfiguration, start: Iap2Messages.StartSession?): Boolean =
         publishEndpoint {
             if (channel.linkGeneration != linkGeneration) return@publishEndpoint null
-            if (wifiHistory.isRetiredRecoveryCredential(configuration.ssid, configuration.passphrase)) return@publishEndpoint null
-            val sameHotspot = wifi?.let { it.ssid == configuration.ssid && it.passphrase == configuration.passphrase } != false
+            if (wifiHistory.isRetiredRecoveryCredential(configuration.ssid, configuration.passphrase,
+                    configuration.securityType)) return@publishEndpoint null
+            val sameHotspot = wifi?.let {
+                it.ssid == configuration.ssid && it.passphrase == configuration.passphrase &&
+                    !wifiHistory.isRetiredRecoveryCredential(it.ssid, it.passphrase, it.securityType)
+            } != false
             val endpoint = endpointOf(start.takeIf { sameHotspot }, configuration).copy(densoOutbackWifi = densoOutback)
             val remember = { wifiHistory.remember(configuration) }
             Iap2EndpointUpdate(endpoint, { remember() }) {

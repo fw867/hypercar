@@ -586,6 +586,11 @@ class Iap2LinkEngine(
         acknowledgement: Int,
         nowMillis: Long,
     ) {
+        val previousAck = lastSentAcknowledged.takeUnless { zeroRetryAndAckMode }
+        val confirmedCount = previousAck?.let { sequenceDistance(acknowledgement, it) }
+        // A cumulative ACK can repeat the watermark or advance through packets
+        // already sent. Half the sequence space separates old from new.
+        if (confirmedCount != null && confirmedCount > minOf(127, outstandingPackets)) return
         onPeerAcknowledgement?.invoke(acknowledgement, sentSequence)
         completeNegotiationIfPending(nowMillis)
         if (hudAwaitingAck.isNotEmpty()) {
@@ -603,8 +608,13 @@ class Iap2LinkEngine(
             }
         }
         lastSentAcknowledged = acknowledgement
-        val window = (peerSynchronization?.maxOutgoing ?: maxOutgoing) + ACK_SLACK
-        unacknowledged.removeAll { sequenceDistance(it.sequence, acknowledgement) !in 1..window }
+        if (previousAck != null && confirmedCount != null) {
+            unacknowledged.removeAll { sequenceDistance(it.sequence, previousAck) in 1..confirmedCount }
+        } else {
+            // Preserve the first ACK and unwindowed Wi-Fi paths.
+            val window = (peerSynchronization?.maxOutgoing ?: maxOutgoing) + ACK_SLACK
+            unacknowledged.removeAll { sequenceDistance(it.sequence, acknowledgement) !in 1..window }
+        }
         retransmitDeadline = unacknowledged.minOfOrNull { it.deadlineMillis }
         drainSendWindow(nowMillis)
     }

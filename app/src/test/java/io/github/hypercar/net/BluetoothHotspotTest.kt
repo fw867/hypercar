@@ -1,8 +1,12 @@
 package io.github.hypercar.net
 
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.test.runTest
 import org.junit.Assert.*
 import org.junit.Test
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class BluetoothHotspotTest {
     @Test fun onlyFreshBluetoothParametersCanStartANewJoin() {
         val hotspot = BluetoothHotspot.fromPeer(car, ssid)!!
@@ -40,5 +44,53 @@ class BluetoothHotspotTest {
         }
         assertFalse(ap.association(mapOf(7 to "home"), "home").associated)
         assertNull(ap.association(mapOf(7 to "home"), ssid).network)
+    }
+
+    @Test fun pendingAssociationKeepsTheExistingLinkWhenAndroidNeverExposesAUsableNetwork() = runTest {
+        val result = BluetoothHotspot.awaitReadyAssociation<Int>(
+            isCurrent = { true },
+            observe = { BluetoothHotspot.Association(true, 7) },
+            isReady = { false },
+        )
+        assertTrue(result.associated)
+        assertNull(result.network)
+        assertEquals(12_000L, testScheduler.currentTime)
+    }
+
+    @Test fun pendingAssociationStopsOnNewCredentialsAndAcceptsAReadyCurrentNetwork() = runTest {
+        val started = testScheduler.currentTime
+        val retired = BluetoothHotspot.awaitReadyAssociation<Int>(
+            isCurrent = { testScheduler.currentTime - started < 500 },
+            observe = { BluetoothHotspot.Association(true, 7) },
+            isReady = { false },
+        )
+        assertFalse(retired.associated)
+        assertEquals(500L, testScheduler.currentTime - started)
+
+        val ready = BluetoothHotspot.awaitReadyAssociation(
+            isCurrent = { true },
+            observe = { BluetoothHotspot.Association(true, 8) },
+            isReady = { testScheduler.currentTime >= started + 1_000 },
+        )
+        assertEquals(8, ready.network)
+
+        var current = true
+        val stale = BluetoothHotspot.awaitReadyAssociation(
+            isCurrent = { current },
+            observe = { delay(10); current = false; BluetoothHotspot.Association(true, 9) },
+            isReady = { true },
+        )
+        assertNull(stale.network)
+    }
+
+    @Test fun disappearingAssociationAllowsTheNormalJoinWithoutWaitingForTheTimeout() = runTest {
+        val started = testScheduler.currentTime
+        val result = BluetoothHotspot.awaitReadyAssociation<Int>(
+            isCurrent = { true },
+            observe = { BluetoothHotspot.Association(testScheduler.currentTime == started, null) },
+            isReady = { false },
+        )
+        assertFalse(result.associated)
+        assertEquals(250L, testScheduler.currentTime - started)
     }
 }

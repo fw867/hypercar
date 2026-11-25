@@ -10,6 +10,7 @@ import android.os.SystemClock
 import android.util.Log
 import io.github.hypercar.bluetooth.BtProfiles
 import io.github.hypercar.bluetooth.CarAclPolicy
+import io.github.hypercar.bluetooth.CarTargetPolicy
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.settings.SettingsStore
 
@@ -21,8 +22,7 @@ import io.github.hypercar.settings.SettingsStore
  * 拉起来，不需要任何前台 Activity。
  *
  * 目标过滤：优先用户选定的目标车机（SettingsStore.targetCarMac），否则识别已成功连接的车机、声明 iAP2 的已配对设备及
- * 常见车机名称——耳机/手表不会误触发。拿不到 address/name（缺 BLUETOOTH_CONNECT）
- * 无法判断是否目标车机，直接放弃并记日志。
+ * 常见车机名称——耳机/手表不会误触发。地址是必要条件，名称只用于识别无其它车机证据的设备。
  *
  * 「上车自动连接」开关（SettingsStore.autoConnect）每次广播都读（进程可能刚冷启动，无内存缓存）。
  *
@@ -61,10 +61,6 @@ class CarBluetoothReceiver : BroadcastReceiver() {
         }
         val forwardAcl = connected || HyperCarRepo.onCarAclDisconnected(address, BtProfiles.isSelfDrop(address))
         val name = runCatching { device.name }.getOrNull()
-        if (name == null) {
-            Log.i(TAG, "拿不到蓝牙 name（缺 BLUETOOTH_CONNECT？）——放弃")
-            return
-        }
         if (!isTargetCar(device, address, name)) {
             Log.i(TAG, "忽略非车机蓝牙 $name（$address）")
             return
@@ -100,12 +96,13 @@ class CarBluetoothReceiver : BroadcastReceiver() {
 
     /** Read the current selection; automatic mode recognises known/advertised receivers too. */
     @SuppressLint("MissingPermission")
-    private fun isTargetCar(device: BluetoothDevice, address: String, name: String): Boolean =
-        io.github.hypercar.bluetooth.CarTargetPolicy.acceptsAcl(
+    private fun isTargetCar(device: BluetoothDevice, address: String, name: String?): Boolean =
+        CarTargetPolicy.acceptsAcl(
             SettingsStore.targetCarMac, address, name,
             knownCar = SettingsStore.isCarPaired(address),
-            hasIap2 = device.bondState == BluetoothDevice.BOND_BONDED && runCatching {
-                device.uuids?.any { it.uuid == io.github.hypercar.iap2.Iap2Bluetooth.ACCESSORY_IAP2_UUID } == true
+            hasIap2 = runCatching {
+                device.bondState == BluetoothDevice.BOND_BONDED &&
+                    device.uuids?.any { it.uuid == io.github.hypercar.iap2.Iap2Bluetooth.ACCESSORY_IAP2_UUID } == true
             }.getOrDefault(false),
         )
 

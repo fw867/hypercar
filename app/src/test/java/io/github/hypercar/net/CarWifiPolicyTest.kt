@@ -1,9 +1,27 @@
 package io.github.hypercar.net
 
+import java.net.InetAddress
 import org.junit.Assert.*
 import org.junit.Test
 
 class CarWifiPolicyTest {
+    @Test fun usableCarWifiAddressesExcludePlaceholdersButKeepIpv6LinkLocal() {
+        for (value in listOf("0.0.0.0", "127.0.0.1", "169.254.1.2", "224.0.0.251", "::", "::1", "ff02::fb")) {
+            assertFalse(value, CarWifiPolicy.isUsableAddress(InetAddress.getByName(value)))
+        }
+        for (value in listOf("192.168.4.2", "fe80::12", "fd00::12")) {
+            assertTrue(value, CarWifiPolicy.isUsableAddress(InetAddress.getByName(value)))
+        }
+    }
+
+    @Test fun onlyTheAndroidPlaceholderIsTreatedAsRedacted() {
+        assertNull(CarWifiPolicy.visibleSsid(null))
+        assertNull(CarWifiPolicy.visibleSsid("<unknown ssid>"))
+        assertNull(CarWifiPolicy.visibleSsid("\"\""))
+        assertEquals("Car unknown edition", CarWifiPolicy.visibleSsid("\"Car unknown edition\""))
+        assertEquals("<unknown ssid>", CarWifiPolicy.visibleSsid("\"<unknown ssid>\""))
+        assertEquals(" Car Wi-Fi ", CarWifiPolicy.visibleSsid("\" Car Wi-Fi \""))
+    }
     @Test fun repeatInvitationCanUseItsVerifiedHandleWithRedactedSsid() {
         fun reuse(current: String?, sameNetwork: Boolean) = CarWifiPolicy.canReuseInvitedCar(
             knownCar = true, sameNetwork = sameNetwork, peerMatches = true, announcedSsid = null,

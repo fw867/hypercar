@@ -40,7 +40,6 @@ internal class MdnsDiscovery(private val log: (String) -> Unit) {
                 }
                 val records = AirplayDnsRecords()
                 val attempts = mutableMapOf<AirplayDnsRecords.Question, Pair<Long, Int>>()
-                var result: AirplayDnsRecords.Endpoint? = null
                 var collectUntil = Long.MAX_VALUE
                 while (continuation.isActive && System.nanoTime() / 1_000_000 < deadline) {
                     val active = synchronized(guard) { transports.toList() }
@@ -74,11 +73,6 @@ internal class MdnsDiscovery(private val log: (String) -> Unit) {
                             val reply = transport.receive(minOf(50L, remaining).toInt())
                             if (reply != null) {
                                 records.accept(reply.bytes, reply.bytes.size, reply.scopeId)
-                                result = records.first(accept)
-                                // A usable A may precede a separately queried AAAA (or another A).
-                                // Keep resolving briefly, bounded by the caller's browse budget.
-                                if (result != null && collectUntil == Long.MAX_VALUE)
-                                    collectUntil = minOf(deadline, System.nanoTime() / 1_000_000 + 250)
                             }
                         } catch (cancelled: CancellationException) { throw cancelled }
                         catch (error: Exception) {
@@ -87,7 +81,15 @@ internal class MdnsDiscovery(private val log: (String) -> Unit) {
                             synchronized(guard) { transports.remove(transport) }
                         }
                     }
-                    if (result != null && System.nanoTime() / 1_000_000 >= collectUntil) break
+                    if (records.first(accept) == null) {
+                        collectUntil = Long.MAX_VALUE
+                    } else {
+                        // A usable A may precede a separately queried AAAA (or another A).
+                        // Give a newly available receiver the same bounded collection window.
+                        val collectedAt = System.nanoTime() / 1_000_000
+                        if (collectUntil == Long.MAX_VALUE) collectUntil = minOf(deadline, collectedAt + 250)
+                        if (collectedAt >= collectUntil) break
+                    }
                 }
                 if (continuation.isActive) continuation.resume(records.first(accept))
             } catch (error: Throwable) {

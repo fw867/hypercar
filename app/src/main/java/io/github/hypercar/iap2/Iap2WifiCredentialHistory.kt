@@ -18,7 +18,7 @@ class Iap2WifiCredentialHistory {
             val supersededCredentials = HashMap<String, Iap2Messages.WifiConfiguration?>()
             val cacheBindings = HashSet<CacheBinding>()
             val cachePasswordsReplacedByDifferentSsid = HashSet<String>()
-            val retiredRecoveryPasswords = HashSet<String>()
+            val retiredRecoverySecurity = HashMap<String, MutableSet<Int?>>()
             var start: Iap2Messages.StartSession? = null
         }
 
@@ -52,7 +52,7 @@ class Iap2WifiCredentialHistory {
 
         @Synchronized
         internal fun remember(credential: Iap2Messages.WifiConfiguration) {
-            if (isRetiredRecoveryCredential(credential.ssid, credential.passphrase)) return
+            if (isRetiredRecoveryCredential(credential.ssid, credential.passphrase, credential.securityType)) return
             val hotspot = hotspots.getOrPut(credential.ssid, ::Hotspot)
             // A 0x5703 can supersede the cached password before the cache ever binds.
             for ((ssid, entry) in hotspots) {
@@ -75,25 +75,30 @@ class Iap2WifiCredentialHistory {
         }
 
         @Synchronized
-        internal fun restoreSelected(ssid: String, password: String, lost: CarWifiRequestIdentity? = null) {
-            if (isRetiredRecoveryCredential(ssid, password)) return
+        internal fun restoreSelected(ssid: String, password: String, lost: CarWifiRequestIdentity? = null,
+            securityType: Int? = null, channel: Int? = null) {
+            if (isRetiredRecoveryCredential(ssid, password, securityType)) return
             val hotspot = hotspots[ssid] ?: return
-            if (hotspot.credential?.passphrase != password) {
-                val selected = hotspot.supersededCredentials[password] ?: return
-                rememberCurrent(hotspot, selected)
+            val selected = hotspot.credential?.takeIf { it.passphrase == password }
+                ?: hotspot.supersededCredentials[password] ?: return
+            rememberCurrent(hotspot, selected.copy(securityType = securityType ?: selected.securityType,
+                channel = channel ?: selected.channel))
+            if (lost != null && !lost.matchesRequest(ssid, password, securityType ?: selected.securityType)) {
+                retireRecoveryCredential(lost.ssid, lost.passphrase, lost.securityType)
             }
-            if (lost != null && !lost.matches(ssid, password)) retireRecoveryCredential(lost.ssid, lost.passphrase)
             activeSsid = ssid
         }
 
         @Synchronized
-        internal fun retireRecoveryCredential(ssid: String, password: String) {
-            hotspots.getOrPut(ssid, ::Hotspot).retiredRecoveryPasswords.add(password)
+        internal fun retireRecoveryCredential(ssid: String, password: String, securityType: Int? = null) {
+            hotspots.getOrPut(ssid, ::Hotspot).retiredRecoverySecurity.getOrPut(password, ::HashSet).add(securityType)
         }
 
         @Synchronized
-        internal fun isRetiredRecoveryCredential(ssid: String, password: String): Boolean =
-            hotspots[ssid]?.retiredRecoveryPasswords?.contains(password) == true
+        internal fun isRetiredRecoveryCredential(ssid: String, password: String, securityType: Int? = null): Boolean =
+            hotspots[ssid]?.retiredRecoverySecurity?.get(password)?.any { previous ->
+                CarWifiRequestIdentity(ssid, password, previous).matchesRequest(ssid, password, securityType)
+            } == true
 
         @Synchronized
         internal fun commitStart(resolution: Resolution) {
@@ -113,8 +118,8 @@ class Iap2WifiCredentialHistory {
         ): Resolution? {
             val ap = start.wirelessAp
             if (ap == null) return Resolution(start, hotspots[activeSsid]?.credential ?: currentWifi)
+            if (isRetiredRecoveryCredential(ap.ssid, ap.passphrase, ap.securityType)) return null
             val hotspot = hotspots[ap.ssid]
-            if (hotspot?.retiredRecoveryPasswords?.contains(ap.passphrase) == true) return null
             if (ap.ssid != activeSsid && hotspot?.cachePasswordsReplacedByDifferentSsid?.contains(ap.passphrase) == true) return null
             val current = hotspot?.credential
             if (hotspot != null && current != null && ap.passphrase != current.passphrase &&

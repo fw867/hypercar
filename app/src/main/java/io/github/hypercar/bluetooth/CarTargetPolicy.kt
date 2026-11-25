@@ -15,8 +15,8 @@ object CarTargetPolicy {
     }
 
     /** Automatic ACL wake must also work for previously used or service-identified receivers. */
-    fun acceptsAcl(explicitTarget: String?, peer: String, name: String, knownCar: Boolean, hasIap2: Boolean): Boolean {
+    fun acceptsAcl(explicitTarget: String?, peer: String, name: String?, knownCar: Boolean, hasIap2: Boolean): Boolean {
         if (!explicitTarget.isNullOrBlank()) return explicitTarget.equals(peer, true)
-        return knownCar || hasIap2 || listOf("BMW", "MINI", "宝马").any { name.contains(it, true) }
+        return knownCar || hasIap2 || (name != null && listOf("BMW", "MINI", "宝马").any { name.contains(it, true) })
     }
 }

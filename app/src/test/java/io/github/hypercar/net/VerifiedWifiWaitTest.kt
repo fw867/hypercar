@@ -10,6 +10,19 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class VerifiedWifiWaitTest {
+    @Test fun associatedWifiCanWaitForLateAddressesWithinTheOriginalRequestDeadline() = runTest {
+        val budget = VerifiedWifiWait.addressBudget(30_000, associated = true)
+        val result = VerifiedWifiWait.await(budget, { testScheduler.currentTime }, { true }) {
+            "car-network".takeIf { testScheduler.currentTime >= 4_000 }
+        }
+        assertEquals("car-network", result)
+        assertEquals(4_000L, testScheduler.currentTime)
+        assertEquals(12_000L, budget)
+        assertEquals(2_500L, VerifiedWifiWait.addressBudget(2_500, associated = true))
+        assertEquals(3_000L, VerifiedWifiWait.addressBudget(30_000, associated = false))
+        assertEquals(0L, VerifiedWifiWait.addressBudget(-1, associated = true))
+    }
+
     @Test fun sameSsidPasswordChangeStopsAnOutstandingRequestBeforeItsSystemTimeout() = runTest {
         val request = CarWifiRequestIdentity("car", "old-passphrase")
         val association = WifiRequestAssociation<Any, String>()

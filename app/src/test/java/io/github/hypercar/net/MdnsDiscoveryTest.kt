@@ -52,10 +52,17 @@ class MdnsDiscoveryTest {
         assertTrue(ipv4.closed)
         assertTrue(ipv6.closed)
     }
-    private fun name(value: String) = ByteArrayOutputStream().apply {
-        value.split('.').forEach { write(it.length); write(it.toByteArray()) }; write(0)
+    private fun name(value: String) = name(value.split('.'))
+    private fun name(labels: List<String>) = ByteArrayOutputStream().apply {
+        labels.forEach { label ->
+            val bytes = label.toByteArray()
+            write(bytes.size)
+            write(bytes)
+        }
+        write(0)
     }.toByteArray()
-    private fun packet(owner: String, type: Int, body: ByteArray) = ByteArrayOutputStream().apply {
+    private fun packet(owner: String, type: Int, body: ByteArray) = packet(owner.split('.'), type, body)
+    private fun packet(owner: List<String>, type: Int, body: ByteArray) = ByteArrayOutputStream().apply {
         val out = DataOutputStream(this)
         out.writeShort(0); out.writeShort(0x8400); out.writeShort(0); out.writeShort(1)
         out.writeShort(0); out.writeShort(0); out.write(name(owner)); out.writeShort(type)
@@ -92,6 +99,33 @@ class MdnsDiscoveryTest {
         assertTrue(questions.size >= 3)
         assertTrue(questions.any { it.toList().windowed(4).any { bytes -> bytes == listOf<Byte>(0,33,0,1) } })
         assertTrue(questions.any { it.toList().windowed(4).any { bytes -> bytes == listOf<Byte>(0,28,0,1) } })
+    }
+
+    @Test fun splitRepliesResolveAnInstanceWithLiteralDotsAndUtf8() = runBlocking {
+        val service = listOf("_airplay", "_tcp", "local")
+        val instance = listOf("BMW.Ä\\导航") + service
+        val queryName = name(listOf("bmw.Ä\\导航") + service) + byteArrayOf(0,33,0,1)
+        val replies = ArrayDeque<MdnsDiscovery.Reply>()
+        replies.add(MdnsDiscovery.Reply(packet(service, 12, name(instance))))
+        var repliedToResolve = false
+        val transport = object : MdnsDiscovery.Transport {
+            override fun send(query: ByteArray) {
+                if (!repliedToResolve && query.toList().windowed(queryName.size).any { it == queryName.toList() }) {
+                    repliedToResolve = true
+                    replies.add(MdnsDiscovery.Reply(packet(instance, 33,
+                        byteArrayOf(0,0,0,0,0x1b,0x58) + name("car.local"))))
+                    replies.add(MdnsDiscovery.Reply(packet("car.local", 1, byteArrayOf(10,0,0,2))))
+                }
+            }
+            override fun receive(timeoutMillis: Int): MdnsDiscovery.Reply? =
+                replies.removeFirstOrNull() ?: run { Thread.sleep(timeoutMillis.toLong()); null }
+            override fun close() { }
+        }
+        val result = MdnsDiscovery { }.browse(1000, { family ->
+            if (family == 4) transport else error("IPv6 unavailable")
+        }) { true }
+        assertEquals("10.0.0.2", result?.host)
+        assertEquals(7000, result?.port)
     }
 
     @Test fun firstUsableIpv4DoesNotLoseLaterSplitIpv6Address() = runBlocking {

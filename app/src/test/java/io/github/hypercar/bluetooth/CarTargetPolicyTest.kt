@@ -45,4 +45,12 @@ class CarTargetPolicyTest {
         assertFalse(CarTargetPolicy.acceptsAcl(bmw, diplay, "DiPlay", true, true))
         assertTrue(CarTargetPolicy.acceptsAcl(bmw, bmw.lowercase(), "BMW", false, false))
     }
+
+    @Test fun missingNameDoesNotHideASelectedKnownOrServiceIdentifiedCar() {
+        assertTrue(CarTargetPolicy.acceptsAcl(bmw, bmw.lowercase(), null, false, false))
+        assertTrue(CarTargetPolicy.acceptsAcl(null, diplay, null, true, false))
+        assertTrue(CarTargetPolicy.acceptsAcl(null, diplay, null, false, true))
+        assertFalse(CarTargetPolicy.acceptsAcl(bmw, diplay, null, true, true))
+        assertFalse(CarTargetPolicy.acceptsAcl(null, headset, null, false, false))
+    }
 }
