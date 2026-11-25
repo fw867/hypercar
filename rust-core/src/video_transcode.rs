@@ -124,6 +124,7 @@ pub struct Router {
     source_fps: Option<u32>,
     source_cadence: SourceCadence,
     enabled:bool, fps:u32, factory:Factory, active:Option<Box<dyn Codec>>, failed:bool,
+    rate_recovery_at: Option<tokio::time::Instant>,
     output_size: Option<(u32,u32)>, target: Option<(u32,u32)>, input_codec: Option<VideoCodec>, vps: Vec<u8>,
     sps:Vec<u8>,pps:Vec<u8>,waiting:bool, submitted:u64,produced:u64,
     // The hardware codec drains asynchronously, may skip pictures, and preserves PTS via EGL.
@@ -133,7 +134,7 @@ pub struct Router {
     last_input:std::time::Instant,
 }
 impl Router {
-    pub fn new(enabled:bool,fps:u32,factory:Factory)->Self {Self {fit_oversize_display:false,requested_fps:fps,display_max_fps:None,source_fps:None,source_cadence:SourceCadence::default(),output_size:None,target:None,input_codec:None,vps:vec![],origins:VecDeque::new(),enabled,fps,factory,active:None,failed:false,sps:vec![],pps:vec![],waiting:true,submitted:0,produced:0,progress:std::time::Instant::now(),last_input:std::time::Instant::now()}}
+    pub fn new(enabled:bool,fps:u32,factory:Factory)->Self {Self {fit_oversize_display:false,requested_fps:fps,display_max_fps:None,source_fps:None,source_cadence:SourceCadence::default(),output_size:None,target:None,input_codec:None,vps:vec![],origins:VecDeque::new(),enabled,fps,factory,active:None,failed:false,rate_recovery_at:None,sps:vec![],pps:vec![],waiting:true,submitted:0,produced:0,progress:std::time::Instant::now(),last_input:std::time::Instant::now()}}
     pub fn for_carwith_profile(profile: Option<&str>, fps: u32, factory: Factory) -> Self {
         let mut router = Self::new(profile.is_some(), fps, factory);
         // CarWith's source is capped at 2560; any receiver may expose a larger display.
@@ -145,6 +146,7 @@ impl Router {
         self.pause();
         self.source_cadence.clear_window();
         self.failed = false;
+        self.rate_recovery_at = None;
         self.input_codec = None;
         self.vps.clear();
         self.sps.clear();
@@ -165,6 +167,7 @@ impl Router {
         } else {
             self.source_cadence.clear_window();
             self.pause();
+            self.rate_recovery_at = None;
         }
     }
 
@@ -203,10 +206,23 @@ impl Router {
     fn fail(&mut self, error: impl std::fmt::Display) {
         self.pause();
         self.failed = true;
-        let fallback = if self.needs_rate_conversion() { "source frame rate unconfirmed or exceeds maxFPS; withholding video" }
+        let fallback = if self.needs_rate_conversion() {
+            self.rate_recovery_at = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(3));
+            "source frame rate unconfirmed or exceeds maxFPS; withholding video"
+        }
             else { "source passthrough fallback latched" };
         crate::emit_log(&format!("CARWITH-TRANSCODE: {fallback}: {error}; request source IDR"));
         crate::emit_force_keyframe();
+    }
+    pub(crate) fn take_rate_recovery(&mut self) -> Option<u32> {
+        if !self.needs_rate_conversion() {
+            self.rate_recovery_at = None;
+        }
+        if self.rate_recovery_at.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            self.rate_recovery_at = None;
+            return Some(self.fps);
+        }
+        None
     }
     pub fn poll(&mut self)->Vec<Unit> {
         let Some(codec)=self.active.as_mut() else {return vec![];};
@@ -350,7 +366,7 @@ impl Router {
 }
 
 // Compare receiver and source aspect ratios relative to the source (the touch canvas).
-fn needs_stretch((sw, sh): (u32,u32), (dw, dh): (u32,u32)) -> bool {
+pub(crate) fn needs_stretch((sw, sh): (u32,u32), (dw, dh): (u32,u32)) -> bool {
     let display = u128::from(dw) * u128::from(sh);
     let source = u128::from(sw) * u128::from(dh);
     display.abs_diff(source) * 100 > source * 3
@@ -475,6 +491,22 @@ pub fn hardware_factory()->Factory {Box::new(|codec,output,(w,h),(tw,th),fps,csd
             assert_eq!(opens.load(Ordering::SeqCst),1);
             router.set_target(Some((1920,1080)), None);
             assert_eq!(router.input(false,4,frame.clone(),VideoCodec::H264, FrameOrigin::Live)[0].data,frame);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sustained_rate_conversion_failure_requests_one_source_recovery() {
+        for conversion_fails in [false, true] {
+            let (mut router, _) = router(true, conversion_fails);
+            router.set_target(Some((1920, 1080)), Some(30));
+            router.set_source_fps(Some(60));
+            let frames = router.input(false, 1, avc(true), VideoCodec::H264, FrameOrigin::Live);
+            assert_eq!(frames.is_empty(), conversion_fails);
+            tokio::time::advance(std::time::Duration::from_secs(2)).await;
+            assert_eq!(router.take_rate_recovery(), None);
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            assert_eq!(router.take_rate_recovery(), conversion_fails.then_some(30));
+            assert_eq!(router.take_rate_recovery(), None);
         }
     }
 

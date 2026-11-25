@@ -377,7 +377,7 @@ impl AudioOut {
         setup_accepted_at: std::time::Instant, ownership: &crate::buffered_ownership::BufferedOwnership,
         listening: Option<(UdpSocket, std::net::IpAddr)>) {
         self.pacing_id = Some(crate::audio_pacing::StreamId { rtsp, stream_id, setup_accepted_at });
-        self.rtp_position = Some((Arc::default(), ownership.subscribe()));
+        self.track_rtp_ownership(ownership);
         if self.pt == 100 && self.opus.is_none() {
             self.pcm_ownership = Some(ownership.subscribe());
         }
@@ -422,6 +422,10 @@ impl AudioOut {
     pub(crate) fn rtp_ownership(&self) -> Option<crate::buffered_ownership::Ownership> {
         let (_, ownership) = self.rtp_position.as_ref()?;
         Some(*ownership.borrow())
+    }
+
+    pub(crate) fn track_rtp_ownership(&mut self, ownership: &crate::buffered_ownership::BufferedOwnership) {
+        self.rtp_position = Some((Arc::default(), ownership.subscribe()));
     }
 
     fn rtp_ownership_generation(&self) -> Option<u64> {
@@ -537,6 +541,10 @@ impl AudioOut {
 
     pub async fn send_pcm(&mut self, frames: &[i16]) -> std::io::Result<()> {
         self.send_pcm_for_generation(frames, self.buffered_loss_generation()).await
+    }
+
+    pub(crate) async fn send_call_audio(&mut self, payload: &[u8], frames: u32, loss_generation: u64) -> std::io::Result<()> {
+        self.send_payload(payload, frames, Some(loss_generation)).await
     }
 
     pub async fn send_pcm_for_generation(&mut self, frames: &[i16], expected_generation: Option<u64>) -> std::io::Result<()> {
@@ -876,6 +884,14 @@ impl AudioOut {
     /// `rtp_ts`：期望锚定的当前 RTP 时间戳；`ntp_nanos`：单调时钟纳秒——与
     /// TimingServer 应答给车机的是同一时间基，否则车机算出的锚点会整体偏移。
     pub async fn send_sync(&mut self, rtp_ts: u32, ntp_nanos: u64) -> std::io::Result<()> {
+        self.send_sync_with_frames(rtp_ts, ntp_nanos, self.samples_per_packet() as u32).await
+    }
+
+    pub(crate) async fn send_call_sync(&mut self, ntp_nanos: u64, frames: u32) -> std::io::Result<()> {
+        self.send_sync_with_frames(self.ts, ntp_nanos, frames).await
+    }
+
+    async fn send_sync_with_frames(&mut self, rtp_ts: u32, ntp_nanos: u64, frames: u32) -> std::io::Result<()> {
         // Classify an in-flight write by the generation sampled before the send.
         let generation = self.resume_trace.as_ref().map(AudioResumeTrace::generation);
         let Some(sync) = self.sync.as_ref() else {
@@ -884,7 +900,7 @@ impl AudioOut {
             }
             return Ok(()); // 车机没下发 controlPort（旧车机）：只发音频
         };
-        let packet = build_sync_packet_for_frames(self.sync_seq, rtp_ts, ntp_nanos, self.samples_per_packet() as u32);
+        let packet = build_sync_packet_for_frames(self.sync_seq, rtp_ts, ntp_nanos, frames);
         // Sync shares the audio pump with media. A full socket must not stall the next tick.
         let result = socket2::SockRef::from(sync).send_with_flags(&packet, libc::MSG_DONTWAIT);
         if let Some(d4) = &mut self.d4 { d4.written(&result, packet.len()); }

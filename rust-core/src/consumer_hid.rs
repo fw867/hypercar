@@ -108,6 +108,11 @@ pub const CONSOLE_DOWN: u32 = 0x30006;
 pub const CONSOLE_PREV: u32 = 0x30007;
 pub const CONSOLE_NEXT: u32 = 0x30008;
 
+// Keep the Telephony page: its digit usages overlap Consumer media keys.
+pub const PHONE_HOOK: u32 = 0x000b_0020;
+pub const PHONE_DROP: u32 = 0x000b_0026;
+pub fn is_phone_key(key: u32) -> bool { matches!(key, PHONE_HOOK | PHONE_DROP) }
+
 const MULTI_AXIS_CONTROLLER: u32 = 0x0001_0008;
 const MAX_ROTATION_STEPS: usize = 16;
 
@@ -125,6 +130,65 @@ fn display_identity(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Apple's R14G17 HIDTelephony.c: array indices, including a final keyboard usage.
+    const TELEPHONY: &[u8] = &[
+        0x05,0x0b,0x09,7,0xa1,1,0x15,0,0x25,0x11,0x05,0x0b,
+        0x09,0,0x09,0x20,0x09,0x21,0x09,0x26,0x09,0x2f,
+        0x09,0xb0,0x09,0xb1,0x09,0xb2,0x09,0xb3,0x09,0xb4,
+        0x09,0xb5,0x09,0xb6,0x09,0xb7,0x09,0xb8,0x09,0xb9,
+        0x09,0xba,0x09,0xbb,0x05,7,0x09,0x2a,0x75,8,0x95,1,0x81,0,0xc0,
+    ];
+
+    #[test]
+    fn phone_array_uses_qualified_usages_and_only_new_press_edges() {
+        let id=Value::int(9);
+        let info=Value::dict(vec![("hidDevices",Value::array(vec![Value::dict(vec![
+            ("uuid",id.clone()),("hidDescriptor",Value::Data(TELEPHONY.to_vec())),
+        ])]))]);
+        let mut hid=ConsumerHid::from_info(&info);
+        assert_eq!(hid.report(Some(&id),&[1]),Some(vec![0xb0020]));
+        assert_eq!(hid.report(Some(&id),&[1]),Some(vec![]));
+        assert_eq!(hid.report(Some(&id),&[]),Some(vec![]));
+        assert_eq!(hid.report(Some(&id),&[1]),Some(vec![]),"short report must not release a held key");
+        assert_eq!(hid.report(Some(&id),&[0]),Some(vec![]));
+        assert_eq!(hid.report(Some(&id),&[1]),Some(vec![0xb0020]));
+        assert_eq!(hid.report(Some(&id),&[3]),Some(vec![0xb0026]));
+        for index in [0,2,4,5,8,10,11,17,255] {
+            assert_eq!(hid.report(Some(&id),&[index]),Some(vec![]),"telephone digits/Flash/Mute/delete must not control media");
+        }
+        assert_eq!(hid.report(Some(&id),&[0x20]),Some(vec![]),"the report is an index, not a direct Usage");
+        let mut reconnected=ConsumerHid::from_info(&info);
+        assert_eq!(reconnected.report(Some(&id),&[3]),Some(vec![0xb0026]));
+        assert_eq!(hid.report(Some(&Value::int(99)),&[1]),Some(vec![]));
+        assert_eq!(ConsumerHid::default().report(None,&[1]),Some(vec![]));
+    }
+
+    #[test]
+    fn phone_bitmap_and_report_ids_do_not_alias_media_or_other_devices() {
+        let mut descriptor=vec![0x05,0x0b,0x09,7,0xa1,1,0x85,4,
+            0x15,0,0x25,1,0x09,0x20,0x09,0x26,0x75,1,0x95,2,0x81,2,
+            0x75,6,0x95,1,0x81,1,0xc0];
+        descriptor.extend([0x05,0x0c,0x09,1,0xa1,1,0x85,5,0x15,0,0x25,1,
+            0x09,0xb5,0x75,1,0x95,1,0x81,2,0x75,7,0x81,1,0xc0]);
+        let a=Value::int(1);let b=Value::int(2);
+        let mut hid=ConsumerHid::from_info(&Value::dict(vec![("hidDevices",Value::array(
+            [a.clone(),b.clone()].into_iter().map(|id|Value::dict(vec![
+                ("uuid",id),("hidDescriptor",Value::Data(descriptor.clone())),
+            ])).collect(),
+        ))]));
+        assert_eq!(hid.report(Some(&a),&[4,3]),Some(vec![0xb0020,0xb0026]));
+        assert_eq!(hid.report(Some(&a),&[5,1]),Some(vec![0xb5]));
+        assert_eq!(hid.report(Some(&a),&[4,3]),Some(vec![]));
+        assert_eq!(hid.report(Some(&b),&[4,1]),Some(vec![0xb0020]));
+        assert_eq!(hid.report(Some(&a),&[4]),Some(vec![]));
+        assert_eq!(hid.report(Some(&a),&[8,1]),Some(vec![]));
+        assert_eq!(hid.report(Some(&a),&[4,0]),Some(vec![]));
+        assert_eq!(hid.report(Some(&a),&[4,2]),Some(vec![0xb0026]));
+        let wrong_page=[0x05,0x0c,0x09,1,0xa1,1,0x09,0x20,0x09,0x26,
+            0x15,0,0x25,1,0x75,1,0x95,2,0x81,2,0xc0];
+        let mut consumer=Device::parse(&wrong_page).unwrap();
+        assert!(consumer.report(&[3]).is_empty(),"Consumer page 0x20/0x26 are not phone operations");
+    }
     // MGU-81 /info hard keys and touchscreen, and G38 NBT Evo hard keys.
     const MGU_KNOB: &[u8] = &[
         0x05,1,0x09,8,0xa1,1,0x05,9,0x09,1,0x15,0,0x25,1,0x75,1,0x95,1,0x81,2,
@@ -536,7 +600,7 @@ impl Device {
                                 }
                             }
                         }
-                    } else if value&1==0 && usages.iter().any(|u|u>>16==0x0c ||
+                    } else if value&1==0 && usages.iter().any(|u|matches!(u>>16, 0x0b | 0x0c) ||
                         controller && matches!(u,0x90001|0x10030|0x10031|0x10038)) {
                         device.fields.push(Field{id:g.id,offset,size:g.size,count:g.count,
                             variable:value&2!=0,relative:value&4!=0,controller,min:g.min,usages:usages.clone()});
@@ -598,6 +662,8 @@ impl Device {
                 let Some(u) = usage else { continue; };
                 if u >> 16 == 0x0c && supported(u & 0xffff) {
                     down.insert(u & 0xffff);
+                } else if is_phone_key(u) {
+                    down.insert(u);
                 } else if u == 0xc0224 {
                     down.insert(CONSOLE_BACK);
                 } else if f.controller && f.variable {

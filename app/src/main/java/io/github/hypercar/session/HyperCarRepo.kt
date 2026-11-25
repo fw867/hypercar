@@ -3860,6 +3860,16 @@ object HyperCarRepo {
                 }
             }
             when (state) {
+                "call_audio_armed" -> {
+                    if (!sessionLive.get() || !sessionCarLifeMode || sessionSystemCarLife) return
+                    val context = appContext() ?: return
+                    val token = detail.substringBefore(' ').toLongOrNull() ?: return
+                    val rate = detail.substringAfter(' ').toIntOrNull() ?: return
+                    scope.launch {
+                        CarWithCallAudio.monitor(context, token, rate,
+                            { sessionLive.get() && engineCallbacks.isCurrent(callbackOwner) }, ::log)
+                    }
+                }
                 "activation" -> {
                     val stage = runCatching { ConnectionDiagnostics.Stage.valueOf(detail) }.getOrNull() ?: return
                     connectionDiagnostics.mark(connectionAttemptId, stage)
@@ -4011,13 +4021,14 @@ object HyperCarRepo {
         }
 
         override fun onDisplaySize(width: Int, height: Int, maxFps: Int) {
-            SettingsStore.receiverMaxFps = maxFps.takeIf { it > 0 }
+            val declaredMaxFps = maxFps.takeIf { it > 0 }
+            SettingsStore.receiverMaxFps = declaredMaxFps
             SettingsStore.receiverViewport = (width to height).takeIf { width >= 320 && height >= 240 }
             if (sessionLive.get() && width in 320..8192 && height in 240..8192) {
                 // receiverForEngine froze the actual peer for this AirPlay session.
                 val key = PairingEvidence.canvasKey(headUnitProfile.protocolProfileId, sessionReceiverMac)
-                if (key != null) SettingsStore.rememberCarWithCanvas(key, width, height)
-                log("CARWITH-SIZE: receiver=${width}x$height canvas_cache=${if (key != null) "saved" else "no_session_identity"}")
+                if (key != null) SettingsStore.rememberCarWithDisplay(key, width, height, declaredMaxFps)
+                log("CARWITH-SIZE: receiver=${width}x$height max_fps=${declaredMaxFps ?: "undeclared"} canvas_cache=${if (key != null) "saved" else "no_session_identity"}")
             }
         }
 
@@ -5108,17 +5119,22 @@ object HyperCarRepo {
             ?: if (profile in setOf("bmw_id85", "bmw_id9")) {
                 PairingEvidence.canvasKey(profile, knownWifiReceiver(wifiSsidFromApi(context)))
             } else null
-        val cached = PairingEvidence.cachedCanvas(key, SettingsStore::carWithCanvas)
-        val canvas = cached ?: (1920 to 1080)
+        val cached = PairingEvidence.cachedDisplay(key, SettingsStore::carWithDisplay)
+        val width = cached?.width ?: SettingsStore.DEFAULT_VIDEO_WIDTH
+        val height = cached?.height ?: SettingsStore.DEFAULT_VIDEO_HEIGHT
+        val systemCarLife = sessionSystemCarLife
+        val cachedMaxFps = cached?.maxFps?.takeUnless { systemCarLife }
         val config = org.json.JSONObject(SettingsStore.engineConfigJson("127.0.0.1", 0, deviceMac, "",
             // Before this attempt's Bluetooth negotiation, only its wake peer or
             // selected target is authoritative; an idle coordinator may retain another car.
-            receiverBluetoothMac = if (sessionSystemCarLife) wakePeer ?: SettingsStore.targetCarMac else null,
+            receiverBluetoothMac = if (systemCarLife) wakePeer ?: SettingsStore.targetCarMac else null,
             carWithSource = true, headUnitProfile = headUnitProfile,
-            systemCarLifeSource = sessionSystemCarLife)).put("width", canvas.first).put("height", canvas.second)
+            systemCarLifeSource = systemCarLife)).put("width", width).put("height", height)
             .put("carwith_cached_canvas", cached != null)
+            .put("carwith_cached_max_fps", cachedMaxFps)
             .put("carwith_navigation_enabled", carWithHudNavigationAllowed).toString()
-        log("CARWITH: 源端预热画布 ${canvas.first}x${canvas.second} canvas_cache=" +
+        val cachedFpsStatus = if (systemCarLife && cached?.maxFps != null) "ignored(system-auto)" else cachedMaxFps?.toString() ?: "unknown"
+        log("CARWITH: 源端预热画布 ${width}x$height cached_max_fps=$cachedFpsStatus canvas_cache=" +
             when { cached != null -> "hit"; key != null -> "miss"; else -> "no_identity" })
         if (!RustCoreBridge.nativePrepareCarWith(config, diagnosticId)) return false
         if (!current()) {

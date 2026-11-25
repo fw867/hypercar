@@ -1,8 +1,9 @@
 //! Independent speech and navigation audio stream lifecycle.
 use std::{collections::VecDeque,sync::{Arc,atomic::{AtomicBool,AtomicU8,AtomicU64,Ordering}},time::Duration};
 use parking_lot::Mutex;
-use tokio::sync::{mpsc,oneshot,Notify};
+use tokio::sync::{mpsc,oneshot,watch,Notify};
 use crate::{airplay::{AirplayParams,AudioCodec,SocketProvider},audio_out::AudioOut,aux_setup::Kind,bplist::Value,rtsp::RtspChannel,speech_resource::SpeechResource};
+use crate::audio_pacing::StreamId;
 use crate::mic_probe::{self, InputFormat, InputStream, ProbeControl};
 use crate::shutdown::EngineShutdown;
 
@@ -42,10 +43,13 @@ pub struct Input {
     lanes:[Mutex<Pending>;2],supported:AtomicU8,media_epoch:AtomicU64,wake:Notify,user_intent:Mutex<Option<std::time::Instant>>,
     shared_voice_wait:AtomicBool,
     pub(crate) buffered_owner: std::sync::OnceLock<tokio::sync::watch::Receiver<crate::buffered_ownership::Ownership>>,
-    pub(crate) buffered_failed: Notify,
+    pub(crate) buffered_failed: watch::Sender<Option<StreamId>>,
 }
 fn index(kind:Kind)->usize {if kind==Kind::Speech {0}else{1}}
 impl Input {
+    pub(crate) fn clear_buffered_failure(&self) {
+        self.buffered_failed.send_if_modified(|failure| failure.take().is_some());
+    }
     pub fn init(&self,kind:Kind,rate:u32,channels:u8) {
         let mut pending=self.lanes[index(kind)].lock();
         let epoch=pending.epoch.wrapping_add(1);
@@ -116,6 +120,7 @@ pub struct Session {
 pub struct Controller {
     session: Arc<Session>,
     stop:Arc<Stop>,tasks:Vec<tokio::task::JoinHandle<()>>,allocated:Arc<[AtomicBool;2]>,
+    call_allocated: Arc<AtomicBool>,
 }
 #[derive(Default)]
 struct Stop {
@@ -132,6 +137,94 @@ impl Stop {
     }
 }
 impl Controller {
+    pub(crate) fn arm_calls(&mut self, commands: mpsc::UnboundedSender<MainCommand>) {
+        let session = self.session.clone();
+        let stop = self.stop.clone();
+        let call_allocated = self.call_allocated.clone();
+        let Some(format) = crate::call_audio::formats(&session.info).next().filter(|_| session.params.enable_audio) else {
+            crate::emit_log("CALL-AUDIO: receiver has no compatible bidirectional telephony format");
+            return;
+        };
+        self.tasks.push(crate::callback_context::spawn(async move {
+            let mut offers = crate::call_audio::Offers::arm(format);
+            let mut ownership = session.control.buffered_ownership.subscribe();
+            'calls: while !stop.requested.load(Ordering::Acquire) && !session.control.is_closed() {
+                let crate::call_audio::Offer { attempt, rate, socket: local } = tokio::select! {
+                    biased;
+                    _ = stop.wait() => break,
+                    socket = offers.rx.recv() => match socket { Some(s) => s, None => break },
+                };
+                if local.set_nonblocking(true).is_err() { continue; }
+                let Ok(local) = tokio::net::UnixStream::from_std(local) else { continue; };
+                // A live call has priority over the optional assistant microphone lease.
+                if let Some(probe) = &session.params.microphone_probe { probe.request(false); }
+                let (transition, grant) = loop {
+                    let transition = tokio::select! {
+                        biased;
+                        _ = stop.wait() => break 'calls,
+                        _ = local.readable() => continue 'calls, // Before GO, readability means EOF or an invalid offer.
+                        guard = stop.main_transition.lock() => guard,
+                    };
+                    let grant = *ownership.borrow_and_update();
+                    if grant.owned { break (transition, grant.losses); }
+                    drop(transition);
+                    tokio::select! {
+                        biased;
+                        _ = stop.wait() => break 'calls,
+                        _ = local.readable() => continue 'calls,
+                        changed = ownership.changed() => if changed.is_err() { break 'calls; },
+                    }
+                };
+                let mut cleanup = Cleanup::default();
+                let mut call_id = None;
+                let mut announced = false;
+                let mut retryable = crate::call_audio::Retry::None;
+                let result = match session.pause_main(&commands, &mut cleanup, false).await {
+                    Ok(()) if stop.requested.load(Ordering::Acquire) => Ok(()),
+                    Ok(()) => crate::call_audio::run(&session, rate, local, grant, stop.wait(), &mut call_id, &call_allocated, &mut announced, &mut retryable).await,
+                    Err(error) => Err(error),
+                };
+                if let Some(id) = call_id {
+                    session.control.udp_media.set(100, false);
+                    let input = InputStream::Shared(InputFormat::Pcm16);
+                    let mut closed = false;
+                    for _ in 0..2 {
+                        if mic_probe::close(&session.control, input, id).await.is_ok() { closed = true; break; }
+                    }
+                    if !closed {
+                        crate::emit_log("CALL-AUDIO: telephony cleanup unconfirmed; close session before restoring media");
+                        session.control.close();
+                        break;
+                    }
+                    call_allocated.store(false, Ordering::Release);
+                }
+                if announced && !session.resource.set_phone_call(false).await && !session.resource.set_phone_call(false).await {
+                    crate::emit_log("CALL-AUDIO: phone state cleanup unconfirmed; close session");
+                    session.control.close();
+                    break;
+                }
+                if cleanup.retire_media && session.retire_media().await.is_err() {
+                    crate::emit_log("CALL-AUDIO: media teardown unconfirmed; close session");
+                    session.control.close();
+                    break;
+                }
+                if cleanup.restore && !session.restore_media_after_call(&commands, &mut ownership, &stop).await {
+                    crate::emit_log("CALL-AUDIO: media restore failed with a current grant; close session");
+                    session.control.close();
+                    break;
+                }
+                drop(transition);
+                if !stop.requested.load(Ordering::Acquire) && !session.control.is_closed() && result.is_err() {
+                    offers.request_retry(attempt, retryable);
+                }
+                match result {
+                    Ok(()) => crate::emit_log("CALL-AUDIO: telephony ended"),
+                    Err(error) => crate::emit_log(&format!("CALL-AUDIO: telephony ended: {error}")),
+                }
+            }
+        }));
+    }
+
     pub fn spawn(session:Session,input:Arc<Input>,commands:mpsc::UnboundedSender<MainCommand>,fallback:mpsc::UnboundedSender<crate::engine::SourceEvent>,shutdown:Arc<EngineShutdown>)->Self {
         input.configure(&session.info,session.kinds);
         let session=Arc::new(session);let stop=Arc::new(Stop::default());
@@ -151,17 +244,30 @@ impl Controller {
         }
         if *session.media_codec.lock() == Some(AudioCodec::BufferedAac) {
             let _ = input.buffered_owner.set(session.control.buffered_ownership.subscribe());
+            let mut failures = input.buffered_failed.subscribe();
             let recovery = session.clone();
             let stopping = stop.clone();
             let commands = commands.clone();
             let engine_shutdown = shutdown.clone();
             tasks.push(crate::callback_context::spawn(async move {
-                tokio::select! {
-                    biased;
-                    _ = engine_shutdown.wait() => (),
-                    _ = stopping.wait() => (),
-                    _ = input.buffered_failed.notified() =>
-                        recovery.fallback_buffered(&commands, &stopping, &engine_shutdown).await,
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = engine_shutdown.wait() => return,
+                        _ = stopping.wait() => return,
+                        update = failures.changed() => if update.is_err() { return; },
+                    }
+                    let Some(failed) = *failures.borrow_and_update() else { continue; };
+                    let _transition = tokio::select! {
+                        biased;
+                        _ = engine_shutdown.wait() => return,
+                        _ = stopping.wait() => return,
+                        guard = stopping.main_transition.lock() => guard,
+                    };
+                    // Pause and restore can supersede this failure while recovery waits for the slot.
+                    if *failures.borrow() != Some(failed) { continue; }
+                    recovery.fallback_buffered(&commands, &stopping, &engine_shutdown).await;
+                    return;
                 }
             }));
         }
@@ -179,7 +285,7 @@ impl Controller {
                 }
             }));
         }
-        Self{session,stop,tasks,allocated}
+        Self{session,stop,tasks,allocated,call_allocated:Arc::default()}
     }
     pub(crate) fn media_stream_type(&self) -> Option<i64> {
         self.session.media_codec.lock().map(AudioCodec::stream_type)
@@ -193,7 +299,10 @@ impl Controller {
             for task in &self.tasks {task.abort();}
             crate::emit_log("AUX-AUDIO: cleanup budget exceeded; final session teardown includes pending streams");
         }
-        [Kind::Speech,Kind::Navigation].into_iter().filter(|k|self.allocated[index(*k)].load(Ordering::Acquire)).map(Kind::stream_type).collect()
+        let mut pending: Vec<_> = [Kind::Speech,Kind::Navigation].into_iter()
+            .filter(|k|self.allocated[index(*k)].load(Ordering::Acquire)).map(Kind::stream_type).collect();
+        if self.call_allocated.load(Ordering::Acquire) && !pending.contains(&100) { pending.push(100); }
+        pending
     }
 }
 impl Drop for Controller {fn drop(&mut self) {self.stop.requested.store(true,Ordering::Release);self.stop.wake.notify_waiters();for task in &self.tasks {task.abort();}}}
@@ -273,15 +382,10 @@ impl Session {
 
     // The buffered stream owns only main media; independent audio keeps running.
     async fn fallback_buffered(&self, commands:&mpsc::UnboundedSender<MainCommand>, stop:&Stop, shutdown:&EngineShutdown) {
-        let _transition = tokio::select! {
-            biased;
-            _ = stop.wait() => return,
-            _ = shutdown.wait() => return,
-            guard = stop.main_transition.lock() => guard,
-        };
+        let stopped = || stop.requested.load(Ordering::Acquire) || shutdown.requested() || self.control.is_closed();
+        if stopped() { return; }
         self.params.pipeline.lock().audio_ready = false;
         let rtsp = self.control.trace_id();
-        let stopped = || stop.requested.load(Ordering::Acquire) || shutdown.requested() || self.control.is_closed();
         for attempt in 1..=2 {
             if stopped() { return; }
             match crate::airplay::retire_buffered_audio(&self.control).await {
@@ -475,18 +579,65 @@ impl Session {
 
     async fn restore_media(&self,commands:&mpsc::UnboundedSender<MainCommand>)->bool {
         let Some(codec)=*self.media_codec.lock() else {let _=commands.send(MainCommand::Install(None));return true;};
-        let desktop = crate::airplay::effective_desktop(&self.params, &self.info);
-        for attempt in 0..2 {
-            if attempt>0 {tokio::time::sleep(Duration::from_millis(100)).await;}
-            let output=crate::airplay::negotiate_audio(&self.control,&self.factory,Some(&self.shared),&self.params,desktop,&self.info,codec).await;
-            if let Some(mut output)=output {
-                output.set_ownership(self.resource.owned.clone());
-                crate::emit_log(&format!("AUX-AUDIO: media restored attempt={} owner_phone={}",attempt+1,self.resource.owned.load(Ordering::Acquire)));
+        for attempt in 1..=2 {
+            if attempt > 1 { tokio::time::sleep(Duration::from_millis(100)).await; }
+            if let Some(output) = self.negotiate_media_restore(codec, attempt).await {
                 return commands.send(MainCommand::Install(Some(output))).is_ok();
             }
         }
         crate::emit_log("AUX-AUDIO: media restore pending; keep pump paused and retry on a fresh media start");
         false
+    }
+
+    async fn negotiate_media_restore(&self, codec: AudioCodec, attempt: usize) -> Option<AudioOut> {
+        let desktop = crate::airplay::effective_desktop(&self.params, &self.info);
+        let mut output = crate::airplay::negotiate_audio(&self.control, &self.factory, Some(&self.shared), &self.params, desktop, &self.info, codec).await?;
+        output.set_ownership(self.resource.owned.clone());
+        crate::emit_log(&format!("AUX-AUDIO: media restored attempt={attempt} owner_phone={}",self.resource.owned.load(Ordering::Acquire)));
+        Some(output)
+    }
+
+    async fn restore_media_after_call(&self, commands: &mpsc::UnboundedSender<MainCommand>,
+        ownership: &mut tokio::sync::watch::Receiver<crate::buffered_ownership::Ownership>, stop: &Stop) -> bool {
+        let stopping = || stop.requested.load(Ordering::Acquire) || self.control.is_closed();
+        if stopping() { return true; }
+        let Some(codec) = *self.media_codec.lock() else {
+            let _ = commands.send(MainCommand::Install(None));
+            return true;
+        };
+        'grants: loop {
+            // Call cleanup freed the slot. A receiver Take can deny media SETUP
+            // until the phone regains the resource. Keep the transition serialized
+            // so another user cannot allocate the slot during restoration.
+            let losses = tokio::select! {
+                biased;
+                _ = stop.wait() => return true,
+                _ = self.control.wait_for_control_close() => return true,
+                grant = ownership.wait_for(|grant| grant.owned) => match grant {
+                    Ok(grant) => grant.losses,
+                    Err(_) => return true,
+                },
+            };
+            for attempt in 1..=2 {
+                if stopping() { return true; }
+                let grant = *ownership.borrow();
+                if grant.losses != losses { continue 'grants; }
+                if let Some(output) = self.negotiate_media_restore(codec, attempt).await {
+                    return commands.send(MainCommand::Install(Some(output))).is_ok();
+                }
+                if stopping() { return true; }
+                if ownership.borrow().losses != losses { continue 'grants; }
+                if attempt == 1 {
+                    tokio::select! {
+                        biased;
+                        _ = stop.wait() => return true,
+                        _ = ownership.changed() => continue 'grants,
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                    }
+                }
+            }
+            return false;
+        }
     }
 }
 #[derive(Default)]

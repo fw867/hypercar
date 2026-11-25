@@ -1,6 +1,16 @@
 # 方向盘媒体键与语音
 
-更新：2026-11-14。媒体键和语音键共用会话输入入口，但分别路由。
+更新：2026-11-25。电话、媒体键和语音键共用会话输入入口，分别按来源路由。
+
+## CarWith 电话键（629）
+
+CarWith 来源现接入 AirPlay `/info` 声明的 Telephony HID 页 `0x0B`：Hook Switch `0x20` 转成 CarLife CTRL `0x68008` 的硬键 2，Drop `0x26` 转成硬键 3。CarWith 原生回调在来电时接听，否则进入电话页面并发送自身的 CALL_UP；结束键挂断当前通话。空闲及拨号行为由 CarWith 版本自身决定，HyperCar 不猜通话状态或实现自动重拨。单键车机是否发送 Hook/Drop 必须观察真实描述符和报告，不能承诺任何电话图标键都自动具备两种行为。
+
+解码沿用按设备、Report ID、位偏移、数组索引/位图以及按下沿隔离。电话页保留完整 Usage，与 Consumer 媒体 Usage 分离；重复按住、松开、数字键、Flash、Mute、删除及畸形报告不触发电话操作。缺少有效描述符时不猜电话报告；不放宽独立 iAP2 MediaPlaybackRemote 的组件过滤。
+
+电话命令只进入 CarWith 的既有认证加密 CTRL writer，一秒过期，重连清队列；自绘、系统 CarLife 和已结束来源消费并丢弃这些操作，不回退到 Android 媒体会话。`PHONE-KEY` 日志区分识别、入队、写出和丢弃，不记录联系人、号码或通话内容。写出成功只证明传输，接听/挂断及声音、车机麦克风走向仍需实车验证。本次不新增通话音频链路。
+
+依据为本机 CarPlay R14G17 的 `HIDTelephony.c` 数组描述符，以及已反编译 CarLife 的 `CommonMsgTransmit.handleSpecialHardKey`、CarWith 的 `CarlifeHw.onKeyEvent` → `HwHelper` → `HomeActivity.f` 原生回调。盒子 xiap2 的 HID 描述符/虚拟输入路径仅作为输入分层对照；已检查上游 mcarplay 快照 `f1ec3ffaa1f9c11b548ec1a8d8f7afff087d8627` 的 Telephony/Consumer 隔离，未把它或盒子符号当作电话端到端成功的证明。参见[验证记录](VALIDATION.md#2026-11-25-carwith-原生电话键629)。
 
 ## 媒体键
 

@@ -22,6 +22,7 @@ mod speech_resource;
 mod aux_audio;
 mod aux_setup;
 mod mic_probe;
+mod call_audio;
 mod audio_resource;
 mod bplist;
 mod consumer_hid;
@@ -78,6 +79,30 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
 
 use crate::airplay::{SocketProvider, TouchInput};
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeCallAudioArmed(
+    _env: JNIEnv, _class: JClass, token: jlong,
+) -> jboolean {
+    if call_audio::armed(token) { JNI_TRUE } else { JNI_FALSE }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeOfferCallAudio(
+    _env: JNIEnv, _class: JClass, token: jlong, attempt: jlong, rate: jint, fd: jint,
+) -> jboolean {
+    if fd < 0 { return JNI_FALSE; }
+    // The Java side detaches this FD even for offers from a retired engine.
+    let socket = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    if call_audio::offer(token, attempt, rate as u32, socket) { JNI_TRUE } else { JNI_FALSE }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeTakeCallAudioRetry(
+    _env: JNIEnv, _class: JClass, token: jlong, attempt: jlong,
+) -> jint {
+    call_audio::take_retry_reason(token, attempt) as jint
+}
 
 static TOKIO_RT: Lazy<Runtime> = Lazy::new(|| {
     Builder::new_multi_thread()

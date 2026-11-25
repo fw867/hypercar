@@ -2,6 +2,26 @@
 
 更新：2026-11-07。实现与已验证范围分别描述，出声不能只凭 connected 或 RECORD 判断。
 
+## CarWith 蜂窝通话
+
+CarWith 会话在手机进入普通蜂窝通话、Shizuku 已授权、本机支持 Android PSTN 双向接口且车机 `/info` 声明同一条 type100 `telephony` 双向格式时，暂停媒体流并建立通话主音频。支持 24/16 kHz 单声道 PCM、48/44.1 kHz 立体声 PCM 和 24/16 kHz 单声道 Opus。SETUP 的 `dataPort` 用于手机接收车机麦克风，响应的 `dataPort` 用于向车机扬声器发送音频。已激活会话确认 SETUP 后公布 `phoneCall` 应用状态并启动手机音频端点。iAP2 通话状态独立上报。
+
+电话 SETUP 校验流级状态及车机回填的音频参数。遇到明确的 RTSP 400、451、461 时，先尝试省略 `controlPort`，随后按 `/info` 声明尝试下一种双向格式。麦克风 `dataPort` 在重试期间保持一致。应答超时或内容不一致时先清理可能占用的主音频槽，再恢复媒体。
+
+手机端通过 Shizuku UserService 调用 Android 通话下行提取及上行注入接口。某个采样率无法创建、启动或路由端点时会尝试其它支持的采样率，和车机协商结果不同时在桥接中转换。桥接要求 Android 通话状态和 Telecom 前台通话均确认只有一路普通蜂窝通话正在活动。收到通话状态变更时先撤销旧桥接，等待新的单路通话确认后重新建流。麦克风 RTP 经对端地址校验、认证和重放检查后进入当前蜂窝通话。暂时收不到麦克风包时扬声器继续播放，收到新的有效包后恢复上行。紧急呼叫保持原有路由，手机麦克风静音时不注入车机麦克风。电话流异常中断后，确认电话流清理且媒体恢复后，同一通电话最多按同一采样率重新建流一次。车机暂时持有主音频时，媒体在授权归还后恢复。诊断 `CALL-AUDIO` 记录状态和传输结果。
+
+桥接保留手机的本地通话输出。AirPlay `/feedback` 中的 `sampleTime` 是车机输出回调的时钟，缓冲区输出静音时也会继续推进。RTP 同步包发送成功或车机麦克风上行也无法确认车机扬声器已经出声。车机开始播放后，手机与车机可能同时出声。
+
+依据为 CarPlay R14G17 样例的 Main Audio Telephony 声明、POSIX 接收端的 `input` 处理及 CarPToCarL 的通话档切换与手机输入端口示例。盒子 xiap2 的 `ResourceManager_ControllerPhone` 与 `setPhoneState` 用于对照电话状态和资源切换。CarWith 的 VoIPService 使用独立 DataBus 通话通道，当前 CarLife VR 仍服务于助手，蜂窝通话 PCM 通过 [Android 系统通话接口](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/master/media/java/android/media/AudioManager.java) 接入。实车需确认车机出声、远端能听到车机麦克风和挂断后音乐恢复。
+
+### 直接桥接原生服务的前提
+
+检查了测试手机正在使用的 `com.miui.carlink` 4.0.23-20261016 APK。原生双向电话音频走 `DataBusService` 的媒体通道和 `VoIPService`，两个服务均未导出。原生投屏入口 `CarlinkService` 需要 `START_CARLINKSERVICE` 的签名或系统特权。已导出的 `CarlifeConnService` 鉴别 Binder 调用者，只允许该版本的 CarLife 伙伴应用注册 `ISystemAudioCallback`。CarLife VR PCM 则交给助手队列。以上检查没有发现当前第三方 APK 可以直接挂到现有 CarWith 会话上的电话 PCM 入口。
+
+系统 CarLife+ 的车机端协议需要按厂商或引擎验证。现有 CarLife 资料和公开协议实现中的电话控制走 HFP，双向通话音频由车机与手机之间的蓝牙免提承载。它可以服务于电话，但不会向 HyperCar 提供可桥接给 AirPlay 的 PCM。参考[通话传输示例](https://patents.google.com/patent/CN117956061A/zh)和[百度车厂接入流程](https://online.carlife.baidu.com/carlife/caroem/start)。
+
+免 Shizuku 的 AirPlay 电话链路还缺厂商支持的音频生产端。需要能在已授权的原生车机会话内读取电话下行、写入车机麦克风，并收到开始、结束和静音等状态的车机 SDK 或公开接口。ICCOA 提供面向车机的 SDK，公开资料确认语音通话场景，但没有提供可直接接入当前 HyperCar 进程的双向电话 PCM 接口。参考 [ICCOA Carlink SDK 说明](https://www.iccoa.cn/suit_2.html)。
+
 ## 两种音源
 
 | 来源 | PCM 输入 | 边界 |

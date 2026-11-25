@@ -19,6 +19,27 @@ impl SpeechResource {
     pub fn serial(&self)->Arc<tokio::sync::Mutex<()>> {self.serial.clone()}
     pub fn speech_valid(&self,lease:&SpeechLease)->bool {lease.valid(&self.modes.lock())}
     pub fn navigation_valid(&self,lease:&NavigationLease)->bool {lease.valid(&self.modes.lock())}
+    pub(crate) async fn set_phone_call(&self, active: bool) -> bool {
+        let _serial = self.serial.lock().await;
+        let (current, body) = {
+            let modes = self.modes.lock();
+            let current = modes.phone_entity();
+            let next = i64::from(active);
+            if current == next && active { return true; }
+            if current == 2 { return !active; }
+            if active && !modes.audio_owned() { return false; }
+            let mut proposed = modes.clone();
+            proposed.set_phone_entity(next);
+            (current, proposed.declaration())
+        };
+        let accepted = self.control.request("POST", "/command", &body, "application/x-apple-binary-plist", &[],
+            std::time::Duration::from_secs(2)).await.is_ok_and(|reply| response_accepted(reply.status(), &reply.body));
+        if !accepted { return false; }
+        let mut modes = self.modes.lock();
+        if modes.phone_entity() != current { return false; }
+        modes.set_phone_entity(i64::from(active));
+        true
+    }
     pub async fn begin_speech(&self,user_initiated:bool)->Option<SpeechLease> {
         let _serial=self.serial.lock().await;
         let (proposal,lease)=self.modes.lock().speech_begin(user_initiated)?;

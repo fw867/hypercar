@@ -9,6 +9,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 /** Network callbacks and address/capability publication need not arrive together. */
 internal object VerifiedWifiWait {
     const val ASSOCIATED_ADDRESS_WAIT_MS = 12_000L
+    enum class CallbackWait { SIGNAL, TIMEOUT, HINT_EXPIRED, SUPERSEDED }
 
     fun addressBudget(remainingMs: Long, associated: Boolean): Long =
         remainingMs.coerceIn(0L, if (associated) ASSOCIATED_ADDRESS_WAIT_MS else 3_000L)
@@ -18,14 +19,26 @@ internal object VerifiedWifiWait {
         now: () -> Long,
         credentialsCurrent: () -> Boolean,
         poll: suspend (Long) -> Boolean,
+        hintCheckMillis: Long? = null,
+        keepHint: () -> Boolean = { true },
         onWaiting: () -> Unit = {},
-    ): Boolean {
+    ): CallbackWait {
         val deadline = now() + waitMs
+        var checkpoint = hintCheckMillis?.takeIf { it < deadline }
         while (true) {
             currentCoroutineContext().ensureActive()
-            if (!credentialsCurrent()) return false
-            val remaining = deadline - now()
-            if (remaining <= 0 || poll(minOf(200L, remaining))) return credentialsCurrent()
+            if (!credentialsCurrent()) return CallbackWait.SUPERSEDED
+            val time = now()
+            if (time >= deadline) return CallbackWait.TIMEOUT
+            val check = checkpoint
+            if (check != null && time >= check) {
+                checkpoint = null
+                if (!keepHint()) return CallbackWait.HINT_EXPIRED
+                continue
+            }
+            if (poll(minOf(200L, (check ?: deadline) - time))) {
+                return if (credentialsCurrent()) CallbackWait.SIGNAL else CallbackWait.SUPERSEDED
+            }
             onWaiting()
         }
     }

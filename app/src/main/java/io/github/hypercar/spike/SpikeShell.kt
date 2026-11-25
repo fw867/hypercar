@@ -42,13 +42,18 @@ object SpikeShell {
     fun startSplitAudioCapture(owner: IBinder, navigationUid: Int): Array<android.os.ParcelFileDescriptor>? =
         service?.startSplitAudioCapture(owner, navigationUid)
     fun stopAudioCapture() { service?.stopAudioCapture() }
+    fun activeCallAudioIdentity(): String? = service?.activeCallAudioIdentity()
+
+    fun openCallAudio(owner: IBinder, token: Long, callId: String, rate: Int): android.os.ParcelFileDescriptor? =
+        service?.openCallAudio(owner, token, callId, rate)
+    fun closeCallAudio(token: Long) { service?.closeCallAudio(token) }
     fun audioCaptureStatus(): String = service?.audioCaptureStatus() ?: "shell disconnected"
     fun startBluetoothDiscoverable(owner: IBinder, token: String, seconds: Int): String =
         call("startBluetoothDiscoverable") { it.startBluetoothDiscoverable(owner, token, seconds) }
     fun stopBluetoothDiscoverable(token: String): String =
         call("stopBluetoothDiscoverable") { it.stopBluetoothDiscoverable(token) }
-    fun startWifiSelection(owner: IBinder, token: String, ssid: String, bssid: String, uid: Int): String =
-        call("startWifiSelection") { it.startWifiSelection(owner, token, ssid, bssid, uid) }
+    fun startWifiSelection(owner: IBinder, token: String, ssid: String, bssid: String, uid: Int, protocolFrequency: Int): String =
+        call("startWifiSelection") { it.startWifiSelection(owner, token, ssid, bssid, uid, protocolFrequency) }
     fun stopWifiSelection(token: String): String =
         call("stopWifiSelection") { it.stopWifiSelection(token) }
 
@@ -115,8 +120,8 @@ object SpikeShell {
             .daemon(false)
             .processNameSuffix("spike")
             .debuggable(BuildConfig.DEBUG)
-            // AIDL revision also distinguishes local installs sharing the same versionCode.
-            .version(BuildConfig.VERSION_CODE + 4)
+            // AIDL revisions also distinguish local installs sharing the same versionCode.
+            .version(BuildConfig.VERSION_CODE + 10)
         args = a
         // 注意：**不要**在 Main 线程调 bindUserService。Shizuku 13.6 在某些机型上会同步等待
         // 用户服务把 binder 交回来；放主线程会与「回调也要主线程」互相等死（真机踩过：

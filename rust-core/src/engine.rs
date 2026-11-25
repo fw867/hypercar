@@ -121,6 +121,8 @@ pub struct EngineConfig {
     #[serde(default)]
     pub carwith_cached_canvas: bool,
     #[serde(default)]
+    pub carwith_cached_max_fps: Option<u32>,
+    #[serde(default)]
     pub carwith_navigation_token: u64,
     #[serde(default)]
     pub carwith_navigation_enabled: bool,
@@ -171,6 +173,11 @@ pub(crate) fn route_display_key(
     key: u32,
     local_key: impl FnOnce(u32),
 ) {
+    if crate::consumer_hid::is_phone_key(key) {
+        if let Some(hub) = hub { hub.handle_phone_key(key); }
+        else { crate::emit_log(&format!("PHONE-KEY: usage=0x{key:x} dropped source=self")); }
+        return;
+    }
     if !hub.is_some_and(|hub| hub.handle_console_key(key)) {
         local_key(key);
     }
@@ -542,7 +549,11 @@ pub async fn run_engine(
 
     drop(pending_cleanup); // The negotiated outcome now owns both channels.
     // Requests share the encrypted control channel, with their own CSeq; feedback continues independently.
-    let mut auxiliary=outcome.aux_audio.map(|session|crate::aux_audio::Controller::spawn(session,auxiliary_input,main_audio_tx,fallback_audio_tx,shutdown.clone()));
+    let mut auxiliary=outcome.aux_audio.map(|session| {
+        let mut controller = crate::aux_audio::Controller::spawn(session,auxiliary_input,main_audio_tx.clone(),fallback_audio_tx,shutdown.clone());
+        if cfg.carlife_source && !cfg.system_carlife_source { controller.arm_calls(main_audio_tx); }
+        controller
+    });
     let keepalive = outcome.keepalive;
     let mut teardown = outcome.teardown_streams;
     let resource_session = outcome.resource_session;
@@ -747,8 +758,18 @@ async fn audio_pump(
                 Some(MainCommand::Pause { reply, hold_mixed_voice: hold_voice }) => {
                     if reply.is_closed() {continue;}
                     // The transition drops the old sender before remote TEARDOWN.
-                    // A simultaneous Pause timeout leaves the current sender here.
-                    if let Err(sender) = reply.send(out.take()) { out = sender; continue; }
+                    // Publish invalidation with the ACK so recovery cannot see the old
+                    // failure after the caller releases the transition lock.
+                    let mut acknowledged = false;
+                    auxiliary.buffered_failed.send_if_modified(|failed| {
+                        if let Err(sender) = reply.send(out.take()) {
+                            out = sender;
+                            return false;
+                        }
+                        acknowledged = true;
+                        failed.take().is_some()
+                    });
+                    if !acknowledged { continue; }
                     paused = true;
                     hold_mixed_voice = hold_voice;
                     pipeline.lock().observe_main_sender(None);
@@ -762,6 +783,7 @@ async fn audio_pump(
                     emit_log("AUDIO-RESOURCE: main sender released; pause acknowledged");
                 }
                 Some(MainCommand::Install(next)) => {
+                    auxiliary.clear_buffered_failure();
                     ready = None;
                     media_mix.clear(); media_remain.clear();
                     if next.is_none() && hold_mixed_voice {
@@ -1024,13 +1046,14 @@ async fn audio_pump(
                     pacing.expired_media += std::mem::take(&mut a.expired_pcm_frames);
                     if let Err(error)=result {
                         if a.stream_type() == 103 {
+                            let failed = a.pacing_id;
                             emit_log(&format!("BUFFERED-AUDIO: type103 sender retired error={error}; requesting type102 fallback"));
                             drop(out.take());
                             paused = true;
                             media_mix.clear();
                             media_remain.clear();
                             pipeline.lock().observe_main_sender(None);
-                            auxiliary.buffered_failed.notify_one();
+                            auxiliary.buffered_failed.send_replace(failed);
                             continue;
                         }
                         audio_errors+=1;
@@ -1107,6 +1130,11 @@ pub(crate) async fn video_pump(
     // 16ms tick：仅用于 keepAlive 节拍（真帧由视频泵推送）
     let mut tick = tokio::time::interval(Duration::from_millis(16));
     loop {
+        if let Some(owner) = source_owner.filter(|_| sender.is_some()) {
+            if let Some(fps) = converter.take_rate_recovery() {
+                crate::carwith_source::report_video_rate_failure(owner, fps);
+            }
+        }
         if recovering_backlog
             && last_backlog_request.is_none_or(|at: tokio::time::Instant| at.elapsed() >= Duration::from_secs(3)) {
             if let Some(s) = &sender {
@@ -1994,6 +2022,41 @@ mod main_audio_command_tests {
         async fn type102_long_backlog() { exercise(false, true).await; }
         #[tokio::test(start_paused = true)]
         async fn type103_long_backlog() { exercise(true, true).await; }
+
+        #[tokio::test]
+        async fn type103_failure_is_invalidated_by_acknowledged_pause() {
+            let (data, _data_peer) = tcp_pair().await;
+            let (control, channel, control_peer) = crate::audio_out::control_pair(48000).await;
+            drop(control_peer);
+            let encoder = crate::aac::AacEncoder::at_rate(48000).unwrap();
+            let mut sender = AudioOut::new_buffered_aac(data, [7; 32], encoder, control, 1_000_000);
+            sender.observe_main_stream(channel.trace_id(), 21, 0, std::time::Instant::now(),
+                &channel.buffered_ownership, None);
+            let input = Arc::new(crate::aux_audio::Input::default());
+            let mut failures = input.buffered_failed.subscribe();
+            let (ready, rx) = tokio::sync::oneshot::channel();
+            let (_events, audio) = mpsc::unbounded_channel();
+            let (commands, command_rx) = mpsc::unbounded_channel();
+            let (claims, _) = mpsc::channel(4);
+            assert!(ready.send(sender).is_ok());
+            let worker = tokio::spawn(audio_pump(Arc::default(), Arc::default(),
+                claims, rx, audio, command_rx, input, test_pipeline()));
+
+            let failed = *tokio::time::timeout(Duration::from_secs(2), failures.wait_for(Option::is_some))
+                .await.expect("control failure must retire the sender").unwrap();
+            assert_eq!(failed.unwrap().stream_id, 21);
+
+            let (reply, abandoned) = tokio::sync::oneshot::channel();
+            drop(abandoned);
+            commands.send(MainCommand::Pause { reply, hold_mixed_voice: false }).unwrap();
+            assert!(tokio::time::timeout(Duration::from_millis(30), failures.changed()).await.is_err());
+
+            let (reply, done) = tokio::sync::oneshot::channel();
+            commands.send(MainCommand::Pause { reply, hold_mixed_voice: false }).unwrap();
+            assert!(tokio::time::timeout(Duration::from_secs(1), done).await.unwrap().unwrap().is_none());
+            assert!(failures.borrow().is_none());
+            worker.abort();
+        }
     }
     fn test_pipeline() -> Arc<Mutex<crate::pipeline::Pipeline>> {
         Arc::new(Mutex::new(crate::pipeline::Pipeline::new()))

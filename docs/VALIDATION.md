@@ -1,5 +1,21 @@
 # 验证记录与边界
 
+## 2026-11-25 CarWith 蜂窝通话双向音频（629，同一未提交批次）
+
+CarWith 活跃会话使用车机明确声明的 type100 `telephony` 双向格式。手机通话下行从 Android 系统通话接口提取，车机上行经过 AirPlay RTP 认证后进入同一通话的注入接口。常规通话、资源拥有和授权是启动条件。Setup 使用两端各自的 `dataPort`，不对已激活会话重复发 RECORD。原媒体流在关闭电话流后恢复。详见[音频说明](AUDIO.md)。
+
+连接手机的 shell UID 2000 探针确认 `CALL_AUDIO_INTERCEPTION` 已授予、`isPstnCallAudioInterceptable=true`、下行接口返回 `AudioRecord`、上行接口返回 `AudioTrack`，以及 Telecom Binder 的紧急呼叫查询可用。探针在空闲状态读取能力，没有采集或注入真实通话音频。中间版本原生全量 673 通过、4 项硬件探针忽略。审查后最终代码的 3 项电话专项通过，覆盖无权限归属时等待、双向加密 PCM、坏密文拒绝、接管并立即归还也会撤销旧通话流、原媒体复原、格式隔离以及 Opus 帧长。最终 Release JVM 1023 项通过，lint 0 错误、88 警告，其中 3 条来自 shell 进程使用的 Android 内部接口。
+
+正式 APK 签名验证通过，包内原生库哈希与本轮产物一致。已用 `adb install -r` 于 23:44 覆盖安装 `0.1.0.629 / 10725`，版本沿用同一未提交批次，原始安装时间保持，主界面启动成功。真实蜂窝通话的车机出声、远端能听到车机麦克风、实际挂断后的音量与媒体恢复仍待实车验证。
+
+## 2026-11-25 CarWith 原生电话键（629）
+
+AirPlay Telephony HID 按描述符解码 Hook Switch/Drop，保留页号并只派发按下沿；当前 CarWith 来源转为 CTRL `0x68008` 硬键 2/3。自绘、系统 CarLife、已结束来源不执行这些操作。接收方原生链路及盒子/上游对照边界见[电话键说明](INPUT-AND-VOICE.md)。
+
+先运行新增用例，复现缺少电话解码和自绘来源电话输入未隔离的三项失败；实现后专项 21 项通过。最终使用本次新生成的 ARM64 测试二进制 `hypercar_core-a81633a6a567a934` 完整运行：670 项通过、0 失败、4 项硬件探针忽略；Release JVM 1023 项通过。真实回环 TCP 测试核对加密正文解密后为原生 protobuf，验证未启动、缺挑战验证/准入/加密就绪及过期命令不写出。独立代码审查无阻断问题，release lint 无错误（85 条既有警告），正式 APK 构建通过，包内原生库哈希与本次产物一致。
+
+已通过 `adb install -r` 覆盖安装 `0.1.0.629 / 10725`，保留应用数据及配对；包版本回读正确，原始安装时间保持 `2026-10-29 16:41:22`，主界面启动成功。未提交或推送。实车方向盘报告、CarWith 实际接听/挂断、空闲按键行为及通话声音/麦克风路径仍待验证；本次没有新增通话音频链路。诊断使用 `PHONE-KEY`，写出不等于电话操作成功。
+
 ## 2026-11-25 B9 与能力声明收敛（626，同一未提交批次）
 
 依据盒子原始 ELF Consumer 映射，B9 与 B0 同为播放：CarMediaKeys 将 B9 从 Stop 改为显式 Play，并纳入播放音频请求；B7 仍为 Stop。公共 CONTROLLER_FEATURES 移除未实现的 sessionManagement、logTransfer、vehicleStateProtocol，不再仅对 BMW 过滤。保留其它能力顺序及 MBUX 最小声明、HEVC、MainBuffered、副屏的既有独立协商。

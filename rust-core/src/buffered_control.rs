@@ -5,7 +5,7 @@ use crate::{
     rtsp::RtspChannel,
 };
 use std::{io, sync::{Arc, OnceLock}, time::{Duration, Instant}};
-use tokio::sync::{watch, Mutex, OwnedMutexGuard};
+use tokio::sync::{oneshot, watch, Mutex, OwnedMutexGuard};
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -209,6 +209,7 @@ pub(crate) struct BufferedControl {
     // Holding this guard from prepare through packet_written serializes those two
     // operations and the observer without ever blocking the RTSP event handler.
     reservation: Option<OwnedMutexGuard<Playback>>,
+    first_write: Option<oneshot::Sender<u64>>,
     retire: watch::Sender<bool>,
 }
 
@@ -217,23 +218,30 @@ impl BufferedControl {
         let mut changes = channel.buffered_ownership.subscribe();
         let losses = changes.borrow().losses;
         let (retire, mut retired) = watch::channel(false);
+        let (first_write, started) = oneshot::channel();
         let stream = Arc::new(Stream { channel, uri, anchor_uri, sample_rate, samples_per_packet,
             ownership: changes.clone(), retired: retired.clone(), failure: OnceLock::new(), mode: OnceLock::new(), playing_generation: Default::default() });
         let state = Arc::new(Mutex::new(Playback { losses, last_written: None, start_requested: false }));
         let observer = stream.clone();
         let playback = state.clone();
         crate::callback_context::spawn(async move {
+            // Start from the generation that wrote the first record. A take may
+            // already have occurred between the final TCP write and this task.
+            let Ok(mut reconciled) = started.await else { return; };
             loop {
+                if changes.borrow_and_update().losses != reconciled {
+                    let mut locked = playback.lock().await;
+                    if *retired.borrow() || observer.reconcile_loss(&mut locked).await.is_err() { break; }
+                    reconciled = locked.losses;
+                }
                 tokio::select! {
                     biased;
                     _ = retired.changed() => break,
                     event = changes.changed() => if event.is_err() { break; },
                 }
-                let mut locked = playback.lock().await;
-                if *retired.borrow() || observer.reconcile_loss(&mut locked).await.is_err() { break; }
             }
         });
-        Self { stream, state, reservation: None, retire }
+        Self { stream, state, reservation: None, first_write: Some(first_write), retire }
     }
 
     pub(crate) fn loss_generation(&self) -> u64 { self.stream.ownership.borrow().losses }
@@ -271,8 +279,12 @@ impl BufferedControl {
     pub(crate) async fn prepare_packet(&mut self, _seq: u32, _ts: u32, generation: u64) -> io::Result<bool> {
         if self.reservation.is_some() { return Err(io::Error::other("uncompleted buffered data write")); }
         if let Some(error) = self.stream.failure.get() { return Err(io::Error::other(error.clone())); }
-        let Ok(state) = self.state.clone().try_lock_owned() else { return Ok(false); };
-        if !self.stream.permits(generation) || state.losses != generation { return Ok(false); }
+        let Ok(mut state) = self.state.clone().try_lock_owned() else { return Ok(false); };
+        if !self.stream.permits(generation) { return Ok(false); }
+        // Until the first completed write there is nothing at the receiver to
+        // flush. Adopt the fresh grant before reserving that first record.
+        if self.first_write.is_some() { state.losses = generation; }
+        if state.losses != generation { return Ok(false); }
         self.reservation = Some(state);
         Ok(true)
     }
@@ -292,6 +304,7 @@ impl BufferedControl {
     pub(crate) async fn packet_written(&mut self, seq: u32, ts: u32) -> io::Result<()> {
         let mut state = self.reservation.take().ok_or_else(|| io::Error::other("unreserved buffered data write"))?;
         state.last_written = Some((seq, ts));
+        if let Some(first_write) = self.first_write.take() { let _ = first_write.send(state.losses); }
         if !state.start_requested && self.stream.permits(state.losses) {
             state.start_requested = true;
             let generation = state.losses;
@@ -394,6 +407,41 @@ mod tests {
             assert_eq!(body.get(key), Some(&Value::int(expected)), "{key}");
         }
         reply(peer, &play, 200, None).await;
+    }
+
+    #[tokio::test]
+    async fn empty_buffer_accepts_first_fresh_au_at_zero_after_rapid_take_and_return() {
+        let (mut control, channel, mut peer) = pair().await;
+        let old = control.loss_generation();
+        channel.buffered_ownership.publish(false);
+        channel.buffered_ownership.publish(true);
+        let fresh = control.loss_generation();
+        assert_ne!(old, fresh);
+        assert!(!control.prepare_packet(0, 0, old).await.unwrap());
+        // There is no receiver data to flush. Prepare the fresh AU before any
+        // background task has had a chance to observe the ownership updates.
+        assert!(control.prepare_packet(0, 0, fresh).await.unwrap());
+        control.packet_written(0, 0).await.unwrap();
+        anchor(&mut peer, 0, 42).await;
+    }
+
+    #[tokio::test]
+    async fn loss_after_first_tcp_write_but_before_completion_still_flushes_it() {
+        let (mut control, channel, mut peer) = pair().await;
+        let generation = control.loss_generation();
+        assert!(control.prepare_packet(7, 0, generation).await.unwrap());
+        assert_eq!(control.with_packet_ownership(generation, || 40), Some(40));
+        channel.buffered_ownership.publish(false);
+        channel.buffered_ownership.publish(true);
+        control.packet_written(7, 0).await.unwrap();
+        assert!(!control.prepare_packet(8, 1024, control.loss_generation()).await.unwrap());
+        let (flush, body) = request(&mut peer, "FLUSHBUFFERED").await;
+        assert_eq!(body.get("flushUntilSeq"), Some(&Value::int(7)));
+        assert_eq!(body.get("flushUntilTS"), Some(&Value::int(1023)));
+        reply(&mut peer, &flush, 200, None).await;
+        let (pause, body) = request(&mut peer, "SETRATEANCHORTIME").await;
+        assert_eq!(body, rate(0));
+        reply(&mut peer, &pause, 200, None).await;
     }
 
     #[tokio::test]

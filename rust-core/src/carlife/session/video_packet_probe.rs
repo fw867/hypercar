@@ -60,7 +60,7 @@ impl VideoPacketProbe {
             self.mode = std::env::var("HC_PROBE_VIDEO_RECOVERY").ok().filter(|m|
                 matches!(m.as_str(), "natural" | "inject-first" | "inject-two"));
             self.eligible = session.ready && session.admitted && session.started && session.seed.is_some();
-            if std::env::var_os("HC_PROBE_DECLARED_ONLY").is_some() && session.fallback_init.is_some() {
+            if std::env::var_os("HC_PROBE_DECLARED_ONLY").is_some() && session.init_used_fallback {
                 self.mode = None;
             }
         }

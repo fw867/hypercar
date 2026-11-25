@@ -49,7 +49,7 @@ interface ISpikeShell {
     String startBluetoothDiscoverable(IBinder owner, String token, int seconds);
     String stopBluetoothDiscoverable(String token);
     /** Select only this app's active local-only Wi-Fi request, using shell NETWORK_SETTINGS. */
-    String startWifiSelection(IBinder owner, String token, String ssid, String bssid, int uid);
+    String startWifiSelection(IBinder owner, String token, String ssid, String bssid, int uid, int protocolFrequency);
     String stopWifiSelection(String token);
 
     /** Release stale projection displays, retaining only the named map and detaching its surface. */
@@ -67,4 +67,8 @@ interface ISpikeShell {
     /** Copy only the focused native AMap card's UID-owned layers into the caller's bounded RGBA buffer. */
     int[] captureInstrumentMap(IBinder owner, int displayId, int width, int height,
                                int maxWidth, int maxHeight, in SharedMemory pixels);
+
+    ParcelFileDescriptor openCallAudio(IBinder owner, long token, String callId, int rate);
+    void closeCallAudio(long token);
+    String activeCallAudioIdentity();
 }

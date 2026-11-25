@@ -120,12 +120,21 @@ pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
     if owner==0 || owner<=slot.newest {return Err("stale CarWith source owner".into());}
     slot.current=None;slot.newest=owner;
     let stop=Arc::new(DialStop::default());
-    // A missing declaration uses the prewarm fallback for INIT only.
-    let display=crate::carlife::DisplayRequest::new(crate::carlife::ReceiverDisplay {
-        size: if cfg.carwith_cached_canvas { (cfg.width,cfg.height) } else { (0,0) }, ..Default::default() });
+    let system=cfg.system_carlife_source;
+    // Cached display values are INIT hints. The AirPlay session confirms the live display.
+    let cached = if cfg.carwith_cached_canvas {
+        crate::carlife::ReceiverDisplay {
+            size: (cfg.width, cfg.height),
+            // Only explicit CarWith can reopen an encrypted encoder to lift a stale cap.
+            max_fps: cfg.carwith_cached_max_fps.filter(|rate| !system && *rate > 0),
+            confirmed: false,
+        }
+    } else {
+        crate::carlife::ReceiverDisplay::default()
+    };
+    let display = crate::carlife::DisplayRequest::new(cached);
     let microphone=cfg.carwith_microphone.then(||Arc::new(crate::mic_probe::ProbeControl::for_carwith()));
     let vehicle_gps = Arc::new(crate::carlife::vehicle_gps::PendingLocation::default());
-    let system=cfg.system_carlife_source;
     let config=CarLifeConfig{
         dialect:if system {crate::carlife::CarLifeDialect::SystemAuto} else {crate::carlife::CarLifeDialect::CarWithEncrypted41},
         manufacturer:if system {cfg.hu_manufacturer.clone()} else {String::new()},
@@ -194,6 +203,13 @@ pub(crate) fn request_fresh_video(owner: u64) {
     }
 }
 
+pub(crate) fn report_video_rate_failure(owner: u64, fps: u32) {
+    let slot = SOURCE.lock();
+    if let Some(source) = slot.current.as_ref().filter(|s| s.owner == owner) {
+        source.stop.report_video_rate_failure(fps);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,17 +238,38 @@ mod tests {
     async fn pause_before_prepare_does_not_revive_retired_attempt() {
         let config: EngineConfig = serde_json::from_value(serde_json::json!({
             "device_id":"02:00:00:00:00:01","car_ip":"127.0.0.1","airplay_port":0,
-            "width":2880,"height":960,"fps":30,"identity_path":"","carlife_source":true
+            "width":2880,"height":960,"fps":60,"identity_path":"","carlife_source":true,
+            "carwith_cached_canvas":true,"carwith_cached_max_fps":30
         })).unwrap();
         stop(710);
         assert!(prepare(710, &config).is_err());
         prepare(711, &config).unwrap();
         let first = attach(711).unwrap();
+        let cached = *first.display.borrow();
+        assert_eq!(cached.size, (2880, 960));
+        assert!(!cached.confirmed);
+        assert_eq!(cached.effective_fps(config.carwith_fps()), 30);
+        first.display.send_modify(|display| {
+            display.max_fps = Some(50);
+            display.confirmed = true;
+        });
         stop(710);
         prepare(711, &config).unwrap();
         let next_engine = attach(711).unwrap();
         assert!(Arc::ptr_eq(&first.hub, &next_engine.hub));
+        let confirmed = *next_engine.display.borrow();
+        assert!(confirmed.confirmed);
+        assert_eq!(confirmed.effective_fps(config.carwith_fps()), 50);
         stop(711);
+
+        let system_config = EngineConfig { system_carlife_source: true, ..config };
+        prepare(712, &system_config).unwrap();
+        let system = attach(712).unwrap();
+        let system_hint = *system.display.borrow();
+        stop(712);
+        assert_eq!(system_hint.size, (2880, 960));
+        assert!(!system_hint.confirmed);
+        assert_eq!(system_hint.effective_fps(system_config.carwith_fps()), 60);
     }
 
     #[tokio::test(start_paused = true)]

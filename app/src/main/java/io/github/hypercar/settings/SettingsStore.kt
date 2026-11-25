@@ -3,6 +3,8 @@
 import android.content.Context
 import android.content.SharedPreferences
 
+internal data class CarWithDisplay(val width: Int, val height: Int, val maxFps: Int? = null)
+
 /**
  * 设置仓库（SharedPreferences 落盘；UI 只依赖这里的默认值与键名）。
  * 与 UI 的契约：全部属性为 suspend-free 同步读，写入立即生效并广播 Flow。
@@ -276,18 +278,25 @@ object SettingsStore {
     @Volatile var receiverMaxFps: Int? = null
     @Volatile var receiverViewport: Pair<Int, Int>? = null
 
-    /** CarWith prewarm uses only this receiver's observed canvas, never custom UI size. */
-    fun carWithCanvas(receiver: String?): Pair<Int, Int>? {
+    /** CarWith prewarm uses the last display declaration of this receiver. */
+    internal fun carWithDisplay(receiver: String?): CarWithDisplay? {
         if (receiver.isNullOrBlank()) return null
-        val width = p().getInt("carwith_canvas_width_$receiver", 0)
-        val height = p().getInt("carwith_canvas_height_$receiver", 0)
-        return (width to height).takeIf { width in 2..8192 && height in 2..8192 }
+        val values = p().all
+        val width = values["carwith_canvas_width_$receiver"] as? Int ?: return null
+        val height = values["carwith_canvas_height_$receiver"] as? Int ?: return null
+        if (width !in 2..8192 || height !in 2..8192) return null
+        val maxFps = (values["carwith_canvas_max_fps_$receiver"] as? Int)?.takeIf { it > 0 }
+        return CarWithDisplay(width, height, maxFps)
     }
 
-    fun rememberCarWithCanvas(receiver: String?, width: Int, height: Int) {
-        if (receiver.isNullOrBlank() || width !in 2..8192 || height !in 2..8192) return
-        p().edit().putInt("carwith_canvas_width_$receiver", width)
-            .putInt("carwith_canvas_height_$receiver", height).apply()
+    internal fun rememberCarWithDisplay(receiver: String, width: Int, height: Int, maxFps: Int?) {
+        if (receiver.isBlank() || width !in 2..8192 || height !in 2..8192) return
+        val fpsKey = "carwith_canvas_max_fps_$receiver"
+        val edit = p().edit()
+            .putInt("carwith_canvas_width_$receiver", width)
+            .putInt("carwith_canvas_height_$receiver", height)
+        if (maxFps != null && maxFps > 0) edit.putInt(fpsKey, maxFps) else edit.remove(fpsKey)
+        edit.apply()
     }
 
     val encodingPlan: VideoEncodingPlan

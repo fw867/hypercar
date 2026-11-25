@@ -345,6 +345,8 @@ impl Modes {
     pub fn declaration(&self) -> Vec<u8> {
         bplist::encode(&Value::dict(vec![("type", Value::str("modesChanged")), ("params", self.snapshot())]))
     }
+    pub(crate) fn phone_entity(&self) -> i64 { self.apps[1] }
+    pub(crate) fn set_phone_entity(&mut self, entity: i64) { self.apps[1] = entity; }
     pub fn change(&mut self, params: &Value) -> bool {
         let mut next = self.clone();
         let mut audio_request = false;

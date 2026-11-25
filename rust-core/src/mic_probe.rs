@@ -91,7 +91,7 @@ fn teardown(kind:i64,id:i64)->Vec<u8>{bplist::encode(&Value::dict(vec![("streams
 pub fn input_key(shared:&[u8;32],id:u64)->[u8;32]{
     crate::crypto::hkdf_sha512(shared,format!("DataStream-Salt{id}").as_bytes(),b"DataStream-Input-Encryption-Key",32).try_into().unwrap()
 }
-fn normalized(ip:std::net::IpAddr)->std::net::IpAddr {match ip {std::net::IpAddr::V6(v)=>v.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip),_=>ip}}
+pub(crate) fn normalized(ip:std::net::IpAddr)->std::net::IpAddr {match ip {std::net::IpAddr::V6(v)=>v.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip),_=>ip}}
 
 // Only allowlisted scalar facts: never dump a response plist (keys, UUIDs or speech).
 fn scalar(value:Option<&Value>)->String {match value {
@@ -143,7 +143,10 @@ fn input_rtp_header(kind:u8,wire:&[u8])->Option<usize> {
 #[derive(Default,Debug)]
 pub struct Stats {pub packets:u64,pub authenticated:u64,pub samples:u64,pub peak:u32,pub lost:u64,pub duplicates:u64,pub reordered:u64,pub rejected:u64,pub decode_errors:u64,sum:f64,last_nonce:Option<u64>,last_seq:Option<u16>}
 impl Stats {
-    fn open(&mut self,kind:u8,wire:&[u8],key:&[u8;32])->Result<Vec<u8>,&'static str>{
+    // A sender may restart its RTP sequence, but a key's authenticated nonce never rolls back.
+    pub(crate) fn reset_sequence(&mut self) { self.last_seq = None; }
+
+    pub(crate) fn open(&mut self,kind:u8,wire:&[u8],key:&[u8;32])->Result<Vec<u8>,&'static str>{
         self.packets+=1;
         let header = input_rtp_header(kind,wire).ok_or_else(|| { self.rejected+=1; "invalid RTP framing/type" })?;
         let n=wire.len();let nonce=u64::from_le_bytes(wire[n-8..].try_into().unwrap());

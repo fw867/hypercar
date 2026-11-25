@@ -1,0 +1,482 @@
+//! A CarPlay main-audio stream for an active cellular call. Local PCM belongs
+//! to the shell call-redirection endpoints and never enters the media/VR mixer.
+use std::{collections::VecDeque, os::unix::net::UnixStream as LocalSocket, sync::atomic::{AtomicBool, AtomicI64, Ordering}, time::Duration};
+use parking_lot::Mutex;
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::UnixStream, sync::mpsc};
+use crate::{audio_out::AudioOut, aux_audio::Session, bplist::{self, Value}, mic_probe, rtsp::RtspMessage};
+
+const TYPE: i64 = 100;
+const TELEPHONY: &str = "telephony";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Format { pub rate: u32, channels: usize, mask: i64, opus: bool }
+
+impl Format {
+    fn frames(self) -> usize {
+        if self.channels == 2 { 352 } else { self.rate as usize / 50 }
+    }
+
+    fn compression(self) -> i64 { if self.opus { 32 } else { 1 } }
+}
+
+pub(crate) fn formats(info: &Value) -> impl Iterator<Item = Format> + '_ {
+    let rows = info.get("audioFormats").and_then(Value::as_array).into_iter().flatten();
+    // Apple's sample declares 16/24 kHz mono PCM/Opus. Some receivers also
+    // advertise the same PCM stereo clock as their high-rate main audio.
+    [(24_000, 1, 6, false), (16_000, 1, 4, false), (48_000, 2, 15, false),
+        (44_100, 2, 11, false), (24_000, 1, 29, true), (16_000, 1, 28, true)]
+        .into_iter().filter_map(move |(rate, channels, bit, opus)| {
+            let mask = 1 << bit;
+            rows.clone().any(|row| {
+                row.get("type").and_then(Value::as_int) == Some(TYPE)
+                    && row.get("audioType").and_then(Value::as_str) == Some(TELEPHONY)
+                    && ["audioInputFormats", "audioOutputFormats"].iter().all(|key| {
+                        row.get(key).and_then(Value::as_int).is_some_and(|value| value >= 0 && value & mask != 0)
+                    })
+            }).then_some(Format { rate, channels, mask, opus })
+        })
+}
+
+static NEXT_TOKEN: AtomicI64 = AtomicI64::new(1);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(i32)]
+pub(crate) enum Retry { #[default] None = 0, SameRate = 1, NextRate = 2 }
+
+pub(crate) struct Offer { pub attempt: i64, pub rate: u32, pub socket: LocalSocket }
+struct Inbox { token: i64, sender: mpsc::Sender<Offer>, retry: Option<(i64, Retry)> }
+static OFFER: Mutex<Option<Inbox>> = Mutex::new(None);
+
+pub(crate) fn armed(token: i64) -> bool {
+    OFFER.lock().as_ref().is_some_and(|inbox| inbox.token == token)
+}
+
+pub(crate) fn offer(token: i64, attempt: i64, rate: u32, socket: LocalSocket) -> bool {
+    if !matches!(rate, 16_000 | 24_000 | 44_100 | 48_000) { return false; }
+    OFFER.lock().as_ref().is_some_and(|inbox| inbox.token == token && attempt > 0
+        && inbox.sender.try_send(Offer { attempt, rate, socket }).is_ok())
+}
+
+pub(crate) fn take_retry_reason(token: i64, attempt: i64) -> Retry {
+    let mut active = OFFER.lock();
+    let Some(inbox) = active.as_mut().filter(|inbox| inbox.token == token && inbox.retry.is_some_and(|(id, _)| id == attempt)) else {
+        return Retry::None;
+    };
+    inbox.retry.take().map_or(Retry::None, |(_, retry)| retry)
+}
+
+#[cfg(test)]
+pub(crate) fn take_retry(token: i64, attempt: i64) -> bool { take_retry_reason(token, attempt) != Retry::None }
+
+#[cfg(test)]
+pub(crate) fn token_for_test() -> Option<i64> { OFFER.lock().as_ref().map(|inbox| inbox.token) }
+
+pub(crate) struct Offers { token: i64, pub rx: mpsc::Receiver<Offer> }
+
+impl Offers {
+    pub fn arm(format: Format) -> Self {
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel(1);
+        *OFFER.lock() = Some(Inbox { token, sender: tx, retry: None });
+        crate::emit_state("call_audio_armed", &format!("{token} {}", format.rate));
+        Self { token, rx }
+    }
+
+    pub fn request_retry(&self, attempt: i64, retry: Retry) {
+        if retry == Retry::None { return; }
+        if let Some(inbox) = OFFER.lock().as_mut().filter(|inbox| inbox.token == self.token) {
+            inbox.retry = Some((attempt, retry));
+        }
+    }
+}
+
+impl Drop for Offers {
+    fn drop(&mut self) {
+        let mut offer = OFFER.lock();
+        if offer.as_ref().is_some_and(|inbox| inbox.token == self.token) { *offer = None; }
+    }
+}
+
+fn setup(format: Format, id: i64, data: u16, control: Option<u16>, info: &Value) -> Vec<u8> {
+    let compression = format.compression();
+    let latency = crate::airplay::output_audio_latency_ms(info, TYPE, TELEPHONY,
+        [format.rate.into(), 16, format.channels as i64, compression], true).unwrap_or_default();
+    let mut fields = vec![
+        ("type", Value::int(TYPE)), ("audioType", Value::str(TELEPHONY)),
+        ("audioFormat", Value::int(format.mask)), ("streamConnectionID", Value::int(id)),
+        ("input", Value::bool(true)), ("dataPort", Value::int(data.into())),
+        ("spf", Value::int(format.frames() as i64)),
+        ("supportsRTPPacketRedundancy", Value::bool(false)), ("ct", Value::int(compression)),
+        ("sr", Value::int(format.rate.into())), ("audioLatencyMs", Value::int(latency)),
+    ];
+    if let Some(port) = control { fields.push(("controlPort", Value::int(port.into()))); }
+    if info.get("extendedFeatures").and_then(Value::as_array).is_none_or(|features| {
+        features.iter().any(|item| item.as_str() == Some("vocoderInfo"))
+    }) {
+        fields.push(("vocoderInfo", Value::dict(vec![("sampleRate", Value::int(format.rate.into()))])));
+    }
+    bplist::encode(&Value::dict(vec![("streams", Value::array(vec![Value::dict(fields)]))]))
+}
+
+fn setup_response(reply: &RtspMessage) -> Result<Value, String> {
+    crate::resource_trace::validate_ack("TELEPHONY_SETUP", reply)?;
+    bplist::parse(&reply.body).map_err(|_| "invalid telephony SETUP plist".into())
+}
+
+fn accept(format: Format, id: i64, row: &Value) -> Result<(u16, Option<u16>), String> {
+    if row.get("status").is_some_and(|v| v.as_int() != Some(0)) {
+        return Err("telephony SETUP stream rejected or invalid status".into());
+    }
+    if row.get("audioType").is_some_and(|v| v.as_str() != Some(TELEPHONY))
+        || row.get("streamConnectionID").is_some_and(|v| v.as_int() != Some(id))
+        || row.get("audioFormat").is_some_and(|v| v.as_int() != Some(format.mask))
+        || row.get("sr").is_some_and(|v| v.as_int() != Some(format.rate.into()))
+        || row.get("ct").is_some_and(|v| v.as_int() != Some(format.compression()))
+        || row.get("spf").is_some_and(|v| v.as_int() != Some(format.frames() as i64))
+        || row.get("input").is_some_and(|v| v.as_bool() != Some(true)) {
+        return Err("telephony SETUP response disagrees with the requested stream".into());
+    }
+    let port = |key| row.get(key).and_then(Value::as_int).and_then(|n| u16::try_from(n).ok());
+    let data = port("dataPort").filter(|p| *p != 0).ok_or("telephony SETUP missing receiver dataPort")?;
+    let control = if row.get("controlPort").is_some() {
+        Some(port("controlPort").ok_or("telephony SETUP invalid controlPort")?).filter(|p| *p != 0)
+    } else { None };
+    Ok((data, control))
+}
+
+pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStream,
+    loss_generation: u64, stop: impl std::future::Future<Output = ()>, allocated: &mut Option<i64>,
+    pending: &AtomicBool, announced: &mut bool, retryable: &mut Retry,
+) -> Result<(), String> {
+    let mut ownership = session.control.buffered_ownership.subscribe();
+    let valid = |state: &crate::buffered_ownership::Ownership| state.owned && state.losses == loss_generation;
+    if !valid(&ownership.borrow()) {
+        *retryable = Retry::SameRate;
+        return Err("main audio grant changed before telephony SETUP".into());
+    }
+    let host = &session.params.car_ip;
+    let uri = crate::rtsp_uri::audio_uri(host, session.params.airplay_port);
+    let microphone = session.factory.open_udp(host, 0).ok_or("no microphone UDP socket")?;
+    let data_port = microphone.local_addr().map_err(|e| e.to_string())?.port();
+    let mut rtcp = session.factory.open_udp(host, 0).and_then(|socket| {
+        let port = socket.local_addr().ok()?.port();
+        (port != 0).then_some((socket, port))
+    });
+    tokio::pin!(stop);
+    let mut candidates = formats(&session.info);
+    let mut format = candidates.next().ok_or("no declared bidirectional telephony format")?;
+    let (id, data, sync) = loop {
+        tokio::select! { biased; _ = &mut stop => return Ok(()), _ = std::future::ready(()) => {} }
+        if !valid(&ownership.borrow()) {
+            *retryable = Retry::SameRate;
+            return Err("main audio grant changed during telephony SETUP".into());
+        }
+        if !matches!(local.try_read(&mut [0]), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock) {
+            return Err("phone call ended during SETUP".into());
+        }
+        let id = crate::airplay::random_positive_i64();
+        *allocated = Some(id);
+        pending.store(true, Ordering::Release);
+        let body = setup(format, id, data_port, rtcp.as_ref().map(|(_, port)| *port), &session.info);
+        let reply = session.control.request("SETUP", &uri, &body, "application/x-apple-binary-plist", &[], Duration::from_secs(3)).await?;
+        if matches!(reply.status(), 400 | 451 | 461) {
+            // These transport rejections leave the shared slot free. Unknown replies still require TEARDOWN.
+            *allocated = None;
+            pending.store(false, Ordering::Release);
+            if rtcp.take().is_some() {
+                crate::emit_log(&format!("CALL-AUDIO: SETUP status={}; retry without controlPort", reply.status()));
+            } else if let Some(next) = candidates.next() {
+                crate::emit_log(&format!("CALL-AUDIO: SETUP status={}; try declared format {:#x}", reply.status(), next.mask));
+                format = next;
+            } else {
+                return Err(format!("telephony SETUP rejected status={}; no remaining declared format", reply.status()));
+            }
+            continue;
+        }
+        let root = setup_response(&reply)?;
+        let conflicting_id = root.get("streams").and_then(Value::as_array).into_iter().flatten()
+            .filter(|row| row.get("type").and_then(Value::as_int) == Some(TYPE))
+            .filter_map(|row| row.get("streamConnectionID").and_then(Value::as_int))
+            .any(|other| other != id);
+        if conflicting_id {
+            // A scoped ACK for our proposed ID cannot retire a different receiver allocation.
+            crate::emit_log("CALL-AUDIO: SETUP returned a different stream ID; closing session");
+            session.control.close();
+            return Err("telephony SETUP stream ID mismatch".into());
+        }
+        let row = crate::screen_session::setup_stream::select(&root, TYPE, false)?;
+        let (data, sync) = accept(format, id, row)?;
+        break (id, data, sync);
+    };
+    let mut decoder = format.opus.then(|| CallOpusDecoder::new(format.rate)).transpose()?;
+    let mut encoder = format.opus.then(|| crate::opus_encode::OpusEncoder::new_call(format.rate, format.frames()))
+        .transpose().map_err(|e| e.to_string())?;
+    session.control.udp_media.set(TYPE, true);
+    let socket = session.factory.open_udp(host, data).ok_or("no speaker UDP socket")?;
+    let receiver = socket.peer_addr().map_err(|e| e.to_string())?;
+    let receiver_ip = mic_probe::normalized(receiver.ip());
+    let sync = if let Some(port) = sync {
+        let mut peer = receiver;
+        peer.set_port(port);
+        let bound = if let Some((rtcp, _)) = rtcp {
+            rtcp.connect(peer).await.ok().map(|()| rtcp)
+        } else { None };
+        bound.or_else(|| session.factory.open_udp(host, port))
+    } else { None };
+    let output_key = crate::airplay::stream_key(&session.shared, id as u64);
+    let mut speaker = AudioOut::new_pcm(socket, sync, output_key, format.rate);
+    speaker.set_ownership(session.resource.owned.clone());
+    speaker.track_rtp_ownership(&session.control.buffered_ownership);
+    let input_key = mic_probe::input_key(&session.shared, id as u64);
+    if !valid(&ownership.borrow()) {
+        *retryable = Retry::SameRate;
+        return Err("main audio grant changed during telephony SETUP".into());
+    }
+    match local.try_read(&mut [0]) {
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+        _ => return Err("phone call ended during SETUP".into()),
+    }
+    *announced = true; // An ACK can be lost after the receiver applied the state.
+    if !session.resource.set_phone_call(true).await {
+        if !valid(&ownership.borrow()) { *retryable = Retry::SameRate; }
+        return Err("phoneCall app state rejected".into());
+    }
+    tokio::select! {
+        biased;
+        _ = &mut stop => return Ok(()),
+        _ = ownership.changed() => {
+            *retryable = Retry::SameRate;
+            return Err("main audio grant changed before call audio start".into());
+        }
+        ready = tokio::time::timeout(Duration::from_secs(1), async {
+            local.write_u8(1).await?;
+            local.read_u8().await
+        }) => {
+            if !matches!(ready, Ok(Ok(1))) {
+                *retryable = Retry::NextRate;
+                return Err("phone call audio did not start".into());
+            }
+        }
+    }
+    *retryable = Retry::SameRate;
+    crate::emit_log(&format!("CALL-AUDIO: telephony SETUP ready type={TYPE} phoneRate={phone_rate} rate={} channels={} opus={}",
+        format.rate, format.channels, format.opus));
+    let uplink_ownership = ownership.clone();
+    let (mut downlink, uplink) = local.split();
+    let down = async {
+        let phone_frames = (format.frames() * phone_rate as usize).div_ceil(format.rate as usize);
+        let mut pcm = vec![0; phone_frames * 2];
+        let mut samples = VecDeque::new();
+        let mut resampler = MonoResampler::default();
+        let mut sync = std::time::Instant::now() - Duration::from_secs(1);
+        let period = Duration::from_secs_f64(format.frames() as f64 / f64::from(format.rate));
+        let mut next_packet = tokio::time::Instant::now();
+        loop {
+            while samples.len() < format.frames() {
+                tokio::time::timeout(Duration::from_secs(2), downlink.read_exact(&mut pcm)).await
+                    .map_err(|_| "phone call downlink stalled")?.map_err(|e| e.to_string())?;
+                resampler.push(&pcm, phone_rate, format.rate, &mut samples);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= next_packet + period { next_packet = now; }
+            tokio::time::sleep_until(next_packet).await;
+            next_packet += period;
+            if !speaker.owns_audio() { return Err("receiver took main audio".into()); }
+            let frames = samples.drain(..format.frames());
+            let payload = if let Some(encoder) = &mut encoder {
+                encoder.encode_mono_packet(&frames.collect::<Vec<_>>()).map_err(|e| e.to_string())?
+            } else {
+                frames.flat_map(|sample| std::iter::repeat_n(sample.to_be_bytes(), format.channels).flatten()).collect()
+            };
+            if sync.elapsed() >= Duration::from_secs(1) {
+                let _ = speaker.send_call_sync(crate::timing::monotonic_nanos(), format.frames() as u32).await;
+                sync = std::time::Instant::now();
+            }
+            speaker.send_call_audio(&payload, format.frames() as u32, loss_generation).await.map_err(|e| e.to_string())?;
+        }
+    };
+    let up = async {
+        let mut stats = mic_probe::Stats::default();
+        let mut wire = [0u8; 8193];
+        let mut port = None;
+        let mut deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+        let mut resampler = MonoResampler::default();
+        let mut converted = VecDeque::new();
+        loop {
+            let receive = microphone.recv_from(&mut wire);
+            let packet = if let Some(until) = deadline {
+                match tokio::time::timeout_at(until, receive).await {
+                    Ok(packet) => packet,
+                    Err(_) => {
+                        crate::emit_log("CALL-AUDIO: no usable microphone RTP; speaker continues");
+                        deadline = None;
+                        port = None;
+                        stats.reset_sequence();
+                        resampler = MonoResampler::default();
+                        continue;
+                    }
+                }
+            } else { receive.await };
+            let (n, source) = packet.map_err(|e| e.to_string())?;
+            if mic_probe::normalized(source.ip()) != receiver_ip || port.is_some_and(|p| p != source.port()) { continue; }
+            let Ok(payload) = stats.open(TYPE as u8, &wire[..n], &input_key) else { continue; };
+            let pcm = if let Some(decoder) = &mut decoder {
+                match decoder.decode(&payload) {
+                    Some(samples) => samples.iter().copied().flat_map(i16::to_le_bytes).collect(),
+                    _ => continue,
+                }
+            } else {
+                let Some(pcm) = mono_pcm(&payload, format.channels) else { continue; };
+                pcm
+            };
+            if !session.resource.owned.load(Ordering::Acquire) { return Err("receiver took main audio".into()); }
+            if port.is_none() { crate::emit_log("CALL-AUDIO: authenticated microphone PCM flowing; remote audibility unconfirmed"); }
+            port = Some(source.port());
+            deadline = Some(tokio::time::Instant::now() + Duration::from_secs(3));
+            resampler.push(&pcm, format.rate, phone_rate, &mut converted);
+            let bytes = converted.len() * 2;
+            if bytes == 0 { continue; }
+            if bytes > 0x7ffe { return Err("phone call microphone frame is too large".into()); }
+            let mut frame = Vec::with_capacity(2 + bytes);
+            frame.extend_from_slice(&(bytes as u16).to_be_bytes());
+            frame.extend(converted.drain(..).flat_map(i16::to_le_bytes));
+            tokio::time::timeout(Duration::from_millis(100), async {
+                let mut written = 0;
+                while written < frame.len() {
+                    uplink.writable().await?;
+                    let result = {
+                        let grant = uplink_ownership.borrow();
+                        if !valid(&grant) { return Err(std::io::Error::other("call microphone grant expired")); }
+                        uplink.try_write(&frame[written..])
+                    };
+                    match result {
+                        Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                        Ok(bytes) => written += bytes,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(())
+            }).await.map_err(|_| "phone call uplink backpressure")?.map_err(|e| e.to_string())?;
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = &mut stop => Ok(()),
+        _ = ownership.changed() => Err("main audio grant changed during call".into()),
+        result = down => result,
+        result = up => result,
+    }
+}
+
+#[derive(Default)]
+struct MonoResampler(crate::audio_resample::PcmToStereo, VecDeque<i16>);
+
+impl MonoResampler {
+    fn push(&mut self, pcm: &[u8], from: u32, to: u32, out: &mut VecDeque<i16>) {
+        if from == to {
+            out.extend(pcm.chunks_exact(2).map(|raw| i16::from_le_bytes([raw[0], raw[1]])));
+        } else {
+            self.0.push(pcm, from, 1, to, &mut self.1);
+            out.extend(self.1.drain(..).step_by(2));
+        }
+    }
+}
+
+struct CallOpusDecoder {
+    decoder: *mut audiopus_sys::OpusDecoder,
+    pcm: Vec<i16>,
+}
+
+// Tokio can migrate the task, but only the uplink future ever accesses the decoder.
+unsafe impl Send for CallOpusDecoder {}
+
+impl CallOpusDecoder {
+    fn new(rate: u32) -> Result<Self, String> {
+        let mut error = 0;
+        let decoder = unsafe { audiopus_sys::opus_decoder_create(rate as i32, 1, &mut error) };
+        if decoder.is_null() || error != 0 { return Err(format!("call Opus decoder status={error}")); }
+        Ok(Self { decoder, pcm: vec![0; rate as usize * 120 / 1000] })
+    }
+
+    fn decode(&mut self, payload: &[u8]) -> Option<&[i16]> {
+        if payload.is_empty() || payload.len() > 4096 { return None; }
+        let frames = unsafe { audiopus_sys::opus_decode(self.decoder, payload.as_ptr(), payload.len() as i32,
+            self.pcm.as_mut_ptr(), self.pcm.len() as i32, 0) };
+        self.pcm.get(..usize::try_from(frames).ok()?).filter(|samples| !samples.is_empty())
+    }
+}
+
+impl Drop for CallOpusDecoder {
+    fn drop(&mut self) { unsafe { audiopus_sys::opus_decoder_destroy(self.decoder); } }
+}
+
+fn mono_pcm(payload: &[u8], channels: usize) -> Option<Vec<u8>> {
+    if payload.is_empty() || payload.len() % (channels * 2) != 0 { return None; }
+    Some(payload.chunks_exact(channels * 2).flat_map(|frame| {
+        let left = i16::from_be_bytes([frame[0], frame[1]]);
+        let mono = if channels == 2 {
+            ((i32::from(left) + i32::from(i16::from_be_bytes([frame[2], frame[3]]))) / 2) as i16
+        } else { left };
+        mono.to_le_bytes()
+    }).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{io::Write, os::fd::AsRawFd};
+
+    #[test]
+    fn abandoned_local_microphone_socket_reports_hangup_before_draining_pcm() {
+        let (mut rust, shell) = LocalSocket::pair().unwrap();
+        rust.write_all(&[0, 2, 42, 0]).unwrap();
+        drop(rust);
+        let mut state = libc::pollfd { fd: shell.as_raw_fd(), events: 0, revents: 0 };
+        assert_eq!(unsafe { libc::poll(&mut state, 1, 0) }, 1);
+        assert_ne!(state.revents & libc::POLLHUP, 0);
+    }
+
+    #[test]
+    fn telephony_rejects_stream_level_refusal_and_conflicting_packet_format() {
+        let format = Format { rate: 16_000, channels: 1, mask: 1 << 4, opus: false };
+        let reply = |extra| {
+            let mut fields = vec![("type", Value::int(100)), ("dataPort", Value::int(7010))];
+            fields.extend(extra);
+            Value::dict(fields)
+        };
+        assert_eq!(accept(format, 1, &reply(vec![])), Ok((7010, None)));
+        assert_eq!(accept(format, 1, &reply(vec![("status", Value::int(0))])), Ok((7010, None)));
+        for field in [("status", Value::int(-6722)), ("status", Value::str("0")),
+            ("ct", Value::int(32)), ("spf", Value::int(480))] {
+            assert!(accept(format, 1, &reply(vec![field.clone()])).is_err(), "accepted {field:?}");
+        }
+    }
+
+    #[test]
+    fn telephony_requires_a_single_bidirectional_receiver_record() {
+        let row = |kind, audio_type, input, output| Value::dict(vec![
+            ("type", Value::int(kind)), ("audioType", Value::str(audio_type)),
+            ("audioInputFormats", Value::int(input)), ("audioOutputFormats", Value::int(output)),
+        ]);
+        let info = |rows| Value::dict(vec![("audioFormats", Value::array(rows))]);
+        let pcm16 = 1 << 4;
+        assert!(formats(&info(vec![row(100, "telephony", 0, pcm16), row(100, "telephony", pcm16, 0),
+            row(100, "speechRecognition", pcm16, pcm16), row(102, "telephony", pcm16, pcm16)])).next().is_none());
+        let selected = formats(&info(vec![row(100, "telephony", 1 << 28, 1 << 28)])).next().unwrap();
+        assert_eq!((selected.rate, selected.frames(), selected.opus), (16000, 320, true));
+        let mut encoder = crate::opus_encode::OpusEncoder::new_call(selected.rate, selected.frames()).unwrap();
+        let encoded = encoder.encode_mono_packet(&[10; 320]).unwrap();
+        let mut decoder = CallOpusDecoder::new(selected.rate).unwrap();
+        let decoded = decoder.decode(&encoded).unwrap();
+        assert_eq!(decoded.len(), 320);
+        assert!(encoder.encode_mono_packet(&[10; 319]).is_err());
+    }
+
+    #[test]
+    fn telephony_stereo_microphone_is_downmixed_and_converted_to_native_endian() {
+        assert_eq!(mono_pcm(&[0x11, 0x22, 0x13, 0x24], 2), Some(vec![0x23, 0x12]));
+        assert_eq!(mono_pcm(&[0xff, 0x80], 1), Some(vec![0x80, 0xff]));
+        assert_eq!(mono_pcm(&[0, 0, 0], 2), None);
+    }
+}

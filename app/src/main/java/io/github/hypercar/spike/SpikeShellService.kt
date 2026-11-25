@@ -30,14 +30,43 @@ class SpikeShellService : ISpikeShell.Stub {
 
     private val playbackAudio = ShellPlaybackAudio()
     private val splitPlaybackAudio = SplitPlaybackAudio()
+    private val callIdentity: ShellCallIdentity by lazy {
+        ShellCallIdentity(onRevoked = { id ->
+            if (callAudio.isInitialized()) callAudio.value.revoke(id)
+        })
+    }
+    private val callStateMonitor by lazy { ShellCallStateMonitor(callIdentity) }
+    private val callAudio: Lazy<ShellCallAudio> = lazy { ShellCallAudio(callIdentity) }
+
+    override fun activeCallAudioIdentity(): String? {
+        if (android.os.Binder.getCallingUid() != appContext?.applicationInfo?.uid) return null
+        val identity = android.os.Binder.clearCallingIdentity()
+        return try { callStateMonitor.run { callIdentity.current() } }
+        finally { android.os.Binder.restoreCallingIdentity(identity) }
+    }
+
+    override fun openCallAudio(owner: IBinder, token: Long, callId: String, rate: Int): android.os.ParcelFileDescriptor? {
+        val context = appContext ?: return null
+        if (android.os.Binder.getCallingUid() != context.applicationInfo.uid) return null
+        val identity = android.os.Binder.clearCallingIdentity()
+        return try { callAudio.value.open(context, owner, token, callId, rate) }
+        finally { android.os.Binder.restoreCallingIdentity(identity) }
+    }
+
+    override fun closeCallAudio(token: Long) {
+        if (android.os.Binder.getCallingUid() != appContext?.applicationInfo?.uid) return
+        val identity = android.os.Binder.clearCallingIdentity()
+        try { if (callAudio.isInitialized()) callAudio.value.close(token) }
+        finally { android.os.Binder.restoreCallingIdentity(identity) }
+    }
     @Volatile private var splitCaptureRequested = false
     private val bluetoothDiscovery = ShellBluetoothDiscovery()
     private val wifiSelection = ShellWifiSelection()
-    override fun startWifiSelection(owner: IBinder, token: String, ssid: String, bssid: String, uid: Int): String {
+    override fun startWifiSelection(owner: IBinder, token: String, ssid: String, bssid: String, uid: Int, protocolFrequency: Int): String {
         if (android.os.Binder.getCallingUid() != uid || appContext?.applicationInfo?.uid != uid)
             return "ERR Wi-Fi request owner mismatch"
         val identity = android.os.Binder.clearCallingIdentity()
-        return try { wifiSelection.start(owner, token, ssid, bssid, uid) }
+        return try { wifiSelection.start(owner, token, ssid, bssid, uid, protocolFrequency) }
         finally { android.os.Binder.restoreCallingIdentity(identity) }
     }
     override fun stopWifiSelection(token: String): String {

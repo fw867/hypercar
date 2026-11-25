@@ -11,10 +11,49 @@ import org.junit.Test
 class WifiApRetryTest {
     private val history = WifiApHint("3a:f9:f5:c6:8c:3c", 5745, 1.0, fromMemory = true)
 
+    @Test fun failedCarChannelRequestRetriesTheScannedAp() = runTest {
+        val requests = mutableListOf<WifiApRetry.Target>()
+        val waits = mutableListOf<Long>()
+        val result = WifiApRetry.join(history, 60_000, { true }, { false }, protocolFrequency = 5320,
+            now = { testScheduler.currentTime }) { target, budget ->
+            requests += target
+            waits += budget.associationWaitMs
+            if (requests.size == 1) { delay(5_000); null } else "scanned AP"
+        }
+        assertEquals("scanned AP", result)
+        assertEquals(listOf("iap2", "scan"), requests.map { it.source })
+        assertEquals(listOf(5320, 5745), requests.map { it.frequency })
+        assertEquals(listOf(null, history), requests.map { it.ap })
+        assertEquals(listOf(60_000L, 55_000L), waits)
+    }
+
+    @Test fun agreeingScanCanPinTheApWithoutRepeatingTheSameChannelRequest() = runTest {
+        val requests = mutableListOf<WifiApRetry.Target>()
+        WifiApRetry.join<String>(history, 60_000, { true }, { false }, protocolFrequency = history.frequency) { target, _ ->
+            requests += target
+            null
+        }
+        assertEquals(listOf("iap2", "full_scan"), requests.map { it.source })
+        assertEquals(listOf(history, null), requests.map { it.ap })
+    }
+
+    @Test fun unchangedRequestCanReachTheScanFallbackWhenTheCarChannelHasNoProgress() = runTest {
+        val now = { testScheduler.currentTime }
+        val result = WifiApRetry.join(history, 60_000, { true }, { false }, protocolFrequency = 5320, now = now) { target, budget ->
+            if (target.source == "scan") return@join target.frequency
+            val callback = VerifiedWifiWait.awaitCallback(budget.associationWaitMs, now, { true },
+                poll = { delay(it); false }, hintCheckMillis = budget.hintCheckMillis, keepHint = { false })
+            assertEquals(VerifiedWifiWait.CallbackWait.HINT_EXPIRED, callback)
+            null
+        }
+        assertEquals(history.frequency, result)
+        assertEquals(12_000L, now())
+    }
+
     @Test fun channelFallbackSharesOneDeadlineAndExhaustedRequestsNeverRestart() = runTest {
         for (firstDuration in listOf(12_000L, 60_000L)) {
             val waits = mutableListOf<Long>()
-            val result = WifiApRetry.join<String>(null, 60_000, { true }, { false }, channelHint = true,
+            val result = WifiApRetry.join<String>(null, 60_000, { true }, { false }, protocolFrequency = 5320,
                 now = { testScheduler.currentTime }) { _, budget ->
                 waits += budget.associationWaitMs
                 if (waits.size == 1) { delay(firstDuration); null } else "full scan"
@@ -26,7 +65,7 @@ class WifiApRetryTest {
 
     @Test fun rejectedHintNeverSubmitsAnotherRequest() = runTest {
         var calls = 0
-        assertNull(WifiApRetry.join<String>(null, 60_000, { true }, { false }, channelHint = true,
+        assertNull(WifiApRetry.join<String>(null, 60_000, { true }, { false }, protocolFrequency = 5320,
             retryAllowed = { false }) { _, _ -> calls++; null })
         assertEquals(1, calls)
     }
@@ -35,7 +74,7 @@ class WifiApRetryTest {
         for (delivered in listOf(false, true)) {
             val waits = mutableListOf<Long>()
             var associated = false
-            val result = WifiApRetry.join<String>(null, 60_000, { true }, { associated }, channelHint = true,
+            val result = WifiApRetry.join<String>(null, 60_000, { true }, { associated }, protocolFrequency = 5320,
                 now = { testScheduler.currentTime }) { _, budget ->
                 waits += budget.associationWaitMs
                 if (waits.size == 1) { associated = delivered; null } else "full scan"
@@ -46,14 +85,22 @@ class WifiApRetryTest {
     }
 
     @Test fun disappearedHistoricalApGetsOneUnpinnedFallbackWithinCacheRestoreBudget() = runTest {
+        val now = { testScheduler.currentTime }
         val requests = mutableListOf<Pair<WifiApHint?, Long>>()
-        val result = WifiApRetry.join(history, 60_000, { true }, { false }, now = { testScheduler.currentTime }) { hint, budget ->
-            requests += hint to budget.associationWaitMs
+        val result = WifiApRetry.join(history, 60_000, { true }, { false }, now = now) { target, budget ->
+            requests += target.ap to budget.associationWaitMs
             assertEquals(60_000L, budget.deadlineMillis)
-            if (hint != null) { delay(budget.associationWaitMs); null } else "new AP"
+            if (target.ap == null) {
+                assertNull(budget.hintCheckMillis)
+                return@join "new AP"
+            }
+            val callback = VerifiedWifiWait.awaitCallback(budget.associationWaitMs, now, { true },
+                poll = { delay(it); false }, hintCheckMillis = budget.hintCheckMillis, keepHint = { false })
+            assertEquals(VerifiedWifiWait.CallbackWait.HINT_EXPIRED, callback)
+            null
         }
         assertEquals("new AP", result)
-        assertEquals(listOf(history to 4_000L, null to 56_000L), requests)
+        assertEquals(listOf(history to 60_000L, null to 56_000L), requests)
         assertEquals(4_000L, testScheduler.currentTime)
     }
 
@@ -61,8 +108,8 @@ class WifiApRetryTest {
         val now = { testScheduler.currentTime }
         var associated = false
         val network = WifiApRetry.join(history, 60_000, { true }, { associated }, now = now) { selected, budget ->
-            assertEquals(history, selected)
-            assertEquals(4_000L, budget.associationWaitMs)
+            assertEquals(history, selected.ap)
+            assertEquals(4_000L, budget.hintCheckMillis)
             delay(3_500)
             associated = true
             val remaining = VerifiedWifiWait.addressBudget(budget.deadlineMillis - now(), associated)
@@ -74,12 +121,30 @@ class WifiApRetryTest {
         assertEquals(7_500L, now())
     }
 
+    @Test fun historicalApCanDeliverItsFirstNetworkCallbackAfterFourSeconds() = runTest {
+        val now = { testScheduler.currentTime }
+        val requests = mutableListOf<WifiApHint?>()
+        val result = WifiApRetry.join(history, 60_000, { true }, { false }, now = now) { target, budget ->
+            requests += target.ap
+            if (target.ap == null) return@join "replacement AP"
+            assertEquals("scan", target.source)
+            val callback = VerifiedWifiWait.awaitCallback(budget.associationWaitMs, now, { true }, poll = {
+                delay(it)
+                now() >= 7_000
+            }, hintCheckMillis = budget.hintCheckMillis, keepHint = { true })
+            "original AP".takeIf { callback == VerifiedWifiWait.CallbackWait.SIGNAL }
+        }
+        assertEquals("original AP", result)
+        assertEquals(listOf(history), requests)
+        assertEquals(7_000L, now())
+    }
+
     @Test fun successfulExactJoinAndOrdinaryRequestsNeverCreateExtraRequests() = runTest {
         for (hint in listOf(history, history.copy(fromMemory = false), null)) {
             var calls = 0
             assertEquals("existing", WifiApRetry.join(hint, 60_000, { true }, { false }) { _, budget ->
                 calls++
-                assertEquals(if (hint?.fromMemory == true) 4_000L else 60_000L, budget.associationWaitMs)
+                assertEquals(60_000L, budget.associationWaitMs)
                 "existing"
             })
             assertEquals(1, calls)
@@ -151,8 +216,8 @@ class WifiApRetryTest {
         val state = WifiRequestAssociation<Any, String>()
         val old = Any()
         val fresh = Any()
-        val joined = WifiApRetry.join(history, 60_000, { true }, { state.network() != null }) { hint, _ ->
-            if (hint != null) {
+        val joined = WifiApRetry.join(history, 60_000, { true }, { state.network() != null }) { target, _ ->
+            if (target.ap != null) {
                 assertTrue(state.register(old))
                 assertSame(old, state.cancelPending(old))
                 null

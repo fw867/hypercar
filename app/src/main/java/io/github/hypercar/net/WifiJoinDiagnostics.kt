@@ -6,6 +6,7 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.wifi.SupplicantState
 import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
@@ -25,9 +26,12 @@ internal class WifiJoinDiagnostics(
     private val target: String,
     private val output: (String) -> Unit,
 ) {
+    enum class StationProgress { ACTIVE, IDLE, UNKNOWN }
+
     val id: String = UUID.randomUUID().toString()
     private val started = SystemClock.elapsedRealtime()
     private val wifi = context.applicationContext.getSystemService(WifiManager::class.java)
+    private val multiSta = runCatching { wifi?.isStaConcurrencyForLocalOnlyConnectionsSupported }.getOrNull()
     private var previousStation: String? = null
     private var removeListener: (() -> Unit)? = null
     @Volatile private var failureCode: Int? = null
@@ -40,7 +44,7 @@ internal class WifiJoinDiagnostics(
             ActivityManager.RunningAppProcessInfo().also(ActivityManager::getMyMemoryState).importance
         }.getOrNull()
         log("request_context sdk=${Build.VERSION.SDK_INT} process_importance=$importance wifi_enabled=${runCatching { wifi?.isWifiEnabled }.getOrNull()} " +
-            "local_only_multi_sta=${runCatching { wifi?.isStaConcurrencyForLocalOnlyConnectionsSupported }.getOrNull()}")
+            "local_only_multi_sta=$multiSta")
         station()
         scanCache("before_request")
         if (Build.VERSION.SDK_INT >= 34 && wifi != null) {
@@ -69,15 +73,18 @@ internal class WifiJoinDiagnostics(
     // On multi-STA phones this snapshot may describe another connection. Always expose
     // whether the visible SSID matches, and retain unknown when Android redacts it.
     @Suppress("DEPRECATION")
-    fun station() {
-        val snapshot = runCatching {
+    fun station(): StationProgress {
+        val (snapshot, progress) = runCatching {
             val info = wifi?.connectionInfo
-            "system_sta ssid_match=${ssidMatch(info?.ssid, target)} supplicant=${info?.supplicantState ?: "unknown"}"
-        }.getOrElse { "system_sta unavailable=${it.javaClass.simpleName}" }
+            val match = ssidMatch(info?.ssid, target)
+            val state = info?.supplicantState
+            "system_sta ssid_match=$match supplicant=${state ?: "unknown"}" to stationProgress(match, state, multiSta)
+        }.getOrElse { "system_sta unavailable=${it.javaClass.simpleName}" to StationProgress.UNKNOWN }
         if (snapshot != previousStation) {
             previousStation = snapshot
             log(snapshot)
         }
+        return progress
     }
 
     fun lost(cm: ConnectivityManager, lost: Network) {
@@ -132,6 +139,20 @@ internal class WifiJoinDiagnostics(
     }
 
     companion object {
+        fun stationProgress(match: String, state: SupplicantState?, multiSta: Boolean?): StationProgress {
+            if (match != "false" && when (state) {
+                    SupplicantState.AUTHENTICATING, SupplicantState.ASSOCIATING, SupplicantState.ASSOCIATED,
+                    SupplicantState.FOUR_WAY_HANDSHAKE, SupplicantState.GROUP_HANDSHAKE -> true
+                    SupplicantState.COMPLETED -> match == "true"
+                    else -> false
+                }) return StationProgress.ACTIVE
+            if (multiSta != false || state == null || state == SupplicantState.INVALID ||
+                state == SupplicantState.UNINITIALIZED || state == SupplicantState.COMPLETED && match == "unknown") {
+                return StationProgress.UNKNOWN
+            }
+            return StationProgress.IDLE
+        }
+
         fun ssidMatch(reportedSsid: String?, target: String): String {
             val name = reportedSsid?.removeSurrounding("\"")
             return if (name.isNullOrBlank() || name == WifiManager.UNKNOWN_SSID) "unknown" else (name == target).toString()

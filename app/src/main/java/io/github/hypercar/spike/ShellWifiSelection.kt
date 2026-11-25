@@ -33,7 +33,7 @@ internal class ShellWifiSelection {
     private var lease: Lease? = null
     private var lastClosed: Pair<String, String>? = null
 
-    @Synchronized fun start(owner: IBinder, token: String, ssid: String, bssid: String, uid: Int): String {
+    @Synchronized fun start(owner: IBinder, token: String, ssid: String, bssid: String, uid: Int, protocolFrequency: Int): String {
         lease?.let { stop(it.token) }
         if (token.isBlank() || ssid.isBlank() || uid < 10000) return "ERR invalid Wi-Fi selection scope"
         return try {
@@ -55,6 +55,7 @@ internal class ShellWifiSelection {
                 synchronized(this) {
                     if (lease?.token != token || selected) return
                     val matching = candidates.filter { it.SSID == ssid && (bssid.isBlank() || it.BSSID.equals(bssid, true)) &&
+                        (protocolFrequency == 0 || it.frequency == protocolFrequency) &&
                         (!cached || (android.os.SystemClock.elapsedRealtime() - it.timestamp / 1000 in 0..30_000 &&
                             it.timestamp / 1000 >= since)) }
                     if (matching.isNotEmpty()) evidence.targetSeen = true
@@ -68,7 +69,7 @@ internal class ShellWifiSelection {
                     selectionType.getMethod("select", WifiConfiguration::class.java).invoke(selection, config)
                     selected = true
                     evidence.selected = true
-                    Log.i("HyperCar", "WIFI-SELECT: selected own local-only request uid=$uid cached_exact_ap=$cached")
+                    Log.i("HyperCar", "WIFI-SELECT: selected own local-only request uid=$uid cached_exact_ap=$cached frequency=${ap.frequency} protocol_frequency=$protocolFrequency")
                 }
             }
             fun pollRecovery(since: Long, until: Long) {

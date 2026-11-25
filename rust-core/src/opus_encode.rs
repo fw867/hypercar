@@ -1,4 +1,4 @@
-//! Statically linked Opus output. Source PCM is always 48kHz interleaved stereo.
+//! Statically linked Opus output for the media mixer and native-rate call audio.
 use std::io;
 
 pub(crate) struct OpusEncoder {
@@ -15,14 +15,31 @@ impl OpusEncoder {
         if !matches!((rate,frames),(24000,480)|(48000,960)) {
             return Err(io::Error::other("Opus output requires negotiated 24k/480 or 48k/960 mono"));
         }
-        let mut error = 0;
         let application = if rate == 24000 {audiopus_sys::OPUS_APPLICATION_VOIP} else {audiopus_sys::OPUS_APPLICATION_AUDIO};
+        Self::create(rate, frames, application)
+    }
+    pub(crate) fn new_call(rate: u32, frames: usize) -> io::Result<Self> {
+        if !matches!((rate, frames), (16000, 320) | (24000, 480)) {
+            return Err(io::Error::other("unsupported call Opus format"));
+        }
+        Self::create(rate, frames, audiopus_sys::OPUS_APPLICATION_VOIP)
+    }
+    fn create(rate: u32, frames: usize, application: i32) -> io::Result<Self> {
+        let mut error = 0;
         let native = unsafe { audiopus_sys::opus_encoder_create(rate as i32,1,application,&mut error) };
         if native.is_null() || error != 0 { return Err(io::Error::other(format!("Opus create status={error}"))); }
         Ok(Self { native, rate, frames, pending:Vec::new(), half:None })
     }
     pub fn sample_rate(&self) -> u32 { self.rate }
     pub fn samples_per_packet(&self) -> usize { self.frames }
+    pub(crate) fn encode_mono_packet(&mut self, pcm: &[i16]) -> io::Result<Vec<u8>> {
+        if pcm.len() != self.frames { return Err(io::Error::other("incorrect Opus call frame length")); }
+        let mut packet = vec![0; 1276];
+        let size = unsafe { audiopus_sys::opus_encode(self.native, pcm.as_ptr(), self.frames as i32, packet.as_mut_ptr(), packet.len() as i32) };
+        if size <= 0 { return Err(io::Error::other(format!("Opus encode status={size}"))); }
+        packet.truncate(size as usize);
+        Ok(packet)
+    }
     pub fn encode(&mut self, stereo: &[i16]) -> io::Result<Vec<Vec<u8>>> {
         if stereo.len()%2 != 0 || stereo.len()>48000 { return Err(io::Error::other("Opus requires bounded complete stereo PCM16 frames")); }
         for pair in stereo.chunks_exact(2) {

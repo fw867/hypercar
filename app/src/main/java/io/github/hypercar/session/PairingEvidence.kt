@@ -1,5 +1,6 @@
 package io.github.hypercar.session
 
+import io.github.hypercar.settings.CarWithDisplay
 import java.io.File
 import java.util.Locale
 
@@ -20,7 +21,7 @@ data class PairingEvidence(val identityPresent: Boolean, val receiverCredentialP
             candidates.firstNotNullOfOrNull(::receiverKey)?.let { "$profile:$it" }
 
         /** The same BMW display may have been observed using the other MGU/IDC23 profile. */
-        fun cachedCanvas(key: String?, read: (String) -> Pair<Int, Int>?): Pair<Int, Int>? {
+        internal fun cachedDisplay(key: String?, read: (String) -> CarWithDisplay?): CarWithDisplay? {
             if (key == null) return null
             read(key)?.let { return it }
             val other = when (key.substringBefore(':')) {

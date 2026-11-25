@@ -199,8 +199,13 @@ pub(crate) struct DialStop {
     retired: Mutex<bool>,
     signal: Arc<Notify>,
     diagnostic_phase: Arc<DiagnosticPhase>,
+    video_rate_failure: watch::Sender<Option<u32>>,
 }
 impl DialStop {
+    pub(crate) fn report_video_rate_failure(&self, fps: u32) {
+        self.video_rate_failure.send_replace(Some(fps));
+    }
+
     pub(crate) fn cancel(&self) {
         *self.retired.lock() = true;
         self.signal.notify_waiters();
@@ -293,7 +298,8 @@ impl CarLifeHub {
         let keyframe_request = Arc::new(Notify::new());
         let reset_request = keyframe_request.clone();
         let (events, event_rx) = mpsc::unbounded_channel();
-        let encoder_size = Arc::new(Mutex::new((cfg.width.max(2),cfg.height.max(2))));
+        // The INIT hint does not define touch bounds. Wait for VIDEO_INIT_DONE.
+        let encoder_size = Arc::new(Mutex::new((0, 0)));
         let requested = requested.unwrap_or_else(|| DisplayRequest::new(ReceiverDisplay::default()));
         let queue = Arc::new(Mutex::new(Vec::<QueuedControl>::new()));
         // One synchronous bounded queue: a round retirement clears every accepted
@@ -356,7 +362,8 @@ impl CarLifeHub {
                 queue.lock().clear();
                 let _ = events_task.send(CarLifeEvent::SourceReset { cache_cleared: None });
                 let mut round = session::Session::new(config.dialect);
-                let video_sync_received = if automatic {
+                round.video_rate_failure = stop.video_rate_failure.clone();
+                let video_sync_received = if automatic || can_reopen_display {
                     let (ready, observed) = watch::channel(false);
                     round.video_sync_received = Some(ready);
                     Some(observed)
@@ -409,11 +416,12 @@ impl CarLifeHub {
                     _=stop.cancelled()=>{children.shutdown().await; return;},
                     result=session::run(cmd,events_task.clone(),size.clone(),requested.clone(),config.clone(),state.clone(),reset_request.clone(),can_reopen_display && !automatic)=>(result, RoundEnd::Command),
                     _=children.join_next()=>(Err("CarWith media/control channel closed".into()), RoundEnd::Transport),
-                    _=video_start_deadline(video_start_written, video_sync_received.clone()) =>
+                    _=video_start_deadline(video_start_written, video_sync_received.clone()), if automatic =>
                         (Err("VIDEO missing a sync picture after START".into()), RoundEnd::VideoStartup),
                     _=session::handshake_deadline(&protocol_progress), if automatic =>
                         (Err("automatic CarLife handshake deadline; no complete source handshake".into()), RoundEnd::Command),
                 };
+                *size.lock() = (0, 0);
                 if let Some(target) = &voice_target { target.clear(); }
                 children.abort_all(); while children.join_next().await.is_some() {}
                 queue.lock().clear();
@@ -512,6 +520,22 @@ impl CarLifeHub {
         if self.system_voice_epoch().is_some() { let _ = self.system_voice_key(0x21); return; }
         let queued = self.queue_hard_key(0x21, Duration::from_secs(2));
         emit_log(&format!("VOICE-KEY: CarWith key=0x21 queued={queued} (not recognition confirmation)"));
+    }
+
+    pub fn handle_phone_key(&self, key: u32) {
+        let code = match key {
+            crate::consumer_hid::PHONE_HOOK => 2,
+            crate::consumer_hid::PHONE_DROP => 3,
+            _ => return,
+        };
+        // Only the explicitly selected CarWith 4.1 source has no system voice target.
+        // SystemAuto can probe that dialect too; it still must not gain phone control.
+        if self.system_voice.is_some() {
+            emit_log(&format!("PHONE-KEY: usage=0x{key:x} dropped source=system-carlife"));
+            return;
+        }
+        let queued = self.queue_hard_key(code, Duration::from_secs(1));
+        emit_log(&format!("PHONE-KEY: usage=0x{key:x} CarWith key={code} queued={queued} (execution unconfirmed)"));
     }
 
     pub fn handle_console_key(&self, key: u32) -> bool {

@@ -53,7 +53,9 @@ impl Fixture {
         configure(&mut params, &mut info);
         let kinds = crate::airplay::independent_audio_kinds(&params, &info);
         let realtime_media_rebuild = crate::airplay::supports_realtime_media_rebuild(&params, &info, params.desktop_receiver);
-        let factory=Arc::new(Factory { receive: params.microphone_probe.is_some() });
+        let calls = crate::call_audio::formats(&info).next().is_some();
+        if calls { control.buffered_ownership.publish(true); }
+        let factory=Arc::new(Factory { receive: params.microphone_probe.is_some() || calls });
         let session=Session{kinds,control,factory,params,shared:[9;32],info,resource,media_codec:Mutex::new(Some(codec)),receiver_audio_generation:Arc::default(),realtime_media_rebuild};
         let input=Arc::new(Input::default());let(command_tx,mut command_rx)=mpsc::unbounded_channel();
         let(event_tx,commands)=mpsc::unbounded_channel();let(fallback_tx,fallback)=mpsc::unbounded_channel();
@@ -73,7 +75,8 @@ impl Fixture {
             }
         }});
         let shutdown = Arc::new(crate::shutdown::EngineShutdown::new());
-        let controller=Controller::spawn(session,input.clone(),command_tx,fallback_tx,shutdown.clone());
+        let mut controller=Controller::spawn(session,input.clone(),command_tx.clone(),fallback_tx,shutdown.clone());
+        if calls { controller.arm_calls(command_tx); }
         Self{media,controller,input,peer,data:UdpSocket::bind("127.0.0.1:0").await.unwrap(),sync:UdpSocket::bind("127.0.0.1:0").await.unwrap(),commands,fallback,command_task,buffer:Vec::new(),order:Vec::new(),shutdown,installed_rate}
     }
     async fn request(&mut self,expected:&str)->(RtspMessage,Value){
@@ -116,9 +119,158 @@ impl Fixture {
         let mut bytes=[0;2048];let n=tokio::time::timeout(Duration::from_secs(2),self.data.recv(&mut bytes)).await.unwrap().unwrap();
         assert!(n>36,"encrypted Opus packet must have payload/tag/counter");assert_eq!(bytes[0],0x80);assert_eq!(bytes[1]&127,typ);
     }
+    fn buffered_failure(&self, stream_id: i64) {
+        self.input.buffered_failed.send_replace(Some(crate::audio_pacing::StreamId {
+            rtsp: self.controller.session.control.trace_id(),
+            stream_id,
+            setup_accepted_at: std::time::Instant::now(),
+        }));
+    }
     async fn stopped(&mut self){
         assert!(self.controller.shutdown().await.is_empty());assert!(self.fallback.try_recv().is_err());
     }
+}
+
+#[tokio::test]
+async fn telephony_bridges_authenticated_pcm_both_ways_and_restores_original_media() {
+    let mut fixture = Fixture::with_config(|_, info| {
+        let mut formats = info.get("audioFormats").unwrap().as_array().unwrap().clone();
+        formats.push(Value::dict(vec![("type", Value::int(100)), ("audioType", Value::str("telephony")),
+            ("audioInputFormats", Value::int((1 << 4) | (1 << 6))),
+            ("audioOutputFormats", Value::int((1 << 4) | (1 << 6)))]));
+        *info = Value::dict(vec![("audioFormats", Value::array(formats))]);
+    }).await;
+    let token = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(token) = crate::call_audio::token_for_test() { break token; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    let (retired, _) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert!(!crate::call_audio::offer(token + 1, 1, 48_000, retired));
+    fixture.controller.session.control.buffered_ownership.publish(false);
+    let (offered, mut phone) = tokio::net::UnixStream::pair().unwrap();
+    assert!(crate::call_audio::offer(token, 1, 48_000, offered.into_std().unwrap()));
+    assert!(tokio::time::timeout(Duration::from_millis(30), fixture.peer.read_u8()).await.is_err());
+    fixture.controller.session.control.buffered_ownership.publish(true);
+    let (pause, _) = fixture.request("teardown:100").await;
+    fixture.ack(&pause, None).await;
+    let (first, body) = fixture.request("setup:100:telephony").await;
+    let row = &body.get("streams").unwrap().as_array().unwrap()[0];
+    let offered_port = row.get("dataPort").and_then(Value::as_int);
+    assert_eq!(row.get("audioFormat").and_then(Value::as_int), Some(1 << 6));
+    assert!(row.get("controlPort").is_some());
+    fixture.reject(&first, 451).await;
+    let (compact, body) = fixture.request("setup:100:telephony").await;
+    let row = &body.get("streams").unwrap().as_array().unwrap()[0];
+    assert_eq!(row.get("audioFormat").and_then(Value::as_int), Some(1 << 6));
+    assert_eq!(row.get("dataPort").and_then(Value::as_int), offered_port);
+    assert!(row.get("controlPort").is_none());
+    fixture.reject(&compact, 461).await;
+    let (setup, body) = fixture.request("setup:100:telephony").await;
+    let row = &body.get("streams").unwrap().as_array().unwrap()[0];
+    let id = row.get("streamConnectionID").unwrap().as_int().unwrap();
+    let microphone_port = row.get("dataPort").unwrap().as_int().unwrap() as u16;
+    assert_eq!(row.get("audioFormat").and_then(Value::as_int), Some(1 << 4));
+    assert_eq!(row.get("input").and_then(Value::as_bool), Some(true));
+    assert_eq!(row.get("dataPort").and_then(Value::as_int), offered_port);
+    fixture.setup_reply(&setup, &body).await;
+    let (state, body) = fixture.request("modesChanged").await;
+    assert_eq!(body.get("params").unwrap().get("appStates").unwrap().as_array().unwrap()[1]
+        .get("entity").and_then(Value::as_int), Some(1));
+    fixture.ack(&state, None).await;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), phone.read_u8()).await.unwrap().unwrap(), 1);
+    phone.write_u8(1).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(30), phone.read_u8()).await.is_err());
+
+    phone.write_all(&123i16.to_le_bytes().repeat(960)).await.unwrap();
+    let mut packet = [0; 2048];
+    let len = tokio::time::timeout(Duration::from_secs(1), fixture.data.recv(&mut packet)).await.unwrap().unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(30), phone.read_u8()).await.is_err());
+    let nonce = u64::from_le_bytes(packet[len - 8..len].try_into().unwrap());
+    let payload = crate::crypto::chacha_open(&crate::airplay::stream_key(&[9; 32], id as u64),
+        &crate::crypto::nonce64(nonce), &packet[12..len - 8], &packet[4..12]).unwrap();
+    assert_eq!(payload, 123i16.to_be_bytes().repeat(320));
+    let mut sync = [0; 20];
+    assert_eq!(tokio::time::timeout(Duration::from_millis(250), fixture.sync.recv(&mut sync)).await.unwrap().unwrap(), 20);
+    assert_eq!(sync[1], 0xd4);
+    assert_eq!(u32::from_be_bytes(sync[16..20].try_into().unwrap()), 320);
+
+    tokio::time::pause();
+    for _ in 0..6 {
+        phone.write_all(&123i16.to_le_bytes().repeat(960)).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(500), fixture.data.recv(&mut packet)).await.unwrap().unwrap() > 36);
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    tokio::time::resume();
+
+    let input_key = crate::mic_probe::input_key(&[9;32], id as u64);
+    let microphone_packet = |sequence: u8, nonce| {
+        let mut packet = vec![0x80, 100, 0, sequence, 0, 0, 0, sequence, 0, 0, 0, 1];
+        let mut encrypted = crate::crypto::chacha_seal(&input_key, &crate::crypto::nonce64(nonce),
+            &(-321i16).to_be_bytes().repeat(320), &packet[4..12]);
+        packet.append(&mut encrypted);
+        packet.extend_from_slice(&nonce.to_le_bytes());
+        packet
+    };
+    let packet = microphone_packet(100, 1);
+    let mut invalid = packet.clone();
+    invalid[12] ^= 1;
+    fixture.data.send_to(&invalid, ("127.0.0.1", microphone_port)).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(30), phone.read_u8()).await.is_err());
+    fixture.data.send_to(&packet, ("127.0.0.1", microphone_port)).await.unwrap();
+    let mut pcm = vec![0; 1916];
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), phone.read_u16()).await.unwrap().unwrap(), 1916);
+    tokio::time::timeout(Duration::from_secs(1), phone.read_exact(&mut pcm)).await.unwrap().unwrap();
+    assert_eq!(pcm, (-321i16).to_le_bytes().repeat(958));
+
+    tokio::time::pause();
+    let mut speaker_packet = [0; 2048];
+    for _ in 0..4 {
+        phone.write_all(&123i16.to_le_bytes().repeat(960)).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(500), fixture.data.recv(&mut speaker_packet)).await.unwrap().unwrap() > 36);
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    tokio::time::resume();
+    let restarted_microphone = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    restarted_microphone.send_to(&packet, ("127.0.0.1", microphone_port)).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(30), phone.read_u8()).await.is_err());
+    restarted_microphone.send_to(&microphone_packet(1, 2), ("127.0.0.1", microphone_port)).await.unwrap();
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), phone.read_u16()).await.unwrap().unwrap(), 1916);
+    tokio::time::timeout(Duration::from_secs(1), phone.read_exact(&mut pcm)).await.unwrap().unwrap();
+    assert_eq!(pcm, (-321i16).to_le_bytes().repeat(958));
+    fixture.controller.session.control.buffered_ownership.publish(false);
+    fixture.controller.session.control.buffered_ownership.publish(true);
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), phone.read_u8()).await.unwrap().unwrap_err().kind(),
+        std::io::ErrorKind::UnexpectedEof);
+
+    let (teardown, body) = fixture.request("teardown:100").await;
+    assert!(!crate::call_audio::take_retry(token, 1));
+    assert_eq!(body.get("streams").unwrap().as_array().unwrap()[0].get("streamConnectionID").and_then(Value::as_int), Some(id));
+    fixture.controller.session.control.buffered_ownership.publish(false);
+    fixture.ack(&teardown, None).await;
+    let (idle, body) = fixture.request("modesChanged").await;
+    assert_eq!(body.get("params").unwrap().get("appStates").unwrap().as_array().unwrap()[1]
+        .get("entity").and_then(Value::as_int), Some(0));
+    fixture.ack(&idle, None).await;
+    assert!(tokio::time::timeout(Duration::from_millis(50), fixture.peer.read_u8()).await.is_err(),
+        "a receiver Take must leave control open and defer main media SETUP until the grant returns");
+    fixture.controller.session.control.buffered_ownership.publish(true);
+    let (interrupted, _) = fixture.request("setup:100:media").await;
+    fixture.controller.session.control.buffered_ownership.publish(false);
+    fixture.reject(&interrupted, 403).await;
+    assert!(tokio::time::timeout(Duration::from_millis(150), fixture.peer.read_u8()).await.is_err(),
+        "a Take while media SETUP is in flight must defer its retry until the grant returns");
+    fixture.controller.session.control.buffered_ownership.publish(true);
+    let (restore, body) = fixture.request("setup:100:media").await;
+    fixture.setup_reply(&restore, &body).await;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), fixture.commands.recv()).await.unwrap(), Some("pause"));
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), fixture.commands.recv()).await.unwrap(), Some("install"));
+    assert!(!crate::call_audio::take_retry(token, 2));
+    assert!(crate::call_audio::take_retry(token, 1));
+    assert!(!crate::call_audio::take_retry(token, 1));
+    fixture.stopped().await;
+    assert!(!crate::call_audio::armed(token));
 }
 
 #[tokio::test]
@@ -493,12 +645,36 @@ async fn id9_same_address_reinvite_discards_old_record_even_with_matching_cseq()
 }
 
 #[tokio::test]
+async fn buffered_failure_waiting_behind_media_restore_cannot_retire_the_restored_sender() {
+    let mut f = Fixture::with_codec(AudioCodec::BufferedAac, |_, _| {}).await;
+    let transition = f.controller.stop.main_transition.clone();
+    let restoring_media = transition.lock().await;
+    f.buffered_failure(1);
+    tokio::task::yield_now().await;
+
+    let pipeline = f.controller.session.params.pipeline.clone();
+    pipeline.lock().audio_ready = true;
+    f.input.clear_buffered_failure();
+    drop(restoring_media);
+    assert!(tokio::time::timeout(Duration::from_millis(80), f.peer.read_u8()).await.is_err(),
+        "an old sender failure must leave the restored type103 stream active");
+    assert!(pipeline.lock().audio_ready);
+
+    f.buffered_failure(2);
+    let (teardown, _) = f.request("teardown:103").await;
+    f.reject(&teardown, 500).await;
+    let (retry, _) = f.request("teardown:103").await;
+    f.reject(&retry, 500).await;
+    f.stopped().await;
+}
+
+#[tokio::test]
 async fn failed_buffered_teardown_never_starts_a_second_main_stream() {
     let mut f = Fixture::with_codec(AudioCodec::BufferedAac, |params, _| {
         params.head_unit_profile = "bmw_id9".into();
         params.audio_codec = "auto".into();
     }).await;
-    f.input.buffered_failed.notify_one();
+    f.buffered_failure(1);
     let (teardown, _) = f.request("teardown:103").await;
     f.reject(&teardown, 500).await;
     let (retry, _) = f.request("teardown:103").await;
@@ -530,7 +706,7 @@ async fn mbux_buffered_fixture() -> Fixture {
 #[tokio::test]
 async fn buffered_cleanup_timeout_requires_new_ack_before_102_and_preserves_active_screen() {
     let mut f = mbux_buffered_fixture().await;
-    f.input.buffered_failed.notify_one();
+    f.buffered_failure(1);
     let (first, _) = f.request("teardown:103").await;
     let (retry, _) = f.request("teardown:103").await;
     assert_ne!(first.cseq(), retry.cseq());
@@ -551,7 +727,7 @@ async fn buffered_cleanup_timeout_requires_new_ack_before_102_and_preserves_acti
 #[tokio::test]
 async fn buffered_cleanup_retry_reply_stays_on_its_session_during_same_address_reinvite() {
     let mut old = mbux_buffered_fixture().await;
-    old.input.buffered_failed.notify_one();
+    old.buffered_failure(1);
     let (first, _) = old.request("teardown:103").await;
     old.reject(&first, 500).await;
     let (old_retry, _) = old.request("teardown:103").await;
@@ -562,7 +738,7 @@ async fn buffered_cleanup_retry_reply_stays_on_its_session_during_same_address_r
     assert!(tokio::time::timeout(Duration::from_millis(60), old.peer.read_u8()).await.is_err());
 
     let mut next = mbux_buffered_fixture().await;
-    next.input.buffered_failed.notify_one();
+    next.buffered_failure(1);
     let (first, _) = next.request("teardown:103").await;
     next.reject(&first, 500).await;
     let (next_retry, _) = next.request("teardown:103").await;
@@ -589,7 +765,7 @@ async fn failed_buffered_playback_recovers_only_main_audio_with_aac_102() {
             ("audioOutputFormats", Value::int(1 << 23)),
         ])]))]);
     }).await;
-    f.input.buffered_failed.notify_one();
+    f.buffered_failure(1);
     let (teardown, _) = f.request("teardown:103").await;
     f.ack(&teardown, None).await;
     let (setup, request) = f.request("setup:102:media").await;
@@ -604,7 +780,7 @@ async fn failed_buffered_playback_uses_declared_pcm_when_no_aac_is_declared() {
     let mut f = Fixture::with_codec(AudioCodec::BufferedAac, |params, _| {
         params.audio_codec = "auto".into();
     }).await;
-    f.input.buffered_failed.notify_one();
+    f.buffered_failure(1);
     let (teardown, _) = f.request("teardown:103").await;
     assert!(f.commands.try_recv().is_err());
     f.ack(&teardown, None).await;
@@ -632,7 +808,7 @@ async fn failed_buffered_playback_tries_preferred_aac_then_accepts_untyped_pcm_f
             ("audioFormats", Value::array(vec![media_format(100, 1 << 15), media_format(102, 1 << 23)])),
         ]);
     }).await;
-    f.input.buffered_failed.notify_one();
+    f.buffered_failure(1);
     let (teardown, _) = f.request("teardown:103").await;
     f.ack(&teardown, None).await;
     let (aac, offer) = f.request("setup:102:media").await;

@@ -428,7 +428,9 @@ pub async fn negotiate(
     }
     if let Some(requested) = &p.carwith_display {
         requested.send_modify(|d| {
-            if disp_w >= 2 && disp_h >= 2 { d.size = (disp_w, disp_h); }
+            // An unknown live canvas leaves the prewarm dimensions available as
+            // the source's INIT fallback. It is not a confirmed resize target.
+            d.size = (disp_w, disp_h);
             d.max_fps = max_fps;
             d.confirmed = true;
         });
@@ -759,7 +761,8 @@ pub async fn negotiate(
     let realtime_media_rebuild = supports_realtime_media_rebuild(p, &info, desktop);
     let realtime_media = realtime_media_rebuild && audio.as_ref().is_some_and(|out| out.stream_type() == 102);
     let shared_input = p.microphone_probe.is_some() && crate::mic_probe::shared_format(&info).is_some();
-    let aux_audio=if shared_input || p.enable_audio && (!kinds.is_empty() || buffered_media || realtime_media) {
+    let call_input = p.carwith_media_rate.is_some() && crate::call_audio::formats(&info).next().is_some();
+    let aux_audio=if shared_input || p.enable_audio && (!kinds.is_empty() || buffered_media || realtime_media || call_input) {
         shared_secret.map(|shared|crate::aux_audio::Session {
             kinds,
             control:channel.clone(),factory:factory.clone(),params:p.clone(),shared,info:info.clone(),resource:speech_resource.clone(),
