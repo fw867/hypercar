@@ -223,8 +223,7 @@ pub struct RtspChannel {
     pending: PendingMap,
     hud_replies: HudReplies,
     reader: tokio::task::JoinHandle<()>,
-    reader_done: Arc<tokio::sync::Notify>,
-    closed: AtomicBool,
+    closed: watch::Sender<bool>,
     pub(crate) nbt_recorded: tokio::sync::Mutex<bool>,
     pub(crate) udp_media: crate::udp_keepalive::MediaActivity,
     pub(crate) buffered_ownership: crate::buffered_ownership::BufferedOwnership,
@@ -438,7 +437,9 @@ impl RtspChannel {
     }
 
     pub(crate) async fn wait_for_control_close(&self) {
-        if !self.is_closed() { self.reader_done.notified().await; }
+        if !self.is_closed() {
+            let _ = self.closed.subscribe().wait_for(|closed| *closed).await;
+        }
     }
 
     pub(crate) fn spawn_event(&self, read: OwnedReadHalf, write: OwnedWriteHalf,
@@ -485,7 +486,7 @@ impl RtspChannel {
             Arc::new(EventTrace { id: trace_id, observe, closed: AtomicBool::new(false) })
         });
 
-        let reader_done: Arc<tokio::sync::Notify> = Arc::default();
+        let closed = watch::Sender::new(false);
         let read = reader_loop(
             read,
             write.clone(),
@@ -500,10 +501,10 @@ impl RtspChannel {
             event_trace.clone(),
             session_end.clone(),
         );
-        let done = reader_done.clone();
+        let reader_closed = closed.clone();
         let reader = crate::callback_context::spawn(async move {
             read.await;
-            done.notify_one();
+            reader_closed.send_replace(true);
         });
 
         let this = Arc::new(Self {
@@ -516,8 +517,7 @@ impl RtspChannel {
             pending,
             hud_replies,
             reader,
-            reader_done,
-            closed: AtomicBool::new(false),
+            closed,
             nbt_recorded: tokio::sync::Mutex::new(false),
             udp_media: Default::default(),
             buffered_ownership: Default::default(),
@@ -859,13 +859,12 @@ impl RtspChannel {
 
     pub fn close(&self) {
         self.record_close("local_close");
-        self.closed.store(true, Ordering::Release);
+        self.closed.send_replace(true);
         self.reader.abort();
         self.pending.lock().clear();
-        self.reader_done.notify_one();
     }
 
-    pub fn is_closed(&self) -> bool { self.closed.load(Ordering::Acquire) || self.reader.is_finished() }
+    pub fn is_closed(&self) -> bool { *self.closed.borrow() || self.reader.is_finished() }
 
     pub async fn shutdown(&self) {
         self.close();
@@ -1839,6 +1838,44 @@ mod cancellation_tests {
         let (r,w) = socket.into_split();
         let (channel,_) = RtspChannel::spawn(r,w,None);
         (channel,peer)
+    }
+
+    async fn assert_control_close_wakes_waiters(close_locally: bool) {
+        use std::future::{Future, poll_fn};
+        use std::pin::pin;
+        use std::task::Poll;
+
+        let (channel, mut peer) = pair().await;
+        let mut first = pin!(channel.wait_for_control_close());
+        let mut second = pin!(channel.wait_for_control_close());
+        poll_fn(|cx| {
+            assert!(first.as_mut().poll(cx).is_pending());
+            assert!(second.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        }).await;
+
+        if close_locally {
+            channel.close();
+        } else {
+            peer.shutdown().await.unwrap();
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(first, second);
+        }).await.expect("control close must wake all registered waiters");
+        assert!(channel.is_closed());
+        tokio::time::timeout(Duration::from_secs(1), channel.wait_for_control_close())
+            .await.expect("new waiters must observe that the control channel is closed");
+    }
+
+    #[tokio::test]
+    async fn local_control_close_wakes_all_waiters() {
+        assert_control_close_wakes_waiters(true).await;
+    }
+
+    #[tokio::test]
+    async fn control_reader_eof_wakes_all_waiters() {
+        assert_control_close_wakes_waiters(false).await;
     }
 
     async fn read_request(peer: &mut TcpStream) -> RtspMessage {

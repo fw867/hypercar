@@ -60,7 +60,14 @@ impl SpeechResource {
     fn commit_call_audio(&self, proposal: &CallAudioTransition) -> bool {
         let mut modes = self.modes.lock();
         if !modes.commit_call_audio(proposal) { return false; }
-        self.control.buffered_ownership.publish_with_gate(&self.owned, modes.audio_owned());
+        self.control.buffered_ownership.publish_with_gate(&self.owned, modes.audio_can_send());
+        true
+    }
+
+    pub(crate) fn enable_call_audio(&self, lease: &CallAudioLease) -> bool {
+        let mut modes = self.modes.lock();
+        if !modes.enable_call_audio(lease) { return false; }
+        self.control.buffered_ownership.publish_with_gate(&self.owned, modes.audio_can_send());
         true
     }
 
@@ -147,7 +154,7 @@ impl SpeechResource {
         if !accepted {crate::emit_log("SPEECH-RESOURCE: declaration rejected/timed out; gate unchanged");return false;}
         let mut modes=self.modes.lock();
         let committed=modes.commit_aux(&proposal);
-        self.control.buffered_ownership.publish_with_gate(&self.owned, modes.audio_owned());
+        self.control.buffered_ownership.publish_with_gate(&self.owned, modes.audio_can_send());
         crate::emit_log(&format!("SPEECH-RESOURCE: acknowledged committed={committed}; receiver audibility unconfirmed"));
         committed
     }

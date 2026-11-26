@@ -2,7 +2,7 @@
 //! to the shell call-redirection endpoints and never enters the media/VR mixer.
 use std::{collections::VecDeque, os::{fd::{AsRawFd, RawFd}, unix::net::UnixStream as LocalSocket}, sync::atomic::{AtomicBool, AtomicI64, Ordering}, time::Duration};
 use parking_lot::Mutex;
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::UnixStream, sync::mpsc};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{UdpSocket, UnixStream}, sync::mpsc, time::Instant};
 use crate::{audio_out::AudioOut, aux_audio::Session, bplist::{self, Value}, mic_probe, rtsp::RtspMessage};
 use crate::call_aac_eld::{self, CallAacEld};
 
@@ -284,9 +284,12 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
             // These transport rejections leave the shared slot free. Unknown replies still require TEARDOWN.
             *allocated = None;
             pending.store(false, Ordering::Release);
-            if !tried_compact {
-                tried_compact = true;
+            if matches!(setup_fields, SetupFields::Extended(Some(_))) {
                 rtcp = None;
+                setup_fields = SetupFields::Extended(None);
+                crate::emit_log(&format!("CALL-AUDIO: SETUP status={}; retry without controlPort for format {:#x}", reply.status(), format.mask));
+            } else if !tried_compact {
+                tried_compact = true;
                 setup_fields = SetupFields::Compact;
                 crate::emit_log(&format!("CALL-AUDIO: SETUP status={}; retry compact request for format {:#x}", reply.status(), format.mask));
             } else if let Some(next) = candidates.next() {
@@ -316,11 +319,11 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
     };
     drop(candidates);
     let PreparedFormat { format, eld } = selected;
-    let (mut eld_encoder, mut eld_decoder) = match eld.map(CallAacEld::into_parts) {
+    let (mut eld_encoder, eld_decoder) = match eld.map(CallAacEld::into_parts) {
         Some((encoder, decoder)) => (Some(encoder), Some(decoder)),
         None => (None, None),
     };
-    let mut decoder = (format.codec == Codec::Opus).then(|| CallOpusDecoder::new(format.rate)).transpose()?;
+    let decoder = (format.codec == Codec::Opus).then(|| CallOpusDecoder::new(format.rate)).transpose()?;
     let mut encoder = (format.codec == Codec::Opus).then(|| crate::opus_encode::OpusEncoder::new_call(format.rate, format.frames()))
         .transpose().map_err(|e| e.to_string())?;
     session.control.udp_media.set(TYPE, true);
@@ -363,7 +366,8 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
             *outcome = OfferResult::SameRate;
             return Err("main audio grant changed before call audio start".into());
         }
-        ready = tokio::time::timeout(Duration::from_secs(1), async {
+        // The phone can finish one bounded Telecom retry before settling the audio route.
+        ready = tokio::time::timeout(Duration::from_millis(1500), async {
             local.write_u8(1).await?;
             local.read_u8().await
         }) => {
@@ -424,55 +428,23 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
                 let _ = speaker.send_call_sync(crate::timing::monotonic_nanos(), format.frames() as u32).await;
                 sync = std::time::Instant::now();
             }
-            check_phone_endpoint(phone_fd)?;
-            speaker.send_call_audio(&payload, format.frames() as u32, loss_generation).await
+            speaker.send_call_audio(&payload, format.frames() as u32, loss_generation, phone_fd).await
                 .map_err(|error| format!("car speaker RTP send failed: {error}"))?;
         }
     };
     let up = async {
-        let mut stats = mic_probe::Stats::default();
-        let mut wire = [0u8; 8193];
-        let mut port = None;
-        let mut deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+        let eld = eld_decoder.map(|codec| EldUplink::new(codec, format,
+            call_aac_eld::Decoder::try_queue_au, call_aac_eld::Decoder::poll_decoded));
+        let mut input = MicrophoneInput::new(&microphone, receiver_ip, input_key, format.channels, decoder, eld);
         let mut resampler = MonoResampler::default();
         let mut converted = VecDeque::new();
-        let mut eld_clock = EldClock::new(format);
         loop {
-            let receive = microphone.recv_from(&mut wire);
-            let packet = if let Some(until) = deadline {
-                match tokio::time::timeout_at(until, receive).await {
-                    Ok(packet) => packet,
-                    Err(_) => {
-                        crate::emit_log("CALL-AUDIO: no usable microphone RTP; speaker continues");
-                        deadline = None;
-                        port = None;
-                        stats.reset_sequence();
-                        resampler = MonoResampler::default();
-                        continue;
-                    }
-                }
-            } else { receive.await };
-            let (n, source) = packet.map_err(|error| format!("car microphone RTP receive failed: {error}"))?;
-            if mic_probe::normalized(source.ip()) != receiver_ip || port.is_some_and(|p| p != source.port()) { continue; }
-            let Ok(payload) = stats.open(TYPE as u8, &wire[..n], &input_key) else { continue; };
-            let pcm = if let Some(eld) = &mut eld_decoder {
-                let decoded = transfer_eld(eld, &payload, &mut eld_clock,
-                    call_aac_eld::Decoder::try_queue_au, call_aac_eld::Decoder::poll_decoded).await?;
-                let Some(pcm) = decoded else { continue; };
-                pcm
-            } else if let Some(decoder) = &mut decoder {
-                match decoder.decode(&payload) {
-                    Some(samples) => samples.iter().copied().flat_map(i16::to_le_bytes).collect(),
-                    _ => continue,
-                }
-            } else {
-                let Some(pcm) = mono_pcm(&payload, format.channels) else { continue; };
-                pcm
+            let Some((port, pcm)) = input.next_pcm().await? else {
+                resampler = MonoResampler::default();
+                continue;
             };
             if !session.resource.owned.load(Ordering::Acquire) { return Err("receiver took main audio".into()); }
-            if port.is_none() { crate::emit_log("CALL-AUDIO: authenticated microphone PCM flowing; remote audibility unconfirmed"); }
-            port = Some(source.port());
-            deadline = Some(tokio::time::Instant::now() + Duration::from_secs(3));
+            input.playing(port);
             resampler.push(&pcm, format.rate, phone_rate, &mut converted);
             let bytes = converted.len() * 2;
             if bytes == 0 { continue; }
@@ -510,6 +482,178 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
     }
 }
 
+type EldQueue<C> = fn(&mut C, &[u8], u64) -> Result<bool, String>;
+type EldPoll<C> = fn(&mut C) -> Result<Option<(u64, Vec<u8>)>, String>;
+type SourcePcm = (u16, Vec<u8>);
+
+const ELD_POLL_INTERVAL: Duration = Duration::from_millis(2);
+// Bound the codec backlog by both media age and packet count, including bursts.
+const ELD_MAX_FRAME_AGE: Duration = Duration::from_millis(200);
+const ELD_MAX_PENDING: usize = 12;
+
+struct EldUplink<C> {
+    codec: C,
+    clock: EldClock,
+    queue: EldQueue<C>,
+    poll: EldPoll<C>,
+    waiting: Option<(Vec<u8>, Instant)>,
+    queued: VecDeque<(u64, Instant)>,
+    pending_port: Option<u16>,
+    next_poll: Instant,
+}
+
+impl<C> EldUplink<C> {
+    fn new(codec: C, format: Format, queue: EldQueue<C>, poll: EldPoll<C>) -> Self {
+        Self { codec, clock: EldClock::new(format), queue, poll, waiting: None,
+            queued: VecDeque::new(), pending_port: None, next_poll: Instant::now() }
+    }
+
+    fn poll_at(&self) -> Option<Instant> {
+        self.pending_port.map(|_| self.next_poll)
+    }
+
+    fn reset(&mut self) {
+        // Keep PTS monotonic so a late codec buffer cannot match a new input.
+        self.waiting = None;
+        self.queued.clear();
+        self.pending_port = None;
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while self.queued.front().is_some_and(|&(_, received)| now - received >= ELD_MAX_FRAME_AGE) {
+            self.queued.pop_front();
+        }
+        if self.waiting.as_ref().is_some_and(|(_, received)| now - *received >= ELD_MAX_FRAME_AGE) {
+            self.waiting = None;
+        }
+        self.release_idle_port();
+    }
+
+    fn release_idle_port(&mut self) {
+        if self.queued.is_empty() && self.waiting.is_none() {
+            self.pending_port = None;
+        }
+    }
+
+    fn offer(&mut self, au: Vec<u8>, port: u16, now: Instant) -> Result<Option<SourcePcm>, String> {
+        if !call_aac_eld::valid_au_size(au.len()) || self.waiting.is_some() || self.queued.len() >= ELD_MAX_PENDING {
+            return Ok(None);
+        }
+        self.waiting = Some((au, now));
+        self.pending_port = Some(port);
+        self.progress(now)
+    }
+
+    fn progress(&mut self, now: Instant) -> Result<Option<SourcePcm>, String> {
+        self.prune(now);
+        let Some(port) = self.pending_port else { return Ok(None); };
+        self.next_poll = now + ELD_POLL_INTERVAL;
+        if let Some((au, received)) = &self.waiting {
+            if (self.queue)(&mut self.codec, au, self.clock.input)? {
+                self.queued.push_back((self.clock.input, *received));
+                self.clock.input += self.clock.step;
+                self.waiting = None;
+            }
+        }
+        for _ in 0..ELD_MAX_PENDING {
+            let Some((pts, pcm)) = (self.poll)(&mut self.codec)? else { break; };
+            let first = self.queued.front().map_or(self.clock.input, |&(pts, _)| pts);
+            if pts < first { continue; } // Expired input or an already delivered frame.
+            if pts >= self.clock.input || !(pts - first).is_multiple_of(self.clock.step) {
+                return Err("AAC-ELD decoder output changed the packet clock".into());
+            }
+            // A decoder may drop a damaged AU. Retire the skipped timestamps with it.
+            while self.queued.front().is_some_and(|&(queued, _)| queued <= pts) {
+                self.queued.pop_front();
+            }
+            self.release_idle_port();
+            return Ok(Some((port, pcm)));
+        }
+        Ok(None)
+    }
+}
+
+struct MicrophoneInput<'a, C> {
+    socket: &'a UdpSocket,
+    receiver_ip: std::net::IpAddr,
+    key: [u8; 32],
+    channels: usize,
+    opus: Option<CallOpusDecoder>,
+    eld: Option<EldUplink<C>>,
+    stats: mic_probe::Stats,
+    wire: [u8; 8193],
+    port: Option<u16>,
+    deadline: Option<Instant>,
+}
+
+impl<'a, C> MicrophoneInput<'a, C> {
+    fn new(socket: &'a UdpSocket, receiver_ip: std::net::IpAddr, key: [u8; 32], channels: usize,
+        opus: Option<CallOpusDecoder>, eld: Option<EldUplink<C>>) -> Self {
+        Self { socket, receiver_ip, key, channels, opus, eld, stats: mic_probe::Stats::default(),
+            wire: [0; 8193], port: None, deadline: Some(Instant::now() + Duration::from_secs(5)) }
+    }
+
+    fn playing(&mut self, port: u16) {
+        if self.port.is_none() {
+            crate::emit_log("CALL-AUDIO: authenticated microphone PCM flowing; remote audibility unconfirmed");
+        }
+        self.port = Some(port);
+        self.deadline = Some(Instant::now() + Duration::from_secs(3));
+    }
+
+    async fn next_pcm(&mut self) -> Result<Option<SourcePcm>, String> {
+        loop {
+            let poll_at = self.eld.as_ref().and_then(EldUplink::poll_at);
+            let packet = tokio::select! {
+                biased;
+                _ = wait_for(self.deadline) => {
+                    crate::emit_log("CALL-AUDIO: no usable microphone RTP; speaker continues");
+                    self.deadline = None;
+                    self.port = None;
+                    self.stats.reset_sequence();
+                    if let Some(eld) = &mut self.eld { eld.reset(); }
+                    return Ok(None);
+                }
+                _ = wait_for(poll_at) => {
+                    if let Some(eld) = &mut self.eld {
+                        if let Some(pcm) = eld.progress(Instant::now())? { return Ok(Some(pcm)); }
+                    }
+                    continue;
+                }
+                packet = self.socket.recv_from(&mut self.wire) => packet,
+            };
+            let (n, source) = packet.map_err(|error| format!("car microphone RTP receive failed: {error}"))?;
+            let now = Instant::now();
+            let mut port = self.port;
+            if let Some(eld) = &mut self.eld {
+                eld.prune(now);
+                port = port.or(eld.pending_port);
+            }
+            if mic_probe::normalized(source.ip()) != self.receiver_ip || port.is_some_and(|p| p != source.port()) {
+                continue;
+            }
+            let Ok(payload) = self.stats.open(TYPE as u8, &self.wire[..n], &self.key) else { continue; };
+            if let Some(eld) = &mut self.eld {
+                if let Some(pcm) = eld.offer(payload, source.port(), now)? { return Ok(Some(pcm)); }
+                continue;
+            }
+            let pcm = if let Some(opus) = &mut self.opus {
+                opus.decode(&payload).map(|samples| samples.iter().copied().flat_map(i16::to_le_bytes).collect())
+            } else {
+                mono_pcm(&payload, self.channels)
+            };
+            if let Some(pcm) = pcm { return Ok(Some((source.port(), pcm))); }
+        }
+    }
+}
+
+async fn wait_for(deadline: Option<Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
 struct EldClock {
     input: u64,
     output: u64,
@@ -524,8 +668,7 @@ impl EldClock {
 }
 
 async fn transfer_eld<C>(codec: &mut C, input: &[u8], clock: &mut EldClock,
-    queue: fn(&mut C, &[u8], u64) -> Result<bool, String>,
-    poll: fn(&mut C) -> Result<Option<(u64, Vec<u8>)>, String>,
+    queue: EldQueue<C>, poll: EldPoll<C>,
 ) -> Result<Option<Vec<u8>>, String> {
     let mut output = None;
     tokio::time::timeout(Duration::from_millis(80), async {
@@ -601,6 +744,93 @@ fn mono_pcm(payload: &[u8], channels: usize) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use std::{io::Write, os::fd::AsRawFd};
+
+    const MIC_TEST_KEY: [u8; 32] = [42; 32];
+
+    #[derive(Default)]
+    struct DelayedEld(VecDeque<(Instant, u64, Vec<u8>)>);
+
+    impl DelayedEld {
+        fn queue(&mut self, au: &[u8], pts: u64) -> Result<bool, String> {
+            let Some(&sample) = au.first() else { return Err("invalid raw access unit size".into()); };
+            let delay = match sample {
+                42 => 0,
+                77 => return Err("decoder runtime failure".into()),
+                99 => 300,
+                _ => 6,
+            };
+            let pcm = vec![sample; call_aac_eld::PCM_BYTES_PER_AU];
+            self.0.push_back((Instant::now() + Duration::from_millis(delay), pts, pcm));
+            Ok(true)
+        }
+
+        fn poll(&mut self) -> Result<Option<(u64, Vec<u8>)>, String> {
+            Ok(self.0.pop_front_if(|(ready_at, _, _)| Instant::now() >= *ready_at)
+                .map(|(_, pts, pcm)| (pts, pcm)))
+        }
+    }
+
+    fn eld_microphone(socket: &UdpSocket) -> MicrophoneInput<'_, DelayedEld> {
+        let format = Format { rate: 24_000, channels: 1, mask: 1 << 27, codec: Codec::AacEld };
+        MicrophoneInput::new(socket, socket.local_addr().unwrap().ip(), MIC_TEST_KEY, format.channels, None,
+            Some(EldUplink::new(DelayedEld::default(), format, DelayedEld::queue, DelayedEld::poll)))
+    }
+
+    async fn send_mic_packet(sender: &UdpSocket, socket: &UdpSocket, seq: u16, nonce: u64, au: &[u8]) {
+        let mut rtp = vec![0x80, TYPE as u8];
+        rtp.extend(seq.to_be_bytes());
+        rtp.extend([0, 0, 0, 0, 0, 0, 0, 1]);
+        let sealed = crate::crypto::chacha_seal(&MIC_TEST_KEY, &crate::crypto::nonce64(nonce), au, &rtp[4..12]);
+        rtp.extend(sealed);
+        rtp.extend(nonce.to_le_bytes());
+        sender.send_to(&rtp, socket.local_addr().unwrap()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn telephony_drops_authenticated_empty_eld_without_losing_microphone() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut input = eld_microphone(&socket);
+        send_mic_packet(&sender, &socket, 1, 1, &[]).await;
+        send_mic_packet(&sender, &socket, 2, 2, &[42]).await;
+        let result = tokio::time::timeout(Duration::from_millis(100), input.next_pcm()).await.unwrap().unwrap();
+        assert_eq!(result, Some((sender.local_addr().unwrap().port(), vec![42; 960])));
+    }
+
+    #[tokio::test]
+    async fn telephony_delivers_delayed_eld_pcm_without_another_rtp_packet() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut input = eld_microphone(&socket);
+        send_mic_packet(&sender, &socket, 1, 1, &[17]).await;
+        let result = tokio::time::timeout(Duration::from_millis(100), input.next_pcm()).await;
+        assert_eq!(result.unwrap().unwrap(), Some((sender.local_addr().unwrap().port(), vec![17; 960])));
+    }
+
+    #[tokio::test]
+    async fn telephony_does_not_treat_an_eld_decoder_failure_as_a_bad_rtp_packet() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut input = eld_microphone(&socket);
+        send_mic_packet(&sender, &socket, 1, 1, &[77]).await;
+        let result = tokio::time::timeout(Duration::from_millis(100), input.next_pcm()).await.unwrap();
+        assert_eq!(result, Err("decoder runtime failure".into()));
+    }
+
+    #[tokio::test]
+    async fn telephony_discards_delayed_eld_pcm_when_a_new_sender_arrives_after_idle() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut input = eld_microphone(&socket);
+        input.deadline = Some(Instant::now() + Duration::from_millis(30));
+        send_mic_packet(&first, &socket, 11, 1, &[99]).await;
+        assert_eq!(input.next_pcm().await.unwrap(), None);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        send_mic_packet(&second, &socket, 1, 2, &[42]).await;
+        let result = tokio::time::timeout(Duration::from_millis(100), input.next_pcm()).await.unwrap().unwrap();
+        assert_eq!(result, Some((second.local_addr().unwrap().port(), vec![42; 960])));
+    }
 
     #[test]
     fn abandoned_local_microphone_socket_reports_hangup_before_draining_pcm() {

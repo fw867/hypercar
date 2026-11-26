@@ -291,23 +291,28 @@ impl CryptoWork {
     }
 }
 
-fn is_authentication_command(kind: u32) -> bool {
-    matches!(kind, CMD_MD_AUTHEN_RESPONSE | CMD_MD_RSA_KEY_REQUEST | CMD_MD_AES_SEED | CMD_MD_ENCRYPT_READY)
+fn is_encryption_handshake(dialect: CarLifeDialect, kind: u32) -> bool {
+    match kind {
+        CMD_MD_AUTHEN_RESPONSE => dialect != CarLifeDialect::SystemPlain32,
+        CMD_MD_RSA_KEY_REQUEST | CMD_MD_AES_SEED | CMD_MD_ENCRYPT_READY => true,
+        _ => false,
+    }
 }
 
-fn observe_buffered_authentication(progress: &Progress, mut buffered: &[u8]) {
+fn observe_buffered_authentication(progress: &Progress, dialect: CarLifeDialect, mut buffered: &[u8]) {
     // The AES seed cannot be installed before authentication is observed, so
     // only the pre-key stream needs this lookahead. Leave validation and all
     // protocol side effects in their original wire order.
     if progress.authentication.load(Ordering::Relaxed) { return; }
     while let Some((kind, _, consumed)) = cmd_frame_parts(buffered) {
-        if is_authentication_command(kind) {
+        if is_encryption_handshake(dialect, kind) {
             progress.authentication.store(true, Ordering::Relaxed);
             return;
         }
         buffered = &buffered[consumed..];
     }
 }
+
 fn navigation_subscription()->Vec<u8> {
     let mut module=Vec::new();proto::varint(&mut module,1,0);
     let mut list=Vec::new();proto::varint(&mut list,1,1);proto::bytes(&mut list,2,&module);list
@@ -322,7 +327,7 @@ impl Session {
     pub(super) fn navigation_ready(&self) -> bool {
         match self.dialect {
             CarLifeDialect::CarWithEncrypted41 => self.proof_ok && self.admitted && self.ready,
-            CarLifeDialect::SystemPlain30 => self.started && self.matched && self.info.is_some() && self.init_sent,
+            CarLifeDialect::SystemPlain30 | CarLifeDialect::SystemPlain32 => self.started && self.matched && self.info.is_some() && self.init_sent,
             CarLifeDialect::SystemAuto => false,
         }
     }
@@ -330,7 +335,7 @@ impl Session {
     pub(super) fn protocol_evidence(&self) -> super::protocol_selection::Evidence {
         self.protocol_progress.evidence()
     }
-    pub(super) fn is_system_plain(&self) -> bool { self.dialect == CarLifeDialect::SystemPlain30 }
+    pub(super) fn is_system_plain(&self) -> bool { self.dialect.is_system_plain() }
     pub(super) fn media_ready(&self) -> bool {
         // Audio lanes retain their format and playback during video reconfiguration.
         self.started || (self.is_system_plain() && self.encoder_epoch!=0)
@@ -377,11 +382,15 @@ impl Session {
     pub fn decrypt(&self, bytes: &[u8]) -> Result<Vec<u8>, String> { crypt(bytes, self.seed.as_deref(), false) }
 
     fn observe_command(&self, kind: u32, body: &[u8]) {
-        if is_authentication_command(kind) {
+        if is_encryption_handshake(self.dialect, kind) {
             self.protocol_progress.authentication.store(true, Ordering::Relaxed);
         }
-        if kind == CMD_VERSION_MATCH_STATUS && matches!(first_int(body, 1), Some(0 | 2)) {
-            self.protocol_progress.version_rejected.store(true, Ordering::Relaxed);
+        if kind == CMD_VERSION_MATCH_STATUS {
+            match first_int(body, 1) {
+                Some(1) => self.protocol_progress.version_matched.store(true, Ordering::Relaxed),
+                Some(0 | 2) => self.protocol_progress.version_rejected.store(true, Ordering::Relaxed),
+                _ => {}
+            }
         }
     }
 
@@ -413,15 +422,15 @@ impl Session {
 
     fn receive_prepared(&mut self, kind: u32, body: &[u8], cfg: &CarLifeConfig, crypto: Option<CommandCrypto>) -> Result<Vec<Action>, String> {
         let mut out = Vec::new();
-        let plain = self.dialect == CarLifeDialect::SystemPlain30;
-        // Admission alone does not imply CONTENT_ENCRYPTION. A plaintext round
-        // still cannot accept a challenge proof or acquire an AES seed.
-        if plain && is_authentication_command(kind) {
-            return Err("encrypted handshake message in SystemPlain30".into());
+        let plain = self.is_system_plain();
+        let plain_32 = self.dialect == CarLifeDialect::SystemPlain32;
+        // 3.2 uses the box's version check without negotiating a content key.
+        if plain && is_encryption_handshake(self.dialect, kind) {
+            return Err(format!("encrypted handshake message in {:?}", self.dialect));
         }
         match kind {
             CMD_MD_AUTHEN_RESULT if plain => {
-                if !self.matched || self.info.is_none() || first_int(body,1)!=Some(1) {
+                if !self.matched || (!plain_32 && self.info.is_none()) || first_int(body,1)!=Some(1) {
                     return Err("plaintext admission rejected/out of order".into());
                 }
                 self.admitted=true;
@@ -429,18 +438,25 @@ impl Session {
             }
             CMD_VERSION_MATCH_STATUS if plain => {
                 if first_int(body, 1) != Some(1) { return Err("protocol version rejected".into()); }
-                if !self.matched { out.push((CMD_HU_STATISTIC_INFO, proto_statistic_payload())); }
+                if !self.matched {
+                    out.push((CMD_HU_STATISTIC_INFO, proto_statistic_payload()));
+                    if plain_32 {
+                        let mut request = Vec::new();
+                        proto::string(&mut request, 1, "CarLife_1.0.0");
+                        out.push((CMD_HU_AUTHEN_REQUEST, request));
+                    }
+                }
                 self.matched = true;
             }
             CMD_MD_INFO if plain => {
                 if self.info.is_none() {
-                    self.info = Some((String::new(), String::new(), String::new()));
+                    self.info = Some(Default::default());
                     let mut identity=cfg.clone();
                     if let Some((w,h))=self.declared_display { identity.width=w;identity.height=h; }
                     out.push((CMD_HU_INFO, proto_hu_info_payload(&identity)));
                 }
             }
-            CMD_MD_FEATURE_CONFIG_REQUEST if plain => {}
+            CMD_MD_FEATURE_CONFIG_REQUEST if plain => { self.features_requested |= plain_32; }
             0x10026 if plain => {
                 if let Some(control)=system_module_control(body) { out.push((0x18028,control)); }
             }
@@ -475,6 +491,9 @@ impl Session {
                 out.push((CMD_HU_INFO, proto_hu_info_payload(cfg)));
                 out.push((CMD_HU_AUTHEN_REQUEST, request));
             }
+            // The box treats this legacy version response as informational.
+            // The local CarLife service separately grants admission to the stream.
+            CMD_MD_AUTHEN_RESPONSE if plain_32 => {}
             CMD_MD_AUTHEN_RESPONSE => {
                 let (brand, model, sdk) = self.info.as_ref().ok_or("auth before MD_INFO")?;
                 if self.proof_ok { return Err("duplicate challenge response".into()); }
@@ -553,15 +572,24 @@ impl Session {
             CMD_MD_EXIT => return Err("peer exited CarWith".into()),
             _ => {}
         }
-        if !self.features_sent && ((plain && self.matched && self.info.is_some()) || (!plain && self.proof_ok && self.features_requested)) {
+        let feature_ready = if plain {
+            self.matched && self.info.is_some() && (!plain_32 || self.features_requested)
+        } else {
+            self.proof_ok && self.features_requested
+        };
+        if !self.features_sent && feature_ready {
             self.features_sent = true;
-            let mut features = vec![("CONTENT_ENCRYPTION", u64::from(!plain)), ("VOICE_MIC", u64::from(cfg.microphone.is_none()))];
-            if plain {
+            let mut features = if plain_32 {
+                vec![("FOCUS_UI", 0), ("VOICE_MIC", 1), ("AUDIO_TRANSMISSION_MODE", 0)]
+            } else {
+                vec![("CONTENT_ENCRYPTION", u64::from(!plain)), ("VOICE_MIC", u64::from(cfg.microphone.is_none()))]
+            };
+            if plain && !plain_32 {
                 features.push(("CONNECT_TYPE", 5));
                 features.push(("I_FRAME_INTERVAL", 20));
                 self.feature_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(2));
             }
-            if plain || self.declared_display.is_some() {
+            if !plain_32 && (plain || self.declared_display.is_some()) {
                 features.push(("DISABLE_RESOLUTION_OPTION", 1));
             }
             let mut payload = Vec::new();
@@ -572,15 +600,21 @@ impl Session {
                 proto::varint(&mut entry, 2, value);
                 proto::bytes(&mut payload, 2, &entry);
             }
-            if plain {
+            if plain && !plain_32 {
                 proto::varint(&mut payload,3,0);
                 proto::string(&mut payload,4,&cfg.bt_name);
                 proto::string(&mut payload,5,&cfg.bt_address);
             }
             out.push((CMD_HU_FEATURE_CONFIG_RESPONSE, payload));
         }
-        let plain_init = plain && self.features_sent && (self.feature_ack || self.feature_deadline.is_some_and(|at| tokio::time::Instant::now() >= at));
-        if !self.init_sent && (plain_init || (!plain && self.proof_ok && self.admitted && self.ready)) {
+        let init_ready = if plain_32 {
+            self.features_sent && self.admitted
+        } else if plain {
+            self.features_sent && (self.feature_ack || self.feature_deadline.is_some_and(|at| tokio::time::Instant::now() >= at))
+        } else {
+            self.proof_ok && self.admitted && self.ready
+        };
+        if !self.init_sent && init_ready {
             self.init_sent = true;
             self.init_fps = Some(cfg.fps);
             let (width,height) = self.declared_display.unwrap_or((cfg.width,cfg.height));
@@ -714,7 +748,11 @@ pub(super) async fn handshake_deadline(progress: &Progress) {
 pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLifeEvent>,
     size: Arc<Mutex<(u32,u32)>>, requested: DisplayRequest, cfg: CarLifeConfig, state: Shared, reset_request: Arc<Notify>, can_reopen_display: bool) -> Result<(),String> {
     let (mut rd, mut wr) = stream.into_split();
-    let version = if cfg.dialect == CarLifeDialect::SystemPlain30 { vec![8, 3, 16, 0] } else { proto_version_payload() };
+    let version = match cfg.dialect {
+        CarLifeDialect::SystemPlain30 => vec![8, 3, 16, 0],
+        CarLifeDialect::SystemPlain32 => vec![8, 3, 16, 2],
+        _ => proto_version_payload(),
+    };
     if !send_cmd(&mut wr, CMD_HU_PROTOCOL_VERSION, &version).await { return Err("version write failed".into()); }
     #[cfg(test)]
     log::info!(target: "carwith_probe", "CMD TX written id=0x{CMD_HU_PROTOCOL_VERSION:x}");
@@ -730,7 +768,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
     let protocol_progress = state.lock().protocol_progress.clone();
     let mut next_gps = tokio::time::Instant::now();
     let mut gps_sent = 0_u64;
-    let system_plain = cfg.dialect == CarLifeDialect::SystemPlain30;
+    let system_plain = cfg.dialect.is_system_plain();
     let (mut rate_failures, source_sync) = {
         let session = state.lock();
         (session.video_rate_failure.subscribe(), session.video_sync_received.as_ref().map(watch::Sender::subscribe))
@@ -782,7 +820,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
         let feature_deadline = state.lock().feature_timeout();
         let voice_deadline = state.lock().voice_lease;
         let read = tokio::select! {
-            _ = reconfigure_request.notified(), if cfg.dialect==CarLifeDialect::SystemPlain30 => {
+            _ = reconfigure_request.notified(), if system_plain => {
                 let display=*requested.borrow();
                 let mut epoch_cfg=cfg.clone();epoch_cfg.fps=display.effective_fps(cfg.fps);
                 let actions=state.lock().reconfigure(display,&epoch_cfg)?;
@@ -791,7 +829,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
                 }
                 continue;
             }
-            _ = voice_request.notified(), if cfg.dialect==CarLifeDialect::SystemPlain30 => {
+            _ = voice_request.notified(), if system_plain => {
                 let requested = state.lock().take_voice();
                 if let Some(key) = requested {
                     let active=state.lock().voice_lease.is_some();
@@ -803,7 +841,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
                 }
                 continue;
             }
-            _ = async {tokio::time::sleep_until(voice_deadline.unwrap()).await}, if voice_deadline.is_some() && cfg.dialect==CarLifeDialect::SystemPlain30 => {
+            _ = async {tokio::time::sleep_until(voice_deadline.unwrap()).await}, if voice_deadline.is_some() && system_plain => {
                 write_system_voice(&mut wr,&state,0x22).await?;
                 continue;
             }
@@ -868,7 +906,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
         let n=read.map_err(|e|e.to_string())?;
         if n==0 { return Err("CarWith command EOF".into()); }
         buf.extend_from_slice(&chunk[..n]);
-        observe_buffered_authentication(&protocol_progress, &buf);
+        observe_buffered_authentication(&protocol_progress, cfg.dialect, &buf);
         while let Some((kind, payload, consumed)) = read_cmd_frame(&buf) {
             // Production RX diagnostics below run after processing, which can include key generation.
             #[cfg(test)]
@@ -934,7 +972,12 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
                     state.lock().video_start_written.notify_one();
                     emit_log("CARWITH-NAV: authenticated CMD/DATA monitoring 0x10030; dashboard card alone does not confirm HUD output");
                     let _=events.send(CarLifeEvent::Handshake);
-                    emit_state("carlife_active", if cfg.dialect == CarLifeDialect::SystemPlain30 { "System CarLife 3.0 plaintext video START sent" } else { "CarWith proof/admission/encryption complete; video START sent" });
+                    let state = match cfg.dialect {
+                        CarLifeDialect::SystemPlain30 => "System CarLife 3.0 plaintext video START sent",
+                        CarLifeDialect::SystemPlain32 => "System CarLife 3.2 plaintext video START sent",
+                        _ => "CarWith proof/admission/encryption complete; video START sent",
+                    };
+                    emit_state("carlife_active", state);
                 }
             }
         }

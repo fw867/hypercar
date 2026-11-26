@@ -1,6 +1,6 @@
 //! Local CarWith/CarLife transport. Xiaomi requires seven owned channels and an
 //! authenticated CONTENT_ENCRYPTION handshake. System CarLife probes this flow
-//! and public 3.0 in isolated rounds; package versions never determine encryption.
+//! and public 3.0 or 3.2 in isolated rounds; package versions never determine encryption.
 //! CMD/CTRL/DATA use 8-byte headers; VIDEO/MEDIA/TTS/VR use 12-byte headers.
 //! CarWith DATA is port 9440. Do not mix generic CarLife assumptions with this path.
 
@@ -147,8 +147,15 @@ pub enum CarLifeDialect {
     #[default]
     CarWithEncrypted41,
     SystemPlain30,
+    SystemPlain32,
     /// Automatic selection is resolved to a concrete dialect before a round starts.
     SystemAuto,
+}
+
+impl CarLifeDialect {
+    pub(crate) fn is_system_plain(self) -> bool {
+        matches!(self, Self::SystemPlain30 | Self::SystemPlain32)
+    }
 }
 
 #[derive(Clone)]
@@ -323,7 +330,7 @@ impl CarLifeHub {
                 // Own all seven sockets together. A failed/closed CMD invalidates the whole round.
                 let mut sockets=Vec::new();
                 for (index, port) in ports.into_iter().enumerate() {
-                    if (automatic || config.dialect == CarLifeDialect::SystemPlain30) && index > 0 { break; }
+                    if (automatic || config.dialect.is_system_plain()) && index > 0 { break; }
                     let Some(result) = stop.dial(&md_host, port).await else { return; };
                     match result {
                         Ok(socket) => {
@@ -331,6 +338,9 @@ impl CarLifeHub {
                             sockets.push(socket);
                         }
                         Err(error) => {
+                            if sockets.is_empty() && error.kind() == std::io::ErrorKind::ConnectionRefused {
+                                selection.command_listener_unavailable();
+                            }
                             if first_round_pending && sockets.is_empty() &&
                                 error.kind() == std::io::ErrorKind::ConnectionRefused {
                                 startup_refusals += 1;
@@ -350,14 +360,18 @@ impl CarLifeHub {
                         }
                     }
                 }
-                if sockets.len()!=if automatic || config.dialect == CarLifeDialect::SystemPlain30 { 1 } else { ports.len() } {
+                if sockets.len()!=if automatic || config.dialect.is_system_plain() { 1 } else { ports.len() } {
                     drop(sockets);
-                    tokio::select! { biased; _=stop.cancelled()=>return, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
+                    tokio::select! { biased; _=stop.cancelled()=>return, _=tokio::time::sleep(selection.reconnect_delay())=>{} }
                     continue;
                 }
                 if stop.is_retired() { return; }
                 first_round_pending = false;
-                emit_log(if config.dialect == CarLifeDialect::SystemPlain30 { "CARLIFE-HS: CMD connected; start public 3.0 handshake and owned channel supervisors" } else if automatic {"CARLIFE-HS: CMD connected; probe 4.1 handshake with owned channel supervisors"} else { "CARWITH-HS: all seven channels connected; start fresh 4.1 handshake" });
+                if config.dialect.is_system_plain() {
+                    emit_log(&format!("CARLIFE-HS: CMD connected; start {:?} handshake and owned channel supervisors", config.dialect));
+                } else {
+                    emit_log(if automatic { "CARLIFE-HS: CMD connected; probe 4.1 handshake with owned channel supervisors" } else { "CARWITH-HS: all seven channels connected; start fresh 4.1 handshake" });
+                }
                 emit_log(&format!("CARLIFE-PROTOCOL: mode={:?} automatic={automatic}; package version is not protocol version",config.dialect));
                 queue.lock().clear();
                 let _ = events_task.send(CarLifeEvent::SourceReset { cache_cleared: None });
@@ -380,7 +394,7 @@ impl CarLifeHub {
                 let mut sockets=sockets.into_iter();
                 let cmd=sockets.next().unwrap();
                 let mut children=tokio::task::JoinSet::new();
-                if automatic || config.dialect == CarLifeDialect::SystemPlain30 {
+                if automatic || config.dialect.is_system_plain() {
                     // Attempt the secondary lanes without making their availability a
                     // precondition for CMD. Plaintext lanes also reconnect independently.
                     let initial_barrier=Arc::new(tokio::sync::Barrier::new(7));
@@ -450,7 +464,7 @@ impl CarLifeHub {
                     continue;
                 }
                 emit_log(&format!("CARWITH-HS: round closed: {}",outcome.unwrap_err()));
-                tokio::select! { biased; _=stop.cancelled()=>return, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
+                tokio::select! { biased; _=stop.cancelled()=>return, _=tokio::time::sleep(selection.reconnect_delay())=>{} }
             }
         }));
         Ok((Self {stop:hub_stop,input_queue,system_voice,encoder_size,keyframe_request},event_rx))
@@ -815,7 +829,7 @@ fn proto_statistic_payload() -> Vec<u8> {
 fn proto_hu_info_payload(cfg: &CarLifeConfig) -> Vec<u8> {
     let mut out = Vec::with_capacity(96);
     proto::string(&mut out, 1, "Android"); // os
-    if cfg.dialect==CarLifeDialect::SystemPlain30 {
+    if cfg.dialect.is_system_plain() {
         // Legacy OEM parsers also inspect the Android device identity fields.
         // Do not claim an unrelated reference handset board or receiver identity.
         proto::string(&mut out,2,"unknown");

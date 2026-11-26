@@ -2,7 +2,7 @@
 use super::{Controller,Input,MainCommand,Session};
 use crate::call_audio::OfferResult;
 use crate::{airplay::{AirplayParams,AudioCodec,SocketProvider},aux_setup::Kind,bplist::{self,Value},modes::Modes,rtsp::{RtspChannel,RtspMessage},speech_resource::SpeechResource};
-use std::{sync::{Arc,atomic::AtomicBool},time::Duration};
+use std::{sync::{Arc,atomic::{AtomicBool, Ordering}},time::Duration};
 use parking_lot::Mutex;
 use tokio::{net::{TcpListener,TcpStream,UdpSocket},sync::mpsc,io::{AsyncReadExt,AsyncWriteExt}};
 
@@ -190,7 +190,7 @@ fn receiver_changes_call_resources(fixture: &Fixture, resources: Vec<Value>) {
     let mut modes = session.resource.modes.lock();
     let reply = modes.response(&command, &session.receiver_audio_generation).unwrap();
     assert_eq!(bplist::parse(&reply.body).unwrap().get("status").and_then(Value::as_int), Some(0));
-    session.control.buffered_ownership.publish_with_gate(&session.resource.owned, modes.audio_owned());
+    session.control.buffered_ownership.publish_with_gate(&session.resource.owned, modes.audio_can_send());
 }
 
 fn receiver_takes_call_resources(fixture: &Fixture, borrow_constraint: i64) {
@@ -225,8 +225,10 @@ async fn call_borrows_receiver_audio_without_screen_and_later_offers_can_borrow_
     assert!(!fixture.controller.session.resource.modes.lock().audio_owned());
     fixture.ack(&borrow, None).await;
     let (retire, _) = fixture.request("teardown:100").await;
+    assert!(!fixture.controller.session.resource.owned.load(Ordering::Acquire));
     fixture.ack(&retire, None).await;
     let (setup, body) = fixture.request("setup:100:telephony").await;
+    assert!(fixture.controller.session.resource.owned.load(Ordering::Acquire));
     fixture.setup_reply(&setup, &body).await;
     assert_eq!(tokio::time::timeout(Duration::from_secs(1), phone.read_u8()).await.unwrap().unwrap(), 1);
     phone.write_u8(1).await.unwrap();
@@ -295,6 +297,29 @@ async fn receiver_take_supersedes_a_pending_call_borrow_even_when_its_ack_arrive
 }
 
 #[tokio::test]
+async fn withdrawn_first_borrow_never_opens_the_media_gate() {
+    let _guard = CALL_AUDIO_TESTS.lock().await;
+    let mut fixture = telephony_fixture().await;
+    let token = call_audio_token().await;
+    receiver_takes_call_resources(&fixture, 100);
+    let (offered, phone) = tokio::net::UnixStream::pair().unwrap();
+    assert!(crate::call_audio::offer(token, 1, 24_000, offered.into_std().unwrap()));
+    let (borrow, body) = fixture.request("modesChanged").await;
+    assert_call_modes(&body, 1, 1);
+    drop(phone);
+    fixture.ack(&borrow, None).await;
+    let (give_back, body) = fixture.request("modesChanged").await;
+    assert_call_modes(&body, 2, 0);
+    assert!(fixture.commands.try_recv().is_err(), "media sender was never paused");
+    let resource = &fixture.controller.session.resource;
+    assert!(!resource.owned.load(Ordering::Acquire));
+    assert!(!resource.control.buffered_ownership.subscribe().borrow().owned);
+    fixture.ack(&give_back, None).await;
+    assert_eq!(call_audio_result(token, 1).await, OfferResult::Withdrawn);
+    fixture.stopped().await;
+}
+
+#[tokio::test]
 async fn call_offer_closed_while_waiting_for_main_audio_reports_withdrawal() {
     let _guard = CALL_AUDIO_TESTS.lock().await;
     let mut fixture = telephony_fixture().await;
@@ -317,7 +342,7 @@ async fn terminal_telephony_rejection_is_reported_after_media_restore() {
     assert!(crate::call_audio::offer(token, 1, 24_000, offered.into_std().unwrap()));
     let (pause, _) = fixture.request("teardown:100").await;
     fixture.ack(&pause, None).await;
-    for _ in 0..3 {
+    for _ in 0..4 {
         let (setup, _) = fixture.request("setup:100:telephony").await;
         fixture.reject(&setup, 451).await;
     }
@@ -402,6 +427,15 @@ async fn telephony_bridges_authenticated_pcm_both_ways_and_restores_original_med
     assert_eq!(row.get("audioFormat").and_then(Value::as_int), Some(1 << 6));
     assert!(row.get("controlPort").is_some());
     fixture.reject(&first, 451).await;
+    let (no_control, body) = fixture.request("setup:100:telephony").await;
+    let row = &body.get("streams").unwrap().as_array().unwrap()[0];
+    assert_eq!(row.get("audioFormat").and_then(Value::as_int), Some(1 << 6));
+    assert_eq!(row.get("dataPort").and_then(Value::as_int), offered_port);
+    assert!(row.get("controlPort").is_none());
+    assert_eq!(row.get("ct").and_then(Value::as_int), Some(1));
+    assert_eq!(row.get("sr").and_then(Value::as_int), Some(24_000));
+    assert_eq!(row.get("spf").and_then(Value::as_int), Some(480));
+    fixture.reject(&no_control, 451).await;
     let (compact, body) = fixture.request("setup:100:telephony").await;
     let row = &body.get("streams").unwrap().as_array().unwrap()[0];
     assert_eq!(row.get("audioFormat").and_then(Value::as_int), Some(1 << 6));
@@ -445,13 +479,14 @@ async fn telephony_bridges_authenticated_pcm_both_ways_and_restores_original_med
     assert_eq!(sync[1], 0xd4);
     assert_eq!(u32::from_be_bytes(sync[16..20].try_into().unwrap()), 320);
 
-    tokio::time::pause();
     for _ in 0..6 {
         phone.write_all(&123i16.to_le_bytes().repeat(960)).await.unwrap();
         assert!(tokio::time::timeout(Duration::from_millis(500), fixture.data.recv(&mut packet)).await.unwrap().unwrap() > 36);
+        // Pause only for the deliberate idle jump, not while waiting on a real UDP socket.
+        tokio::time::pause();
         tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
     }
-    tokio::time::resume();
 
     let input_key = crate::mic_probe::input_key(&[9;32], id as u64);
     let microphone_packet = |sequence: u8, nonce| {
@@ -473,14 +508,14 @@ async fn telephony_bridges_authenticated_pcm_both_ways_and_restores_original_med
     tokio::time::timeout(Duration::from_secs(1), phone.read_exact(&mut pcm)).await.unwrap().unwrap();
     assert_eq!(pcm, (-321i16).to_le_bytes().repeat(958));
 
-    tokio::time::pause();
     let mut speaker_packet = [0; 2048];
     for _ in 0..4 {
         phone.write_all(&123i16.to_le_bytes().repeat(960)).await.unwrap();
         assert!(tokio::time::timeout(Duration::from_millis(500), fixture.data.recv(&mut speaker_packet)).await.unwrap().unwrap() > 36);
+        tokio::time::pause();
         tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
     }
-    tokio::time::resume();
     let restarted_microphone = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     restarted_microphone.send_to(&packet, ("127.0.0.1", microphone_port)).await.unwrap();
     assert!(tokio::time::timeout(Duration::from_millis(30), phone.read_u8()).await.is_err());

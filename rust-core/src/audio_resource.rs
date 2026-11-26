@@ -67,7 +67,7 @@ impl AudioResource {
             if committed { crate::emit_receiver_audio_take(false); }
             // Event dispatch may have received another take while the RTSP request was in flight.
             // Never restore a grant from an older arbitration epoch.
-            self.control.buffered_ownership.publish_with_gate(&self.owned, current.audio_owned());
+            self.control.buffered_ownership.publish_with_gate(&self.owned, current.audio_can_send());
             crate::emit_log(&format!("AUDIO-RESOURCE: committed={committed} {}; receiver audibility unconfirmed", current.diagnostics()));
             if committed || current.audio_change_epoch() != audio_epoch || attempt == 1 { return; }
             drop(current);

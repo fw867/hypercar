@@ -119,6 +119,7 @@ pub struct Modes {
     speech_epoch: u64,
     audio_borrow_epoch: u64,
     phone_epoch: u64,
+    pending_call_borrow: Option<(u64, u64)>,
     navigation_epoch: u64,
 }
 
@@ -168,6 +169,7 @@ impl Modes {
         next.set_phone_entity(1);
         next.audio_borrow_epoch = self.audio_borrow_epoch.wrapping_add(1);
         let (phone, audio) = next.call_audio_epochs();
+        next.pending_call_borrow = Some((phone, audio));
         Some((CallAudioTransition { base: self.call_audio_epochs(), speech: Some(self.speech_epoch), next, transfer_audio: true }, CallAudioLease { phone, audio }))
     }
 
@@ -180,6 +182,7 @@ impl Modes {
             next.audio_borrow_epoch = self.audio_borrow_epoch.wrapping_add(1);
         }
         next.set_phone_entity(0);
+        next.pending_call_borrow = None;
         Some(CallAudioTransition { base: self.call_audio_epochs(), speech: None, next, transfer_audio })
     }
 
@@ -193,7 +196,16 @@ impl Modes {
             self.audio_epoch = self.audio_epoch.wrapping_add(1);
         }
         self.set_phone_entity(proposal.next.phone_entity());
+        self.pending_call_borrow = proposal.next.pending_call_borrow;
         self.audio_change_epoch = self.audio_change_epoch.wrapping_add(1);
+        true
+    }
+
+    pub(crate) fn enable_call_audio(&mut self, lease: &CallAudioLease) -> bool {
+        if !lease.valid(self) || self.pending_call_borrow != Some(self.call_audio_epochs()) {
+            return false;
+        }
+        self.pending_call_borrow = None;
         true
     }
 
@@ -266,8 +278,12 @@ impl Modes {
         value
     }
     pub fn audio_owned(&self) -> bool { self.resources[1].current == 1 }
+    pub(crate) fn audio_can_send(&self) -> bool {
+        // The remote borrow has been acknowledged, but the old sender still has the slot.
+        self.audio_owned() && self.pending_call_borrow != Some(self.call_audio_epochs())
+    }
     pub(crate) fn media_rebuild_epoch(&self) -> Option<u64> {
-        (self.audio_owned() && !(self.apps[0] == 1 && matches!(self.speech, 1 | 2))).then_some(self.audio_borrow_epoch)
+        (self.audio_can_send() && !(self.apps[0] == 1 && matches!(self.speech, 1 | 2))).then_some(self.audio_borrow_epoch)
     }
     pub fn audio_change_epoch(&self) -> u64 { self.audio_change_epoch }
     pub fn audio_claim(&self, user_initiated: bool) -> Option<(u64, Self)> {

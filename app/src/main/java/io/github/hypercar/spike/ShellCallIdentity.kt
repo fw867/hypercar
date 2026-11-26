@@ -1,7 +1,6 @@
 package io.github.hypercar.spike
 
 import android.os.SystemClock
-import java.io.File
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
@@ -29,9 +28,15 @@ internal data class PreciseCallRoles(val ringing: Int, val foreground: Int, val 
 }
 
 internal sealed interface TelecomCallSnapshot {
-    data class Observed(val activeCallId: String?, val endedCallIds: Set<String> = emptySet(),
+    val endedCallIds: Set<String>
+
+    data class Observed(val activeCallId: String?, override val endedCallIds: Set<String> = emptySet(),
                         val noCalls: Boolean = false) : TelecomCallSnapshot
-    data object Unavailable : TelecomCallSnapshot
+    data class Unavailable(val exitCode: Int? = null, val reason: Reason = Reason.PROCESS_ERROR,
+                           val callEvidence: Observed? = null,
+                           override val endedCallIds: Set<String> = callEvidence?.endedCallIds.orEmpty()) : TelecomCallSnapshot {
+        enum class Reason { TIMEOUT, SIGKILL, NONZERO_EXIT, PROCESS_ERROR, INCOMPLETE_OUTPUT, STALE_RESULT }
+    }
 }
 
 internal data class CallAudioBridgeIdentity(val lease: String, val retryKey: String)
@@ -42,13 +47,23 @@ internal class ShellCallIdentity(
     private val readCall: (timeoutMs: Long) -> TelecomCallSnapshot = ::readTelecom,
     private val onRevoked: (String) -> Unit = {},
     private val trace: (String) -> Unit = {},
+    private val sleepForStartRetry: (Long) -> Unit = SystemClock::sleep,
 ) {
-    private data class Sample(val verifiedAt: Long, val callId: String, val identity: String)
+    private enum class PreciseRefresh { IDLE, FIRST_ATTEMPT, RETRY_PENDING }
+    private data class Sample(val verifiedAt: Long, val confirmedAt: Long, val callId: String, val identity: String,
+                              val refresh: PreciseRefresh = PreciseRefresh.IDLE) {
+        fun remainingAt(now: Long): Long {
+            val maxAge = if (refresh == PreciseRefresh.IDLE) MAX_AGE_MS else PRECISE_REFRESH_MAX_AGE_MS
+            return maxAge - (now - verifiedAt)
+        }
+    }
+    private data class StartProof(val recheckAt: Long, val retried: Boolean)
     private data class FallbackCandidate(val callId: String, val observedAt: Long)
 
     private data class Revalidation(val notBefore: Long, var firstActiveCallId: String? = null)
     private enum class Gate { NOT_READY, NO_SUBSCRIPTIONS, CONTRADICTORY, MULTIPLE_ACTIVE, IDLE, PRECISE, UNKNOWN_ROLES }
     private enum class Query { PRECISE, FALLBACK, TERMINAL_CHECK, BLOCKED }
+    private data class ReadRequest(val boundary: Long, val query: Query, val timeoutMs: Long, val retrying: Boolean)
 
     private val stateLock = Any()
     private val track = mutableMapOf<Int, PreciseCallRoles?>()
@@ -69,6 +84,7 @@ internal class ShellCallIdentity(
     private var lastGate: String? = null
     private var lastReadSource: Query? = null
     private var lastReadResult: String? = null
+    private var lastReadLoggedAt = 0L
 
     fun beginTracking(): Long {
         val (generation, retired) = synchronized(stateLock) {
@@ -134,9 +150,9 @@ internal class ShellCallIdentity(
         return true
     }
 
-    private fun recordEndedCallsLocked(result: TelecomCallSnapshot.Observed) {
-        endedCallIds.addAll(result.endedCallIds)
-        if (result.noCalls) {
+    private fun recordEndedCallsLocked(ended: Set<String>, noCalls: Boolean) {
+        endedCallIds.addAll(ended)
+        if (noCalls) {
             for (id in listOfNotNull(lastVerifiedCallId, lastUnconfirmedCallId)) {
                 endedCallIds.remove(id)
                 endedCallIds.add(id)
@@ -190,23 +206,37 @@ internal class ShellCallIdentity(
         }
     }
 
-    private fun traceTelecomResultLocked(query: Query, result: TelecomCallSnapshot) {
-        val summary = when (result) {
+    private fun traceTelecomResultLocked(query: Query, result: TelecomCallSnapshot, startedAt: Long,
+                                         finishedAt: Long, timeoutMs: Long, retrying: Boolean, discarded: Boolean) {
+        val summary = if (discarded) "discarded" else when (result) {
             is TelecomCallSnapshot.Observed ->
                 "active_pstn=${result.activeCallId ?: "none"} no_calls=${result.noCalls} terminal_count=${result.endedCallIds.size}"
-            TelecomCallSnapshot.Unavailable -> "unavailable"
+            is TelecomCallSnapshot.Unavailable -> "unavailable"
         }
-        val line = "telecom query=${query.name.lowercase()} result=$summary"
-        if (line != lastReadResult) {
-            lastReadResult = line
-            trace(line)
+        val failure = result as? TelecomCallSnapshot.Unavailable
+        val exitCode = if (failure == null) 0 else failure.exitCode
+        val duration = finishedAt - startedAt
+        val timedOut = when {
+            failure?.reason == TelecomCallSnapshot.Unavailable.Reason.TIMEOUT -> "true"
+            exitCode == 137 -> "unknown"
+            else -> "false"
+        }
+        val line = "telecom query=${query.name.lowercase()} result=$summary " +
+            "exit_code=${exitCode ?: "none"} timed_out=$timedOut failure=${failure?.reason?.name?.lowercase() ?: "none"} " +
+            "refresh_retry=$retrying"
+        if (discarded || line != lastReadResult || finishedAt - lastReadLoggedAt >= TELECOM_TRACE_INTERVAL_MS) {
+            if (!discarded) {
+                lastReadResult = line
+                lastReadLoggedAt = finishedAt
+            }
+            trace("$line duration_ms=$duration timeout_ms=$timeoutMs")
         }
     }
 
     @Synchronized
     fun current(allowFallback: Boolean = false): String? {
         val startedAt = elapsed()
-        val (expectedBoundary, query, timeoutMs) = synchronized(stateLock) {
+        val (expectedBoundary, query, timeoutMs, retrying) = synchronized(stateLock) {
             val gate = preciseGateLocked()
             val fallback = allowFallback && gate == Gate.UNKNOWN_ROLES && startedAt >= fallbackNotBefore
             val query = when {
@@ -221,26 +251,36 @@ internal class ShellCallIdentity(
             if (query == Query.BLOCKED || pendingDisconnect) return null
             val fresh = freshSampleLocked(startedAt)
             if (startedAt < nextReadAt) return fresh?.identity
-            val remainingAge = fresh?.let { MAX_AGE_MS - (startedAt - it.verifiedAt) } ?: MAX_AGE_MS
+            val remainingAge = fresh?.remainingAt(startedAt) ?: MAX_AGE_MS
             val timeout = minOf(TELECOM_TIMEOUT_MS, remainingAge)
+            if (query == Query.PRECISE && fresh?.refresh == PreciseRefresh.IDLE) {
+                // A refresh begun with a verified identity can finish and retry once
+                // while the same precise call boundary still holds.
+                sample = fresh.copy(refresh = PreciseRefresh.FIRST_ATTEMPT)
+            }
             if (lastReadSource != query) {
                 lastReadSource = query
                 trace("telecom query=${query.name.lowercase()} started timeout_ms=$timeout")
             }
-            Triple(boundary, query, timeout)
+            ReadRequest(boundary, query, timeout, fresh?.refresh == PreciseRefresh.RETRY_PENDING)
         }
         // The event callback must be able to retire an identity while dumpsys is blocked.
         val observed = readCall(timeoutMs)
         val finishedAt = elapsed()
         val (identity, retired) = synchronized(stateLock) {
-            if (expectedBoundary != boundary) return null
+            val discarded = expectedBoundary != boundary
+            val result = if (observed is TelecomCallSnapshot.Observed && finishedAt - startedAt >= MAX_AGE_MS) {
+                TelecomCallSnapshot.Unavailable(0, TelecomCallSnapshot.Unavailable.Reason.STALE_RESULT)
+            } else {
+                observed
+            }
+            traceTelecomResultLocked(query, result, startedAt, finishedAt, timeoutMs, retrying, discarded)
+            if (discarded) return null
             nextReadAt = startedAt + REFRESH_MS
             val fresh = freshSampleLocked(finishedAt)
-            val result = if (finishedAt - startedAt < MAX_AGE_MS) observed else TelecomCallSnapshot.Unavailable
-            traceTelecomResultLocked(query, result)
             when (result) {
                 is TelecomCallSnapshot.Observed -> {
-                    recordEndedCallsLocked(result)
+                    recordEndedCallsLocked(result.endedCallIds, result.noCalls)
                     val previous = sample
                     val callId = result.activeCallId
                     val ended = callId != null && (callId in result.endedCallIds || callId in endedCallIds)
@@ -264,7 +304,7 @@ internal class ShellCallIdentity(
                             null to previous?.identity
                         } else {
                             val key = sameCall?.identity ?: UUID.randomUUID().toString()
-                            sample = Sample(startedAt, callId, key)
+                            sample = Sample(startedAt, finishedAt, callId, key)
                             if (lastVerifiedCallId != callId) retryKey = UUID.randomUUID().toString()
                             lastVerifiedCallId = callId
                             lastUnconfirmedCallId = null
@@ -273,16 +313,23 @@ internal class ShellCallIdentity(
                         }
                     }
                 }
-                TelecomCallSnapshot.Unavailable -> {
+                is TelecomCallSnapshot.Unavailable -> {
                     updateStatusLocked("telecom_query_unavailable")
                     revalidation?.firstActiveCallId = null
                     fallbackCandidate = null
-                    if (fresh == null || query == Query.FALLBACK) {
-                        null to sample?.identity.also { sample = null }
-                    } else {
-                        // A transport failure cannot extend the age of the last verified call.
+                    val oldCallId = sample?.callId
+                    val evidence = result.callEvidence
+                    val oldLegExcluded = oldCallId != null &&
+                        (oldCallId in result.endedCallIds || (evidence != null && evidence.activeCallId != oldCallId))
+                    recordEndedCallsLocked(result.endedCallIds, evidence?.noCalls == true)
+                    if (query == Query.PRECISE && fresh?.refresh == PreciseRefresh.FIRST_ATTEMPT &&
+                        !oldLegExcluded && result.reason != TelecomCallSnapshot.Unavailable.Reason.STALE_RESULT
+                    ) {
+                        sample = fresh.copy(refresh = PreciseRefresh.RETRY_PENDING)
                         nextReadAt = startedAt + FAILED_REFRESH_RETRY_MS
                         fresh.identity to null
+                    } else {
+                        null to sample?.identity.also { sample = null }
                     }
                 }
             }
@@ -320,10 +367,19 @@ internal class ShellCallIdentity(
         return true
     }
 
-    private fun freshSampleLocked(now: Long) = sample?.takeIf { now - it.verifiedAt < MAX_AGE_MS }
+    private fun freshSampleLocked(now: Long) = sample?.takeIf { it.remainingAt(now) > 0 }
 
     fun matchesCached(identity: String): Boolean = synchronized(stateLock) {
         freshSampleLocked(elapsed())?.identity == identity
+    }
+
+    // Only short endpoint operations belong here. Telecom reads and route checks run outside stateLock.
+    fun <T : Any> withCurrentLease(identity: String, startBefore: Long?, action: () -> T): T? = synchronized(stateLock) {
+        val now = elapsed()
+        val lease = freshSampleLocked(now)
+        if (lease?.identity == identity &&
+            (startBefore == null || (now < startBefore && lease.refresh == PreciseRefresh.IDLE))
+        ) action() else null
     }
 
     fun millisUntilRefresh(): Long = synchronized(stateLock) {
@@ -339,11 +395,45 @@ internal class ShellCallIdentity(
 
     fun confirmsOpen(identity: String): Boolean {
         if (current(allowFallback = true) != identity) return false
-        return isConfirmed(identity)
+        return matchesCached(identity)
     }
 
-    fun isConfirmed(identity: String): Boolean = synchronized(stateLock) {
-        status == TELECOM_CONFIRMED && freshSampleLocked(elapsed())?.identity == identity
+    // Share the watchdog's query monitor through startup, including its check for a due retry.
+    @Synchronized
+    fun confirmsStart(identity: String, authorize: (Long) -> Boolean = { true },
+                      preflight: () -> Boolean = { true }): Boolean {
+        val first = confirmStartSample(identity, allowRetry = true) ?: return false
+        if (!preflight() || !matchesCached(identity)) return false
+        val proof = if (elapsed() >= first.recheckAt) {
+            val renewed = confirmStartSample(identity, allowRetry = !first.retried) ?: return false
+            if (!preflight()) return false
+            renewed
+        } else first
+        return elapsed() < proof.recheckAt && matchesCached(identity) && authorize(proof.recheckAt)
+    }
+
+    private fun confirmStartSample(identity: String, allowRetry: Boolean): StartProof? {
+        val previous = synchronized(stateLock) { sample }
+        if (!confirmsOpen(identity)) return null
+        val retryDelay = synchronized(stateLock) {
+            val now = elapsed()
+            val lease = freshSampleLocked(now)?.takeIf { it.identity == identity } ?: return null
+            if (lease.refresh == PreciseRefresh.RETRY_PENDING) (nextReadAt - now).coerceAtLeast(0) else null
+        }
+        if (retryDelay != null) {
+            if (!allowRetry) return null
+            // Keep the existing endpoint alive during the first miss, but wait for proof before starting it.
+            if (retryDelay > 0) sleepForStartRetry(retryDelay)
+            if (!matchesCached(identity) || !confirmsOpen(identity)) return null
+        }
+        return synchronized(stateLock) {
+            val lease = freshSampleLocked(elapsed())
+                ?.takeIf { it.identity == identity && it.refresh == PreciseRefresh.IDLE } ?: return null
+            // A just-completed slow query can already be due for the watchdog. Give
+            // its result a short window to finish route preflight without querying again.
+            val recheckAt = if (lease !== previous) maxOf(nextReadAt, lease.confirmedAt + START_PREFLIGHT_MS) else nextReadAt
+            StartProof(recheckAt, retryDelay != null)
+        }
     }
 
     fun diagnosticStatus(): String = synchronized(stateLock) {
@@ -353,8 +443,11 @@ internal class ShellCallIdentity(
     companion object {
         private const val REFRESH_MS = 200L
         private const val FAILED_REFRESH_RETRY_MS = 80L
+        private const val START_PREFLIGHT_MS = 50L
         private const val MAX_AGE_MS = 500L
         private const val TELECOM_TIMEOUT_MS = 400L
+        private const val PRECISE_REFRESH_MAX_AGE_MS = MAX_AGE_MS + TELECOM_TIMEOUT_MS + FAILED_REFRESH_RETRY_MS
+        private const val TELECOM_TRACE_INTERVAL_MS = 1_000L
         private const val TERMINAL_HISTORY_SIZE = 16
         private const val DISCONNECT_SETTLE_MS = 250L
         private const val FALLBACK_SETTLE_MS = 500L
@@ -366,37 +459,69 @@ internal class ShellCallIdentity(
 
         private fun readTelecom(timeoutMs: Long): TelecomCallSnapshot = runCatching {
             val timeout = "0.${timeoutMs.toString().padStart(3, '0')}"
-            val process = ProcessBuilder("/system/bin/timeout", "-k", "0.05", timeout,
+            val process = ProcessBuilder("/system/bin/timeout", "-v", "-k", "0.05", timeout,
                 "/system/bin/dumpsys", "-t", "1", "telecom")
-                .redirectError(File("/dev/null"))
+                .redirectErrorStream(true)
                 .start()
             try {
                 val snapshot = process.inputStream.bufferedReader().use { reader ->
                     parseSnapshot(reader.lineSequence())
                 }
-                if (!process.waitFor(50, TimeUnit.MILLISECONDS) || process.exitValue() != 0) {
-                    TelecomCallSnapshot.Unavailable
-                } else {
-                    snapshot
-                }
+                val exitCode = if (process.waitFor(50, TimeUnit.MILLISECONDS)) process.exitValue() else null
+                withProcessExit(snapshot, exitCode)
             } finally {
                 process.destroyForcibly()
             }
-        }.getOrDefault(TelecomCallSnapshot.Unavailable)
+        }.getOrDefault(TelecomCallSnapshot.Unavailable())
+
+        fun withProcessExit(snapshot: TelecomCallSnapshot, exitCode: Int?): TelecomCallSnapshot {
+            val reason = when {
+                exitCode == null || exitCode == 124 ||
+                    (snapshot as? TelecomCallSnapshot.Unavailable)?.reason ==
+                    TelecomCallSnapshot.Unavailable.Reason.TIMEOUT -> TelecomCallSnapshot.Unavailable.Reason.TIMEOUT
+                exitCode == 0 -> return snapshot
+                exitCode == 137 -> TelecomCallSnapshot.Unavailable.Reason.SIGKILL
+                else -> TelecomCallSnapshot.Unavailable.Reason.NONZERO_EXIT
+            }
+            val evidence = when (snapshot) {
+                is TelecomCallSnapshot.Observed -> snapshot
+                is TelecomCallSnapshot.Unavailable -> snapshot.callEvidence
+            }
+            return TelecomCallSnapshot.Unavailable(exitCode, reason, evidence, snapshot.endedCallIds)
+        }
 
         private val historyCall = Regex("Call\\s*(TC@[0-9]{1,19})(?=[:\\s]|$).*")
         private val terminalEvent = Regex("[0-9:.]+ - SET_DISCONNECT(?:ED|ING)(?=[:\\s]|$).*")
         private val samsungNonVoip = Regex(
             """falsecaps=\[Capabilities:[^\[\]]*\], props=\[Properties:[^\[\]]*\], conf\(false\), had_child\(false\)""",
         )
+        private val finishedCallRecord = Regex(
+            """\], voip=(?:true|false)(?:caps=.*\), had_child\((?:true|false)\))?$""",
+        )
+        private val timeoutSignal = Regex(
+            """timeout: sending signal (?:TERM|KILL) to command /system/bin/dumpsys(?:[: ].*)?""",
+        )
 
         /** Extract only opaque IDs and terminal events. Never retain call details from the history. */
-        fun parseSnapshot(lines: Sequence<String>): TelecomCallSnapshot.Observed {
+        fun parseSnapshot(lines: Sequence<String>): TelecomCallSnapshot {
             val head = ArrayList<String>(96)
             val ended = linkedSetOf<String>()
             var historyIndent: Int? = null
             var eventCall: String? = null
+            var dumpFailure: TelecomCallSnapshot.Unavailable.Reason? = null
             for (line in lines) {
+                if (line.startsWith("*** SERVICE 'telecom' DUMP TIMEOUT (") || timeoutSignal.containsMatchIn(line)) {
+                    dumpFailure = TelecomCallSnapshot.Unavailable.Reason.TIMEOUT
+                    continue
+                }
+                if (line.startsWith("Error in poll while dumping service telecom ") ||
+                    line.startsWith("Failed to read while dumping service telecom:") ||
+                    line.startsWith("Failed to write while dumping service telecom:") ||
+                    line.startsWith("Error with service 'telecom' while dumping:")
+                ) {
+                    dumpFailure = dumpFailure ?: TelecomCallSnapshot.Unavailable.Reason.INCOMPLETE_OUTPUT
+                    continue
+                }
                 if (head.size < 96) head.add(line)
                 if (line.trim() == "Historical Events:") {
                     historyIndent = line.indexOfFirst { !it.isWhitespace() }
@@ -417,49 +542,50 @@ internal class ShellCallIdentity(
                     if (ended.size > TERMINAL_HISTORY_SIZE) ended.remove(ended.first())
                 }
             }
+            fun unavailable(evidence: TelecomCallSnapshot.Observed? = null) = TelecomCallSnapshot.Unavailable(
+                0, dumpFailure ?: TelecomCallSnapshot.Unavailable.Reason.INCOMPLETE_OUTPUT, evidence, ended,
+            )
+            fun observed(callId: String?, noCalls: Boolean = false): TelecomCallSnapshot {
+                val evidence = TelecomCallSnapshot.Observed(callId, ended, noCalls)
+                return if (dumpFailure == null) evidence else unavailable(evidence)
+            }
             val callsManager = head.indexOfFirst { it.trim() == "CallsManager:" }
-            val first = head.getOrNull(callsManager + 1)
-            val after = head.drop(callsManager + 2).firstOrNull { it.isNotBlank() }
-            val noCalls = callsManager >= 0 && first?.trim() == "mCalls:" &&
-                after?.trim() == "mCallAudioManager:" && first.indexOfFirst { !it.isWhitespace() } ==
-                after.indexOfFirst { !it.isWhitespace() }
-            return TelecomCallSnapshot.Observed(parse(head.asSequence()), ended, noCalls)
+            val sections = if (callsManager < 0) emptyList() else head.drop(callsManager + 1)
+                .takeWhile { it.isBlank() || it.first().isWhitespace() }
+            val calls = sections.indexOfFirst { it.trim() == "mCalls:" }
+            val callsIndent = sections.getOrNull(calls)?.indexOfFirst { !it.isWhitespace() }
+                ?: return unavailable()
+            val audio = sections.indexOfFirst {
+                it.trim() == "mCallAudioManager:" && it.indexOfFirst { char -> !char.isWhitespace() } == callsIndent
+            }
+            // dumpsys can exit zero even when the service fails to produce a dump.
+            if (audio <= calls) {
+                return unavailable()
+            }
+            val mainCalls = sections.subList(calls + 1, audio)
+                .takeWhile { it.isBlank() || it.indexOfFirst { char -> !char.isWhitespace() } > callsIndent }
+                .filter { it.isNotBlank() }
+            if (mainCalls.isEmpty()) return observed(null, noCalls = true)
+            if (mainCalls.any { !isCompleteCallRecord(it.trim()) }) {
+                return unavailable()
+            }
+            val mainCallId = mainCalls.singleOrNull()?.trim()?.let(::parseActiveCall)
+                ?: return observed(null)
+            val audioLines = sections.drop(audio + 1)
+                .takeWhile { it.isBlank() || it.indexOfFirst { char -> !char.isWhitespace() } > callsIndent }
+            val label = audioLines.indexOfFirst { it.trim() == "Foreground call:" }
+            val foreground = audioLines.getOrNull(label + 1)?.trim().orEmpty()
+            if (label < 0 || (foreground != "null" && !isCompleteCallRecord(foreground))) {
+                if (mainCallId in ended) return observed(null)
+                return unavailable(TelecomCallSnapshot.Observed(mainCallId, ended))
+            }
+            return observed(mainCallId.takeIf { it == parseActiveCall(foreground) })
         }
 
-        // The main list must identify a single leg, and the audio manager must own that same leg.
-        fun parse(lines: Sequence<String>): String? {
-            var callsManager = false
-            var callsIndent = 0
-            var onlyCall: String? = null
-            var callAudioManagerIndent = 0
-            val iterator = lines.take(96).iterator()
-            while (iterator.hasNext()) {
-                val line = iterator.next()
-                val field = line.trim()
-                val indent = line.indexOfFirst { !it.isWhitespace() }
-                if (field.isEmpty()) continue
-                if (callsIndent > 0 && indent > callsIndent) {
-                    if (onlyCall != null) return null
-                    onlyCall = parseActiveCall(field) ?: return null
-                    continue
-                }
-                callsIndent = 0
-                if (field == "CallsManager:") {
-                    callsManager = true
-                } else if (callsManager && indent == 0) {
-                    return null
-                } else if (callsManager && field == "mCalls:") {
-                    callsIndent = indent
-                } else if (callsManager && field == "mCallAudioManager:") {
-                    callAudioManagerIndent = indent
-                } else if (callAudioManagerIndent > 0 && indent <= callAudioManagerIndent) {
-                    return null
-                } else if (callAudioManagerIndent > 0 && field == "Foreground call:" && iterator.hasNext()) {
-                    return onlyCall?.takeIf { it == parseActiveCall(iterator.next().trim()) }
-                }
-            }
-            return null
-        }
+        private fun isCompleteCallRecord(record: String): Boolean = record.startsWith(CALL_PREFIX) &&
+            (finishedCallRecord.containsMatchIn(record) || (", prop=" in record && record.endsWith("]]")))
+
+        fun parse(lines: Sequence<String>): String? = (parseSnapshot(lines) as? TelecomCallSnapshot.Observed)?.activeCallId
 
         private fun parseActiveCall(record: String): String? {
             if (!record.startsWith(CALL_PREFIX) || ", childs(0), has_parent(false)," !in record) return null

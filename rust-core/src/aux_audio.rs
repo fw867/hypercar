@@ -271,6 +271,13 @@ impl Controller {
                 } else {
                     session.pause_main(&commands, &mut cleanup, false).await
                 };
+                let pause = pause.and_then(|()| {
+                    if borrow.as_ref().is_some_and(|lease| !session.resource.enable_call_audio(lease)) {
+                        outcome = OfferResult::SameRate;
+                        return Err("main audio borrow changed while retiring the media sender".into());
+                    }
+                    Ok(())
+                });
                 let result = match pause {
                     Ok(()) if !stop.requested.load(Ordering::Acquire) =>
                         crate::call_audio::run(&session, rate, local, prepared, grant, stop.wait(), &mut call_id, &call_allocated, &mut announced, &mut outcome).await,

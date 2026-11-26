@@ -472,7 +472,7 @@ pub async fn negotiate(
     p.pipeline.lock().touch_modes = Arc::downgrade(&modes);
     let screen_owned = Arc::new(std::sync::atomic::AtomicBool::new(modes.lock().screen_owned()));
     let audio_owned = Arc::new(std::sync::atomic::AtomicBool::new(modes.lock().audio_owned()));
-    channel.buffered_ownership.publish(modes.lock().audio_owned());
+    channel.buffered_ownership.publish(modes.lock().audio_can_send());
     let reply_buffered = channel.buffered_ownership.clone();
     let reply_audio = audio_owned.clone();
     let reply_audio_generation = receiver_audio_generation.clone();
@@ -518,7 +518,7 @@ pub async fn negotiate(
             .map(|generation| generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel).wrapping_add(1));
         let screen_owned = modes.screen_owned();
         reply_owner.store(screen_owned, std::sync::atomic::Ordering::Release);
-        reply_buffered.publish_with_gate(&reply_audio, modes.audio_owned());
+        reply_buffered.publish_with_gate(&reply_audio, modes.audio_can_send());
         if let Some(unborrow) = unborrow {
             emit_log(&format!("AUDIO-RESUME: RTSP#{rtsp_id} unborrow={unborrow} event=main_audio_returned monoNs={}", crate::timing::monotonic_nanos()));
             if let Some(control) = unborrow_control.upgrade() { control.audio_unborrow_wake.notify_one(); }
@@ -691,7 +691,7 @@ pub async fn negotiate(
     // modesChanged before stream SETUP. Receiver borrow/take requests still gate packets.
     {
         let modes = modes.lock();
-        channel.buffered_ownership.publish_with_gate(&audio_owned, modes.audio_owned());
+        channel.buffered_ownership.publish_with_gate(&audio_owned, modes.audio_can_send());
     }
     emit_log(&format!("AUDIO: enabled={} preference={} owner_controller={}", p.enable_audio, p.audio_codec, modes.lock().audio_owned()));
     let mut audio_retries = Vec::new();

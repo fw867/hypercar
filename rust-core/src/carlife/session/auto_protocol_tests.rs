@@ -19,7 +19,10 @@ async fn accept(listener:&TcpListener) -> TcpStream {
     tokio::time::timeout(Duration::from_secs(3),listener.accept()).await.unwrap().unwrap().0
 }
 async fn frame(socket:&mut TcpStream) -> (u32,Vec<u8>) {
-    tokio::time::timeout(Duration::from_secs(3),async {
+    frame_with_timeout(socket, Duration::from_secs(3)).await
+}
+async fn frame_with_timeout(socket: &mut TcpStream, timeout: Duration) -> (u32, Vec<u8>) {
+    tokio::time::timeout(timeout,async {
         let mut header=[0;8];socket.read_exact(&mut header).await.unwrap();
         let mut body=vec![0;u16::from_be_bytes([header[0],header[1]]) as usize];
         socket.read_exact(&mut body).await.unwrap();
@@ -76,7 +79,9 @@ async fn encrypted_start(cmd:&mut TcpStream,late_video:Option<u16>) -> (Vec<u8>,
     let (id,features)=frame(cmd).await;assert_eq!(id,CMD_HU_FEATURE_CONFIG_RESPONSE);
     assert!(features.windows(18).any(|bytes|bytes==b"CONTENT_ENCRYPTION"));
     send(cmd,CMD_MD_RSA_KEY_REQUEST,&[]).await;
-    let (id,public)=frame(cmd).await;assert_eq!(id,CMD_HU_RSA_PUBLIC_KEY);
+    // Key generation is randomized and uses the authenticated handshake budget.
+    let (id,public)=frame_with_timeout(cmd, Duration::from_secs(30)).await;
+    assert_eq!(id,CMD_HU_RSA_PUBLIC_KEY);
     let der=base64::Engine::decode(&base64::engine::general_purpose::STANDARD,pb_first_string(&public,1).unwrap()).unwrap();
     let key=rsa::RsaPublicKey::from_public_key_der(&der).unwrap();
     let seed=vec![17;16];
@@ -113,7 +118,7 @@ fn admission_is_not_a_content_encryption_signal_and_proof_failure_never_downgrad
 }
 
 #[test]
-fn actual_plain_version_rejection_retries_encrypted_immediately() {
+fn actual_plain_version_rejection_tries_legacy_version() {
     let mut cfg = config();
     cfg.dialect = CarLifeDialect::SystemPlain30;
     let mut choice = super::super::protocol_selection::Selection::new(config().dialect);
@@ -121,7 +126,130 @@ fn actual_plain_version_rejection_retries_encrypted_immediately() {
     let mut plain = Session::new(cfg.dialect);
     assert!(plain.receive(CMD_VERSION_MATCH_STATUS, &[8, 2], &cfg).is_err());
     assert!(choice.round_ended(plain.protocol_evidence(), RoundEnd::Command));
-    assert_eq!(choice.current(), CarLifeDialect::CarWithEncrypted41);
+    assert_eq!(choice.current(), CarLifeDialect::SystemPlain32);
+}
+
+#[test]
+fn system_plain32_keeps_phone_admission_and_observes_content_key_requests() {
+    let mut cfg = config();
+    cfg.dialect = CarLifeDialect::SystemPlain32;
+    let mut session = Session::new(cfg.dialect);
+    session.receive(CMD_VERSION_MATCH_STATUS, &[8, 1], &cfg).unwrap();
+    session.receive(CMD_MD_INFO, &[], &cfg).unwrap();
+    session.receive(CMD_MD_FEATURE_CONFIG_REQUEST, &[], &cfg).unwrap();
+    let mut response = Vec::new();
+    proto::string(&mut response, 1, "optional-legacy-response");
+    assert!(session.receive(CMD_MD_AUTHEN_RESPONSE, &response, &cfg).unwrap().is_empty());
+    assert!(!session.protocol_evidence().authentication);
+    assert!(session.receive(CMD_MD_AUTHEN_RESULT, &[8, 0], &cfg).is_err());
+    assert!(!session.init_sent);
+    assert!(session.receive(CMD_MD_RSA_KEY_REQUEST, &[], &cfg).is_err());
+    assert!(session.protocol_evidence().authentication && session.seed.is_none());
+}
+
+#[tokio::test]
+async fn system_plain32_recovers_startup_and_reprobes_plain30_after_rejection() {
+    let (listeners, ports) = listeners().await;
+    let stop = Arc::new(DialStop::default());
+    let (_hub, mut events) = CarLifeHub::connect_to_ports(config(), "127.0.0.1".into(), ports,
+        stop.clone(), None, |_| {}).unwrap();
+
+    for version in [[8, 4, 16, 1], [8, 3, 16, 0], [8, 3, 16, 0], [8, 3, 16, 0]] {
+        let mut peers = accept_round(&listeners).await;
+        assert_eq!(frame(&mut peers[0]).await, (CMD_HU_PROTOCOL_VERSION, version.to_vec()));
+        if version[1] == 4 {
+            send(&mut peers[0], CMD_VERSION_MATCH_STATUS, &[8, 2]).await;
+        } else {
+            send(&mut peers[0], CMD_VERSION_MATCH_STATUS, &[8, 1]).await;
+            assert_eq!(frame(&mut peers[0]).await.0, CMD_HU_STATISTIC_INFO);
+            send(&mut peers[0], CMD_MD_EXIT, &[]).await;
+        }
+        assert!(tokio::time::timeout(Duration::from_secs(2), peers[0].read_u8()).await.unwrap().is_err());
+    }
+
+    let mut interrupted = accept_round(&listeners).await;
+    assert_eq!(frame(&mut interrupted[0]).await, (CMD_HU_PROTOCOL_VERSION, vec![8, 3, 16, 2]));
+    send(&mut interrupted[0], CMD_VERSION_MATCH_STATUS, &[8, 1]).await;
+    assert_eq!(frame(&mut interrupted[0]).await.0, CMD_HU_STATISTIC_INFO);
+    assert_eq!(frame(&mut interrupted[0]).await.0, CMD_HU_AUTHEN_REQUEST);
+    drop(interrupted);
+    let mut encrypted_probe = accept_round(&listeners).await;
+    assert_eq!(frame(&mut encrypted_probe[0]).await, (CMD_HU_PROTOCOL_VERSION, vec![8, 4, 16, 1]));
+    send(&mut encrypted_probe[0], CMD_VERSION_MATCH_STATUS, &[8, 2]).await;
+    assert!(tokio::time::timeout(Duration::from_secs(2), encrypted_probe[0].read_u8()).await.unwrap().is_err());
+    drop(encrypted_probe);
+
+    let mut interrupted = accept_round(&listeners).await;
+    assert_eq!(frame(&mut interrupted[0]).await, (CMD_HU_PROTOCOL_VERSION, vec![8, 3, 16, 2]));
+    send(&mut interrupted[0], CMD_VERSION_MATCH_STATUS, &[8, 1]).await;
+    assert_eq!(frame(&mut interrupted[0]).await.0, CMD_HU_STATISTIC_INFO);
+    assert_eq!(frame(&mut interrupted[0]).await.0, CMD_HU_AUTHEN_REQUEST);
+    drop(interrupted);
+    assert!(tokio::time::timeout(Duration::from_secs(2), listeners[0].accept()).await.is_err());
+
+    let backoff = super::super::protocol_selection::PLAIN32_RECOVERY_BACKOFF;
+    let (cmd, _) = tokio::time::timeout(backoff + Duration::from_secs(3), listeners[0].accept())
+        .await.unwrap().unwrap();
+    let mut encrypted_probe = vec![cmd];
+    for listener in &listeners[1..] {
+        encrypted_probe.push(accept(listener).await);
+    }
+    assert_eq!(frame(&mut encrypted_probe[0]).await, (CMD_HU_PROTOCOL_VERSION, vec![8, 4, 16, 1]));
+    send(&mut encrypted_probe[0], CMD_VERSION_MATCH_STATUS, &[8, 2]).await;
+    assert!(tokio::time::timeout(Duration::from_secs(2), encrypted_probe[0].read_u8()).await.unwrap().is_err());
+    drop(encrypted_probe);
+
+    let mut peers = accept_round(&listeners).await;
+    let cmd = &mut peers[0];
+    assert_eq!(frame(cmd).await, (CMD_HU_PROTOCOL_VERSION, vec![8, 3, 16, 2]));
+    send(cmd, CMD_VERSION_MATCH_STATUS, &[8, 1]).await;
+    assert_eq!(frame(cmd).await.0, CMD_HU_STATISTIC_INFO);
+    let (kind, body) = frame(cmd).await;
+    assert_eq!(kind, CMD_HU_AUTHEN_REQUEST);
+    assert_eq!(pb_first_string(&body, 1).as_deref(), Some("CarLife_1.0.0"));
+    send(cmd, CMD_MD_INFO, &[]).await;
+    assert_eq!(frame(cmd).await.0, CMD_HU_INFO);
+    send(cmd, CMD_MD_FEATURE_CONFIG_REQUEST, &[]).await;
+    let (kind, features) = frame(cmd).await;
+    assert_eq!(kind, CMD_HU_FEATURE_CONFIG_RESPONSE);
+    for key in ["FOCUS_UI", "VOICE_MIC", "AUDIO_TRANSMISSION_MODE"] {
+        assert!(features.windows(key.len()).any(|bytes| bytes == key.as_bytes()));
+    }
+    assert!(!features.windows(18).any(|bytes| bytes == b"CONTENT_ENCRYPTION"));
+    assert!(tokio::time::timeout(Duration::from_millis(40), cmd.read_u8()).await.is_err());
+    send(cmd, CMD_MD_AUTHEN_RESULT, &[8, 1]).await;
+    assert_eq!(frame(cmd).await.0, CMD_HU_MD_AUTH_RESULT_ACK);
+    let (kind, init) = frame(cmd).await;
+    assert_eq!(kind, CMD_VIDEO_ENCODER_INIT);
+    assert_eq!(parse_encoder_info(&init), (1280, 720));
+    send(cmd, CMD_VIDEO_ENCODER_INIT_DONE, &proto_encoder_info_payload(1280, 720, 30)).await;
+    assert_eq!(frame(cmd).await.0, CMD_VIDEO_ENCODER_START);
+    peers[1].write_all(&build_media_frame(VIDEO_DATA, 0, H264_SYNC)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(events.recv().await.unwrap(), CarLifeEvent::VideoFrameTagged { .. }) { break; }
+        }
+    }).await.unwrap();
+    drop(peers);
+
+    for version in [[8, 3, 16, 2], [8, 4, 16, 1]] {
+        let mut peers = accept_round(&listeners).await;
+        assert_eq!(frame(&mut peers[0]).await, (CMD_HU_PROTOCOL_VERSION, version.to_vec()));
+        send(&mut peers[0], CMD_VERSION_MATCH_STATUS, &[8, 2]).await;
+        assert!(tokio::time::timeout(Duration::from_secs(2), peers[0].read_u8()).await.unwrap().is_err());
+    }
+    let mut peers = accept_round(&listeners).await;
+    plain_start(&mut peers[0]).await;
+    peers[1].write_all(&build_media_frame(VIDEO_DATA, 0, H264_SYNC)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if matches!(events.recv().await.unwrap(), CarLifeEvent::VideoFrameTagged { .. }) { break; }
+        }
+    }).await.unwrap();
+    drop(peers);
+    let mut next = accept(&listeners[0]).await;
+    assert_eq!(frame(&mut next).await, (CMD_HU_PROTOCOL_VERSION, vec![8, 3, 16, 0]));
+    stop.cancel();
 }
 
 #[tokio::test]
@@ -187,7 +315,7 @@ async fn encrypted_video_socket_without_sync_picture_retries_encrypted() {
 }
 
 #[tokio::test]
-async fn automatic_plain_start_without_a_sync_picture_exhausts_the_plain_probe() {
+async fn automatic_plain_start_without_a_sync_picture_tries_32_then_returns_to_41() {
     let (listeners, ports) = listeners().await;
     let stop = Arc::new(DialStop::default());
     let (_hub, _events) = CarLifeHub::connect_to_ports(config(), "127.0.0.1".into(), ports,
@@ -206,6 +334,12 @@ async fn automatic_plain_start_without_a_sync_picture_exhausts_the_plain_probe()
             .expect("unconfirmed plaintext video must expire").unwrap_err().kind(),
             std::io::ErrorKind::UnexpectedEof);
     }
+    let mut legacy = accept_round(&listeners).await;
+    assert_eq!(frame(&mut legacy[0]).await, (CMD_HU_PROTOCOL_VERSION, vec![8, 3, 16, 2]));
+    send(&mut legacy[0], CMD_VERSION_MATCH_STATUS, &[8, 2]).await;
+    assert!(tokio::time::timeout(Duration::from_secs(2), legacy[0].read_u8()).await.unwrap().is_err());
+    drop(legacy);
+
     let mut next = accept(&listeners[0]).await;
     assert_eq!(frame(&mut next).await, (CMD_HU_PROTOCOL_VERSION, vec![8, 4, 16, 1]));
     stop.cancel();
@@ -265,9 +399,9 @@ fn buffered_authentication_requires_a_complete_frame() {
         build_cmd_frame(CMD_MD_AUTHEN_RESULT, &[8, 1]),
         build_cmd_frame(CMD_MD_AUTHEN_RESPONSE, &[0x0a, 1, b'x']),
     ].concat();
-    observe_buffered_authentication(&progress, &batch[..batch.len() - 1]);
+    observe_buffered_authentication(&progress, CarLifeDialect::CarWithEncrypted41, &batch[..batch.len() - 1]);
     assert!(!progress.evidence().authentication);
-    observe_buffered_authentication(&progress, &batch);
+    observe_buffered_authentication(&progress, CarLifeDialect::CarWithEncrypted41, &batch);
     assert!(progress.evidence().authentication);
 }
 

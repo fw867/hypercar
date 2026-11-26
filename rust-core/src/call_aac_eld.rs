@@ -2,6 +2,11 @@
 
 pub(crate) const SAMPLES_PER_AU: usize = 480;
 pub(crate) const PCM_BYTES_PER_AU: usize = SAMPLES_PER_AU * size_of::<i16>();
+const MAX_AU_BYTES: usize = 4_096;
+
+pub(crate) fn valid_au_size(size: usize) -> bool {
+    (1..=MAX_AU_BYTES).contains(&size)
+}
 
 #[cfg(any(target_os = "android", test))]
 fn decoder_asc(sample_rate: u32) -> Result<[u8; 4], String> {
@@ -75,7 +80,6 @@ mod platform {
     };
 
     const MIME: &CStr = c"audio/mp4a-latm";
-    const MAX_AU_BYTES: usize = 4_096;
     const MAX_ASC_BYTES: usize = 64;
     const TRY_AGAIN: isize = -1;
     const FORMAT_CHANGED: isize = -2;
@@ -476,7 +480,7 @@ mod platform {
 
         /// `false` means MediaCodec has not taken this AU. Drain and retry it.
         pub(crate) fn try_queue_au(&mut self, au: &[u8], pts_us: u64) -> Result<bool, String> {
-            if !(1..=MAX_AU_BYTES).contains(&au.len()) {
+            if !valid_au_size(au.len()) {
                 return Err("AAC-ELD invalid raw access unit size".into());
             }
             self.codec.queue(au, pts_us)
