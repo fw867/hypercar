@@ -23,17 +23,24 @@ import java.io.EOFException
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /** Live PSTN downlink/extraction and uplink/injection owned by the authorized shell service. */
 internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
+    private class UnconfirmedCallIdentity : IllegalStateException()
+
     private class Session(
         val token: Long, val callId: String, val owner: IBinder, val death: IBinder.DeathRecipient,
         val socket: ParcelFileDescriptor, val record: AudioRecord, val track: AudioTrack,
     ) {
         val live = AtomicBoolean(true)
+        val endReason = AtomicReference<String?>()
     }
 
     @Volatile private var session: Session? = null
+    @Volatile private var status = "idle"
+
+    fun diagnosticStatus(): String = status
 
     private val pstnRedirectionMode by lazy { AudioManager::class.java.getField("CALL_REDIRECT_PSTN").getInt(null) }
 
@@ -91,7 +98,8 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
             val emergency = Class.forName("com.android.internal.telecom.ITelecomService")
                 .getMethod("isInEmergencyCall")
             fun safeCall() = manager.mode == AudioManager.MODE_IN_CALL && emergency.invoke(telecomService) == false
-            check(safeCall() && callIdentity.current() == callId) { "regular cellular call unavailable" }
+            check(safeCall()) { "regular cellular call unavailable" }
+            if (!callIdentity.confirmsOpen(callId)) throw UnconfirmedCallIdentity()
             check(AudioManager::class.java.getMethod("isPstnCallAudioInterceptable").invoke(manager) == true) {
                 "cellular call audio unavailable on this device"
             }
@@ -117,24 +125,32 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
             stage = "attach endpoints"
             val pair = ParcelFileDescriptor.createSocketPair()
             sockets = pair
-            val ownerDeath = IBinder.DeathRecipient { close(token) }
+            val ownerDeath = IBinder.DeathRecipient { close(token, "owner_disconnected") }
             death = ownerDeath
             owner.linkToDeath(ownerDeath, 0)
-            check(owner.isBinderAlive && safeCall() && callIdentity.current() == callId)
+            check(owner.isBinderAlive && safeCall())
+            if (!callIdentity.confirmsOpen(callId)) throw UnconfirmedCallIdentity()
             val active = Session(token, callId, owner, ownerDeath, pair[0], downlink, uplink)
             session = active
+            status = "endpoints_ready_rate_$rate"
             val watchdog = Thread({
+                var reason = "call_no_longer_eligible"
                 try {
-                    while (active.live.get() && safeCall() && callIdentity.current() == callId) {
-                        SystemClock.sleep(200)
+                    while (active.live.get() && safeCall()) {
+                        if (callIdentity.current() != callId) {
+                            reason = "identity_lost_${callIdentity.diagnosticStatus()}"
+                            break
+                        }
+                        SystemClock.sleep(callIdentity.millisUntilRefresh())
                     }
-                } catch (error: Exception) { if (active.live.get()) logFailure("call state", error) }
-                finally { close(active) }
+                } catch (error: Exception) { reason = failureStatus("call_state", error) }
+                finally { close(active, reason) }
             }, "hypercar-call-state")
             val transport = Thread({
+                var reason = "uplink_closed"
                 try { transfer(active, rate, manager) { safeCall() && callIdentity.matchesCached(callId) } }
-                catch (error: Exception) { if (active.live.get()) logFailure("transfer", error) }
-                finally { close(active) }
+                catch (error: Exception) { reason = failureStatus("transfer", error) }
+                finally { close(active, reason) }
             }, "hypercar-call-uplink")
             listOf(watchdog, transport).forEach { it.isDaemon = true; it.start() }
             Log.i("HyperCar", "CALL-AUDIO: shell endpoints ready rate=$rate")
@@ -145,7 +161,9 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
             runCatching { record?.release() }
             runCatching { track?.release() }
             sockets?.forEach { runCatching { it.close() } }
-            logFailure("$stage rate=$rate", error)
+            status = if (error is UnconfirmedCallIdentity) OPEN_IDENTITY_UNCONFIRMED
+                else failureStatus("${stage.replace(' ', '_')}_rate_$rate", error)
+            Log.i("HyperCar", "CALL-AUDIO: $status")
             null
         }
     }
@@ -159,8 +177,16 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
             (Os.poll(socketState, 0) == 0 || (socketState[0].revents.toInt() and hangup) == 0)
         // Rust sends this byte only after the active session accepts the call stream.
         check(input.read() == 1)
+        if (!callIdentity.confirmsOpen(active.callId)) {
+            active.endReason.compareAndSet(null, OPEN_IDENTITY_UNCONFIRMED)
+            return
+        }
         synchronized(this) {
             check(session === active && safeCall())
+            if (!callIdentity.isConfirmed(active.callId)) {
+                active.endReason.compareAndSet(null, OPEN_IDENTITY_UNCONFIRMED)
+                return
+            }
             active.record.startRecording()
             active.track.play()
             check(active.record.recordingState == AudioRecord.RECORDSTATE_RECORDING)
@@ -177,11 +203,13 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
         }
         val routedType = active.track.routedDevice?.type
         if (routedType != AudioDeviceInfo.TYPE_TELEPHONY) {
+            active.endReason.compareAndSet(null, "uplink_route_rejected_type_$routedType")
             Log.w("HyperCar", "CALL-AUDIO: shell uplink route rejected actualType=$routedType rate=$rate")
             error("telephony uplink route unavailable")
         }
         Log.i("HyperCar", "CALL-AUDIO: shell uplink routed to telephony rate=$rate")
         Thread({
+            var reason = "downlink_call_no_longer_eligible"
             try {
                 val output = FileOutputStream(fd)
                 val frames = if (rate >= 44100) 352 else rate / 50
@@ -189,7 +217,10 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
                 var ready = false
                 while (active.live.get()) {
                     val count = active.record.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
-                    check(count > 0 && count % 2 == 0) { "call record read=$count" }
+                    if (count <= 0 || count % 2 != 0) {
+                        reason = "downlink_read_$count"
+                        break
+                    }
                     if (!active.live.get() || !safeCall()) break
                     if (!ready) {
                         output.write(1)
@@ -199,8 +230,8 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
                     output.write(buffer, 0, count)
                 }
             } catch (error: Exception) {
-                if (active.live.get()) logFailure("downlink", error)
-            } finally { close(active) }
+                reason = failureStatus("downlink", error)
+            } finally { close(active, reason) }
         }, "hypercar-call-downlink").apply { isDaemon = true; start() }
         val buffer = ByteArray(0x7ffe)
         while (ownsEndpoint()) {
@@ -223,22 +254,25 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
 
     fun revoke(callId: String) {
         val active = session?.takeIf { it.callId == callId } ?: return
+        active.endReason.compareAndSet(null, "identity_revoked_${callIdentity.diagnosticStatus()}")
         // Wake the PCM workers immediately. Their finally blocks release the audio endpoints.
         active.live.set(false)
         runCatching { Os.shutdown(active.socket.fileDescriptor, OsConstants.SHUT_RDWR) }
     }
 
     @Synchronized
-    fun close(token: Long) {
-        session?.takeIf { it.token == token }?.let { close(it) }
+    fun close(token: Long, reason: String = "controller_closed") {
+        session?.takeIf { it.token == token }?.let { close(it, reason) }
     }
 
     @Synchronized
-    private fun close(active: Session) {
+    private fun close(active: Session, reason: String) {
         if (session !== active) return
+        status = active.endReason.get() ?: reason
         session = null
         active.live.set(false)
         runCatching { Os.shutdown(active.socket.fileDescriptor, OsConstants.SHUT_RDWR) }
+        Log.i("HyperCar", "CALL-AUDIO: shell endpoints closed $status")
         runCatching { active.socket.close() }
         runCatching { active.record.stop() }
         runCatching { active.track.pause() }
@@ -248,7 +282,10 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
         runCatching { active.owner.unlinkToDeath(active.death, 0) }
     }
 
-    private fun logFailure(stage: String, error: Exception) {
-        Log.i("HyperCar", "CALL-AUDIO: shell $stage failed ${(error.cause ?: error).javaClass.simpleName}")
+    private fun failureStatus(stage: String, error: Exception) =
+        "${stage}_failed_${(error.cause ?: error).javaClass.simpleName}"
+
+    companion object {
+        const val OPEN_IDENTITY_UNCONFIRMED = "open_identity_unconfirmed"
     }
 }

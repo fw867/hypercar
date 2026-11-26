@@ -10,6 +10,7 @@ import org.junit.Test
 
 class ShellCallIdentityTest {
     private val telephony = "com.android.phone/com.android.services.telephony.TelephonyConnectionService"
+    private fun confirmed(id: String = "TC@4", vararg ended: String) = TelecomCallSnapshot.Observed(id, ended.toSet())
 
     private fun call(id: Int, state: String, component: String = telephony, voip: Boolean = false) =
         "[Call id=TC@$id, state=$state, tpac=ComponentInfo{$component}, 1, UserHandle{0}, " +
@@ -35,7 +36,7 @@ class ShellCallIdentityTest {
     @Test fun returnedLegGetsANewKeyAfterWatchdogObservesSwap() {
         var elapsed = 0L
         var active = "TC@4"
-        val identity = ShellCallIdentity({ elapsed }, { active })
+        val identity = ShellCallIdentity({ elapsed }, { confirmed(active) })
         val monitor = identity.beginTracking()
         identity.trackSubscriptions(monitor, setOf(1))
         identity.onPreciseCallState(monitor, 1, singleActive)
@@ -65,7 +66,7 @@ class ShellCallIdentityTest {
     @Test fun waitingLegRetiresIdentityBeforeRefreshAndResumingNeedsFreshOffer() {
         var reads = 0
         val retired = mutableListOf<String>()
-        val identity = ShellCallIdentity({ 0L }, { reads++; "TC@4" }, retired::add)
+        val identity = ShellCallIdentity({ 0L }, { reads++; confirmed() }, retired::add)
         val monitor = identity.beginTracking()
         identity.trackSubscriptions(monitor, setOf(1))
         identity.trackingReady(monitor)
@@ -85,8 +86,325 @@ class ShellCallIdentityTest {
         assertEquals(2, reads)
     }
 
+    @Test fun repeatedUnchangedActiveStateDoesNotRetireTheCurrentAudioBridge() {
+        val retired = mutableListOf<String>()
+        val identity = ShellCallIdentity({ 0L }, { confirmed() }, retired::add)
+        val monitor = identity.beginTracking()
+        identity.trackSubscriptions(monitor, setOf(1, 2))
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        identity.onPreciseCallState(monitor, 2, idle)
+        identity.trackingReady(monitor)
+        val original = checkNotNull(identity.current())
+
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        identity.onPreciseCallState(monitor, 2, idle)
+
+        assertTrue(retired.isEmpty())
+        assertTrue(identity.matchesCached(original))
+        assertEquals(original, identity.current())
+    }
+
+    @Test fun disconnectFencesTheOldLegAndAllowsAReplacementWithTheSameRoles() {
+        var elapsed = 0L
+        var active = confirmed()
+        val retired = mutableListOf<String>()
+        val identity = ShellCallIdentity({ elapsed }, { active }, retired::add)
+        val monitor = identity.beginTracking()
+        identity.trackSubscriptions(monitor, setOf(1))
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        identity.trackingReady(monitor)
+        val original = checkNotNull(identity.current())
+
+        identity.onDisconnected(monitor, 1)
+        assertEquals(listOf(original), retired)
+        assertNull(identity.current())
+        assertFalse(identity.matchesCached(original))
+
+        elapsed = 250
+        active = confirmed("TC@8", "TC@4")
+        assertNull(identity.current())
+        elapsed = 450
+        assertNotEquals(original, checkNotNull(identity.current()))
+    }
+
+    @Test fun roleChangeBeforeDisconnectUsesPriorConfirmedLeg() {
+        var elapsed = 0L
+        var active = confirmed()
+        val identity = ShellCallIdentity({ elapsed }, { active })
+        val monitor = identity.beginTracking()
+        identity.trackSubscriptions(monitor, setOf(1))
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        identity.trackingReady(monitor)
+        val original = checkNotNull(identity.current())
+
+        identity.onPreciseCallState(monitor, 1, singleActive.copy(ringing = 6))
+        identity.onDisconnected(monitor, 1)
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        assertNull(identity.current())
+        assertFalse(identity.matchesCached(original))
+
+        elapsed = 250
+        active = confirmed("TC@8", "TC@4")
+        assertNull(identity.current())
+        elapsed = 450
+        assertNotEquals(original, checkNotNull(identity.current()))
+    }
+
+    @Test fun subscriptionReregistrationDoesNotPermitADisconnectedLeg() {
+        var elapsed = 0L
+        var active = confirmed()
+        val identity = ShellCallIdentity({ elapsed }, { active })
+        fun register(): Long {
+            val generation = identity.beginTracking()
+            identity.trackSubscriptions(generation, setOf(1))
+            identity.onPreciseCallState(generation, 1, singleActive)
+            identity.trackingReady(generation)
+            return generation
+        }
+        val first = register()
+        val original = checkNotNull(identity.current())
+        identity.onDisconnected(first, 1)
+        assertNull(identity.current())
+        register()
+        elapsed = 250
+        active = confirmed("TC@4", "TC@4")
+        assertNull(identity.current())
+
+        active = confirmed("TC@8", "TC@4")
+        register()
+        assertNull(identity.current())
+        elapsed = 450
+        assertNotEquals(original, checkNotNull(identity.current()))
+    }
+
+    @Test fun delayedTerminalRoleAndDisconnectUseTheOldCallIdFromTelecom() {
+        var elapsed = 0L
+        var active = confirmed()
+        val identity = ShellCallIdentity({ elapsed }, { active })
+        val monitor = identity.beginTracking()
+        identity.trackSubscriptions(monitor, setOf(1))
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        identity.trackingReady(monitor)
+        val original = checkNotNull(identity.current())
+
+        identity.onPreciseCallState(monitor, 1, singleActive.copy(ringing = 6))
+        active = confirmed("TC@8")
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        val replacement = checkNotNull(identity.current())
+        identity.onPreciseCallState(monitor, 1, singleActive.copy(foreground = 7))
+        identity.onDisconnected(monitor, 1)
+        assertFalse(identity.matchesCached(replacement))
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        assertNull(identity.current())
+        elapsed = 275
+        active = confirmed("TC@8", "TC@4")
+        assertNull(identity.current())
+        elapsed = 475
+        val reopened = checkNotNull(identity.current())
+        assertNotEquals(original, reopened)
+        assertNotEquals(replacement, reopened)
+
+        // Precise-state repeats do not create a second disconnect observation.
+        elapsed = 750
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        assertEquals(reopened, identity.current())
+
+        identity.onDisconnected(monitor, 1)
+        elapsed = 1000
+        assertNull(identity.current())
+        elapsed = 1200
+        assertNotEquals(reopened, checkNotNull(identity.current()))
+    }
+
+    @Test fun secondDisconnectRequiresPostEventRevalidationAndRejectsTheEndedLeg() {
+        var elapsed = 0L
+        var active = confirmed()
+        val identity = ShellCallIdentity({ elapsed }, { active })
+        val monitor = identity.beginTracking()
+        identity.trackSubscriptions(monitor, setOf(1))
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        identity.trackingReady(monitor)
+        checkNotNull(identity.current())
+
+        elapsed = 200
+        active = confirmed("TC@8")
+        val replacement = checkNotNull(identity.current())
+        identity.onDisconnected(monitor, 1)
+        elapsed += 100
+        identity.onDisconnected(monitor, 1)
+        assertFalse(identity.matchesCached(replacement))
+        elapsed += 150
+        active = confirmed("TC@8", "TC@4")
+        assertNull(identity.current())
+        elapsed = 550
+        assertNull(identity.current())
+        elapsed += 200
+        active = confirmed("TC@9", "TC@4", "TC@8")
+        assertNull(identity.current())
+        elapsed += 200
+        assertNotNull(identity.current())
+        elapsed += 200
+        active = confirmed("TC@8")
+        assertNull(identity.current())
+    }
+
+    @Test fun disconnectBeforeFirstSnapshotDefersInitialAdmission() {
+        var elapsed = 0L
+        var reads = 0
+        var result = confirmed()
+        val identity = ShellCallIdentity({ elapsed }, { reads++; result })
+        val monitor = identity.beginTracking()
+        identity.trackSubscriptions(monitor, setOf(1))
+        identity.onDisconnected(monitor, 1)
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        identity.trackingReady(monitor)
+
+        assertNull(identity.current())
+        assertEquals(0, reads)
+        elapsed = 250
+        assertNull(identity.current())
+        elapsed = 450
+        result = TelecomCallSnapshot.Observed(null, noCalls = true)
+        assertNull(identity.current())
+        elapsed = 650
+        result = confirmed("TC@8")
+        assertNotNull(identity.current())
+        assertEquals(3, reads)
+    }
+
+    @Test fun rejectedWaitingCallDoesNotFenceTheContinuingForeground() {
+        var elapsed = 0L
+        var active = confirmed()
+        val identity = ShellCallIdentity({ elapsed }, { active })
+        val monitor = identity.beginTracking()
+        identity.trackSubscriptions(monitor, setOf(1))
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        identity.trackingReady(monitor)
+        val original = checkNotNull(identity.current())
+
+        identity.onPreciseCallState(monitor, 1, singleActive.copy(ringing = 6))
+        identity.onDisconnected(monitor, 1)
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        active = confirmed("TC@4", "TC@8")
+        elapsed = 250
+        assertNull(identity.current())
+        elapsed = 450
+        assertNotEquals(original, checkNotNull(identity.current()))
+    }
+
+    @Test fun a240msReadFitsContinuousRefreshWithoutExtendingTheLease() {
+        var elapsed = 0L
+        val budgets = mutableListOf<Long>()
+        val identity = ShellCallIdentity({ elapsed }, { budget ->
+            budgets += budget
+            elapsed += minOf(240, budget)
+            if (budget >= 240) confirmed() else TelecomCallSnapshot.Unavailable
+        })
+        val monitor = identity.beginTracking()
+        identity.trackSubscriptions(monitor, setOf(1))
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        identity.trackingReady(monitor)
+        val original = checkNotNull(identity.current())
+
+        repeat(3) { assertEquals(original, identity.current()) }
+        assertEquals(listOf(400L, 260L, 260L, 260L), budgets)
+        assertTrue(identity.matchesCached(original))
+    }
+
+    @Test fun watchdogUsesTheRefreshDeadlineEvenWhenItJustReadTheCache() {
+        var elapsed = 0L
+        var duration = 0L
+        val identity = ShellCallIdentity({ elapsed }, { budget ->
+            elapsed += minOf(duration, budget)
+            if (duration <= budget) confirmed() else TelecomCallSnapshot.Unavailable
+        })
+        val monitor = identity.beginTracking()
+        identity.trackSubscriptions(monitor, setOf(1))
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        identity.trackingReady(monitor)
+        val original = checkNotNull(identity.current())
+
+        elapsed = 199
+        assertEquals(original, identity.current())
+        assertEquals(1L, identity.millisUntilRefresh())
+        elapsed += identity.millisUntilRefresh()
+        duration = 240
+        assertEquals(original, identity.current())
+        assertEquals(0L, identity.millisUntilRefresh())
+    }
+
+    @Test fun telecomHistoryMatchesTerminalEventsToTheRecordId() {
+        val lines = telecomDump(call(8, "ACTIVE"), "null") + sequenceOf(
+            "Historical Events:",
+            "  CallTC@4 (2 events):",
+            "    10:40:03.123 - SET_DISCONNECTING",
+            "    10:40:03.125 - SET_DISCONNECTED (cause)",
+            "  CallTC@8 (1 events):",
+            "    10:40:03.400 - SET_ACTIVE",
+            "  unrelated block",
+            "    10:40:04.000 - SET_DISCONNECTED",
+        )
+        val snapshot = ShellCallIdentity.parseSnapshot(lines)
+        assertEquals("TC@8", snapshot.activeCallId)
+        assertEquals(setOf("TC@4"), snapshot.endedCallIds)
+        assertFalse(snapshot.noCalls)
+        val idleDump = telecomDump("null", "null").map {
+            if (it == "CallsManager:" || it == "  mCalls:") "$it " else it
+        }
+        assertTrue(ShellCallIdentity.parseSnapshot(idleDump).noCalls)
+    }
+
+    @Test fun aTransportMissCannotEraseOrExtendTheLastVerifiedIdentity() {
+        var elapsed = 0L
+        var result: TelecomCallSnapshot = confirmed()
+        val retired = mutableListOf<String>()
+        val budgets = mutableListOf<Long>()
+        val identity = ShellCallIdentity({ elapsed }, { budgets += it; result }, retired::add)
+        val monitor = identity.beginTracking()
+        identity.trackSubscriptions(monitor, setOf(1))
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        identity.trackingReady(monitor)
+        val original = checkNotNull(identity.current())
+
+        elapsed = 200
+        result = TelecomCallSnapshot.Unavailable
+        assertEquals(original, identity.current())
+        assertFalse(identity.confirmsOpen(original))
+        elapsed = 280
+        result = confirmed()
+        assertEquals(original, identity.current())
+        assertTrue(identity.confirmsOpen(original))
+        assertEquals(listOf(400L, 300L, 220L), budgets)
+
+        elapsed = 480
+        result = TelecomCallSnapshot.Unavailable
+        assertEquals(original, identity.current())
+        elapsed = 780
+        assertNull(identity.current())
+        assertFalse(identity.matchesCached(original))
+        assertEquals(listOf(original), retired)
+    }
+
+    @Test fun successfulReadWithNoEligibleForegroundRevokesImmediately() {
+        var elapsed = 0L
+        var result: TelecomCallSnapshot = confirmed()
+        val retired = mutableListOf<String>()
+        val identity = ShellCallIdentity({ elapsed }, { result }, retired::add)
+        val monitor = identity.beginTracking()
+        identity.trackSubscriptions(monitor, setOf(1))
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        identity.trackingReady(monitor)
+        val original = checkNotNull(identity.current())
+
+        elapsed = 200
+        result = TelecomCallSnapshot.Observed(null)
+        assertNull(identity.current())
+        assertEquals(listOf(original), retired)
+        assertFalse(identity.matchesCached(original))
+    }
+
     @Test fun recoveryRequiresAllSubscriptionsAndIgnoresCallbacksFromPreviousRegistration() {
-        val identity = ShellCallIdentity({ 0L }, { "TC@4" })
+        val identity = ShellCallIdentity({ 0L }, { confirmed() })
         val firstMonitor = identity.beginTracking()
         identity.trackSubscriptions(firstMonitor, setOf(1, 2))
         identity.onPreciseCallState(firstMonitor, 2, singleActive)
@@ -117,7 +435,7 @@ class ShellCallIdentityTest {
                 identity.onPreciseCallState(monitor, 1, singleActive.copy(ringing = 6))
                 identity.onPreciseCallState(monitor, 1, singleActive)
             }
-            "TC@4"
+            confirmed()
         })
         monitor = identity.beginTracking()
         identity.trackSubscriptions(monitor, setOf(1))

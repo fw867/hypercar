@@ -2,15 +2,16 @@ package io.github.hypercar.spike
 
 import android.util.Log
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /** Tracks all active subscriptions only when PSTN audio is requested in the shell service. */
 internal class ShellCallStateMonitor(private val identity: ShellCallIdentity) {
-    private val worker = Executors.newSingleThreadExecutor { task ->
+    private val worker = Executors.newSingleThreadScheduledExecutor { task ->
         Thread(task, "hypercar-precise-call-state").apply { isDaemon = true }
     }
     private lateinit var registry: ShellTelephonyRegistry
     private var subscriptionsListener: Any? = null
-    private val callListeners = mutableMapOf<Int, Any>()
+    private val callListeners = mutableMapOf<Int, AutoCloseable>()
 
     init {
         worker.execute {
@@ -39,12 +40,19 @@ internal class ShellCallStateMonitor(private val identity: ShellCallIdentity) {
             val subscriptions = registry.activeSubscriptions()
             if (!identity.trackSubscriptions(generation, subscriptions)) return
             for (subscription in subscriptions) {
-                callListeners[subscription] = registry.watchPreciseState(subscription) { ringing, foreground, background ->
-                    val roles = PreciseCallRoles(ringing, foreground, background)
-                    if (identity.onPreciseCallState(generation, subscription, roles)) {
-                        Log.i("HyperCar", "CALL-AUDIO: initial precise call states received count=${subscriptions.size}")
-                    }
-                }
+                callListeners[subscription] = registry.watchPreciseState(subscription,
+                    { ringing, foreground, background ->
+                        val roles = PreciseCallRoles(ringing, foreground, background)
+                        if (identity.onPreciseCallState(generation, subscription, roles)) {
+                            Log.i("HyperCar", "CALL-AUDIO: initial precise call states received count=${subscriptions.size}")
+                        }
+                    },
+                    {
+                        if (identity.onDisconnected(generation, subscription)) {
+                            scheduleRevalidation(2)
+                        }
+                    },
+                )
             }
             identity.trackingReady(generation)
             Log.i("HyperCar", "CALL-AUDIO: precise call state listeners registered count=${subscriptions.size}")
@@ -54,11 +62,19 @@ internal class ShellCallStateMonitor(private val identity: ShellCallIdentity) {
         }
     }
 
+    private fun scheduleRevalidation(attempts: Int) {
+        val delay = identity.millisUntilRevalidation() ?: return
+        worker.schedule({
+            identity.current()
+            if (attempts > 1) scheduleRevalidation(attempts - 1)
+        }, delay, TimeUnit.MILLISECONDS)
+    }
+
     private fun unregisterCallListeners() {
         val listeners = callListeners.entries.iterator()
         while (listeners.hasNext()) {
-            val (subscription, callback) = listeners.next()
-            registry.unwatchPreciseState(subscription, callback)
+            val (_, callback) = listeners.next()
+            callback.close()
             listeners.remove()
         }
     }

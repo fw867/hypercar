@@ -31,7 +31,9 @@ final class ShellTelephonyRegistry {
     private final Method listen;
     private final CallbackType subscriptionsCallback;
     private final CallbackType preciseCallback;
+    private final CallbackType disconnectCallback;
     private final int preciseEvent;
+    private final int disconnectEvent;
     private final Parcelable.Creator<?> preciseCreator;
     private final Method getRinging;
     private final Method getForeground;
@@ -56,6 +58,7 @@ final class ShellTelephonyRegistry {
         getActiveSubscriptions = subscriptionType.getMethod("getActiveSubIdList", boolean.class);
         subscriptionsCallback = new CallbackType("IOnSubscriptionsChangedListener", "onSubscriptionsChanged");
         preciseCallback = new CallbackType("IPhoneStateListener", "onPreciseCallStateChanged");
+        disconnectCallback = new CallbackType("IPhoneStateListener", "onCallDisconnectCauseChanged");
         addSubscriptionsListener = registryType.getMethod("addOnSubscriptionsChangedListener",
                 String.class, String.class, subscriptionsCallback.type);
         Method listenWithEvents;
@@ -68,6 +71,7 @@ final class ShellTelephonyRegistry {
         }
         listen = listenWithEvents;
         preciseEvent = TelephonyCallback.class.getField("EVENT_PRECISE_CALL_STATE_CHANGED").getInt(null);
+        disconnectEvent = TelephonyCallback.class.getField("EVENT_CALL_DISCONNECT_CAUSE_CHANGED").getInt(null);
         Class<?> precise = Class.forName("android.telephony.PreciseCallState");
         preciseCreator = (Parcelable.Creator<?>) precise.getField("CREATOR").get(null);
         getRinging = precise.getMethod("getRingingCallState");
@@ -98,7 +102,16 @@ final class ShellTelephonyRegistry {
         return callback;
     }
 
-    Object watchPreciseState(int subscription, PreciseStateListener state) throws Exception {
+    AutoCloseable watchPreciseState(int subscription, PreciseStateListener state, Runnable disconnected) throws Exception {
+        Object disconnectListener = disconnectCallback.create(data -> {
+            try {
+                int cause = data.readInt();
+                int preciseCause = data.readInt();
+                if (cause != -1 || preciseCause != -1 || data.dataAvail() != 0) disconnected.run();
+            } catch (RuntimeException malformed) {
+                disconnected.run();
+            }
+        });
         Object callback = preciseCallback.create(data -> {
             int ringing = -1;
             int foreground = -1;
@@ -114,12 +127,20 @@ final class ShellTelephonyRegistry {
             }
             state.onState(ringing, foreground, background);
         });
-        setEvents(subscription, callback, new int[]{preciseEvent}, true);
-        return callback;
-    }
-
-    void unwatchPreciseState(int subscription, Object callback) throws Exception {
-        setEvents(subscription, callback, new int[0], false);
+        // The registry retains the last disconnect cause. Only live notifications
+        // are relevant to the currently tracked call.
+        setEvents(subscription, disconnectListener, new int[]{disconnectEvent}, false);
+        try {
+            setEvents(subscription, callback, new int[]{preciseEvent}, true);
+        } catch (Exception failed) {
+            try { setEvents(subscription, disconnectListener, new int[0], false); }
+            catch (Exception cleanup) { failed.addSuppressed(cleanup); }
+            throw failed;
+        }
+        return () -> {
+            try { setEvents(subscription, callback, new int[0], false); }
+            finally { setEvents(subscription, disconnectListener, new int[0], false); }
+        };
     }
 
     private void setEvents(int subscription, Object callback, int[] events, boolean now) throws Exception {

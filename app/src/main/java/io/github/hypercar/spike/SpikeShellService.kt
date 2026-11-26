@@ -45,6 +45,12 @@ class SpikeShellService : ISpikeShell.Stub {
         finally { android.os.Binder.restoreCallingIdentity(identity) }
     }
 
+    override fun callAudioStatus(): String? {
+        if (android.os.Binder.getCallingUid() != appContext?.applicationInfo?.uid) return null
+        val endpoint = if (callAudio.isInitialized()) callAudio.value.diagnosticStatus() else "idle"
+        return "identity=${callIdentity.diagnosticStatus()} endpoint=$endpoint"
+    }
+
     override fun openCallAudio(owner: IBinder, token: Long, callId: String, rate: Int): android.os.ParcelFileDescriptor? {
         val context = appContext ?: return null
         if (android.os.Binder.getCallingUid() != context.applicationInfo.uid) return null

@@ -43,6 +43,10 @@ object SpikeShell {
         service?.startSplitAudioCapture(owner, navigationUid)
     fun stopAudioCapture() { service?.stopAudioCapture() }
     fun activeCallAudioIdentity(): String? = service?.activeCallAudioIdentity()
+    fun callAudioStatus(): String? = service?.callAudioStatus()
+    fun callAudioOpenNeedsIdentity(): Boolean = runCatching {
+        callAudioStatus()?.endsWith(" endpoint=${ShellCallAudio.OPEN_IDENTITY_UNCONFIRMED}") == true
+    }.getOrDefault(false)
 
     fun openCallAudio(owner: IBinder, token: Long, callId: String, rate: Int): android.os.ParcelFileDescriptor? =
         service?.openCallAudio(owner, token, callId, rate)
