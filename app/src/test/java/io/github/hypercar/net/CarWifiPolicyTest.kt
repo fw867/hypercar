@@ -5,6 +5,20 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CarWifiPolicyTest {
+    @Test fun aVisibleStationSsidDuringAuthenticationIsJoiningEvidence() {
+        val state = android.net.wifi.SupplicantState.FOUR_WAY_HANDSHAKE
+        assertEquals("Car AP", CarWifiPolicy.joiningStationSsid("\"Car AP\"", state))
+        assertEquals("Car AP", CarWifiPolicy.joiningStationSsid("Car AP", android.net.wifi.SupplicantState.AUTHENTICATING))
+        assertNull(CarWifiPolicy.joiningStationSsid("<unknown ssid>", state))
+        assertNull(CarWifiPolicy.joiningStationSsid("\"Car AP\"", android.net.wifi.SupplicantState.SCANNING))
+        assertNull(CarWifiPolicy.joiningStationSsid("\"Car AP\"", android.net.wifi.SupplicantState.DISCONNECTED))
+    }
+
+    @Test fun authenticatingStationCannotIdentifyTheCurrentlyConnectedNetwork() {
+        assertNull(CarWifiPolicy.connectedStationSsid("\"Car AP\"", android.net.wifi.SupplicantState.AUTHENTICATING))
+        assertEquals("Car AP", CarWifiPolicy.connectedStationSsid("\"Car AP\"", android.net.wifi.SupplicantState.COMPLETED))
+    }
+
     @Test fun usableCarWifiAddressesExcludePlaceholdersButKeepIpv6LinkLocal() {
         for (value in listOf("0.0.0.0", "127.0.0.1", "169.254.1.2", "224.0.0.251", "::", "::1", "ff02::fb")) {
             assertFalse(value, CarWifiPolicy.isUsableAddress(InetAddress.getByName(value)))

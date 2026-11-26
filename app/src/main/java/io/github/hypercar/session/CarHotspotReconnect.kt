@@ -26,6 +26,11 @@ internal object CarHotspotReconnect {
     // Keep the original alias and directory so upgrades can read existing BMW caches.
     private const val KEY_ALIAS = "bmw-local-wifi"
     private const val NONCE_BYTES = 12
+    private const val SYSTEM_AUTOJOIN_GRACE_MILLIS = 8_000L
+
+    fun systemAutojoinWaitMillis(edge: AclTrigger.Edge?, now: Long, savedAutojoin: Boolean): Long =
+        if (edge == null || !savedAutojoin) 0L
+        else (SYSTEM_AUTOJOIN_GRACE_MILLIS - (now - edge.observedAt)).coerceIn(0, SYSTEM_AUTOJOIN_GRACE_MILLIS)
 
     class Credentials(val ssid: String, val passphrase: String, val securityType: Int? = null) {
         internal fun encode(): ByteArray = ByteArrayOutputStream().apply {

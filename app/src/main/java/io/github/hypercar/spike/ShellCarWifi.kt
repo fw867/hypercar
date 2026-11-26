@@ -5,11 +5,33 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.AttributionSource
 import android.net.ConnectivityManager
+import android.net.wifi.SupplicantState
 import android.net.wifi.WifiManager
 import android.os.Looper
+import io.github.hypercar.net.CarWifiPolicy
 
 /** Shell-attributed managers used by the app-owned, reversible Wi-Fi selection lease. */
 object ShellCarWifi {
+    internal fun hasSavedWifiWithAutojoin(ssid: String): Boolean {
+        if (ssid.isBlank()) return false
+        val (wifi, _) = managers()
+        val saved = try { wifi.configuredNetworks.orEmpty() }
+        catch (_: SecurityException) { return false }
+        return saved.any { config ->
+            config.networkId >= 0 && CarWifiPolicy.visibleSsid(config.SSID) == ssid &&
+                config.javaClass.getField("allowAutojoin").getBoolean(config)
+        }
+    }
+
+    internal fun isWifiStationJoiningOrConnected(ssid: String): Boolean {
+        if (ssid.isBlank()) return false
+        val (wifi, _) = managers()
+        val station = (try { wifi.connectionInfo } catch (_: SecurityException) { return false }) ?: return false
+        val name = if (station.supplicantState == SupplicantState.COMPLETED) CarWifiPolicy.visibleSsid(station.ssid)
+        else CarWifiPolicy.joiningStationSsid(station.ssid, station.supplicantState)
+        return name == ssid
+    }
+
     internal fun managers(): Pair<WifiManager, ConnectivityManager> {
         if (Looper.myLooper() == null) Looper.prepare()
         val at = Class.forName("android.app.ActivityThread")

@@ -46,6 +46,14 @@ class BluetoothHotspotTest {
         assertNull(ap.association(mapOf(7 to "home"), ssid).network)
     }
 
+    @Test fun authenticatingCarHotspotDoesNotClaimTheOldRedactedNetwork() {
+        val ap = BluetoothHotspot.fromPeer(car, ssid)!!
+        val pending = ap.association(mapOf(7 to null), connectedStationSsid = null, joiningStationSsid = ssid)
+        assertTrue(pending.associated)
+        assertNull(pending.network)
+        assertEquals(8, ap.association(mapOf(7 to null, 8 to ssid), null, ssid).network)
+    }
+
     @Test fun pendingAssociationKeepsTheExistingLinkWhenAndroidNeverExposesAUsableNetwork() = runTest {
         val result = BluetoothHotspot.awaitReadyAssociation<Int>(
             isCurrent = { true },

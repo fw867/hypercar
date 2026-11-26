@@ -260,8 +260,6 @@ class RemoteProfilesTest {
         })
         val remote = RemoteProfiles.parse(config).associateBy { it.id }
         assertEquals(HeadUnitProfiles.builtin.map { it.id }.toSet(), remote.keys)
-        assertTrue(HeadUnitProfiles.builtin.all { it.verified })
-        assertTrue(remote.values.all { it.verified })
         assertEquals(10716, remote.getValue(HeadUnitProfiles.MOTORCYCLE_ID).minVersionCode)
         for (builtin in HeadUnitProfiles.builtin) {
             // Display copy may differ, transport and lifecycle policies must not drift.

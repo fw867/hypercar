@@ -1,6 +1,6 @@
 # 车机档案与验证范围
 
-更新于 2026-11-24。远程档案由 [profiles/headunits.json](../profiles/headunits.json) 下发。
+更新于 2026-11-26。远程档案由 [profiles/headunits.json](../profiles/headunits.json) 下发。
 
 当前编码策略：所有档案默认HEVC优先，保留显式H.264选择；手机缺少硬件HEVC Main/Surface编码器，或本轮会话未明确启用HEVC时使用H.264。ID9、MBUX兼容档案不再按车型强制移除HEVC，其余认证、启动顺序、音频和缓冲能力策略保持。旧章节的“ID9关闭HEVC/默认H.264”为当时验证阶段记录，当前规则见[视频策略](VIDEO-STREAM-REVIEW.md)。这不构成所有车型HEVC实车通过的结论。
 
@@ -18,6 +18,7 @@
 | winplay | false | true | false | 校验 deviceID，优先使用 mDNS 公告端口 |
 | audi_mib3 | true | true | false | mDNS 优先，兼容晚到的端点 |
 | volkswagen_mib | false | true | true | 在当前目标 Wi-Fi 广播，等待本轮 ctrl 邀请 |
+| citroen_generic | false | true | true | 等待车机邀请或当前 iAP2 端点，未声明端口时用 7000 |
 | mercedes_mbux | false | true | true | 使用本轮 iAP2 端点，单次 RECORD 后协商屏幕与音频 |
 
 MGU BMW/generic/Audi 启用0x4300、EA及0x4E0E；大众/奔驰启用0x4300、0x4E0E但不主动打开EA；WinPlay关闭三项。ID6 仅启用0x4300，不套用MGU的EA、传输标识及SAP引导；nbtAudioFirst只允许ID6启用，禁止与ID9/MBUX前置策略混用。全部回复电源更新，不因CarPlay窗口关闭就主动中止。音频配置保护只涉及HFP/A2DP，不能因此提前断掉RFCOMM控制链。
@@ -51,6 +52,10 @@ useScreenResourceLifecycle 默认false；有效值为档案值 OR 用户开关�
 参考 mcarplay 的 VW4131/VW4211（ID.7、帕萨特2025）线索。必须明确目标车机才在当前Wi-Fi提前广播，不据此写入成功配对历史。ctrl邀请须属于当前Network且在20秒内，控制连接前后复核；过期候选关闭。20秒是兼容性经验，不是协议常量。失败后保留广播及蓝牙，等待新邀请，不能复用已消耗邀请。
 
 CarLetter 接收端的音频处理见[音频](AUDIO.md)。
+
+## 雪铁龙
+
+「雪铁龙 Citroën 通用」参考[凡尔赛 C5 X 的连接日志](https://github.com/fw867/hypercar/issues/122)。该样本的 Marelli CARLINE_1 车机通过 `0x5703` 提供热点凭据，随后发送控制邀请，并在 TCP 7000 上成功投屏。档案在同一轮连接中发送 CarPlay 可用性和传输标识，保留蓝牙配置文件。端口和音视频优先采用车机的有效声明，缺少控制端口时使用 7000。新档案标记为未实测，待验证冷启动能否一次连上，以及蓝牙通话后的媒体恢复。
 
 ## 奥迪
 

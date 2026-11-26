@@ -307,6 +307,25 @@ object HeadUnitProfiles {
         pairingHint = "先完成系统蓝牙配对，在「目标车机」选定这台大众车机；首次请手动连接车机 Wi-Fi，并在车机确认 Apple CarPlay。",
     )
 
+    /** Issue #122 observed the C5 X Marelli receiver using 0x5703, a ctrl invite, and TCP 7000. */
+    val CITROEN = HeadUnitProfile(
+        id = "citroen_generic",
+        label = "雪铁龙 Citroën 通用",
+        model = "无线 CarPlay",
+        listing = HeadUnitListing(
+            brandId = "citroen", brandName = "雪铁龙 Citroën", platformName = "My Citroën / Marelli",
+            vehicleModels = listOf("凡尔赛 C5 X"), aliases = listOf("Citroen", "C5X", "CARLINE_1"),
+        ),
+        notes = "参考凡尔赛 C5 X 连接日志。保留蓝牙，等待车机激活；未提供控制端口时尝试 7000。",
+        verified = false,
+        sendCarPlayAvailability = true,
+        sendTransportIdentifier = true,
+        dropProfilesBeforeIap2 = false,
+        requireAirplayActivation = true,
+        fallbackAirplayPorts = listOf(7000),
+        pairingHint = "先完成手机蓝牙配对并在 HyperCar 启动连接，再从车机的 Apple CarPlay 或 Mirror Screen 中选择这台手机。",
+    )
+
     /** MB_D-PP reference policy replaces the unsuccessful MB_E-P-4 experiment; keep the saved ID. */
     val MERCEDES_MBUX = HeadUnitProfile(
         id = "mercedes_mbux",
@@ -335,7 +354,7 @@ object HeadUnitProfiles {
 
     /** 内置档案（出厂就有的，断网也一定在）。宝马排第一：它是默认档案。 */
     val builtin: List<HeadUnitProfile> =
-        listOf(BMW_ID85, BMW_ID6, BMW_ID9, GENERIC, MOTORCYCLE, WINPLAY, AUDI_MIB3, VOLKSWAGEN, MERCEDES_MBUX)
+        listOf(BMW_ID85, BMW_ID6, BMW_ID9, GENERIC, MOTORCYCLE, WINPLAY, AUDI_MIB3, VOLKSWAGEN, CITROEN, MERCEDES_MBUX)
 
     /**
      * 全部可用档案 = 内置 + 远程（GitHub 下发的 `profiles/headunits.json`）。

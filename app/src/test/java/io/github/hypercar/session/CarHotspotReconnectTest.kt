@@ -20,6 +20,15 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CarHotspotReconnectTest {
+    @Test fun onlyAutomaticCacheRestoreGivesSavedSystemWifiAnAssociationWindow() {
+        val edge = CarHotspotReconnect.AclTrigger.Edge("AA:BB:CC:DD:EE:01", 10_000)
+        assertEquals(6_000L, CarHotspotReconnect.systemAutojoinWaitMillis(edge, 12_000, true))
+        assertEquals(1L, CarHotspotReconnect.systemAutojoinWaitMillis(edge, 17_999, true))
+        assertEquals(0L, CarHotspotReconnect.systemAutojoinWaitMillis(edge, 18_000, true))
+        assertEquals(0L, CarHotspotReconnect.systemAutojoinWaitMillis(edge, 12_000, false))
+        assertEquals(0L, CarHotspotReconnect.systemAutojoinWaitMillis(null, 12_000, true))
+    }
+
     @Test fun recoveryAcceptsNewSecurityWithTheSameSsidAndPassword() = kotlinx.coroutines.test.runTest {
         val hotspot = checkNotNull(BluetoothHotspot.fromPeer("10:11:22:33:44:55", "CAR-WIFI"))
         val old = CarPlayEndpoint(hotspot.ssid, "fixture-pass", 0, null, null, null, emptyList(), null,

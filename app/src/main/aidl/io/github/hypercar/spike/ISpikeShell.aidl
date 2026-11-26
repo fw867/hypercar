@@ -72,4 +72,8 @@ interface ISpikeShell {
     void closeCallAudio(long token);
     String activeCallAudioIdentity();
     String callAudioStatus();
+
+    /** Read-only check for one exact SSID. */
+    boolean hasSavedWifiWithAutojoin(String ssid);
+    boolean isWifiStationJoiningOrConnected(String ssid);
 }

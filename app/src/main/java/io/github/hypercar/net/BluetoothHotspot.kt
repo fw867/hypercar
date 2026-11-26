@@ -41,10 +41,10 @@ data class BluetoothHotspot private constructor(val peer: String, val ssid: Stri
 
     data class Association<N>(val associated: Boolean, val network: N?)
 
-    fun <N> association(wifi: Map<N, String?>, connectedStationSsid: String?): Association<N> {
+    fun <N> association(wifi: Map<N, String?>, connectedStationSsid: String?, joiningStationSsid: String? = null): Association<N> {
         val exact = wifi.filterValues { it == ssid }
         if (exact.isNotEmpty()) return Association(true, exact.keys.singleOrNull())
-        if (connectedStationSsid != ssid) return Association(false, null)
+        if (connectedStationSsid != ssid) return Association(joiningStationSsid == ssid, null)
         // A system STA can appear before Android publishes its Network/addresses. On multi-STA
         // devices a redacted handle is attributable only when it is the sole Wi-Fi candidate.
         return Association(true, wifi.entries.singleOrNull()?.takeIf { it.value == null }?.key)

@@ -105,6 +105,7 @@ class WifiJoiner(
         rememberedBssid: String? = null,
         securityType: Int? = null,
         channel: Int? = null,
+        mayStartRequest: suspend () -> Boolean = { true },
         deviceIdentifierHint: () -> String? = { null }): JoinResult {
         lastFailureReason = null
         hintRetryAllowed = false
@@ -172,7 +173,7 @@ class WifiJoiner(
         diagnose("join_policy declared_security=${securityType ?: "legacy"} selected_security=$security declared_channel=${channel ?: 0} protocol_frequency=${protocolFrequency ?: 0}")
         return WifiApRetry.join(hint, SPECIFIER_WAIT_MS, admission::isCurrent, { currentNetwork != null },
             protocolFrequency = protocolFrequency, retryAllowed = { hintRetryAllowed && isWifiEnabled() },
-            now = SystemClock::uptimeMillis) { target, budget ->
+            now = SystemClock::uptimeMillis, mayStartRequest = mayStartRequest) { target, budget ->
             if (!firstAttempt) {
                 diagnose("hint_fallback=${target.source} reason=hint_request_failed; no live association replaced")
                 lastFailureReason = null

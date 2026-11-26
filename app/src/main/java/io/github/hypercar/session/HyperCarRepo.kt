@@ -2742,7 +2742,9 @@ object HyperCarRepo {
         }
     }
 
-    private suspend fun hotspotAssociation(context: Context, hotspot: BluetoothHotspot): BluetoothHotspot.Association<Network> {
+    private suspend fun hotspotAssociation(context: Context, hotspot: BluetoothHotspot,
+        includeJoining: Boolean = false,
+    ): BluetoothHotspot.Association<Network> {
         val cm = context.getSystemService(ConnectivityManager::class.java)
         val candidates = wifiNetworks(context).mapNotNull { network ->
             val caps = cm?.getNetworkCapabilities(network) ?: return@mapNotNull null
@@ -2753,11 +2755,19 @@ object HyperCarRepo {
             network to (name ?: hotspot.ssid.takeIf { owned })
         }.toMap()
         if (hotspot.ssid in candidates.values) return hotspot.association(candidates, null)
-        val station = runCatching { context.applicationContext.getSystemService(android.net.wifi.WifiManager::class.java)?.connectionInfo }.getOrNull()
-        val systemSsid = if (station?.supplicantState == android.net.wifi.SupplicantState.COMPLETED) {
-            CarWifiPolicy.visibleSsid(station.ssid) ?: currentWifiSsid(context)
-        } else null
-        return hotspot.association(candidates, systemSsid)
+        val station = wifiStationInfo(context)
+        val state = station?.supplicantState
+        val connectedSsid = CarWifiPolicy.connectedStationSsid(station?.ssid, state)
+        if (!includeJoining) {
+            val currentSsid = connectedSsid ?: if (state == android.net.wifi.SupplicantState.COMPLETED)
+                currentWifiSsid(context) else null
+            return hotspot.association(candidates, currentSsid)
+        }
+        val joiningSsid = CarWifiPolicy.joiningStationSsid(station?.ssid, state)
+        val shellMatches = connectedSsid == null && joiningSsid == null &&
+            (state == null || state == android.net.wifi.SupplicantState.COMPLETED || CarWifiPolicy.isStationJoining(state)) &&
+            io.github.hypercar.spike.SpikeShell.isWifiStationJoiningOrConnected(hotspot.ssid)
+        return hotspot.association(candidates, connectedSsid, joiningSsid ?: hotspot.ssid.takeIf { shellMatches })
     }
 
     private suspend fun awaitBluetoothHotspotNetwork(context: Context, endpoint: CarPlayEndpoint, attempt: Long,
@@ -3155,12 +3165,27 @@ object HyperCarRepo {
     private suspend fun restoreCarHotspot(
         context: Context,
         receiver: String,
+        acl: CarHotspotReconnect.AclTrigger.Edge?,
         credentials: CarHotspotReconnect.Credentials,
+        savedAutojoin: Boolean,
         advertiser: CarPlayCtrlAdvertiser,
         restoreBlockReason: () -> String?,
         reportSkip: (String) -> Unit,
         submitRequest: (() -> Unit) -> Boolean,
     ) {
+        val hotspot = BluetoothHotspot.fromPeer(receiver, credentials.ssid) ?: return
+        fun current() = restoreBlockReason() == null
+        suspend fun systemAssociationPresent() = hotspotAssociation(context, hotspot, includeJoining = true).associated
+
+        restoreBlockReason()?.let { reportSkip(it); return }
+        val systemWait = CarHotspotReconnect.systemAutojoinWaitMillis(acl, SystemClock.elapsedRealtime(), savedAutojoin)
+        if (systemWait > 0) log("CAR-WIFI-RESUME: 系统已保存该热点并开启自动加入，优先等待系统，最多 ${systemWait}ms")
+        if (acl != null && io.github.hypercar.net.VerifiedWifiWait.await(systemWait, SystemClock::elapsedRealtime, ::current) {
+                Unit.takeIf { systemAssociationPresent() }
+            } != null) {
+            reportSkip("system_association_in_progress")
+            return
+        }
         val cm = context.getSystemService(ConnectivityManager::class.java)
         if (cm == null) { reportSkip("connectivity_manager_unavailable"); return }
         val identity = CarWifiRequestIdentity(credentials.ssid, credentials.passphrase, credentials.securityType)
@@ -3191,15 +3216,24 @@ object HyperCarRepo {
         }
         try {
             log("CAR-WIFI-RESUME: 尝试重新接入已配对车机的专用 Wi-Fi")
+            var yieldedToSystem = false
             val result = withTimeoutOrNull(12_000) {
                 joiner.joinCarHotspotSilently(credentials.ssid, credentials.passphrase,
                     securityType = credentials.securityType,
                     rememberedBssid = SettingsStore.carHotspotBssid(receiver, credentials.ssid),
-                    submitRequest = { request -> restoreBlockReason() == null && submitRequest(request) })
+                    mayStartRequest = {
+                        yieldedToSystem = acl != null && systemAssociationPresent()
+                        !yieldedToSystem
+                    },
+                    submitRequest = { request -> current() && submitRequest(request) })
             }
             val network = (result as? WifiJoiner.JoinResult.Joined)?.network
             if (network == null) {
-                reportSkip(restoreBlockReason() ?: if (result == null) "join_timeout" else "join_failed")
+                reportSkip(restoreBlockReason() ?: when {
+                    yieldedToSystem -> "system_association_in_progress"
+                    result == null -> "join_timeout"
+                    else -> "join_failed"
+                })
                 return
             }
             autoConnectChanges.lock()
@@ -3315,14 +3349,18 @@ object HyperCarRepo {
      * 缺定位权限时它会返回 `<unknown ssid>`（HyperOS 常见），此时退回 Shizuku 的
      * `cmd wifi status`（与 WifiJoiner 同源的解析，一直可读）。
      */
-    private fun wifiSsidFromApi(context: Context): String? =
-            runCatching {
-                val wifi = context.getSystemService(android.net.wifi.WifiManager::class.java)
-                CarWifiPolicy.visibleSsid(wifi?.connectionInfo?.ssid)
-            }.getOrNull()
+    private fun wifiStationInfo(context: Context): android.net.wifi.WifiInfo? = runCatching {
+        context.applicationContext.getSystemService(android.net.wifi.WifiManager::class.java)?.connectionInfo
+    }.getOrNull()
+
+    private fun wifiSsidFromApi(context: Context): String? = wifiStationInfo(context)?.let {
+        CarWifiPolicy.connectedStationSsid(it.ssid, it.supplicantState)
+    }
 
     private suspend fun currentWifiSsid(context: Context): String? {
-        wifiSsidFromApi(context)?.let { return it }
+        val station = wifiStationInfo(context)
+        if (CarWifiPolicy.isStationJoining(station?.supplicantState)) return null
+        CarWifiPolicy.connectedStationSsid(station?.ssid, station?.supplicantState)?.let { return it }
         if (!ShizukuTools.isReady) return null
         val out = runCatching { ShizukuTools.exec("cmd wifi status", 3_000) }.getOrNull()?.out
         val match = out?.let { Regex("connected\\s+to\\s+\"([^\"]*)\"").find(it) }
@@ -4238,6 +4276,7 @@ object HyperCarRepo {
         var cachedWifiReceiver: String? = null
         var cachedWifiJob: Job? = null
         var cacheAcl: CarHotspotReconnect.AclTrigger.Edge? = null
+        var savedAutojoinForAcl: Triple<CarHotspotReconnect.AclTrigger.Edge, String, Boolean>? = null
         var lastCacheSkip: String? = null
         fun logCacheSkip(reason: String) {
             if (lastCacheSkip == reason) return
@@ -4318,7 +4357,17 @@ object HyperCarRepo {
                     wifiJoiner != null -> "existing_wifi_request"
                     else -> carHotspotCacheBlockReason(context, profileId, receiver)
                 }
-                restoreCarHotspot(context, receiver, saved, advertiser, ::restoreBlockReason, ::logCacheSkip) { request ->
+                restoreBlockReason()?.let { logCacheSkip(it); return@launch }
+                val savedAutojoin = if (acl != null && ShizukuTools.isReady) {
+                    savedAutojoinForAcl?.takeIf { it.first === acl && it.second == saved.ssid }?.third ?: run {
+                        val remaining = CarHotspotReconnect.systemAutojoinWaitMillis(acl,
+                            SystemClock.elapsedRealtime(), savedAutojoin = true)
+                        io.github.hypercar.spike.SpikeShell.hasSavedWifiWithAutojoin(saved.ssid, remaining)?.also {
+                            savedAutojoinForAcl = Triple(acl, saved.ssid, it)
+                        } ?: false
+                    }
+                } else false
+                restoreCarHotspot(context, receiver, acl, saved, savedAutojoin, advertiser, ::restoreBlockReason, ::logCacheSkip) { request ->
                     submitCachedHotspot(trigger, request)
                 }
             }

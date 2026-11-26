@@ -9,7 +9,11 @@ import android.view.Surface
 import android.view.MotionEvent
 import io.github.hypercar.BuildConfig
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
@@ -30,6 +34,8 @@ object SpikeShell {
     @Volatile private var connection: ServiceConnection? = null
     private var args: Shizuku.UserServiceArgs? = null
     private val bindMutex = Mutex()
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val wifiProbeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
     private val displayOwner = Binder()
     @Volatile var isBinding: Boolean = false
         private set
@@ -60,6 +66,21 @@ object SpikeShell {
         call("startWifiSelection") { it.startWifiSelection(owner, token, ssid, bssid, uid, protocolFrequency) }
     fun stopWifiSelection(token: String): String =
         call("stopWifiSelection") { it.stopWifiSelection(token) }
+
+    suspend fun hasSavedWifiWithAutojoin(ssid: String, remainingMs: Long): Boolean? =
+        readWifiState(remainingMs.coerceAtMost(200L)) { it.hasSavedWifiWithAutojoin(ssid) }
+
+    suspend fun isWifiStationJoiningOrConnected(ssid: String): Boolean =
+        readWifiState(200L) { it.isWifiStationJoiningOrConnected(ssid) } == true
+
+    private suspend fun readWifiState(waitMs: Long, query: (ISpikeShell) -> Boolean): Boolean? {
+        val bound = service ?: return null
+        if (waitMs <= 0) return null
+        // Binder reads cannot be interrupted. A stalled read must not hold up a new endpoint.
+        val read = wifiProbeScope.async { runCatching { query(bound) }.getOrNull() }
+        return try { withTimeoutOrNull(waitMs) { read.await() } }
+        finally { read.cancel() }
+    }
 
     fun updateDisplaySurface(id: Int, surface: Surface?, width: Int, height: Int, dpi: Int): String =
         service?.updateDisplaySurface(id, surface, width, height, dpi) ?: "ERR shell disconnected"
@@ -125,7 +146,7 @@ object SpikeShell {
             .processNameSuffix("spike")
             .debuggable(BuildConfig.DEBUG)
             // AIDL revisions also distinguish local installs sharing the same versionCode.
-            .version(BuildConfig.VERSION_CODE + 10)
+            .version(BuildConfig.VERSION_CODE + 11)
         args = a
         // 注意：**不要**在 Main 线程调 bindUserService。Shizuku 13.6 在某些机型上会同步等待
         // 用户服务把 binder 交回来；放主线程会与「回调也要主线程」互相等死（真机踩过：

@@ -24,6 +24,7 @@ internal object WifiApRetry {
     suspend fun <T> join(hint: WifiApHint?, normalWaitMs: Long, current: () -> Boolean,
         associated: () -> Boolean, protocolFrequency: Int? = null, retryAllowed: () -> Boolean = { true },
         now: () -> Long = { System.nanoTime() / 1_000_000 },
+        mayStartRequest: suspend () -> Boolean = { true },
         attempt: suspend (Target, Budget) -> T?): T? {
         val started = now()
         val deadline = started + normalWaitMs
@@ -41,13 +42,14 @@ internal object WifiApRetry {
             else -> null
         }
         val hintCheck = checkAfter?.let { started + it }?.takeIf { it < deadline }
+        if (!mayStartRequest()) return null
         // Android applies the requestNetwork timeout before the app can inspect STA progress.
         val result = attempt(first, Budget(normalWaitMs, deadline, hintCheck))
         if (result != null || fallback == null) return result
         currentCoroutineContext().ensureActive()
         // A delivered request, including one still waiting for DHCP/capabilities, belongs
         // to the Wi-Fi lifetime. Do not withdraw or replace it to retry an AP hint.
-        if (!current() || associated() || !retryAllowed()) return null
+        if (!current() || associated() || !retryAllowed() || !mayStartRequest()) return null
         val fallbackWait = (deadline - now()).coerceIn(0, normalWaitMs)
         if (fallbackWait == 0L) return null
         return attempt(fallback, Budget(fallbackWait, deadline))

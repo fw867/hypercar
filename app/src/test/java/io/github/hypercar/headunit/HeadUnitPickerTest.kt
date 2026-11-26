@@ -26,6 +26,17 @@ class HeadUnitPickerTest {
         assertEquals(listOf(HeadUnitProfiles.MOTORCYCLE), HeadUnitPicker.search(profiles, "突破者 m2pro"))
     }
 
+    @Test fun citroenIsListedUnderItsBrandAndSearchableByTheC5XSample() {
+        val profiles = HeadUnitProfiles.builtin
+        val group = HeadUnitPicker.groups(profiles).single { it.id == "brand:citroen" }
+        val profile = group.profiles.single()
+        assertEquals("雪铁龙 Citroën", group.label)
+        assertEquals("citroen_generic", profile.id)
+        for (query in listOf("凡尔赛 C5 X", "Citroen C5X", "Marelli", "CARLINE_1")) {
+            assertEquals(query, listOf(profile), HeadUnitPicker.search(profiles, query))
+        }
+    }
+
     @Test fun groupingUsesRemoteMetadataButSearchOnlySeesEligibleEntries() {
         val snapshot = RemoteProfiles.parseSnapshot("""{"_schema":13,"profiles":[
             {"id":"ford_one","label":"SYNC 4","category":"car","brandId":"ford","brandName":"福特 Ford",

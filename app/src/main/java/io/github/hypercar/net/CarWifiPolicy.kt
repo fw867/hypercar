@@ -2,6 +2,7 @@ package io.github.hypercar.net
 
 import android.net.NetworkCapabilities
 import android.net.LinkProperties
+import android.net.wifi.SupplicantState
 import android.net.wifi.WifiManager
 import java.net.Inet6Address
 import java.net.InetAddress
@@ -10,6 +11,18 @@ import java.net.InetAddress
 internal object CarWifiPolicy {
     fun visibleSsid(value: String?): String? =
         value?.takeUnless { it == WifiManager.UNKNOWN_SSID }?.removeSurrounding("\"")?.takeUnless { it.isBlank() }
+
+    fun isStationJoining(state: SupplicantState?): Boolean = when (state) {
+        SupplicantState.AUTHENTICATING, SupplicantState.ASSOCIATING, SupplicantState.ASSOCIATED,
+        SupplicantState.FOUR_WAY_HANDSHAKE, SupplicantState.GROUP_HANDSHAKE -> true
+        else -> false
+    }
+
+    fun joiningStationSsid(value: String?, state: SupplicantState?): String? =
+        if (isStationJoining(state)) visibleSsid(value) else null
+
+    fun connectedStationSsid(value: String?, state: SupplicantState?): String? =
+        if (state == SupplicantState.COMPLETED) visibleSsid(value) else null
 
     fun hasUsableAddress(link: LinkProperties?): Boolean =
         link?.linkAddresses?.any { isUsableAddress(it.address) } == true

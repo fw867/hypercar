@@ -17,12 +17,14 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.res.painterResource
 import io.github.hypercar.R
@@ -46,6 +48,7 @@ fun CarBrandBadge(profileId: String, label: String, modifier: Modifier = Modifie
         "mercedes" in identity || "奔驰" in identity -> "Mercedes-Benz"
         "audi" in identity || "奥迪" in identity -> "Audi"
         "volkswagen" in identity || "大众" in identity -> "Volkswagen"
+        "citroen" in identity || "citroën" in identity || "雪铁龙" in identity -> "Citroën"
         "winplay" in identity || "diplay" in identity -> "desktop"
         else -> "generic"
     }
@@ -102,6 +105,24 @@ fun CarBrandBadge(profileId: String, label: String, modifier: Modifier = Modifie
                             val w = Path().apply { moveTo(9f, 22f); lineTo(23f, 51f); lineTo(32f, 36f); lineTo(41f, 51f); lineTo(55f, 22f) }
                             drawPath(v, silver, style = Stroke(3.8f, cap = StrokeCap.Round))
                             drawPath(w, silver, style = Stroke(3.8f, cap = StrokeCap.Round))
+                        }
+                        "Citroën" -> {
+                            val oval = Path().apply { addOval(Rect(9f, 3f, 55f, 61f)) }
+                            clipPath(oval) {
+                                for (offset in listOf(0f, 12f)) {
+                                    val chevron = Path().apply {
+                                        moveTo(4f, 34f + offset)
+                                        lineTo(32f, 15f + offset)
+                                        lineTo(60f, 34f + offset)
+                                        lineTo(60f, 41f + offset)
+                                        lineTo(32f, 22f + offset)
+                                        lineTo(4f, 41f + offset)
+                                        close()
+                                    }
+                                    drawPath(chevron, silver)
+                                }
+                            }
+                            drawOval(silver, Offset(10.5f, 4.5f), Size(43f, 55f), style = Stroke(3f))
                         }
                     }
                 }

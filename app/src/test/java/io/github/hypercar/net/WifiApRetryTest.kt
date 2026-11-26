@@ -156,6 +156,21 @@ class WifiApRetryTest {
         assertEquals(1, calls)
     }
 
+    @Test fun systemJoiningTheTargetPreventsEitherRequestBeforeItIsSubmitted() = runTest {
+        for (systemAlreadyJoining in listOf(true, false)) {
+            var systemJoining = systemAlreadyJoining
+            val requests = mutableListOf<WifiApHint?>()
+            val network = WifiApRetry.join<String>(history, 60_000, { true }, { false },
+                mayStartRequest = { !systemJoining }) { target, _ ->
+                requests += target.ap
+                systemJoining = true // Android starts autojoin after the first request is released.
+                null
+            }
+            assertNull(network)
+            assertEquals(if (systemAlreadyJoining) emptyList() else listOf(history), requests)
+        }
+    }
+
     @Test fun targetSwitchAndDeliveredAssociationBothPreventRetry() = runTest {
         for (delivered in listOf(false, true)) {
             var current = true

@@ -24,6 +24,21 @@ class HeadUnitActivationPolicyTest {
         assertFalse(vw.dropProfilesBeforeIap2)
     }
 
+    @Test fun citroenUsesPort7000AndRetainsBothActivationPaths() {
+        val citroen = HeadUnitProfiles.builtin.single { it.id == "citroen_generic" }.connectionPolicy()
+        assertFalse(citroen.verified)
+        assertTrue(citroen.requireAirplayActivation)
+        assertTrue(citroen.sendCarPlayAvailability)
+        assertTrue(citroen.sendTransportIdentifier)
+        assertTrue(citroen.preferMdnsAirplay)
+        assertFalse(citroen.requireFreshCtrlInvite)
+        assertFalse(citroen.advertiseOnCurrentWifi)
+        assertFalse(citroen.dropProfilesBeforeIap2)
+        assertFalse(citroen.openEaSessions)
+        assertEquals(listOf(7000), citroen.fallbackAirplayPorts)
+        assertFalse(ReceiverCompatibility.isDesktopReceiver(citroen.id, "Marelli CARLINE_1"))
+    }
+
     @Test fun volkswagenRejectsOldMissingAndFutureInvites() {
         val vw = HeadUnitProfiles.VOLKSWAGEN
         assertFalse(HeadUnitActivationPolicy.acceptsInvitation(vw, 0, 50_000))

@@ -80,9 +80,23 @@ class SpikeShellService : ISpikeShell.Stub {
         return try { wifiSelection.stop(token) }
         finally { android.os.Binder.restoreCallingIdentity(identity) }
     }
+
+    override fun hasSavedWifiWithAutojoin(ssid: String): Boolean {
+        if (android.os.Binder.getCallingUid() != appContext?.applicationInfo?.uid) return false
+        val identity = android.os.Binder.clearCallingIdentity()
+        return try { runCatching { ShellCarWifi.hasSavedWifiWithAutojoin(ssid) }.getOrDefault(false) }
+        finally { android.os.Binder.restoreCallingIdentity(identity) }
+    }
     override fun startBluetoothDiscoverable(owner: IBinder, token: String, seconds: Int): String {
         val identity = android.os.Binder.clearCallingIdentity()
         return try { bluetoothDiscovery.start(appContext, owner, token, seconds) }
+        finally { android.os.Binder.restoreCallingIdentity(identity) }
+    }
+
+    override fun isWifiStationJoiningOrConnected(ssid: String): Boolean {
+        if (android.os.Binder.getCallingUid() != appContext?.applicationInfo?.uid) return false
+        val identity = android.os.Binder.clearCallingIdentity()
+        return try { runCatching { ShellCarWifi.isWifiStationJoiningOrConnected(ssid) }.getOrDefault(false) }
         finally { android.os.Binder.restoreCallingIdentity(identity) }
     }
 
