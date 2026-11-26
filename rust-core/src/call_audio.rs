@@ -1,6 +1,6 @@
 //! A CarPlay main-audio stream for an active cellular call. Local PCM belongs
 //! to the shell call-redirection endpoints and never enters the media/VR mixer.
-use std::{collections::VecDeque, os::unix::net::UnixStream as LocalSocket, sync::atomic::{AtomicBool, AtomicI64, Ordering}, time::Duration};
+use std::{collections::VecDeque, os::{fd::{AsRawFd, RawFd}, unix::net::UnixStream as LocalSocket}, sync::atomic::{AtomicBool, AtomicI64, Ordering}, time::Duration};
 use parking_lot::Mutex;
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::UnixStream, sync::mpsc};
 use crate::{audio_out::AudioOut, aux_audio::Session, bplist::{self, Value}, mic_probe, rtsp::RtspMessage};
@@ -41,10 +41,17 @@ static NEXT_TOKEN: AtomicI64 = AtomicI64::new(1);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(i32)]
-pub(crate) enum Retry { #[default] None = 0, SameRate = 1, NextRate = 2 }
+pub(crate) enum OfferResult {
+    #[default]
+    Pending = 0,
+    SameRate = 1,
+    NextRate = 2,
+    Rejected = 3,
+    Withdrawn = 4,
+}
 
 pub(crate) struct Offer { pub attempt: i64, pub rate: u32, pub socket: LocalSocket }
-struct Inbox { token: i64, sender: mpsc::Sender<Offer>, retry: Option<(i64, Retry)> }
+struct Inbox { token: i64, sender: mpsc::Sender<Offer>, result: Option<(i64, OfferResult)> }
 static OFFER: Mutex<Option<Inbox>> = Mutex::new(None);
 
 pub(crate) fn armed(token: i64) -> bool {
@@ -57,16 +64,18 @@ pub(crate) fn offer(token: i64, attempt: i64, rate: u32, socket: LocalSocket) ->
         && inbox.sender.try_send(Offer { attempt, rate, socket }).is_ok())
 }
 
-pub(crate) fn take_retry_reason(token: i64, attempt: i64) -> Retry {
+pub(crate) fn take_result(token: i64, attempt: i64) -> OfferResult {
     let mut active = OFFER.lock();
-    let Some(inbox) = active.as_mut().filter(|inbox| inbox.token == token && inbox.retry.is_some_and(|(id, _)| id == attempt)) else {
-        return Retry::None;
+    let Some(inbox) = active.as_mut().filter(|inbox| inbox.token == token && inbox.result.is_some_and(|(id, _)| id == attempt)) else {
+        return OfferResult::Pending;
     };
-    inbox.retry.take().map_or(Retry::None, |(_, retry)| retry)
+    inbox.result.take().map_or(OfferResult::Pending, |(_, result)| result)
 }
 
 #[cfg(test)]
-pub(crate) fn take_retry(token: i64, attempt: i64) -> bool { take_retry_reason(token, attempt) != Retry::None }
+pub(crate) fn take_retry(token: i64, attempt: i64) -> bool {
+    matches!(take_result(token, attempt), OfferResult::SameRate | OfferResult::NextRate)
+}
 
 #[cfg(test)]
 pub(crate) fn token_for_test() -> Option<i64> { OFFER.lock().as_ref().map(|inbox| inbox.token) }
@@ -77,23 +86,61 @@ impl Offers {
     pub fn arm(format: Format) -> Self {
         let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(1);
-        *OFFER.lock() = Some(Inbox { token, sender: tx, retry: None });
+        *OFFER.lock() = Some(Inbox { token, sender: tx, result: None });
         crate::emit_state("call_audio_armed", &format!("{token} {}", format.rate));
         Self { token, rx }
     }
 
-    pub fn request_retry(&self, attempt: i64, retry: Retry) {
-        if retry == Retry::None { return; }
+    pub fn complete(&self, attempt: i64, result: OfferResult) {
         if let Some(inbox) = OFFER.lock().as_mut().filter(|inbox| inbox.token == self.token) {
-            inbox.retry = Some((attempt, retry));
+            inbox.result = Some((attempt, result));
         }
+    }
+
+    pub fn finish_before_setup(&self, attempt: i64, outcome: OfferResult, reason: String) {
+        self.report_stopping(attempt, None, &Err(reason));
+        self.complete(attempt, outcome);
+    }
+
+    pub(crate) fn finish_queued_on_shutdown(&mut self) {
+        self.rx.close();
+        while let Ok(Offer { attempt, socket, .. }) = self.rx.try_recv() {
+            drop(socket);
+            self.finish_before_setup(attempt, OfferResult::Withdrawn, "session stopped before dequeuing call offer".into());
+        }
+    }
+
+    pub fn report_stopping(&self, attempt: i64, stream_id: Option<i64>, result: &Result<(), String>) {
+        let reason = result.as_ref().err().map(String::as_str).unwrap_or("session stopped");
+        crate::emit_log(&format!("CALL-AUDIO: telephony stopping token={} offer={attempt} stream={stream_id:?} reason={reason}", self.token));
+        crate::emit_state("call_audio_stopping", &format!("{} offer={attempt}", self.token));
     }
 }
 
 impl Drop for Offers {
     fn drop(&mut self) {
+        // Stop admission before reporting offers that the worker never dequeued.
+        self.finish_queued_on_shutdown();
         let mut offer = OFFER.lock();
         if offer.as_ref().is_some_and(|inbox| inbox.token == self.token) { *offer = None; }
+    }
+}
+
+fn check_phone_endpoint(fd: RawFd) -> Result<(), String> {
+    let mut state = libc::pollfd { fd, events: 0, revents: 0 };
+    loop {
+        // The Unix socket stays alive through this check. A hangup is reported even with unread PCM.
+        let result = unsafe { libc::poll(&mut state, 1, 0) };
+        if result >= 0 {
+            if state.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                return Err("phone downlink PCM endpoint closed".into());
+            }
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(format!("phone PCM endpoint poll failed: {error}"));
+        }
     }
 }
 
@@ -110,10 +157,11 @@ fn setup(format: Format, id: i64, data: u16, control: Option<u16>, info: &Value)
         ("sr", Value::int(format.rate.into())), ("audioLatencyMs", Value::int(latency)),
     ];
     if let Some(port) = control { fields.push(("controlPort", Value::int(port.into()))); }
-    if info.get("extendedFeatures").and_then(Value::as_array).is_none_or(|features| {
+    if info.get("extendedFeatures").and_then(Value::as_array).is_some_and(|features| {
         features.iter().any(|item| item.as_str() == Some("vocoderInfo"))
     }) {
-        fields.push(("vocoderInfo", Value::dict(vec![("sampleRate", Value::int(format.rate.into()))])));
+        // The box declares a 16 kHz vocoder separately from the RTP stream's negotiated clock.
+        fields.push(("vocoderInfo", Value::dict(vec![("sampleRate", Value::real(16_000.0))])));
     }
     bplist::encode(&Value::dict(vec![("streams", Value::array(vec![Value::dict(fields)]))]))
 }
@@ -146,12 +194,12 @@ fn accept(format: Format, id: i64, row: &Value) -> Result<(u16, Option<u16>), St
 
 pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStream,
     loss_generation: u64, stop: impl std::future::Future<Output = ()>, allocated: &mut Option<i64>,
-    pending: &AtomicBool, announced: &mut bool, retryable: &mut Retry,
+    pending: &AtomicBool, announced: &mut bool, outcome: &mut OfferResult,
 ) -> Result<(), String> {
     let mut ownership = session.control.buffered_ownership.subscribe();
     let valid = |state: &crate::buffered_ownership::Ownership| state.owned && state.losses == loss_generation;
     if !valid(&ownership.borrow()) {
-        *retryable = Retry::SameRate;
+        *outcome = OfferResult::SameRate;
         return Err("main audio grant changed before telephony SETUP".into());
     }
     let host = &session.params.car_ip;
@@ -168,10 +216,11 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
     let (id, data, sync) = loop {
         tokio::select! { biased; _ = &mut stop => return Ok(()), _ = std::future::ready(()) => {} }
         if !valid(&ownership.borrow()) {
-            *retryable = Retry::SameRate;
+            *outcome = OfferResult::SameRate;
             return Err("main audio grant changed during telephony SETUP".into());
         }
         if !matches!(local.try_read(&mut [0]), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock) {
+            *outcome = OfferResult::Withdrawn;
             return Err("phone call ended during SETUP".into());
         }
         let id = crate::airplay::random_positive_i64();
@@ -229,23 +278,26 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
     speaker.track_rtp_ownership(&session.control.buffered_ownership);
     let input_key = mic_probe::input_key(&session.shared, id as u64);
     if !valid(&ownership.borrow()) {
-        *retryable = Retry::SameRate;
+        *outcome = OfferResult::SameRate;
         return Err("main audio grant changed during telephony SETUP".into());
     }
     match local.try_read(&mut [0]) {
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-        _ => return Err("phone call ended during SETUP".into()),
+        _ => {
+            *outcome = OfferResult::Withdrawn;
+            return Err("phone call ended during SETUP".into());
+        }
     }
     *announced = true; // An ACK can be lost after the receiver applied the state.
     if !session.resource.set_phone_call(true).await {
-        if !valid(&ownership.borrow()) { *retryable = Retry::SameRate; }
+        if !valid(&ownership.borrow()) { *outcome = OfferResult::SameRate; }
         return Err("phoneCall app state rejected".into());
     }
     tokio::select! {
         biased;
         _ = &mut stop => return Ok(()),
         _ = ownership.changed() => {
-            *retryable = Retry::SameRate;
+            *outcome = OfferResult::SameRate;
             return Err("main audio grant changed before call audio start".into());
         }
         ready = tokio::time::timeout(Duration::from_secs(1), async {
@@ -253,15 +305,16 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
             local.read_u8().await
         }) => {
             if !matches!(ready, Ok(Ok(1))) {
-                *retryable = Retry::NextRate;
+                *outcome = OfferResult::NextRate;
                 return Err("phone call audio did not start".into());
             }
         }
     }
-    *retryable = Retry::SameRate;
+    *outcome = OfferResult::SameRate;
     crate::emit_log(&format!("CALL-AUDIO: telephony SETUP ready type={TYPE} phoneRate={phone_rate} rate={} channels={} opus={}",
         format.rate, format.channels, format.opus));
     let uplink_ownership = ownership.clone();
+    let phone_fd = local.as_raw_fd();
     let (mut downlink, uplink) = local.split();
     let down = async {
         let phone_frames = (format.frames() * phone_rate as usize).div_ceil(format.rate as usize);
@@ -271,10 +324,19 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
         let mut sync = std::time::Instant::now() - Duration::from_secs(1);
         let period = Duration::from_secs_f64(format.frames() as f64 / f64::from(format.rate));
         let mut next_packet = tokio::time::Instant::now();
+        let mut phone_pcm_ready = false;
         loop {
+            check_phone_endpoint(phone_fd)?;
             while samples.len() < format.frames() {
                 tokio::time::timeout(Duration::from_secs(2), downlink.read_exact(&mut pcm)).await
-                    .map_err(|_| "phone call downlink stalled")?.map_err(|e| e.to_string())?;
+                    .map_err(|_| "phone downlink PCM stalled")?.map_err(|error| match error.kind() {
+                        std::io::ErrorKind::UnexpectedEof => "phone downlink PCM endpoint closed".into(),
+                        _ => format!("phone downlink PCM read failed: {error}"),
+                    })?;
+                if !phone_pcm_ready {
+                    phone_pcm_ready = true;
+                    crate::emit_log("CALL-AUDIO: phone downlink PCM received");
+                }
                 resampler.push(&pcm, phone_rate, format.rate, &mut samples);
             }
             let now = tokio::time::Instant::now();
@@ -292,7 +354,9 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
                 let _ = speaker.send_call_sync(crate::timing::monotonic_nanos(), format.frames() as u32).await;
                 sync = std::time::Instant::now();
             }
-            speaker.send_call_audio(&payload, format.frames() as u32, loss_generation).await.map_err(|e| e.to_string())?;
+            check_phone_endpoint(phone_fd)?;
+            speaker.send_call_audio(&payload, format.frames() as u32, loss_generation).await
+                .map_err(|error| format!("car speaker RTP send failed: {error}"))?;
         }
     };
     let up = async {
@@ -317,7 +381,7 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
                     }
                 }
             } else { receive.await };
-            let (n, source) = packet.map_err(|e| e.to_string())?;
+            let (n, source) = packet.map_err(|error| format!("car microphone RTP receive failed: {error}"))?;
             if mic_probe::normalized(source.ip()) != receiver_ip || port.is_some_and(|p| p != source.port()) { continue; }
             let Ok(payload) = stats.open(TYPE as u8, &wire[..n], &input_key) else { continue; };
             let pcm = if let Some(decoder) = &mut decoder {
@@ -357,7 +421,8 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
                     }
                 }
                 Ok(())
-            }).await.map_err(|_| "phone call uplink backpressure")?.map_err(|e| e.to_string())?;
+            }).await.map_err(|_| "phone uplink PCM write timed out")?
+                .map_err(|error| format!("phone uplink PCM write failed: {error}"))?;
         }
     };
     tokio::select! {
@@ -471,6 +536,19 @@ mod tests {
         let decoded = decoder.decode(&encoded).unwrap();
         assert_eq!(decoded.len(), 320);
         assert!(encoder.encode_mono_packet(&[10; 319]).is_err());
+    }
+
+    #[test]
+    fn telephony_sets_vocoder_rate_only_when_receiver_advertises_it() {
+        let format = Format { rate: 24_000, channels: 1, mask: 1 << 29, opus: true };
+        let advertised = Value::dict(vec![("extendedFeatures", Value::array(vec![Value::str("vocoderInfo")]))]);
+        let other = Value::dict(vec![("extendedFeatures", Value::array(vec![Value::str("other")]))]);
+        for (info, expected) in [(advertised, Some(Value::Real(16_000.0))), (other, None), (Value::dict(vec![]), None)] {
+            let request = bplist::parse(&setup(format, 7, 7001, None, &info)).unwrap();
+            let stream = &request.get("streams").unwrap().as_array().unwrap()[0];
+            assert_eq!(stream.get("sr"), Some(&Value::Int(24_000)));
+            assert_eq!(stream.get("vocoderInfo").and_then(|info| info.get("sampleRate")), expected.as_ref());
+        }
     }
 
     #[test]

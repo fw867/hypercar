@@ -25,22 +25,53 @@ import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
+internal enum class CallAudioOfferEnd {
+    WITHDRAWN, IDENTITY_UNCONFIRMED, OTHER;
+
+    companion object {
+        fun fromStatus(status: String?): CallAudioOfferEnd {
+            val endpoint = status?.substringAfter(" endpoint=", "") ?: return OTHER
+            return when {
+                endpoint == ShellCallAudio.OPEN_IDENTITY_UNCONFIRMED -> IDENTITY_UNCONFIRMED
+                endpoint == ShellCallAudio.CONTROLLER_REVOKED ||
+                    endpoint == ShellCallAudio.CALL_NO_LONGER_ELIGIBLE ||
+                    endpoint.startsWith(ShellCallAudio.IDENTITY_REVOKED) ||
+                    endpoint.startsWith(ShellCallAudio.IDENTITY_LOST) -> WITHDRAWN
+                else -> OTHER
+            }
+        }
+    }
+}
+
 /** Live PSTN downlink/extraction and uplink/injection owned by the authorized shell service. */
 internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
     private class UnconfirmedCallIdentity : IllegalStateException()
 
     private class Session(
-        val token: Long, val callId: String, val owner: IBinder, val death: IBinder.DeathRecipient,
+        val token: Long, val offer: Long, val callId: String, val owner: IBinder, val death: IBinder.DeathRecipient,
         val socket: ParcelFileDescriptor, val record: AudioRecord, val track: AudioTrack,
     ) {
         val live = AtomicBoolean(true)
         val endReason = AtomicReference<String?>()
     }
 
+    private data class ClosedOffer(val token: Long, val offer: Long, val status: String)
+
     @Volatile private var session: Session? = null
     @Volatile private var status = "idle"
+    private val closedOffers = ArrayDeque<ClosedOffer>()
 
-    fun diagnosticStatus(): String = status
+    fun diagnosticStatus(): String = session?.endReason?.get() ?: status
+
+    fun diagnosticStatus(token: Long, offer: Long): String? {
+        val active = session
+        if (active?.token == token && active.offer == offer) {
+            active.endReason.get()?.let { return "identity=${callIdentity.diagnosticStatus()} endpoint=$it" }
+        }
+        return synchronized(closedOffers) {
+            closedOffers.lastOrNull { it.token == token && it.offer == offer }?.status
+        }
+    }
 
     private val pstnRedirectionMode by lazy { AudioManager::class.java.getField("CALL_REDIRECT_PSTN").getInt(null) }
 
@@ -77,8 +108,9 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
     }
 
     @Synchronized
-    fun open(context: Context, owner: IBinder, token: Long, callId: String, rate: Int): ParcelFileDescriptor? {
-        if (token <= 0 || rate !in setOf(16000, 24000, 44100, 48000) || session != null) return null
+    fun open(context: Context, owner: IBinder, token: Long, offer: Long, callId: String, rate: Int,
+             route: ICallAudioRoute): ParcelFileDescriptor? {
+        if (token <= 0 || offer <= 0 || rate !in setOf(16000, 24000, 44100, 48000) || session != null) return null
         var record: AudioRecord? = null
         var track: AudioTrack? = null
         var sockets: Array<ParcelFileDescriptor>? = null
@@ -130,15 +162,15 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
             owner.linkToDeath(ownerDeath, 0)
             check(owner.isBinderAlive && safeCall())
             if (!callIdentity.confirmsOpen(callId)) throw UnconfirmedCallIdentity()
-            val active = Session(token, callId, owner, ownerDeath, pair[0], downlink, uplink)
+            val active = Session(token, offer, callId, owner, ownerDeath, pair[0], downlink, uplink)
             session = active
             status = "endpoints_ready_rate_$rate"
             val watchdog = Thread({
-                var reason = "call_no_longer_eligible"
+                var reason = CALL_NO_LONGER_ELIGIBLE
                 try {
                     while (active.live.get() && safeCall()) {
-                        if (callIdentity.current() != callId) {
-                            reason = "identity_lost_${callIdentity.diagnosticStatus()}"
+                        if (callIdentity.current(allowFallback = true) != callId) {
+                            reason = "$IDENTITY_LOST${callIdentity.diagnosticStatus()}"
                             break
                         }
                         SystemClock.sleep(callIdentity.millisUntilRefresh())
@@ -148,7 +180,15 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
             }, "hypercar-call-state")
             val transport = Thread({
                 var reason = "uplink_closed"
-                try { transfer(active, rate, manager) { safeCall() && callIdentity.matchesCached(callId) } }
+                try {
+                    transfer(active, rate, manager, route) {
+                        val eligible = safeCall()
+                        val authorized = callIdentity.matchesCached(callId)
+                        if (!authorized) active.endReason.compareAndSet(null, "$IDENTITY_LOST${callIdentity.diagnosticStatus()}")
+                        else if (!eligible) active.endReason.compareAndSet(null, CALL_NO_LONGER_ELIGIBLE)
+                        authorized && eligible
+                    }
+                }
                 catch (error: Exception) { reason = failureStatus("transfer", error) }
                 finally { close(active, reason) }
             }, "hypercar-call-uplink")
@@ -168,7 +208,7 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
         }
     }
 
-    private fun transfer(active: Session, rate: Int, manager: AudioManager, safeCall: () -> Boolean) {
+    private fun transfer(active: Session, rate: Int, manager: AudioManager, route: ICallAudioRoute, safeCall: () -> Boolean) {
         val fd = active.socket.fileDescriptor
         val input = DataInputStream(FileInputStream(fd))
         val hangup = OsConstants.POLLHUP or OsConstants.POLLERR or OsConstants.POLLNVAL
@@ -181,13 +221,19 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
             active.endReason.compareAndSet(null, OPEN_IDENTITY_UNCONFIRMED)
             return
         }
+        // Bluetooth belongs to the app process. Consult it without holding the audio lifecycle lock.
+        if (!runCatching { route.mayStart() }.getOrDefault(false)) {
+            active.endReason.compareAndSet(null, "phone_route_revoked")
+            return
+        }
         synchronized(this) {
-            check(session === active && safeCall())
+            if (session !== active || !ownsEndpoint()) return
             if (!callIdentity.isConfirmed(active.callId)) {
                 active.endReason.compareAndSet(null, OPEN_IDENTITY_UNCONFIRMED)
                 return
             }
             active.record.startRecording()
+            if (!ownsEndpoint()) return
             active.track.play()
             check(active.record.recordingState == AudioRecord.RECORDSTATE_RECORDING)
             check(active.track.playState == AudioTrack.PLAYSTATE_PLAYING)
@@ -242,7 +288,11 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
             if (!ownsEndpoint()) return
             var offset = 0
             while (offset < count && !manager.isMicrophoneMute) {
-                check(active.track.routedDevice?.type == AudioDeviceInfo.TYPE_TELEPHONY) { "telephony uplink lost its route" }
+                val routedType = active.track.routedDevice?.type
+                if (routedType != AudioDeviceInfo.TYPE_TELEPHONY) {
+                    active.endReason.compareAndSet(null, "uplink_route_lost_type_$routedType")
+                    return
+                }
                 if (!ownsEndpoint()) return
                 val written = active.track.write(buffer, offset, count - offset, AudioTrack.WRITE_NON_BLOCKING)
                 check(written >= 0) { "call track write=$written" }
@@ -254,10 +304,20 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
 
     fun revoke(callId: String) {
         val active = session?.takeIf { it.callId == callId } ?: return
-        active.endReason.compareAndSet(null, "identity_revoked_${callIdentity.diagnosticStatus()}")
+        revoke(active, "$IDENTITY_REVOKED${callIdentity.diagnosticStatus()}")
+    }
+
+    fun revokeOffer(token: Long, offer: Long) {
+        val active = session?.takeIf { it.token == token && it.offer == offer } ?: return
+        revoke(active, CONTROLLER_REVOKED)
+    }
+
+    private fun revoke(active: Session, reason: String) {
+        active.endReason.compareAndSet(null, reason)
         // Wake the PCM workers immediately. Their finally blocks release the audio endpoints.
-        active.live.set(false)
-        runCatching { Os.shutdown(active.socket.fileDescriptor, OsConstants.SHUT_RDWR) }
+        if (active.live.getAndSet(false)) {
+            runCatching { Os.shutdown(active.socket.fileDescriptor, OsConstants.SHUT_RDWR) }
+        }
     }
 
     @Synchronized
@@ -269,10 +329,15 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
     private fun close(active: Session, reason: String) {
         if (session !== active) return
         status = active.endReason.get() ?: reason
+        val outcome = "identity=${callIdentity.diagnosticStatus()} endpoint=$status"
+        synchronized(closedOffers) {
+            if (closedOffers.size == 8) closedOffers.removeFirst()
+            closedOffers.addLast(ClosedOffer(active.token, active.offer, outcome))
+        }
+        Log.i("HyperCar", "CALL-AUDIO: shell endpoints stopping token=${active.token} offer=${active.offer} $outcome")
         session = null
         active.live.set(false)
         runCatching { Os.shutdown(active.socket.fileDescriptor, OsConstants.SHUT_RDWR) }
-        Log.i("HyperCar", "CALL-AUDIO: shell endpoints closed $status")
         runCatching { active.socket.close() }
         runCatching { active.record.stop() }
         runCatching { active.track.pause() }
@@ -287,5 +352,9 @@ internal class ShellCallAudio(private val callIdentity: ShellCallIdentity) {
 
     companion object {
         const val OPEN_IDENTITY_UNCONFIRMED = "open_identity_unconfirmed"
+        const val IDENTITY_REVOKED = "identity_revoked_"
+        const val IDENTITY_LOST = "identity_lost_"
+        const val CONTROLLER_REVOKED = "controller_revoked"
+        const val CALL_NO_LONGER_ELIGIBLE = "call_no_longer_eligible"
     }
 }

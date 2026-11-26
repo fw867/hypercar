@@ -6,6 +6,7 @@ import android.os.ParcelFileDescriptor;
 import android.os.SharedMemory;
 import android.view.Surface;
 import android.view.MotionEvent;
+import io.github.hypercar.spike.ICallAudioRoute;
 
 interface ISpikeShell {
     /** 返回 "OK id=<n> flags=0x<hex>" 或 "ERR ..."。 */
@@ -68,12 +69,15 @@ interface ISpikeShell {
     int[] captureInstrumentMap(IBinder owner, int displayId, int width, int height,
                                int maxWidth, int maxHeight, in SharedMemory pixels);
 
-    ParcelFileDescriptor openCallAudio(IBinder owner, long token, String callId, int rate);
+    ParcelFileDescriptor openCallAudio(IBinder owner, long token, long offer, String callId, int rate, ICallAudioRoute route);
     void closeCallAudio(long token);
-    String activeCallAudioIdentity();
+    /** Lease, retry key, first diagnostic sequence, then sanitized diagnostics after the given cursor. */
+    String[] pollCallAudioIdentity(boolean verify, long publishedThrough);
     String callAudioStatus();
 
     /** Read-only check for one exact SSID. */
     boolean hasSavedWifiWithAutojoin(String ssid);
     boolean isWifiStationJoiningOrConnected(String ssid);
+    String callAudioOfferStatus(long token, long offer);
+    void revokeCallAudio(long token, long offer);
 }

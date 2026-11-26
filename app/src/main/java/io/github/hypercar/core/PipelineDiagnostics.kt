@@ -42,6 +42,7 @@ data class PipelineDiagnostics(
     val tcpInfoError: Long? = null,
     val snapshotSequence: Long = 0,
     val videoTcpEvidence: String? = null,
+    val displayMaxFps: Int? = null,
 ) {
     internal fun canReplace(previous: PipelineDiagnostics): Boolean =
         generation > previous.generation || (generation == previous.generation &&
@@ -70,6 +71,9 @@ data class PipelineDiagnostics(
     val controlStatus get() = status(controlReady)
     val wifiStatus get() = status(wifiIap2 == "READY_TRANSPORT", wifiIap2 in setOf("FAILED", "STOPPED"))
     val videoStatus get() = status(videoStream == "READY", videoStream == "FAILED")
+    val displayDeclarationLabel: String get() = displaySize?.let { size ->
+        displayMaxFps?.let { "$size · $it FPS" } ?: size
+    } ?: "待获取"
     val audioStatus get() = status(audioReady)
     val audioChannelLabel get() = when {
         !audioReady -> "未就绪"
@@ -138,6 +142,7 @@ data class PipelineDiagnostics(
                 screenOwned = if (j.isNull("screen_owned")) null else j.getBoolean("screen_owned"),
                 videoStream = j.optString("video_stream", "WAIT_SETUP"),
                 displaySize = display?.let { resolution(it.optInt(0), it.optInt(1)) },
+                displayMaxFps = j.number("display_max_fps")?.takeIf { it in 1L..Int.MAX_VALUE.toLong() }?.toInt(),
                 videoFormat = format,
                 sourceUnits = j.optLong("video_source_units").coerceAtLeast(0),
                 writtenFrames = j.optLong("video_frames_written").coerceAtLeast(0),

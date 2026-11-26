@@ -14,6 +14,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
@@ -36,6 +37,11 @@ object SpikeShell {
     private val bindMutex = Mutex()
     @OptIn(ExperimentalCoroutinesApi::class)
     private val wifiProbeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val callAudioProbeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
+    private data class CallDiagnosticBinding(val binder: IBinder, val delivery: CallAudioDiagnosticDelivery)
+    private val callDiagnosticBindingLock = Any()
+    private var callDiagnosticBinding: CallDiagnosticBinding? = null
     private val displayOwner = Binder()
     @Volatile var isBinding: Boolean = false
         private set
@@ -48,15 +54,60 @@ object SpikeShell {
     fun startSplitAudioCapture(owner: IBinder, navigationUid: Int): Array<android.os.ParcelFileDescriptor>? =
         service?.startSplitAudioCapture(owner, navigationUid)
     fun stopAudioCapture() { service?.stopAudioCapture() }
-    fun activeCallAudioIdentity(): String? = service?.activeCallAudioIdentity()
+    internal fun pollCallAudioIdentity(verify: Boolean, log: (String) -> Unit): CallAudioBridgeIdentity? {
+        val bound = service ?: return null
+        return pollCallAudioIdentity(bound, verify, log)
+    }
+
+    private fun pollCallAudioIdentity(bound: ISpikeShell, verify: Boolean, log: (String) -> Unit): CallAudioBridgeIdentity? {
+        val delivery = synchronized(callDiagnosticBindingLock) {
+            if (service !== bound) return null
+            val binder = bound.asBinder()
+            val current = callDiagnosticBinding?.takeIf { it.binder == binder }
+                ?: CallDiagnosticBinding(binder, CallAudioDiagnosticDelivery()).also { callDiagnosticBinding = it }
+            current.delivery
+        }
+        val snapshot = bound.pollCallAudioIdentity(verify, delivery.publishedThrough) ?: return null
+        if (service !== bound || snapshot.size < 3) return null
+        val firstSequence = snapshot[2].toLongOrNull()?.takeIf { it > 0 } ?: return null
+        delivery.publish(CallAudioDiagnosticBatch(firstSequence, snapshot.drop(3))) { log("CALL-AUDIO: $it") }
+        if (service !== bound || snapshot[0].isEmpty() || snapshot[1].isEmpty()) return null
+        return CallAudioBridgeIdentity(snapshot[0], snapshot[1])
+    }
+
+    internal suspend fun flushCallAudioDiagnosticsForExport(log: (String) -> Unit) {
+        val bound = service ?: return
+        val read = callAudioProbeScope.async {
+            runCatching { pollCallAudioIdentity(bound, verify = false, log) }
+        }
+        try { withTimeoutOrNull(500L) { read.await() } }
+        finally { read.cancel() }
+    }
+
     fun callAudioStatus(): String? = service?.callAudioStatus()
+    suspend fun awaitCallAudioOfferStatus(token: Long, offer: Long): String? {
+        val bound = service ?: return null
+        // Await the result separately so an uninterruptible Binder call cannot extend the deadline.
+        val read = callAudioProbeScope.async {
+            while (service === bound) {
+                val status = runCatching { bound.callAudioOfferStatus(token, offer) }.getOrElse { return@async null }
+                if (status != null) return@async status
+                delay(100L)
+            }
+            null
+        }
+        return try { withTimeoutOrNull(500L) { read.await() } }
+        finally { read.cancel() }
+    }
     fun callAudioOpenNeedsIdentity(): Boolean = runCatching {
         callAudioStatus()?.endsWith(" endpoint=${ShellCallAudio.OPEN_IDENTITY_UNCONFIRMED}") == true
     }.getOrDefault(false)
 
-    fun openCallAudio(owner: IBinder, token: Long, callId: String, rate: Int): android.os.ParcelFileDescriptor? =
-        service?.openCallAudio(owner, token, callId, rate)
+    fun openCallAudio(owner: IBinder, token: Long, offer: Long, callId: String, rate: Int,
+                      route: ICallAudioRoute): android.os.ParcelFileDescriptor? =
+        service?.openCallAudio(owner, token, offer, callId, rate, route)
     fun closeCallAudio(token: Long) { service?.closeCallAudio(token) }
+    fun revokeCallAudio(token: Long, offer: Long) { service?.revokeCallAudio(token, offer) }
     fun audioCaptureStatus(): String = service?.audioCaptureStatus() ?: "shell disconnected"
     fun startBluetoothDiscoverable(owner: IBinder, token: String, seconds: Int): String =
         call("startBluetoothDiscoverable") { it.startBluetoothDiscoverable(owner, token, seconds) }
@@ -145,8 +196,8 @@ object SpikeShell {
             .daemon(false)
             .processNameSuffix("spike")
             .debuggable(BuildConfig.DEBUG)
-            // AIDL revisions also distinguish local installs sharing the same versionCode.
-            .version(BuildConfig.VERSION_CODE + 11)
+            // UserService revisions also distinguish local installs sharing the same versionCode.
+            .version(BuildConfig.VERSION_CODE + 18)
         args = a
         // 注意：**不要**在 Main 线程调 bindUserService。Shizuku 13.6 在某些机型上会同步等待
         // 用户服务把 binder 交回来；放主线程会与「回调也要主线程」互相等死（真机踩过：

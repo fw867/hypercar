@@ -30,18 +30,24 @@ class SpikeShellService : ISpikeShell.Stub {
 
     private val playbackAudio = ShellPlaybackAudio()
     private val splitPlaybackAudio = SplitPlaybackAudio()
+    private val callDiagnostics = CallAudioDiagnostics()
     private val callIdentity: ShellCallIdentity by lazy {
         ShellCallIdentity(onRevoked = { id ->
             if (callAudio.isInitialized()) callAudio.value.revoke(id)
-        })
+        }, trace = callDiagnostics::record)
     }
-    private val callStateMonitor by lazy { ShellCallStateMonitor(callIdentity) }
+    private val callStateMonitor by lazy { ShellCallStateMonitor(callIdentity, callDiagnostics::record) }
     private val callAudio: Lazy<ShellCallAudio> = lazy { ShellCallAudio(callIdentity) }
 
-    override fun activeCallAudioIdentity(): String? {
+    override fun pollCallAudioIdentity(verify: Boolean, publishedThrough: Long): Array<String>? {
         if (android.os.Binder.getCallingUid() != appContext?.applicationInfo?.uid) return null
         val identity = android.os.Binder.clearCallingIdentity()
-        return try { callStateMonitor.run { callIdentity.current() } }
+        return try {
+            val active = if (verify) callStateMonitor.run { callIdentity.currentBridgeIdentity() } else null
+            val batch = callDiagnostics.readAfter(publishedThrough)
+            (listOf(active?.lease.orEmpty(), active?.retryKey.orEmpty(), batch.firstSequence.toString()) + batch.lines)
+                .toTypedArray()
+        }
         finally { android.os.Binder.restoreCallingIdentity(identity) }
     }
 
@@ -51,11 +57,17 @@ class SpikeShellService : ISpikeShell.Stub {
         return "identity=${callIdentity.diagnosticStatus()} endpoint=$endpoint"
     }
 
-    override fun openCallAudio(owner: IBinder, token: Long, callId: String, rate: Int): android.os.ParcelFileDescriptor? {
+    override fun callAudioOfferStatus(token: Long, offer: Long): String? {
+        if (android.os.Binder.getCallingUid() != appContext?.applicationInfo?.uid || !callAudio.isInitialized()) return null
+        return callAudio.value.diagnosticStatus(token, offer)
+    }
+
+    override fun openCallAudio(owner: IBinder, token: Long, offer: Long, callId: String, rate: Int,
+                               route: ICallAudioRoute): android.os.ParcelFileDescriptor? {
         val context = appContext ?: return null
         if (android.os.Binder.getCallingUid() != context.applicationInfo.uid) return null
         val identity = android.os.Binder.clearCallingIdentity()
-        return try { callAudio.value.open(context, owner, token, callId, rate) }
+        return try { callAudio.value.open(context, owner, token, offer, callId, rate, route) }
         finally { android.os.Binder.restoreCallingIdentity(identity) }
     }
 
@@ -64,6 +76,11 @@ class SpikeShellService : ISpikeShell.Stub {
         val identity = android.os.Binder.clearCallingIdentity()
         try { if (callAudio.isInitialized()) callAudio.value.close(token) }
         finally { android.os.Binder.restoreCallingIdentity(identity) }
+    }
+
+    override fun revokeCallAudio(token: Long, offer: Long) {
+        if (android.os.Binder.getCallingUid() != appContext?.applicationInfo?.uid || !callAudio.isInitialized()) return
+        callAudio.value.revokeOffer(token, offer)
     }
     @Volatile private var splitCaptureRequested = false
     private val bluetoothDiscovery = ShellBluetoothDiscovery()

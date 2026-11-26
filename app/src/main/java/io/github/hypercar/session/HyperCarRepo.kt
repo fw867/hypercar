@@ -3880,6 +3880,15 @@ object HyperCarRepo {
             }
         }
         override fun onState(state: String, detail: String) {
+            if (state == "call_audio_stopping") {
+                val token = detail.substringBefore(' ').toLongOrNull() ?: return
+                val offer = detail.substringAfter(" offer=", "").toLongOrNull() ?: return
+                scope.launch {
+                    val status = io.github.hypercar.spike.SpikeShell.awaitCallAudioOfferStatus(token, offer)
+                    if (status != null) log("CALL-AUDIO: stop endpoint token=$token offer=$offer $status")
+                }
+                return
+            }
             val callbackOwner = engineCallbacks.current()
             log("CORE: [$state] $detail")
             if (!sessionLive.get() && state in setOf("activation", "negotiating", "connected", "failed", "ended")) return
@@ -3906,10 +3915,11 @@ object HyperCarRepo {
                     val context = appContext() ?: return
                     val token = detail.substringBefore(' ').toLongOrNull() ?: return
                     val rate = detail.substringAfter(' ').toIntOrNull() ?: return
+                    val receiver = sessionReceiverMac
                     log("CALL-AUDIO: armed source=$sessionCarSource rate=$rate")
                     scope.launch {
                         CarWithCallAudio.monitor(context, token, rate,
-                            { sessionLive.get() && engineCallbacks.isCurrent(callbackOwner) }, ::log)
+                            { sessionLive.get() && engineCallbacks.isCurrent(callbackOwner) }, receiver, ::log)
                     }
                 }
                 "activation" -> {
@@ -5000,6 +5010,7 @@ object HyperCarRepo {
      */
     fun exportLogs() {
         scope.launch {
+            io.github.hypercar.spike.SpikeShell.flushCallAudioDiagnosticsForExport(::log)
             mediaLog.flush()
             val logs = withContext(Dispatchers.IO) {
                 synchronized(diskLogLock) {

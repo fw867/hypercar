@@ -11,6 +11,10 @@ internal class EngineEventListener(
     private val ignoredStates = java.util.concurrent.atomic.AtomicInteger()
     private fun deliver(action: () -> Unit) { gate.deliver(owner, action) }
     override fun onState(state: String, detail: String) {
+        if (state == "call_audio_stopping") {
+            target.onState(state, detail) // Read-only endpoint diagnostics carry their own token and offer.
+            return
+        }
         if (!gate.deliver(owner) { target.onState(state, detail) } && ignoredStates.incrementAndGet() <= 8)
             target.onLog("CORE-CALLBACK: 忽略旧引擎状态 owner=$owner current=${gate.current()} state=$state")
     }

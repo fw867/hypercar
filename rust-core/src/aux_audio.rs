@@ -4,6 +4,7 @@ use parking_lot::Mutex;
 use tokio::sync::{mpsc,oneshot,watch,Notify};
 use crate::{airplay::{AirplayParams,AudioCodec,SocketProvider},audio_out::AudioOut,aux_setup::Kind,bplist::Value,rtsp::RtspChannel,speech_resource::SpeechResource};
 use crate::audio_pacing::StreamId;
+use crate::call_audio::OfferResult;
 use crate::mic_probe::{self, InputFormat, InputStream, ProbeControl};
 use crate::shutdown::EngineShutdown;
 
@@ -154,42 +155,62 @@ impl Controller {
         self.tasks.push(crate::callback_context::spawn(async move {
             let mut offers = crate::call_audio::Offers::arm(format);
             let mut ownership = session.control.buffered_ownership.subscribe();
-            'calls: while !stop.requested.load(Ordering::Acquire) && !session.control.is_closed() {
+            while !stop.requested.load(Ordering::Acquire) && !session.control.is_closed() {
                 let crate::call_audio::Offer { attempt, rate, socket: local } = tokio::select! {
                     biased;
                     _ = stop.wait() => break,
                     socket = offers.rx.recv() => match socket { Some(s) => s, None => break },
                 };
-                if local.set_nonblocking(true).is_err() { continue; }
-                let Ok(local) = tokio::net::UnixStream::from_std(local) else { continue; };
+                let local = match local.set_nonblocking(true).and_then(|()| tokio::net::UnixStream::from_std(local)) {
+                    Ok(local) => local,
+                    Err(error) => {
+                        offers.finish_before_setup(attempt, OfferResult::Rejected, format!("phone PCM socket failed: {error}"));
+                        continue;
+                    }
+                };
                 // A live call has priority over the optional assistant microphone lease.
                 if let Some(probe) = &session.params.microphone_probe { probe.request(false); }
-                let (transition, grant) = loop {
+                let grant = loop {
                     let transition = tokio::select! {
                         biased;
-                        _ = stop.wait() => break 'calls,
-                        _ = local.readable() => continue 'calls, // Before GO, readability means EOF or an invalid offer.
+                        _ = stop.wait() => break Err("session stopped before call SETUP"),
+                        _ = local.readable() => break Err("phone PCM closed or readable before call SETUP"),
                         guard = stop.main_transition.lock() => guard,
                     };
                     let grant = *ownership.borrow_and_update();
-                    if grant.owned { break (transition, grant.losses); }
+                    if grant.owned { break Ok((transition, grant.losses)); }
                     drop(transition);
                     tokio::select! {
                         biased;
-                        _ = stop.wait() => break 'calls,
-                        _ = local.readable() => continue 'calls,
-                        changed = ownership.changed() => if changed.is_err() { break 'calls; },
+                        _ = stop.wait() => break Err("session stopped while waiting for main audio"),
+                        _ = local.readable() => break Err("phone PCM closed or readable while waiting for main audio"),
+                        changed = ownership.changed() => {
+                            if changed.is_err() { break Err("main audio ownership closed before call SETUP"); }
+                        },
+                    }
+                };
+                let (transition, grant) = match grant {
+                    Ok(ready) => ready,
+                    Err(reason) => {
+                        drop(local);
+                        offers.finish_before_setup(attempt, OfferResult::Withdrawn, reason.into());
+                        continue;
                     }
                 };
                 let mut cleanup = Cleanup::default();
                 let mut call_id = None;
                 let mut announced = false;
-                let mut retryable = crate::call_audio::Retry::None;
+                let mut outcome = OfferResult::Rejected;
                 let result = match session.pause_main(&commands, &mut cleanup, false).await {
-                    Ok(()) if stop.requested.load(Ordering::Acquire) => Ok(()),
-                    Ok(()) => crate::call_audio::run(&session, rate, local, grant, stop.wait(), &mut call_id, &call_allocated, &mut announced, &mut retryable).await,
-                    Err(error) => Err(error),
+                    Ok(()) if !stop.requested.load(Ordering::Acquire) =>
+                        crate::call_audio::run(&session, rate, local, grant, stop.wait(), &mut call_id, &call_allocated, &mut announced, &mut outcome).await,
+                    result => {
+                        // Let the phone endpoint close before we report the stop or wait for media cleanup.
+                        drop(local);
+                        result
+                    }
                 };
+                offers.report_stopping(attempt, call_id, &result);
                 if let Some(id) = call_id {
                     session.control.udp_media.set(100, false);
                     let input = InputStream::Shared(InputFormat::Pcm16);
@@ -223,13 +244,8 @@ impl Controller {
                 } else {
                     drop(transition);
                 }
-                if !stop.requested.load(Ordering::Acquire) && !session.control.is_closed() && result.is_err() {
-                    offers.request_retry(attempt, retryable);
-                }
-                match result {
-                    Ok(()) => crate::emit_log("CALL-AUDIO: telephony ended"),
-                    Err(error) => crate::emit_log(&format!("CALL-AUDIO: telephony ended: {error}")),
-                }
+                offers.complete(attempt, if result.is_err() { outcome } else { OfferResult::Withdrawn });
+                crate::emit_log(&format!("CALL-AUDIO: telephony cleanup complete offer={attempt}"));
             }
         }));
     }

@@ -86,6 +86,29 @@ class ShellCallIdentityTest {
         assertEquals(2, reads)
     }
 
+    @Test fun expiredPcmLeasesKeepTheSameCallRetryKey() {
+        var elapsed = 0L
+        var active = "TC@4"
+        val identity = ShellCallIdentity({ elapsed }, { confirmed(active) })
+        val monitor = identity.beginTracking()
+        identity.trackSubscriptions(monitor, setOf(1))
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        identity.trackingReady(monitor)
+        val first = checkNotNull(identity.currentBridgeIdentity())
+
+        repeat(2) {
+            elapsed += 600
+            val resumed = checkNotNull(identity.currentBridgeIdentity())
+            assertNotEquals(first.lease, resumed.lease)
+            assertFalse(identity.matchesCached(first.lease))
+            assertEquals(first.retryKey, resumed.retryKey)
+        }
+
+        elapsed += 200
+        active = "TC@9"
+        assertNotEquals(first.retryKey, checkNotNull(identity.currentBridgeIdentity()).retryKey)
+    }
+
     @Test fun repeatedUnchangedActiveStateDoesNotRetireTheCurrentAudioBridge() {
         val retired = mutableListOf<String>()
         val identity = ShellCallIdentity({ 0L }, { confirmed() }, retired::add)
@@ -309,6 +332,267 @@ class ShellCallIdentityTest {
         repeat(3) { assertEquals(original, identity.current()) }
         assertEquals(listOf(400L, 260L, 260L, 260L), budgets)
         assertTrue(identity.matchesCached(original))
+    }
+
+    @Test fun missingPreciseRoleCanUseTwoConsistentTelecomSnapshotsAfterRegistrationSettles() {
+        var elapsed = 0L
+        var reads = 0
+        val identity = ShellCallIdentity({ elapsed }, { reads++; confirmed() })
+        val generation = identity.beginTracking()
+        identity.trackSubscriptions(generation, setOf(1, 2))
+        identity.onPreciseCallState(generation, 1, singleActive)
+        assertNull(identity.currentBridgeIdentity())
+        assertEquals(0, reads)
+
+        identity.trackingReady(generation)
+        assertNull(identity.currentBridgeIdentity())
+        assertEquals(0, reads)
+
+        elapsed += 500
+        assertNull(identity.currentBridgeIdentity())
+        assertEquals(1, reads)
+        assertNull(identity.currentBridgeIdentity())
+        assertEquals(1, reads)
+
+        elapsed += 200
+        val verified = checkNotNull(identity.currentBridgeIdentity())
+        assertTrue(identity.isConfirmed(verified.lease))
+        assertEquals(2, reads)
+        elapsed += 200
+        assertEquals(verified, identity.currentBridgeIdentity())
+        assertEquals(verified.lease, identity.current(allowFallback = true))
+        assertTrue(identity.confirmsOpen(verified.lease))
+    }
+
+    @Test fun fallbackRevokesOnKnownConflictAndAnUnknownFieldCannotClearIt() {
+        var elapsed = 0L
+        var reads = 0
+        val revoked = mutableListOf<String>()
+        val identity = ShellCallIdentity({ elapsed }, { reads++; confirmed() }, revoked::add)
+        val generation = identity.beginTracking()
+        identity.trackSubscriptions(generation, setOf(1, 2))
+        identity.trackingReady(generation)
+        identity.onPreciseCallState(generation, 1, singleActive)
+        elapsed = 500
+        assertNull(identity.currentBridgeIdentity())
+        elapsed = 700
+        val current = checkNotNull(identity.currentBridgeIdentity())
+
+        identity.onPreciseCallState(generation, 2, idle.copy(ringing = 6))
+        assertEquals(listOf(current.lease), revoked)
+        assertFalse(identity.matchesCached(current.lease))
+        identity.onPreciseCallState(generation, 2, PreciseCallRoles(-1, -1, -1))
+        elapsed = 1_200
+        assertNull(identity.currentBridgeIdentity())
+        assertEquals(2, reads)
+
+        identity.onPreciseCallState(generation, 2, idle.copy(background = -1))
+        elapsed = 1_700
+        assertNull(identity.currentBridgeIdentity())
+        elapsed = 1_900
+        assertNotEquals(current.lease, checkNotNull(identity.currentBridgeIdentity()).lease)
+    }
+
+    @Test fun confirmedIdleAndTwoReportedActiveLegsDoNotFallBack() {
+        var elapsed = 0L
+        var reads = 0
+        val identity = ShellCallIdentity({ elapsed }, { reads++; confirmed() })
+        val generation = identity.beginTracking()
+        identity.trackSubscriptions(generation, setOf(1, 2))
+        identity.trackingReady(generation)
+        identity.onPreciseCallState(generation, 1, idle)
+        identity.onPreciseCallState(generation, 2, idle)
+        elapsed = 500
+        assertNull(identity.currentBridgeIdentity())
+        identity.onPreciseCallState(generation, 1, singleActive)
+        identity.onPreciseCallState(generation, 2, singleActive.copy(ringing = -1))
+        elapsed = 1_000
+        assertNull(identity.currentBridgeIdentity())
+        assertEquals(0, reads)
+
+        identity.onPreciseCallState(generation, 2, PreciseCallRoles(-1, -1, -1))
+        elapsed = 1_500
+        assertNull(identity.currentBridgeIdentity())
+        assertEquals(0, reads)
+
+        identity.onPreciseCallState(generation, 2, idle.copy(background = -1))
+        elapsed = 2_000
+        assertNull(identity.currentBridgeIdentity())
+        elapsed = 2_200
+        assertNotNull(identity.currentBridgeIdentity())
+        assertEquals(2, reads)
+    }
+
+    @Test fun mismatchesAndUnavailableTelecomReadsResetTheFallbackProof() {
+        var elapsed = 0L
+        var result: TelecomCallSnapshot = confirmed("TC@4")
+        val events = CallAudioDiagnostics()
+        val identity = ShellCallIdentity({ elapsed }, { result }, trace = events::record)
+        val generation = identity.beginTracking()
+        identity.trackSubscriptions(generation, setOf(1))
+        identity.trackingReady(generation)
+        identity.onPreciseCallState(generation, 1, PreciseCallRoles(-1, -1, -1))
+        elapsed = 500
+        assertNull(identity.currentBridgeIdentity())
+        elapsed = 700
+        result = confirmed("TC@7")
+        assertNull(identity.currentBridgeIdentity())
+        elapsed = 900
+        result = TelecomCallSnapshot.Unavailable
+        assertNull(identity.currentBridgeIdentity())
+        elapsed = 1_100
+        result = confirmed("TC@7")
+        assertNull(identity.currentBridgeIdentity())
+        elapsed = 1_300
+        val verified = checkNotNull(identity.currentBridgeIdentity())
+        elapsed = 1_500
+        result = TelecomCallSnapshot.Unavailable
+        assertNull(identity.currentBridgeIdentity())
+        assertFalse(identity.matchesCached(verified.lease))
+
+        val diagnostics = events.readAfter(0).lines
+        assertTrue(diagnostics.any { it.contains("ready=true subscriptions=[1]") })
+        assertTrue(diagnostics.any { it.contains("sub=1 ringing=-1 foreground=-1 background=-1") })
+        assertTrue(diagnostics.any { it.contains("gate=unknown_roles") && it.contains("query=fallback") })
+        assertTrue(diagnostics.any { it.contains("telecom query=fallback result=active_pstn=TC@7") })
+        assertTrue(diagnostics.any { it.contains("identity=telecom_fallback_unconfirmed") })
+        assertTrue(diagnostics.any { it.contains("identity=telecom_confirmed") })
+        assertTrue(events.readAfter(diagnostics.size.toLong()).lines.isEmpty())
+    }
+
+    @Test fun fallbackCannotReauthorizeATelecomLegMarkedEndedAfterDisconnect() {
+        var elapsed = 0L
+        var result = confirmed("TC@4")
+        val identity = ShellCallIdentity({ elapsed }, { result })
+        val generation = identity.beginTracking()
+        identity.trackSubscriptions(generation, setOf(1))
+        identity.trackingReady(generation)
+        elapsed = 500
+        assertNull(identity.currentBridgeIdentity())
+        elapsed = 700
+        val original = checkNotNull(identity.currentBridgeIdentity())
+        assertTrue(identity.onDisconnected(generation, 1))
+        assertFalse(identity.matchesCached(original.lease))
+
+        elapsed = 950
+        result = confirmed("TC@4", "TC@4")
+        assertNull(identity.currentBridgeIdentity())
+        elapsed = 1_150
+        result = confirmed("TC@4") // The terminal record can rotate out of the next snapshot.
+        assertNull(identity.currentBridgeIdentity())
+
+        elapsed = 1_350
+        result = confirmed("TC@7")
+        assertNull(identity.currentBridgeIdentity())
+        elapsed = 1_550
+        assertNotEquals(original.lease, checkNotNull(identity.currentBridgeIdentity()).lease)
+    }
+
+    @Test fun refreshKeepsCompetingRolesOnlyForSubscriptionsStillActive() {
+        var elapsed = 0L
+        var reads = 0
+        val identity = ShellCallIdentity({ elapsed }, { reads++; confirmed() })
+        val original = identity.beginTracking()
+        identity.trackSubscriptions(original, setOf(1, 2))
+        identity.onPreciseCallState(original, 1, singleActive)
+        identity.onPreciseCallState(original, 2, singleActive)
+        identity.trackingReady(original)
+
+        val refreshed = identity.beginTracking()
+        identity.trackSubscriptions(refreshed, setOf(1, 2))
+        identity.onPreciseCallState(refreshed, 1, singleActive)
+        identity.trackingReady(refreshed)
+        elapsed = 500
+        assertNull(identity.currentBridgeIdentity())
+        elapsed = 700
+        assertNull(identity.currentBridgeIdentity())
+        assertEquals(0, reads)
+
+        val removed = identity.beginTracking()
+        identity.trackSubscriptions(removed, setOf(1))
+        identity.trackingReady(removed)
+        elapsed = 1_200
+        assertNull(identity.currentBridgeIdentity())
+        elapsed = 1_400
+        assertNotNull(identity.currentBridgeIdentity())
+    }
+
+    @Test fun emptyTelecomSnapshotRetiresTheUnverifiedCandidate() {
+        var elapsed = 0L
+        var snapshot = confirmed("TC@4")
+        val identity = ShellCallIdentity({ elapsed }, { snapshot })
+        val generation = identity.beginTracking()
+        identity.trackSubscriptions(generation, setOf(1))
+        identity.trackingReady(generation)
+        elapsed = 500
+        assertNull(identity.currentBridgeIdentity())
+        elapsed = 700
+        snapshot = TelecomCallSnapshot.Observed(null, noCalls = true)
+        assertNull(identity.currentBridgeIdentity())
+
+        snapshot = confirmed("TC@4")
+        elapsed = 900
+        assertNull(identity.currentBridgeIdentity())
+        elapsed = 1_100
+        assertNull(identity.currentBridgeIdentity())
+        assertEquals("telecom_leg_disconnected", identity.diagnosticStatus())
+    }
+
+    @Test fun disconnectDoesNotEraseThePendingCallThatAnEmptySnapshotMustRetire() {
+        var elapsed = 0L
+        var snapshot = confirmed("TC@4")
+        val identity = ShellCallIdentity({ elapsed }, { snapshot })
+        val generation = identity.beginTracking()
+        identity.trackSubscriptions(generation, setOf(1))
+        identity.trackingReady(generation)
+        elapsed = 500
+        assertNull(identity.currentBridgeIdentity())
+        assertTrue(identity.onDisconnected(generation, 1))
+
+        elapsed = 750
+        snapshot = TelecomCallSnapshot.Observed(null, noCalls = true)
+        assertNull(identity.currentBridgeIdentity())
+        snapshot = confirmed("TC@4")
+        elapsed = 950
+        assertNull(identity.currentBridgeIdentity())
+        elapsed = 1_150
+        assertNull(identity.currentBridgeIdentity())
+        assertEquals("telecom_leg_disconnected", identity.diagnosticStatus())
+    }
+
+    @Test fun staleSubscriptionRefreshCannotReachTheListenerReplacement() {
+        val identity = ShellCallIdentity({ 0L }, { confirmed() })
+        val old = identity.beginTracking()
+        val current = identity.beginTracking()
+        assertEquals(setOf(1), identity.queryTrackedSubscriptions(current) { setOf(1) })
+        identity.onPreciseCallState(current, 1, singleActive)
+        identity.trackingReady(current)
+        val active = checkNotNull(identity.currentBridgeIdentity())
+
+        assertNull(identity.queryTrackedSubscriptions(old) { error("stale refresh must not query subscriptions") })
+        assertEquals(active, identity.currentBridgeIdentity())
+
+        assertNull(identity.queryTrackedSubscriptions(current) {
+            identity.beginTracking()
+            setOf(2)
+        })
+        assertFalse(identity.matchesCached(active.lease))
+    }
+
+    @Test fun exportCanPublishPendingMonitorDiagnosticsWithoutDuplicates() {
+        val events = CallAudioDiagnostics()
+        val delivery = CallAudioDiagnosticDelivery()
+        val published = mutableListOf<String>()
+        events.record("registration failed")
+
+        val pendingMonitor = events.readAfter(delivery.publishedThrough)
+        events.record("identity unconfirmed")
+        val export = events.readAfter(delivery.publishedThrough)
+        delivery.publish(export, published::add)
+        delivery.publish(pendingMonitor, published::add)
+
+        assertEquals(listOf("registration failed", "identity unconfirmed"), published)
+        assertTrue(events.readAfter(delivery.publishedThrough).lines.isEmpty())
     }
 
     @Test fun watchdogUsesTheRefreshDeadlineEvenWhenItJustReadTheCache() {

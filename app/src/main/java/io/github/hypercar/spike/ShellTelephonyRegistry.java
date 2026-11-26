@@ -15,6 +15,7 @@ import java.lang.reflect.Method;
 import java.util.LinkedHashSet;
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Consumer;
 
 /** Shell-only adapter for the system API behind TelephonyCallback.PreciseCallStateListener. */
 @SuppressLint("BlockedPrivateApi")
@@ -102,7 +103,8 @@ final class ShellTelephonyRegistry {
         return callback;
     }
 
-    AutoCloseable watchPreciseState(int subscription, PreciseStateListener state, Runnable disconnected) throws Exception {
+    AutoCloseable watchPreciseState(int subscription, PreciseStateListener state, Runnable disconnected,
+                                   Consumer<String> unreadable) throws Exception {
         Object disconnectListener = disconnectCallback.create(data -> {
             try {
                 int cause = data.readInt();
@@ -123,7 +125,9 @@ final class ShellTelephonyRegistry {
                 foreground = (Integer) getForeground.invoke(precise);
                 background = (Integer) getBackground.invoke(precise);
             } catch (Exception | LinkageError failure) {
-                Log.w("HyperCar", "CALL-AUDIO: precise state unreadable " + failure.getClass().getSimpleName());
+                String reason = failure.getClass().getSimpleName();
+                unreadable.accept(reason);
+                Log.w("HyperCar", "CALL-AUDIO: precise state unreadable " + reason);
             }
             state.onState(ringing, foreground, background);
         });

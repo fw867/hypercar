@@ -20,7 +20,13 @@ class PipelineDiagnosticsTest {
     @Test fun declared_screen_and_written_video_are_independent() {
         val pending = PipelineDiagnostics.parse("""{"generation":1,"display_size":[2400,1080]}""")!!
         assertEquals("2400×1080", pending.displaySize)
+        assertEquals("2400×1080", pending.displayDeclarationLabel)
         assertNull(pending.videoFormat)
+        val declared = PipelineDiagnostics.parse(
+            """{"generation":1,"display_size":[2400,1080],"display_max_fps":30,"video_requested_fps":60,"video_actual_fps":24}"""
+        )!!
+        assertEquals("2400×1080 · 30 FPS", declared.displayDeclarationLabel)
+        assertEquals("待获取", declared.copy(displaySize = null).displayDeclarationLabel)
         for ((codec, label) in listOf("hevc" to "HEVC", "h264" to "H.264")) {
             val video = PipelineDiagnostics.parse("""{"generation":1,"display_size":[2400,1080],"video_format":{"codec":"$codec","width":1920,"height":720}}""")!!
             assertEquals("1920×720 $label", video.videoFormat)

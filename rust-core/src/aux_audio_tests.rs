@@ -1,5 +1,6 @@
 //! Loopback receiver tests exercising Controller, resource ACKs and real Opus UDP.
 use super::{Controller,Input,MainCommand,Session};
+use crate::call_audio::OfferResult;
 use crate::{airplay::{AirplayParams,AudioCodec,SocketProvider},aux_setup::Kind,bplist::{self,Value},modes::Modes,rtsp::{RtspChannel,RtspMessage},speech_resource::SpeechResource};
 use std::{sync::{Arc,atomic::AtomicBool},time::Duration};
 use parking_lot::Mutex;
@@ -131,21 +132,150 @@ impl Fixture {
     }
 }
 
-#[tokio::test]
-async fn telephony_bridges_authenticated_pcm_both_ways_and_restores_original_media() {
-    let mut fixture = Fixture::with_config(|_, info| {
+static CALL_AUDIO_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn telephony_formats_row() -> Value {
+    Value::dict(vec![("type", Value::int(100)), ("audioType", Value::str("telephony")),
+        ("audioInputFormats", Value::int((1 << 4) | (1 << 6))),
+        ("audioOutputFormats", Value::int((1 << 4) | (1 << 6)))])
+}
+
+async fn telephony_fixture() -> Fixture {
+    Fixture::with_config(|_, info| {
         let mut formats = info.get("audioFormats").unwrap().as_array().unwrap().clone();
-        formats.push(Value::dict(vec![("type", Value::int(100)), ("audioType", Value::str("telephony")),
-            ("audioInputFormats", Value::int((1 << 4) | (1 << 6))),
-            ("audioOutputFormats", Value::int((1 << 4) | (1 << 6)))]));
+        formats.push(telephony_formats_row());
         *info = Value::dict(vec![("audioFormats", Value::array(formats))]);
-    }).await;
-    let token = tokio::time::timeout(Duration::from_secs(1), async {
+    }).await
+}
+
+#[tokio::test]
+async fn shutdown_reports_accepted_call_offer_still_in_queue() {
+    let _guard = CALL_AUDIO_TESTS.lock().await;
+    let info = Value::dict(vec![("audioFormats", Value::array(vec![telephony_formats_row()]))]);
+    let mut offers = crate::call_audio::Offers::arm(crate::call_audio::formats(&info).next().unwrap());
+    let token = call_audio_token().await;
+    let (offered, mut phone) = tokio::net::UnixStream::pair().unwrap();
+    assert!(crate::call_audio::offer(token, 1, 24_000, offered.into_std().unwrap()));
+
+    offers.finish_queued_on_shutdown();
+    assert_eq!(crate::call_audio::take_result(token, 1), OfferResult::Withdrawn);
+    assert_eq!(phone.read_u8().await.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+    let (late, _) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert!(!crate::call_audio::offer(token, 2, 24_000, late));
+}
+
+async fn call_audio_token() -> i64 {
+    tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if let Some(token) = crate::call_audio::token_for_test() { break token; }
             tokio::task::yield_now().await;
         }
-    }).await.unwrap();
+    }).await.unwrap()
+}
+
+async fn call_audio_result(token: i64, offer: i64) -> OfferResult {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let result = crate::call_audio::take_result(token, offer);
+            if result != OfferResult::Pending { break result; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("native must report how the offer ended")
+}
+
+#[tokio::test]
+async fn call_offer_closed_while_waiting_for_main_audio_reports_withdrawal() {
+    let _guard = CALL_AUDIO_TESTS.lock().await;
+    let mut fixture = telephony_fixture().await;
+    let token = call_audio_token().await;
+    fixture.controller.session.control.buffered_ownership.publish(false);
+    let (offered, phone) = tokio::net::UnixStream::pair().unwrap();
+    assert!(crate::call_audio::offer(token, 1, 24_000, offered.into_std().unwrap()));
+    assert!(tokio::time::timeout(Duration::from_millis(30), fixture.peer.read_u8()).await.is_err());
+    drop(phone);
+    assert_eq!(call_audio_result(token, 1).await, OfferResult::Withdrawn);
+    fixture.stopped().await;
+}
+
+#[tokio::test]
+async fn terminal_telephony_rejection_is_reported_after_media_restore() {
+    let _guard = CALL_AUDIO_TESTS.lock().await;
+    let mut fixture = telephony_fixture().await;
+    let token = call_audio_token().await;
+    let (offered, _phone) = tokio::net::UnixStream::pair().unwrap();
+    assert!(crate::call_audio::offer(token, 1, 24_000, offered.into_std().unwrap()));
+    let (pause, _) = fixture.request("teardown:100").await;
+    fixture.ack(&pause, None).await;
+    for _ in 0..3 {
+        let (setup, _) = fixture.request("setup:100:telephony").await;
+        fixture.reject(&setup, 451).await;
+    }
+    let (restore, body) = fixture.request("setup:100:media").await;
+    assert_eq!(crate::call_audio::take_result(token, 1), OfferResult::Pending);
+    fixture.setup_reply(&restore, &body).await;
+    assert_eq!(call_audio_result(token, 1).await, OfferResult::Rejected);
+    fixture.stopped().await;
+}
+
+#[tokio::test]
+async fn rejected_media_pause_closes_phone_pcm_before_retrying_media_teardown() {
+    let _guard = CALL_AUDIO_TESTS.lock().await;
+    let mut fixture = telephony_fixture().await;
+    let token = call_audio_token().await;
+    let (offer, mut phone) = tokio::net::UnixStream::pair().unwrap();
+    assert!(crate::call_audio::offer(token, 1, 16_000, offer.into_std().unwrap()));
+    let (pause, _) = fixture.request("teardown:100").await;
+    fixture.reject(&pause, 500).await;
+    let (cleanup, _) = fixture.request("teardown:100").await;
+    assert_eq!(tokio::time::timeout(Duration::from_millis(500), phone.read_u8()).await
+        .expect("phone PCM must close while the media cleanup request is still pending").unwrap_err().kind(),
+        std::io::ErrorKind::UnexpectedEof);
+    fixture.ack(&cleanup, None).await;
+    let (restore, body) = fixture.request("setup:100:media").await;
+    fixture.setup_reply(&restore, &body).await;
+    fixture.stopped().await;
+}
+
+#[tokio::test]
+async fn revoked_phone_endpoint_discards_unread_speaker_pcm() {
+    use std::os::fd::AsRawFd;
+
+    let _guard = CALL_AUDIO_TESTS.lock().await;
+    let mut fixture = telephony_fixture().await;
+    let token = call_audio_token().await;
+    let (offered, mut phone) = tokio::net::UnixStream::pair().unwrap();
+    assert!(crate::call_audio::offer(token, 1, 24_000, offered.into_std().unwrap()));
+    let (pause, _) = fixture.request("teardown:100").await;
+    fixture.ack(&pause, None).await;
+    let (setup, body) = fixture.request("setup:100:telephony").await;
+    fixture.setup_reply(&setup, &body).await;
+    let (state, _) = fixture.request("modesChanged").await;
+    fixture.ack(&state, None).await;
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), phone.read_u8()).await.unwrap().unwrap(), 1);
+
+    let mut pcm = vec![1];
+    pcm.extend(123i16.to_le_bytes().repeat(24_000 * 400 / 1_000));
+    phone.write_all(&pcm).await.unwrap();
+    // As in the shell service, shut down both directions while the peer still has unread PCM.
+    assert_eq!(unsafe { libc::shutdown(phone.as_raw_fd(), libc::SHUT_RDWR) }, 0);
+    let mut packet = [0; 2048];
+    assert!(tokio::time::timeout(Duration::from_millis(100), fixture.data.recv(&mut packet)).await.is_err(),
+        "the car received PCM from a revoked phone endpoint");
+
+    let (teardown, _) = fixture.request("teardown:100").await;
+    fixture.ack(&teardown, None).await;
+    let (state, _) = fixture.request("modesChanged").await;
+    fixture.ack(&state, None).await;
+    let (restore, body) = fixture.request("setup:100:media").await;
+    fixture.setup_reply(&restore, &body).await;
+    fixture.stopped().await;
+}
+
+#[tokio::test]
+async fn telephony_bridges_authenticated_pcm_both_ways_and_restores_original_media() {
+    let _guard = CALL_AUDIO_TESTS.lock().await;
+    let mut fixture = telephony_fixture().await;
+    let token = call_audio_token().await;
     let (retired, _) = std::os::unix::net::UnixStream::pair().unwrap();
     assert!(!crate::call_audio::offer(token + 1, 1, 48_000, retired));
     fixture.controller.session.control.buffered_ownership.publish(false);

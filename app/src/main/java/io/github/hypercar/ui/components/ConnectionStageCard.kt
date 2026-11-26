@@ -90,7 +90,7 @@ fun ConnectionStageCard(pipeline: PipelineDiagnostics, modifier: Modifier = Modi
                     "   ·   归属 " to neutral, when (p.screenOwned) { true -> "手机"; false -> "车机"; null -> "未知" } to neutral)
                 HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
                 if (p.active) {
-                    Facts("车机声明 " to neutral, (p.displaySize ?: "待获取") to neutral,
+                    Facts("车机声明 " to neutral, p.displayDeclarationLabel to neutral,
                         "   ·   视频输出 " to neutral, (p.videoFormat ?: "待写出") to observed(p.videoFormat != null))
                 }
                 Facts("视频 " to neutral, "${p.writtenFrames}帧写出" to observed(p.writtenFrames > 0),

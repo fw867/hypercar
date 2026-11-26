@@ -1,11 +1,23 @@
 package io.github.hypercar.bluetooth
 
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothHeadset
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.os.SystemClock
 import android.util.Log
+import androidx.core.content.ContextCompat
+import androidx.core.content.IntentCompat
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
@@ -226,4 +238,205 @@ object BtProfiles {
         } catch (_: Throwable) {
             false
         }
+}
+
+internal class CarScoRoute(private val address: String, private val onConnected: (Long) -> Unit = {}) {
+    data class Snapshot(val generation: Long = 0, val reportedConnected: Boolean = false)
+
+    private val state = AtomicReference(Snapshot())
+    val generation: Long get() = state.get().generation
+    val reportedConnected: Boolean get() = state.get().reportedConnected
+    fun snapshot(): Snapshot = state.get()
+
+    fun connected(device: String): Boolean {
+        if (!address.equals(device, ignoreCase = true)) return false
+        val previous = state.getAndUpdate {
+            // Every broadcast supersedes a concurrent profile query, including repeat notifications.
+            if (it.reportedConnected) it.copy() else Snapshot(it.generation + 1, true)
+        }
+        if (!previous.reportedConnected) onConnected(previous.generation + 1)
+        return true
+    }
+
+    fun disconnected(device: String) {
+        if (address.equals(device, ignoreCase = true)) state.updateAndGet { it.copy(reportedConnected = false) }
+    }
+
+    fun reconcileAfterProfileReconnect(before: Snapshot, profileSco: Boolean?, selectedSco: Boolean?): Boolean? {
+        // A false headset response can mean IPC failure. Require an actual non-SCO call route to clear the latch.
+        val observed = if (profileSco == true) true else selectedSco
+        if (state.get() !== before) return null
+        if (before.reportedConnected && observed == false) {
+            if (!state.compareAndSet(before, before.copy(reportedConnected = false))) return null
+        }
+        return observed
+    }
+
+    fun mayStart(offeredAt: Long, scoConnected: () -> Boolean): Boolean {
+        val initial = state.get()
+        if (offeredAt != initial.generation || initial.reportedConnected) return false
+        if (scoConnected()) {
+            val next = initial.copy(generation = initial.generation + 1)
+            if (state.compareAndSet(initial, next)) onConnected(next.generation)
+            return false
+        }
+        return state.get().let { it.generation == offeredAt && !it.reportedConnected }
+    }
+}
+
+/** Read-only HEADSET state for the car associated with the active projection. */
+internal class CarHfpAudio(context: Context, private val address: String, onScoConnected: (Long) -> Unit) :
+    BluetoothProfile.ServiceListener, AutoCloseable {
+    private enum class ProfileState { READY, OFFLINE, RECONNECTED }
+    private data class Headset(val proxy: BluetoothHeadset, val state: ProfileState)
+
+    private val app = context.applicationContext
+    private val adapter = app.getSystemService(BluetoothManager::class.java)?.adapter
+    private val audio = app.getSystemService(AudioManager::class.java)
+    private val ready = CompletableDeferred<Unit>()
+    private val changed = Channel<Unit>(Channel.CONFLATED)
+    private val route = CarScoRoute(address, onScoConnected)
+    val routeGeneration: Long get() = route.generation
+    private val lock = Any()
+    private var headset: Headset? = null
+    private var closed = false
+    private val receiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == BluetoothAdapter.ACTION_STATE_CHANGED &&
+                intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1) == BluetoothAdapter.STATE_OFF
+            ) {
+                route.disconnected(address)
+                changed.trySend(Unit)
+                return
+            }
+            if (intent.action != BluetoothHeadset.ACTION_AUDIO_STATE_CHANGED &&
+                intent.action != BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED
+            ) return
+            val device = IntentCompat.getParcelableExtra(intent, BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                ?: return
+            if (!address.equals(device.address, ignoreCase = true)) return
+            val state = intent.getIntExtra(BluetoothProfile.EXTRA_STATE, -1)
+            if (intent.action == BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED) {
+                if (state == BluetoothProfile.STATE_DISCONNECTED) route.disconnected(device.address)
+            } else {
+                when (state) {
+                    BluetoothHeadset.STATE_AUDIO_CONNECTED -> route.connected(device.address)
+                    BluetoothHeadset.STATE_AUDIO_DISCONNECTED -> route.disconnected(device.address)
+                }
+            }
+            changed.trySend(Unit)
+        }
+    }
+    private val registered = runCatching {
+        val filter = IntentFilter(BluetoothHeadset.ACTION_AUDIO_STATE_CHANGED).apply {
+            addAction(BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED)
+            addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
+        }
+        ContextCompat.registerReceiver(app, receiver, filter, ContextCompat.RECEIVER_EXPORTED)
+    }.isSuccess
+
+    init {
+        val requested = runCatching {
+            adapter?.getProfileProxy(app, this, BluetoothProfile.HEADSET) == true
+        }.getOrDefault(false)
+        if (!requested) ready.complete(Unit)
+    }
+
+    suspend fun awaitInitialState() { withTimeoutOrNull(1_200L) { ready.await() } }
+
+    suspend fun awaitChange(timeoutMs: Long) { withTimeoutOrNull(timeoutMs) { changed.receive() } }
+
+    override fun onServiceConnected(profile: Int, service: BluetoothProfile) {
+        if (profile != BluetoothProfile.HEADSET || service !is BluetoothHeadset) return
+        val release = synchronized(lock) {
+            if (closed) {
+                service
+            } else {
+                val previous = headset
+                val state = if (previous == null || previous.state == ProfileState.READY) ProfileState.READY
+                    else ProfileState.RECONNECTED
+                headset = Headset(service, state)
+                previous?.proxy?.takeUnless { it === service }
+            }
+        }
+        release?.let(::releaseProxy)
+        ready.complete(Unit)
+        changed.trySend(Unit)
+    }
+
+    override fun onServiceDisconnected(profile: Int) {
+        if (profile != BluetoothProfile.HEADSET) return
+        // Retain the previous proxy for release. Its SCO query fails while the profile is offline.
+        synchronized(lock) { headset = headset?.copy(state = ProfileState.OFFLINE) }
+        ready.complete(Unit)
+    }
+
+    /** Classic HFP control can be connected while SCO is still inactive. */
+    fun isCallAudioConnected(): Boolean {
+        val active = synchronized(lock) { headset } ?: return route.reportedConnected
+        if (active.state == ProfileState.OFFLINE) return route.reportedConnected
+        if (active.state == ProfileState.RECONNECTED) {
+            val before = route.snapshot()
+            val profileSco = querySco(active.proxy)
+            val selectedSco = if (profileSco == true) null else selectedCallSco()
+            return synchronized(lock) {
+                if (headset !== active) return@synchronized route.reportedConnected
+                val observed = route.reconcileAfterProfileReconnect(before, profileSco, selectedSco)
+                if (observed == false || (observed == true && profileSco == true)) {
+                    headset = active.copy(state = ProfileState.READY)
+                }
+                route.reportedConnected || observed == true
+            }
+        }
+        return route.reportedConnected || querySco(active.proxy) == true
+    }
+
+    private fun selectedCallSco(): Boolean? {
+        val manager = audio ?: return null
+        return runCatching {
+            if (manager.mode != AudioManager.MODE_IN_CALL) return@runCatching null
+            val device = manager.communicationDevice ?: return@runCatching null
+            if (device.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+                if (address.equals(device.address, ignoreCase = true)) return@runCatching true
+                if (device.address.isBlank()) return@runCatching null
+            }
+            if (device.type == AudioDeviceInfo.TYPE_UNKNOWN) return@runCatching null
+            // A fallback earpiece can be reported when the communication route is unresolved.
+            // Confirm the selected port still exists and that no SCO port can belong to this car.
+            val outputs = manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            val selectedExists = outputs.any { it.id == device.id }
+            val targetScoExists = outputs.any {
+                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO &&
+                    (it.address.isBlank() || address.equals(it.address, ignoreCase = true))
+            }
+            if (selectedExists && !targetScoExists) false else null
+        }.getOrNull()
+    }
+
+    private fun querySco(proxy: BluetoothHeadset): Boolean? {
+        return try {
+            proxy.connectedDevices.any { it.address.equals(address, true) && proxy.isAudioConnected(it) }
+        } catch (_: SecurityException) {
+            null
+        }
+    }
+
+    fun mayStart(offeredAt: Long): Boolean {
+        val allowed = route.mayStart(offeredAt, ::isCallAudioConnected)
+        if (!allowed) changed.trySend(Unit)
+        return allowed
+    }
+
+    override fun close() {
+        if (registered) app.unregisterReceiver(receiver)
+        val release = synchronized(lock) {
+            closed = true
+            headset?.proxy.also { headset = null }
+        }
+        release?.let(::releaseProxy)
+    }
+
+    private fun releaseProxy(proxy: BluetoothHeadset) {
+        runCatching { adapter?.closeProfileProxy(BluetoothProfile.HEADSET, proxy) }
+    }
 }

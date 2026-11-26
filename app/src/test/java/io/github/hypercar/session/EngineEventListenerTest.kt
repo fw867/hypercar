@@ -10,6 +10,22 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class EngineEventListenerTest {
+    @Test fun retiredEngineCanReportItsCallAudioShutdownWithoutRearmingAudio() {
+        val gate = EngineCallbackGate()
+        val received = mutableListOf<Pair<String, String>>()
+        val target = object : RustCoreBridge.EventListener {
+            override fun onState(state: String, detail: String) { received += state to detail }
+            override fun onLog(line: String) {}
+            override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {}
+            override fun onNightMode(night: Boolean) {}
+        }
+        val old = EngineEventListener(gate, gate.begin(), target)
+        gate.retire()
+        old.onState("call_audio_armed", "7 16000")
+        old.onState("call_audio_stopping", "7 offer=3")
+        assertEquals(listOf("call_audio_stopping" to "7 offer=3"), received)
+    }
+
     @Test fun lateScreenSnapshotsCannotRestoreBufferedBadgeAfterFallbackOrSamePeerReinvite() {
         val gate = EngineCallbackGate()
         var shown = io.github.hypercar.core.PipelineDiagnostics()

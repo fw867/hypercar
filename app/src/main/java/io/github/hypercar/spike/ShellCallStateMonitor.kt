@@ -5,7 +5,10 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /** Tracks all active subscriptions only when PSTN audio is requested in the shell service. */
-internal class ShellCallStateMonitor(private val identity: ShellCallIdentity) {
+internal class ShellCallStateMonitor(
+    private val identity: ShellCallIdentity,
+    private val trace: (String) -> Unit,
+) {
     private val worker = Executors.newSingleThreadScheduledExecutor { task ->
         Thread(task, "hypercar-precise-call-state").apply { isDaemon = true }
     }
@@ -15,16 +18,21 @@ internal class ShellCallStateMonitor(private val identity: ShellCallIdentity) {
 
     init {
         worker.execute {
+            var stage = "registry_lookup"
             runCatching {
                 registry = ShellTelephonyRegistry()
+                stage = "registry_death_watch"
                 registry.linkToDeath {
                     identity.beginTracking()
+                    trace("precise registry=lost")
                     Log.w("HyperCar", "CALL-AUDIO: precise call state service lost")
                 }
+                stage = "watch_subscriptions"
                 subscriptionsListener = registry.watchSubscriptions(::subscriptionsChanged)
+                trace("precise registry=ready subscription_listener=registered")
                 // Some devices defer the first subscription notification until a SIM update.
                 subscriptionsChanged()
-            }.onFailure(::logUnavailable)
+            }.onFailure { logUnavailable(stage, it) }
         }
     }
 
@@ -35,11 +43,15 @@ internal class ShellCallStateMonitor(private val identity: ShellCallIdentity) {
     }
 
     private fun refreshSubscriptions(generation: Long) {
+        var stage = "query_active_subscriptions"
         runCatching {
+            val subscriptions = identity.queryTrackedSubscriptions(generation, registry::activeSubscriptions) ?: return
+            // This worker owns the listener table. An older queued refresh must leave it alone.
+            stage = "unregister_old"
             unregisterCallListeners()
-            val subscriptions = registry.activeSubscriptions()
-            if (!identity.trackSubscriptions(generation, subscriptions)) return
+            trace("precise generation=$generation active_subscriptions=$subscriptions")
             for (subscription in subscriptions) {
+                stage = "register_sub_$subscription"
                 callListeners[subscription] = registry.watchPreciseState(subscription,
                     { ringing, foreground, background ->
                         val roles = PreciseCallRoles(ringing, foreground, background)
@@ -52,13 +64,16 @@ internal class ShellCallStateMonitor(private val identity: ShellCallIdentity) {
                             scheduleRevalidation(2)
                         }
                     },
+                    { reason -> trace("precise generation=$generation sub=$subscription state_unreadable=$reason") },
                 )
+                trace("precise generation=$generation sub=$subscription state_listener=registered disconnect_listener=registered")
             }
-            identity.trackingReady(generation)
-            Log.i("HyperCar", "CALL-AUDIO: precise call state listeners registered count=${subscriptions.size}")
+            if (identity.trackingReady(generation)) {
+                Log.i("HyperCar", "CALL-AUDIO: precise call state listeners registered count=${subscriptions.size}")
+            }
         }.onFailure { failure ->
             runCatching { unregisterCallListeners() }
-            logUnavailable(failure)
+            logUnavailable("generation=$generation stage=$stage", failure)
         }
     }
 
@@ -79,7 +94,9 @@ internal class ShellCallStateMonitor(private val identity: ShellCallIdentity) {
         }
     }
 
-    private fun logUnavailable(failure: Throwable) {
-        Log.w("HyperCar", "CALL-AUDIO: precise call state unavailable ${(failure.cause ?: failure).javaClass.simpleName}")
+    private fun logUnavailable(stage: String, failure: Throwable) {
+        val reason = (failure.cause ?: failure).javaClass.simpleName
+        trace("precise registration_failed $stage error=$reason")
+        Log.w("HyperCar", "CALL-AUDIO: precise call state unavailable $stage $reason")
     }
 }

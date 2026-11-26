@@ -161,7 +161,7 @@ object RustCoreBridge {
     external fun nativeStartNavigationAudio(rate: Int, channels: Int)
     external fun nativeCallAudioArmed(token: Long): Boolean
     external fun nativeOfferCallAudio(token: Long, attempt: Long, rate: Int, socketFd: Int): Boolean
-    external fun nativeTakeCallAudioRetry(token: Long, attempt: Long): Int
+    external fun nativeTakeCallAudioResult(token: Long, attempt: Long): Int
     external fun nativePushNavigationAudioPcm(pcm: ShortArray, rate: Int, channels: Int)
     external fun nativeStopNavigationAudio()
 
