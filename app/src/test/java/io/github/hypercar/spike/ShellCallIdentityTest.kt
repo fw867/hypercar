@@ -354,6 +354,55 @@ class ShellCallIdentityTest {
         assertTrue(ShellCallIdentity.parseSnapshot(idleDump).noCalls)
     }
 
+    private fun samsungCall(id: Int) = call(id, "ACTIVE") +
+        "caps=[Capabilities: CAPABILITY_HOLD CAPABILITY_MUTE], props=[Properties:], conf(false), had_child(false)"
+
+    @Test fun oneUi85ActivePstnRecordMustMatchTheForegroundRecord() {
+        val active = samsungCall(170)
+        val snapshot = ShellCallIdentity.parseSnapshot(telecomDump(active, "null"))
+        assertEquals("TC@170", snapshot.activeCallId)
+        assertFalse(snapshot.noCalls)
+        assertNull(ShellCallIdentity.parse(telecomDump(active, samsungCall(171))))
+        assertNull(ShellCallIdentity.parse(sequenceOf(
+            "CallsManager:", "  mCalls:", "    $active", "  mCallAudioManager:",
+            "    Foreground call:", "    ${samsungCall(171)}",
+        )))
+    }
+
+    @Test fun oneUi85RejectsVoipConferenceAndMalformedCallRecords() {
+        val active = samsungCall(170)
+        for (invalid in listOf(
+            active.replace("voip=falsecaps", "voip=truecaps"),
+            active.replace("conf(false)", "conf(true)"),
+            active.replace("had_child(false)", "had_child(true)"),
+            active.replace("childs(0)", "childs(1)"),
+            active.replace("has_parent(false)", "has_parent(true)"),
+            active.replace("state=ACTIVE", "state=ON_HOLD"),
+            active.replace(telephony, "example.voip/.Connections"),
+            active.substringBefore(", conf(false)"),
+        )) {
+            assertNull(ShellCallIdentity.parse(telecomDump(invalid, "null")))
+        }
+    }
+
+    @Test fun oneUi85NestedHistoryRevokesOnlyTheCallWithTheTerminalEvent() {
+        val snapshot = ShellCallIdentity.parseSnapshot(telecomDump(samsungCall(170), "null") + sequenceOf(
+            "      Historical Events:",
+            "        CallTC@169 (2 events):",
+            "          10:13:15.005 - SET_DISCONNECTING",
+            "          10:13:15.010 - SET_DISCONNECTED (cause)",
+            "        CallTC@170 (1 events):",
+            "          10:13:37.838 - SET_ACTIVE",
+            "        Unrelated data:",
+            "          10:13:37.900 - SET_DISCONNECTED",
+            "      Another section:",
+            "        CallTC@170 (1 events):",
+            "          10:13:38.001 - SET_DISCONNECTED",
+        ))
+        assertEquals(setOf("TC@169"), snapshot.endedCallIds)
+        assertEquals("TC@170", snapshot.activeCallId)
+    }
+
     @Test fun aTransportMissCannotEraseOrExtendTheLastVerifiedIdentity() {
         var elapsed = 0L
         var result: TelecomCallSnapshot = confirmed()

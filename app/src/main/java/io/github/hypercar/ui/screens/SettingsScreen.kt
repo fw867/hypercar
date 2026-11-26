@@ -1616,7 +1616,10 @@ fun CarSourceSection(
                 if (current == "carwith" && startup.carWithInstalled) {
                     CarWithSettingsShortcut()
                 }
-                if (current == "system_carlife") SystemCarLifeSettingsShortcut(!connected)
+                if (current == "system_carlife") {
+                    SystemCarLifeSettingsShortcut(!connected)
+                    SystemCarLifeCallAudioSwitch(!connected)
+                }
                 if (!startup.carWithInstalled && current != "system_carlife") {
                     Text("未安装系统 CarWith，此选项不可用。", color = AmberWarning,
                         style = MaterialTheme.typography.bodySmall)
@@ -1685,12 +1688,13 @@ fun CarSourceSection(
             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
             Spacer(Modifier.height(16.dp))
             Text("手机 CarLife+", color = TextPrimary, style = MaterialTheme.typography.titleSmall)
-            Text("使用三星车联、荣耀车联等手机自带的 CarLife+ 画面，无需小米 CarWith 或 Shizuku。请在手机车联中打开无线连接并开始连接，保持页面等待。",
+            Text("通过三星车联、荣耀车联等手机自带的 CarLife+ 投屏，投屏无需 Shizuku。请在手机车联中打开无线连接并开始连接，保持页面等待。",
                 color = TextSecondary, style = MaterialTheme.typography.bodySmall)
             CapsuleButton(if (current == "system_carlife") "已选择 CarLife+" else "选择 CarLife+",
                 onClick = { selectSource("system_carlife") }, enabled = !connected,
                 modifier = Modifier.fillMaxWidth(), filled = current == "system_carlife")
             SystemCarLifeSettingsShortcut(!connected)
+            if (current == "system_carlife") SystemCarLifeCallAudioSwitch(!connected)
             if (!compact) {
                 Spacer(Modifier.height(8.dp))
                 Text("从安装或授权页面返回后会自动重新检查。", color = TextSecondary,
@@ -1698,6 +1702,21 @@ fun CarSourceSection(
             }
         }
     }
+}
+
+@Composable
+private fun SystemCarLifeCallAudioSwitch(enabled: Boolean) {
+    var checked by remember { mutableStateOf(SettingsStore.systemCarLifeCallAudio) }
+    SwitchRow(
+        title = "CarLife+ 车机通话（实验）",
+        subtitle = "使用车机扬声器和麦克风进行蜂窝通话。需启动并授权 Shizuku，下次连接生效。",
+        checked = checked,
+        onCheckedChange = {
+            SettingsStore.systemCarLifeCallAudio = it
+            checked = it
+        },
+        enabled = enabled,
+    )
 }
 
 @Composable

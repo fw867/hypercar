@@ -109,6 +109,8 @@ pub struct EngineConfig {
     #[serde(default)]
     pub system_carlife_source: bool,
     #[serde(default)]
+    pub system_carlife_call_audio: bool,
+    #[serde(default)]
     pub hu_bt_address: String,
     #[serde(default)]
     pub hu_bt_name: String,
@@ -162,6 +164,36 @@ impl EngineConfig {
     pub(crate) fn carwith_fps(&self) -> u32 {
         self.fps.clamp(1, 60)
     }
+
+    fn carlife_call_audio_enabled(&self) -> bool {
+        self.carlife_source && (!self.system_carlife_source || self.system_carlife_call_audio)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn carlife_call_audio_is_opt_in_for_the_system_source() {
+    let mut json = serde_json::json!({
+        "device_id": "test", "car_ip": "127.0.0.1", "airplay_port": 7000,
+        "width": 1920, "height": 720, "fps": 60, "identity_path": "unused",
+    });
+    let enabled = |json: &serde_json::Value| {
+        serde_json::from_value::<EngineConfig>(json.clone())
+            .unwrap()
+            .carlife_call_audio_enabled()
+    };
+    assert!(!enabled(&json));
+    json["system_carlife_call_audio"] = true.into();
+    assert!(!enabled(&json));
+    json["carlife_source"] = true.into();
+    json.as_object_mut().unwrap().remove("system_carlife_call_audio");
+    assert!(enabled(&json));
+    json["system_carlife_source"] = true.into();
+    assert!(!enabled(&json));
+    json["system_carlife_call_audio"] = false.into();
+    assert!(!enabled(&json));
+    json["system_carlife_call_audio"] = true.into();
+    assert!(enabled(&json));
 }
 
 fn default_true() -> bool {
@@ -551,7 +583,7 @@ pub async fn run_engine(
     // Requests share the encrypted control channel, with their own CSeq; feedback continues independently.
     let mut auxiliary=outcome.aux_audio.map(|session| {
         let mut controller = crate::aux_audio::Controller::spawn(session,auxiliary_input,main_audio_tx.clone(),fallback_audio_tx,shutdown.clone());
-        if cfg.carlife_source && !cfg.system_carlife_source { controller.arm_calls(main_audio_tx); }
+        if cfg.carlife_call_audio_enabled() { controller.arm_calls(main_audio_tx); }
         controller
     });
     let keepalive = outcome.keepalive;

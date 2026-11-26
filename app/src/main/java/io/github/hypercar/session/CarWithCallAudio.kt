@@ -9,9 +9,12 @@ import io.github.hypercar.shizuku.ShizukuTools
 import io.github.hypercar.spike.SpikeShell
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 internal object CarWithCallAudio {
     private const val REBIND_INTERVAL_MS = 2_000L
+    private val monitorLock = Mutex()
 
     private class ForegroundCall(val identity: String, rate: Int) {
         val rates = CallAudioRates(rate)
@@ -26,13 +29,24 @@ internal object CarWithCallAudio {
     }
 
     suspend fun monitor(context: Context, token: Long, rate: Int, current: () -> Boolean, log: (String) -> Unit) {
+        fun armed() = current() && RustCoreBridge.nativeCallAudioArmed(token)
+        withArmedMonitor(::armed) { monitorCall(context, token, rate, ::armed, log) }
+    }
+
+    internal suspend fun withArmedMonitor(armed: () -> Boolean, monitor: suspend () -> Unit) {
+        // The shell has one endpoint slot. Keep it until the previous monitor's cleanup finishes.
+        monitorLock.withLock {
+            if (armed()) monitor()
+        }
+    }
+
+    private suspend fun monitorCall(context: Context, token: Long, rate: Int, armed: () -> Boolean, log: (String) -> Unit) {
         val audio = context.getSystemService(AudioManager::class.java) ?: return
         val owner = Binder()
         var foreground: ForegroundCall? = null
         var offerId = 0L
         var nextBindAt = 0L
         var reportedUnavailable: String? = null
-        fun armed() = current() && RustCoreBridge.nativeCallAudioArmed(token)
         fun diagnosticStatus() = runCatching { SpikeShell.callAudioStatus() }.getOrNull() ?: "shell_status_unavailable"
 
         try {
@@ -105,6 +119,7 @@ internal object CarWithCallAudio {
                                 socket.use {
                                     if (armed() && RustCoreBridge.nativeOfferCallAudio(token, ++offerId, captureRate, it.detachFd())) {
                                         call.offer = offerId
+                                        log("CALL-AUDIO: phone audio offered rate=$captureRate")
                                     }
                                 }
                             } finally {

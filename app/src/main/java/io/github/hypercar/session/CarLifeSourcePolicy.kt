@@ -5,6 +5,9 @@ import io.github.hypercar.net.CarNetworkReuse
 /** Entry lifecycle uses the attempt snapshot; wire protocol is negotiated separately in Rust. */
 internal object CarLifeSourcePolicy {
     fun isGateway(source: String) = source == "carwith" || source == "system_carlife"
+    fun allowsCallAudio(source: String, systemCallAudio: Boolean) =
+        source == "carwith" || source == "system_carlife" && systemCallAudio
+
     fun shouldReopen(source: String, startup: Boolean) =
         source == "carwith" || source == "system_carlife" && startup
 

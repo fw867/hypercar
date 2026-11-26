@@ -83,7 +83,7 @@ impl Fixture {
         let message=tokio::time::timeout(Duration::from_secs(3),async {loop {
             if let Some(m)=crate::rtsp::parse_rtsp_messages(&mut self.buffer).unwrap().into_iter().next(){return m;}
             let mut bytes=[0;4096];let n=self.peer.read(&mut bytes).await.unwrap();assert!(n>0);self.buffer.extend_from_slice(&bytes[..n]);
-        }}).await.unwrap();
+        }}).await.unwrap_or_else(|_| panic!("timed out waiting for {expected}, prior requests: {:?}", self.order));
         let value=if message.body.is_empty() { Value::dict(vec![]) } else { bplist::parse(&message.body).unwrap() };
         let actual=if message.first_line == "RECORD / RTSP/1.0" { "record".into() }
         else if message.first_line.starts_with("POST /command ") {value.get("type").and_then(Value::as_str).unwrap().to_string()} else {
@@ -247,7 +247,20 @@ async fn telephony_bridges_authenticated_pcm_both_ways_and_restores_original_med
     let (teardown, body) = fixture.request("teardown:100").await;
     assert!(!crate::call_audio::take_retry(token, 1));
     assert_eq!(body.get("streams").unwrap().as_array().unwrap()[0].get("streamConnectionID").and_then(Value::as_int), Some(id));
-    fixture.controller.session.control.buffered_ownership.publish(false);
+    let set_receiver_main_audio = |fixture: &Fixture, takes: bool| {
+        let session = &fixture.controller.session;
+        let mut fields = vec![("resourceID", Value::int(2)), ("transferType", Value::int(if takes { 1 } else { 2 }))];
+        if takes {
+            fields.extend([("transferPriority", Value::int(500)), ("takeConstraint", Value::int(100)), ("borrowConstraint", Value::int(100))]);
+        }
+        let command = Value::dict(vec![("type", Value::str("changeModes")), ("params",
+            Value::dict(vec![("resources", Value::array(vec![Value::dict(fields)]))]))]);
+        let mut modes = session.resource.modes.lock();
+        modes.response(&command, &session.receiver_audio_generation).unwrap();
+        assert_eq!(modes.audio_owned(), !takes);
+        session.control.buffered_ownership.publish_with_gate(&session.resource.owned, modes.audio_owned());
+    };
+    set_receiver_main_audio(&fixture, true);
     fixture.ack(&teardown, None).await;
     let (idle, body) = fixture.request("modesChanged").await;
     assert_eq!(body.get("params").unwrap().get("appStates").unwrap().as_array().unwrap()[1]
@@ -255,7 +268,20 @@ async fn telephony_bridges_authenticated_pcm_both_ways_and_restores_original_med
     fixture.ack(&idle, None).await;
     assert!(tokio::time::timeout(Duration::from_millis(50), fixture.peer.read_u8()).await.is_err(),
         "a receiver Take must leave control open and defer main media SETUP until the grant returns");
-    fixture.controller.session.control.buffered_ownership.publish(true);
+    // Keep the car's permanent grant. A speech reply can still borrow it temporarily.
+    fixture.source(Kind::Speech);
+    let (borrow, _) = fixture.request("modesChanged").await;
+    fixture.ack(&borrow, None).await;
+    let (speech, body) = fixture.request("setup:100:speechRecognition").await;
+    fixture.setup_reply(&speech, &body).await;
+    fixture.opus_packet(100).await;
+    let (end_speech, _) = fixture.request("teardown:100").await;
+    fixture.ack(&end_speech, None).await;
+    let (unborrow, _) = fixture.request("modesChanged").await;
+    fixture.ack(&unborrow, None).await;
+    assert!(tokio::time::timeout(Duration::from_millis(50), fixture.peer.read_u8()).await.is_err(),
+        "ending borrowed speech must not restore main media before the car returns it");
+    set_receiver_main_audio(&fixture, false);
     let (interrupted, _) = fixture.request("setup:100:media").await;
     fixture.controller.session.control.buffered_ownership.publish(false);
     fixture.reject(&interrupted, 403).await;
@@ -497,6 +523,38 @@ async fn id9_unborrow_only_switches_after_usable_setup_and_then_records() {
     trigger(3);
     let mut bytes = [0; 64];
     assert!(tokio::time::timeout(Duration::from_millis(60), f.peer.read(&mut bytes)).await.is_err());
+}
+
+#[tokio::test]
+async fn call_media_restore_consumes_the_same_unborrow_as_realtime_rebuild() {
+    use std::sync::atomic::Ordering;
+    let mut f = id9_aac_fixture().await;
+    let control = f.controller.session.control.clone();
+    control.buffered_ownership.publish(false);
+    let session = f.controller.session.clone();
+    let stop = f.controller.stop.clone();
+    let (commands, mut installed) = mpsc::unbounded_channel();
+    let restore = tokio::spawn(async move {
+        let mut ownership = session.control.buffered_ownership.subscribe();
+        let transition = stop.main_transition.lock().await;
+        session.restore_media_after_call(&commands, &mut ownership, &stop, transition).await
+    });
+
+    control.audio_unborrow_generation.store(1, Ordering::Release);
+    control.buffered_ownership.publish(true);
+    let (setup, offer) = f.request("setup:102:media").await;
+    control.audio_unborrow_wake.notify_one();
+    f.setup_reply(&setup, &offer).await;
+    assert!(matches!(installed.recv().await, Some(MainCommand::Install(Some(_)))));
+    assert!(restore.await.unwrap());
+    assert!(tokio::time::timeout(Duration::from_millis(100), f.peer.read_u8()).await.is_err(),
+        "the return used to restore media cannot also start a realtime rebuild");
+
+    control.audio_unborrow_generation.store(2, Ordering::Release);
+    control.audio_unborrow_wake.notify_one();
+    let (setup, _) = f.request("setup:102:media").await;
+    f.reject(&setup, 400).await;
+    f.stopped().await;
 }
 
 #[tokio::test]

@@ -244,27 +244,35 @@ internal class ShellCallIdentity(
             }
         }.getOrDefault(TelecomCallSnapshot.Unavailable)
 
-        private val historyCall = Regex("^ {2}Call\\s*(TC@[0-9]{1,19})(?=[:\\s]|$).*")
-        private val terminalEvent = Regex("^ {4}[0-9:.]+ - SET_DISCONNECT(?:ED|ING)(?=[:\\s]|$).*")
+        private val historyCall = Regex("Call\\s*(TC@[0-9]{1,19})(?=[:\\s]|$).*")
+        private val terminalEvent = Regex("[0-9:.]+ - SET_DISCONNECT(?:ED|ING)(?=[:\\s]|$).*")
+        private val samsungNonVoip = Regex(
+            """falsecaps=\[Capabilities:[^\[\]]*\], props=\[Properties:[^\[\]]*\], conf\(false\), had_child\(false\)""",
+        )
 
         /** Extract only opaque IDs and terminal events. Never retain call details from the history. */
         fun parseSnapshot(lines: Sequence<String>): TelecomCallSnapshot.Observed {
             val head = ArrayList<String>(96)
             val ended = linkedSetOf<String>()
-            var inHistory = false
+            var historyIndent: Int? = null
             var eventCall: String? = null
             for (line in lines) {
                 if (head.size < 96) head.add(line)
-                if (line.trimEnd() == "Historical Events:") {
-                    inHistory = true
+                if (line.trim() == "Historical Events:") {
+                    historyIndent = line.indexOfFirst { !it.isWhitespace() }
                     eventCall = null
                     continue
                 }
-                if (!inHistory || line.isBlank()) continue
+                val sectionIndent = historyIndent ?: continue
+                if (line.isBlank()) continue
                 val indent = line.indexOfFirst { !it.isWhitespace() }
-                if (indent == 0) inHistory = false
-                if (indent == 2) eventCall = historyCall.matchEntire(line)?.groupValues?.get(1)
-                if (eventCall != null && terminalEvent.matches(line)) {
+                if (indent <= sectionIndent) {
+                    historyIndent = null
+                    eventCall = null
+                } else if (indent == sectionIndent + 2) {
+                    eventCall = historyCall.matchEntire(line.substring(indent))?.groupValues?.get(1)
+                } else if (indent == sectionIndent + 4 && eventCall != null &&
+                    terminalEvent.matches(line.substring(indent))) {
                     ended.add(eventCall)
                     if (ended.size > TERMINAL_HISTORY_SIZE) ended.remove(ended.first())
                 }
@@ -314,8 +322,14 @@ internal class ShellCallIdentity(
         }
 
         private fun parseActiveCall(record: String): String? {
-            if (!record.endsWith("]") && !record.endsWith("], voip=false")) return null
             if (!record.startsWith(CALL_PREFIX) || ", childs(0), has_parent(false)," !in record) return null
+            val voip = record.substringAfter("], voip=", missingDelimiterValue = "")
+            val nonVoip = when {
+                voip.isEmpty() -> record.endsWith(']')
+                voip == "false" -> true
+                else -> samsungNonVoip.matches(voip)
+            }
+            if (!nonVoip) return null
             val id = record.substring(CALL_PREFIX.length).substringBefore(',')
             val digits = id.removePrefix("TC@")
             if (digits == id || digits.length !in 1..19 || digits.any { it !in '0'..'9' }) return null

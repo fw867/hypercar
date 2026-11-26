@@ -357,6 +357,7 @@ object HyperCarRepo {
     private var reconnectJob: Job? = null
     private var sessionUiJob: Job? = null
     @Volatile private var sessionCarSource = "car_ui"
+    @Volatile private var sessionCallAudioEnabled = false
     private val sessionCarLifeMode: Boolean get() = CarLifeSourcePolicy.isGateway(sessionCarSource)
     private val sessionSystemCarLife: Boolean get() = sessionCarSource == "system_carlife"
     @Volatile private var sessionIdentity: PairingIdentityFiles.Location? = null
@@ -903,6 +904,7 @@ object HyperCarRepo {
         sessionHadLink = false
         roundSessionBaseline = iap2?.sessionStartCount ?: 0
         sessionCarSource = SettingsStore.carSource
+        sessionCallAudioEnabled = CarLifeSourcePolicy.allowsCallAudio(sessionCarSource, SettingsStore.systemCarLifeCallAudio)
         hudSessionEnabled = true
         io.github.hypercar.navigation.NavigationSources.clear()
         sessionIdentity = null
@@ -2288,7 +2290,8 @@ object HyperCarRepo {
                             receiverBluetoothMac = receiver, carWithSource = sessionCarLifeMode,
                             receiverModel = coordinator.activePeerAddress?.takeIf { it.equals(receiver, ignoreCase = true) }
                                 ?.let { io.github.hypercar.iap2.Iap2Peer.modelFor(it) } ?: mdnsEndpoint?.model,
-                            headUnitProfile = headUnitProfile, systemCarLifeSource = sessionSystemCarLife)
+                            headUnitProfile = headUnitProfile, systemCarLifeSource = sessionSystemCarLife,
+                            systemCarLifeCallAudio = sessionCallAudioEnabled)
                         log("SESSION-ORIGIN: ctrlInvite=${advertiser.lastInvitation != null} endpointFromInvite=${endpoint.fromInvite} " +
                             "bluetoothSession=${coordinator.isSessionActive} knownWifi=${wifiReceiverMac != null} network=$boundNetwork")
                         log("CORE +${stageMs()}ms 引擎配置：$json")
@@ -3861,10 +3864,11 @@ object HyperCarRepo {
             }
             when (state) {
                 "call_audio_armed" -> {
-                    if (!sessionLive.get() || !sessionCarLifeMode || sessionSystemCarLife) return
+                    if (!sessionLive.get() || !sessionCallAudioEnabled) return
                     val context = appContext() ?: return
                     val token = detail.substringBefore(' ').toLongOrNull() ?: return
                     val rate = detail.substringAfter(' ').toIntOrNull() ?: return
+                    log("CALL-AUDIO: armed source=$sessionCarSource rate=$rate")
                     scope.launch {
                         CarWithCallAudio.monitor(context, token, rate,
                             { sessionLive.get() && engineCallbacks.isCurrent(callbackOwner) }, ::log)
@@ -5129,7 +5133,8 @@ object HyperCarRepo {
             // selected target is authoritative; an idle coordinator may retain another car.
             receiverBluetoothMac = if (systemCarLife) wakePeer ?: SettingsStore.targetCarMac else null,
             carWithSource = true, headUnitProfile = headUnitProfile,
-            systemCarLifeSource = systemCarLife)).put("width", width).put("height", height)
+            systemCarLifeSource = systemCarLife, systemCarLifeCallAudio = sessionCallAudioEnabled))
+            .put("width", width).put("height", height)
             .put("carwith_cached_canvas", cached != null)
             .put("carwith_cached_max_fps", cachedMaxFps)
             .put("carwith_navigation_enabled", carWithHudNavigationAllowed).toString()

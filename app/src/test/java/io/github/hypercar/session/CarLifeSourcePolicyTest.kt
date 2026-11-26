@@ -4,6 +4,14 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CarLifeSourcePolicyTest {
+    @Test fun systemCallAudioRequiresOptIn() {
+        assertTrue(CarLifeSourcePolicy.allowsCallAudio("carwith", false))
+        assertTrue(CarLifeSourcePolicy.allowsCallAudio("carwith", true))
+        assertFalse(CarLifeSourcePolicy.allowsCallAudio("system_carlife", false))
+        assertTrue(CarLifeSourcePolicy.allowsCallAudio("system_carlife", true))
+        assertFalse(CarLifeSourcePolicy.allowsCallAudio("car_ui", true))
+    }
+
     private val first="10:11:12:13:14:15"
     private val second="20:21:22:23:24:25"
     @Test fun onlyCarLifeSourcesShareTheGateway() {

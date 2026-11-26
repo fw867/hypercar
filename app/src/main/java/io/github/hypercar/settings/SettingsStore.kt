@@ -329,6 +329,10 @@ object SettingsStore {
     val systemCarLifeMode: Boolean get() = carSource == "system_carlife"
     val carLifeMode: Boolean get() = io.github.hypercar.session.CarLifeSourcePolicy.isGateway(carSource)
 
+    var systemCarLifeCallAudio: Boolean
+        get() = p().getBoolean("system_carlife_call_audio", false)
+        set(value) = p().edit().putBoolean("system_carlife_call_audio", value).apply()
+
     // The retired self-rendered speech experiment also gates incoming native callbacks.
     val carVoiceRecognition: Boolean get() = false
 
@@ -407,6 +411,7 @@ object SettingsStore {
         receiverModel: String? = null,
         headUnitProfile: io.github.hypercar.headunit.HeadUnitProfile,
         systemCarLifeSource: Boolean = systemCarLifeMode,
+        systemCarLifeCallAudio: Boolean = false,
     ): String {
         fun esc(s: String) = s.replace("\\", "\\\\").replace("\"", "\\\"")
         // 触摸兜底空间：车机档案若给了 touchDisplay 就用它；否则用设置里的
@@ -441,6 +446,7 @@ object SettingsStore {
             append("\"carlife_source\":").append(if (carWithSource) "true" else "false").append(",")
             append("\"system_carlife_source\":").append(carWithSource && systemCarLifeSource).append(",")
             if (carWithSource && systemCarLifeSource) {
+                append("\"system_carlife_call_audio\":").append(systemCarLifeCallAudio).append(",")
                 io.github.hypercar.session.CarLifeSourcePolicy.huIdentity(receiverBluetoothMac,targetCarMac,targetCarName,pairedCars)?.let { hu ->
                     append("\"hu_bt_address\":").append(org.json.JSONObject.quote(hu.address)).append(",")
                     append("\"hu_bt_name\":").append(org.json.JSONObject.quote(hu.name)).append(",")

@@ -123,12 +123,18 @@ pub struct Controller {
     call_allocated: Arc<AtomicBool>,
 }
 #[derive(Default)]
+struct MainAudioTransition {
+    call_media_paused: bool,
+    restored_unborrow_generation: u64,
+}
+
+#[derive(Default)]
 struct Stop {
     requested:AtomicBool,
     wake:Notify,
     // R14G17 type100/102 SETUP and TEARDOWN share a receiver slot. Serialize
     // media swaps and temporary users of the slot until cleanup is acknowledged.
-    main_transition:Arc<tokio::sync::Mutex<()>>,
+    main_transition: Arc<tokio::sync::Mutex<MainAudioTransition>>,
 }
 impl Stop {
     async fn wait(&self) {
@@ -208,12 +214,15 @@ impl Controller {
                     session.control.close();
                     break;
                 }
-                if cleanup.restore && !session.restore_media_after_call(&commands, &mut ownership, &stop).await {
-                    crate::emit_log("CALL-AUDIO: media restore failed with a current grant; close session");
-                    session.control.close();
-                    break;
+                if cleanup.restore {
+                    if !session.restore_media_after_call(&commands, &mut ownership, &stop, transition).await {
+                        crate::emit_log("CALL-AUDIO: media restore failed with a current grant; close session");
+                        session.control.close();
+                        break;
+                    }
+                } else {
+                    drop(transition);
                 }
-                drop(transition);
                 if !stop.requested.load(Ordering::Acquire) && !session.control.is_closed() && result.is_err() {
                     offers.request_retry(attempt, retryable);
                 }
@@ -258,14 +267,14 @@ impl Controller {
                         update = failures.changed() => if update.is_err() { return; },
                     }
                     let Some(failed) = *failures.borrow_and_update() else { continue; };
-                    let _transition = tokio::select! {
+                    let transition = tokio::select! {
                         biased;
                         _ = engine_shutdown.wait() => return,
                         _ = stopping.wait() => return,
                         guard = stopping.main_transition.lock() => guard,
                     };
                     // Pause and restore can supersede this failure while recovery waits for the slot.
-                    if *failures.borrow() != Some(failed) { continue; }
+                    if transition.call_media_paused || *failures.borrow() != Some(failed) { continue; }
                     recovery.fallback_buffered(&commands, &stopping, &engine_shutdown).await;
                     return;
                 }
@@ -319,7 +328,7 @@ impl Lease {
         Self::Navigation(lease)=>session.resource.end_navigation(lease.clone()).await,
     }}
 }
-struct Active { output:AudioOut,lease:Lease }
+struct Active { output: AudioOut, lease: Lease, restore_media: bool }
 enum StartError {Refused(String),Failed(String),AwaitNavigationCleanup(String)}
 impl Session {
     async fn rebuild_on_unborrow(&self, commands: &mpsc::UnboundedSender<MainCommand>, shutdown: &Arc<EngineShutdown>, stop: &Stop) {
@@ -327,10 +336,13 @@ impl Session {
         let mut handled = 0;
         loop {
             self.control.audio_unborrow_wake.notified().await;
-            let _transition = stop.main_transition.lock().await;
+            let transition = stop.main_transition.lock().await;
             let generation = unborrow.load(Ordering::Acquire);
             if generation == handled { continue; }
             handled = generation;
+            if transition.call_media_paused || transition.restored_unborrow_generation == generation {
+                continue;
+            }
             let codec = *self.media_codec.lock();
             let Some(codec @ (AudioCodec::Aac | AudioCodec::Aac441)) = codec else { continue; };
             let grant = {
@@ -533,7 +545,7 @@ impl Session {
             let media_ready = self.media_codec.lock().is_none_or(|codec| {
                 self.params.pipeline.lock().main_audio_stream_type == Some(codec.stream_type())
             });
-            if !media_ready {
+            if transition.call_media_paused || !media_ready {
                 drop(transition);
                 // Install is asynchronous, so its pipeline publication can trail
                 // release of the transition guard.
@@ -598,17 +610,19 @@ impl Session {
     }
 
     async fn restore_media_after_call(&self, commands: &mpsc::UnboundedSender<MainCommand>,
-        ownership: &mut tokio::sync::watch::Receiver<crate::buffered_ownership::Ownership>, stop: &Stop) -> bool {
+        ownership: &mut tokio::sync::watch::Receiver<crate::buffered_ownership::Ownership>, stop: &Stop,
+        mut transition: tokio::sync::MutexGuard<'_, MainAudioTransition>) -> bool {
         let stopping = || stop.requested.load(Ordering::Acquire) || self.control.is_closed();
         if stopping() { return true; }
         let Some(codec) = *self.media_codec.lock() else {
             let _ = commands.send(MainCommand::Install(None));
             return true;
         };
+        // The call and previous sender are gone. Speech may borrow the slot while
+        // the car owns it, with media restoration still owned by this task.
+        transition.call_media_paused = true;
+        drop(transition);
         'grants: loop {
-            // Call cleanup freed the slot. A receiver Take can deny media SETUP
-            // until the phone regains the resource. Keep the transition serialized
-            // so another user cannot allocate the slot during restoration.
             let losses = tokio::select! {
                 biased;
                 _ = stop.wait() => return true,
@@ -618,11 +632,21 @@ impl Session {
                     Err(_) => return true,
                 },
             };
+            let mut transition = tokio::select! {
+                biased;
+                _ = stop.wait() => return true,
+                _ = self.control.wait_for_control_close() => return true,
+                guard = stop.main_transition.lock() => guard,
+            };
             for attempt in 1..=2 {
                 if stopping() { return true; }
                 let grant = *ownership.borrow();
-                if grant.losses != losses { continue 'grants; }
+                if !grant.owned || grant.losses != losses { continue 'grants; }
+                let unborrow = self.control.audio_unborrow_generation.load(Ordering::Acquire);
                 if let Some(output) = self.negotiate_media_restore(codec, attempt).await {
+                    // The same receiver return may also have queued a realtime rebuild.
+                    transition.restored_unborrow_generation = unborrow;
+                    transition.call_media_paused = false;
                     return commands.send(MainCommand::Install(Some(output))).is_ok();
                 }
                 if stopping() { return true; }
@@ -645,7 +669,7 @@ struct Cleanup {
     lease:Option<Lease>,close:bool,retire_media:bool,restore:bool,
     close_state:crate::aux_setup::CloseState,
     shared_input: Option<(InputStream, i64)>,
-    main_transition: Option<tokio::sync::OwnedMutexGuard<()>>,
+    main_transition: Option<tokio::sync::OwnedMutexGuard<MainAudioTransition>>,
 }
 impl Cleanup {
     fn pending(&self)->bool {self.lease.is_some()||self.close||self.retire_media||self.restore||self.shared_input.is_some()}
@@ -678,15 +702,16 @@ impl Cleanup {
         true
     }
 }
-async fn start(kind:Kind,session:&Session,input:&Input,commands:&mpsc::UnboundedSender<MainCommand>,allocated:&[AtomicBool;2],cleanup:&mut Cleanup,transition:Option<tokio::sync::OwnedMutexGuard<()>>)->Result<Active,StartError> {
+async fn start(kind:Kind,session:&Session,input:&Input,commands:&mpsc::UnboundedSender<MainCommand>,allocated:&[AtomicBool;2],cleanup:&mut Cleanup,transition:Option<tokio::sync::OwnedMutexGuard<MainAudioTransition>>)->Result<Active,StartError> {
     crate::opus_encode::OpusEncoder::new(kind.rate(),kind.spf()).map_err(|e|StartError::Failed(e.to_string()))?;
     let lease=match kind {
         Kind::Speech=>Lease::Speech(session.resource.begin_speech(input.user_initiated()).await.ok_or_else(||StartError::Refused("speech resource denied or superseded".into()))?),
         Kind::Navigation=>Lease::Navigation(session.resource.begin_navigation().await.ok_or_else(||StartError::Refused("navigation app state denied or superseded".into()))?),
     };
     cleanup.lease=Some(lease.clone());
+    let call_media_paused = transition.as_ref().is_some_and(|state| state.call_media_paused);
     cleanup.main_transition = transition;
-    if kind==Kind::Speech {
+    if kind==Kind::Speech && !call_media_paused {
         if let Err(error)=session.pause_main(commands, cleanup, false).await {
             if !cleanup.retire_media { cleanup.run(kind,session,commands,allocated,false).await; }
             return Err(StartError::Refused(format!("media teardown pending; no conflicting SETUP: {error}")));
@@ -703,8 +728,9 @@ async fn start(kind:Kind,session:&Session,input:&Input,commands:&mpsc::Unbounded
             }
             if kind==Kind::Speech {output.set_ownership(session.resource.owned.clone());}
             // Ownership of cleanup moves to Active only after the stream is usable.
-            cleanup.lease=None;cleanup.restore=false;
-            Ok(Active{output,lease})
+            cleanup.lease = None;
+            let restore_media = std::mem::take(&mut cleanup.restore);
+            Ok(Active { output, lease, restore_media })
         }
         Err(error)=>{
             cleanup.close=!error.cleanup_confirmed;
@@ -721,7 +747,7 @@ async fn start(kind:Kind,session:&Session,input:&Input,commands:&mpsc::Unbounded
 }
 async fn finish(kind:Kind,active:Active,session:&Session,commands:&mpsc::UnboundedSender<MainCommand>,allocated:&[AtomicBool;2],cleanup:&mut Cleanup,stopping:bool) {
     drop(active.output);
-    cleanup.lease=Some(active.lease);cleanup.close=true;cleanup.restore=kind==Kind::Speech;
+    cleanup.lease=Some(active.lease);cleanup.close=true;cleanup.restore=active.restore_media;
     cleanup.run(kind,session,commands,allocated,stopping).await;
 }
 
@@ -765,7 +791,14 @@ async fn run_lane(kind:Kind,session:Arc<Session>,input:Arc<Input>,commands:mpsc:
                 cleanup_attempts+=1;cleanup_mark=tokio::time::Instant::now();
                 recovery_media_epoch=media_epoch;recovery_source_epoch=epoch;
             }
-            if cleanup.pending() {continue;}
+            if cleanup.pending() {
+                if cleanup_attempts >= 2 && cleanup.main_transition.as_ref().is_some_and(|state| state.call_media_paused) {
+                    crate::emit_log("CALL-AUDIO: speech cleanup blocked media restoration; close session");
+                    session.control.close();
+                    break;
+                }
+                continue;
+            }
             if let Some(epoch) = fallback_after_cleanup.take() {
                 fallback_to_mix(&input, kind, epoch, &fallback);
                 continue;
