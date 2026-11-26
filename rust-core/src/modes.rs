@@ -118,6 +118,7 @@ pub struct Modes {
     audio_change_epoch: u64,
     speech_epoch: u64,
     audio_borrow_epoch: u64,
+    phone_epoch: u64,
     navigation_epoch: u64,
 }
 
@@ -131,7 +132,71 @@ impl NavigationLease { pub fn valid(&self,modes:&Modes)->bool { modes.navigation
 pub(crate) struct AuxTransition { base:(u64,u64,u64), next:Modes, speech:bool }
 impl AuxTransition { pub fn declaration(&self)->Vec<u8> { self.next.declaration() } }
 
+pub(crate) struct CallAudioLease { phone: u64, audio: u64 }
+
+impl CallAudioLease {
+    pub fn valid(&self, modes: &Modes) -> bool {
+        modes.call_audio_epochs() == (self.phone, self.audio) && modes.phone_entity() == 1 && modes.audio_owned()
+    }
+}
+
+pub(crate) struct CallAudioTransition {
+    base: (u64, u64),
+    speech: Option<u64>,
+    next: Modes,
+    transfer_audio: bool,
+}
+
+impl CallAudioTransition {
+    pub fn declaration(&self) -> Vec<u8> { self.next.declaration() }
+}
+
 impl Modes {
+    pub(crate) fn call_audio_epochs(&self) -> (u64, u64) { (self.phone_epoch, self.audio_borrow_epoch) }
+    pub(crate) fn call_borrow_epochs(&self) -> (u64, u64, u64) {
+        (self.phone_epoch, self.audio_borrow_epoch, self.speech_epoch)
+    }
+
+    pub(crate) fn call_audio_begin(&self) -> Option<(CallAudioTransition, CallAudioLease)> {
+        if self.apps[1] != 0 || self.apps[0] != 0 || self.audio_owned() || self.resources[1].permanent != 2 {
+            return None;
+        }
+        let mut next = self.clone();
+        let request = Value::dict(vec![("transferType", Value::int(3)),
+            ("transferPriority", Value::int(USER_INITIATED)), ("unborrowConstraint", Value::int(ANYTIME))]);
+        if !next.resources[1].request(&request, 1) { return None; }
+        next.set_phone_entity(1);
+        next.audio_borrow_epoch = self.audio_borrow_epoch.wrapping_add(1);
+        let (phone, audio) = next.call_audio_epochs();
+        Some((CallAudioTransition { base: self.call_audio_epochs(), speech: Some(self.speech_epoch), next, transfer_audio: true }, CallAudioLease { phone, audio }))
+    }
+
+    pub(crate) fn call_audio_end(&self, lease: &CallAudioLease) -> Option<CallAudioTransition> {
+        if self.phone_epoch != lease.phone || self.phone_entity() != 1 { return None; }
+        let mut next = self.clone();
+        let transfer_audio = self.audio_borrow_epoch == lease.audio;
+        if transfer_audio {
+            if !next.resources[1].request(&Value::dict(vec![("transferType", Value::int(4))]), 1) { return None; }
+            next.audio_borrow_epoch = self.audio_borrow_epoch.wrapping_add(1);
+        }
+        next.set_phone_entity(0);
+        Some(CallAudioTransition { base: self.call_audio_epochs(), speech: None, next, transfer_audio })
+    }
+
+    pub(crate) fn commit_call_audio(&mut self, proposal: &CallAudioTransition) -> bool {
+        if self.call_audio_epochs() != proposal.base || proposal.speech.is_some_and(|epoch| epoch != self.speech_epoch) {
+            return false;
+        }
+        if proposal.transfer_audio {
+            self.resources[1] = proposal.next.resources[1];
+            self.audio_borrow_epoch = proposal.next.audio_borrow_epoch;
+            self.audio_epoch = self.audio_epoch.wrapping_add(1);
+        }
+        self.set_phone_entity(proposal.next.phone_entity());
+        self.audio_change_epoch = self.audio_change_epoch.wrapping_add(1);
+        true
+    }
+
     pub(crate) fn speech_begin(&self,user:bool)->Option<(AuxTransition,SpeechLease)> {
         self.speech_begin_mode(user, 1)
     }
@@ -346,7 +411,11 @@ impl Modes {
         bplist::encode(&Value::dict(vec![("type", Value::str("modesChanged")), ("params", self.snapshot())]))
     }
     pub(crate) fn phone_entity(&self) -> i64 { self.apps[1] }
-    pub(crate) fn set_phone_entity(&mut self, entity: i64) { self.apps[1] = entity; }
+    pub(crate) fn set_phone_entity(&mut self, entity: i64) {
+        if entity == self.apps[1] { return; }
+        self.apps[1] = entity;
+        self.phone_epoch = self.phone_epoch.wrapping_add(1);
+    }
     pub fn change(&mut self, params: &Value) -> bool {
         let mut next = self.clone();
         let mut audio_request = false;
@@ -402,8 +471,11 @@ impl Modes {
                     self.speech = mode;
                     self.apps[0] = if mode == -1 { 0 } else { 2 };
                 } else if let Some(active) = v.get("state").and_then(Value::as_bool) {
-                    if active {
-                        if id == 2 && self.apps[1] == 1 { return false; }
+                    if id == 2 {
+                        if active && self.phone_entity() == 1 { return false; }
+                        if active { self.set_phone_entity(2); }
+                        else if self.phone_entity() == 2 { self.set_phone_entity(0); }
+                    } else if active {
                         self.apps[id as usize - 1] = 2;
                     } else if self.apps[id as usize - 1] == 2 { self.apps[id as usize - 1] = 0; }
                 } else { return false; }

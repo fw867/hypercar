@@ -4,9 +4,9 @@
 
 ## CarWith 与系统 CarLife+ 蜂窝通话
 
-CarWith 会话及[开启车机通话实验的系统 CarLife+ 会话](SYSTEM-CARLIFE-SOURCE.md#使用)在手机进入普通蜂窝通话、Shizuku 已授权、本机支持 Android PSTN 双向接口且车机 `/info` 声明同一条 type100 `telephony` 双向格式时，暂停媒体流并建立通话主音频。支持 24/16 kHz 单声道 PCM、48/44.1 kHz 立体声 PCM 和 24/16 kHz 单声道 Opus。SETUP 的 `dataPort` 用于手机接收车机麦克风，响应的 `dataPort` 用于向车机扬声器发送音频。已激活会话确认 SETUP 后公布 `phoneCall` 应用状态并启动手机音频端点。iAP2 通话状态独立上报。
+CarWith 会话及[开启车机通话实验的系统 CarLife+ 会话](SYSTEM-CARLIFE-SOURCE.md#使用)在手机进入普通蜂窝通话、Shizuku 已授权、本机支持 Android PSTN 双向接口且车机 `/info` 声明同一条 type100 `telephony` 双向格式时，暂停媒体流并建立通话主音频。支持 24/16 kHz 单声道 PCM、48/44.1 kHz 立体声 PCM 和 24/16 kHz 单声道 Opus。若车机声明 24/16 kHz 单声道 AAC‑ELD，先用 Android MediaCodec 验证双向每包 480 个采样，验证通过才使用。SETUP 的 `dataPort` 用于手机接收车机麦克风，响应的 `dataPort` 用于向车机扬声器发送音频。已有主音频授权时，SETUP 确认后公布 `phoneCall` 并启动端点。车机持有主音频时，按其约束临时借用，在借用确认后建流，通话结束归还。iAP2 通话状态独立上报。
 
-电话 SETUP 校验流级状态及车机回填的音频参数。遇到明确的 RTSP 400、451、461 时，先尝试省略 `controlPort`，随后按 `/info` 声明尝试下一种双向格式。麦克风 `dataPort` 在重试期间保持一致。应答超时或内容不一致时先清理可能占用的主音频槽，再恢复媒体。
+电话 SETUP 校验流级状态及车机回填的音频参数。遇到明确的 RTSP 400、451、461 时，先用同一格式尝试省略 `controlPort`、`ct`、`sr`、`spf`、`supportsRTPPacketRedundancy`，随后按 `/info` 声明尝试下一种双方支持的格式。麦克风 `dataPort` 在重试期间保持一致。车机未声明匹配的延迟时省略 `audioLatencyMs`。应答超时或内容不一致时先清理可能占用的主音频槽，再恢复媒体。
 
 车机通过 `/info` 的 `extendedFeatures` 明确声明 `vocoderInfo` 时，按盒子固件样本发送 `sampleRate=16000.0`，RTP 采样率仍由双方协商的音频格式决定。若 Android 已为当前目标车机建立 HFP 的 SCO 音频，通话继续走系统蓝牙路由。SCO 消失且同一通普通蜂窝电话仍有效时，可以重新尝试 AirPlay 通话。若此前已用尽 AirPlay 重试机会，第一次回切可恢复一次原有的有界重试。导出日志会记录电话流开始清理前的退出原因，并在 500 ms 内独立查询本次通话的手机端关闭记录。
 

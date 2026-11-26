@@ -1,5 +1,5 @@
 //! Independent speech and navigation audio stream lifecycle.
-use std::{collections::VecDeque,sync::{Arc,atomic::{AtomicBool,AtomicU8,AtomicU64,Ordering}},time::Duration};
+use std::{collections::VecDeque,os::fd::AsRawFd,sync::{Arc,atomic::{AtomicBool,AtomicU8,AtomicU64,Ordering}},time::Duration};
 use parking_lot::Mutex;
 use tokio::sync::{mpsc,oneshot,watch,Notify};
 use crate::{airplay::{AirplayParams,AudioCodec,SocketProvider},audio_out::AudioOut,aux_setup::Kind,bplist::Value,rtsp::RtspChannel,speech_resource::SpeechResource};
@@ -133,6 +133,7 @@ struct MainAudioTransition {
 struct Stop {
     requested:AtomicBool,
     wake:Notify,
+    call_media_restore: Notify,
     // R14G17 type100/102 SETUP and TEARDOWN share a receiver slot. Serialize
     // media swaps and temporary users of the slot until cleanup is acknowledged.
     main_transition: Arc<tokio::sync::Mutex<MainAudioTransition>>,
@@ -152,6 +153,32 @@ impl Controller {
             crate::emit_log("CALL-AUDIO: receiver has no compatible bidirectional telephony format");
             return;
         };
+        let recovery = session.clone();
+        let recovery_stop = stop.clone();
+        let recovery_commands = commands.clone();
+        self.tasks.push(crate::callback_context::spawn(async move {
+            let mut ownership = recovery.control.buffered_ownership.subscribe();
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = recovery_stop.wait() => break,
+                    _ = recovery.control.wait_for_control_close() => break,
+                    _ = recovery_stop.call_media_restore.notified() => {},
+                }
+                let transition = tokio::select! {
+                    biased;
+                    _ = recovery_stop.wait() => break,
+                    _ = recovery.control.wait_for_control_close() => break,
+                    transition = recovery_stop.main_transition.lock() => transition,
+                };
+                if !transition.call_media_paused { continue; }
+                if !recovery.restore_media_after_call(&recovery_commands, &mut ownership, &recovery_stop, transition).await {
+                    crate::emit_log("CALL-AUDIO: deferred media restore failed with a current grant; close session");
+                    recovery.control.close();
+                    break;
+                }
+            }
+        }));
         self.tasks.push(crate::callback_context::spawn(async move {
             let mut offers = crate::call_audio::Offers::arm(format);
             let mut ownership = session.control.buffered_ownership.subscribe();
@@ -159,6 +186,7 @@ impl Controller {
                 let crate::call_audio::Offer { attempt, rate, socket: local } = tokio::select! {
                     biased;
                     _ = stop.wait() => break,
+                    _ = session.control.wait_for_control_close() => break,
                     socket = offers.rx.recv() => match socket { Some(s) => s, None => break },
                 };
                 let local = match local.set_nonblocking(true).and_then(|()| tokio::net::UnixStream::from_std(local)) {
@@ -168,28 +196,57 @@ impl Controller {
                         continue;
                     }
                 };
+                let prepared = tokio::select! {
+                    biased;
+                    _ = stop.wait() => {
+                        drop(local);
+                        offers.finish_before_setup(attempt, OfferResult::Withdrawn, "session stopped before codec preparation".into());
+                        break;
+                    },
+                    _ = local.readable() => {
+                        drop(local);
+                        offers.finish_before_setup(attempt, OfferResult::Withdrawn, "phone PCM closed before codec preparation".into());
+                        continue;
+                    },
+                    prepared = crate::call_audio::prepare_formats(&session.info) => prepared,
+                };
+                if prepared.is_empty() {
+                    drop(local);
+                    offers.finish_before_setup(attempt, OfferResult::Rejected, "no usable local bidirectional telephony codec".into());
+                    continue;
+                }
                 // A live call has priority over the optional assistant microphone lease.
                 if let Some(probe) = &session.params.microphone_probe { probe.request(false); }
+                let mut attempted_borrow = None;
                 let grant = loop {
                     let transition = tokio::select! {
                         biased;
                         _ = stop.wait() => break Err("session stopped before call SETUP"),
+                        _ = session.control.wait_for_control_close() => break Err("control closed before call SETUP"),
                         _ = local.readable() => break Err("phone PCM closed or readable before call SETUP"),
                         guard = stop.main_transition.lock() => guard,
                     };
                     let grant = *ownership.borrow_and_update();
-                    if grant.owned { break Ok((transition, grant.losses)); }
+                    if grant.owned { break Ok((transition, grant.losses, None)); }
+                    if let Some(lease) = session.resource.borrow_for_call(&mut attempted_borrow, ||
+                        !stop.requested.load(Ordering::Acquire) && crate::call_audio::check_phone_endpoint(local.as_raw_fd()).is_ok()).await {
+                        let grant = *ownership.borrow_and_update();
+                        break Ok((transition, grant.losses, Some(lease)));
+                    }
                     drop(transition);
                     tokio::select! {
                         biased;
                         _ = stop.wait() => break Err("session stopped while waiting for main audio"),
+                        _ = session.control.wait_for_control_close() => break Err("control closed while waiting for main audio"),
                         _ = local.readable() => break Err("phone PCM closed or readable while waiting for main audio"),
                         changed = ownership.changed() => {
                             if changed.is_err() { break Err("main audio ownership closed before call SETUP"); }
                         },
+                        // A new receiver constraint can allow borrowing without changing the holder.
+                        _ = tokio::time::sleep(Duration::from_millis(200)) => {},
                     }
                 };
-                let (transition, grant) = match grant {
+                let (mut transition, grant, borrow) = match grant {
                     Ok(ready) => ready,
                     Err(reason) => {
                         drop(local);
@@ -201,9 +258,22 @@ impl Controller {
                 let mut call_id = None;
                 let mut announced = false;
                 let mut outcome = OfferResult::Rejected;
-                let result = match session.pause_main(&commands, &mut cleanup, false).await {
+                let pause = if stop.requested.load(Ordering::Acquire) || session.control.is_closed()
+                    || crate::call_audio::check_phone_endpoint(local.as_raw_fd()).is_err() {
+                    outcome = OfferResult::Withdrawn;
+                    Err("call ended before media pause".into())
+                } else if borrow.as_ref().is_some_and(|lease| !lease.valid(&session.resource.modes.lock())) {
+                    outcome = OfferResult::SameRate;
+                    Err("main audio borrow changed before media pause".into())
+                } else if transition.call_media_paused {
+                    cleanup.restore = true;
+                    Ok(())
+                } else {
+                    session.pause_main(&commands, &mut cleanup, false).await
+                };
+                let result = match pause {
                     Ok(()) if !stop.requested.load(Ordering::Acquire) =>
-                        crate::call_audio::run(&session, rate, local, grant, stop.wait(), &mut call_id, &call_allocated, &mut announced, &mut outcome).await,
+                        crate::call_audio::run(&session, rate, local, prepared, grant, stop.wait(), &mut call_id, &call_allocated, &mut announced, &mut outcome).await,
                     result => {
                         // Let the phone endpoint close before we report the stop or wait for media cleanup.
                         drop(local);
@@ -225,18 +295,27 @@ impl Controller {
                     }
                     call_allocated.store(false, Ordering::Release);
                 }
-                if announced && !session.resource.set_phone_call(false).await && !session.resource.set_phone_call(false).await {
-                    crate::emit_log("CALL-AUDIO: phone state cleanup unconfirmed; close session");
-                    session.control.close();
-                    break;
-                }
                 if cleanup.retire_media && session.retire_media().await.is_err() {
                     crate::emit_log("CALL-AUDIO: media teardown unconfirmed; close session");
                     session.control.close();
                     break;
                 }
+                let returned = if let Some(lease) = &borrow {
+                    session.resource.return_call_borrow(lease).await || session.resource.return_call_borrow(lease).await
+                } else {
+                    !announced || session.resource.set_phone_call(false).await || session.resource.set_phone_call(false).await
+                };
+                if !returned {
+                    crate::emit_log("CALL-AUDIO: phone state cleanup unconfirmed; close session");
+                    session.control.close();
+                    break;
+                }
                 if cleanup.restore {
-                    if !session.restore_media_after_call(&commands, &mut ownership, &stop, transition).await {
+                    if borrow.is_some() {
+                        transition.call_media_paused = true;
+                        drop(transition);
+                        stop.call_media_restore.notify_one();
+                    } else if !session.restore_media_after_call(&commands, &mut ownership, &stop, transition).await {
                         crate::emit_log("CALL-AUDIO: media restore failed with a current grant; close session");
                         session.control.close();
                         break;
@@ -631,6 +710,7 @@ impl Session {
         let stopping = || stop.requested.load(Ordering::Acquire) || self.control.is_closed();
         if stopping() { return true; }
         let Some(codec) = *self.media_codec.lock() else {
+            transition.call_media_paused = false;
             let _ = commands.send(MainCommand::Install(None));
             return true;
         };
@@ -654,12 +734,19 @@ impl Session {
                 _ = self.control.wait_for_control_close() => return true,
                 guard = stop.main_transition.lock() => guard,
             };
+            if !transition.call_media_paused { return true; }
             for attempt in 1..=2 {
                 if stopping() { return true; }
                 let grant = *ownership.borrow();
                 if !grant.owned || grant.losses != losses { continue 'grants; }
                 let unborrow = self.control.audio_unborrow_generation.load(Ordering::Acquire);
                 if let Some(output) = self.negotiate_media_restore(codec, attempt).await {
+                    let current = *ownership.borrow();
+                    if !current.owned || current.losses != losses {
+                        drop(output);
+                        if self.retire_media().await.is_err() { return false; }
+                        continue 'grants;
+                    }
                     // The same receiver return may also have queued a realtime rebuild.
                     transition.restored_unborrow_generation = unborrow;
                     transition.call_media_paused = false;

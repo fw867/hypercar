@@ -4,28 +4,39 @@ use std::{collections::VecDeque, os::{fd::{AsRawFd, RawFd}, unix::net::UnixStrea
 use parking_lot::Mutex;
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::UnixStream, sync::mpsc};
 use crate::{audio_out::AudioOut, aux_audio::Session, bplist::{self, Value}, mic_probe, rtsp::RtspMessage};
+use crate::call_aac_eld::{self, CallAacEld};
 
 const TYPE: i64 = 100;
 const TELEPHONY: &str = "telephony";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Format { pub rate: u32, channels: usize, mask: i64, opus: bool }
+enum Codec { Pcm, Opus, AacEld }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Format { pub rate: u32, channels: usize, mask: i64, codec: Codec }
 
 impl Format {
     fn frames(self) -> usize {
-        if self.channels == 2 { 352 } else { self.rate as usize / 50 }
+        match self.codec {
+            Codec::AacEld => call_aac_eld::SAMPLES_PER_AU,
+            Codec::Pcm if self.channels == 2 => 352,
+            _ => self.rate as usize / 50,
+        }
     }
 
-    fn compression(self) -> i64 { if self.opus { 32 } else { 1 } }
+    fn compression(self) -> i64 {
+        match self.codec { Codec::Pcm => 1, Codec::AacEld => 8, Codec::Opus => 32 }
+    }
 }
 
 pub(crate) fn formats(info: &Value) -> impl Iterator<Item = Format> + '_ {
     let rows = info.get("audioFormats").and_then(Value::as_array).into_iter().flatten();
-    // Apple's sample declares 16/24 kHz mono PCM/Opus. Some receivers also
-    // advertise the same PCM stereo clock as their high-rate main audio.
-    [(24_000, 1, 6, false), (16_000, 1, 4, false), (48_000, 2, 15, false),
-        (44_100, 2, 11, false), (24_000, 1, 29, true), (16_000, 1, 28, true)]
-        .into_iter().filter_map(move |(rate, channels, bit, opus)| {
+    // Keep the established PCM/Opus priority when a receiver also supports ELD.
+    use Codec::{AacEld, Opus, Pcm};
+    [(24_000, 1, 6, Pcm), (16_000, 1, 4, Pcm), (48_000, 2, 15, Pcm),
+        (44_100, 2, 11, Pcm), (24_000, 1, 29, Opus), (16_000, 1, 28, Opus),
+        (24_000, 1, 27, AacEld), (16_000, 1, 26, AacEld)]
+        .into_iter().filter_map(move |(rate, channels, bit, codec)| {
             let mask = 1 << bit;
             rows.clone().any(|row| {
                 row.get("type").and_then(Value::as_int) == Some(TYPE)
@@ -33,8 +44,38 @@ pub(crate) fn formats(info: &Value) -> impl Iterator<Item = Format> + '_ {
                     && ["audioInputFormats", "audioOutputFormats"].iter().all(|key| {
                         row.get(key).and_then(Value::as_int).is_some_and(|value| value >= 0 && value & mask != 0)
                     })
-            }).then_some(Format { rate, channels, mask, opus })
+            }).then_some(Format { rate, channels, mask, codec })
         })
+}
+
+pub(crate) struct PreparedFormat {
+    format: Format,
+    eld: Option<CallAacEld>,
+}
+
+/// A declared ELD format is usable only if the phone can actually encode and decode
+/// the 480-sample configuration. Check before touching the shared media stream.
+pub(crate) async fn prepare_formats(info: &Value) -> Vec<PreparedFormat> {
+    let candidates = formats(info).collect::<Vec<_>>();
+    let mut prepared = Vec::with_capacity(candidates.len());
+    for format in candidates {
+        let eld = if format.codec == Codec::AacEld {
+            let probe = tokio::task::spawn_blocking(move || CallAacEld::probe(format.rate));
+            let result = match tokio::time::timeout(Duration::from_secs(1), probe).await {
+                Ok(result) => result.map_err(|error| error.to_string()).and_then(|result| result),
+                Err(_) => Err("MediaCodec probe timed out".into()),
+            };
+            match result {
+                Ok(codec) => Some(codec),
+                Err(error) => {
+                    crate::emit_log(&format!("CALL-AUDIO: AAC-ELD {}Hz unavailable: {error}", format.rate));
+                    continue;
+                }
+            }
+        } else { None };
+        prepared.push(PreparedFormat { format, eld });
+    }
+    prepared
 }
 
 static NEXT_TOKEN: AtomicI64 = AtomicI64::new(1);
@@ -126,7 +167,7 @@ impl Drop for Offers {
     }
 }
 
-fn check_phone_endpoint(fd: RawFd) -> Result<(), String> {
+pub(crate) fn check_phone_endpoint(fd: RawFd) -> Result<(), String> {
     let mut state = libc::pollfd { fd, events: 0, revents: 0 };
     loop {
         // The Unix socket stays alive through this check. A hangup is reported even with unread PCM.
@@ -144,19 +185,27 @@ fn check_phone_endpoint(fd: RawFd) -> Result<(), String> {
     }
 }
 
-fn setup(format: Format, id: i64, data: u16, control: Option<u16>, info: &Value) -> Vec<u8> {
+#[derive(Clone, Copy)]
+enum SetupFields { Extended(Option<u16>), Compact }
+
+fn setup(format: Format, id: i64, data: u16, shape: SetupFields, info: &Value) -> Vec<u8> {
     let compression = format.compression();
     let latency = crate::airplay::output_audio_latency_ms(info, TYPE, TELEPHONY,
-        [format.rate.into(), 16, format.channels as i64, compression], true).unwrap_or_default();
+        [format.rate.into(), 16, format.channels as i64, compression], true);
     let mut fields = vec![
         ("type", Value::int(TYPE)), ("audioType", Value::str(TELEPHONY)),
         ("audioFormat", Value::int(format.mask)), ("streamConnectionID", Value::int(id)),
         ("input", Value::bool(true)), ("dataPort", Value::int(data.into())),
-        ("spf", Value::int(format.frames() as i64)),
-        ("supportsRTPPacketRedundancy", Value::bool(false)), ("ct", Value::int(compression)),
-        ("sr", Value::int(format.rate.into())), ("audioLatencyMs", Value::int(latency)),
     ];
-    if let Some(port) = control { fields.push(("controlPort", Value::int(port.into()))); }
+    if let Some(latency) = latency { fields.push(("audioLatencyMs", Value::int(latency))); }
+    if let SetupFields::Extended(control) = shape {
+        fields.extend([
+            ("spf", Value::int(format.frames() as i64)),
+            ("supportsRTPPacketRedundancy", Value::bool(false)), ("ct", Value::int(compression)),
+            ("sr", Value::int(format.rate.into())),
+        ]);
+        if let Some(port) = control { fields.push(("controlPort", Value::int(port.into()))); }
+    }
     if info.get("extendedFeatures").and_then(Value::as_array).is_some_and(|features| {
         features.iter().any(|item| item.as_str() == Some("vocoderInfo"))
     }) {
@@ -192,7 +241,7 @@ fn accept(format: Format, id: i64, row: &Value) -> Result<(u16, Option<u16>), St
     Ok((data, control))
 }
 
-pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStream,
+pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStream, prepared: Vec<PreparedFormat>,
     loss_generation: u64, stop: impl std::future::Future<Output = ()>, allocated: &mut Option<i64>,
     pending: &AtomicBool, announced: &mut bool, outcome: &mut OfferResult,
 ) -> Result<(), String> {
@@ -211,9 +260,12 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
         (port != 0).then_some((socket, port))
     });
     tokio::pin!(stop);
-    let mut candidates = formats(&session.info);
-    let mut format = candidates.next().ok_or("no declared bidirectional telephony format")?;
+    let mut candidates = prepared.into_iter();
+    let mut selected = candidates.next().ok_or("no usable bidirectional telephony format")?;
+    let mut setup_fields = SetupFields::Extended(rtcp.as_ref().map(|(_, port)| *port));
+    let mut tried_compact = false;
     let (id, data, sync) = loop {
+        let format = selected.format;
         tokio::select! { biased; _ = &mut stop => return Ok(()), _ = std::future::ready(()) => {} }
         if !valid(&ownership.borrow()) {
             *outcome = OfferResult::SameRate;
@@ -226,17 +278,22 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
         let id = crate::airplay::random_positive_i64();
         *allocated = Some(id);
         pending.store(true, Ordering::Release);
-        let body = setup(format, id, data_port, rtcp.as_ref().map(|(_, port)| *port), &session.info);
+        let body = setup(format, id, data_port, setup_fields, &session.info);
         let reply = session.control.request("SETUP", &uri, &body, "application/x-apple-binary-plist", &[], Duration::from_secs(3)).await?;
         if matches!(reply.status(), 400 | 451 | 461) {
             // These transport rejections leave the shared slot free. Unknown replies still require TEARDOWN.
             *allocated = None;
             pending.store(false, Ordering::Release);
-            if rtcp.take().is_some() {
-                crate::emit_log(&format!("CALL-AUDIO: SETUP status={}; retry without controlPort", reply.status()));
+            if !tried_compact {
+                tried_compact = true;
+                rtcp = None;
+                setup_fields = SetupFields::Compact;
+                crate::emit_log(&format!("CALL-AUDIO: SETUP status={}; retry compact request for format {:#x}", reply.status(), format.mask));
             } else if let Some(next) = candidates.next() {
-                crate::emit_log(&format!("CALL-AUDIO: SETUP status={}; try declared format {:#x}", reply.status(), next.mask));
-                format = next;
+                // A format refusal does not establish that optional fields caused it.
+                setup_fields = SetupFields::Extended(None);
+                crate::emit_log(&format!("CALL-AUDIO: SETUP status={}; try declared format {:#x}", reply.status(), next.format.mask));
+                selected = next;
             } else {
                 return Err(format!("telephony SETUP rejected status={}; no remaining declared format", reply.status()));
             }
@@ -257,8 +314,14 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
         let (data, sync) = accept(format, id, row)?;
         break (id, data, sync);
     };
-    let mut decoder = format.opus.then(|| CallOpusDecoder::new(format.rate)).transpose()?;
-    let mut encoder = format.opus.then(|| crate::opus_encode::OpusEncoder::new_call(format.rate, format.frames()))
+    drop(candidates);
+    let PreparedFormat { format, eld } = selected;
+    let (mut eld_encoder, mut eld_decoder) = match eld.map(CallAacEld::into_parts) {
+        Some((encoder, decoder)) => (Some(encoder), Some(decoder)),
+        None => (None, None),
+    };
+    let mut decoder = (format.codec == Codec::Opus).then(|| CallOpusDecoder::new(format.rate)).transpose()?;
+    let mut encoder = (format.codec == Codec::Opus).then(|| crate::opus_encode::OpusEncoder::new_call(format.rate, format.frames()))
         .transpose().map_err(|e| e.to_string())?;
     session.control.udp_media.set(TYPE, true);
     let socket = session.factory.open_udp(host, data).ok_or("no speaker UDP socket")?;
@@ -311,8 +374,8 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
         }
     }
     *outcome = OfferResult::SameRate;
-    crate::emit_log(&format!("CALL-AUDIO: telephony SETUP ready type={TYPE} phoneRate={phone_rate} rate={} channels={} opus={}",
-        format.rate, format.channels, format.opus));
+    crate::emit_log(&format!("CALL-AUDIO: telephony SETUP ready type={TYPE} phoneRate={phone_rate} rate={} channels={} codec={:?}",
+        format.rate, format.channels, format.codec));
     let uplink_ownership = ownership.clone();
     let phone_fd = local.as_raw_fd();
     let (mut downlink, uplink) = local.split();
@@ -323,6 +386,7 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
         let mut resampler = MonoResampler::default();
         let mut sync = std::time::Instant::now() - Duration::from_secs(1);
         let period = Duration::from_secs_f64(format.frames() as f64 / f64::from(format.rate));
+        let mut eld_clock = EldClock::new(format);
         let mut next_packet = tokio::time::Instant::now();
         let mut phone_pcm_ready = false;
         loop {
@@ -345,7 +409,13 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
             next_packet += period;
             if !speaker.owns_audio() { return Err("receiver took main audio".into()); }
             let frames = samples.drain(..format.frames());
-            let payload = if let Some(encoder) = &mut encoder {
+            let payload = if let Some(eld) = &mut eld_encoder {
+                let pcm: Vec<_> = frames.flat_map(i16::to_le_bytes).collect();
+                let payload = transfer_eld(eld, &pcm, &mut eld_clock,
+                    call_aac_eld::Encoder::try_queue_pcm, call_aac_eld::Encoder::poll_encoded).await?;
+                let Some(payload) = payload else { continue; };
+                payload
+            } else if let Some(encoder) = &mut encoder {
                 encoder.encode_mono_packet(&frames.collect::<Vec<_>>()).map_err(|e| e.to_string())?
             } else {
                 frames.flat_map(|sample| std::iter::repeat_n(sample.to_be_bytes(), format.channels).flatten()).collect()
@@ -366,6 +436,7 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
         let mut deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
         let mut resampler = MonoResampler::default();
         let mut converted = VecDeque::new();
+        let mut eld_clock = EldClock::new(format);
         loop {
             let receive = microphone.recv_from(&mut wire);
             let packet = if let Some(until) = deadline {
@@ -384,7 +455,12 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
             let (n, source) = packet.map_err(|error| format!("car microphone RTP receive failed: {error}"))?;
             if mic_probe::normalized(source.ip()) != receiver_ip || port.is_some_and(|p| p != source.port()) { continue; }
             let Ok(payload) = stats.open(TYPE as u8, &wire[..n], &input_key) else { continue; };
-            let pcm = if let Some(decoder) = &mut decoder {
+            let pcm = if let Some(eld) = &mut eld_decoder {
+                let decoded = transfer_eld(eld, &payload, &mut eld_clock,
+                    call_aac_eld::Decoder::try_queue_au, call_aac_eld::Decoder::poll_decoded).await?;
+                let Some(pcm) = decoded else { continue; };
+                pcm
+            } else if let Some(decoder) = &mut decoder {
                 match decoder.decode(&payload) {
                     Some(samples) => samples.iter().copied().flat_map(i16::to_le_bytes).collect(),
                     _ => continue,
@@ -432,6 +508,40 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
         result = down => result,
         result = up => result,
     }
+}
+
+struct EldClock {
+    input: u64,
+    output: u64,
+    step: u64,
+}
+
+impl EldClock {
+    fn new(format: Format) -> Self {
+        Self { input: 1_000_000, output: 1_000_000,
+            step: format.frames() as u64 * 1_000_000 / u64::from(format.rate) }
+    }
+}
+
+async fn transfer_eld<C>(codec: &mut C, input: &[u8], clock: &mut EldClock,
+    queue: fn(&mut C, &[u8], u64) -> Result<bool, String>,
+    poll: fn(&mut C) -> Result<Option<(u64, Vec<u8>)>, String>,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut output = None;
+    tokio::time::timeout(Duration::from_millis(80), async {
+        loop {
+            if output.is_none() { output = poll(codec)?; }
+            if queue(codec, input, clock.input)? {
+                clock.input += clock.step;
+                if output.is_none() { output = poll(codec)?; }
+                let Some((pts, bytes)) = output else { return Ok(None); };
+                if pts != clock.output { return Err("AAC-ELD codec output changed the packet clock".into()); }
+                clock.output += clock.step;
+                return Ok(Some(bytes));
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }).await.map_err(|_| "AAC-ELD codec input timed out".to_string())?
 }
 
 #[derive(Default)]
@@ -504,7 +614,7 @@ mod tests {
 
     #[test]
     fn telephony_rejects_stream_level_refusal_and_conflicting_packet_format() {
-        let format = Format { rate: 16_000, channels: 1, mask: 1 << 4, opus: false };
+        let format = Format { rate: 16_000, channels: 1, mask: 1 << 4, codec: Codec::Pcm };
         let reply = |extra| {
             let mut fields = vec![("type", Value::int(100)), ("dataPort", Value::int(7010))];
             fields.extend(extra);
@@ -529,7 +639,7 @@ mod tests {
         assert!(formats(&info(vec![row(100, "telephony", 0, pcm16), row(100, "telephony", pcm16, 0),
             row(100, "speechRecognition", pcm16, pcm16), row(102, "telephony", pcm16, pcm16)])).next().is_none());
         let selected = formats(&info(vec![row(100, "telephony", 1 << 28, 1 << 28)])).next().unwrap();
-        assert_eq!((selected.rate, selected.frames(), selected.opus), (16000, 320, true));
+        assert_eq!((selected.rate, selected.frames(), selected.codec), (16000, 320, Codec::Opus));
         let mut encoder = crate::opus_encode::OpusEncoder::new_call(selected.rate, selected.frames()).unwrap();
         let encoded = encoder.encode_mono_packet(&[10; 320]).unwrap();
         let mut decoder = CallOpusDecoder::new(selected.rate).unwrap();
@@ -539,12 +649,36 @@ mod tests {
     }
 
     #[test]
+    fn telephony_matches_mgu_aac_eld_at_both_declared_rates() {
+        let info = Value::dict(vec![("audioFormats", Value::array(vec![Value::dict(vec![
+            ("type", Value::int(100)), ("audioType", Value::str("telephony")),
+            ("audioInputFormats", Value::int(0x0c00_0000)), ("audioOutputFormats", Value::int(0x0c00_0000)),
+        ])]))]);
+        let actual = formats(&info).map(|format| (format.mask, format.rate, format.frames(), format.compression()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, [(1 << 27, 24_000, 480, 8), (1 << 26, 16_000, 480, 8)]);
+    }
+
+    #[test]
+    fn telephony_preserves_declared_zero_latency_but_omits_unknown_latency() {
+        let format = Format { rate: 24_000, channels: 1, mask: 1 << 29, codec: Codec::Opus };
+        let declared = Value::dict(vec![("audioLatencies", Value::array(vec![Value::dict(vec![
+            ("type", Value::int(100)), ("audioType", Value::str("telephony")), ("outputLatencyMicros", Value::int(0)),
+        ])]))]);
+        for (info, expected) in [(Value::dict(vec![]), None), (declared, Some(0))] {
+            let request = bplist::parse(&setup(format, 7, 7001, SetupFields::Extended(Some(7002)), &info)).unwrap();
+            let stream = &request.get("streams").unwrap().as_array().unwrap()[0];
+            assert_eq!(stream.get("audioLatencyMs").and_then(Value::as_int), expected);
+        }
+    }
+
+    #[test]
     fn telephony_sets_vocoder_rate_only_when_receiver_advertises_it() {
-        let format = Format { rate: 24_000, channels: 1, mask: 1 << 29, opus: true };
+        let format = Format { rate: 24_000, channels: 1, mask: 1 << 29, codec: Codec::Opus };
         let advertised = Value::dict(vec![("extendedFeatures", Value::array(vec![Value::str("vocoderInfo")]))]);
         let other = Value::dict(vec![("extendedFeatures", Value::array(vec![Value::str("other")]))]);
         for (info, expected) in [(advertised, Some(Value::Real(16_000.0))), (other, None), (Value::dict(vec![]), None)] {
-            let request = bplist::parse(&setup(format, 7, 7001, None, &info)).unwrap();
+            let request = bplist::parse(&setup(format, 7, 7001, SetupFields::Extended(None), &info)).unwrap();
             let stream = &request.get("streams").unwrap().as_array().unwrap()[0];
             assert_eq!(stream.get("sr"), Some(&Value::Int(24_000)));
             assert_eq!(stream.get("vocoderInfo").and_then(|info| info.get("sampleRate")), expected.as_ref());

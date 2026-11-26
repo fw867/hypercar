@@ -3,8 +3,11 @@ use std::sync::{Arc,atomic::AtomicBool};
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use parking_lot::Mutex;
-use crate::{bplist,modes::{AuxTransition,Modes},rtsp::RtspChannel};
+use crate::{bplist,modes::{AuxTransition,CallAudioTransition,Modes},rtsp::RtspChannel};
 pub use crate::modes::{SpeechLease,NavigationLease};
+pub(crate) use crate::modes::CallAudioLease;
+
+enum CallAck { Accepted, Rejected, Unconfirmed }
 
 pub struct SpeechResource {
     pub control:Arc<RtspChannel>,
@@ -19,6 +22,72 @@ impl SpeechResource {
     pub fn serial(&self)->Arc<tokio::sync::Mutex<()>> {self.serial.clone()}
     pub fn speech_valid(&self,lease:&SpeechLease)->bool {lease.valid(&self.modes.lock())}
     pub fn navigation_valid(&self,lease:&NavigationLease)->bool {lease.valid(&self.modes.lock())}
+    pub(crate) async fn borrow_for_call(&self, attempted: &mut Option<(u64, u64, u64)>,
+        offer_is_live: impl FnOnce() -> bool) -> Option<CallAudioLease> {
+        let _serial = self.serial.lock().await;
+        if !offer_is_live() { return None; }
+        let (proposal, lease) = {
+            let modes = self.modes.lock();
+            let epochs = modes.call_borrow_epochs();
+            if *attempted == Some(epochs) { return None; }
+            let proposal = modes.call_audio_begin()?;
+            *attempted = Some(epochs);
+            proposal
+        };
+        let reconcile = match self.call_declaration(&proposal.declaration()).await {
+            CallAck::Accepted => {
+                if self.commit_call_audio(&proposal) { return Some(lease); }
+                true
+            }
+            CallAck::Rejected => false,
+            CallAck::Unconfirmed => true,
+        };
+        if reconcile && !self.reconcile_call_modes().await {
+            crate::emit_log("CALL-AUDIO: pending borrow state could not be reconciled; close session");
+            self.control.close();
+        }
+        None
+    }
+
+    pub(crate) async fn return_call_borrow(&self, lease: &CallAudioLease) -> bool {
+        let _serial = self.serial.lock().await;
+        let proposal = self.modes.lock().call_audio_end(lease);
+        let Some(proposal) = proposal else { return true; };
+        matches!(self.call_declaration(&proposal.declaration()).await, CallAck::Accepted)
+            && self.commit_call_audio(&proposal)
+    }
+
+    fn commit_call_audio(&self, proposal: &CallAudioTransition) -> bool {
+        let mut modes = self.modes.lock();
+        if !modes.commit_call_audio(proposal) { return false; }
+        self.control.buffered_ownership.publish_with_gate(&self.owned, modes.audio_owned());
+        true
+    }
+
+    async fn call_declaration(&self, body: &[u8]) -> CallAck {
+        let reply = self.control.request("POST", "/command", body, "application/x-apple-binary-plist", &[],
+            std::time::Duration::from_secs(2)).await;
+        match reply {
+            Ok(reply) if response_accepted(reply.status(), &reply.body) => CallAck::Accepted,
+            Ok(reply) if (400..500).contains(&reply.status()) || (reply.status() == 200 &&
+                bplist::parse(&reply.body).ok().and_then(|body| body.get("status").and_then(bplist::Value::as_int))
+                    .is_some_and(|status| status != 0)) => CallAck::Rejected,
+            _ => CallAck::Unconfirmed,
+        }
+    }
+
+    async fn reconcile_call_modes(&self) -> bool {
+        for _ in 0..2 {
+            let (epochs, body) = {
+                let modes = self.modes.lock();
+                (modes.call_audio_epochs(), modes.declaration())
+            };
+            if !matches!(self.call_declaration(&body).await, CallAck::Accepted) { return false; }
+            if self.modes.lock().call_audio_epochs() == epochs { return true; }
+        }
+        false
+    }
+
     pub(crate) async fn set_phone_call(&self, active: bool) -> bool {
         let _serial = self.serial.lock().await;
         let (current, body) = {

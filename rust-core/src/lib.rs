@@ -22,6 +22,7 @@ mod speech_resource;
 mod aux_audio;
 mod aux_setup;
 mod mic_probe;
+mod call_aac_eld;
 mod call_audio;
 mod audio_resource;
 mod bplist;
