@@ -60,28 +60,35 @@ class CtrlDiscoveryTraceTest {
         } finally { scope.cancel() }
     }
 
-    @Test fun recordingInvitationDoesNotWaitForDiskWriter() = runBlocking {
+    @Test fun recordingInvitationAndBluetoothDecisionDoesNotWaitForDiskWriter() = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val writerStarted = CompletableDeferred<Unit>()
         val releaseWriter = CountDownLatch(1)
         val invitationWritten = CompletableDeferred<Unit>()
+        val discoveryWritten = CompletableDeferred<Unit>()
         try {
             val trace = CtrlDiscoveryTrace({ 10 }, { 20 }, scope) {
-                if ("deltaMs" !in it) {
-                    writerStarted.complete(Unit)
-                    releaseWriter.await()
-                } else if ("event=tcp-accepted" in it) invitationWritten.complete(Unit)
+                when {
+                    "event=tcp-accepted" in it -> invitationWritten.complete(Unit)
+                    it.startsWith("BT-DISCOVERY: ") -> discoveryWritten.complete(Unit)
+                    else -> {
+                        writerStarted.complete(Unit)
+                        releaseWriter.await()
+                    }
+                }
             }
             trace.mark()
             withTimeout(2_000) { writerStarted.await() }
             val producerDone = CompletableDeferred<Unit>()
             scope.launch {
                 trace.record("event=tcp-accepted")
+                trace.enqueue("BT-DISCOVERY: attempt=1 policy_attempt=true")
                 producerDone.complete(Unit)
             }
             withTimeout(2_000) { producerDone.await() }
             releaseWriter.countDown()
             withTimeout(2_000) { invitationWritten.await() }
+            withTimeout(2_000) { discoveryWritten.await() }
         } finally {
             releaseWriter.countDown()
             scope.cancel()

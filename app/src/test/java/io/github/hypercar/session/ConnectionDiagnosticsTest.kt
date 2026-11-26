@@ -1,10 +1,57 @@
 package io.github.hypercar.session
 
+import io.github.hypercar.iap2.RfcommStamp
+import io.github.hypercar.session.ConnectionDiagnostics.Stage
 import org.junit.Assert.*
 import org.junit.Test
-import io.github.hypercar.session.ConnectionDiagnostics.Stage
 
 class ConnectionDiagnosticsTest {
+    @Test fun inboundWaitUsesOnlyTheLatestAclObservationFromThisAttempt() {
+        var now = 1_000L
+        val journal = ConnectionDiagnostics { now }
+        val peer = "AA"
+        val first = journal.begin("manual", "bmw_id85")
+        assertEquals("本轮尚未观察到车机 ACL 连入", journal.aclObservation(first))
+        assertEquals(first, journal.recordAcl(peer, true, 1_001L))
+        assertEquals("本轮最近观察到车机 ACL 连入", journal.aclObservation(first))
+        journal.recordAcl(peer, false, 1_010L)
+        journal.recordAcl(peer, true, 1_005L)
+        assertEquals("本轮最近观察到车机 ACL 断开", journal.aclObservation(first))
+        journal.recordAcl(peer, true, 1_010L)
+        assertEquals("本轮最近观察到车机 ACL 断开", journal.aclObservation(first))
+        journal.recordAcl(peer, true, 1_020L)
+        assertEquals("本轮最近观察到车机 ACL 连入", journal.aclObservation(first))
+        now = 1_040L
+        val next = journal.begin("manual", "bmw_id85")
+        assertNull(journal.recordAcl(peer, true, 1_030L))
+        assertEquals("本轮尚未观察到车机 ACL 连入", journal.aclObservation(next))
+    }
+
+    @Test fun aclEventsFromAnotherCarCannotReplaceTheSelectedCarsStatus() {
+        val journal = ConnectionDiagnostics { 1_000L }
+        val attempt = journal.begin("manual", "bmw_id85")
+        journal.recordAcl("AA", true, 1_010L)
+        journal.recordAcl("BB", false, 1_020L)
+        assertEquals("本轮最近观察到车机 ACL 连入", journal.aclObservation(attempt, "aa"))
+        assertEquals("本轮最近观察到车机 ACL 断开", journal.aclObservation(attempt, "BB"))
+        assertEquals("本轮尚未观察到车机 ACL 连入", journal.aclObservation(attempt, "CC"))
+        assertEquals("本轮观察到多台车机的 ACL，当前对端尚未确认", journal.aclObservation(attempt))
+        val snapshot = journal.connectionSnapshot(attempt, null, "AA")!!
+        assertTrue(snapshot.contains("车机蓝牙 ACL 连上：+10 ms"))
+        assertTrue(snapshot.contains("车机蓝牙 ACL 断开：未记录"))
+    }
+
+    @Test fun profileDropIsRecordedWithoutEndingTheAttempt() {
+        val journal = ConnectionDiagnostics { 1_000L }
+        val attempt = journal.begin("manual", "bmw_id85")
+        journal.recordAcl("AA", true, 1_010L)
+        assertEquals(attempt, journal.recordAcl("AA", false, 1_020L, profileDrop = true))
+        assertEquals("本轮最近观察到车机 ACL 断开（应用主动降级）", journal.aclObservation(attempt, "AA"))
+        val snapshot = journal.connectionSnapshot(attempt, null, "AA")!!
+        assertTrue(snapshot.contains("进行中"))
+        assertTrue(snapshot.contains("车机蓝牙 ACL 断开：+20 ms（应用主动降级）"))
+    }
+
     @Test fun videoRecoverySurvivesFeedbackRolloverAndRoutineEventsLimitPersistence() {
         val journal = ConnectionDiagnostics { 1_000L }
         val attempt = journal.begin("manual", "bmw_id85")
@@ -107,21 +154,50 @@ class ConnectionDiagnosticsTest {
     }
 
     @Test fun aclTriggerKeepsPreAttemptTimeAndDelayedForwardCannotOverwriteNewerEdge() {
-        var now = 100L
+        var now = 80L
         val journal = ConnectionDiagnostics { now }
-        val up = ConnectionDiagnostics.Observation.ACL_UP
-        val down = ConnectionDiagnostics.Observation.ACL_DOWN
-        val attempt = journal.begin("acl", "bmw_id85")
-        journal.observe(attempt, up, at = 80L)
+        val wake = ConnectionDiagnostics.AclWake("AA", now)
+        assertNull(journal.recordAcl("AA", true, now))
+        now = 100L
+        val attempt = journal.begin("acl", "bmw_id85", aclWake = wake)
         assertTrue(journal.connectionSnapshot(attempt, null)!!.contains("车机蓝牙 ACL 连上：-20 ms"))
         now = 140L
-        journal.observe(attempt, down)
+        journal.recordAcl("AA", false, now)
         now = 150L
-        journal.observe(attempt, up)
-        journal.observe(attempt, up, at = 80L)
+        journal.recordAcl("AA", true, now)
+        assertNull(journal.recordAcl("AA", true, wake.observedAt))
         val snapshot = journal.connectionSnapshot(attempt, null)!!
         assertTrue(snapshot.contains("车机蓝牙 ACL 断开：+40 ms"))
         assertTrue(snapshot.contains("车机蓝牙 ACL 连上：+50 ms"))
+    }
+
+    @Test fun missedAclWakeCannotBeReplayedAfterAnotherAttemptStartsAndEnds() {
+        var now = 80L
+        val journal = ConnectionDiagnostics { now }
+        val wake = ConnectionDiagnostics.AclWake("AA", now)
+        journal.recordAcl("AA", true, now)
+        now = 100L
+        val manual = journal.begin("manual", "bmw_id85")
+        now = 110L
+        journal.recordAcl("AA", true, now)
+        now = 120L
+        journal.finish(manual, "STOPPED", "manual retry")
+        assertNull(journal.recordAcl("AA", true, 115L))
+        now = 130L
+        val next = journal.begin("acl", "bmw_id85", aclWake = wake)
+        assertEquals("本轮尚未观察到车机 ACL 连入", journal.aclObservation(next, "AA"))
+    }
+
+    @Test fun idleWakeRequiresMatchingPeerAndTheLatestStillConnectedEdge() {
+        var now = 80L
+        val journal = ConnectionDiagnostics { now }
+        val stale = ConnectionDiagnostics.AclWake("AA", now)
+        journal.recordAcl("AA", true, now)
+        journal.recordAcl("AA", false, 85L)
+        journal.recordAcl("BB", true, 80L)
+        now = 100L
+        val next = journal.begin("acl", "bmw_id85", aclWake = stale)
+        assertEquals("本轮尚未观察到车机 ACL 连入", journal.aclObservation(next))
     }
 
     @Test fun newCtrlListenerDoesNotBorrowOldNetworkEvidence() {
@@ -255,6 +331,27 @@ class ConnectionDiagnosticsTest {
         assertTrue(first, first.contains("BT_INBOUND_ADMITTED@5ms,CTRL_TCP_ACCEPTED@10ms,CTRL_INVITE_HEAD@15ms,CTRL_INVITE_ACK@20ms"))
         assertTrue(first.contains("invite=false"))
         assertTrue(second.contains("milestones=[REQUESTED@0ms]"))
+    }
+
+    @Test fun admissionAcrossWarmRestartRecordsTheNewStageWithoutBorrowingAnOldAccept() {
+        var now = 100L
+        val journal = ConnectionDiagnostics { now }
+        val old = journal.begin("manual", "bmw_id85", 100)
+        val accepted = journal.captureRfcommStamp(110, old)
+        now = 120L
+        val next = journal.begin("manual-retry", "bmw_id85", 120)
+        assertEquals(RfcommStamp(0, 119), journal.captureRfcommStamp(119, next))
+        assertEquals(RfcommStamp(0, 121), journal.captureRfcommStamp(121, old))
+        now = 125L
+        val admitted = journal.captureRfcommStamp(125, next)
+        journal.rfcommAdmitted("AA", accepted, admitted)
+        assertEquals(old, accepted.attempt)
+        assertEquals(110L, accepted.uptime)
+        assertEquals(next, admitted.attempt)
+        journal.engineStarted(next, 42, "AA", 130, 1_000)
+        val line = journal.report().last()
+        assertTrue(line.contains("BT_INBOUND_ADMITTED@5ms"))
+        assertTrue(line.contains("rfcomm_reentry_ms=unknown"))
     }
 
     @Test fun waitingForCtrlTcpTracksOnlyTheCurrentListenerAndAttempt() {

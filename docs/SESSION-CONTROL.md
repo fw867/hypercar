@@ -8,6 +8,8 @@
 
 自动模式把持久待机身份与单轮会话分开。目标MAC是车机身份边界，同名Wi-Fi不能共用配对身份。已授权的系统配对、长期AirPlay身份和临时端点各自管理，不因每次失败就全部清空。
 
+宝马已有身份监听时，新连接轮次可先接收一个符合目标的 RFCOMM 入站。待本轮端点回调就绪才开始握手，主 iAP2 入口优先于附加发现入口。取消连接、切换目标或结束准备时，保留的 socket 和本轮准备票据一起撤销。
+
 ## 发现和蓝牙
 
 主监听使用cafe服务，附加CarPlay Phone标记UUID为2d8d2466-e14d-451c-88bc-7301abea291a，动态RFCOMM通道复用过滤及会话处理。主服务优先、附加服务独立重试，开关不影响主监听；注册了SDP/EIR不等于车机已接受标记或实车重连改善。
@@ -32,7 +34,7 @@ BMW默认不主动拨iAP2、不主动断HFP/A2DP。其它档案依赖自身策�
 
 复测时保留手机和车机原有配对及 Wi-Fi 配置，记下车机弹窗的时间。按 `attempt` 对齐以下证据：
 
-- `BT-CAFF` 是手机主动出站；`BT-ACCEPT: entry=BT-S` 是车机主动入站。用 `acceptedUptimeMs` 关联接管该 socket 的 `BT-WORKER`，再按 `handshake` 对照 `HS#` 的 iAP2 时序。仅有 SDP UUID 或 socket accept 不等于进入 iAP2。
+- `BT-CAFF` 是手机主动出站，`BT-ACCEPT: entry=BT-S` 是车机主动入站。用 `acceptedUptimeMs` 关联接管该 socket 的 `BT-WORKER`。接入轮次与时间是 `acceptAttempt` 和 `acceptedUptimeMs`，获准握手的轮次与时间是 `handshakeAttempt` 和 `handshakeUptimeMs`。`acceptTicket` 记录入站时的会话票据，票据到期的 socket 在接管仲裁前关闭。再按 `handshake` 对照 `HS#` 的时序，确认是否进入 iAP2。
 - `CTRL-DIAG` 记本地监听与 NSD 回调；`MDNS-OBS` 的 `known-answer` 是查询携带的已知记录，不是新响应，也不等于完成 SRV/TXT/地址解析。观察器只收多播，不能排除单播应答或 TCP SYN；需要链路抓包才能区分未发 SYN、旧地址/端口、与当前端口握手未成。
 - `CTRL_TCP_ACCEPTED` 是应用收到已建连 socket，`CTRL_INVITE_HEAD` 是完整有效的邀请请求头，`CTRL_INVITE_ACK` 是应用写出邀请的 HTTP 200，`CTRL_INVITED` 才是邀请已发布给会话层；前一阶段不能代替后一阶段。
 

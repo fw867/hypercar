@@ -269,9 +269,11 @@ internal object ReconnectDiscoverability {
 
     suspend fun watch(
         context: Context,
+        attempt: Long,
         networkKey: () -> String?,
         servicesReady: () -> Boolean,
         sessionStarted: () -> Boolean,
+        enqueueDiagnostic: (String) -> Unit,
         log: (String) -> Unit,
         preparationKey: () -> String? = { null },
         immediatePreparation: Boolean = false,
@@ -283,6 +285,12 @@ internal object ReconnectDiscoverability {
     ) {
         val watchJob = currentCoroutineContext().job
         val policy = ReconnectDiscoverabilityPolicy(immediatePreparation, suppressManualWindow)
+        var lastDecision: String? = null
+        fun logDecision(state: String) {
+            if (lastDecision == state) return
+            lastDecision = state
+            enqueueDiagnostic("BT-DISCOVERY: attempt=$attempt $state elapsedMs=${SystemClock.elapsedRealtime()}")
+        }
         synchronized(this) {
             firstWindowFinished = false
             activePolicy = policy
@@ -296,6 +304,7 @@ internal object ReconnectDiscoverability {
                 val phase = reservation.phase
                 if (phase == DiscoverabilityReservation.Phase.RESERVED) {
                     // An older watch that has not started yet isn't a window to share. Do not eat the manual request.
+                    logDecision("lease=reserved")
                     delay(500)
                     continue
                 }
@@ -310,8 +319,13 @@ internal object ReconnectDiscoverability {
                 }
                 fun canStart(): Boolean = watchJob.isActive && activePolicy === policy &&
                     !sessionStarted() && readyForWindow()
-                if (policy.shouldAttempt(true, network, servicesReady(), false,
-                        SystemClock.elapsedRealtime(), preparation, windowAlreadyOpen, aclPreparation)) {
+                val ready = servicesReady()
+                val shouldAttempt = policy.shouldAttempt(true, network, ready, false,
+                    SystemClock.elapsedRealtime(), preparation, windowAlreadyOpen, aclPreparation)
+                logDecision("lease=${phase.name.lowercase()} policy_attempt=$shouldAttempt manual=$immediatePreparation " +
+                    "manual_suppressed=$suppressManualWindow shell_ready=$shizukuReady system_prompt=${systemPrompt != null} " +
+                    "wifi_bound=${network != null} services_ready=$ready target_ready=${preparation != null} acl_ready=$fromAcl")
+                if (shouldAttempt) {
                     if (!reservation.acquire()) {
                         policy.noteWindowClosed(staleAclBeforeStart = fromAcl && !windowOpenAtManualClick())
                         delay(500)

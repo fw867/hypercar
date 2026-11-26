@@ -70,6 +70,7 @@ class CarBluetoothReceiver : BroadcastReceiver() {
         // 会话，并与前台服务的 ACTION_STOP 串成刷屏回环（历史故障）。
         if (!forwardAcl) {
             val now = SystemClock.elapsedRealtime()
+            HyperCarRepo.recordProfileDropAcl(address, now)
             if (now - lastSelfDropLogAt > SELF_DROP_LOG_THROTTLE_MILLIS) {
                 lastSelfDropLogAt = now
                 Log.i(TAG, "忽略 ACL 断开（$name）：iAP2 建链主动断开音频配置文件所致，不按「下车」处理")

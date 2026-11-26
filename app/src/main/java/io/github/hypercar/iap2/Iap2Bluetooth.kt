@@ -27,6 +27,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
+data class RfcommStamp(val attempt: Long, val uptime: Long)
+
 /**
  * iAP2 蓝牙 RFCOMM 出站客户端 + 入站服务端（合并实现）。
  *
@@ -61,13 +63,14 @@ class Iap2Bluetooth(
     private val onEndpoint: (Iap2EndpointProposal) -> Boolean,
     /** 会话结束（拿到端点后链路断开，或中途失败）——上层用来收尾/重排。 */
     private val onSessionEnded: (String) -> Unit,
-    private val onInboundSession: (Long, String?, Long) -> Unit = { _, _, _ -> },
-    private val diagnosticAttempt: () -> Long = { 0L },
+    private val onInboundSession: (String?, RfcommStamp, RfcommStamp) -> Unit = { _, _, _ -> },
+    private val captureRfcommStamp: (Long) -> RfcommStamp = { RfcommStamp(0L, it) },
     private val wifiCredentialHistory: () -> Iap2WifiCredentialHistory = { Iap2WifiCredentialHistory() },
 ) {
     private val profileId = profile.protocolProfileId
 
     companion object {
+        private val bluetoothIds = AtomicLong()
         private val HANDSHAKE_IDS = java.util.concurrent.atomic.AtomicLong(0)
         /** 手机侧（我们监听）的 iAP2 服务 UUID；配件端（车机监听）是 …decacaff。 */
         val IPHONE_IAP2_UUID: UUID = UUID.fromString("00000000-deca-fade-deca-deafdecacafe")
@@ -107,6 +110,7 @@ class Iap2Bluetooth(
 
     private val appContext = context.applicationContext
 
+    private val bluetoothId = bluetoothIds.incrementAndGet()
     private val generation = AtomicLong(0)
 
     @Volatile
@@ -126,12 +130,26 @@ class Iap2Bluetooth(
     /** 当前会话的链路通道（主动结束会话用）。 */
     private val activeChannel = AtomicReference<RfcommLinkChannel?>(null)
 
-    @Volatile private var listener: RecoveringListener<BluetoothServerSocket, BluetoothSocket>? = null
+    private class AcceptWorker(
+        val generation: Long,
+        val listener: RecoveringListener<BluetoothServerSocket, BluetoothSocket>,
+        val thread: Thread,
+    ) {
+        val accepted = AtomicLong()
+        val rejected = AtomicLong()
+        @Volatile var lastAcceptAt = 0L
+        @Volatile var lastWorkerAt = 0L
+    }
+
+    @Volatile private var acceptWorker: AcceptWorker? = null
+    private data class HeldInbound(val socket: BluetoothSocket, val worker: AcceptWorker, val tag: String,
+                                   val arrival: RfcommStamp, val ticket: Long)
+    private class InboundPreparation(val attempt: Long, val peer: String?) {
+        var held: HeldInbound? = null
+    }
+    private var inboundPreparation: InboundPreparation? = null
     private val carPlayMarkers = mutableMapOf<CarPlayBluetoothMarker.Service, CarPlayBluetoothMarker>()
     @Volatile private var markerEnabled = false
-
-    @Volatile
-    private var serverThread: Thread? = null
 
     @Volatile
     private var clientThread: Thread? = null
@@ -144,43 +162,76 @@ class Iap2Bluetooth(
      */
     private val sessionActive = java.util.concurrent.atomic.AtomicBoolean(false)
     private val sessions = Iap2SessionGate()
-    private val acceptedSockets = AtomicLong()
-    private val rejectedSockets = AtomicLong()
-    @Volatile private var lastAcceptAt = 0L
-    @Volatile private var lastWorkerAt = 0L
+    fun diagnosticSummary(): String = diagnosticSummary(acceptWorker)
 
-    fun diagnosticSummary(): String {
+    private fun diagnosticSummary(worker: AcceptWorker?): String {
         val now = SystemClock.elapsedRealtime()
-        fun age(at: Long) = if (at == 0L) "none" else "${now - at}ms"
-        return "generation=${generation.get()} running=$running registered=$isListening " +
-            "acceptThread=${serverThread?.state} alive=${serverThread?.isAlive == true} ${sessions.diagnostics()} " +
-            "outboundPausedForWifi=${sessions.outboundPausedForWifi} active=${sessionActive.get()} accepted=${acceptedSockets.get()} " +
-            "rejected=${rejectedSockets.get()} acceptAge=${age(lastAcceptAt)} workerAge=${age(lastWorkerAt)}"
+        fun age(at: Long?) = if (at == null || at == 0L) "none" else "${now - at}ms"
+        val sdp = worker?.listener?.diagnostics
+        val acceptThreadState = worker?.thread?.state
+        val gate = sessions.diagnostics()
+        val outboundPaused = sessions.outboundPausedForWifi
+        val sessionRunning = sessionActive.get()
+        val active = worker != null && worker === acceptWorker && worker.generation == generation.get() && running
+        return "bluetooth_id=$bluetoothId generation=${worker?.generation ?: "none"} running=$active " +
+            "registered=${active && worker?.listener?.isRegistered == true} " +
+            "sdp_scope=local sdp_registrations=${sdp?.registrations ?: 0} " +
+            "sdp_register_failures=${sdp?.registerFailures ?: 0} rfcomm_accept_failures=${sdp?.acceptFailures ?: 0} " +
+            "last_listener_failure=${sdp?.lastFailure?.name?.lowercase() ?: "none"} " +
+            "acceptThread=$acceptThreadState alive=${acceptThreadState != null && acceptThreadState != Thread.State.NEW && acceptThreadState != Thread.State.TERMINATED} " +
+            (if (active) "$gate outboundPausedForWifi=$outboundPaused active=$sessionRunning " else "") +
+            "accepted=${worker?.accepted?.get() ?: 0} rejected=${worker?.rejected?.get() ?: 0} " +
+            "acceptAge=${age(worker?.lastAcceptAt)} workerAge=${age(worker?.lastWorkerAt)}"
     }
 
     private fun rejectSocket(socket: BluetoothSocket, tag: String, reason: String,
-                             handoff: BmwCaffHandoff<BluetoothSocket>? = null) {
-        rejectedSockets.incrementAndGet()
-        log("BT-REJECT: entry=$tag reason=$reason peer=${safeAddress(socket.remoteDevice)} ${diagnosticSummary()}")
+                             worker: AcceptWorker?, handoff: BmwCaffHandoff<BluetoothSocket>? = null) {
+        worker?.rejected?.incrementAndGet()
+        log("BT-REJECT: entry=$tag reason=$reason peer=${safeAddress(socket.remoteDevice)} ${diagnosticSummary(worker)}")
         if (handoff == null) runCatching { socket.close() } else handoff.cancel()
     }
 
     /** This runs before the admission monitor, so a blocked handler is observable too. */
-    private fun acceptSocket(socket: BluetoothSocket, epoch: Long, tag: String) {
+    private fun acceptSocket(socket: BluetoothSocket, worker: AcceptWorker, tag: String) {
         val acceptedAt = SystemClock.uptimeMillis()
-        if (running && generation.get() == epoch && sessions.ticket() != null &&
+        val acceptedTicket = sessions.inboundTicket()
+        val current = running && generation.get() == worker.generation && acceptWorker === worker
+        if (current && sessions.admitInbound(acceptedTicket) != null &&
             io.github.hypercar.bluetooth.CarTargetPolicy.acceptsIncoming(targetProvider(), safeAddress(socket.remoteDevice))) {
             lastInboundAdmission = acceptedAt
         }
-        acceptedSockets.incrementAndGet()
-        lastAcceptAt = SystemClock.elapsedRealtime()
-        log("BT-ACCEPT: entry=$tag attempt=${diagnosticAttempt()} acceptedUptimeMs=$acceptedAt elapsedMs=$lastAcceptAt epochMs=${System.currentTimeMillis()} " +
-            "listenerGeneration=$epoch peer=${safeAddress(socket.remoteDevice)} ${diagnosticSummary()}")
-        handleIncomingSocket(socket, epoch, tag, acceptedAt)
+        val elapsedAt = SystemClock.elapsedRealtime()
+        worker.accepted.incrementAndGet()
+        worker.lastAcceptAt = elapsedAt
+        val arrival = if (current) captureRfcommStamp(acceptedAt) else RfcommStamp(0L, acceptedAt)
+        log("BT-ACCEPT: entry=$tag attempt=${arrival.attempt} acceptedUptimeMs=${arrival.uptime} " +
+            "elapsedMs=$elapsedAt epochMs=${System.currentTimeMillis()} listenerGeneration=${worker.generation} " +
+            "acceptTicket=${acceptedTicket ?: "none"} " +
+            "peer=${safeAddress(socket.remoteDevice)} ${diagnosticSummary(worker)}")
+        handleIncomingSocket(socket, worker, tag, arrival, acceptedTicket)
     }
 
-    @Synchronized fun setSessionEnabled(enabled: Boolean, reason: String = "caller", closeCurrent: Boolean = true) {
+    @Synchronized internal fun prepareInbound(attempt: Long, peer: String?) {
+        if (!running || sessions.ticket() != null || inboundPreparation?.attempt == attempt) return
+        inboundPreparation?.let { cancelPreparedInbound(it.attempt) }
+        inboundPreparation = InboundPreparation(attempt, peer)
+        sessions.prepareInbound()
+    }
+
+    @Synchronized internal fun cancelPreparedInbound(attempt: Long) {
+        val preparation = inboundPreparation?.takeIf { it.attempt == attempt } ?: return
+        inboundPreparation = null
+        sessions.setEnabled(false)
+        preparation.held?.let { rejectSocket(it.socket, it.tag, "inbound-preparation-ended", it.worker) }
+    }
+
+    @Synchronized fun setSessionEnabled(enabled: Boolean, reason: String = "caller", closeCurrent: Boolean = true,
+                                        inboundAttempt: Long? = null) {
         val previous = sessions.diagnostics()
+        val preparation = inboundPreparation
+        val promote = enabled && preparation != null && preparation.attempt == inboundAttempt
+        if (promote) inboundPreparation = null
+        else preparation?.let { cancelPreparedInbound(it.attempt) }
         sessions.setEnabled(enabled)
         if (!enabled) {
             cancelBmwProbe("sessions disabled")
@@ -188,6 +239,9 @@ class Iap2Bluetooth(
         }
         if (previous != sessions.diagnostics()) log("BT-GATE: reason=$reason before=[$previous] after=[${sessions.diagnostics()}] generation=${generation.get()}")
         if (!enabled && closeCurrent) dropCurrentSession()
+        if (promote) preparation?.held?.let {
+            handleIncomingSocket(it.socket, it.worker, it.tag, it.arrival, it.ticket, promoted = true)
+        }
     }
 
     /** 「蓝牙已连接→已断开」日志节流（车机可能反复自动重连，避免刷屏）。 */
@@ -239,7 +293,7 @@ class Iap2Bluetooth(
         get() = sessionSocket.get()?.let { runCatching { safeAddress(it.remoteDevice) }.getOrNull() }
 
     val isSessionActive: Boolean get() = sessionActive.get()
-    val isListening: Boolean get() = running && listener?.isRegistered == true
+    val isListening: Boolean get() = running && acceptWorker?.listener?.isRegistered == true
 
     /** 只变更额外标记，不重建主服务、不打断当前会话。 */
     @Synchronized fun setCarPlayMarkerEnabled(enabled: Boolean) {
@@ -258,6 +312,7 @@ class Iap2Bluetooth(
             return
         }
         val adapter = adapterOrNull() ?: return
+        val worker = acceptWorker ?: return
         val required = CarPlayBluetoothMarker.registrationPrefix(CarPlayBluetoothMarker.forProfile(profileId)) {
             carPlayMarkers[it]?.isRegistered == true
         }
@@ -270,8 +325,8 @@ class Iap2Bluetooth(
                 ownerAlive = { running && markerEnabled && generation.get() == epoch },
                 primaryReady = { isListening },
                 onRegistrationChanged = { startMarkerWhenListening(epoch) },
-                onConnection = { socket -> acceptSocket(socket, epoch, "BT-MARKER") },
-                log = log,
+                onConnection = { socket -> acceptSocket(socket, worker, "BT-MARKER") },
+                log = { message -> log("$message bluetooth_id=$bluetoothId generation=$epoch") },
             )
             carPlayMarkers[service] = marker
             marker.start()
@@ -321,44 +376,50 @@ class Iap2Bluetooth(
                     if (profile.allowOutboundIap2) "（自动：只尝试已配对且声明 iAP2 服务的设备）" else "（等车机发起，不操作其它已配对设备）"
                 },
         )
-        var lastRegistrationErrorAt: Long? = null
+        val lastErrorAt = mutableMapOf<RecoveringListener.FailureStage, Long>()
         var lastRegistrationAt: Long? = null
         val newListener = RecoveringListener(
             ownerAlive = { running && generation.get() == myGeneration },
             open = {
                 try {
                     if (!adapter.isEnabled) throw IOException("蓝牙未开启，等待系统恢复")
-                    adapter.listenUsingRfcommWithServiceRecord(SDP_NAME, IPHONE_IAP2_UUID).also {
-                        val now = SystemClock.elapsedRealtime()
-                        if (lastRegistrationAt == null || now - lastRegistrationAt!! >= 30_000) {
-                            log("BT: SDP 监听已注册 generation=$myGeneration uuid=$IPHONE_IAP2_UUID")
-                            lastRegistrationAt = now
-                        }
-                    }
+                    adapter.listenUsingRfcommWithServiceRecord(SDP_NAME, IPHONE_IAP2_UUID)
                 } catch (error: SecurityException) {
                     throw IOException("蓝牙权限不可用", error)
                 }
             },
             accept = { socket: BluetoothServerSocket -> socket.accept() },
-            onRegistered = { startMarkerWhenListening(myGeneration) },
-            onFailure = { error ->
+            onRegistered = {
+                val now = SystemClock.elapsedRealtime()
+                if (lastRegistrationAt == null || now - lastRegistrationAt!! >= 30_000) {
+                    log("BT: SDP 监听已注册 bluetooth_id=$bluetoothId generation=$myGeneration " +
+                        "uuid=$IPHONE_IAP2_UUID scope=local peer_sdp_eir=unverified")
+                    lastRegistrationAt = now
+                }
+                startMarkerWhenListening(myGeneration)
+            },
+            onFailure = { stage, error ->
                 if (CarPlayBluetoothMarker.usesDiscoveryMarker(profileId)) startMarkerWhenListening(myGeneration)
                 val now = SystemClock.elapsedRealtime()
-                if (lastRegistrationErrorAt == null || now - lastRegistrationErrorAt!! >= 30_000) {
-                    log("BT: 监听失效/注册失败：${error.message}；保留会话任务，1s 后重新注册")
-                    lastRegistrationErrorAt = now
+                val previous = lastErrorAt[stage]
+                if (previous == null || now - previous >= 30_000) {
+                    val operation = if (stage == RecoveringListener.FailureStage.REGISTER) "SDP 注册失败" else "RFCOMM accept 失败"
+                    log("BT: $operation bluetooth_id=$bluetoothId generation=$myGeneration " +
+                        "uuid=$IPHONE_IAP2_UUID error=${error.message}；保留会话任务，1s 后重新注册")
+                    lastErrorAt[stage] = now
                 }
             },
             awaitRetry = { sleepQuietly(1_000) },
         )
-        listener = newListener
-        Thread({ try { acceptLoop(myGeneration, newListener) } finally { newListener.close() } }, "iap2-bt-accept").apply {
+        lateinit var worker: AcceptWorker
+        val acceptThread = Thread({ try { acceptLoop(worker) } finally { newListener.close() } }, "iap2-bt-accept").apply {
             isDaemon = true
-            serverThread = this
-            start()
         }
+        worker = AcceptWorker(myGeneration, newListener, acceptThread)
+        acceptWorker = worker
+        acceptThread.start()
         if (profile.allowOutboundIap2) {
-            Thread({ connectLoop(myGeneration) }, "iap2-bt-client").apply {
+            Thread({ connectLoop(worker) }, "iap2-bt-client").apply {
                 isDaemon = true
                 clientThread = this
                 start()
@@ -376,15 +437,16 @@ class Iap2Bluetooth(
     @Synchronized fun stop() {
         if (!running) return
         running = false
+        inboundPreparation?.let { cancelPreparedInbound(it.attempt) }
         sessions.setEnabled(false)
         generation.incrementAndGet()
         closeMarkers()
-        listener?.close()
-        listener = null
+        val worker = acceptWorker
+        worker?.listener?.close()
+        acceptWorker = null
         dropCurrentSession()
-        serverThread?.interrupt()
+        worker?.thread?.interrupt()
         clientThread?.interrupt()
-        serverThread = null
         clientThread = null
         log("BT: 已停止（监听与出站均已关闭）")
     }
@@ -410,6 +472,7 @@ class Iap2Bluetooth(
     }
 
     @Synchronized fun onTargetChanged() {
+        inboundPreparation?.let { cancelPreparedInbound(it.attempt) }
         cafeReservations.clear()
         cancelBmwProbe("target changed")
         targetRevision.incrementAndGet()
@@ -423,22 +486,25 @@ class Iap2Bluetooth(
     // ---- 入站：车机连入 ----
 
     @SuppressLint("MissingPermission")
-    private fun acceptLoop(myGeneration: Long, listener: RecoveringListener<BluetoothServerSocket, BluetoothSocket>) {
-        while (running && generation.get() == myGeneration) {
-            val socket = listener.acceptNext() ?: break
-            acceptSocket(socket, myGeneration, "BT-S")
+    private fun acceptLoop(worker: AcceptWorker) {
+        while (running && generation.get() == worker.generation) {
+            val socket = worker.listener.acceptNext() ?: break
+            acceptSocket(socket, worker, "BT-S")
         }
     }
 
     @SuppressLint("MissingPermission")
-    @Synchronized private fun handleIncomingSocket(socket: BluetoothSocket, myGeneration: Long, tag: String, acceptedAt: Long) {
-        if (!running || generation.get() != myGeneration) {
-            rejectSocket(socket, tag, "stale-listener-generation")
+    @Synchronized private fun handleIncomingSocket(socket: BluetoothSocket, worker: AcceptWorker, tag: String,
+                                                  arrival: RfcommStamp, acceptedTicket: Long?, promoted: Boolean = false) {
+        fun reject(reason: String) = rejectSocket(socket, tag, reason, worker = worker)
+        if (!running || generation.get() != worker.generation) {
+            reject("stale-listener-generation")
             return
         }
-        val ticket = sessions.ticket()
+        val preparation = inboundPreparation?.takeIf { sessions.canHoldInbound(acceptedTicket) }
+        val ticket = sessions.admitInbound(acceptedTicket) ?: acceptedTicket?.takeIf { preparation != null }
         if (ticket == null) {
-            rejectSocket(socket, tag, "sessions-disabled")
+            reject(if (acceptedTicket == null) "sessions-disabled" else "stale-session-ticket")
             return
         }
         val peerAddress = safeAddress(socket.remoteDevice)
@@ -447,23 +513,43 @@ class Iap2Bluetooth(
         val target = targetProvider()
         if (!io.github.hypercar.bluetooth.CarTargetPolicy.acceptsIncoming(target, peerAddress)) {
             log("$tag: 忽略非目标设备连入 addr=${peerAddress ?: "?"}（当前目标：$target）")
-            rejectSocket(socket, tag, "non-target")
+            reject("non-target")
             return
         }
         if (!canStartSession()) {
-            rejectSocket(socket, tag, "profile-no-longer-available")
+            reject("profile-no-longer-available")
             return
         }
+        if (preparation != null) {
+            if (!io.github.hypercar.bluetooth.CarTargetPolicy.acceptsIncoming(preparation.peer, peerAddress)) {
+                reject("non-target-inbound-preparation")
+                return
+            }
+            val held = preparation.held
+            if (held != null) {
+                val samePeer = peerAddress != null && peerAddress.equals(safeAddress(held.socket.remoteDevice), true)
+                val preferred = tag == "BT-S" && (held.tag != "BT-S" || samePeer)
+                if (!preferred) {
+                    reject("inbound-preparation-already-held")
+                    return
+                }
+                rejectSocket(held.socket, held.tag, "primary-inbound-preferred", held.worker)
+            }
+            preparation.held = HeldInbound(socket, worker, tag, arrival, ticket)
+            log("$tag: 保留入站 RFCOMM，等待本轮端点处理就绪 attempt=${preparation.attempt} ticket=$ticket")
+            return
+        }
+        if (promoted) lastInboundAdmission = SystemClock.uptimeMillis()
         cancelBmwProbe("inbound $tag")
         if (cafeReservations.pending != null) {
-            rejectSocket(socket, tag, "inbound-handoff-already-pending")
+            reject("inbound-handoff-already-pending")
             return
         }
         if (sessionActive.get()) {
             // 额外身份入口只补充发现，不能用它的探测替换正在建立的主 iAP2 会话。
             if (tag == "BT-MARKER") {
                 log("$tag: 已有 iAP2 会话，关闭额外入口连接并保留原会话")
-                rejectSocket(socket, tag, "duplicate-marker")
+                reject("duplicate-marker")
                 return
             }
             // **本轮已拿到凭据（端点）**才拒绝新连入；还在等凭据的「空转轮次」必须让位：
@@ -473,22 +559,22 @@ class Iap2Bluetooth(
             // The invitation can arrive on Wi-Fi without fresh Bluetooth credentials.
             // Once AirPlay owns a transport, let the car retire the active RFCOMM.
             if (io.github.hypercar.session.HyperCarRepo.hasAirPlayTransport) {
-                rejectSocket(socket, tag, "active-session-during-airplay")
+                reject("active-session-during-airplay")
                 return
             }
             if (sessionEndpoints.hasCurrentEndpoint) {
                 log("$tag: 已有 iAP2 会话在跑且已拿到凭据，忽略新的连入 addr=${peerAddress ?: "?"}")
-                rejectSocket(socket, tag, "productive-session")
+                reject("productive-session")
                 return
             }
             val old = activeCaffSocket
             if (profileId == "bmw_id85" && tag == "BT-S" && old != null && peerAddress != null &&
                 peerAddress.equals(safeAddress(old.remoteDevice), true)) {
                 val retained = cafeReservations.reserve(activeCaffAttempt, old, socket) { handoff ->
-                    startInboundWorker(socket, myGeneration, tag, ticket, acceptedAt, handoff)
+                    startInboundWorker(socket, worker, tag, ticket, arrival, handoff)
                 }
                 if (!retained) {
-                    rejectSocket(socket, tag, "inbound-handoff-attempt-retired")
+                    reject("inbound-handoff-attempt-retired")
                     return
                 }
                 activeCaffSocket = null // Discard late endpoint callbacks from the retiring worker.
@@ -501,11 +587,11 @@ class Iap2Bluetooth(
             sleepQuietly(500)
             if (sessionActive.get()) {
                 log("$tag: 旧会话未在 500ms 内退出，忽略本次连入 addr=${peerAddress ?: "?"}")
-                rejectSocket(socket, tag, "previous-session-still-closing")
+                reject("previous-session-still-closing")
                 return
             }
         }
-        startInboundWorker(socket, myGeneration, tag, ticket, acceptedAt)
+        startInboundWorker(socket, worker, tag, ticket, arrival)
     }
 
     @Synchronized fun retireCafeHandoff(attempt: Long, reason: String, networkCurrent: (() -> Boolean)?) {
@@ -517,13 +603,13 @@ class Iap2Bluetooth(
         cafeReservations.exited(socket)
     }
 
-    private fun startInboundWorker(socket: BluetoothSocket, myGeneration: Long, tag: String,
-                                   ticket: Long, acceptedAt: Long, handoff: BmwCaffHandoff<BluetoothSocket>? = null) {
+    private fun startInboundWorker(socket: BluetoothSocket, worker: AcceptWorker, tag: String,
+                                   ticket: Long, arrival: RfcommStamp, handoff: BmwCaffHandoff<BluetoothSocket>? = null) {
         val peerAddress = safeAddress(socket.remoteDevice)
         val peerName = safeName(socket.remoteDevice) ?: peerAddress ?: "unknown"
         log("$tag: 车机已连入 name=$peerName，开始 iAP2 发送端会话")
         Thread({
-            runSession(socket, tag, ticket, acceptedAt, inboundGeneration = myGeneration, handoff = handoff)
+            runSession(socket, tag, ticket, arrival, socketWorker = worker, handoff = handoff)
         }, "iap2-bt-session").apply {
             isDaemon = true
             start()
@@ -549,8 +635,10 @@ class Iap2Bluetooth(
             device.bondState == BluetoothDevice.BOND_BONDED
         if (!eligible()) return
         val profiles = BtProfiles.connectedNames(appContext, device.address, classicOnly = true)
+        val origin: AcceptWorker?
         synchronized(this) {
             if (!eligible()) return
+            origin = acceptWorker
             if (bmwProbe !== probe) {
                 cancelBmwProbe("new attempt")
                 bmwProbe = probe
@@ -599,7 +687,8 @@ class Iap2Bluetooth(
             log("$tag: RFCOMM connected; waiting for handshake admission")
             Thread({
                 try {
-                    runSession(socket, tag, ticket, caffAttempt = probe.attempt, probeAdmission = { eligible() && probe.promote() })
+                    runSession(socket, tag, ticket, caffAttempt = probe.attempt,
+                        probeAdmission = { eligible() && probe.promote() }, socketWorker = origin)
                 } finally {
                     probe.cancel()
                     caffWorkerExited(socket)
@@ -615,7 +704,8 @@ class Iap2Bluetooth(
     }
 
     @SuppressLint("MissingPermission")
-    private fun connectLoop(myGeneration: Long) {
+    private fun connectLoop(worker: AcceptWorker) {
+        val myGeneration = worker.generation
         val adapter = adapterOrNull() ?: return
         var inboundGraceDone = false
         while (running && generation.get() == myGeneration) {
@@ -713,7 +803,7 @@ class Iap2Bluetooth(
                 runCatching { connected.close() }
                 return
             }
-            runSession(connected, "BT-C", ticket)
+            runSession(connected, "BT-C", ticket, socketWorker = worker)
             sleepQuietly(RETRY_DELAY_MILLIS)
         }
     }
@@ -864,18 +954,20 @@ class Iap2Bluetooth(
         socket: BluetoothSocket,
         tag: String,
         ticket: Long,
-        inboundAt: Long? = null,
+        inbound: RfcommStamp? = null,
         caffAttempt: Long = 0L,
         probeAdmission: (() -> Boolean)? = null,
-        inboundGeneration: Long? = null,
+        socketWorker: AcceptWorker? = null,
         handoff: BmwCaffHandoff<BluetoothSocket>? = null,
     ) {
         val workerEndpoints = Iap2RfcommEndpointState()
+        val inboundAt = inbound?.uptime
         // Publish the socket atomically with the pause check, so pausing can always close it.
+        val admitted: RfcommStamp
         synchronized(this) {
             val rejected = when {
                 !running -> "not-running"
-                inboundGeneration != null && generation.get() != inboundGeneration -> "stale-worker-generation"
+                inboundAt != null && socketWorker != null && generation.get() != socketWorker.generation -> "stale-worker-generation"
                 !sessions.allows(ticket) -> "stale-session-ticket"
                 !canStartSession() -> "profile-no-longer-available"
                 cafeReservations.pending !== handoff -> "inbound-handoff-superseded"
@@ -889,11 +981,11 @@ class Iap2Bluetooth(
             }
             if (handoff != null) cafeReservations.finish(handoff)
             if (rejected != null) {
-                rejectSocket(socket, tag, rejected, handoff)
+                rejectSocket(socket, tag, rejected, socketWorker, handoff)
                 return
             }
             sessionActive.set(true)
-            lastWorkerAt = SystemClock.elapsedRealtime()
+            socketWorker?.lastWorkerAt = SystemClock.elapsedRealtime()
             activeCaffSocket = if (probeAdmission != null) socket else null
             activeCaffAttempt = caffAttempt
             if (handoff != null) log("$tag: 旧 …caff 握手已退出，接管保留的入站 RFCOMM")
@@ -901,17 +993,20 @@ class Iap2Bluetooth(
             sessionStarts.incrementAndGet()
             sessionEndpoints = workerEndpoints
             currentSocket.set(socket)
+            val stamp = captureRfcommStamp(SystemClock.uptimeMillis())
+            admitted = if (caffAttempt == 0L) stamp else stamp.copy(attempt = caffAttempt)
         }
-        val attempt = caffAttempt.takeIf { it != 0L } ?: diagnosticAttempt()
+        val attempt = admitted.attempt
         val wifiHistory = wifiCredentialHistory()
-        inboundAt?.let { onInboundSession(attempt, safeAddress(socket.remoteDevice), it) }
+        inbound?.let { onInboundSession(safeAddress(socket.remoteDevice), it, admitted) }
         val handshakeId = HANDSHAKE_IDS.incrementAndGet()
         val started = SystemClock.elapsedRealtime()
         val sessionLog: (String) -> Unit = { line -> log("HS#$handshakeId +${SystemClock.elapsedRealtime() - started}ms attempt=$attempt $line") }
         var channel: RfcommLinkChannel? = null
         try {
-            log("BT-WORKER: entry=$tag attempt=$attempt handshake=$handshakeId acceptedUptimeMs=${inboundAt ?: "none"} " +
-                "ticket=$ticket peer=${safeAddress(socket.remoteDevice)} ${diagnosticSummary()}")
+            log("BT-WORKER: entry=$tag acceptAttempt=${inbound?.attempt ?: "none"} handshakeAttempt=$attempt " +
+                "handshake=$handshakeId acceptedUptimeMs=${inboundAt ?: "none"} handshakeUptimeMs=${admitted.uptime} " +
+                "ticket=$ticket peer=${safeAddress(socket.remoteDevice)} ${diagnosticSummary(socketWorker)}")
             // 记住本轮对端车机（ACL 广播可能没收到，记录「已配对车机」要靠它拿 MAC）
             val receiver = socket.remoteDevice
             val receiverAddress = safeAddress(receiver)

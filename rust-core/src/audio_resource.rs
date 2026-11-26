@@ -30,7 +30,7 @@ pub struct AudioResource {
 }
 
 impl AudioResource {
-    pub async fn request(&self, intent: PlaybackIntent) {
+    pub async fn request(&self, intent: PlaybackIntent) -> bool {
         let user_initiated = matches!(intent, PlaybackIntent::Play(_));
         let _serial=self.serial.lock().await;
         let audio_epoch = self.modes.lock().audio_change_epoch();
@@ -40,14 +40,14 @@ impl AudioResource {
                 // Take and this comparison share the modes lock, including after a wait for serial.
                 if !intent.is_current(&self.receiver_audio_generation) {
                     crate::emit_log("AUDIO-RESOURCE: dropped superseded play before proposal");
-                    return;
+                    return false;
                 }
-                if current.audio_change_epoch() != audio_epoch { return; }
+                if current.audio_change_epoch() != audio_epoch { return false; }
                 current.audio_claim(user_initiated)
             };
             let Some((epoch, claim)) = proposal else {
                 crate::emit_log(&format!("AUDIO-RESOURCE: playback start user={user_initiated} no claim (owned/disabled/constrained); {}", self.modes.lock().diagnostics()));
-                return;
+                return false;
             };
             let body = claim.declaration();
             let result = self.control.request("POST", "/command", &body,
@@ -60,7 +60,7 @@ impl AudioResource {
                 }
                 Err(error) => { crate::emit_log(&format!("AUDIO-RESOURCE: claim failed {error}")); false }
             };
-            if !accepted { return; }
+            if !accepted { return false; }
             let mut current = self.modes.lock();
             let committed = current.commit_audio_claim(epoch, &claim);
             // A successful local reclaim (including a fresh MEDIA_INIT) cancels a pending car Take.
@@ -69,10 +69,11 @@ impl AudioResource {
             // Never restore a grant from an older arbitration epoch.
             self.control.buffered_ownership.publish_with_gate(&self.owned, current.audio_can_send());
             crate::emit_log(&format!("AUDIO-RESOURCE: committed={committed} {}; receiver audibility unconfirmed", current.diagnostics()));
-            if committed || current.audio_change_epoch() != audio_epoch || attempt == 1 { return; }
+            if committed || current.audio_change_epoch() != audio_epoch || attempt == 1 { return committed; }
             drop(current);
             crate::emit_log("AUDIO-RESOURCE: screen-only event superseded snapshot; retry once with latest modes");
         }
+        false
     }
 }
 

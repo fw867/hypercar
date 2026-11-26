@@ -1025,6 +1025,16 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeRequest
     } else { JNI_FALSE }
 }
 
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeNotifyMediaPlayback(
+    _env: JNIEnv, _class: JClass, playing: jboolean,
+) -> jboolean {
+    ENGINE.lock().as_ref().is_some_and(|h| !h.shutdown.requested()
+        && h.source_tx.send(engine::SourceEvent::PhoneMediaPlayback {
+            playing: playing == JNI_TRUE, at: std::time::Instant::now(),
+        }).is_ok()) as jboolean
+}
+
 /// Queue a choice from the receiver's last active view-area declaration.
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeRequestViewArea(

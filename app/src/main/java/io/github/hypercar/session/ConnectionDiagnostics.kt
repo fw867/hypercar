@@ -1,7 +1,29 @@
 package io.github.hypercar.session
 
+import io.github.hypercar.iap2.RfcommStamp
+
 /** Bounded evidence journal. Tokens reject late events; a missing milestone is never inferred as success. */
 class ConnectionDiagnostics(private val clockMillis: () -> Long) {
+    internal data class AclWake(val peer: String, val observedAt: Long)
+
+    private class AclEdges {
+        var up: Long? = null
+        var down: Long? = null
+        var profileDrop = false
+            private set
+        val disconnected: Boolean get() = down?.let { it >= (up ?: Long.MIN_VALUE) } == true
+
+        fun record(connected: Boolean, at: Long, profileDrop: Boolean = false) {
+            if (connected) up = maxOf(up ?: Long.MIN_VALUE, at)
+            else if (at >= (down ?: Long.MIN_VALUE)) {
+                down = at
+                this.profileDrop = profileDrop
+            }
+        }
+    }
+
+    private val idleAcl = linkedMapOf<String, AclEdges>()
+
     enum class Stage {
         REQUESTED, DEPENDENCIES_CHECKED, BLUETOOTH_LISTENING, IAP2_STARTED,
         IAP2_PARAMETERS, WIFI_BOUND, CTRL_REGISTERED, CTRL_INVITED, AIRPLAY_START,
@@ -17,6 +39,7 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
         var transport: Transport? = null,
         val earlyInbound: ArrayDeque<Pair<String, Long>> = ArrayDeque(),
         val observations: MutableMap<Observation, Pair<Long, String>> = mutableMapOf(),
+        val acl: LinkedHashMap<String, AclEdges> = linkedMapOf(),
         val ctrlReached: MutableMap<Stage, Long> = mutableMapOf(),
         var ctrlPort: String? = null,
     )
@@ -152,11 +175,24 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
 
     @Synchronized internal fun exportSnapshot() = report() to mediaSummaries()
 
-    @Synchronized fun rfcommAccepted(id: Long, peer: String?, at: Long) {
-        val a = history.lastOrNull()?.takeIf { it.id == id && it.ended == null && at >= it.startedUptime } ?: return
+    @Synchronized internal fun captureRfcommStamp(uptime: Long, publishedAttempt: Long): RfcommStamp {
+        val attempt = history.lastOrNull()
+            ?.takeIf { it.id == publishedAttempt && it.ended == null && uptime >= it.startedUptime }
+        return RfcommStamp(attempt?.id ?: 0L, uptime)
+    }
+
+    fun rfcommAccepted(id: Long, peer: String?, at: Long) =
+        rfcommAdmitted(peer, RfcommStamp(id, at), RfcommStamp(id, at))
+
+    @Synchronized internal fun rfcommAdmitted(peer: String?, accepted: RfcommStamp, admitted: RfcommStamp) {
+        val a = history.lastOrNull()?.takeIf {
+            it.id == admitted.attempt && it.ended == null && admitted.uptime >= it.startedUptime
+        } ?: return
         if (peer == null) return
-        // Raw accepts are logged separately; only sockets admitted to an iAP2 worker reach this stage.
+        // Standby may hand a socket across a round. Only the admission belongs to the new round.
         a.reached.putIfAbsent(Stage.BT_INBOUND_ADMITTED, (clockMillis() - a.started).coerceAtLeast(0))
+        if (accepted.attempt != admitted.attempt || accepted.uptime < a.startedUptime || accepted.uptime > admitted.uptime) return
+        val at = accepted.uptime
         val t = a.transport
         if (t == null) {
             a.earlyInbound.addLast(peer to at)
@@ -169,11 +205,23 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
         if (t.engine == engine && t.closed == null) t.tcp = sample
     }
 
-    @Synchronized fun begin(source: String, profile: String, startedUptime: Long = clockMillis()): Long {
+    @Synchronized internal fun begin(
+        source: String, profile: String, startedUptime: Long = clockMillis(), aclWake: AclWake? = null,
+    ): Long {
+        val now = clockMillis()
         history.lastOrNull()?.takeIf { it.ended == null }?.let {
-            it.outcome = "SUPERSEDED"; it.ended = clockMillis()
+            it.outcome = "SUPERSEDED"; it.ended = now
         }
-        val attempt = Attempt(++serial, clean(source), clean(profile), clockMillis(), startedUptime)
+        val attempt = Attempt(++serial, clean(source), clean(profile), now, startedUptime)
+        // Only the original idle edge that actually opens this round may predate it.
+        if (aclWake != null) {
+            val peer = aclWake.peer.uppercase()
+            val pending = idleAcl[peer]
+            if (pending != null && pending.up == aclWake.observedAt && !pending.disconnected) {
+                attempt.acl[peer] = AclEdges().also { it.record(true, aclWake.observedAt) }
+            }
+        }
+        idleAcl.clear()
         attempt.reached[Stage.REQUESTED] = 0L
         history.addLast(attempt)
         while (history.size > 8) history.removeFirst()
@@ -213,7 +261,6 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
     internal enum class Observation(val label: String) {
         CARD_UNLOCKED("已刷卡"), ABOUT_TO_SELECT_CARPLAY("即将点旧设备 CarPlay"),
         OLD_CARPLAY_ERROR("旧设备 CarPlay 报错"), NEW_LIST_PHONE_SELECTED("在连接新设备列表点手机"),
-        ACL_UP("车机蓝牙 ACL 连上"), ACL_DOWN("车机蓝牙 ACL 断开"),
         MDNS_LOCAL_ANNOUNCEMENT("本机完整 mDNS 通告（最近观察）"),
         MDNS_PEER_QUERY("对端 CarPlay ctrl mDNS 查询（最近观察）"),
     }
@@ -226,6 +273,34 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
             attempt.observations[kind] = offset to clean(detail)
         }
         return true
+    }
+
+    /** Called for the original broadcast, with the round bound under the same lock as begin/finish. */
+    @Synchronized internal fun recordAcl(peer: String, connected: Boolean, observedAt: Long, profileDrop: Boolean = false): Long? {
+        val latest = history.lastOrNull()
+        if (latest != null && observedAt < (latest.ended ?: latest.started)) return null
+        val active = latest?.takeIf { it.ended == null }
+        val peers = active?.acl ?: idleAcl
+        val edges = peers.getOrPut(peer.uppercase()) { AclEdges() }
+        if (peers.size > 16) peers.remove(peers.keys.first())
+        edges.record(connected, observedAt, profileDrop)
+        return active?.id
+    }
+
+    private fun Attempt.aclFor(peer: String?): AclEdges? =
+        if (peer.isNullOrBlank()) acl.values.singleOrNull() else acl[peer.uppercase()]
+
+    @Synchronized internal fun aclObservation(id: Long, peer: String? = null): String {
+        val attempt = history.lastOrNull()?.takeIf { it.id == id && it.ended == null }
+        val target = peer ?: attempt?.transport?.peer
+        val edges = attempt?.aclFor(target)
+        return when {
+            edges?.disconnected == true && edges.profileDrop -> "本轮最近观察到车机 ACL 断开（应用主动降级）"
+            edges?.disconnected == true -> "本轮最近观察到车机 ACL 断开"
+            edges?.up != null -> "本轮最近观察到车机 ACL 连入"
+            target.isNullOrBlank() && (attempt?.acl?.size ?: 0) > 1 -> "本轮观察到多台车机的 ACL，当前对端尚未确认"
+            else -> "本轮尚未观察到车机 ACL 连入"
+        }
     }
 
     /** Keep the attempt-wide report, but do not mix ctrl evidence from different listeners. */
@@ -242,8 +317,11 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
         return Stage.CTRL_REGISTERED in current.ctrlReached && Stage.CTRL_TCP_ACCEPTED !in current.ctrlReached
     }
 
-    @Synchronized internal fun connectionSnapshot(id: Long, listeningPort: Int?): String? {
+    @Synchronized internal fun connectionSnapshot(id: Long, listeningPort: Int?, aclPeer: String? = null): String? {
         val a = history.lastOrNull()?.takeIf { it.id == id } ?: return null
+        val target = aclPeer ?: a.transport?.peer
+        val acl = a.aclFor(target)
+        fun formatTime(at: Long?) = at?.let { "${if (it >= 0) "+" else ""}$it ms" } ?: "未记录"
         return buildString {
             appendLine("HyperCar 连接快照 · #${a.id} · ${if (a.ended == null) "进行中" else "最近已结束"}")
             appendLine("来源=${a.source} 档案=${a.profile} 状态=${a.outcome}；时间以本轮开始为 0 ms，负值表示本轮开始前")
@@ -251,7 +329,14 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
             for (kind in Observation.entries) {
                 val event = a.observations[kind]
                 val detail = event?.second.orEmpty()
-                appendLine("${kind.label}：${event?.let { "${if (it.first >= 0) "+" else ""}${it.first} ms" } ?: "未记录"}${if (detail.isBlank()) "" else "（$detail）"}")
+                appendLine("${kind.label}：${formatTime(event?.first)}${if (detail.isBlank()) "" else "（$detail）"}")
+            }
+            if (target.isNullOrBlank() && a.acl.size > 1) {
+                appendLine("车机蓝牙 ACL：本轮观察到多台车机，当前对端尚未确认")
+            } else {
+                appendLine("车机蓝牙 ACL 连上：${formatTime(acl?.up?.minus(a.started))}")
+                appendLine("车机蓝牙 ACL 断开：${formatTime(acl?.down?.minus(a.started))}" +
+                    if (acl?.profileDrop == true) "（应用主动降级）" else "")
             }
             fun stage(label: String, stage: Stage) {
                 val at = if (stage in ctrlStages) a.ctrlReached[stage] else a.reached[stage]

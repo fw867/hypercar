@@ -169,6 +169,10 @@ object HyperCarRepo {
         sessionLive.get() && RustCoreBridge.nativeRequestAudioOwnership()
     }
 
+    internal fun notifyMediaPlayback(owner: Long, playing: Boolean) = engineCallbacks.notifyMediaPlayback(owner) {
+        sessionLive.get() && RustCoreBridge.nativeNotifyMediaPlayback(playing)
+    }
+
     private suspend fun startNativeForSession(
         fd: Int, sockets: SessionSocketLease<Network>, attempt: Long, activation: ProactiveActivation,
         advertiser: CarPlayCtrlAdvertiser, target: AirplayTarget,
@@ -331,6 +335,12 @@ object HyperCarRepo {
     private val cachedHotspotAcl = CarHotspotReconnect.AclTrigger()
     internal fun onCarAclDisconnected(address: String, profileDrop: Boolean): Boolean =
         cachedHotspotAcl.onDisconnect(address, profileDrop)
+
+    internal fun recordProfileDropAcl(address: String, observedAt: Long) {
+        val attempt = connectionDiagnostics.recordAcl(address, false, observedAt, profileDrop = true)
+        ctrlDiscoveryTrace.record("event=bluetooth-acl connected=false origin=profile_drop " +
+            "attempt=${attempt ?: "none"} elapsedMsAtAcl=$observedAt")
+    }
     // Only a manual retry may keep an already-open shell window across attempt teardown.
     @Volatile private var discoveryHandoff: DiscoverabilityHandoff? = null
 
@@ -459,9 +469,12 @@ object HyperCarRepo {
             // 服务起来后再触发真正会话（handler 幂等，service 二次进入走直连分支）
             AutoStart.handler = handler@{ ctx, device, connected, forwarded, observedAt ->
                 val app = ctx.applicationContext
-                if (!forwarded && hasCurrentSession) recordAclObservation(connectionAttemptId, connected, observedAt)
+                val address = runCatching { device.address }.getOrNull()
+                val aclAttempt = if (!forwarded && address != null) {
+                    connectionDiagnostics.recordAcl(address, connected, observedAt)
+                } else null
                 if (!connected) {
-                    val cleanup = runCatching { device.address }.getOrNull()?.let { address ->
+                    val cleanup = address?.let {
                         aclDiscoverabilityEdge.updateAndGet { edge ->
                             edge?.takeUnless { it.ticket.peer.equals(address, ignoreCase = true) }
                         }
@@ -483,7 +496,7 @@ object HyperCarRepo {
                     // 记住刚连上 ACL 的车机：本轮 iAP2 只拨/只收这台，别再去碰
                     // HI-BOX 之类已配对的旧 dongle（每次 RFCOMM 失败都白占栈、添噪音，
                     // 2026-10-25 现场日志里 10 分钟里一半是它们的连接失败）
-                    runCatching { device.address }.getOrNull()?.let { address ->
+                    address?.let {
                         synchronized(targetCarChanges) {
                             if (!forwarded && address.equals(SettingsStore.targetCarMac, ignoreCase = true)) {
                                 cachedHotspotAcl.connected(address, observedAt)
@@ -499,6 +512,7 @@ object HyperCarRepo {
                         CarProfileGuard.onCarConnected(app, device, address)
                     }
                     val edge = captureAclDiscoverability(device, forwarded)
+                    val aclWake = address?.let { ConnectionDiagnostics.AclWake(it, observedAt) }
                     if (hasCurrentSession) {
                         // A genuine ACL edge may queue discoverability; it never starts AirPlay here.
                         val attempt = connectionAttemptId
@@ -513,16 +527,15 @@ object HyperCarRepo {
                         }.onFailure {
                             // FGS 被系统拦（未授悬浮窗等）：降级直接连接（进程可能被回收）
                             log("AUTO: FGS 启动被拦（${it.message}）——降级直接拉起会话")
-                            connectAutomatically(app, aclEdge = edge, aclObservedAt = observedAt)
+                            connectAutomatically(app, aclEdge = edge, aclWake = aclWake)
                         }
                     } else {
-                        connectAutomatically(app, aclEdge = edge, aclObservedAt = observedAt)
+                        connectAutomatically(app, aclEdge = edge, aclWake = aclWake)
                     }
                 } else {
                     // An ACL broadcast has no connection generation. The RFCOMM reader,
                     // the bound network monitor and RTSP each own their transport's end.
                     val attempt = connectionAttemptId
-                    val address = runCatching { device.address }.getOrNull()
                     if (sessionLive.get() && RustCoreBridge.nativeCanKeepWifiSession()) {
                         iap2?.pauseOutboundForWifi()
                         log("HANDOFF: ACL 退场，保留 RFCOMM 收发与当前 Wi-Fi CarPlay 会话")
@@ -539,7 +552,7 @@ object HyperCarRepo {
                         }
                     }
                 }
-                logAclEvent(device, connected)
+                if (!forwarded) logAclEvent(device, connected, aclAttempt, observedAt)
             }
             // Rust 回调 → 快照（Rust 工作线程回调，直接改 StateFlow 是安全的）
             RustCoreBridge.setListener(rustListener)
@@ -549,10 +562,10 @@ object HyperCarRepo {
     }
 
     /**
-     * ACL 事件日志：同一次事件会被 receiver 与 service 各转交一次，去重后只记一行；
+     * ACL 事件日志只接收原始广播，短时间的重复广播去重；
      * 车机若在极短时间内反复重建 ACL，也不会把日志刷满（见 [log] 的限流兜底）。
      */
-    private fun logAclEvent(device: BluetoothDevice, connected: Boolean) {
+    private fun logAclEvent(device: BluetoothDevice, connected: Boolean, attempt: Long?, observedAt: Long) {
         val name = bluetoothName(device) ?: "未知设备"
         val address = runCatching { device.address }.getOrNull() ?: "?"
         val key = "$address/$connected"
@@ -561,15 +574,10 @@ object HyperCarRepo {
             lastAclEventAt = now
             return
         }
-        ctrlDiscoveryTrace.record("event=bluetooth-acl connected=$connected attempt=$connectionAttemptId elapsedMsAtAcl=$now")
+        ctrlDiscoveryTrace.record("event=bluetooth-acl connected=$connected attempt=${attempt ?: "none"} elapsedMsAtAcl=$observedAt")
         lastAclEventKey = key
         lastAclEventAt = now
         log("AUTO: 车机蓝牙 ${if (connected) "连上" else "断开"}（$name）")
-    }
-
-    private fun recordAclObservation(attempt: Long, connected: Boolean, at: Long) {
-        connectionDiagnostics.observe(attempt,
-            if (connected) ConnectionDiagnostics.Observation.ACL_UP else ConnectionDiagnostics.Observation.ACL_DOWN, at = at)
     }
 
     /** handler 只在主线程（receiver/service 都是主线程）调用，无需加锁。 */
@@ -633,9 +641,13 @@ object HyperCarRepo {
     internal suspend fun latestConnectionSnapshot(): String? = withContext(Dispatchers.IO) {
         val attempt = connectionAttemptId
         val advertiser = ctrlAdvertiser
-        if (advertiser == null) connectionDiagnostics.connectionSnapshot(attempt, null)
-        else advertiser.withListeningPortFor(attempt) { port -> connectionDiagnostics.connectionSnapshot(attempt, port) }
+        val peer = aclDiagnosticPeer()
+        if (advertiser == null) connectionDiagnostics.connectionSnapshot(attempt, null, peer)
+        else advertiser.withListeningPortFor(attempt) { port -> connectionDiagnostics.connectionSnapshot(attempt, port, peer) }
     }
+
+    private fun aclDiagnosticPeer(coordinator: Iap2Coordinator? = iap2): String? =
+        sessionReceiverMac ?: coordinator?.activePeerAddress ?: SettingsStore.targetCarMac
 
     private val developerConnectionAction = kotlinx.coroutines.sync.Mutex()
 
@@ -704,9 +716,9 @@ object HyperCarRepo {
     }
 
     private fun connectAutomatically(context: Context, source: String = "acl", wakePeer: String? = null,
-                                     aclEdge: AclDiscoverabilityEdge? = null, aclObservedAt: Long? = null) =
+                                     aclEdge: AclDiscoverabilityEdge? = null, aclWake: ConnectionDiagnostics.AclWake? = null) =
         requestConnect(context, manual = false, source = source, wakePeer = wakePeer, aclEdge = aclEdge,
-            aclObservedAt = aclObservedAt)
+            aclWake = aclWake)
 
     fun connectFromCompanion(context: Context, address: String) {
         if (!io.github.hypercar.autowake.CompanionWakePolicy.accepts(
@@ -806,7 +818,8 @@ object HyperCarRepo {
 
     private fun requestConnect(context: Context, manual: Boolean, source: String, wakePeer: String? = null,
                                systemPrompt: SystemDiscoverabilityPrompt? = null,
-                               suppressManualWindow: Boolean = false, aclEdge: AclDiscoverabilityEdge? = null, aclObservedAt: Long? = null) {
+                               suppressManualWindow: Boolean = false, aclEdge: AclDiscoverabilityEdge? = null,
+                               aclWake: ConnectionDiagnostics.AclWake? = null) {
         init(context)
         scope.launch {
             autoConnectChanges.lock()
@@ -844,7 +857,7 @@ object HyperCarRepo {
                     return@launch
                 }
                 if (AutomaticConnectionPolicy.mayStart(manual, SettingsStore.autoConnect, automaticPauseRemaining > 0)) {
-                    beginConnect(context, source, manual, wakePeer, systemPrompt, suppressManualWindow, aclEdge, aclObservedAt)
+                    beginConnect(context, source, manual, wakePeer, systemPrompt, suppressManualWindow, aclEdge, aclWake)
                 }
             } finally { autoConnectChanges.unlock() }
         }
@@ -883,12 +896,12 @@ object HyperCarRepo {
 
     private fun beginConnect(context: Context, source: String, manual: Boolean, wakePeer: String? = null,
                              systemPrompt: SystemDiscoverabilityPrompt?,
-                             suppressManualWindow: Boolean = false, aclEdge: AclDiscoverabilityEdge? = null, aclObservedAt: Long? = null) {
+                             suppressManualWindow: Boolean = false, aclEdge: AclDiscoverabilityEdge? = null,
+                             aclWake: ConnectionDiagnostics.AclWake? = null) {
         init(context)
         if (sessionLive.get() || connecting || streaming) {
             if (sessionLive.get()) {
                 aclEdge?.ticket?.assign(connectionAttemptId)
-                aclObservedAt?.let { recordAclObservation(connectionAttemptId, true, it) }
             }
             log("CONNECT: 已在连接/已连接，忽略重复触发")
             return
@@ -920,12 +933,14 @@ object HyperCarRepo {
         connectionAttemptId = connectionDiagnostics.begin(source,
             "${profile.id} remote=${selection.remote} " +
                 "activation=${profile.requireAirplayActivation} outbound=${profile.allowOutboundIap2} " +
-                "profileGuard=${profile.dropProfilesBeforeIap2}", SystemClock.uptimeMillis())
-        aclObservedAt?.let { recordAclObservation(connectionAttemptId, true, it) }
+                "profileGuard=${profile.dropProfilesBeforeIap2}", SystemClock.uptimeMillis(), aclWake)
         val moving = discoveryHandoff?.takeIf { source == "manual-retry" && it.successor == null }
         aclEdge?.ticket?.assign(connectionAttemptId)
         if (sessionCarLifeMode) carWithEntries.begin(connectionAttemptId)
         sessionLive.set(true)
+        if (!sessionCarLifeMode && profile.protocolProfileId.startsWith("bmw_") && coordinatorProfile == profile) {
+            iap2?.prepareInbound(connectionAttemptId, SettingsStore.targetCarMac ?: wakePeer)
+        }
         // Readers that observe the published successor must also see its live flag and ID.
         discoveryHandoff = moving?.let { DiscoverabilityHandoff(it.origin, connectionAttemptId) }
         standbyEndpoint.get()?.takeIf { it.sourceIsCurrent }?.bluetoothHotspot?.let {
@@ -1240,8 +1255,11 @@ object HyperCarRepo {
                 val activeProfile = sessionProfile?.takeIf { sessionLive.get() }
                 (activeProfile ?: HeadUnitProfiles.selection().profile) == profile
             },
-            onInboundSession = { attempt, peer, at -> connectionDiagnostics.rfcommAccepted(attempt, peer, at) },
-            diagnosticAttempt = { connectionAttemptId.takeIf { sessionLive.get() } ?: 0L },
+            onInboundSession = connectionDiagnostics::rfcommAdmitted,
+            captureRfcommStamp = { uptime ->
+                val publishedAttempt = connectionAttemptId.takeIf { sessionLive.get() } ?: 0L
+                connectionDiagnostics.captureRfcommStamp(uptime, publishedAttempt)
+            },
             wifiCredentialHistory = { iap2WifiHistory },
             log = ::log,
         ).also { iap2 = it }
@@ -1878,6 +1896,7 @@ object HyperCarRepo {
                     !coordinator.isSessionActive && coordinator.sessionStartCount <= baselineSessions &&
                     !invited.get() && advertiser.lastInvitePeerIp == null
                 try { ReconnectDiscoverability.watch(context,
+                    attempt = discoveryAttempt,
                     networkKey = {
                         val mac = wifiReceiverMac
                         val network = boundNetwork
@@ -1941,6 +1960,7 @@ object HyperCarRepo {
                             }
                         }.getOrNull()
                     },
+                    enqueueDiagnostic = ctrlDiscoveryTrace::enqueue,
                     log = ::log,
                 ) } catch (cancelled: CancellationException) {
                     throw cancelled
@@ -1990,8 +2010,9 @@ object HyperCarRepo {
                 }
             }
             connectionEndpoints = diagnosticId to endpoints
+            if (!sessionLive.get() || connectionAttemptId != diagnosticId || iap2 !== coordinator) return
             activeEndpointInbox.set(connectionEndpoints)
-            coordinator.start { propose ->
+            coordinator.start(diagnosticId) { propose ->
                 synchronized(iap2EndpointChanges) {
                     if (connectionAttemptId != diagnosticId || !sessionLive.get() || iap2 !== coordinator) return@start false
                     val update = propose() ?: return@start false
@@ -2077,7 +2098,7 @@ object HyperCarRepo {
                         val reason =
                             if (seen == null) {
                                 if (coordinator.sessionStartCount == 0) {
-                                    "车机未发起 iAP2（ACL 已连但收不到 …cafe 连入）——" +
+                                    "暂未建立车机 iAP2 会话（${connectionDiagnostics.aclObservation(diagnosticId, aclDiagnosticPeer(coordinator))}）——" +
                                         "请在车机确认 Apple CarPlay 已启用；继续保留广播与监听"
                                 } else {
                                     "车机连入了 iAP2 但没给 0x5703/0x4301——请在车机上点一次 Apple CarPlay"
@@ -2432,6 +2453,7 @@ object HyperCarRepo {
         } catch (t: Throwable) {
             fail("会话异常: ${t.message}")
         } finally {
+            iap2?.cancelPreparedInbound(diagnosticId)
             connectionEndpoints?.let {
                 activeEndpointInbox.compareAndSet(it, null)
                 it.second.close()
@@ -2450,6 +2472,7 @@ object HyperCarRepo {
     private suspend fun watchOldDeviceReadiness(context: Context, attempt: Long, advertiser: CarPlayCtrlAdvertiser) {
         val cm = context.getSystemService(ConnectivityManager::class.java) ?: return
         val adapter = context.getSystemService(BluetoothManager::class.java)?.adapter
+        var lastScanState: String? = null
         fun current() = sessionLive.get() && connectionAttemptId == attempt && ctrlAdvertiser === advertiser &&
             !userDisconnectRequested
         fun publish(next: OldDeviceReadiness?) {
@@ -2471,9 +2494,24 @@ object HyperCarRepo {
                         cm.boundNetworkForProcess == it &&
                             cm.getNetworkCapabilities(it)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
                     }
-                    val scanMode = if (context.checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED) {
+                    val canReadScanMode = context.checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
+                    val scanMode = if (canReadScanMode) {
                         runCatching { adapter?.scanMode }.getOrNull()
                     } else null
+                    val scanState = when {
+                        !canReadScanMode -> "permission_missing"
+                        adapter == null -> "adapter_unavailable"
+                        scanMode == null || scanMode == BluetoothAdapter.ERROR -> "unavailable"
+                        scanMode == BluetoothAdapter.SCAN_MODE_NONE -> "none"
+                        scanMode == BluetoothAdapter.SCAN_MODE_CONNECTABLE -> "connectable"
+                        scanMode == BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE -> "discoverable"
+                        else -> "unknown($scanMode)"
+                    }
+                    if (scanState != lastScanState) {
+                        lastScanState = scanState
+                        ctrlDiscoveryTrace.enqueue("BT-DISCOVERY: attempt=$attempt local_scan_mode=$scanState " +
+                            "elapsedMs=${SystemClock.elapsedRealtime()}")
+                    }
                     val discoverable = scanMode?.takeUnless { it == BluetoothAdapter.ERROR }
                         ?.let { it == BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE }
                     val srv = network?.let(advertiser::currentSrv)?.let { OldDeviceReadiness.Srv(it.host, it.port) }
@@ -4494,7 +4532,8 @@ object HyperCarRepo {
                     if (ssid != null) observedSsid = ssid
                     // ② 每 15s 报一次进度（tick 是 5s，探测要跟得上换网速度）
                     if (ticks % TICKS_PER_PROGRESS == 0) {
-                        log("BT-HEALTH: attempt=$diagnosticId ${coordinator.diagnosticSummary()}")
+                        val acl = connectionDiagnostics.aclObservation(diagnosticId, aclDiagnosticPeer(coordinator))
+                        log("BT-HEALTH: attempt=$diagnosticId ${coordinator.diagnosticSummary()} acl=$acl")
                         log("CTRL-DIAG: attempt=$diagnosticId ${advertiser.diagnosticSummary()}")
                         connectionDiagnostics.report().lastOrNull()?.let { log(it) }
                         val seen = lastSeen.get()
@@ -4546,7 +4585,7 @@ object HyperCarRepo {
                             }
                         } else if (seen == null && coordinator.sessionStartCount == 0 && wifiReceiverMac == null) {
                             log(
-                                "SESSION: ${waited}s 内车机一次都没发起 iAP2（ACL 已连但收不到 …cafe 连入）——" +
+                                "SESSION: 等待 iAP2 会话 ${waited}s（$acl）——" +
                                     "请确认「Apple CarPlay」已为该设备启用，继续保持监听",
                             )
                         } else {

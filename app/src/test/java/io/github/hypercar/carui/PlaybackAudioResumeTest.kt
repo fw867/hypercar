@@ -5,6 +5,22 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PlaybackAudioResumeTest {
+    @Test fun attachingAPlayingPlayerReportsStateWithoutAUserPlayAction() {
+        val observed = mutableListOf<Boolean>()
+        val intent = PlaybackAudioResume(STATE_PLAYING, onPlaying = { observed += true })
+        assertEquals(listOf(true), observed)
+        assertFalse(intent.onState(STATE_PLAYING))
+        assertEquals(listOf(true), observed)
+    }
+    @Test fun stopPublishesOnceAcrossPauseUpdatesAndRearmsAfterPlaying() {
+        val events = mutableListOf<String>()
+        val intent = PlaybackAudioResume(STATE_PLAYING) { events.add("pause") }
+        for (state in listOf(STATE_PAUSED, STATE_STOPPED, STATE_BUFFERING, STATE_PAUSED,
+            STATE_PLAYING, STATE_PLAYING, STATE_STOPPED)) {
+            if (intent.onState(state)) events.add("play")
+        }
+        assertEquals(listOf("pause", "play", "pause"), events)
+    }
     @Test fun attachingAnAlreadyPlayingSessionOrRebufferingDoesNotRequestAudio() {
         val intent = PlaybackAudioResume(null)
         assertFalse(intent.onState(STATE_PLAYING))

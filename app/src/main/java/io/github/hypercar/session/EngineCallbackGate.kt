@@ -28,6 +28,10 @@ internal class EngineCallbackGate {
         true
     }
 
+    fun notifyMediaPlayback(engine: Long, enqueue: () -> Boolean): Boolean = synchronized(audioLock) {
+        isCurrent(engine) && enqueue()
+    }
+
     fun endConnection(markEnded: () -> Boolean): Boolean = synchronized(audioLock) {
         markEnded().also { if (it) take = null }
     }

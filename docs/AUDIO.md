@@ -55,6 +55,8 @@ CarWith 会话及[开启车机通话实验的系统 CarLife+ 会话](SYSTEM-CARL
 
 实时媒体绑定本地控制端口后，在 SETUP 声明 `supportsHighAccuracyTimestamps`。接收端拒绝该提议时可保留控制端口并重试原字段。`AUDIO-FEEDBACK` 根据当前会话、流类型、`streamConnectionID` 和当前音频归属关联 `/feedback` 中的 `sampleTime`、`timestampRawNs`。`rateHz` 是接收端采样率估计，`sampleClockOffsetNs` 是相对于本次观测初始样本的偏差，采用接收端原始时钟。两项只用于诊断。
 
+BMW ID7–ID8.5 档案识别到 MGU-103-F 时，主音频归还后若 AAC 重建最终收到 RTSP 400，且同一次重建期间旧流的 RTP 或 RTCP 端口报拒绝，暂停旧发送端。暂停期间归还的换流机会留到恢复播放时处理，本地主动取回音频授权也会单独唤醒恢复。暂停确认会等正在执行的 RTCP 重传写入结束，候选流安装后才启用 RTCP 回包。所有类型 102 清理共用应答校验，收到整个类型的清理确认后才能重新 SETUP。媒体停止期间只清理，待播放恢复后重建；发送泵安装流时再次校验播放轮次。首次替换和后续恢复允许通话或语音在 RTSP 操作之间接管。每轮恢复最多两次 SETUP 和 RECORD，收到新的播放请求后可在 500 ms 退避后再次尝试。见 [#104](https://github.com/fw867/hypercar/issues/104)。
+
 AirPlay PCM 使用 SPF352，约 136.36 包/秒，16-bit 大端样本。TTS 参与闪避混音；持续全零样本不会一直保持“播放中”。
 
 实时主媒体 PCM/type100 和 AAC/type102 在 SETUP 前于会话网络绑定 UDP 端口，并写入 `streams[].controlPort`。车机返回控制端口后，沿用同一个 socket 收 RTCP 和发同步包。车机省略控制端口时，仍保留通告的监听端口，只接收来自本轮数据端点 IP 的请求，回包发往请求源端口。PCM SETUP 遇到 400、451 或 461 时去掉本地端口重试一次。对照日志按 `streamConnectionID` 核对 `advertisedControlPort`、`localPort` 和 `peerControlPort`。支持 8 字节和附带 NTP 时间戳的 16 字节 `0xD5`，长度字段分别为 1 和 3。Apple 接收端参考代码的主动重传路径在 MainHighAudio/type102。PCM/type100 是否会请求补发，仍取决于车机实现。

@@ -38,6 +38,7 @@ pub enum SourceEvent {
     RequestViewArea(crate::display_layout::ViewRequest),
     CancelSelfAsr(u64),
     RequestAudioOwnership(PlaybackIntent, std::time::Instant),
+    PhoneMediaPlayback { playing: bool, at: std::time::Instant },
     /// 视频编码器产出一帧（H.264 Annex B，可能含 SPS/PPS/IDR）。
     VideoFrame { pts_us: u64, data: Vec<u8> },
     VideoFrameTagged { pts_us:u64, data:Vec<u8>, codec:crate::video_format::VideoCodec, origin:FrameOrigin },
@@ -394,6 +395,7 @@ pub async fn run_engine(
     {
         let stop_d = stop.clone();
         let claims = audio_claim_tx.clone();
+        let playback_input = auxiliary_input.clone();
         let microphone_cancel=microphone_probe.clone();
         tasks.spawn(async move {
             loop {
@@ -415,6 +417,9 @@ pub async fn run_engine(
                             if let Err(error) = claims.try_send((intent, at)) {
                                 emit_log(&format!("AUDIO-RESOURCE: claim user=true queue rejected: {error}"));
                             }
+                        }
+                        Some(SourceEvent::PhoneMediaPlayback { playing, at }) => {
+                            playback_input.observe_phone_playback(playing, at);
                         }
                         Some(ev) => {
                             let to_audio = matches!(
@@ -582,7 +587,7 @@ pub async fn run_engine(
     drop(pending_cleanup); // The negotiated outcome now owns both channels.
     // Requests share the encrypted control channel, with their own CSeq; feedback continues independently.
     let mut auxiliary=outcome.aux_audio.map(|session| {
-        let mut controller = crate::aux_audio::Controller::spawn(session,auxiliary_input,main_audio_tx.clone(),fallback_audio_tx,shutdown.clone());
+        let mut controller = crate::aux_audio::Controller::spawn(session,auxiliary_input.clone(),main_audio_tx.clone(),fallback_audio_tx,shutdown.clone());
         if cfg.carlife_call_audio_enabled() { controller.arm_calls(main_audio_tx); }
         controller
     });
@@ -600,15 +605,19 @@ pub async fn run_engine(
                 request = audio_claim_rx.recv() => {
                     let Some(first) = request else { return; };
                     let intent = fresh_audio_claim(first, &mut audio_claim_rx, &receiver_audio_generation);
-                    if let Some(claim) = intent.filter(|_| had_audio) {
-                        tokio::select! {
+                    if let Some((claim, at)) = intent.filter(|_| had_audio) {
+                        let granted = tokio::select! {
                             _ = stop_audio_claim.notified() => {
                                 emit_log(&format!("AUDIO-RESOURCE: claim {claim:?} cancelled by session stop"));
                                 return;
                             }
-                            _ = audio_resource.request(claim) => {}
+                            granted = audio_resource.request(claim) => granted,
+                        };
+                        if granted { auxiliary_input.media_granted(); }
+                        if matches!(claim, PlaybackIntent::Play(_)) && claim.is_current(&receiver_audio_generation) {
+                            auxiliary_input.retry_rejected_media_on_playback_at(at);
                         }
-                    } else if let Some(claim) = intent {
+                    } else if let Some((claim, _)) = intent {
                         emit_log(&format!("AUDIO-RESOURCE: claim {claim:?} skipped: no negotiated main audio"));
                     }
                 }
@@ -711,6 +720,7 @@ fn merge_auxiliary_teardown(streams: &mut Vec<crate::bplist::Value>, pending: &[
 }
 
 pub use crate::aux_audio::MainCommand;
+use crate::aux_audio::RealtimeReplacement;
 
 fn refresh_main_pcm_ownership(
     output: Option<&AudioOut>, auxiliary: &crate::aux_audio::Input, mixed_generation: &mut Option<u64>,
@@ -794,21 +804,24 @@ async fn audio_pump(
                     // failure after the caller releases the transition lock.
                     let mut acknowledged = false;
                     auxiliary.buffered_failed.send_if_modified(|failed| {
+                        let mut pipeline = pipeline.lock();
+                        if let Some(sender) = &out { sender.set_resend_active(false); }
                         if let Err(sender) = reply.send(out.take()) {
+                            if let Some(sender) = &sender { sender.set_resend_active(true); }
                             out = sender;
                             return false;
                         }
+                        pipeline.observe_main_sender(None);
                         acknowledged = true;
                         failed.take().is_some()
                     });
                     if !acknowledged { continue; }
                     paused = true;
                     hold_mixed_voice = hold_voice;
-                    pipeline.lock().observe_main_sender(None);
                     media_mix.clear(); media_remain.clear();
                     // Retire queued main media but preserve assistant/navigation boundaries.
                     while let Ok(event)=audio_rx.try_recv() {
-                        if !matches!(event, SourceEvent::AudioInit{tts:false,..}|SourceEvent::AudioData{tts:false,..}|SourceEvent::AudioStop{tts:false}) {
+                        if !matches!(event, SourceEvent::AudioInit{tts:false,..}|SourceEvent::AudioData{tts:false,..}) {
                             pending_events.push_back(event);
                         }
                     }
@@ -822,21 +835,84 @@ async fn audio_pump(
                         voice.discard_reply();
                         hold_mixed_voice = false;
                     }
-                    pipeline.lock().observe_main_sender(next.as_ref());
+                    {
+                        let mut pipeline = pipeline.lock();
+                        if pipeline.rejected_audio_recovery.is_some() { pipeline.audio_ready = next.is_some(); }
+                        pipeline.observe_main_sender(next.as_ref());
+                    }
                     out=next; paused=false;
+                    if let Some(sender) = &out { sender.set_resend_active(true); }
                 }
-                Some(MainCommand::ReplaceRealtime { output, grant, reply }) => {
+                Some(MainCommand::RetireRejectedRealtime { target, grant, reply }) => {
                     let modes = grant.modes.lock();
-                    let same_main_stream = out.as_ref().is_some_and(|old|
+                    let mut pipeline = pipeline.lock();
+                    let same_sender = pipeline.main_audio_feedback.as_ref().is_some_and(|source| source.target == target)
+                        && out.as_ref().and_then(|audio| audio.pacing_id)
+                            .is_some_and(|id| id.rtsp == target.rtsp && id.stream_id == target.stream_id);
+                    if reply.is_closed() || !same_sender || !grant.is_current(&modes) { continue; }
+                    let old = out.take();
+                    if let Some(sender) = &old { sender.set_resend_active(false); }
+                    if reply.send(()).is_err() {
+                        if let Some(sender) = &old { sender.set_resend_active(true); }
+                        out = old;
+                        continue;
+                    }
+                    drop(old);
+                    paused = true;
+                    media_mix.clear();
+                    media_remain.clear();
+                    pipeline.observe_main_sender(None);
+                    pipeline.audio_ready = false;
+                    pipeline.rejected_audio_recovery = Some(crate::pipeline::RejectedAudioRecovery {
+                        retired: target, cleanup_stream: Some(target.stream_id),
+                    });
+                }
+                Some(MainCommand::ReplaceRealtime { output, grant, replacement, reply }) => {
+                    let modes = grant.modes.lock();
+                    let mut pipeline = pipeline.lock();
+                    let live_replacement = || out.as_ref().is_some_and(|old|
                         old.stream_type() == 102 && old.sample_rate() == output.sample_rate()
                         && old.owns_audio() && old.pacing_id.zip(output.pacing_id)
                             .is_some_and(|(old, new)| old.rtsp == new.rtsp && old.stream_id != new.stream_id));
+                    let same_main_stream = match replacement {
+                        RealtimeReplacement::Legacy => live_replacement(),
+                        RealtimeReplacement::Pending { pending, .. } => {
+                            !pending.after_switch && pipeline.pending_aac_replacement == Some(pending) && live_replacement()
+                                && out.as_ref().and_then(|old| old.pacing_id)
+                                    .is_some_and(|id| id.rtsp == pending.active.rtsp && id.stream_id == pending.active.stream_id)
+                                && output.pacing_id.is_some_and(|id| id.stream_id == pending.stream)
+                        }
+                        RealtimeReplacement::Retired { target, .. } => {
+                            paused && out.is_none()
+                                && output.stream_type() == target.stream_type && output.sample_rate() == target.rate
+                                && pipeline.rejected_audio_recovery.is_some_and(|recovery| recovery.retired == target
+                                    && output.pacing_id.is_some_and(|id| id.rtsp == target.rtsp
+                                        && id.stream_id != target.stream_id && recovery.cleanup_stream == Some(id.stream_id)))
+                        }
+                    };
                     if reply.is_closed() || !same_main_stream || !grant.is_current(&modes) {
                         continue;
                     }
-                    pipeline.lock().observe_main_sender(Some(&output));
+                    let _playback = match replacement {
+                        RealtimeReplacement::Legacy => None,
+                        RealtimeReplacement::Pending { generation, .. } | RealtimeReplacement::Retired { generation, .. } => {
+                            let Some(state) = auxiliary.playback_guard(generation) else { continue; };
+                            Some(state)
+                        }
+                    };
+                    let reply_after_install = if !matches!(replacement, RealtimeReplacement::Legacy) {
+                        if reply.send(()).is_err() { continue; }
+                        None
+                    } else { Some(reply) };
+                    pipeline.observe_main_sender(Some(&output));
+                    if let RealtimeReplacement::Pending { pending, .. } = replacement {
+                        // Publish the displaced stream before the next call can take the media slot.
+                        pipeline.pending_aac_replacement = Some(pending.after_switch());
+                    }
+                    if matches!(replacement, RealtimeReplacement::Retired { .. }) { pipeline.audio_ready = true; paused = false; }
                     out = Some(output);
-                    let _ = reply.send(());
+                    if let Some(sender) = &out { sender.set_resend_active(true); }
+                    if let Some(reply) = reply_after_install { let _ = reply.send(()); }
                 }
                 None => commands_open=false,
             },
@@ -847,7 +923,11 @@ async fn audio_pump(
                 }
             } => {
                 if let Some(a) = r.flatten() {
-                    if !paused { pipeline.lock().observe_main_sender(Some(&a)); out = Some(a); }
+                    if !paused {
+                        pipeline.lock().observe_main_sender(Some(&a));
+                        out = Some(a);
+                        if let Some(sender) = &out { sender.set_resend_active(true); }
+                    }
                 }
                 ready = None;
             }
@@ -915,6 +995,7 @@ async fn audio_pump(
                         auxiliary.stop(crate::aux_setup::Kind::Navigation);
                         tts_mix.clear(); tts_remain.clear();
                     } else {
+                        auxiliary.media_stopped();
                         media_mix.clear(); media_remain.clear();
                         if tts_mix.is_empty() && voice.mix.is_empty() { last_audio_at = None; }
                     }
@@ -1883,8 +1964,8 @@ fn fresh_audio_claim(
     first: (PlaybackIntent, std::time::Instant),
     pending: &mut mpsc::Receiver<(PlaybackIntent, std::time::Instant)>,
     generation: &std::sync::atomic::AtomicU64,
-) -> Option<PlaybackIntent> {
-    let mut latest_play: Option<u64> = None;
+) -> Option<(PlaybackIntent, std::time::Instant)> {
+    let mut latest_play: Option<(u64, std::time::Instant)> = None;
     let mut media_init = None;
     for (intent, at) in std::iter::once(first).chain(std::iter::from_fn(|| pending.try_recv().ok())) {
         if at.elapsed() >= Duration::from_secs(2) {
@@ -1892,12 +1973,16 @@ fn fresh_audio_claim(
             continue;
         }
         match intent {
-            PlaybackIntent::MediaInit => media_init = Some(intent),
-            PlaybackIntent::Play(epoch) => latest_play = Some(latest_play.map_or(epoch, |old| old.max(epoch))),
+            PlaybackIntent::MediaInit => media_init = Some((intent, at)),
+            PlaybackIntent::Play(epoch) => {
+                let play = (epoch, at);
+                latest_play = Some(latest_play.map_or(play, |old| old.max(play)));
+            }
         }
     }
-    if let Some(play) = latest_play.map(PlaybackIntent::Play) {
-        if play.is_current(generation) { return Some(play); }
+    if let Some((epoch, at)) = latest_play {
+        let play = PlaybackIntent::Play(epoch);
+        if play.is_current(generation) { return Some((play, at)); }
         emit_log(&format!("AUDIO-RESOURCE: dropped superseded queued {play:?}"));
     }
     media_init
@@ -1927,7 +2012,7 @@ mod audio_intent_tests {
         let card = (PlaybackIntent::play(&generation), std::time::Instant::now());
         modes.response(&receiver_take(), &generation).unwrap();
         tx.try_send((PlaybackIntent::MediaInit, std::time::Instant::now())).unwrap();
-        assert_eq!(fresh_audio_claim(card, &mut rx, &generation), Some(PlaybackIntent::MediaInit));
+        assert_eq!(fresh_audio_claim(card, &mut rx, &generation).map(|(intent, _)| intent), Some(PlaybackIntent::MediaInit));
         assert!(modes.audio_claim(false).is_none());
         assert_eq!(fresh_audio_claim(card, &mut rx, &generation), None);
     }
@@ -1943,7 +2028,7 @@ mod audio_intent_tests {
         let card = PlaybackIntent::play(&generation);
         for intent in [card, old] { tx.try_send((intent, std::time::Instant::now())).unwrap(); }
         let first = (PlaybackIntent::MediaInit, std::time::Instant::now());
-        assert_eq!(fresh_audio_claim(first, &mut rx, &generation), Some(card));
+        assert_eq!(fresh_audio_claim(first, &mut rx, &generation).map(|(intent, _)| intent), Some(card));
         let (epoch, claim) = modes.audio_claim(true).unwrap();
         assert!(modes.commit_audio_claim(epoch, &claim));
         assert!(modes.audio_owned());
@@ -1955,7 +2040,7 @@ mod audio_intent_tests {
         let generation = Default::default();
         let expired = (PlaybackIntent::play(&generation), std::time::Instant::now() - Duration::from_secs(3));
         tx.try_send((PlaybackIntent::MediaInit, std::time::Instant::now())).unwrap();
-        assert_eq!(fresh_audio_claim(expired, &mut rx, &generation), Some(PlaybackIntent::MediaInit));
+        assert_eq!(fresh_audio_claim(expired, &mut rx, &generation).map(|(intent, _)| intent), Some(PlaybackIntent::MediaInit));
         assert_eq!(fresh_audio_claim(expired, &mut rx, &generation), None);
     }
 }
@@ -2111,8 +2196,9 @@ mod main_audio_command_tests {
         let (_events, audio) = mpsc::unbounded_channel();
         let (commands, command_rx) = mpsc::unbounded_channel();
         let pipeline = test_pipeline();
+        let playback = Arc::new(crate::aux_audio::Input::default());
         let worker = crate::callback_context::spawn(audio_pump(stop, stats, claims, rx, audio, command_rx,
-            Arc::new(crate::aux_audio::Input::default()), pipeline.clone()));
+            playback.clone(), pipeline.clone()));
         let (first, _first_peer, old_local) = realtime(4, 21).await;
         assert!(ready.send(first).is_ok());
         let timeout = Duration::from_secs(1);
@@ -2129,11 +2215,40 @@ mod main_audio_command_tests {
                 output, grant: crate::aux_audio::MainAudioGrant {
                     modes: modes.clone(), generation: resource_generation.clone(), expected: generation,
                     media_epoch: modes.lock().media_rebuild_epoch().unwrap(), shutdown: shutdown.clone(),
-                }, reply,
+                }, replacement: RealtimeReplacement::Legacy, reply,
             }).unwrap();
             assert_eq!(tokio::time::timeout(timeout, installed).await.unwrap().is_ok(), expected);
             assert_eq!(UdpSocket::bind(old_local).await.is_ok(), expected);
         }
+        let target = pipeline.lock().main_audio_feedback.as_ref().unwrap().target;
+        let grant = crate::aux_audio::MainAudioGrant {
+            modes: modes.clone(), generation: resource_generation, expected: 2,
+            media_epoch: modes.lock().media_rebuild_epoch().unwrap(), shutdown,
+        };
+        for target in [crate::audio_diagnostics::ClockTarget { stream_id: 21, ..target }, target] {
+            let (reply, retired) = tokio::sync::oneshot::channel();
+            commands.send(MainCommand::RetireRejectedRealtime { target, grant: grant.clone(), reply }).unwrap();
+            assert_eq!(tokio::time::timeout(timeout, retired).await.unwrap().is_ok(), target.stream_id == 22);
+        }
+        assert_eq!(pipeline.lock().rejected_audio_recovery.unwrap().retired, target);
+        assert!(!pipeline.lock().audio_ready);
+        pipeline.lock().rejected_audio_recovery.as_mut().unwrap().cleanup_stream = Some(23);
+        let previous = playback.playing_generation().unwrap();
+        let late_play = std::time::Instant::now();
+        playback.media_stopped();
+        playback.retry_rejected_media_on_playback_at(late_play);
+        assert!(playback.playing_generation().is_none());
+        playback.observe_phone_playback(true, std::time::Instant::now());
+        let fresh = playback.playing_generation().unwrap();
+        for (generation, expected) in [(previous, false), (fresh, true)] {
+            let (output, _new_peer, _) = realtime(4, 23).await;
+            let (reply, installed) = tokio::sync::oneshot::channel();
+            commands.send(MainCommand::ReplaceRealtime { output, grant: grant.clone(),
+                replacement: RealtimeReplacement::Retired { target, generation }, reply }).unwrap();
+            assert_eq!(tokio::time::timeout(timeout, installed).await.unwrap().is_ok(), expected);
+        }
+        assert!(pipeline.lock().audio_ready);
+        assert!(pipeline.lock().rejected_audio_recovery.is_none());
         worker.abort();
         let _ = worker.await;
     }

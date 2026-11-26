@@ -132,8 +132,8 @@ class Iap2Coordinator(
     private val profile: io.github.hypercar.headunit.HeadUnitProfile,
     private val canStartSession: () -> Boolean,
     private val log: (String) -> Unit,
-    private val onInboundSession: (Long, String?, Long) -> Unit = { _, _, _ -> },
-    private val diagnosticAttempt: () -> Long = { 0L },
+    private val onInboundSession: (String?, RfcommStamp, RfcommStamp) -> Unit = { _, _, _ -> },
+    private val captureRfcommStamp: (Long) -> RfcommStamp = { RfcommStamp(0L, it) },
     private val wifiCredentialHistory: () -> Iap2WifiCredentialHistory = { Iap2WifiCredentialHistory() },
 ) {
 
@@ -171,9 +171,14 @@ class Iap2Coordinator(
      *
      * 可重复调用：已在运行时只更新回调，不重建蓝牙栈。
      */
-    fun start(onEndpoint: (Iap2EndpointProposal) -> Boolean) = startTransport(true, onEndpoint)
+    fun start(inboundAttempt: Long? = null, onEndpoint: (Iap2EndpointProposal) -> Boolean) =
+        startTransport(true, onEndpoint, inboundAttempt)
 
     fun keepIdentityOnly() = startTransport(false, null)
+
+    internal fun prepareInbound(attempt: Long, peer: String?) { bluetooth?.prepareInbound(attempt, peer) }
+
+    internal fun cancelPreparedInbound(attempt: Long) { bluetooth?.cancelPreparedInbound(attempt) }
 
     fun diagnosticSummary(): String = bluetooth?.diagnosticSummary() ?: "transport=not-created"
 
@@ -187,12 +192,13 @@ class Iap2Coordinator(
         endpointCallback = null
     }
 
-    private fun startTransport(allowSessions: Boolean, onEndpoint: ((Iap2EndpointProposal) -> Boolean)?) {
+    private fun startTransport(allowSessions: Boolean, onEndpoint: ((Iap2EndpointProposal) -> Boolean)?,
+                               inboundAttempt: Long? = null) {
         synchronized(this) {
             endpointCallback = onEndpoint
             bluetooth?.let { existing ->
                 if (existing.isRunning) {
-                    existing.setSessionEnabled(allowSessions, "startTransport-existing")
+                    existing.setSessionEnabled(allowSessions, "startTransport-existing", inboundAttempt = inboundAttempt)
                     if (allowSessions) existing.setOutboundPausedForWifi(false)
                     existing.setCarPlayMarkerEnabled(true)
                     log(if (allowSessions) "IAP2: 已在运行，允许会话且保留 SDP 注册" else "IAP2: 仅保留 iPhone 身份声明，暂停会话与出站；SDP 已注册=${existing.isListening}")
@@ -216,7 +222,7 @@ class Iap2Coordinator(
                     log = log,
                     onEndpoint = { proposed -> endpointCallback?.invoke(proposed) == true },
                     onInboundSession = onInboundSession,
-                    diagnosticAttempt = diagnosticAttempt,
+                    captureRfcommStamp = captureRfcommStamp,
                     wifiCredentialHistory = wifiCredentialHistory,
                     onSessionEnded = { reason -> log("IAP2: 会话结束（$reason），继续监听/出站等待重连") },
                 )

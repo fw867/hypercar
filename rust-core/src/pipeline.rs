@@ -12,6 +12,29 @@ pub(crate) struct MainVideoConnection {
     pub resource_grant: Option<(std::sync::Arc<parking_lot::Mutex<crate::modes::Modes>>, u64)>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RejectedAudioRecovery {
+    pub retired: crate::audio_diagnostics::ClockTarget,
+    pub cleanup_stream: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingAacReplacement {
+    pub active: crate::audio_diagnostics::ClockTarget,
+    pub stream: i64,
+    pub after_switch: bool,
+}
+
+impl PendingAacReplacement {
+    pub(crate) fn after_switch(self) -> Self {
+        Self {
+            active: crate::audio_diagnostics::ClockTarget { stream_id: self.stream, ..self.active },
+            stream: self.active.stream_id,
+            after_switch: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Pipeline {
     pub video_requested_fps: u32,
@@ -52,6 +75,10 @@ pub struct Pipeline {
     pub main_audio_stream_type: Option<i64>,
     #[serde(skip)]
     pub(crate) main_audio_feedback: Option<crate::audio_diagnostics::FeedbackSource>,
+    #[serde(skip)]
+    pub(crate) rejected_audio_recovery: Option<RejectedAudioRecovery>,
+    #[serde(skip)]
+    pub(crate) pending_aac_replacement: Option<PendingAacReplacement>,
     pub audio_kbps: u64,
     pub audio_packets_written: u64,
     pub audio_signal_packets: u64,
@@ -78,6 +105,8 @@ impl Pipeline {
         self.video_tcp.as_ref().or(self.retired_video_tcp.as_ref())
     }
     pub(crate) fn observe_main_sender(&mut self, sender: Option<&crate::audio_out::AudioOut>) {
+        self.rejected_audio_recovery = None;
+        self.pending_aac_replacement = None;
         self.main_audio_stream_type = sender.map(crate::audio_out::AudioOut::stream_type);
         self.audio_codec = sender.map(crate::audio_out::AudioOut::codec_name).unwrap_or("").into();
         self.main_audio_feedback = sender.and_then(crate::audio_out::AudioOut::feedback_source);
@@ -125,7 +154,7 @@ impl Pipeline {
         Self { keyframe_trace:Default::default(),video_requested_fps:0,display_max_fps:None,video_actual_fps:None,display_size:None, video_format:None, screen_config_size:None, screen_config_generation:0, touch_modes:Default::default(), generation: NEXT.fetch_add(1,Ordering::Relaxed), snapshot_sequence:0, control_ready:false, control_trace_id:None, record_accepted:false, resources_accepted:false,
             screen_setup_accepted:false,video_channel_ready:false,wifi_id:0,
             wifi_iap2:"WAIT_SESSION".into(),screen_owned:None,video_stream:"WAIT_SETUP".into(),
-            video_source_units:0,video_frames_written:0,main_video_connection:None,audio_ready:false,audio_codec:String::new(),main_audio_stream_type:None,main_audio_feedback:None,audio_kbps:0,audio_packets_written:0,
+            video_source_units:0,video_frames_written:0,main_video_connection:None,audio_ready:false,audio_codec:String::new(),main_audio_stream_type:None,main_audio_feedback:None,rejected_audio_recovery:None,pending_aac_replacement:None,audio_kbps:0,audio_packets_written:0,
             audio_signal_packets:0,ui_requests:0,screen_rebuilds:0,timing:Default::default(),video_tcp:None,main_video_writes:Default::default(),retired_video_tcp:None }
     }
     pub fn effective_fps(&self) -> u32 {

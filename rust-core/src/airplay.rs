@@ -902,19 +902,31 @@ pub(crate) async fn finish_session(control: &RtspChannel, streams: &[Value], gra
         } else { None };
         let stream_deadline = tokio::time::Instant::now() + Duration::from_millis(900);
         let pending = Value::dict(vec![("type", Value::int(103))]);
+        let pending_aac = Value::dict(vec![("type", Value::int(102))]);
         let mut ordered: Vec<_> = streams.iter().collect();
         if control.buffered_cleanup_pending.load(std::sync::atomic::Ordering::Acquire)
             && !streams.iter().any(|s| s.get("type").and_then(Value::as_int) == Some(103)) {
             ordered.push(&pending);
+        }
+        if control.realtime_aac_cleanup_pending.load(std::sync::atomic::Ordering::Acquire)
+            && !streams.iter().any(|s| s.get("type").and_then(Value::as_int) == Some(102)) {
+            ordered.push(&pending_aac);
         }
         ordered.sort_by_key(|stream| stream.get("type").and_then(Value::as_int) == Some(110));
         for stream in ordered {
             let remaining = stream_deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() || control.is_closed() { break; }
             let kind = stream.get("type").and_then(Value::as_int);
+            let timeout = remaining.min(Duration::from_millis(400));
+            if kind == Some(102) {
+                match retire_realtime_aac_with_timeout(control, timeout).await {
+                    Ok(()) => emit_log("SESSION-CLOSE: stream type=102 TEARDOWN confirmed"),
+                    Err(error) => emit_log(&format!("SESSION-CLOSE: stream type=102 TEARDOWN unconfirmed: {error}")),
+                }
+                continue;
+            }
             let body = bplist::encode(&Value::dict(vec![("streams", Value::array(vec![stream.clone()]))]));
-            send_close_request(control, &format!("stream type={kind:?}"), &body,
-                remaining.min(Duration::from_millis(400))).await;
+            send_close_request(control, &format!("stream type={kind:?}"), &body, timeout).await;
         }
         if !control.is_closed() {
             send_close_request(control, "session", &[], Duration::from_millis(800)).await;
@@ -1735,6 +1747,27 @@ mod shutdown_tests {
         task.await.unwrap();
         assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
     }
+    #[tokio::test]
+    async fn shutdown_retries_pending_type102_cleanup_with_type_validation() {
+        let (control, mut peer) = pair().await;
+        control.realtime_aac_cleanup_pending.store(true, std::sync::atomic::Ordering::Release);
+        let shutdown = control.clone();
+        let task = crate::callback_context::spawn(async move { finish_session(&shutdown, &[], true).await });
+        let request = read_request(&mut peer).await;
+        let body = bplist::parse(&request.body).unwrap();
+        let stream = &body.get("streams").unwrap().as_array().unwrap()[0];
+        assert_eq!(stream.get("type").and_then(Value::as_int), Some(102));
+        assert!(stream.get("streamConnectionID").is_none());
+        let response = format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n", request.cseq().unwrap());
+        peer.write_all(response.as_bytes()).await.unwrap();
+        let end = read_request(&mut peer).await;
+        assert!(end.body.is_empty());
+        assert!(!control.realtime_aac_cleanup_pending.load(std::sync::atomic::Ordering::Acquire));
+        let response = format!("RTSP/1.0 200 OK\r\nCSeq: {}\r\nContent-Length: 0\r\n\r\n", end.cseq().unwrap());
+        peer.write_all(response.as_bytes()).await.unwrap();
+        task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn unanswered_stream_release_still_leaves_time_to_end_session() {
         let (control, mut peer) = pair().await;
@@ -3224,6 +3257,11 @@ pub(crate) fn supports_realtime_media_rebuild(p: &AirplayParams, info: &Value, d
     !desktop && !mercedes
 }
 
+pub(crate) fn supports_rejected_aac_recovery(p: &AirplayParams, info: &Value) -> bool {
+    p.head_unit_profile == "bmw_id85" && info.get("model").and_then(Value::as_str)
+        .is_some_and(|model| model.trim().eq_ignore_ascii_case("MGU-103-F"))
+}
+
 fn use_box_bootstrap(requested: bool, info: &Value) -> bool {
     requested && !["name", "model", "manufacturer"].iter().any(|key| {
         let value = info.get(key).and_then(Value::as_str).unwrap_or("").to_ascii_lowercase();
@@ -3244,9 +3282,13 @@ async fn activate_session(channel: &Arc<RtspChannel>, declaration: &[u8], pipeli
 }
 
 pub(crate) async fn record_session(channel: &Arc<RtspChannel>) -> Result<(), String> {
+    record_session_with_timeout(channel, Duration::from_secs(5)).await
+}
+
+pub(crate) async fn record_session_with_timeout(channel: &Arc<RtspChannel>, timeout: Duration) -> Result<(), String> {
     // CatPlay AirPlayRtspClient::record 使用无请求体的 RECORD /。
     let reply = channel.request(
-        "RECORD", "/", &[], "application/x-apple-binary-plist", &[], Duration::from_secs(5),
+        "RECORD", "/", &[], "application/x-apple-binary-plist", &[], timeout,
     ).await?;
     crate::resource_trace::validate_ack("RECORD", &reply)?;
     Ok(())
@@ -3734,6 +3776,55 @@ fn buffered_endpoints(stream: &Value, connection_id: i64) -> Result<(u16, u32), 
     Ok((data, buffer))
 }
 
+pub(crate) async fn retire_realtime_aac(channel: &RtspChannel) -> Result<(), String> {
+    retire_realtime_aac_with_timeout(channel, Duration::from_secs(2)).await
+}
+
+async fn retire_realtime_aac_with_timeout(channel: &RtspChannel, timeout: Duration) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    channel.realtime_aac_cleanup_pending.store(true, Ordering::Release);
+    channel.udp_media.set(102, false);
+    let body = bplist::encode(&Value::dict(vec![("streams", Value::array(vec![
+        Value::dict(vec![("type", Value::int(102))]),
+    ]))]));
+    let reply = channel.request("TEARDOWN", "/", &body, "application/x-apple-binary-plist",
+        &[], timeout).await?;
+    validate_aac_teardown(&reply)?;
+    channel.realtime_aac_cleanup_pending.store(false, Ordering::Release);
+    Ok(())
+}
+
+fn validate_aac_teardown(reply: &crate::rtsp::RtspMessage) -> Result<(), String> {
+    const AIRPLAY_NOT_FOUND: i64 = -6727;
+    if let Ok(root) = crate::bplist::parse(&reply.body) {
+        if root.get("streamConnectionID").is_some() {
+            return Err("type102 teardown result covers only a stream ID".into());
+        }
+        if let Some(streams) = root.get("streams") {
+            let streams = streams.as_array().ok_or("invalid type102 teardown stream list")?;
+            let mut absent = !streams.is_empty();
+            for entry in streams {
+                if entry.get("type").and_then(Value::as_int) != Some(102) {
+                    return Err("type102 teardown result identifies a different stream type".into());
+                }
+                if entry.get("streamConnectionID").is_some() {
+                    return Err("type102 teardown result covers only a stream ID".into());
+                }
+                match entry.get("status").map(Value::as_int) {
+                    Some(Some(AIRPLAY_NOT_FOUND)) => {}
+                    None | Some(Some(0)) => absent = false,
+                    _ => return Err("type102 teardown rejected the requested media type".into()),
+                }
+            }
+            if absent && matches!(reply.status(), 200 | 404)
+                && root.get("status").is_none_or(|value| matches!(value.as_int(), Some(0 | AIRPLAY_NOT_FOUND))) {
+                return Ok(());
+            }
+        }
+    }
+    crate::resource_trace::validate_ack("AAC_TEARDOWN", reply)
+}
+
 pub(crate) async fn retire_buffered_audio(channel: &RtspChannel) -> Result<(), String> {
     use std::sync::atomic::Ordering;
     let _ordered = channel.buffered_commands.lock().await;
@@ -3826,6 +3917,12 @@ pub(crate) async fn negotiate_audio(
     info: &Value,
     codec: AudioCodec,
 ) -> Option<AudioOut> {
+    if channel.realtime_aac_cleanup_pending.load(std::sync::atomic::Ordering::Acquire) {
+        if let Err(error) = retire_realtime_aac(channel).await {
+            emit_log(&format!("AUDIO: defer {codec:?}, type102 cleanup pending: {error}"));
+            return None;
+        }
+    }
     if channel.buffered_cleanup_pending.load(std::sync::atomic::Ordering::Acquire) {
         if let Err(error) = retire_buffered_audio(channel).await {
             emit_log(&format!("BUFFERED-AUDIO: defer {codec:?}, type103 cleanup pending: {error}"));
@@ -3836,7 +3933,54 @@ pub(crate) async fn negotiate_audio(
         if !p.allows_buffered_media() || !declares_media(info, codec) { return None; }
         return negotiate_buffered_audio(channel, factory, shared?, p, desktop, info).await;
     }
-    negotiate_realtime_audio(channel, factory, shared, p, desktop, info, codec, false).await
+    match negotiate_realtime_audio(channel, factory, shared, p, desktop, info, codec, None).await {
+        Ok(output) => Some(output),
+        Err(error) => {
+            if codec.stream_type() == 102 && error.cleanup_stream(None).is_some() {
+                if let Err(cleanup) = retire_realtime_aac(channel).await {
+                    emit_log(&format!("AUDIO: unusable {codec:?} SETUP cleanup pending: {cleanup}"));
+                }
+            }
+            None
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum RealtimeSetupError {
+    Rejected(u16),
+    PossiblyAllocated(i64),
+    UnexpectedStreamId { offered: i64, reported: i64 },
+    Unavailable,
+}
+
+impl RealtimeSetupError {
+    pub(crate) fn cleanup_stream(&self, active: Option<i64>) -> Option<i64> {
+        let stream = match *self {
+            Self::PossiblyAllocated(id) => id,
+            Self::UnexpectedStreamId { reported, .. } if active != Some(reported) => reported,
+            Self::UnexpectedStreamId { offered, .. } => offered,
+            _ => return None,
+        };
+        (active != Some(stream)).then_some(stream)
+    }
+}
+
+pub(crate) struct RealtimeReplacementSetup {
+    pub exclude_id: i64,
+    pub deadline: Option<tokio::time::Instant>,
+}
+
+fn distinct_realtime_stream_id(candidate: i64, excluded: Option<i64>) -> i64 {
+    if excluded != Some(candidate) { return candidate; }
+    if candidate == i64::MAX { 1 } else { candidate + 1 }
+}
+
+#[test]
+fn realtime_stream_id_excludes_active_id_even_on_collision() {
+    assert_eq!(distinct_realtime_stream_id(1, Some(1)), 2);
+    assert_eq!(distinct_realtime_stream_id(i64::MAX, Some(i64::MAX)), 1);
+    assert_eq!(distinct_realtime_stream_id(42, Some(1)), 42);
 }
 
 pub(crate) async fn negotiate_realtime_audio(
@@ -3847,15 +3991,23 @@ pub(crate) async fn negotiate_realtime_audio(
     desktop: bool,
     info: &Value,
     codec: AudioCodec,
-    replacing: bool,
-) -> Option<AudioOut> {
+    replacement: Option<RealtimeReplacementSetup>,
+) -> Result<AudioOut, RealtimeSetupError> {
+    let replacing = replacement.is_some();
+    let setup_deadline = replacement.as_ref().and_then(|setup| setup.deadline);
     let encoder = if codec.stream_type() == 102 {
         match crate::aac::AacEncoder::at_rate(codec.rate()) {
             Ok(encoder) => { emit_log(&format!("AUDIO: AAC-LC encoder ready {}Hz stereo 256kbps raw/SPF1024",codec.rate())); Some(encoder) }
-            Err(error) => { emit_log(&format!("AUDIO: AAC encoder unavailable: {error}")); return None; }
+            Err(error) => {
+                emit_log(&format!("AUDIO: AAC encoder unavailable: {error}"));
+                return Err(RealtimeSetupError::Unavailable);
+            }
         }
     } else { None };
-    let conn_id = random_positive_i64();
+    let excluded = replacement.map(|setup| setup.exclude_id).or_else(|| {
+        p.pipeline.lock().main_audio_feedback.as_ref().map(|sender| sender.target.stream_id)
+    });
+    let conn_id = distinct_realtime_stream_id(random_positive_i64(), excluded);
     let latency_ms = media_latency_ms(info, codec);
     let mut local_control = bind_main_audio_control(factory.as_ref(), &p.car_ip, codec);
     let advertised_port = local_control.as_ref().and_then(|socket| socket.local_addr().ok()).map(|addr| addr.port());
@@ -3869,8 +4021,14 @@ pub(crate) async fn negotiate_realtime_audio(
     let mut offer_port = advertised_port;
     let mut high_accuracy = offer_port.is_some();
     let resp = loop {
+        let setup_timeout = setup_deadline.map_or(Duration::from_secs(8), |deadline| {
+            deadline.saturating_duration_since(tokio::time::Instant::now())
+        });
+        if setup_timeout.is_zero() { return Err(RealtimeSetupError::Unavailable); }
         let body = build_audio_setup_request(conn_id, latency_ms, codec, None, offer_port, high_accuracy);
-        match channel.request("SETUP", &audio_uri, &body, "application/x-apple-binary-plist", &[], Duration::from_secs(8)).await {
+        let (signal, mut written) = tokio::sync::oneshot::channel();
+        match channel.request_with_write_signal("SETUP", &audio_uri, &body, "application/x-apple-binary-plist",
+            &[], setup_timeout, Some(signal)).await {
             Ok(reply) if high_accuracy && matches!(reply.status(), 400 | 451 | 461) => {
                 emit_log(&format!("AUDIO-RTCP: type={} timestamp capability rejected status={}; retrying with the same local control port", codec.stream_type(), reply.status()));
                 high_accuracy = false;
@@ -3884,31 +4042,45 @@ pub(crate) async fn negotiate_realtime_audio(
             Ok(reply) => break reply,
             Err(error) => {
                 emit_log(&format!("AIRPLAY: 音频 SETUP 失败 - {error}"));
-                return None;
+                return if written.try_recv().is_ok() { Err(RealtimeSetupError::PossiblyAllocated(conn_id)) }
+                    else { Err(RealtimeSetupError::Unavailable) };
             }
         }
     };
     if resp.status() != 200 {
         emit_log(&format!("AIRPLAY: 音频流被拒 [{}]", resp.first_line));
-        return None;
+        return Err(RealtimeSetupError::Rejected(resp.status()));
     }
+    let root = bplist::parse(&resp.body);
+    let selected = root.as_ref().ok().map(|root|
+        crate::screen_session::setup_stream::select(root, codec.stream_type(), desktop));
+    let reported = selected.as_ref().and_then(|stream| stream.as_ref().ok())
+        .and_then(|stream| stream.get("streamConnectionID")).and_then(Value::as_int);
+    let allocation_error = match reported {
+        Some(reported) if replacing && reported > 0 && reported != conn_id =>
+            RealtimeSetupError::UnexpectedStreamId { offered: conn_id, reported },
+        _ => RealtimeSetupError::PossiblyAllocated(conn_id),
+    };
     if let Err(error) = crate::resource_trace::validate_ack("AUDIO_SETUP", &resp) {
         emit_log(&format!("AUDIO: {error}"));
-        return None;
+        return Err(allocation_error);
     }
     let result = async {
-        let root = bplist::parse(&resp.body).ok()?;
-        let stream = match crate::screen_session::setup_stream::select(&root, codec.stream_type(), desktop) {
+        let stream = match selected? {
             Ok(stream) => stream,
             Err(error) => { emit_log(&format!("AUDIO: {error}")); return None; }
         };
+        if codec.stream_type() == 102 && stream.get("status").is_some_and(|status| status.as_int() != Some(0)) {
+            emit_log(&format!("AUDIO: type102 SETUP stream rejected status={:?}", stream.get("status")));
+            return None;
+        }
         if stream.get("audioFormat").is_some_and(|v| v.as_int()!=Some(codec.format()))
             || stream.get("sr").is_some_and(|v| v.as_int()!=Some(i64::from(codec.rate()))) {
             emit_log(&format!("AUDIO: receiver SETUP format/rate differs from {codec:?}; release stream and try next declared format"));
             return None;
         }
         if replacing && stream.get("streamConnectionID").is_some_and(|id| id.as_int() != Some(conn_id)) {
-            emit_log("AUDIO: replacement SETUP returned a different streamConnectionID");
+            emit_log(&format!("AUDIO: replacement SETUP returned a different streamConnectionID offered={conn_id} reported={reported:?}"));
             return None;
         }
         let data_port = port_of(stream.get("dataPort"));
@@ -3969,6 +4141,9 @@ pub(crate) async fn negotiate_realtime_audio(
             emit_log(&format!("AUDIO: AAC worker unavailable: {error}"));
             return None;
         }
+        if codec.stream_type() == 102 && supports_rejected_aac_recovery(p, info) {
+            out.track_port_refusals();
+        }
         out.observe_main_stream(channel.trace_id(), conn_id, control_port, resp.received_at, &channel.buffered_ownership, listening);
         out.high_accuracy_timestamps = high_accuracy;
         if p.head_unit_profile == "bmw_id9" {
@@ -3976,7 +4151,7 @@ pub(crate) async fn negotiate_realtime_audio(
         }
         Some(out)
     }.await;
-    if result.is_none() && !replacing {
+    if result.is_none() && !replacing && codec.stream_type() != 102 {
         // SETUP 200 can allocate a stream even when ports are missing or local socket creation fails.
         // Retire just this audio type before trying another format; keep the screen/control alive.
         let body=bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![
@@ -3987,7 +4162,7 @@ pub(crate) async fn negotiate_realtime_audio(
             Err(error) => emit_log(&format!("AUDIO: unusable {codec:?} SETUP cleanup failed: {error}")),
         }
     }
-    result
+    result.ok_or(allocation_error)
 }
 
 // ---------------------------------------------------------------- 心跳

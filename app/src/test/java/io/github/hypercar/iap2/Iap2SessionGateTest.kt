@@ -7,6 +7,44 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class Iap2SessionGateTest {
+    @Test fun preparedInboundTicketSurvivesOpeningForHandshakeWithoutEnablingOutboundEarly() {
+        val gate = Iap2SessionGate()
+        val old = gate.ticket()!!
+        gate.setEnabled(false)
+        assertNull(gate.inboundTicket())
+        gate.prepareInbound()
+        val incoming = gate.inboundTicket()!!
+        assertNull(gate.ticket())
+        assertFalse(gate.allowsOutbound(incoming))
+        assertNull(gate.admitInbound(old))
+        assertTrue(gate.canHoldInbound(incoming))
+        gate.setEnabled(true)
+        assertEquals(incoming, gate.admitInbound(incoming))
+        assertNull(gate.admitInbound(old))
+    }
+
+    @Test fun cancellingPreparationNeverRevivesItsTicketOnOrdinaryStandbyStart() {
+        val gate = Iap2SessionGate()
+        gate.setEnabled(false)
+        gate.prepareInbound()
+        val abandoned = gate.inboundTicket()
+        gate.setEnabled(false)
+        gate.setEnabled(true)
+        assertNull(gate.admitInbound(abandoned))
+        assertNotNull(gate.admitInbound(gate.inboundTicket()))
+    }
+    @Test fun admissionKeepsTheTicketObservedAtAcceptEvenAfterListenerResumes() {
+        val gate = Iap2SessionGate()
+        val oldAccept = gate.ticket()
+        gate.setEnabled(false)
+        val pausedAccept = gate.ticket()
+        gate.setEnabled(true)
+        val newAccept = gate.ticket()
+        assertNull(gate.admitInbound(oldAccept))
+        assertNull(gate.admitInbound(pausedAccept))
+        gate.outboundPausedForWifi = true
+        assertEquals(newAccept, gate.admitInbound(newAccept))
+    }
     @Test fun wifiHandoffLeavesCurrentAndIncomingSessionsUsableAndPausesNewDials() {
         val gate = Iap2SessionGate()
         val current = gate.ticket()!!
@@ -57,7 +95,7 @@ class Iap2SessionGateTest {
             ownerAlive = { true },
             open = { Socket().also { opens++; server = it } },
             accept = { Socket() },
-            onFailure = { throw it },
+            onFailure = { _, error -> throw error },
             awaitRetry = {},
         )
         val first = listener.acceptNext()!!

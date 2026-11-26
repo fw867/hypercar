@@ -1,7 +1,7 @@
 //! Receiver feedback and retransmission of already sealed realtime main audio RTP.
 use crate::{bplist::{self, Value}, buffered_ownership::Ownership, emit_log, timing::monotonic_nanos};
 use parking_lot::Mutex;
-use std::{collections::VecDeque, io, net::{IpAddr, SocketAddr}, sync::{Arc, Weak, atomic::{AtomicBool, AtomicU64, Ordering}}, time::{Duration, Instant}};
+use std::{collections::VecDeque, io, net::{IpAddr, SocketAddr}, sync::{Arc, Weak, atomic::{AtomicU64, Ordering}}, time::{Duration, Instant}};
 use tokio::{net::UdpSocket, sync::{mpsc, watch}};
 
 const CACHE_PACKETS: usize = 32;
@@ -18,20 +18,28 @@ struct CachedRtp {
 }
 
 struct ResendCache {
-    active: AtomicBool,
+    active: Mutex<bool>,
     capacity: usize,
     ownership: watch::Receiver<Ownership>,
     packets: Mutex<VecDeque<CachedRtp>>,
 }
 
 impl ResendCache {
-    fn new(ownership: watch::Receiver<Ownership>, capacity: usize) -> Self {
-        Self { active: AtomicBool::new(true), capacity, ownership, packets: Mutex::new(VecDeque::with_capacity(capacity)) }
+    fn new(ownership: watch::Receiver<Ownership>, capacity: usize, active: bool) -> Self {
+        Self { active: Mutex::new(active), capacity, ownership, packets: Mutex::new(VecDeque::with_capacity(capacity)) }
     }
 
     fn generation(&self) -> Option<u64> {
         let state = self.ownership.borrow();
-        (state.owned && self.active.load(Ordering::Acquire)).then_some(state.losses)
+        (state.owned && *self.active.lock()).then_some(state.losses)
+    }
+
+    fn set_active(&self, active: bool) { *self.active.lock() = active; }
+
+    fn with_send<T>(&self, generation: u64, send: impl FnOnce() -> T) -> Option<T> {
+        let state = self.ownership.borrow();
+        let active = self.active.lock();
+        (state.owned && state.losses == generation && *active).then(send)
     }
 
     fn remember(&self, seq: u16, generation: u64, wire: Vec<u8>) {
@@ -96,22 +104,23 @@ fn resend(socket: &UdpSocket, destination: Option<SocketAddr>, cache: &ResendCac
         let hit = response.is_some();
         result.hits += u64::from(hit);
         result.misses += u64::from(!hit);
-        // Keep the ownership check and nonblocking write together across handover.
-        let state = cache.ownership.borrow();
-        if *budget == 0 || !state.owned || state.losses != generation || !cache.active.load(Ordering::Acquire) {
+        if *budget == 0 {
             result.skipped += 1;
             continue;
         }
-        *budget -= 1;
         // xiap2 uses an eight-byte negative response with original sequence and zero pad.
         let [hi, lo] = seq.to_be_bytes();
         let futile = [0x80, 0xd6, 4, 0, hi, lo, 0, 0];
         let bytes = response.as_deref().unwrap_or(&futile);
         let socket = socket2::SockRef::from(socket);
-        let written = match destination {
+        let Some(written) = cache.with_send(generation, || match destination {
             Some(peer) => socket.send_to_with_flags(bytes, &peer.into(), libc::MSG_DONTWAIT),
             None => socket.send_with_flags(bytes, libc::MSG_DONTWAIT),
+        }) else {
+            result.skipped += 1;
+            continue;
         };
+        *budget -= 1;
         match written {
             Ok(n) if n == bytes.len() && hit => result.sent += 1,
             Ok(n) if n == bytes.len() => result.futile_sent += 1,
@@ -140,7 +149,7 @@ pub(crate) struct ControlObserver {
 
 impl Drop for ControlObserver {
     fn drop(&mut self) {
-        self.cache.active.store(false, Ordering::Release);
+        self.set_resend_active(false);
         self.worker.abort();
         emit_log(&format!("AUDIO-RTCP: {} stream retired observedD5={} {}", self.label,
             self.requests.load(Ordering::Relaxed), self.totals.lock().fields()));
@@ -148,16 +157,19 @@ impl Drop for ControlObserver {
 }
 
 impl ControlObserver {
+    pub(crate) fn set_resend_active(&self, active: bool) { self.cache.set_active(active); }
+
     pub(crate) fn start(socket: Arc<UdpSocket>, label: String, ownership: watch::Receiver<Ownership>,
-        pcm: bool, peer_ip: Option<IpAddr>) -> Self {
+        pcm: bool, peer_ip: Option<IpAddr>, port_refusal: Option<watch::Sender<Option<Instant>>>, resend_active: bool) -> Self {
         let local = socket.local_addr().map(|a| a.port()).ok();
         let peer = socket.peer_addr().map(|a| a.port()).ok();
         let source = if peer_ip.is_some() { "session_address" } else { "negotiated_endpoint" };
         emit_log(&format!("AUDIO-RTCP: {label} listening localPort={local:?} peerControlPort={peer:?} sourceFilter={source}"));
         let requests = Arc::new(AtomicU64::new(0));
-        let cache = Arc::new(ResendCache::new(ownership, if pcm { PCM_CACHE_PACKETS } else { CACHE_PACKETS }));
+        let cache = Arc::new(ResendCache::new(ownership, if pcm { PCM_CACHE_PACKETS } else { CACHE_PACKETS }, resend_active));
         let totals = Arc::new(Mutex::new(ResendTotals::default()));
-        let worker = crate::callback_context::spawn(observe_control(socket, peer_ip, label.clone(), requests.clone(), cache.clone(), totals.clone(), emit_log));
+        let worker = crate::callback_context::spawn(observe_control(socket, peer_ip, label.clone(), requests.clone(),
+            cache.clone(), totals.clone(), port_refusal, emit_log));
         Self { worker, label, requests, cache, totals }
     }
 
@@ -169,7 +181,8 @@ impl ControlObserver {
 }
 
 async fn observe_control(socket: Arc<UdpSocket>, peer_ip: Option<IpAddr>, label: String, requests: Arc<AtomicU64>,
-    cache: Arc<ResendCache>, totals: Arc<Mutex<ResendTotals>>, log: impl Fn(&str)) {
+    cache: Arc<ResendCache>, totals: Arc<Mutex<ResendTotals>>, port_refusal: Option<watch::Sender<Option<Instant>>>,
+    log: impl Fn(&str)) {
     let period = Duration::from_secs(10);
     let mut summary = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     summary.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -208,6 +221,7 @@ async fn observe_control(socket: Arc<UdpSocket>, peer_ip: Option<IpAddr>, label:
                     } else { other += 1; }
                 }
                 Err(error) => {
+                    observe_port_refusal(port_refusal.as_ref(), &error);
                     errors += 1;
                     if errors == 1 { log(&format!("AUDIO-RTCP: {label} receive error={error}")); }
                     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -217,6 +231,14 @@ async fn observe_control(socket: Arc<UdpSocket>, peer_ip: Option<IpAddr>, label:
                 log(&format!("AUDIO-RTCP: {label} d5={} requestedPackets={requested_packets} unconfirmedD5={candidates} other={other} receiveErrors={errors} lastFirstCountMonoNs={last:?} {}",
                     requests.load(Ordering::Relaxed), totals.lock().fields()));
             }
+        }
+    }
+}
+
+pub(crate) fn observe_port_refusal(port_refusal: Option<&watch::Sender<Option<Instant>>>, error: &io::Error) {
+    if error.kind() == io::ErrorKind::ConnectionRefused {
+        if let Some(port_refusal) = port_refusal {
+            port_refusal.send_replace(Some(Instant::now()));
         }
     }
 }
@@ -367,6 +389,7 @@ pub(crate) struct FeedbackSource {
     pub(crate) target: ClockTarget,
     pub(crate) high_accuracy: bool,
     pub(crate) position: Weak<RtpPosition>,
+    pub(crate) port_refusal: Option<watch::Receiver<Option<Instant>>>,
 }
 
 pub(crate) struct FeedbackSnapshot {
@@ -599,7 +622,7 @@ mod tests {
     async fn resend_cache_expires_packets_and_bounds_each_request() {
         let ownership = crate::buffered_ownership::BufferedOwnership::default();
         ownership.publish(true);
-        let cache = ResendCache::new(ownership.subscribe(), CACHE_PACKETS);
+        let cache = ResendCache::new(ownership.subscribe(), CACHE_PACKETS, true);
         let generation = cache.generation().unwrap();
         for seq in 0..=CACHE_PACKETS as u16 {
             cache.remember(seq, generation, vec![0x80, 0x66]);
@@ -617,6 +640,58 @@ mod tests {
         assert_eq!(budget, 0);
     }
 
+    #[test]
+    fn resend_pause_waits_for_a_write_and_blocks_later_writes() {
+        let ownership = crate::buffered_ownership::BufferedOwnership::default();
+        ownership.publish(true);
+        let cache = Arc::new(ResendCache::new(ownership.subscribe(), CACHE_PACKETS, true));
+        let generation = cache.generation().unwrap();
+        let (writing, entered) = std::sync::mpsc::channel();
+        let (release, finish) = std::sync::mpsc::channel();
+        let sender = cache.clone();
+        let write = std::thread::spawn(move || sender.with_send(generation, || {
+            writing.send(()).unwrap();
+            finish.recv_timeout(Duration::from_secs(2)).unwrap();
+        }));
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (pausing, started) = std::sync::mpsc::channel();
+        let (paused, done) = std::sync::mpsc::channel();
+        let retiring = cache.clone();
+        let pause = std::thread::spawn(move || {
+            pausing.send(()).unwrap();
+            retiring.set_active(false);
+            paused.send(()).unwrap();
+        });
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(done.recv_timeout(Duration::from_millis(30)), Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        release.send(()).unwrap();
+        assert_eq!(write.join().unwrap(), Some(()));
+        done.recv_timeout(Duration::from_secs(2)).unwrap();
+        pause.join().unwrap();
+        assert!(cache.with_send(generation, || panic!("paused sender wrote a packet")).is_none());
+    }
+
+    #[tokio::test]
+    async fn prepared_control_observer_waits_for_sender_install_before_replying() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let address = local.local_addr().unwrap();
+        local.connect(peer.local_addr().unwrap()).await.unwrap();
+        let ownership = crate::buffered_ownership::BufferedOwnership::default();
+        ownership.publish(true);
+        let observer = ControlObserver::start(local, "pending AAC".into(), ownership.subscribe(),
+            false, None, None, false);
+        let request = [0x80, 0xd5, 0, 1, 0, 9, 0, 1];
+        let mut reply = [0; 16];
+        peer.send_to(&request, address).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(50), peer.recv_from(&mut reply)).await.is_err());
+        assert_eq!(observer.requests.load(Ordering::Relaxed), 1);
+        observer.set_resend_active(true);
+        peer.send_to(&request, address).await.unwrap();
+        let (size, _) = tokio::time::timeout(Duration::from_secs(1), peer.recv_from(&mut reply)).await.unwrap().unwrap();
+        assert_eq!(&reply[..size], &[0x80, 0xd6, 4, 0, 0, 9, 0, 0]);
+    }
+
     #[tokio::test]
     async fn listener_without_peer_port_accepts_extended_request_only_from_session_address() {
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -626,7 +701,7 @@ mod tests {
         let ownership = crate::buffered_ownership::BufferedOwnership::default();
         ownership.publish(true);
         let observer = ControlObserver::start(local, "PCM test".into(), ownership.subscribe(), true,
-            Some(peer.local_addr().unwrap().ip()));
+            Some(peer.local_addr().unwrap().ip()), None, true);
         observer.remember_sent(9, observer.generation().unwrap(), vec![0x80, 100, 0, 9]);
         let request = [0x80, 0xd5, 0, 3, 0, 9, 0, 1, 1, 2, 3, 4, 5, 6, 7, 8];
         other.send_to(&request, address).await.unwrap();
@@ -640,6 +715,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connected_control_port_refusal_updates_only_its_stream() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        local.connect(peer.local_addr().unwrap()).await.unwrap();
+        let ownership = crate::buffered_ownership::BufferedOwnership::default();
+        let (refusal, mut observed) = watch::channel(None);
+        let _observer = ControlObserver::start(local.clone(), "AAC control test".into(),
+            ownership.subscribe(), false, None, Some(refusal), true);
+        let (unrelated, unrelated_observations) = watch::channel(None::<Instant>);
+        observe_port_refusal(Some(&unrelated), &io::Error::from(io::ErrorKind::WouldBlock));
+        assert_eq!(*unrelated_observations.borrow(), None);
+
+        drop(peer);
+        let sent = Instant::now();
+        local.send(&[0x80, 84, 0, 0]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1),
+            observed.wait_for(|at| at.is_some_and(|at| at >= sent))).await.unwrap().unwrap();
+        assert_eq!(*unrelated_observations.borrow(), None);
+    }
+
+    #[tokio::test]
     async fn connected_control_socket_ignores_other_peers_and_logs_cache_misses() {
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -650,9 +746,9 @@ mod tests {
         let count = Arc::new(AtomicU64::new(0));
         let ownership = crate::buffered_ownership::BufferedOwnership::default();
         ownership.publish(true);
-        let cache = Arc::new(ResendCache::new(ownership.subscribe(), CACHE_PACKETS));
+        let cache = Arc::new(ResendCache::new(ownership.subscribe(), CACHE_PACKETS, true));
         let reader = tokio::spawn(observe_control(local.clone(), None, "RTSP#9".into(), count.clone(),
-            cache, Arc::new(Mutex::new(ResendTotals::default())),
+            cache, Arc::new(Mutex::new(ResendTotals::default())), None,
             move |line| { tx.send(line.to_owned()).unwrap(); }));
         other.send_to(&[0x80, 0xd5, 0, 1, 0, 0, 0, 9], addr).await.unwrap();
         peer.send_to(&[0x80, 0xd5, 0, 1, 0, 1, 0, 2], addr).await.unwrap();
@@ -771,7 +867,7 @@ mod tests {
     fn feedback_compares_both_sides_of_the_request_only_for_the_same_stream_and_ownership() {
         let position = Arc::new(RtpPosition::default());
         let source = FeedbackSource { target: ClockTarget { rtsp: 1, stream_id: 42, stream_type: 100, rate: 48_000 },
-            high_accuracy: false, position: Arc::downgrade(&position) };
+            high_accuracy: false, position: Arc::downgrade(&position), port_refusal: None };
         let row = |id, rate| Value::dict(vec![("type", Value::int(100)), ("streamConnectionID", Value::int(id)),
             ("sampleRate", Value::int(rate)), ("sampleTime", Value::int(i64::from(u32::MAX) - 99))]);
         let body = |rows| bplist::encode(&Value::dict(vec![("streams", Value::array(rows))]));

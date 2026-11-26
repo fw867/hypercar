@@ -1,12 +1,20 @@
 //! Independent speech and navigation audio stream lifecycle.
-use std::{collections::VecDeque,os::fd::AsRawFd,sync::{Arc,atomic::{AtomicBool,AtomicU8,AtomicU64,Ordering}},time::Duration};
+use std::{collections::VecDeque,os::fd::AsRawFd,sync::{Arc,atomic::{AtomicBool,AtomicU8,AtomicU64,Ordering}},time::{Duration,Instant}};
 use parking_lot::Mutex;
 use tokio::sync::{mpsc,oneshot,watch,Notify};
-use crate::{airplay::{AirplayParams,AudioCodec,SocketProvider},audio_out::AudioOut,aux_setup::Kind,bplist::Value,rtsp::RtspChannel,speech_resource::SpeechResource};
+use crate::{airplay::{AirplayParams,AudioCodec,RealtimeReplacementSetup,RealtimeSetupError,SocketProvider},audio_diagnostics::ClockTarget,audio_out::AudioOut,aux_setup::Kind,bplist::Value,rtsp::RtspChannel,speech_resource::SpeechResource};
 use crate::audio_pacing::StreamId;
 use crate::call_audio::OfferResult;
 use crate::mic_probe::{self, InputFormat, InputStream, ProbeControl};
+use crate::pipeline::PendingAacReplacement;
 use crate::shutdown::EngineShutdown;
+
+#[derive(Clone, Copy)]
+pub(crate) enum RealtimeReplacement {
+    Legacy,
+    Pending { pending: PendingAacReplacement, generation: u64 },
+    Retired { target: ClockTarget, generation: u64 },
+}
 
 pub enum MainCommand {
     Pause {
@@ -14,13 +22,37 @@ pub enum MainCommand {
         hold_mixed_voice: bool,
     },
     Install(Option<AudioOut>),
+    RetireRejectedRealtime {
+        target: ClockTarget,
+        grant: MainAudioGrant,
+        reply: oneshot::Sender<()>,
+    },
     ReplaceRealtime {
         output: AudioOut,
         grant: MainAudioGrant,
+        replacement: RealtimeReplacement,
         reply: oneshot::Sender<()>,
     },
 }
 
+async fn wait_for_main_command<T>(mut reply: oneshot::Receiver<T>) -> Option<T> {
+    match tokio::time::timeout(Duration::from_secs(1), &mut reply).await {
+        Ok(result) => result.ok(),
+        Err(_) => {
+            reply.close();
+            reply.try_recv().ok()
+        }
+    }
+}
+
+async fn pause_realtime_for_recovery(commands: &mpsc::UnboundedSender<MainCommand>, target: ClockTarget,
+    grant: &MainAudioGrant) -> bool {
+    let (reply, paused) = oneshot::channel();
+    commands.send(MainCommand::RetireRejectedRealtime { target, grant: grant.clone(), reply }).is_ok()
+        && wait_for_main_command(paused).await.is_some()
+}
+
+#[derive(Clone)]
 pub struct MainAudioGrant {
     pub modes: Arc<Mutex<crate::modes::Modes>>,
     pub generation: Arc<AtomicU64>,
@@ -43,8 +75,16 @@ struct Pending { epoch:u64,format:Option<(u32,u8)>,samples:VecDeque<i16>,remain:
 pub struct Input {
     lanes:[Mutex<Pending>;2],supported:AtomicU8,media_epoch:AtomicU64,wake:Notify,user_intent:Mutex<Option<std::time::Instant>>,
     shared_voice_wait:AtomicBool,
+    realtime_playback: watch::Sender<RealtimePlayback>,
+    realtime_grant_wake: Notify,
     pub(crate) buffered_owner: std::sync::OnceLock<tokio::sync::watch::Receiver<crate::buffered_ownership::Ownership>>,
     pub(crate) buffered_failed: watch::Sender<Option<StreamId>>,
+}
+#[derive(Default)]
+pub(crate) struct RealtimePlayback {
+    generation: u64,
+    stopped: bool,
+    at: Option<std::time::Instant>,
 }
 fn index(kind:Kind)->usize {if kind==Kind::Speech {0}else{1}}
 impl Input {
@@ -91,7 +131,44 @@ impl Input {
         pending.samples.drain(..count);pending.remain.clear();true
     }
     fn user_initiated(&self)->bool {self.user_intent.lock().is_some_and(|at|at.elapsed()<Duration::from_secs(30))}
-    pub fn media_restart(&self) {self.media_epoch.fetch_add(1,Ordering::AcqRel);self.wake.notify_waiters();}
+    pub fn media_restart(&self) {
+        self.media_epoch.fetch_add(1, Ordering::AcqRel);
+        self.wake.notify_waiters();
+        self.retry_rejected_media_on_playback_at(std::time::Instant::now());
+    }
+    pub(crate) fn retry_rejected_media_on_playback_at(&self, at: std::time::Instant) {
+        self.update_realtime_playback(at, false, true);
+    }
+    pub(crate) fn media_stopped(&self) {
+        self.media_stopped_at(std::time::Instant::now());
+    }
+    pub(crate) fn media_stopped_at(&self, at: std::time::Instant) {
+        self.update_realtime_playback(at, true, false);
+    }
+    pub(crate) fn observe_phone_playback(&self, playing: bool, at: std::time::Instant) {
+        self.update_realtime_playback(at, !playing, false);
+    }
+    fn update_realtime_playback(&self, at: std::time::Instant, stopped: bool, retry_while_playing: bool) {
+        self.realtime_playback.send_if_modified(|state| {
+            if state.at.is_some_and(|previous| at < previous || (at == previous && state.stopped && !stopped)) {
+                return false;
+            }
+            state.at = Some(at);
+            let changed = state.stopped != stopped;
+            if changed { state.generation = state.generation.wrapping_add(1); }
+            state.stopped = stopped;
+            changed || retry_while_playing
+        });
+    }
+    pub(crate) fn playing_generation(&self) -> Option<u64> {
+        let state = self.realtime_playback.borrow();
+        (!state.stopped).then_some(state.generation)
+    }
+    pub(crate) fn media_granted(&self) { self.realtime_grant_wake.notify_one(); }
+    pub(crate) fn playback_guard(&self, generation: u64) -> Option<watch::Ref<'_, RealtimePlayback>> {
+        let state = self.realtime_playback.borrow();
+        (!state.stopped && state.generation == generation).then_some(state)
+    }
     pub fn mark_user_intent(&self) {*self.user_intent.lock()=Some(std::time::Instant::now());}
     pub(crate) fn configure(&self,info:&Value,kinds:&[Kind]) {
         let mask=kinds.iter().copied().filter(|kind| crate::aux_setup::supports(info,*kind))
@@ -302,7 +379,7 @@ impl Controller {
                     }
                     call_allocated.store(false, Ordering::Release);
                 }
-                if cleanup.retire_media && session.retire_media().await.is_err() {
+                if cleanup.retire_pending_media(&session).await.is_err() {
                     crate::emit_log("CALL-AUDIO: media teardown unconfirmed; close session");
                     session.control.close();
                     break;
@@ -387,12 +464,13 @@ impl Controller {
             let recovery = session.clone();
             let stopping = stop.clone();
             let commands = commands.clone();
+            let input = input.clone();
             tasks.push(crate::callback_context::spawn(async move {
                 tokio::select! {
                     biased;
                     _ = shutdown.wait() => (),
                     _ = stopping.wait() => (),
-                    _ = recovery.rebuild_on_unborrow(&commands, &shutdown, &stopping) => (),
+                    _ = recovery.rebuild_on_unborrow(&commands, &shutdown, &stopping, &input) => (),
                 }
             }));
         }
@@ -433,20 +511,52 @@ impl Lease {
 struct Active { output: AudioOut, lease: Lease, restore_media: bool }
 enum StartError {Refused(String),Failed(String),AwaitNavigationCleanup(String)}
 impl Session {
-    async fn rebuild_on_unborrow(&self, commands: &mpsc::UnboundedSender<MainCommand>, shutdown: &Arc<EngineShutdown>, stop: &Stop) {
+    async fn rebuild_on_unborrow(&self, commands: &mpsc::UnboundedSender<MainCommand>, shutdown: &Arc<EngineShutdown>,
+        stop: &Stop, input: &Input) {
         let unborrow = &self.control.audio_unborrow_generation;
         let mut handled = 0;
+        let mut deferred_return = None;
+        let mut playback = input.realtime_playback.subscribe();
         loop {
-            self.control.audio_unborrow_wake.notified().await;
-            let transition = stop.main_transition.lock().await;
+            let (playback_changed, grant_changed) = tokio::select! {
+                _ = self.control.audio_unborrow_wake.notified() => (playback.has_changed().unwrap_or(false), false),
+                change = playback.changed() => if change.is_ok() { (true, false) } else { return; },
+                _ = input.realtime_grant_wake.notified() => (playback.has_changed().unwrap_or(false), true),
+            };
             let generation = unborrow.load(Ordering::Acquire);
-            if generation == handled { continue; }
+            let returned = generation != handled;
             handled = generation;
-            if transition.call_media_paused || transition.restored_unborrow_generation == generation {
+            if returned { deferred_return = None; }
+            let wants_playback = !playback.borrow_and_update().stopped;
+            if !returned {
+                let has_pending = {
+                    let pipeline = self.params.pipeline.lock();
+                    pipeline.rejected_audio_recovery.is_some() || pipeline.pending_aac_replacement.is_some()
+                };
+                if !(playback_changed || grant_changed) || !(has_pending || deferred_return.is_some()) { continue; }
+                if wants_playback && !grant_changed {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    // Use the most recent source state if playback stopped during backoff.
+                    playback.borrow_and_update();
+                }
+            }
+            let transition = stop.main_transition.lock().await;
+            if transition.call_media_paused || ((returned || deferred_return.is_some()) && transition.restored_unborrow_generation == generation)
+                || unborrow.load(Ordering::Acquire) != generation {
+                deferred_return = None;
                 continue;
             }
             let codec = *self.media_codec.lock();
             let Some(codec @ (AudioCodec::Aac | AudioCodec::Aac441)) = codec else { continue; };
+            let (stream_type, old_sender, pending, candidate) = {
+                let pipeline = self.params.pipeline.lock();
+                (pipeline.main_audio_stream_type, pipeline.main_audio_feedback.clone(), pipeline.rejected_audio_recovery,
+                    pipeline.pending_aac_replacement)
+            };
+            if returned && input.playing_generation().is_none() && pending.is_none() && candidate.is_none() {
+                deferred_return = old_sender.as_ref().filter(|sender| sender.port_refusal.is_some())
+                    .map(|sender| (generation, sender.target));
+            }
             let grant = {
                 let modes = self.resource.modes.lock();
                 let Some(media_epoch) = modes.media_rebuild_epoch() else { continue; };
@@ -458,17 +568,55 @@ impl Session {
                     shutdown: shutdown.clone(),
                 }
             };
-            if self.control.is_closed() || shutdown.requested()
-                || self.params.pipeline.lock().main_audio_stream_type != Some(102) {
+            if self.control.is_closed() || shutdown.requested() { continue; }
+            if let Some(pending) = pending {
+                deferred_return = None;
+                drop(transition);
+                self.recover_rejected_realtime(commands, codec, &grant, pending.retired, stop, input).await;
                 continue;
             }
+            if let Some(candidate) = candidate {
+                deferred_return = None;
+                if old_sender.as_ref().is_some_and(|sender| sender.target == candidate.active) {
+                    let acknowledged = pause_realtime_for_recovery(commands, candidate.active, &grant).await;
+                    drop(transition);
+                    if acknowledged {
+                        self.recover_rejected_realtime(commands, codec, &grant, candidate.active, stop, input).await;
+                    }
+                }
+                continue;
+            }
+            let Some(old_sender) = old_sender.filter(|_| stream_type == Some(102)) else {
+                deferred_return = None;
+                continue;
+            };
+            let old = old_sender.target;
+            if !returned && deferred_return != Some((generation, old)) {
+                deferred_return = None;
+                continue;
+            }
+            if let Some(refusals) = old_sender.port_refusal {
+                if let Some(playback_generation) = input.playing_generation().filter(|_| grant.is_current(&grant.modes.lock())) {
+                    deferred_return = None;
+                    self.replace_mgu_aac(commands, codec, &grant, old, refusals, stop, input,
+                        playback_generation, transition).await;
+                } else {
+                    deferred_return = Some((generation, old));
+                }
+                continue;
+            }
+            if !returned { continue; }
             let rtsp = self.control.trace_id();
             crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} unborrow={generation} setup type=102 codec={codec:?}"));
-            let Some(mut output) = crate::airplay::negotiate_realtime_audio(
-                &self.control, &self.factory, Some(&self.shared), &self.params, false, &self.info, codec, true,
-            ).await else {
-                crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} unborrow={generation} setup unusable; retaining old sender"));
-                continue;
+            let mut output = match crate::airplay::negotiate_realtime_audio(
+                &self.control, &self.factory, Some(&self.shared), &self.params, false, &self.info, codec,
+                Some(RealtimeReplacementSetup { exclude_id: old.stream_id, deadline: None }),
+            ).await {
+                Ok(output) => output,
+                Err(error) => {
+                    crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} unborrow={generation} setup unusable: {error:?}; retaining old sender"));
+                    continue;
+                }
             };
             let stream = output.pacing_id.map(|id| id.stream_id);
             if !grant.is_current(&grant.modes.lock()) { continue; }
@@ -483,7 +631,7 @@ impl Session {
             }
             output.set_ownership(self.resource.owned.clone());
             let (reply, installed) = oneshot::channel();
-            if commands.send(MainCommand::ReplaceRealtime { output, grant, reply }).is_err() {
+            if commands.send(MainCommand::ReplaceRealtime { output, grant, replacement: RealtimeReplacement::Legacy, reply }).is_err() {
                 return;
             }
             if installed.await.is_err() {
@@ -492,6 +640,207 @@ impl Session {
             }
             crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} unborrow={generation} streamConnectionID={stream:?} RECORD confirmed; sender switched"));
         }
+    }
+
+    async fn lock_live_aac<'a>(&self, stop: &'a Stop, old: ClockTarget)
+        -> Option<tokio::sync::MutexGuard<'a, MainAudioTransition>> {
+        let transition = stop.main_transition.lock().await;
+        let same_sender = self.params.pipeline.lock().main_audio_feedback.as_ref().is_some_and(|sender| sender.target == old);
+        if stop.requested.load(Ordering::Acquire) || self.control.is_closed() || transition.call_media_paused || !same_sender {
+            return None;
+        }
+        Some(transition)
+    }
+
+    async fn replace_mgu_aac(&self, commands: &mpsc::UnboundedSender<MainCommand>, codec: AudioCodec,
+        grant: &MainAudioGrant, old: ClockTarget, mut refusals: watch::Receiver<Option<Instant>>, stop: &Stop, input: &Input,
+        generation: u64, transition: tokio::sync::MutexGuard<'_, MainAudioTransition>) {
+        let current = || grant.is_current(&grant.modes.lock()) && input.playing_generation() == Some(generation);
+        let rtsp = self.control.trace_id();
+        let setup_started = Instant::now();
+        crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} MGU-103-F setup type=102 codec={codec:?}"));
+        let mut output = match crate::airplay::negotiate_realtime_audio(
+            &self.control, &self.factory, Some(&self.shared), &self.params, false, &self.info, codec,
+            Some(RealtimeReplacementSetup { exclude_id: old.stream_id,
+                deadline: Some(tokio::time::Instant::now() + Duration::from_secs(2)) }),
+        ).await {
+            Ok(output) => output,
+            Err(RealtimeSetupError::Rejected(400)) => {
+                drop(transition);
+                let refused = matches!(tokio::time::timeout(Duration::from_millis(1500),
+                    refusals.wait_for(|at| at.is_some_and(|at| at >= setup_started))).await, Ok(Ok(_)));
+                if !refused {
+                    crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} no new port refusal; retaining old sender"));
+                    return;
+                }
+                let Some(transition) = self.lock_live_aac(stop, old).await.filter(|_| current()) else { return; };
+                let acknowledged = pause_realtime_for_recovery(commands, old, grant).await;
+                drop(transition);
+                if acknowledged {
+                    self.recover_rejected_realtime(commands, codec, grant, old, stop, input).await;
+                }
+                return;
+            }
+            Err(error) => {
+                crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} setup unusable: {error:?}; retaining old sender"));
+                if let Some(stream) = error.cleanup_stream(Some(old.stream_id)) {
+                    let pending = PendingAacReplacement { active: old, stream, after_switch: false };
+                    self.params.pipeline.lock().pending_aac_replacement = Some(pending);
+                    crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} deferred type102 cleanup until media pause stream={stream}"));
+                }
+                return;
+            }
+        };
+        let Some(stream) = output.pacing_id else { return; };
+        let pending = PendingAacReplacement { active: old, stream: stream.stream_id, after_switch: false };
+        self.params.pipeline.lock().pending_aac_replacement = Some(pending);
+        drop(transition);
+
+        if self.record_live_aac(stop, pending, current).await {
+            if let Some(_transition) = self.lock_live_aac(stop, old).await.filter(|_| current()) {
+                output.set_ownership(self.resource.owned.clone());
+                let (reply, installed) = oneshot::channel();
+                if commands.send(MainCommand::ReplaceRealtime {
+                    output, grant: grant.clone(), replacement: RealtimeReplacement::Pending { pending, generation }, reply,
+                }).is_ok() && wait_for_main_command(installed).await.is_some() {
+                    crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} MGU-103-F RECORD confirmed; sender switched stream={} old_stream={} cleanup=deferred_until_pause",
+                        pending.stream, old.stream_id));
+                    return;
+                }
+            }
+        }
+        // If no takeover has consumed it, pause_main will inherit the candidate ID.
+    }
+
+    async fn record_live_aac(&self, stop: &Stop, pending: PendingAacReplacement, current: impl Fn() -> bool) -> bool {
+        let Some(_transition) = self.lock_live_aac(stop, pending.active).await else { return false; };
+        if !current() || self.params.pipeline.lock().pending_aac_replacement != Some(pending) {
+            return false;
+        }
+        match crate::airplay::record_session_with_timeout(&self.control, Duration::from_secs(2)).await {
+            Ok(()) => true,
+            Err(error) => {
+                crate::emit_log(&format!("AUDIO-REBUILD: MGU-103-F replacement RECORD failed stream={}: {error}", pending.stream));
+                false
+            }
+        }
+    }
+
+    async fn lock_rejected_realtime<'a>(&self, stop: &'a Stop, retired: ClockTarget)
+        -> Option<tokio::sync::MutexGuard<'a, MainAudioTransition>> {
+        let transition = stop.main_transition.lock().await;
+        if stop.requested.load(Ordering::Acquire) || self.control.is_closed() || transition.call_media_paused
+            || !self.params.pipeline.lock().rejected_audio_recovery.is_some_and(|state| state.retired == retired) {
+            return None;
+        }
+        Some(transition)
+    }
+
+    async fn recover_rejected_realtime(&self, commands: &mpsc::UnboundedSender<MainCommand>, codec: AudioCodec,
+        grant: &MainAudioGrant, retired: ClockTarget, stop: &Stop, input: &Input) {
+        let rtsp = self.control.trace_id();
+        let current = || !self.control.is_closed() && grant.is_current(&grant.modes.lock());
+        let generation = input.playing_generation();
+        let may_restore = || current() && generation.is_some() && input.playing_generation() == generation;
+        // Keep requests serialized against temporary users of the receiver slot, but
+        // give those users a chance to acquire it between bounded RTSP transactions.
+        let update_cleanup = |stream| {
+            let mut pipeline = self.params.pipeline.lock();
+            if let Some(recovery) = pipeline.rejected_audio_recovery.as_mut().filter(|r| r.retired == retired) {
+                recovery.cleanup_stream = stream;
+            }
+        };
+        for attempt in 1..=2 {
+            if attempt > 1 { tokio::time::sleep(Duration::from_millis(100)).await; }
+            let pending = self.params.pipeline.lock().rejected_audio_recovery.filter(|r| r.retired == retired);
+            let Some(pending) = pending.filter(|_| current()) else { return; };
+            if let Some(stream) = pending.cleanup_stream {
+                if !self.clean_rejected_realtime(retired, stream, stop).await { continue; }
+            }
+            let Some(transition) = self.lock_rejected_realtime(stop, retired).await else { return; };
+            if !may_restore() { return; }
+            let mut output = match crate::airplay::negotiate_realtime_audio(
+                &self.control, &self.factory, Some(&self.shared), &self.params, false, &self.info, codec,
+                Some(RealtimeReplacementSetup { exclude_id: retired.stream_id,
+                    deadline: Some(tokio::time::Instant::now() + Duration::from_secs(2)) }),
+            ).await {
+                Ok(output) => output,
+                Err(error) => {
+                    if let Some(stream) = error.cleanup_stream(None) {
+                        update_cleanup(Some(stream));
+                        drop(transition);
+                        self.clean_rejected_realtime(retired, stream, stop).await;
+                    }
+                    crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} scoped recovery SETUP failed attempt={attempt}: {error:?}"));
+                    continue;
+                }
+            };
+            let Some(stream) = output.pacing_id else { return; };
+            update_cleanup(Some(stream.stream_id));
+            drop(transition);
+            let recorded = if let Some(_transition) = self.lock_rejected_realtime(stop, retired).await.filter(|_| may_restore()) {
+                match crate::airplay::record_session_with_timeout(&self.control, Duration::from_secs(2)).await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} scoped recovery RECORD failed attempt={attempt}: {error}"));
+                        false
+                    }
+                }
+            } else { false };
+            if recorded {
+                if let Some(transition) = self.lock_rejected_realtime(stop, retired).await.filter(|_| may_restore()) {
+                    output.set_ownership(self.resource.owned.clone());
+                    let (reply, installed) = oneshot::channel();
+                    if commands.send(MainCommand::ReplaceRealtime {
+                        output, grant: grant.clone(), replacement: RealtimeReplacement::Retired {
+                            target: retired, generation: generation.expect("playing generation checked before install"),
+                        }, reply,
+                    }).is_ok()
+                        && wait_for_main_command(installed).await.is_some() {
+                        self.control.udp_media.set(102, true);
+                        crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} restored type102 after old endpoint failed stream={}", stream.stream_id));
+                    } else {
+                        drop(transition);
+                        self.clean_rejected_realtime(retired, stream.stream_id, stop).await;
+                    }
+                    return;
+                }
+            }
+            drop(output);
+            self.clean_rejected_realtime(retired, stream.stream_id, stop).await;
+            if !may_restore() { return; }
+        }
+        crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} scoped recovery exhausted; main audio paused"));
+    }
+
+    async fn clean_rejected_realtime(&self, retired: ClockTarget, stream: i64, stop: &Stop) -> bool {
+        let pending = |recovery: &crate::pipeline::RejectedAudioRecovery| {
+            recovery.retired == retired && recovery.cleanup_stream == Some(stream)
+        };
+        let Some(_transition) = self.lock_rejected_realtime(stop, retired).await else { return false; };
+        if !self.params.pipeline.lock().rejected_audio_recovery.as_ref().is_some_and(pending) {
+            return false;
+        }
+        if let Err(error) = self.teardown_paused_aac(Some(stream)).await {
+            let rtsp = self.control.trace_id();
+            crate::emit_log(&format!("AUDIO-REBUILD: RTSP#{rtsp} type102 cleanup unconfirmed stream={stream}: {error}"));
+            return false;
+        }
+        if let Some(recovery) = self.params.pipeline.lock().rejected_audio_recovery.as_mut().filter(|r| pending(r)) {
+            recovery.cleanup_stream = None;
+        }
+        true
+    }
+
+    async fn teardown_paused_aac(&self, stream: Option<i64>) -> Result<(), String> {
+        {
+            let pipeline = self.params.pipeline.lock();
+            // Type-only receivers can close their active main stream regardless of the ID.
+            if pipeline.main_audio_stream_type.is_some() || pipeline.main_audio_feedback.is_some() {
+                return Err(format!("type102 TEARDOWN deferred until main audio is paused stream={stream:?}"));
+            }
+        }
+        crate::airplay::retire_realtime_aac(&self.control).await
     }
 
     // The buffered stream owns only main media; independent audio keeps running.
@@ -537,6 +886,7 @@ impl Session {
     }
     async fn retire_media(&self)->Result<(),String> {
         let Some(codec)=*self.media_codec.lock() else {return Ok(());};
+        if codec.stream_type() == 102 { return self.teardown_paused_aac(None).await; }
         let body=crate::bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![("type",Value::int(codec.stream_type()))])]))]));
         self.control.udp_media.set(codec.stream_type(), false);
         let reply=self.control.request("TEARDOWN","/",&body,"application/x-apple-binary-plist",&[],Duration::from_secs(2)).await?;
@@ -544,24 +894,27 @@ impl Session {
     }
     async fn pause_main(&self, commands: &mpsc::UnboundedSender<MainCommand>, cleanup: &mut Cleanup,
         hold_mixed_voice: bool) -> Result<(), String> {
-        let (tx, mut rx) = oneshot::channel();
+        // Pause clears the pump's state. Move the exact remote allocations to the
+        // caller before that handoff, while it holds the main transition.
+        let retire = {
+            let pipeline = self.params.pipeline.lock();
+            if let Some(recovery) = pipeline.rejected_audio_recovery {
+                recovery.cleanup_stream.into_iter().map(MediaTeardown::Aac).collect()
+            } else if let Some(pending) = pipeline.pending_aac_replacement {
+                VecDeque::from([MediaTeardown::Aac(pending.stream)])
+            } else {
+                VecDeque::from([MediaTeardown::CurrentType])
+            }
+        };
+        let (tx, rx) = oneshot::channel();
         if commands.send(MainCommand::Pause { reply: tx, hold_mixed_voice }).is_err() {
             return Err("media pump pause was not acknowledged".into());
         }
-        let sender = match tokio::time::timeout(Duration::from_secs(1), &mut rx).await {
-            Ok(Ok(sender)) => sender,
-            Ok(Err(_)) => return Err("media pump pause was not acknowledged".into()),
-            Err(_) => {
-                rx.close();
-                rx.try_recv().map_err(|_| "media pump pause timed out")?
-            }
-        };
+        let sender = wait_for_main_command(rx).await.ok_or("media pump pause was not acknowledged")?;
         drop(sender);
         cleanup.restore = true;
-        cleanup.retire_media = true;
-        self.retire_media().await?;
-        cleanup.retire_media = false;
-        Ok(())
+        cleanup.retire_media = retire;
+        cleanup.retire_pending_media(self).await
     }
 
     async fn run_shared_microphone(&self, trigger: Arc<ProbeControl>, format: InputFormat,
@@ -645,7 +998,9 @@ impl Session {
                 guard = stop.main_transition.clone().lock_owned() => guard,
             };
             let media_ready = self.media_codec.lock().is_none_or(|codec| {
-                self.params.pipeline.lock().main_audio_stream_type == Some(codec.stream_type())
+                let pipeline = self.params.pipeline.lock();
+                pipeline.main_audio_stream_type == Some(codec.stream_type()) ||
+                    pipeline.rejected_audio_recovery.is_some_and(|state| state.retired.stream_type == codec.stream_type())
             });
             if transition.call_media_paused || !media_ready {
                 drop(transition);
@@ -774,20 +1129,32 @@ impl Session {
         }
     }
 }
+
+#[derive(Clone, Copy)]
+enum MediaTeardown { CurrentType, Aac(i64) }
+
 #[derive(Default)]
 struct Cleanup {
-    lease:Option<Lease>,close:bool,retire_media:bool,restore:bool,
+    lease: Option<Lease>, close: bool, retire_media: VecDeque<MediaTeardown>, restore: bool,
     close_state:crate::aux_setup::CloseState,
     shared_input: Option<(InputStream, i64)>,
     main_transition: Option<tokio::sync::OwnedMutexGuard<MainAudioTransition>>,
 }
 impl Cleanup {
-    fn pending(&self)->bool {self.lease.is_some()||self.close||self.retire_media||self.restore||self.shared_input.is_some()}
-    async fn run(&mut self,kind:Kind,session:&Session,commands:&mpsc::UnboundedSender<MainCommand>,allocated:&[AtomicBool;2],stopping:bool)->bool {
-        if self.retire_media {
-            if let Err(error)=session.retire_media().await {crate::emit_log(&format!("AUX-AUDIO: pending media teardown: {error}"));return false;}
-            self.retire_media=false;
+    fn pending(&self)->bool {self.lease.is_some()||self.close||!self.retire_media.is_empty()||self.restore||self.shared_input.is_some()}
+    async fn retire_pending_media(&mut self, session: &Session) -> Result<(), String> {
+        while let Some(target) = self.retire_media.front().copied() {
+            match target {
+                MediaTeardown::CurrentType => session.retire_media().await?,
+                MediaTeardown::Aac(stream) => session.teardown_paused_aac(Some(stream)).await?,
+            }
+            self.retire_media.pop_front();
         }
+        Ok(())
+    }
+
+    async fn run(&mut self,kind:Kind,session:&Session,commands:&mpsc::UnboundedSender<MainCommand>,allocated:&[AtomicBool;2],stopping:bool)->bool {
+        if let Err(error)=self.retire_pending_media(session).await {crate::emit_log(&format!("AUX-AUDIO: pending media teardown: {error}"));return false;}
         if self.close {
             if let Err(error)=crate::aux_setup::close(&session.control,kind,&mut self.close_state).await {crate::emit_log(&format!("AUX-AUDIO: {:?} pending stream cleanup: {error}",kind));return false;}
             self.close=false;allocated[index(kind)].store(false,Ordering::Release);
@@ -823,7 +1190,7 @@ async fn start(kind:Kind,session:&Session,input:&Input,commands:&mpsc::Unbounded
     cleanup.main_transition = transition;
     if kind==Kind::Speech && !call_media_paused {
         if let Err(error)=session.pause_main(commands, cleanup, false).await {
-            if !cleanup.retire_media { cleanup.run(kind,session,commands,allocated,false).await; }
+            if cleanup.retire_media.is_empty() { cleanup.run(kind,session,commands,allocated,false).await; }
             return Err(StartError::Refused(format!("media teardown pending; no conflicting SETUP: {error}")));
         }
     }

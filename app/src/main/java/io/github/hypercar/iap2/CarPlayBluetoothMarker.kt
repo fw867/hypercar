@@ -41,7 +41,7 @@ internal class CarPlayBluetoothMarker(
         }
     }
 
-    private var lastErrorAt: Long? = null
+    private val lastErrorAt = mutableMapOf<RecoveringListener.FailureStage, Long>()
     @SuppressLint("MissingPermission")
     private val listener = RecoveringListener(
         ownerAlive = ownerAlive,
@@ -49,21 +49,25 @@ internal class CarPlayBluetoothMarker(
             if (!primaryReady()) throw IOException("等待主 iAP2 服务注册")
             try {
                 if (!adapter.isEnabled) throw IOException("蓝牙未开启")
-                adapter.listenUsingRfcommWithServiceRecord(service.serviceName, service.uuid).also {
-                    log("BT-MARKER: 系统标记服务已注册 uuid=${service.uuid}（等待系统更新 EIR）")
-                }
+                adapter.listenUsingRfcommWithServiceRecord(service.serviceName, service.uuid)
             } catch (error: RuntimeException) {
                 throw IOException("标记服务不可用：${error.javaClass.simpleName}", error)
             }
         },
         accept = { socket: BluetoothServerSocket -> socket.accept() },
-        onRegistered = onRegistrationChanged,
-        onFailure = {
+        onRegistered = {
+            log("BT-MARKER: 系统标记服务已注册 service=${service.name.lowercase()} uuid=${service.uuid} " +
+                "scope=local peer_sdp_eir=unverified")
+            onRegistrationChanged()
+        },
+        onFailure = { stage, error ->
             onRegistrationChanged()
             val now = SystemClock.elapsedRealtime()
-            if (lastErrorAt == null || now - lastErrorAt!! >= 30_000) {
-                log("BT-MARKER: ${service.uuid} ${it.message}；保留主 iAP2 监听，5s 后重试")
-                lastErrorAt = now
+            val previous = lastErrorAt[stage]
+            if (previous == null || now - previous >= 30_000) {
+                log("BT-MARKER: service=${service.name.lowercase()} uuid=${service.uuid} " +
+                    "failure=${stage.name.lowercase()} error=${error.message}；保留主 iAP2 监听，5s 后重试")
+                lastErrorAt[stage] = now
             }
         },
         awaitRetry = { try { Thread.sleep(5_000) } catch (_: InterruptedException) { } },

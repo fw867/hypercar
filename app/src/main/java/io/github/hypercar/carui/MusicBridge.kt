@@ -659,7 +659,10 @@ object MusicBridge {
     }
 
     private fun sessionCallback(owner: Long) = object : MediaController.Callback() {
-        private val audioResume = PlaybackAudioResume(playback?.state)
+        private val audioResume = PlaybackAudioResume(playback?.state,
+            onPlaying = { HyperCarRepo.notifyMediaPlayback(owner, true) },
+            onPause = { HyperCarRepo.notifyMediaPlayback(owner, false) },
+        )
         override fun onMetadataChanged(value: MediaMetadata?) {
             if (callback !== this) return
             snapshotEpoch.metadataChanged()
