@@ -14,7 +14,6 @@ import android.media.AudioManager
 import android.net.ConnectivityManager
 import android.net.InetAddresses
 import android.net.Network
-import android.net.NetworkCapabilities
 import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
@@ -230,6 +229,7 @@ class YadeaProjectionService : Service() {
             var wakeLock: PowerManager.WakeLock? = null
             val p2p = scannedLink
             var outcome: String? = null
+            var manualPing: YadeaInstrumentNetwork.Ping? = null
             try {
                 if (stopping.get()) return null
                 if (!source.installed(this@YadeaProjectionService)) error("本机未安装或未启用 ${source.title}")
@@ -264,8 +264,15 @@ class YadeaProjectionService : Service() {
                 } else {
                     host = checkNotNull(manualHost)
                     localAddress = null
-                    network = instrumentNetwork(connectivity, host)
-                        ?: error("找不到到达仪表 $host 的 Wi-Fi 网络，请先连接仪表 Wi-Fi")
+                    val address = checkNotNull(YadeaInstrumentNetwork.parseAddress(host))
+                    val route = YadeaInstrumentNetwork.findRoute(connectivity, address)
+                        ?: error(YadeaInstrumentNetwork.Ping.NoRoute.message)
+                    network = route.network
+                    update { it.copy(link = LinkState.Negotiating("正在 Ping 仪表…")) }
+                    manualPing = YadeaInstrumentNetwork.ping(route, address)
+                    android.util.Log.i("YadeaNetwork", "手动 IP Ping 结果 ${manualPing.name}")
+                    if (stopping.get()) return null
+                    update { it.copy(link = LinkState.Negotiating("正在连接投屏端口 TCP ${YadeaInstrumentNetwork.CONTROL_PORT}…")) }
                 }
                 val display = transport.connect(host, network = network, localAddress = localAddress)
                 connected.set(true)
@@ -395,8 +402,11 @@ class YadeaProjectionService : Service() {
                 }
             } catch (error: Exception) {
                 if (!stopping.get()) {
-                    outcome = "投屏中断：${error.localizedMessage ?: error.javaClass.simpleName}"
+                    val reason = error.localizedMessage ?: error.javaClass.simpleName
+                    val pingHint = manualPing?.takeIf { !connected.get() }?.message.orEmpty()
+                    outcome = "投屏中断：$pingHint$reason"
                     HyperCarRepo.log("YADEA: $outcome")
+                    android.util.Log.w("YadeaNetwork", outcome)
                 }
             } finally {
                 stopping.set(true)
@@ -437,20 +447,6 @@ class YadeaProjectionService : Service() {
         }
     }
 
-    private fun instrumentNetwork(connectivity: ConnectivityManager, host: String): Network? {
-        val target = InetAddresses.parseNumericAddress(host)
-        @Suppress("DEPRECATION")
-        return connectivity.allNetworks.mapNotNull { network ->
-            val capabilities = connectivity.getNetworkCapabilities(network) ?: return@mapNotNull null
-            if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
-                !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) return@mapNotNull null
-            val prefix = connectivity.getLinkProperties(network)?.routes.orEmpty()
-                .filter { !it.hasGateway() && it.destination.contains(target) }
-                .maxOfOrNull { it.destination.prefixLength } ?: return@mapNotNull null
-            network to prefix
-        }.maxByOrNull { it.second }?.first
-    }
-
     companion object {
         private const val CHANNEL = "yadea-projection"
         private const val NOTIFICATION_ID = 8888
@@ -470,7 +466,7 @@ class YadeaProjectionService : Service() {
         internal val audioRoute = selectedRoute.asStateFlow()
 
         internal fun isValidInstrumentIp(host: String): Boolean =
-            runCatching { InetAddresses.parseNumericAddress(host.trim()) }.isSuccess
+            YadeaInstrumentNetwork.parseAddress(host) != null
 
         private fun failureState(reason: String) = YadeaSessionState(link = LinkState.Failed(reason, recoverable = false))
 

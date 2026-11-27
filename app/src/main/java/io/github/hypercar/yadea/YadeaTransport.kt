@@ -24,7 +24,7 @@ internal class YadeaTransport : Closeable {
 
     fun connect(
         host: String,
-        tcpPort: Int = 8888,
+        tcpPort: Int = YadeaInstrumentNetwork.CONTROL_PORT,
         udpPort: Int = 8889,
         network: Network? = null,
         localAddress: InetAddress? = null,
@@ -51,7 +51,11 @@ internal class YadeaTransport : Closeable {
                 opened.udp.bind(InetSocketAddress(it, 0))
             }
             opened.tcp.tcpNoDelay = true
-            opened.tcp.connect(InetSocketAddress(address, tcpPort), CONNECT_TIMEOUT_MS)
+            try {
+                opened.tcp.connect(InetSocketAddress(address, tcpPort), CONNECT_TIMEOUT_MS)
+            } catch (error: IOException) {
+                throw IOException("无法连接仪表投屏端口 TCP $tcpPort（${error.localizedMessage}）", error)
+            }
             opened.udp.connect(InetSocketAddress(address, udpPort))
 
             val active = Session(opened)

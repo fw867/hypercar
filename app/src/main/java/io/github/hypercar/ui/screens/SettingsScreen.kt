@@ -105,6 +105,7 @@ import io.github.hypercar.ui.theme.SurfaceInset
 import io.github.hypercar.ui.theme.TextPrimary
 import io.github.hypercar.ui.theme.TextSecondary
 import io.github.hypercar.yadea.YadeaProjectionService
+import io.github.hypercar.yadea.YadeaInstrumentNetwork
 import io.github.hypercar.yadea.yadeaAudioOutputs
 
 /**
@@ -253,8 +254,13 @@ private fun ProjectionTargetSection(target: ProjectionTarget, connected: Boolean
 
 @Composable
 private fun InstrumentNetworkSection(connected: Boolean) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var address by rememberSaveable { mutableStateOf(SettingsStore.yadeaInstrumentIp) }
     val mode = remember(SettingsRevision.value) { SettingsStore.yadeaConnectionMode }
+    val currentAddress = address.trim()
+    var pinging by remember { mutableStateOf(false) }
+    var pingResult by remember { mutableStateOf<Pair<String, String>?>(null) }
     SectionLabel(text = "雅迪仪表网络")
     GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
         SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
@@ -287,6 +293,23 @@ private fun InstrumentNetworkSection(connected: Boolean) {
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
                 modifier = Modifier.fillMaxWidth(),
             )
+            TextButton(
+                enabled = !connected && !pinging && YadeaProjectionService.isValidInstrumentIp(currentAddress),
+                onClick = {
+                    pinging = true
+                    pingResult = null
+                    scope.launch {
+                        try {
+                            pingResult = currentAddress to YadeaInstrumentNetwork.check(context, currentAddress)
+                        } finally {
+                            pinging = false
+                        }
+                    }
+                },
+            ) { Text(if (pinging) "正在 Ping…" else "Ping 仪表") }
+            pingResult?.takeIf { it.first == currentAddress }?.second?.let { result ->
+                Text(result, color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+            }
         } else {
             Text("仪表开启投屏 Wi-Fi Direct 后，从主页启动扫描并选择仪表。", color = TextSecondary,
                 style = MaterialTheme.typography.bodySmall)
