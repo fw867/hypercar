@@ -12,6 +12,8 @@ data class Iap2VehicleStatus(
     val fuelRangeWarnings: Map<VehicleFuel, Boolean> = emptyMap(),
 )
 
+internal val VEHICLE_STATUS_SELECTORS = setOf(3, 4, 6, 9, 10, 11, 12, 13, 14, 15, 16)
+
 /** The BMW box requests empty flags 3, 4, 6 and 9..16, in that order (xiap2 0x5bfcc..0x5c2bc). */
 internal class Iap2VehicleStatusSession(
     private val onUpdate: (Iap2VehicleStatus) -> Unit,
@@ -19,19 +21,28 @@ internal class Iap2VehicleStatusSession(
 ) {
     private var requested = emptyList<Int>()
     private var status = Iap2VehicleStatus()
+    private var stopSupported = false
 
-    fun subscribe(peer: Iap2Messages.Identification): ByteArray? {
+    fun subscribe(peer: Iap2Messages.Identification): Iap2Csm.Frame? {
+        val declaredFields = peer.vehicleStatusFields ?: return null
+        stopSupported = peer.vehicleStatusStopSupported ?: stopSupported
         val fields = if (peer.declaresReceive(Iap2MessageIds.START_VEHICLE_STATUS_UPDATES) == true &&
             peer.declaresSend(Iap2MessageIds.VEHICLE_STATUS_UPDATE) == true) {
-            peer.vehicleStatusFields.filter { it == 3 || it == 4 || it == 6 || it in 9..16 }.sorted()
+            declaredFields.sorted()
         } else emptyList()
         if (fields == requested) return null
-        reset()
         requested = fields
-        if (fields.isNotEmpty()) log("VEHICLE A100 requested fields=$fields")
-        return fields.takeIf { it.isNotEmpty() }?.fold(byteArrayOf()) { body, field ->
+        if (status != Iap2VehicleStatus()) publish(Iap2VehicleStatus())
+        if (fields.isEmpty()) {
+            if (!stopSupported) return null
+            log("VEHICLE A102 stopped after capability withdrawal")
+            return Iap2Csm.Frame(Iap2MessageIds.STOP_VEHICLE_STATUS_UPDATES, byteArrayOf())
+        }
+        log("VEHICLE A100 requested fields=$fields")
+        val body = fields.fold(byteArrayOf()) { body, field ->
             body + Iap2Csm.param(field, byteArrayOf())
         }
+        return Iap2Csm.Frame(Iap2MessageIds.START_VEHICLE_STATUS_UPDATES, body)
     }
 
     fun receive(body: ByteArray) {
@@ -68,6 +79,7 @@ internal class Iap2VehicleStatusSession(
 
     fun reset() {
         requested = emptyList()
+        stopSupported = false
         if (status != Iap2VehicleStatus()) publish(Iap2VehicleStatus())
     }
 

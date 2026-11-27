@@ -70,7 +70,8 @@ object RustCoreBridge {
         fun onIap2Start(id: Long, deviceId: String, deviceName: String, profileId: String) {
             io.github.hypercar.iap2.WifiIap2Bridge.start(id, deviceId, deviceName, profileId)
         }
-        fun onIap2Bytes(id: Long, bytes: ByteArray) { io.github.hypercar.iap2.WifiIap2Bridge.receive(id, bytes) }
+        fun onIap2Ingress(id: Long, ticket: Long, bytes: ByteArray, writtenSynAck: Long = 0): Boolean =
+            io.github.hypercar.iap2.WifiIap2Bridge.receive(id, ticket, bytes, writtenSynAck)
         fun onIap2ScreenSetupAccepted(id: Long) { io.github.hypercar.iap2.WifiIap2Bridge.screenSetupAccepted(id) }
         fun onIap2Stop(id: Long) { io.github.hypercar.iap2.WifiIap2Bridge.stop(id) }
     }
@@ -135,13 +136,19 @@ object RustCoreBridge {
     external fun nativeStop()
     /** 主动退出：有界等待 TEARDOWN 和旧引擎资源释放，不用于网络丢失或蓝牙交接。 */
     external fun nativeStopGracefully(): Boolean
-    external fun nativeMarkWifiIap2Ready(id: Long, ready: Boolean): Boolean
+    external fun nativeMarkWifiIap2Ready(id: Long, generation: Long, ready: Boolean): Boolean
     external fun nativeSetWifiIap2Phase(id: Long, phase: String)
     external fun nativeCanKeepWifiSession(): Boolean
-    external fun nativeSendIap2(id: Long, bytes: ByteArray, hudMessageId: Int, hudSerial: Long): Boolean
+    external fun nativeSendIap2(id: Long, generation: Long, bytes: ByteArray, hudMessageId: Int, hudSerial: Long, writeTicket: Long): Boolean
+    external fun nativeWifiIap2SendCapacity(id: Long, generation: Long): Int
+    external fun nativeCancelWifiIap2Write(id: Long, generation: Long, ticket: Long)
+    external fun nativeTakeWifiIap2Writes(id: Long, generation: Long): LongArray?
+    external fun nativeFinishWifiIap2Ingress(id: Long, ticket: Long)
+    external fun nativeWifiIap2IngressFence(id: Long, through: Long): Long
+    external fun nativeWifiIap2DestinationCurrent(id: Long, generation: Long): Boolean
     external fun nativePublishCarWithGps(id: Long, fields: LongArray?)
     external fun nativeWifiIap2PeerSyn(id: Long)
-    external fun nativeSendWifiIap2Detect(id: Long): Boolean
+    external fun nativeSendWifiIap2Detect(id: Long, generation: Long): Boolean
 
     external fun nativeRequestViewArea(revision: Long, uuid: String, target: Int): Boolean
 

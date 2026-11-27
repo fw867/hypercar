@@ -1,5 +1,6 @@
 package io.github.hypercar.iap2
 
+import io.github.hypercar.headunit.HeadUnitProfiles
 import io.github.hypercar.net.BluetoothHotspot
 import java.io.IOException
 import java.security.interfaces.ECPublicKey
@@ -36,6 +37,21 @@ interface Iap2LinkChannel {
     fun sendHudControl(bytes: ByteArray, awaitAck: Boolean, messageId: Int): Boolean =
         sendControl(bytes, awaitAck)
 
+    val hasQueuedHudMessages: Boolean get() = false
+    fun queueHudMessage(bytes: ByteArray, messageId: Int, canStart: () -> Boolean, commitStart: (() -> Boolean)?): Boolean {
+        if (!canStart() || commitStart?.invoke() == false) return true
+        val limit = peerMaxControlPayload() ?: bytes.size
+        if (limit <= 0) return false
+        var offset = 0
+        while (offset < bytes.size) {
+            val end = minOf(offset + limit, bytes.size)
+            if (!sendHudControl(bytes.copyOfRange(offset, end), false, messageId)) return false
+            offset = end
+        }
+        return true
+    }
+    fun flushHudMessages() {}
+
     /** 取下一个控制载荷；空数组表示同一传输上的链路重建边界，null 表示超时或结束。 */
     fun recvControl(timeoutMillis: Long): ByteArray?
 
@@ -44,6 +60,17 @@ interface Iap2LinkChannel {
     /** 传输层保留的关闭原因；不包含认证报文或密钥。 */
     val closeReason: String? get() = null
     val isCancelled: Boolean get() = false
+    val localStopRequested: Boolean get() = isCancelled
+
+    fun <T> commitMfi(action: () -> T): T {
+        if (localStopRequested || Thread.currentThread().isInterrupted) throw InterruptedIOException("MFi 已取消")
+        return action()
+    }
+
+    fun sendMfiControl(bytes: ByteArray, awaitAck: Boolean): Boolean =
+        commitMfi { sendControl(bytes, awaitAck) }
+
+    fun sendMfiResult(bytes: ByteArray, awaitAck: Boolean): Boolean = sendMfiControl(bytes, awaitAck)
 
     val supportsFileTransfer: Boolean get() = false
     val canQueueMedia: Boolean get() = true
@@ -303,42 +330,39 @@ class Iap2SenderSession(
         enterPhase("IDENTIFICATION")
         send(Iap2MessageIds.START_IDENTIFICATION)
         val identFrame = expect(Iap2MessageIds.IDENTIFICATION_INFORMATION, deadline)
-        val ident = Iap2Messages.parseIdentification(identFrame.body)
-        rememberAppsAuthenticationPolicy(ident)
-        if (authFirst) log("MGU-AUTH: v1 identification ordinaryApps=${isBmwAppsOnly(ident)} wirelessCarPlay=${isCarPlayProfileB(ident)}")
+        val initialIdentity = Iap2Messages.parseIdentification(identFrame.body)
+        rememberAppsAuthenticationPolicy(initialIdentity)
+        if (authFirst) log("MGU-AUTH: v1 identification ordinaryApps=${isBmwAppsOnly(initialIdentity)} wirelessCarPlay=${isCarPlayProfileB(initialIdentity)}")
         authenticatedAppsV1Early = authFirst
-        peerIdentification = ident
-        navigation.declareReceiveSupport(ident.acceptsRouteGuidance, ident.currentRoadLimits)
-        subscriptions.identify(ident.model, ident.manufacturer)
-        media.identify(ident.hidComponents)
-        onIdentification(ident)
-        logIdentification(ident, identFrame)
-        logWirelessCarPlayProfile(ident)
+        applyIdentification(initialIdentity)
+        logIdentification(initialIdentity, identFrame)
+        logWirelessCarPlayProfile(initialIdentity)
         send(Iap2MessageIds.IDENTIFICATION_ACCEPTED)
         log("iap2 tx=0x1d02 identification-accepted")
 
-        val identityText = listOfNotNull(ident.name, ident.model, ident.manufacturer).joinToString(" ").lowercase()
+        val identityText = listOfNotNull(initialIdentity.name, initialIdentity.model, initialIdentity.manufacturer).joinToString(" ").lowercase()
         if (!authFirst) {
             enterPhase("MFI_EXCHANGE")
             if (channel.peerControlVersion == 1 && verifiedAppsV1Required) {
-                authenticatePairedAppsV1(ident, deadline)
+                authenticatePairedAppsV1(initialIdentity, deadline)
             } else {
-                authenticateCompatibility(ident, identityText, deadline)
+                authenticateCompatibility(initialIdentity, identityText, deadline)
             }
         }
         // IDC23 capture: AA05 -> 4300, before greetings, EA, HID or queued subscriptions.
         val earlyAvailability = usesId9MinimalBootstrap() && profile.sendCarPlayAvailability
         if (earlyAvailability) {
             sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY,carPlayAvailabilityBody())
-            log("iap2 ID9 minimal bootstrap: AA05 -> 4300; no unsolicited state greetings")
+            log("iap2 ID9 minimal bootstrap: CarPlay availability enqueued")
         }
         media.authenticated()
         nowPlaying.authenticated()
         subscriptions.authenticated()
 
         // ID8.5 按盒子在设备问候中声明无线可用性；其它档案保留原有 0x5702/0x4E0D 顺序。
-        val wifiGen = ReceiverProfile.classifyWifiGen(ident.sendIds, ident.receiveIds)
-        val legacyWifiExchange = wifiGen != ReceiverProfile.WifiGen.NEW
+        val ident = checkNotNull(peerIdentification)
+        val initialWifiGen = ReceiverProfile.classifyWifiGen(ident.sendIds, ident.receiveIds)
+        val initialLegacyExchange = initialWifiGen != ReceiverProfile.WifiGen.NEW
         val boxOrderedGreetings = profile.protocolProfileId == "bmw_id85"
 
         // ---- MGU／旧路径设备问候；IDC23新式路径已直接发送4300并跳过问候 ----
@@ -346,7 +370,7 @@ class Iap2SenderSession(
         // 早期MGU样本在 0xAA05 之后发设备问候，然后才轮到
         // 订阅/请求。旧实现排在 0x5703 等待之后：BMW 等问候、我们等 0x5703，
         // 两轮实测稳定 5.37~5.45s 后车机拆 RFCOMM（另一台 MGU-86 五轮全败同签名）。
-        sendDeviceStateGreetings(includeWirelessUpdate = boxOrderedGreetings || !legacyWifiExchange)
+        sendDeviceStateGreetings(includeWirelessUpdate = boxOrderedGreetings || !initialLegacyExchange)
         enterPhase("EA_AND_HID")
         val declaresReceiveWifi = ident.declaresReceive(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION)
         val declaresSendWifi = ident.declaresSend(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION)
@@ -361,7 +385,7 @@ class Iap2SenderSession(
         val mgu55Legacy = boxOrderedGreetings && ident.model.equals("MGU-55-BMW", ignoreCase = true) &&
             ident.manufacturer.equals("BMW Group", ignoreCase = true) && declaresReceiveWifi == true &&
             declaresSendWifi == true && ident.declaresReceive(Iap2MessageIds.CARPLAY_AVAILABILITY) == false
-        val optionalDeadline = if (mgu55Legacy || returningMgu && legacyWifiExchange) rescueDeadline(deadline, 100) else deadline
+        val optionalDeadline = if (mgu55Legacy || returningMgu && initialLegacyExchange) rescueDeadline(deadline, 100) else deadline
 
         // ---- EA 会话（MFi 完成后发；认证前发会噎死 DiPlay）----
         // BMW iD8.5 档案 B 声明 com.bmw.carplay protocol=8；档案 A 声明 de.bmw.a4a.bt。
@@ -415,6 +439,16 @@ class Iap2SenderSession(
         // ---- Optional HID registration; CSM receive continuously consumes declared media components. ----
         awaitOptionalHid(optionalDeadline)
 
+        val wifiIdentity = checkNotNull(peerIdentification)
+        fun waitsForCarPlayWindow() = peerIdentification?.let {
+            isBmwAppsOnly(it) && (authFirst || usesMguReentry(it)) && !profile.abortWhenCarPlayWindowClosed
+        } == true
+        if (wifiIdentity !== ident && waitsForCarPlayWindow()) {
+            enterPhase("WAIT_CARPLAY_WINDOW")
+            return endpointOf(null, null)
+        }
+        val wifiGen = ReceiverProfile.classifyWifiGen(wifiIdentity.sendIds, wifiIdentity.receiveIds)
+        val legacyWifiExchange = wifiGen != ReceiverProfile.WifiGen.NEW
         // ---- WiFi 配置交换（按「车机画像 wifiGen」分派，不按清单硬拦）----
         // 旧协议（0x5702 → 0x5703）：手机请求，车机回 AP 明文。
         // 新协议（0x4300 → 0x4301）：AP 信息由 0x4301 自带（BMW iD9 走这条）。
@@ -426,10 +460,12 @@ class Iap2SenderSession(
         // 明确声明 0x4301 且未声明 0x57xx 才优先新路径，不按清单数量推断完整性。
         enterPhase("WIFI_CREDENTIALS")
         log("iap2 车机画像 wifiGen=${ReceiverProfile.describe(wifiGen)}")
-        if (legacyWifiExchange && (declaresReceiveWifi == false || declaresSendWifi == false)) {
+        val receivesWifi = wifiIdentity.declaresReceive(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION)
+        val sendsWifi = wifiIdentity.declaresSend(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION)
+        if (legacyWifiExchange && (receivesWifi == false || sendsWifi == false)) {
             log(
-                "iap2 清单未声明 0x5702/0x5703（收=${declaresReceiveWifi ?: "未知"} " +
-                    "发=${declaresSendWifi ?: "未知"}）但画像判 ${wifiGen}——仍发 0x5702" +
+                "iap2 清单未声明 0x5702/0x5703（收=${receivesWifi ?: "未知"} " +
+                    "发=${sendsWifi ?: "未知"}）但画像判 ${wifiGen}——仍发 0x5702" +
                     "（清单不完整不能反证「不支持」；车机对未声明消息通常照常处理）",
             )
         }
@@ -442,16 +478,25 @@ class Iap2SenderSession(
                 // 只占用本阶段预算，为 0x4300/0x4301 留出时间；4301 早到也立即结束等待。
                 val wifiDeadline = rescueDeadline(deadline, WIFI_EXCHANGE_BUDGET_MILLIS)
                 val credentialMessages = setOf(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION, Iap2MessageIds.CARPLAY_START_SESSION)
+                fun stillExpectsLegacyWifi(): Boolean {
+                    val latest = checkNotNull(peerIdentification)
+                    return latest === wifiIdentity || (!waitsForCarPlayWindow() &&
+                        ReceiverProfile.classifyWifiGen(latest.sendIds, latest.receiveIds) != ReceiverProfile.WifiGen.NEW)
+                }
                 var parsed = expectAnyOrNull(credentialMessages, rescueDeadline(wifiDeadline, WIFI_RESCUE_GREETING_MILLIS))
-                if (parsed == null) {
+                if (parsed == null && stillExpectsLegacyWifi()) {
                     sendDeviceStateGreetings(force = true)
                     log("iap2 0x5703 1.5s 未到——强制重发设备状态问候，继续等待")
                     parsed = expectAnyOrNull(credentialMessages, rescueDeadline(wifiDeadline, WIFI_RESCUE_RETRY_MILLIS))
                 }
-                if (parsed == null) {
+                if (parsed == null && stillExpectsLegacyWifi()) {
                     send(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION)
                     log("iap2 0x5702 重发一次（首次仅链路 ACK）")
                     parsed = expectAnyOrNull(credentialMessages, wifiDeadline)
+                }
+                if (peerIdentification !== wifiIdentity && waitsForCarPlayWindow()) {
+                    enterPhase("WAIT_CARPLAY_WINDOW")
+                    return endpointOf(null, null)
                 }
                 if (parsed == null) {
                     log("iap2 0x5703 未在窗口内到达——改走 0x4300/0x4301（新版协议自带 AP 信息）")
@@ -486,7 +531,7 @@ class Iap2SenderSession(
         // 0x4300 里带的是本机蓝牙传输标识：车机靠它把 CarPlay 设备与已配对手机对上，
         // 这也是必须用真实 MAC 的原因（伪 MAC 会对不上任何已配对设备）。
         if (profile.sendCarPlayAvailability && !earlyAvailability) {
-            if (ident.declaresReceive(Iap2MessageIds.CARPLAY_AVAILABILITY) == false) {
+            if (peerIdentification?.declaresReceive(Iap2MessageIds.CARPLAY_AVAILABILITY) == false) {
                 log("iap2 车机清单未声明可收 0x4300，但档案 ${profile.id} 要求发——照发（清单可能不完整）")
             }
             sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY, carPlayAvailabilityBody())
@@ -494,7 +539,7 @@ class Iap2SenderSession(
         } else if (!earlyAvailability) {
             log("iap2 跳过 0x4300（CarPlayAvailability）——档案 ${profile.id} 不要求")
         }
-        val declaresStartSession = ident.declaresSend(Iap2MessageIds.CARPLAY_START_SESSION)
+        val declaresStartSession = peerIdentification?.declaresSend(Iap2MessageIds.CARPLAY_START_SESSION)
         // 没拿到 0x5703（新协议车机）时 0x4301 是**唯一** AP 来源——窗口给足；
         // 已有 0x5703 的旧协议车机保持 3 秒短窗口（应答都在毫秒级）。
         val startSessionWindow =
@@ -558,7 +603,9 @@ class Iap2SenderSession(
         // （只发 4E09/4E0A/4E0B/4E0C），MGU-55 也只是 ACK 掉。
         // 为减少与真机行为的差异，默认不发；需要时把 SEND_TRANSPORT_IDENTIFIER 改 true。
         if (profile.sendTransportIdentifier) {
-            sendFireAndForget(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER, Iap2Csm.string(0, bluetoothMac))
+            // MGU libNmeIAP decodes parameter 0 as USB serial number and 1 as Bluetooth address.
+            val bluetoothField = if (profile.id == HeadUnitProfiles.BMW_ID85.id) 1 else 0
+            sendFireAndForget(Iap2MessageIds.DEVICE_TRANSPORT_IDENTIFIER, Iap2Csm.string(bluetoothField, bluetoothMac))
             log("iap2 tx=0x4e0e 设备传输标识（mac=$bluetoothMac）")
         } else {
             log("iap2 跳过 0x4e0e 传输标识（档案 ${profile.id} 不要求，对齐真 iPhone 行为）")
@@ -775,32 +822,53 @@ class Iap2SenderSession(
      * 会打断正在等待的车机窗口，得不偿失）。
      */
     private fun handleReidentification(frame: Iap2Csm.Frame) {
+        val acknowledgeBeforeApply = profile.id == HeadUnitProfiles.BMW_ID85.id
+        if (acknowledgeBeforeApply && (frame.body.isEmpty() ||
+                Iap2Csm.parseParams(frame.body).sumOf { it.value.size + Iap2Csm.PARAM_HEADER_BYTES } != frame.body.size)) {
+            log("MGU-REENTRY: ignored incomplete identification update bytes=${frame.body.size}")
+            return
+        }
         val ident = Iap2Messages.parseIdentification(frame.body)
+        val previous = peerIdentification
+        val returningMgu = usesMguReentry(ident)
+        if (acknowledgeBeforeApply) send(Iap2MessageIds.IDENTIFICATION_ACCEPTED)
         rememberAppsAuthenticationPolicy(ident)
-        peerIdentification = ident
-        navigation.declareReceiveSupport(ident.acceptsRouteGuidance, ident.currentRoadLimits)
-        subscriptions.identify(ident.model, ident.manufacturer)
-        media.identify(ident.hidComponents)
-        onIdentification(ident)
+        applyIdentification(ident)
         log(
             "iap2 rx=0x1d01（重新识别）name=${ident.name} 发送清单=${ident.sendIds?.sorted()?.joinToString { "0x%04x".format(it) }} " +
                 "可收清单=${ident.receiveIds?.sorted()?.joinToString { "0x%04x".format(it) }}",
         )
-        val returningMgu = usesMguReentry(ident)
         if (returningMgu) {
             eaProtocols = emptyList()
         } else ident.eaProtocols.takeIf { it.isNotEmpty() }?.let { eaProtocols = it }
-        if (returningMgu || authenticatedAppsV1Early) {
+        if (!acknowledgeBeforeApply && (returningMgu || authenticatedAppsV1Early)) {
             send(Iap2MessageIds.IDENTIFICATION_ACCEPTED)
+        }
+        if (acknowledgeBeforeApply || returningMgu || authenticatedAppsV1Early) {
             log("MGU-REENTRY: accepted updated identification; CarPlay window=${isCarPlayProfileB(ident)}")
+        }
+        // The initial exchange reads the updated identity before deciding which credentials to request.
+        val mayReprobe = when (phaseName) {
+            "MAINTAIN_LINK" -> true
+            "WIFI_CREDENTIALS", "CARPLAY_START_SESSION" ->
+                previous?.sendIds != ident.sendIds || previous?.receiveIds != ident.receiveIds
+            else -> false
         }
         val declaresWifi = ident.declaresSend(Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION) != false
         val declaresStart = ident.declaresSend(Iap2MessageIds.CARPLAY_START_SESSION) != false
-        if (declaresWifi || declaresStart) {
+        if (mayReprobe && (declaresWifi || declaresStart)) {
             log("iap2 车机重新识别后声明了无线 CarPlay——立刻重探 0x5702/0x4300")
             lastPokeNanos = 0L
             pokeWhileWaiting()
         }
+    }
+
+    private fun applyIdentification(ident: Iap2Messages.Identification) {
+        peerIdentification = ident
+        navigation.declareReceiveSupport(ident)
+        subscriptions.identify(ident.model, ident.manufacturer)
+        media.identify(ident.hidComponents)
+        onIdentification(ident)
     }
 
     /** Bounded initial wait only. StartHID registers parameter-4 descriptors continuously;
@@ -964,34 +1032,36 @@ class Iap2SenderSession(
 
     // ---- MFi 挑战 ----
 
+    private fun rejectMfi(error: IOException): Nothing {
+        ensureNotCancelled("MFi 校验失败")
+        log("MGU-AUTH: failed: ${error.message}")
+        ensureActive("MFi 校验失败")
+        send(Iap2MessageIds.MFI_AUTHENTICATION_FAILED)
+        throw error
+    }
+
     private fun authenticatePairedAppsV1(ident: Iap2Messages.Identification?, deadline: Long) {
         log("MGU-AUTH: paired BMW Apps v1 order=${if (ident == null) "authentication-first" else "identification-first"}")
         val certificate = requestCertificate(ident, deadline)
-        fun reject(error: IOException): Nothing {
-            log("MGU-AUTH: failed: ${error.message}")
-            ensureActive("MFi 校验失败")
-            send(Iap2MessageIds.MFI_AUTHENTICATION_FAILED)
-            throw error
-        }
         val key = try {
             verifyMfi3Certificate(certificate.frame.body)
         } catch (error: IOException) {
-            reject(error)
+            rejectMfi(error)
         }
         log("MGU-AUTH: certificate-chain=verified")
         val challenge = ByteArray(32).also(random::nextBytes)
         send(Iap2MessageIds.MFI_REQUEST_CHALLENGE, Iap2Csm.param(0, challenge))
         val response = expectAnyOrNull(setOf(Iap2MessageIds.MFI_RESPONSE, Iap2MessageIds.MFI_AUTHENTICATION_FAILED),
-            rescueDeadline(deadline, MFI_ATTEMPTS.first().second)) ?: reject(IOException("MFi 3 挑战应答超时"))
+            rescueDeadline(deadline, MFI_ATTEMPTS.first().second)) ?: rejectMfi(IOException("MFi 3 挑战应答超时"))
         if (response.messageId == Iap2MessageIds.MFI_AUTHENTICATION_FAILED)
             throw IOException("MGU-AUTH: 对端报告认证失败")
         try {
             Mfi3AccessoryVerifier.verifyResponse(key, challenge, response.body)
         } catch (error: IOException) {
-            reject(error)
+            rejectMfi(error)
         }
         send(Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED)
-        log("MGU-AUTH: signature=verified tx=0xaa05")
+        log("MGU-AUTH: signature=verified")
     }
 
     private fun authenticateCompatibility(ident: Iap2Messages.Identification?, identityText: String, deadline: Long) {
@@ -1001,23 +1071,32 @@ class Iap2SenderSession(
             runMfiChallenge(
                 deadline,
                 receiverKey = MfiLengthMemory.receiverKey(identityText, receiverAddress),
-                certificateParamBytes = certificate.parameterBytes,
+                certificate = certificate,
             )
         } catch (error: IOException) {
-            if (usesId9MinimalBootstrap() && error !is InterruptedIOException && error !is LinkRestart) MfiCertificateCache.forget(context,receiverAddress)
+            ensureNotCancelled("MFi 挑战结束")
+            if (usesId9MinimalBootstrap() && error !is InterruptedIOException && error !is LinkRestart) {
+                channel.commitMfi { MfiCertificateCache.forget(context, receiverAddress) }
+            }
             throw error
         }
         ensureActive("MFi 结果发送前")
+        if (profile.id == HeadUnitProfiles.BMW_ID85.id && mfiResult == MfiResult.TIMEOUT_COMPATIBILITY) {
+            rejectMfi(IOException("ID8.5 MFi 挑战应答超时"))
+        }
         if (usesId9MinimalBootstrap()) {
             if (mfiResult == MfiResult.RESPONSE_RECEIVED_UNVERIFIED) {
                 if (!certificate.cached) certificate.serial?.let { serial ->
-                    val saved=MfiCertificateCache.remember(context,receiverAddress,serial,certificate.frame.body)
+                    val saved = channel.commitMfi {
+                        MfiCertificateCache.remember(context, receiverAddress, serial, certificate.frame.body)
+                    }
                     log("iap2 certificate-cache stored=$saved; certificate reuse only, authentication remains unverified")
                 }
-            } else MfiCertificateCache.forget(context,receiverAddress)
+            } else channel.commitMfi { MfiCertificateCache.forget(context, receiverAddress) }
         }
         send(Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED)
-        log("iap2 tx=0xaa05 compatibility-result=$mfiResult（未做证书/签名验证，不代表标准认证通过）")
+        if (mfiResult == MfiResult.RESPONSE_VERIFIED) log("MGU-AUTH: updated Apps identity certificate and signature verified")
+        else log("iap2 compatibility-result=$mfiResult（未做证书/签名验证，不代表标准认证通过）")
     }
 
     private fun usesId9MinimalBootstrap(): Boolean = profile.id=="bmw_id9" && peerIdentification?.let {
@@ -1054,7 +1133,9 @@ class Iap2SenderSession(
                     serial=received
                     if (!followedSerial) {
                         followedSerial=true
-                        val cached=if (usesId9MinimalBootstrap()) MfiCertificateCache.load(context,receiverAddress,received) else null
+                        val cached = if (usesId9MinimalBootstrap()) channel.commitMfi {
+                            MfiCertificateCache.load(context, receiverAddress, received)
+                        } else null
                         if (cached!=null) {
                             log("iap2 rx=0xaa06 certificate-cache hit -> challenge; authentication remains unverified")
                             return CertificateExchange(Iap2Csm.Frame(Iap2MessageIds.MFI_CERTIFICATE,cached),received,true)
@@ -1068,17 +1149,18 @@ class Iap2SenderSession(
         }
     }
 
-    private enum class MfiResult { RESPONSE_RECEIVED_UNVERIFIED, TIMEOUT_COMPATIBILITY }
+    private enum class MfiResult { RESPONSE_VERIFIED, RESPONSE_RECEIVED_UNVERIFIED, TIMEOUT_COMPATIBILITY }
 
     /** 保留已跑通接收端的超时兼容策略；断链/取消绝不能作为正常认证结果返回。 */
     private fun runMfiChallenge(
         deadline: Long,
         receiverKey: String,
-        certificateParamBytes: Int,
+        certificate: CertificateExchange,
     ): MfiResult {
         val baseline = MFI_ATTEMPTS.map { it.first }
         val windowOf = MFI_ATTEMPTS.toMap()
         val memory = MfiLengthMemory.load(context, receiverKey)
+        val certificateParamBytes = certificate.parameterBytes
         val certificatePreference = mfiChallengeLengthForCertificateParam(certificateParamBytes)
         // Hard disconnects still rotate the established ladder. With no usable success, move the
         // certificate's preferred length to the front and retain the other candidates in order.
@@ -1112,23 +1194,24 @@ class Iap2SenderSession(
             try {
                 send(Iap2MessageIds.MFI_REQUEST_CHALLENGE, Iap2Csm.param(0, challenge))
             } catch (error: IOException) {
-                if (error !is InterruptedIOException && !channel.isCancelled && !channel.isAlive) {
-                    MfiLengthMemory.recordDisconnected(context, receiverKey, size)
+                if (error !is InterruptedIOException && !channel.isAlive) {
+                    channel.commitMfi { MfiLengthMemory.recordDisconnected(context, receiverKey, size) }
                 }
                 throw error
             }
             log("iap2 tx=0xaa02 challenge=${size}B（第 ${position + 1} 次，窗口 ${windowMillis}ms）")
             val window = minOf(nanoTime() + windowMillis * 1_000_000L, deadline)
-            var gotResponse = false
+            var response: MfiResult? = null
             var gotFailure = false
             while (true) {
                 val remaining = (window - nanoTime()) / 1_000_000L
                 if (remaining <= 0) break
                 val frame = recvFrame(remaining)
                 if (frame == null) {
-                    if (Thread.currentThread().isInterrupted || channel.isCancelled) throw InterruptedIOException("MFi 挑战已取消")
-                    if (!channel.isAlive) {
-                        MfiLengthMemory.recordDisconnected(context, receiverKey, size)
+                    val disconnected = !channel.isAlive
+                    ensureNotCancelled("MFi 挑战等待")
+                    if (disconnected) {
+                        channel.commitMfi { MfiLengthMemory.recordDisconnected(context, receiverKey, size) }
                         val elapsed = (nanoTime() - started) / 1_000_000L
                         throw IOException("MFi 等待 0xaa03 时链路关闭：挑战=${size}B，经过=${elapsed}ms，原因=${channel.closeReason ?: "未知"}；下次连接轮换候选，未发送 0xaa05")
                     }
@@ -1137,8 +1220,18 @@ class Iap2SenderSession(
                 when (frame.messageId) {
                     Iap2MessageIds.MFI_RESPONSE -> {
                         if (!Iap2Csm.hasNonEmptyParameter(frame.body, 0)) throw IOException("MFi 响应缺少完整签名参数")
-                        log("iap2 rx=0xaa03 signature bytes=${frame.body.size}（跳过校验）")
-                        gotResponse = true
+                        if (profile.id == HeadUnitProfiles.BMW_ID85.id && channel.peerControlVersion == 1 && verifiedAppsV1Required) {
+                            // The car can reveal its Apps identity after the compatibility challenge was sent.
+                            try {
+                                Mfi3AccessoryVerifier.verifyResponse(verifyMfi3Certificate(certificate.frame.body), challenge, frame.body)
+                            } catch (error: IOException) {
+                                rejectMfi(error)
+                            }
+                            response = MfiResult.RESPONSE_VERIFIED
+                        } else {
+                            log("iap2 rx=0xaa03 signature bytes=${frame.body.size}（跳过校验）")
+                            response = MfiResult.RESPONSE_RECEIVED_UNVERIFIED
+                        }
                     }
 
                     Iap2MessageIds.MFI_AUTHENTICATION_FAILED -> {
@@ -1151,26 +1244,26 @@ class Iap2SenderSession(
                             "(${Iap2MessageIds.nameOf(frame.messageId)})",
                     )
                 }
-                if (gotResponse || gotFailure) break
+                if (response != null || gotFailure) break
             }
-            if (gotResponse) {
+            if (response != null) {
                 ensureActive("MFi 响应接收后")
                 if (position == 0) {
-                    MfiLengthMemory.recordSuccess(context, receiverKey, size)
+                    channel.commitMfi { MfiLengthMemory.recordSuccess(context, receiverKey, size) }
                 } else {
                     log("iap2 AA03 可能属于先前超时挑战——不把 ${size}B 写成成功长度")
                 }
-                return MfiResult.RESPONSE_RECEIVED_UNVERIFIED
+                return response
             }
             if (gotFailure) {
                 throw IOException("MFi 收到非预期 0xaa04，停止本轮（不能据此判定挑战长度）")
             } else {
-                MfiLengthMemory.recordSilent(context, receiverKey, size)
+                channel.commitMfi { MfiLengthMemory.recordSilent(context, receiverKey, size) }
             }
             if (position < order.size - 1) {
                 log("iap2 MFi ${size}B 无应答，改用 ${order[position + 1]}B 重试")
             } else {
-                log("iap2 MFi 挑战全部无应答——跳过校验直接发 0xaa05（由后续消息判定车机是否放行）")
+                log("iap2 MFi 挑战全部无应答，进入超时兼容处理，签名未验证")
             }
         }
         ensureActive("MFi 超时兼容处理前")
@@ -1278,20 +1371,26 @@ class Iap2SenderSession(
     ) {
         ensureActive("发送 0x${messageId.toString(16)} 前")
         val limit = channel.peerMaxControlPayload() ?: (frame.size - 1).coerceAtLeast(1)
-        log("TX phase=$phaseName id=0x${messageId.toString(16)} bytes=${frame.size} maxPayload=$limit awaitAck=$awaitAck")
+        val stage = if (messageId == Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED) " stage=before_enqueue" else ""
+        log("TX phase=$phaseName id=0x${messageId.toString(16)} bytes=${frame.size} maxPayload=$limit awaitAck=$awaitAck$stage")
         var offset = 0
         while (offset < frame.size) {
             val end = minOf(offset + limit, frame.size)
             val part = frame.copyOfRange(offset, end)
-            val sent = if (messageId == 0x5201 || messageId == 0x5202) {
-                channel.sendHudControl(part, awaitAck, messageId)
-            } else channel.sendControl(part, awaitAck)
+            val sent = when (messageId) {
+                Iap2MessageIds.MFI_REQUEST_CHALLENGE, Iap2MessageIds.MFI_AUTHENTICATION_FAILED ->
+                    channel.sendMfiControl(part, awaitAck)
+                Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED -> channel.sendMfiResult(part, awaitAck)
+                0x5201, 0x5202, 0x5204 -> channel.sendHudControl(part, awaitAck, messageId)
+                else -> channel.sendControl(part, awaitAck)
+            }
             if (!sent) {
                 ensureCurrentLink()
                 throw IOException("iAP2 链路在发送 0x${messageId.toString(16)} 时关闭")
             }
             offset = end
         }
+        if (messageId == Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED) return // RFCOMM reports each fragment's actual write.
         log(
             "iap2 tx=0x${messageId.toString(16).padStart(4, '0')}" +
                 if (awaitAck) "" else "（发后不管）",
@@ -1403,10 +1502,14 @@ class Iap2SenderSession(
                 val frame = receivedFrames.removeFirst()
                 if (frame.messageId == Iap2MessageIds.IDENTIFICATION_REJECTED) throw IOException("车机拒绝 iAP2 设备识别")
                 if (frame.messageId == Iap2MessageIds.IDENTIFICATION_INFORMATION && peerIdentification != null) {
+                    if (profile.id == HeadUnitProfiles.BMW_ID85.id) {
+                        handleReidentification(frame)
+                        continue
+                    }
                     // Late identity can be queued by a Wi-Fi/credential wait. Its capability
                     // boundary must precede the following StartHID, not wait for the keepalive pump.
                     val ident = Iap2Messages.parseIdentification(frame.body)
-                    navigation.declareReceiveSupport(ident.acceptsRouteGuidance, ident.currentRoadLimits)
+                    navigation.declareReceiveSupport(ident)
                     subscriptions.identify(ident.model, ident.manufacturer)
                     media.identify(ident.hidComponents)
                 }
@@ -1418,7 +1521,12 @@ class Iap2SenderSession(
             val remaining = (deadline - nanoTime()) / 1_000_000L
             if (remaining <= 0) return null
             serviceControlUpdates()
-            val bytes = channel.recvControl(minOf(remaining, if (nowPlaying.hasFileWork) 100L else 1_000L))
+            val pollMillis = when {
+                channel.hasQueuedHudMessages -> 50L
+                nowPlaying.hasFileWork -> 100L
+                else -> 1_000L
+            }
+            val bytes = channel.recvControl(minOf(remaining, pollMillis))
             ensureCurrentLink()
             if (bytes == null) {
                 if (!channel.isAlive || nanoTime() >= deadline) return null
@@ -1464,11 +1572,20 @@ class Iap2SenderSession(
 
     private fun serviceControlUpdates() {
         val now = nanoTime() / 1_000_000
-        subscriptions.drain().forEach { sendFireAndForget(it.messageId, it.body) }
+        subscriptions.drain(now).forEach { sendFireAndForget(it.messageId, it.body) }
         if (subscriptions.isAuthenticated) {
-            navigation.updates(now, navigationEnabled(), navigationCue()).forEach {
-                sendFireAndForget(it.messageId, it.body)
+            val enabled = navigationEnabled()
+            val cue = navigationCue()
+            navigation.refreshLaneSource(enabled, cue)
+            if (!channel.hasQueuedHudMessages) navigation.queuedUpdates(now, enabled, cue).forEach {
+                val frame = it.frame
+                if (!channel.queueHudMessage(Iap2Csm.encode(frame.messageId, frame.body), frame.messageId,
+                        it.canStart, it.commitStart)) {
+                    ensureCurrentLink()
+                    throw IOException("iAP2 链路在排队 0x${frame.messageId.toString(16)} 时关闭")
+                }
             }
+            channel.flushHudMessages()
         }
         for (index in 0 until 64) {
             val bytes = channel.recvFileTransfer() ?: break
@@ -1516,6 +1633,10 @@ class Iap2SenderSession(
     private fun remainingMillis(deadlineNanos: Long): Long {
         val remaining = (deadlineNanos - nanoTime()) / 1_000_000L
         return remaining.coerceIn(0, 60_000L)
+    }
+
+    private fun ensureNotCancelled(stage: String) {
+        if (Thread.currentThread().isInterrupted || channel.localStopRequested) throw InterruptedIOException("iAP2 已取消（$stage）")
     }
 
     private fun ensureActive(stage: String) {

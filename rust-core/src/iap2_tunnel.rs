@@ -55,14 +55,35 @@ impl Target {
 }
 
 impl Tunnel {
+    #[cfg(test)]
     pub async fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.write_guarded(bytes, None).await.map(|_| ())
+    }
+
+    pub(crate) async fn write_guarded(
+        &mut self, bytes: &[u8], start: Option<&crate::wifi_iap2::WriteStart>,
+    ) -> Result<bool, String> {
         let mut package = vec![0; HEADER_BYTES];
         let length = (HEADER_BYTES + bytes.len()) as u32;
         package[..4].copy_from_slice(&length.to_be_bytes());
         package[16..20].copy_from_slice(b"comm");
         package.extend_from_slice(bytes);
-        let wire = self.cipher.encrypt(&package);
-        tokio::time::timeout(Duration::from_secs(3), self.socket.write_all(&wire)).await
+        let (wire, counter) = self.cipher.preview_encrypt(&package);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let offset = if let Some(start) = start {
+                match start.prefix(wire.len(), || self.socket.writable(), || self.socket.try_write(&wire)).await? {
+                    Some(count) => count,
+                    None => return Ok(false),
+                }
+            } else { 0 };
+            self.cipher.commit_encrypt(counter);
+            if let Some(start) = start.filter(|start| start.syn_ack) {
+                start.finish_syn_ack(wire.len(), offset, || self.socket.writable(), |at| self.socket.try_write(&wire[at..])).await?;
+            } else {
+                self.socket.write_all(&wire[offset..]).await?;
+            }
+            Ok::<_, std::io::Error>(true)
+        }).await
             .map_err(|_| "type 130 write timeout".to_string())?
             .map_err(|error| format!("type 130 write failed: {error}"))
     }

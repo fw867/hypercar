@@ -41,7 +41,8 @@ class Iap2MediaBluetoothTest {
         val identificationExchange:ByteArray?=null, val afterGreetings:ByteArray?=null,
         var controlVersion: Int? = null, val silentChallenge: Boolean = false,
         val wifiReply:ByteArray=wifiCredentials("fixture-ap"),
-        val signChallenge: ((ByteArray) -> ByteArray)? = null) : Iap2LinkChannel {
+        val signChallenge: ((ByteArray) -> ByteArray)? = null,
+        val duringChallenge: ByteArray = byteArrayOf()) : Iap2LinkChannel {
         val queue=ArrayDeque<ByteArray>()
         val sent=mutableListOf<Int>()
         val updates=mutableListOf<Iap2Csm.Frame>()
@@ -92,7 +93,7 @@ class Iap2MediaBluetoothTest {
                         else Iap2Csm.encode(0xaa01,certificateBody)
                     0xaa02->if (!silentChallenge) {
                         val signature = signChallenge?.invoke(Iap2Csm.parseParams(frame.body).single().value)
-                        queue += Iap2Csm.encode(0xaa03, signature?.let { Iap2Csm.param(0, it) } ?: signatureBody)
+                        queue += duringChallenge + Iap2Csm.encode(0xaa03, signature?.let { Iap2Csm.param(0, it) } ?: signatureBody)
                     }
                     0x4e0b -> afterGreetings?.let { queue += it }
                     0x5702 -> if (wifiReply.isNotEmpty()) queue += wifiReply
@@ -264,6 +265,74 @@ class Iap2MediaBluetoothTest {
         assertEquals(listOf("fixture-ap"), endpoints.map { it.ssid })
         assertEquals(2, endpoints.single().wifiSecurityType)
         assertEquals(6, endpoints.single().wifiChannel)
+    }
+
+    @Test fun id85AcceptsWirelessIdentificationDuringChallengeBeforeRequestingWifi() {
+        val channel = Channel(identificationExchange = appsIdentification(), controlVersion = 2,
+            duringChallenge = legacyBmwIdentification("MGU-55-BMW"))
+        val session = Iap2SenderSession(channel, {}, profile = HeadUnitProfiles.BMW_ID85,
+            nanoTime = { channel.time }, pairedReceiver = true)
+
+        assertEquals("fixture-ap", session.run(10_000).ssid)
+        assertEquals(listOf(0x1d02, 0xaa02, 0x1d02, 0xaa05, 0x5702),
+            channel.sent.filter { it in setOf(0x1d02, 0xaa02, 0xaa05, 0x5702) })
+    }
+
+    @Test fun id85AcknowledgesIdentityThatArrivesWithItsWifiCredentials() {
+        val update = legacyBmwIdentification("MGU-55-BMW")
+        val channel = Channel(identificationExchange = update, wifiReply = update + wifiCredentials("fixture-ap"))
+        val session = Iap2SenderSession(channel, {}, profile = HeadUnitProfiles.BMW_ID85,
+            nanoTime = { channel.time }, pairedReceiver = true)
+
+        assertEquals("fixture-ap", session.run(10_000).ssid)
+        assertEquals(listOf(0x1d02, 0x5702, 0x1d02, 0x4300),
+            channel.sent.filter { it in setOf(0x1d02, 0x5702, 0x4300) })
+    }
+
+    @Test fun id85AppsIdentityArrivingDuringV1ChallengeStillRequiresVerifiedSignature() {
+        val keys = KeyPairGenerator.getInstance("EC").apply { initialize(ECGenParameterSpec("secp256r1")) }
+            .generateKeyPair()
+        for (valid in listOf(true, false)) {
+            val channel = Channel(identificationExchange = legacyBmwIdentification("MGU-55-BMW"),
+                controlVersion = 1, duringChallenge = appsIdentification(), signChallenge = { challenge ->
+                    if (!valid) ByteArray(64) else Signature.getInstance("NONEwithECDSAinP1363Format").run {
+                        initSign(keys.private)
+                        update(challenge)
+                        sign()
+                    }
+                })
+            val session = Iap2SenderSession(channel, {}, profile = HeadUnitProfiles.BMW_ID85,
+                nanoTime = { channel.time }, pairedReceiver = true, verifyMfi3Certificate = { keys.public as ECPublicKey })
+
+            if (valid) assertNull(session.run(10_000).ssid)
+            else assertThrows(java.io.IOException::class.java) { session.run(10_000) }
+            assertEquals(listOf(0x1d02, 0xaa02, 0x1d02, if (valid) 0xaa05 else 0xaa04),
+                channel.sent.filter { it in setOf(0x1d02, 0xaa02, 0xaa04, 0xaa05) })
+            assertFalse(0x5702 in channel.sent)
+        }
+    }
+
+    @Test fun id85IgnoresTruncatedReidentificationWithoutRetiringTheAcceptedIdentity() {
+        val original = legacyBmwIdentification("MGU-55-BMW")
+        val truncated = Iap2Csm.encode(0x1d01, byteArrayOf(0, 5, 0, 1))
+        val channel = Channel(identificationExchange = original, duringChallenge = truncated)
+        val session = Iap2SenderSession(channel, {}, profile = HeadUnitProfiles.BMW_ID85,
+            nanoTime = { channel.time }, pairedReceiver = true)
+
+        assertEquals("fixture-ap", session.run(10_000).ssid)
+        assertEquals(1, channel.sent.count { it == 0x1d02 })
+    }
+
+    @Test fun id85StopsLegacyWifiExchangeWhenTheCarClosesItsWindow() {
+        val channel = Channel(identificationExchange = legacyBmwIdentification("MGU-55-BMW"),
+            wifiReply = appsIdentification() + wifiCredentials("retired-ap"))
+        val endpoints = mutableListOf<CarPlayEndpoint>()
+        val session = Iap2SenderSession(channel, {}, profile = HeadUnitProfiles.BMW_ID85,
+            nanoTime = { channel.time }, pairedReceiver = true, onEndpoint = endpoints::add)
+
+        assertNull(session.run(10_000).ssid)
+        assertTrue(endpoints.isEmpty())
+        assertEquals(listOf(0x1d02, 0x5702, 0x1d02), channel.sent.filter { it in setOf(0x1d02, 0x5702, 0x4300) })
     }
 
     @Test fun newHotspotCapabilitiesSurviveAddressOnlyReportsAndDoNotRestoreOldSecurity() {

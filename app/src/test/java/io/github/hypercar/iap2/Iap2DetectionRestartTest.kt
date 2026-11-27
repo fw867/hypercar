@@ -15,8 +15,8 @@ class Iap2DetectionRestartTest {
             if (zeroRetryAndAck) 0 else 4000, if (zeroRetryAndAck) 0 else 1000,
             if (zeroRetryAndAck) 0 else 4, if (zeroRetryAndAck) 0 else 1,
             listOf(Iap2LinkEngine.SessionDescriptor(session, 0, 2))).encode())
-    private fun normal(reliable: Boolean = false, zeroRetryAndAck: Boolean = false): Iap2LinkEngine {
-        val link = Iap2LinkEngine(reliableTransport = reliable)
+    private fun normal(reliable: Boolean = false, zeroRetryAndAck: Boolean = false, window: Int = 127): Iap2LinkEngine {
+        val link = Iap2LinkEngine(reliableTransport = reliable, declaredWindow = window)
         link.start(0, passive = true)
         link.feed(syn(zeroRetryAndAck = zeroRetryAndAck), 1)
         val answer = link.takeOutput()
@@ -24,6 +24,108 @@ class Iap2DetectionRestartTest {
         link.takeOutput()
         assertEquals(Iap2LinkEngine.State.NORMAL, link.state)
         return link
+    }
+
+    @Test fun authenticationOutputRemainsProtectedAcrossWindowWaitAndRetransmit() {
+        val link = normal(window = 1)
+        val result = Iap2Csm.encode(0xaa05)
+        link.sendControl(Iap2Csm.encode(0x4300), 3)
+        val first = link.takeOutput()
+        link.sendMfiControl(result, 4, awaitAck = true, result = true)
+        assertEquals(1, link.queuedControlPackets)
+        assertFalse(link.outputContainsMfi)
+        link.feed(packet(0x40, 40, first[5].toInt() and 255), 5)
+        assertTrue(link.outputContainsMfi)
+        val sent = link.takeOutput()
+        assertArrayEquals(result, sent.copyOfRange(9, sent.size - 1))
+        assertFalse(link.outputContainsMfi)
+        link.advanceTime(4006)
+        assertTrue(link.outputContainsMfi)
+        assertTrue(link.takeOutput().size >= sent.size)
+        assertFalse(link.outputContainsMfi)
+    }
+
+    @Test fun localStopBeforeAckOrRetryPreventsAnotherResultFromReachingTheSocket() {
+        for (alreadySent in listOf(false, true)) {
+            val link = normal(window = 1)
+            val transport = RfcommTransport(java.io.Closeable {})
+            val result = Iap2Csm.encode(0xaa05)
+            val lines = mutableListOf<String>()
+            link.mfiLog = lines::add
+            if (alreadySent) {
+                link.sendMfiControl(result, 3, awaitAck = true, result = true)
+                transport.writeOutput(link) { assertArrayEquals(result, it.copyOfRange(9, it.size - 1)) }
+                transport.noteLocalStop()
+                link.advanceTime(4004)
+            } else {
+                link.sendControl(Iap2Csm.encode(0x4300), 3)
+                val seq = link.takeOutput()[5].toInt() and 255
+                link.sendMfiControl(result, 4, awaitAck = true, result = true)
+                transport.noteLocalStop()
+                link.feed(packet(0x40, 40, seq), 5)
+            }
+            assertThrows(java.io.InterruptedIOException::class.java) {
+                transport.writeOutput(link) { fail("cancelled 0xaa05 reached the socket") }
+            }
+            assertEquals(if (alreadySent) 1 else 0, lines.count { "RFCOMM written " in it })
+            assertTrue(lines.last().contains("RFCOMM cancelled id=0xaa05"))
+            assertTrue(lines.last().contains("retry=${if (alreadySent) 1 else 0} "))
+        }
+    }
+
+    @Test fun synchronousWriteFailureReachesCallerAfterQueueAdmission() {
+        val link = normal()
+        val lines = mutableListOf<String>()
+        link.mfiLog = lines::add
+        val transport = RfcommTransport(java.io.Closeable {})
+        val error = java.io.IOException("socket write failed")
+        val seen = assertThrows(java.io.IOException::class.java) {
+            transport.sendMfiControl(link, Iap2Csm.encode(0xaa05), 3, true, result = true) {
+                try {
+                    transport.writeOutput(link) { throw error }
+                    null
+                } catch (failure: java.io.IOException) {
+                    failure
+                }
+            }
+        }
+        assertSame(error, seen)
+        assertEquals(2, lines.size)
+        assertTrue(lines[0].contains("RFCOMM enqueued id=0xaa05"))
+        assertTrue(lines[1].contains("RFCOMM write_failed id=0xaa05 seq=101 retry=0 "))
+    }
+
+    @Test fun delayedFragmentAndRetryAreReportedOnlyAfterTheirWritesReturn() {
+        val link = normal(window = 1)
+        val transport = RfcommTransport(java.io.Closeable {})
+        val lines = mutableListOf<String>()
+        link.mfiLog = lines::add
+        link.sendControl(byteArrayOf(1), 3)
+        val firstSeq = link.takeOutput()[5].toInt() and 255
+        link.sendMfiControl(byteArrayOf(0), 4, true, result = true) // A continuation fragment has no CSM header.
+        assertEquals(0, transport.writeOutput(link) { fail("window still full") })
+        assertEquals(1, lines.size)
+        link.feed(packet(0x40, 40, firstSeq), 5)
+        transport.writeOutput(link) { assertEquals(1, lines.size) }
+        assertTrue(lines.last().contains("RFCOMM written id=0xaa05 seq=102 retry=0 fragment_bytes=1"))
+        link.advanceTime(4006)
+        transport.writeOutput(link) { assertEquals(2, lines.size) }
+        assertTrue(lines.last().contains("RFCOMM written id=0xaa05 seq=102 retry=1 fragment_bytes=1"))
+    }
+
+    @Test fun resetAndEofDiscardQueuedAndBufferedFragmentsWithoutReportingAWireWrite() {
+        for (eof in listOf(false, true)) {
+            val link = normal(window = 1)
+            val lines = mutableListOf<String>()
+            link.mfiLog = lines::add
+            repeat(2) { link.sendMfiControl(byteArrayOf(0), 3, true, result = true) }
+            if (eof) link.feedEof() else link.feed(Iap2LinkEngine.MARKER, 4)
+            val reason = if (eof) "link_ended" else "link_reset"
+            assertEquals(2, lines.count { "discarded id=0xaa05" in it && "reason=$reason" in it })
+            assertTrue(lines.any { "seq=unassigned" in it })
+            assertTrue(lines.any { "seq=101" in it })
+            assertFalse(lines.any { "RFCOMM written" in it })
+        }
     }
 
     @Test fun zeroAckSuppressionIsWifiOnlyAndNewSynReplacesThePolicy() {

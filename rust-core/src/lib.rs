@@ -71,7 +71,7 @@ use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;
 
 use jni::objects::{GlobalRef, JByteArray, JClass, JLongArray, JObject, JShortArray, JString};
-use jni::sys::{jboolean, jint, jlong, JNI_FALSE, JNI_TRUE};
+use jni::sys::{jboolean, jint, jlong, jlongArray, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -343,11 +343,15 @@ pub(crate) fn emit_iap2_start(id: u64, device: &str, device_name: &str, profile_
     });
 }
 
-pub(crate) fn emit_iap2_bytes(id: u64, bytes: &[u8]) {
-    call_listener("onIap2Bytes", |env, obj| {
+pub(crate) fn emit_iap2_ingress(id: u64, ticket: u64, written_syn_ack: u64, bytes: &[u8]) -> bool {
+    let mut accepted = false;
+    call_listener("onIap2Ingress", |env, obj| {
         let data = env.byte_array_from_slice(bytes)?;
-        env.call_method(obj, "onIap2Bytes", "(J[B)V", &[(id as jlong).into(), (&data).into()]).map(|_| ())
+        accepted = env.call_method(obj, "onIap2Ingress", "(JJ[BJ)Z",
+            &[(id as jlong).into(), (ticket as jlong).into(), (&data).into(), (written_syn_ack as jlong).into()])?.z()?;
+        Ok(())
     });
+    accepted
 }
 
 pub(crate) fn emit_iap2_stop(id: u64) {
@@ -371,27 +375,78 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeWifiIap
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendWifiIap2Detect(
-    _env: JNIEnv, _class: JClass, id: jlong,
+    _env: JNIEnv, _class: JClass, id: jlong, generation: jlong,
 ) -> jboolean {
-    if wifi_iap2::queue_startup_detect(id as u64) { JNI_TRUE } else { JNI_FALSE }
+    if id > 0 && wifi_iap2::queue_startup_detect(id as u64, generation as u64) { JNI_TRUE } else { JNI_FALSE }
 }
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendIap2(
-    env: JNIEnv, _class: JClass, id: jlong, bytes: JByteArray, hud_message_id: jint, hud_serial: jlong,
+    env: JNIEnv, _class: JClass, id: jlong, generation: jlong, bytes: JByteArray,
+    hud_message_id: jint, hud_serial: jlong, ticket: jlong,
 ) -> jboolean {
     if id <= 0 { return JNI_FALSE; }
     match env.convert_byte_array(&bytes) {
-        Ok(data) => if wifi_iap2::send(id as u64, data, hud_message_id, hud_serial) { JNI_TRUE } else { JNI_FALSE },
+        Ok(data) => if wifi_iap2::send_packet(id as u64, generation as u64, data, hud_message_id, hud_serial, ticket) { JNI_TRUE } else { JNI_FALSE },
         _ => JNI_FALSE,
     }
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeMarkWifiIap2Ready(
-    _env: JNIEnv, _class: JClass, id: jlong, ready: jboolean,
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeCancelWifiIap2Write(
+    _env: JNIEnv, _class: JClass, id: jlong, generation: jlong, ticket: jlong,
+) {
+    if id > 0 && ticket > 0 { wifi_iap2::cancel_pending_start(id as u64, generation as u64, ticket as u64); }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeTakeWifiIap2Writes(
+    env: JNIEnv, _class: JClass, id: jlong, generation: jlong,
+) -> jlongArray {
+    let writes = wifi_iap2::take_write_completions(id as u64, generation as u64);
+    if writes.is_empty() { return std::ptr::null_mut(); }
+    match env.new_long_array(writes.len() as i32) {
+        Ok(result) if env.set_long_array_region(&result, 0, &writes).is_ok() => result.into_raw(),
+        _ => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeFinishWifiIap2Ingress(
+    _env: JNIEnv, _class: JClass, id: jlong, ticket: jlong,
+) {
+    if id > 0 && ticket > 0 { wifi_iap2::finish_ingress(id as u64, ticket as u64); }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeWifiIap2IngressFence(
+    _env: JNIEnv, _class: JClass, id: jlong, through: jlong,
+) -> jlong {
+    wifi_iap2::ingress_fence(id as u64, through as u64) as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeWifiIap2DestinationCurrent(
+    _env: JNIEnv, _class: JClass, id: jlong, generation: jlong,
 ) -> jboolean {
-    if id > 0 && wifi_iap2::mark_ready(id as u64, ready != JNI_FALSE) { JNI_TRUE } else { JNI_FALSE }
+    if wifi_iap2::destination_current(id as u64, generation as u64) { JNI_TRUE } else { JNI_FALSE }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeWifiIap2SendCapacity(
+    _env: JNIEnv, _class: JClass, id: jlong, generation: jlong,
+) -> jint {
+    if id <= 0 { return -1; }
+    wifi_iap2::send_capacity(id as u64, generation as u64).map_or(-1, |capacity| capacity as jint)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeMarkWifiIap2Ready(
+    _env: JNIEnv, _class: JClass, id: jlong, generation: jlong, ready: jboolean,
+) -> jboolean {
+    if id > 0 && wifi_iap2::mark_ready_generation(id as u64, Some(generation as u64), ready != JNI_FALSE) {
+        JNI_TRUE
+    } else { JNI_FALSE }
 }
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeCanKeepWifiSession(

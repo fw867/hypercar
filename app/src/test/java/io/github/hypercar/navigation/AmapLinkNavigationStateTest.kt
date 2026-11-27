@@ -120,6 +120,38 @@ class AmapLinkNavigationStateTest {
         state.accept(token, 5, JSONObject().put("maneuverID", 2), 104)
         assertTrue(state.snapshot(104)!!.lanes.isEmpty())
     }
+    @Test fun lanesExpireIndependentlyAndDoNotFollowTheSameTurnOntoAnotherRoad() {
+        val state = AmapLinkNavigationState(); val token = state.begin()
+        val lanes = JSONObject().put("laneCount", 1)
+            .put("backLane", org.json.JSONArray(listOf(3))).put("frontLane", org.json.JSONArray(listOf(3)))
+        state.accept(token, 4, info().put("nextRouteName", "first"), 0)
+        state.accept(token, 14, lanes, 1)
+        state.accept(token, 4, info().put("nextRouteName", "first"), 15_001)
+        assertEquals(1, state.snapshot(15_001)!!.lanes.size)
+        assertTrue(state.snapshot(15_002)!!.lanes.isEmpty())
+        state.accept(token, 14, lanes, 15_003)
+        state.accept(token, 4, info().put("nextRouteName", "second"), 15_004)
+        assertTrue(state.snapshot(15_004)!!.lanes.isEmpty())
+    }
+
+    @Test fun sameRoadTurnsDoNotShareLanesAfterReachingTheFirstJunction() {
+        val state = AmapLinkNavigationState(); val token = state.begin()
+        fun guidance(distance: Int) = info().put("curRouteName", "Main").put("nextRouteName", "Main")
+            .put("segmentRemainDist", distance)
+        val lanes = JSONObject().put("laneCount", 1)
+            .put("backLane", org.json.JSONArray(listOf(3))).put("frontLane", org.json.JSONArray(listOf(3)))
+        state.accept(token, 4, guidance(5), 0)
+        state.accept(token, 14, lanes, 1)
+        state.accept(token, 4, guidance(6), 2)
+        assertEquals(1, state.snapshot(2)!!.lanes.size)
+        state.accept(token, 4, guidance(40), 1_000)
+        assertTrue(state.snapshot(1_000)!!.lanes.isEmpty())
+        state.accept(token, 4, guidance(5).put("routeRemainDist", 120), 2_000)
+        state.accept(token, 14, lanes, 2_001)
+        state.accept(token, 4, guidance(12).put("routeRemainDist", 114), 2_002)
+        assertTrue(state.snapshot(2_002)!!.lanes.isEmpty())
+    }
+
     @Test fun malformedLaneDataDoesNotInventDirectionsAndHideClearsOldLanes() {
         val state = AmapLinkNavigationState(); val token = state.begin()
         state.accept(token, 4, info(), 0)

@@ -12,6 +12,7 @@ data class NavigationCue(
     val remainingDistanceMeters: Long? = null,
     val remainingTimeSeconds: Long? = null,
     val lanes: List<NavigationLane> = emptyList(),
+    val destinationToShare: NavigationDestinationShare? = null,
 ) {
     init {
         require(state in 0..6)
@@ -25,6 +26,68 @@ data class NavigationCue(
 
 /** AMap LaneAction, not the maneuver enum. Foreground 255 means this lane is not recommended. */
 data class NavigationLane(val direction: Int, val recommended: Boolean, val foregroundDirection: Int? = null)
+
+/** Destination explicitly selected for handoff by the navigation source. */
+data class NavigationDestination(
+    val id: String,
+    val latitude: Double,
+    val longitude: Double,
+    val locale: String,
+    val name: String = "",
+    val address: String = "",
+) {
+    init {
+        require(latitude in -90.0..90.0 && longitude in -180.0..180.0)
+        require(id.isNotBlank() && id.encodeToByteArray().size <= 128 && '\u0000' !in id)
+        require(locale.isNotBlank() && locale.encodeToByteArray().size <= 32 && '\u0000' !in locale)
+        require(name.encodeToByteArray().size <= 512 && '\u0000' !in name)
+        require(address.encodeToByteArray().size <= 512 && '\u0000' !in address)
+    }
+}
+
+/** Issued by an authenticated Wi-Fi iAP2 session. The caller obtains consent before authorizing. */
+class NavigationDestinationTarget internal constructor() {
+    private var active = true
+    private var current: NavigationDestinationShare? = null
+
+    @Synchronized
+    fun authorize(destination: NavigationDestination): NavigationDestinationShare? {
+        if (!active) return null
+        return NavigationDestinationShare(destination).also { current = it }
+    }
+
+    @Synchronized
+    internal fun isCurrent(share: NavigationDestinationShare): Boolean = active && current === share
+
+    @Synchronized
+    internal fun commitIfCurrent(
+        share: NavigationDestinationShare, transportCurrent: () -> Boolean = { true }, commit: () -> Unit,
+    ): Boolean {
+        if (!isCurrent(share) || !transportCurrent()) return false
+        commit()
+        return true
+    }
+
+    @Synchronized
+    internal fun canClaim(share: NavigationDestinationShare): Boolean = isCurrent(share) && !share.claimed
+
+    @Synchronized
+    internal fun claim(share: NavigationDestinationShare): Boolean {
+        if (!canClaim(share)) return false
+        share.claimed = true
+        return true
+    }
+
+    @Synchronized
+    internal fun close() {
+        active = false
+        current = null
+    }
+}
+
+class NavigationDestinationShare internal constructor(internal val destination: NavigationDestination) {
+    internal var claimed = false
+}
 
 internal object AmapNotificationParser {
     private val distance = Regex("^(\\d+(?:\\.\\d+)?)\\s*(公里|千米|米|km|m)\\s*(?:后|後)?\\s*[,，:：]?\\s*(.+)$", RegexOption.IGNORE_CASE)

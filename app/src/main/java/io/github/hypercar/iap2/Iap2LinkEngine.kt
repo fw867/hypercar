@@ -38,6 +38,7 @@ class Iap2LinkEngine(
     maxRetransmissions: Int = 4,
     private val reliableTransport: Boolean = false,
     private val declaredWindow: Int = PHONE_DECLARED_MAX_OUTGOING,
+    private val socketWriteFeedback: Boolean = false,
 ) {
     enum class State { IDLE, NEGOTIATING, NORMAL, DEAD }
 
@@ -111,18 +112,86 @@ class Iap2LinkEngine(
         ) : Event()
     }
 
+    private enum class MfiControl { OTHER, RESULT }
+
+    private class BulkMessage(val canStart: () -> Boolean, val commitStart: (() -> Boolean)?) {
+        var started = false
+    }
+
     private class Packet(
         var sequence: Int,
         val payload: ByteArray,
         var retransmissions: Int = 0,
-        var deadlineMillis: Long = 0,
+        var deadlineMillis: Long? = null,
         val awaitAck: Boolean = true,
         val sessionId: Int? = null,
         val optional: Boolean = false,
+        val mfi: MfiControl? = null,
         val hudMessageId: Int = 0,
         var hudSerial: Long = 0,
         val onSequenceAssigned: ((Int) -> Unit)? = null,
-    )
+        val bulk: BulkMessage? = null,
+        val onWritten: (() -> Unit)? = null,
+    ) {
+        var writeTicket = 0L
+        var retryDueAt: Long? = null
+    }
+
+    private class PendingStart(val packet: Packet) {
+        var acknowledged = false
+        var cancelRequested = false
+        var revoked = false
+    }
+    internal data class SocketWrite(val offset: Int, val ticket: Long, val cancellable: Boolean)
+    internal var withdrawSocketWrite: ((Long) -> Unit)? = null
+    private var nextWriteTicket = 0L
+    private var pendingStart: PendingStart? = null
+    private val socketWrites = mutableListOf<SocketWrite>()
+    private val writeCallbacks = mutableMapOf<Long, () -> Unit>()
+
+    internal fun takeSocketWrites(): List<SocketWrite> = socketWrites.toList().also { socketWrites.clear() }
+
+    internal fun socketWriteFinished(ticket: Long, writtenAt: Long?) {
+        if (state == State.DEAD) return
+        val onWritten = writeCallbacks.remove(ticket)
+        val start = pendingStart
+        if (start != null && start.packet.writeTicket == ticket) {
+            pendingStart = null
+            val packet = start.packet
+            val group = checkNotNull(packet.bulk)
+            if (writtenAt == null) {
+                val tail = sendBacklog.filter { it.bulk === group }
+                sendBacklog.removeAll { it.bulk === group }
+                if (!start.revoked && group.canStart()) {
+                    val index = sendBacklog.indexOfFirst { it.bulk?.started == false }
+                    sendBacklog.addAll(if (index < 0) sendBacklog.size else index, listOf(packet) + tail)
+                }
+                if (!zeroRetryAndAckMode) pendingReliableAck = true
+                return
+            }
+            // No other data sequence was assigned while this first fragment was cancellable.
+            sentSequence = packet.sequence
+            group.started = true
+            group.commitStart?.invoke()
+            trackHudAcknowledgement(packet)
+            if (packet.awaitAck && agreedRetryCount > 0 && retryTimeoutMillis > 0) {
+                unacknowledged += packet
+                packet.deadlineMillis = writtenAt + retryTimeoutMillis
+                updateRetransmitDeadline()
+            }
+            if (start.acknowledged) handleAcknowledgement(packet.sequence, writtenAt)
+            onWritten?.invoke()
+            return
+        }
+        unacknowledged.firstOrNull { it.writeTicket == ticket }?.let {
+            val retryDue = it.retryDueAt
+            it.retryDueAt = null
+            if (retryDue != null && writtenAt != null) it.retransmissions++
+            it.deadlineMillis = if (writtenAt != null) writtenAt + retryTimeoutMillis else retryDue
+            updateRetransmitDeadline()
+        }
+        if (writtenAt != null) onWritten?.invoke()
+    }
 
     internal data class HudFrame(val offset: Int, val messageId: Int, val sequence: Int, val serial: Long) {
         val label get() = "id=0x${messageId.toString(16)} seq=$sequence hud_serial=$serial"
@@ -181,6 +250,8 @@ class Iap2LinkEngine(
             it.kind == CONTROL_KIND && it.id != 0 && it.id == controlSessionId()
         }?.version
     val queuedControlPackets: Int get() = sendBacklog.size
+    internal val hasBulkControl: Boolean get() = pendingStart != null || sendBacklog.any { it.bulk != null }
+    internal val hasNonBulkControl: Boolean get() = sendBacklog.any { it.bulk == null && !it.optional }
     val outstandingPackets: Int get() = lastSentAcknowledged?.let { sequenceDistance(sentSequence,it) } ?: 0
 
     /** 诊断：首次采纳对端会话表时回调（打印对端提议的会话表，便于真车排查）。 */
@@ -201,6 +272,25 @@ class Iap2LinkEngine(
     private val sendBacklog = ArrayDeque<Packet>()
     private val pendingEvents = ArrayDeque<Event>()
     private val output = ByteArrayOutputStream()
+    private var outputPacketCount = 0
+    private var flushOutputLimit: Int? = null
+    private var newBulkOutputLimit = 0
+    internal data class MfiResultFrame(val sequence: Int, val retry: Int, val fragmentBytes: Int) {
+        val label get() = "id=0xaa05 seq=$sequence retry=$retry fragment_bytes=$fragmentBytes"
+    }
+    internal var mfiLog: ((String) -> Unit)? = null
+    private val mfiResults = mutableListOf<MfiResultFrame>()
+    internal var outputContainsMfi = false
+        private set
+    internal fun pendingMfiResults(): List<MfiResultFrame> = mfiResults.toList()
+
+    internal fun reportDiscardedMfi(reason: String) {
+        val log = mfiLog ?: return
+        sendBacklog.forEach {
+            if (it.mfi == MfiControl.RESULT) log("MFi RFCOMM discarded id=0xaa05 seq=unassigned fragment_bytes=${it.payload.size} reason=$reason")
+        }
+        mfiResults.forEach { log("MFi RFCOMM discarded ${it.label} reason=$reason") }
+    }
     private val receive = ReceiveBuffer()
 
     private var markerDeadline: Long? = null
@@ -224,6 +314,8 @@ class Iap2LinkEngine(
     /** 上一次回显 SYN 时对端的 SYN 序号与我方序号（重传同一 SYN 时原样重放）。 */
     private var lastEchoPeerSequence: Int? = null
     private var lastEchoOwnSequence = 0
+    private var lastEchoTicket = 0L
+    private var inboundWrittenSynAck = 0L
 
     /** 最近一次出向帧时刻（NORMAL 态裸 ACK 保活的基准）。 */
     private var lastOutputMillis: Long = 0
@@ -235,6 +327,7 @@ class Iap2LinkEngine(
         receive.size > 1 || (receive.size == 1 && receive[0] == 0xff.toByte())
 
     /** Same-transport detection restart: consumers must discard partial CSMs from the old link. */
+    internal var onDetectionRetiring: (() -> Unit)? = null
     var onDetectionRestart: (() -> Unit)? = null
     // Wi-Fi drains CSM responses before flushing a required standalone ACK.
     private var pendingReliableAck = false
@@ -267,8 +360,10 @@ class Iap2LinkEngine(
     fun feed(
         bytes: ByteArray,
         nowMillis: Long,
+        writtenSynAck: Long = 0L,
     ) {
         if (state == State.DEAD) return
+        inboundWrittenSynAck = writtenSynAck
         var offset = 0
         while (offset < bytes.size && state != State.DEAD) {
             val room = receive.remainingCapacity()
@@ -288,10 +383,17 @@ class Iap2LinkEngine(
     fun feedEof() = die(null)
 
     fun takeOutput(): ByteArray {
-        if (pendingReliableAck) writePacket(null, sentSequence, CONTROL_ACKNOWLEDGEMENT, 0)
+        if (pendingReliableAck && pendingStart == null) writePacket(null, sentSequence, CONTROL_ACKNOWLEDGEMENT, 0)
         val bytes = output.toByteArray()
-        output.reset()
+        resetOutput()
         return bytes
+    }
+
+    private fun resetOutput() {
+        output.reset()
+        outputPacketCount = 0
+        outputContainsMfi = false
+        mfiResults.clear()
     }
 
     fun pollEvent(): Event? = if (pendingEvents.isEmpty()) null else pendingEvents.removeFirst()
@@ -301,7 +403,9 @@ class Iap2LinkEngine(
         return listOfNotNull(markerDeadline, syncDeadline, retransmitDeadline, keepAlive).minOrNull()
     }
 
-    fun advanceTime(nowMillis: Long) {
+    internal fun retryDeadlineReached(nowMillis: Long) = retransmitDeadline?.let { it <= nowMillis } == true
+
+    fun advanceTime(nowMillis: Long, allowRetryExpiry: Boolean = true) {
         if (state == State.DEAD) return
         if (markerDeadline != null && markerDeadline!! <= nowMillis) {
             markerDeadline = null
@@ -322,7 +426,7 @@ class Iap2LinkEngine(
                 syncDeadline = nowMillis + SYNC_RESEND_MILLIS
             }
         }
-        if (retransmitDeadline != null && retransmitDeadline!! <= nowMillis) {
+        if (allowRetryExpiry && retryDeadlineReached(nowMillis)) {
             retransmitDeadline = null
             if (state == State.NORMAL) retransmitDue(nowMillis)
         }
@@ -350,6 +454,14 @@ class Iap2LinkEngine(
         awaitAck: Boolean = true,
         hudMessageId: Int = 0,
         onSequenceAssigned: ((Int) -> Unit)? = null,
+    ): Boolean = enqueueControl(bytes, nowMillis, awaitAck, hudMessageId, onSequenceAssigned, mfi = null)
+
+    internal fun sendMfiControl(bytes: ByteArray, nowMillis: Long, awaitAck: Boolean, result: Boolean = false): Boolean =
+        enqueueControl(bytes, nowMillis, awaitAck, 0, null, if (result) MfiControl.RESULT else MfiControl.OTHER)
+
+    private fun enqueueControl(
+        bytes: ByteArray, nowMillis: Long, awaitAck: Boolean, hudMessageId: Int,
+        onSequenceAssigned: ((Int) -> Unit)?, mfi: MfiControl?,
     ): Boolean {
         if (state == State.DEAD) return false
         val limit = (peerSynchronization?.maxLength ?: 0xFFFF) - HEADER_BYTES - 1
@@ -357,10 +469,68 @@ class Iap2LinkEngine(
             die("control payload ${bytes.size} exceeds negotiated limit $limit")
             return false
         }
-        sendBacklog += Packet(0, bytes.copyOf(), awaitAck = awaitAck, hudMessageId = hudMessageId,
+        val packet = Packet(0, bytes.copyOf(), awaitAck = awaitAck, hudMessageId = hudMessageId, mfi = mfi,
             onSequenceAssigned = onSequenceAssigned)
+        // Once a CSM starts, keep its remaining fragments contiguous in the control session.
+        val waitingGroup = pendingStart?.packet?.bulk
+        val bulkStart = sendBacklog.indexOfFirst { it.bulk?.started == false && it.bulk !== waitingGroup }
+        if (bulkStart < 0) sendBacklog.addLast(packet) else sendBacklog.add(bulkStart, packet)
+        // The first optional sequence is provisional until the transport reports a write.
+        pendingStart?.let { start ->
+            if (!start.cancelRequested) {
+                start.cancelRequested = true
+                withdrawSocketWrite?.invoke(start.packet.writeTicket)
+            }
+        }
+        if (mfi == MfiControl.RESULT) mfiLog?.invoke("MFi RFCOMM enqueued id=0xaa05 fragment_bytes=${bytes.size}")
         drainSendWindow(nowMillis)
         return true
+    }
+
+    /** Optional complete CSM. Only the application worker may start it, after handling inbound messages. */
+    internal fun queueBulkControl(
+        bytes: ByteArray, awaitAck: Boolean, hudMessageId: Int, canStart: () -> Boolean,
+        commitStart: (() -> Boolean)? = null,
+        onWritten: (() -> Unit)? = null,
+    ): Boolean {
+        val limit = (peerSynchronization?.maxLength ?: 0xffff) - HEADER_BYTES - 1
+        if (state != State.NORMAL || limit <= 0) return false
+        val group = BulkMessage(canStart, commitStart)
+        var offset = 0
+        while (offset < bytes.size) {
+            val end = minOf(bytes.size, offset + limit)
+            sendBacklog.addLast(Packet(0, bytes.copyOfRange(offset, end), awaitAck = awaitAck,
+                hudMessageId = hudMessageId, bulk = group, onWritten = onWritten.takeIf { end == bytes.size }))
+            offset = end
+        }
+        return true
+    }
+
+    internal fun discardUnstartedBulkControl() {
+        val start = pendingStart
+        val waitingGroup = start?.packet?.bulk
+        val invalid = sendBacklog.mapNotNull { it.bulk }.toSet()
+            .filterTo(mutableSetOf()) { it !== waitingGroup && !it.started && !it.canStart() }
+        sendBacklog.removeAll { it.bulk in invalid }
+        if (start != null && waitingGroup?.canStart() == false) {
+            start.revoked = true
+            if (!start.cancelRequested) {
+                start.cancelRequested = true
+                withdrawSocketWrite?.invoke(start.packet.writeTicket)
+            }
+        }
+    }
+
+    internal fun flushBulkControl(
+        nowMillis: Long, capacity: Int, allowBulkStart: Boolean = true, reserveForNewBulk: Int = 0,
+    ) {
+        flushOutputLimit = minOf(capacity.coerceAtLeast(0), outputPacketCount + 8)
+        newBulkOutputLimit = (capacity - reserveForNewBulk).coerceAtLeast(0)
+        try {
+            drainSendWindow(nowMillis, allowBulkStart)
+        } finally {
+            flushOutputLimit = null
+        }
     }
 
     /** Only a file-transfer session actually negotiated by this peer may carry artwork. */
@@ -390,7 +560,9 @@ class Iap2LinkEngine(
                 if (receive.peek(MARKER.size).contentEquals(MARKER)) {
                     receive.discard(MARKER.size)
                     if (deferInitialDetectEcho && !previouslyNegotiated) return true
-                    if (state == State.NORMAL) restartDetection(nowMillis)
+                    if (state == State.NORMAL || (reliableTransport && lastEchoPeerSequence != null)) {
+                        restartDetection(nowMillis)
+                    }
                     // A reflected echo must not create a tight DETECT ping-pong. Real peer
                     // retries (typically one second) still get a reply if the first is lost.
                     if (lastMarkerEchoMillis?.let { nowMillis - it >= 250L } != false) {
@@ -438,28 +610,35 @@ class Iap2LinkEngine(
     }
 
     private fun restartDetection(nowMillis: Long) {
+        onDetectionRetiring?.invoke()
+        reportDiscardedMfi("link_reset")
         state = State.NEGOTIATING
         passiveNegotiation = true
         peerSynchronization = null
         adoptedSynchronization = null
         adoptedPeerControlSessionId = null
-        sentSequence = INITIAL_SEQUENCE
+        // The refreshed Wi-Fi link must not reuse the preceding SYN|ACK sequence.
+        sentSequence = if (reliableTransport) pendingStart?.packet?.sequence ?: sentSequence else INITIAL_SEQUENCE
         endHudTrace("link_reset")
         lastSentAcknowledged = null
         lastReceivedInOrder = 0
         lastEchoPeerSequence = null
         lastEchoOwnSequence = 0
+        lastEchoTicket = 0
         declaredMaxOutgoing = maxOutgoing
         markerDeadline = null
         syncDeadline = null
         retransmitDeadline = null
+        pendingStart = null
+        socketWrites.clear()
+        writeCallbacks.clear()
         pendingReliableAck = false
         lastMarkerEchoMillis = null
         lastOutputMillis = nowMillis
         unacknowledged.clear()
         sendBacklog.clear()
         pendingEvents.clear()
-        output.reset()
+        resetOutput()
         // Keep unread bytes: the new SYN can share this read with DETECT.
         onDetectionRestart?.invoke()
     }
@@ -499,7 +678,8 @@ class Iap2LinkEngine(
             } else if (sync != null &&
                 !isPureSyn &&
                 adoptedSynchronization == null &&
-                state == State.NEGOTIATING
+                state == State.NEGOTIATING &&
+                (!reliableTransport || (!passiveNegotiation && ack == sentSequence))
             ) {
                 // 发起方收到 SYN|ACK（对端对我们 SYN 的应答，载荷=对端表）：
                 // 只采纳、**不回显**（回显会形成互回 SYN|ACK 的乒乓）。
@@ -515,6 +695,12 @@ class Iap2LinkEngine(
             }
         }
         if (control and CONTROL_ACKNOWLEDGEMENT != 0 && peerSynchronization != null) {
+            // A passive Wi-Fi link only opens when the peer confirms this round's SYN|ACK.
+            if (reliableTransport && state == State.NEGOTIATING && passiveNegotiation) {
+                val echoWasWritten = !socketWriteFeedback ||
+                    (lastEchoTicket != 0L && inboundWrittenSynAck == lastEchoTicket)
+                if (control and CONTROL_SYNCHRONIZE != 0 || ack != lastEchoOwnSequence || !echoWasWritten) return
+            }
             handleAcknowledgement(ack, nowMillis)
         }
         val isDataFrame =
@@ -557,14 +743,14 @@ class Iap2LinkEngine(
         sync: SynchronizationPayload,
         peerSequence: Int,
     ) {
-        if (lastEchoPeerSequence == peerSequence) {
-            writePacket(ownSyncOf(sync).encode(), lastEchoOwnSequence, CONTROL_SYNCHRONIZE or CONTROL_ACKNOWLEDGEMENT, 0)
-            return
+        if (lastEchoPeerSequence != peerSequence) {
+            lastEchoOwnSequence = nextSequence(sentSequence)
+            sentSequence = lastEchoOwnSequence
+            lastEchoPeerSequence = peerSequence
+            if (socketWriteFeedback) lastEchoTicket = ++nextWriteTicket
         }
-        val ownSequence = nextSequence(sentSequence).also { sentSequence = it }
-        writePacket(ownSyncOf(sync).encode(), ownSequence, CONTROL_SYNCHRONIZE or CONTROL_ACKNOWLEDGEMENT, 0)
-        lastEchoPeerSequence = peerSequence
-        lastEchoOwnSequence = ownSequence
+        if (lastEchoTicket != 0L) socketWrites += SocketWrite(output.size(), lastEchoTicket, cancellable = false)
+        writePacket(ownSyncOf(sync).encode(), lastEchoOwnSequence, CONTROL_SYNCHRONIZE or CONTROL_ACKNOWLEDGEMENT, 0)
     }
 
     /**
@@ -586,6 +772,12 @@ class Iap2LinkEngine(
         acknowledgement: Int,
         nowMillis: Long,
     ) {
+        val start = pendingStart
+        if (start != null && acknowledgement == start.packet.sequence) {
+            // The peer can ACK before the native writer publishes its completion.
+            start.acknowledged = true
+            return
+        }
         val previousAck = lastSentAcknowledged.takeUnless { zeroRetryAndAckMode }
         val confirmedCount = previousAck?.let { sequenceDistance(acknowledgement, it) }
         // A cumulative ACK can repeat the watermark or advance through packets
@@ -608,14 +800,15 @@ class Iap2LinkEngine(
             }
         }
         lastSentAcknowledged = acknowledgement
-        if (previousAck != null && confirmedCount != null) {
-            unacknowledged.removeAll { sequenceDistance(it.sequence, previousAck) in 1..confirmedCount }
-        } else {
-            // Preserve the first ACK and unwindowed Wi-Fi paths.
-            val window = (peerSynchronization?.maxOutgoing ?: maxOutgoing) + ACK_SLACK
-            unacknowledged.removeAll { sequenceDistance(it.sequence, acknowledgement) !in 1..window }
+        val window = (peerSynchronization?.maxOutgoing ?: maxOutgoing) + ACK_SLACK
+        unacknowledged.removeAll {
+            val confirmed = if (previousAck != null && confirmedCount != null)
+                sequenceDistance(it.sequence, previousAck) in 1..confirmedCount
+            else sequenceDistance(it.sequence, acknowledgement) !in 1..window
+            if (confirmed && it.retryDueAt != null) withdrawSocketWrite?.invoke(it.writeTicket)
+            confirmed
         }
-        retransmitDeadline = unacknowledged.minOfOrNull { it.deadlineMillis }
+        updateRetransmitDeadline()
         drainSendWindow(nowMillis)
     }
 
@@ -649,8 +842,8 @@ class Iap2LinkEngine(
 
     // ---- 发送 ----
 
-    private fun drainSendWindow(nowMillis: Long) {
-        if (state != State.NORMAL) return
+    private fun drainSendWindow(nowMillis: Long, allowBulkStart: Boolean = true) {
+        if (state != State.NORMAL || pendingStart != null) return
         val peer = peerSynchronization
         // Box firmware uses the same negotiated mode for the send window and standalone ACKs.
         val sendWindow = if (reliableTransport) (peer?.maxOutgoing ?: maxOutgoing).coerceIn(1, 127)
@@ -658,54 +851,96 @@ class Iap2LinkEngine(
         val retryCount = agreedRetryCount
         val retryTimeout = retryTimeoutMillis
         while (sendBacklog.isNotEmpty()) {
+            val flushLimit = flushOutputLimit
+            if (flushLimit != null && outputPacketCount >= flushLimit) return
             if (!zeroRetryAndAckMode && lastSentAcknowledged != null && outstandingPackets >= sendWindow) return
+            val bulk = sendBacklog.first().bulk
+            if (bulk != null) {
+                if (flushLimit == null) return
+                if (!bulk.started) {
+                    if (!allowBulkStart || outputPacketCount >= newBulkOutputLimit) return
+                    if (!bulk.canStart() || (!socketWriteFeedback && bulk.commitStart?.invoke() == false)) {
+                        while (sendBacklog.firstOrNull()?.bulk === bulk) sendBacklog.removeFirst()
+                        continue
+                    }
+                    if (socketWriteFeedback) {
+                        val first = sendBacklog.removeFirst()
+                        first.sequence = nextSequence(sentSequence)
+                        assignHudSerial(first)
+                        pendingStart = PendingStart(first)
+                        writeDataPacket(first, cancellable = true, needsCompletion = true, firstAttempt = true)
+                        return
+                    }
+                    bulk.started = true
+                }
+            }
             val packet = sendBacklog.removeFirst()
             sentSequence = nextSequence(sentSequence)
             packet.sequence = sentSequence
             packet.onSequenceAssigned?.invoke(packet.sequence)
-            if (hudAwaitingAck.isNotEmpty()) {
-                hudAwaitingAck.values.removeAll { frame ->
-                    val expired = sequenceDistance(sentSequence, frame.sequence) >= 127 || frame.sequence == sentSequence
-                    if (expired) hudLog?.invoke("HUD LINK ${frame.label} ack=unconfirmed reason=sequence_window")
-                    expired
-                }
-            }
-            if (packet.hudMessageId != 0) {
-                packet.hudSerial = ++nextHudSerial
-                if (hudAwaitingAck.isEmpty()) hudAckWatermark = lastSentAcknowledged
-                hudAwaitingAck[packet.sequence] = HudFrame(0, packet.hudMessageId, packet.sequence, packet.hudSerial)
-            }
-            writeDataPacket(packet)
+            assignHudSerial(packet)
+            trackHudAcknowledgement(packet)
+            val trackForRetry = packet.awaitAck && retryCount > 0 && retryTimeout > 0
+            writeDataPacket(packet, needsCompletion = socketWriteFeedback && (trackForRetry || packet.onWritten != null),
+                firstAttempt = true)
             if (!packet.awaitAck) continue // 发后不管：不追踪、不重传（见 sendControl 注释）
-            if (retryCount > 0 && retryTimeout > 0) {
-                packet.deadlineMillis = nowMillis + retryTimeout
+            if (trackForRetry) {
                 unacknowledged += packet
-                retransmitDeadline = retransmitDeadline?.let { minOf(it, packet.deadlineMillis) } ?: packet.deadlineMillis
+                if (!socketWriteFeedback) {
+                    packet.deadlineMillis = nowMillis + retryTimeout
+                    updateRetransmitDeadline()
+                }
             } else if (!reliableTransport && retryCount == 0) {
                 lastSentAcknowledged = sentSequence
             }
         }
     }
 
+    private fun assignHudSerial(packet: Packet) {
+        if (packet.hudMessageId != 0) packet.hudSerial = ++nextHudSerial
+    }
+
+    private fun trackHudAcknowledgement(packet: Packet) {
+        hudAwaitingAck.values.removeAll { frame ->
+            val expired = sequenceDistance(packet.sequence, frame.sequence) >= 127 || frame.sequence == packet.sequence
+            if (expired) hudLog?.invoke("HUD LINK ${frame.label} ack=unconfirmed reason=sequence_window")
+            expired
+        }
+        if (packet.hudMessageId != 0) {
+            if (hudAwaitingAck.isEmpty()) hudAckWatermark = lastSentAcknowledged
+            hudAwaitingAck[packet.sequence] = HudFrame(0, packet.hudMessageId, packet.sequence, packet.hudSerial)
+        }
+    }
+
+    private fun updateRetransmitDeadline() {
+        retransmitDeadline = unacknowledged.mapNotNull { it.deadlineMillis }.minOrNull()
+    }
+
     /** 出向控制消息的会话 ID：采纳了对端表就用其 control ID（Audi=1），否则本表 10。 */
     private fun controlSessionId(): Int = adoptedPeerControlSessionId ?: SESSION_CONTROL
 
     private fun retransmitDue(nowMillis: Long) {
-        val next = unacknowledged.minByOrNull { it.deadlineMillis } ?: return
-        next.retransmissions += 1
-        if (next.optional && next.retransmissions > 1) {
+        val next = unacknowledged.minByOrNull { it.deadlineMillis ?: Long.MAX_VALUE } ?: return
+        if (next.deadlineMillis == null) return
+        if (next.optional && next.retransmissions >= 1) {
             // Artwork has its own bounded business timeout. Its loss must not kill CarPlay.
             unacknowledged.remove(next)
-            retransmitDeadline = unacknowledged.minOfOrNull { it.deadlineMillis }
+            updateRetransmitDeadline()
             return
         }
-        if (next.retransmissions > agreedRetryCount) {
+        if (next.retransmissions >= agreedRetryCount) {
             die("packet ${next.sequence} not acknowledged")
             return
         }
-        next.deadlineMillis = nowMillis + retryTimeoutMillis
-        writeDataPacket(next)
-        retransmitDeadline = unacknowledged.minOfOrNull { it.deadlineMillis }
+        if (socketWriteFeedback) {
+            next.retryDueAt = next.deadlineMillis
+            next.deadlineMillis = null
+        } else {
+            next.retransmissions++
+            next.deadlineMillis = nowMillis + retryTimeoutMillis
+        }
+        writeDataPacket(next, needsCompletion = socketWriteFeedback, cancellable = socketWriteFeedback)
+        updateRetransmitDeadline()
     }
 
     private fun sendSynchronization() {
@@ -779,11 +1014,25 @@ class Iap2LinkEngine(
         appendOutput(frame)
     }
 
-    private fun writeDataPacket(packet: Packet) {
+    private fun writeDataPacket(
+        packet: Packet, needsCompletion: Boolean = false, cancellable: Boolean = false, firstAttempt: Boolean = false,
+    ) {
+        if (needsCompletion) {
+            packet.writeTicket = ++nextWriteTicket
+            socketWrites += SocketWrite(output.size(), packet.writeTicket, cancellable)
+            if (firstAttempt) packet.onWritten?.let { writeCallbacks[packet.writeTicket] = it }
+        }
+        if (packet.mfi != null && state != State.DEAD) {
+            outputContainsMfi = true
+            if (packet.mfi == MfiControl.RESULT) {
+                mfiResults += MfiResultFrame(packet.sequence, packet.retransmissions, packet.payload.size)
+            }
+        }
         if (state != State.DEAD && packet.hudMessageId != 0) {
             hudOutput += HudFrame(output.size(), packet.hudMessageId, packet.sequence, packet.hudSerial)
         }
         writePacket(packet.payload, packet.sequence, CONTROL_ACKNOWLEDGEMENT, packet.sessionId ?: controlSessionId())
+        if (firstAttempt && !socketWriteFeedback) packet.onWritten?.invoke()
     }
 
     /** 单调时钟基准（与调用方喂进 feed/advanceTime 的 nowMillis 同源）。 */
@@ -791,11 +1040,15 @@ class Iap2LinkEngine(
 
     private fun die(reason: String?) {
         if (state == State.DEAD) return
+        reportDiscardedMfi("link_ended")
         state = State.DEAD
         markerDeadline = null
         syncDeadline = null
         retransmitDeadline = null
-        output.reset()
+        pendingStart = null
+        socketWrites.clear()
+        writeCallbacks.clear()
+        resetOutput()
         endHudTrace("link_ended")
         pendingEvents.clear()
         sendBacklog.clear()
@@ -806,6 +1059,7 @@ class Iap2LinkEngine(
     private fun appendOutput(bytes: ByteArray): Boolean {
         if (state == State.DEAD) return false
         output.write(bytes)
+        outputPacketCount++
         return true
     }
 

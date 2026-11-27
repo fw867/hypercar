@@ -25,13 +25,12 @@ import java.util.concurrent.atomic.AtomicReference
  * The NetworkCallback stays alive for the complete CarPlay session. */
 class WifiJoiner(
     private val context: Context,
+    initialAttempt: Long,
     private val diagnostic: (String) -> Unit = {},
     private val maySubmitRequest: () -> Boolean,
-    onLost: () -> Unit,
+    private val captureLossHandler: (Long, Network) -> (() -> Unit),
 ) {
     private class CredentialsSuperseded : kotlinx.coroutines.CancellationException()
-    /** 构造参数转存：避免与 NetworkCallback.onLost 回调方法名冲突。 */
-    private val lostCallback: () -> Unit = onLost
     private fun diagnose(message: String) {
         Log.i(TAG, message)
         diagnostic("WIFI-JOIN: $message")
@@ -53,7 +52,7 @@ class WifiJoiner(
         context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
     /** 当前持有的网络回调（join 时注册，供 onLost 使用）。 */
-    private val association = WifiRequestAssociation<ConnectivityManager.NetworkCallback, Network>()
+    private val association = WifiRequestAssociation<ConnectivityManager.NetworkCallback, Network>(initialAttempt)
 
     /** 当前已绑定的网络（bindProcess 记录，供快路径与 onLost 解绑）。 */
     private val boundNetwork = AtomicReference<Network?>(null)
@@ -275,11 +274,19 @@ class WifiJoiner(
             }
 
             override fun onLost(network: Network) {
-                if (association.owner() !== this) return
+                val attempt = association.lost(this, network, boundFallback = boundNetwork.get() == network) ?: return
+                val onCurrentNetworkLost = captureLossHandler(attempt, network)
                 result.compareAndSet(network, null)
                 trace.log("callback=lost handle=${network.networkHandle} bound=${boundNetwork.get() == network}")
                 trace.lost(connectivityManager, network)
-                handleNetworkLost(this, network)
+                synchronized(bindLock) {
+                    if (association.owner() === this && association.network() == null) {
+                        if (boundNetwork.get() == network) boundNetwork.set(null)
+                        if (connectivityManager.boundNetworkForProcess == network)
+                            connectivityManager.bindProcessToNetwork(null)
+                    }
+                }
+                onCurrentNetworkLost()
             }
 
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
@@ -453,6 +460,11 @@ class WifiJoiner(
 
     fun ownsLiveRequest(network: Network): Boolean = association.owns(network)
 
+    internal fun adopt(network: Network, attempt: Long, claimLease: () -> Boolean): Boolean =
+        association.adopt(network, attempt, claimLease)
+
+    internal fun monitorLost(attempt: Long, network: Network) = association.monitorLost(attempt, network)
+
     internal fun hotspotIdentityFor(network: Network): CarWifiRequestIdentity? = synchronized(bindLock) {
         requestIdentity.takeIf { association.owns(network) }
     }
@@ -494,17 +506,6 @@ class WifiJoiner(
         val ok = connectivityManager.bindProcessToNetwork(network)
         if (ok) boundNetwork.set(network)
         ok
-    }
-
-    private fun handleNetworkLost(owner: ConnectivityManager.NetworkCallback, network: Network) {
-        synchronized(bindLock) {
-            if (!association.lost(owner, network, boundFallback = boundNetwork.get() == network)) return
-            boundNetwork.compareAndSet(network, null)
-            if (connectivityManager.boundNetworkForProcess == network) {
-                connectivityManager.bindProcessToNetwork(null)
-            }
-        }
-        lostCallback()
     }
 
     /** Ordinary cleanup keeps a delivered Wi-Fi request even if onAvailable just raced teardown. */

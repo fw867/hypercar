@@ -4418,13 +4418,7 @@ fn spawn_event_dispatcher(
                     crate::emit_hid_log(&format!("VOICE-KEY: requestSiri action={action:?}"));
                     if let Some(key)=action.and_then(crate::voice_key::message) {let _=key_tx.send(key);}
                 }
-                "iAPSendMessage" => {
-                    if let Some(data)=crate::wifi_iap2::command_bytes(&command) {
-                        crate::wifi_iap2::receive_bytes(wifi_iap_id, data, "event");
-                    } else if crate::wifi_iap2::command_data(&command).is_none() {
-                        emit_log("WIFI-IAP: missing/oversized params.data");
-                    }
-                }
+                "iAPSendMessage" => {}, // Routed at RTSP enqueue on both sockets.
                 "setLimitedUI" => {
                     if let Some(payload) = limited_ui.update(&command) {
                         crate::emit_receiver_ui(cmd_type, payload);

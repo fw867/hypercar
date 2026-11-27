@@ -49,22 +49,33 @@ impl ControlCipher {
 
     /// 明文 → 密文帧序列（按 1422B 分片，每片独立封帧）。
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Vec<u8> {
+        let (wire, counter) = self.preview_encrypt(plaintext);
+        self.commit_encrypt(counter);
+        wire
+    }
+
+    pub(crate) fn preview_encrypt(&self, plaintext: &[u8]) -> (Vec<u8>, u64) {
         let mut out = Vec::with_capacity(plaintext.len() + 32);
         let mut offset = 0usize;
+        let mut counter = self.write_counter;
         loop {
             let end = (offset + CIPHER_MAX_PAYLOAD).min(plaintext.len());
             let chunk = &plaintext[offset..end];
             let header = [(chunk.len() & 0xFF) as u8, ((chunk.len() >> 8) & 0xFF) as u8];
-            let sealed = chacha_seal(&self.write_key, &nonce64(self.write_counter), chunk, &header);
+            let sealed = chacha_seal(&self.write_key, &nonce64(counter), chunk, &header);
             out.extend_from_slice(&header);
             out.extend_from_slice(&sealed);
-            self.write_counter = self.write_counter.wrapping_add(1);
+            counter = counter.wrapping_add(1);
             if end >= plaintext.len() {
                 break;
             }
             offset = end;
         }
-        out
+        (out, counter)
+    }
+
+    pub(crate) fn commit_encrypt(&mut self, counter: u64) {
+        self.write_counter = counter;
     }
 
     /// 从 buffer 里解出所有完整密文帧的明文拼接；返回 (明文, 已消费字节数)。
@@ -254,6 +265,7 @@ enum SessionEndState {
 // Session termination is owned by the Wi-Fi iAP2 generation's end gate.
 #[derive(Default)]
 struct SessionEnd {
+    iap_ingress: Arc<crate::wifi_iap2::Ingress>,
     uri: Arc<std::sync::OnceLock<crate::rtsp_uri::SessionUri>>,
     session_header: Arc<SessionHeader>,
     state: watch::Sender<SessionEndState>,
@@ -448,6 +460,10 @@ impl RtspChannel {
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<RtspMessage>) {
         Self::spawn_with_reply(read, write, None, reply, self.view_areas.clone(),
             Some((observer, self.session_end.clone())))
+    }
+
+    pub(crate) fn iap_ingress(&self) -> Arc<crate::wifi_iap2::Ingress> {
+        self.session_end.iap_ingress.clone()
     }
 
     pub async fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
@@ -794,22 +810,27 @@ impl RtspChannel {
     pub(crate) async fn post_traced(
         &self, path: &str, body: &[u8], content_type: &str, hud: Option<HudPostTrace>,
     ) -> Result<i32, String> {
-        self.post_traced_if(path, body, content_type, hud, || true).await
+        self.post_guarded(path, body, content_type, hud, None).await
             .map(|cseq| cseq.expect("unconditional RTSP write"))
     }
 
-    pub(crate) async fn post_traced_if(
+    pub(crate) async fn post_guarded(
         &self, path: &str, body: &[u8], content_type: &str, hud: Option<HudPostTrace>,
-        should_write: impl FnOnce() -> bool,
+        start: Option<&crate::wifi_iap2::WriteStart>,
     ) -> Result<Option<i32>, String> {
         if self.is_closed() { return Err("控制通道已关闭".into()); }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         let cseq = self.next_cseq();
         let mut transaction = TransactionGuard { channel: self, cseq, writing: false };
-        let mut w = tokio::time::timeout_at(deadline, self.write.lock()).await
-            .map_err(|_| "事件通道等待写锁超时".to_string())?;
+        let lock = tokio::time::timeout_at(deadline, self.write.lock());
+        let mut w = if let Some(start) = start {
+            tokio::select! {
+                biased;
+                _ = start.cancelled() => return Ok(None),
+                result = lock => result,
+            }
+        } else { lock.await }.map_err(|_| "事件通道等待写锁超时".to_string())?;
         if self.is_closed() { return Err("控制通道已关闭".into()); }
-        if !should_write() { return Ok(None); }
         // Register before writing so a reply racing flush still has its CSeq metadata.
         if let Some(hud) = hud {
             let mut replies = self.hud_replies.lock();
@@ -832,23 +853,47 @@ impl RtspChannel {
         let mut plaintext = Vec::with_capacity(head.len() + body.len());
         plaintext.extend_from_slice(head.as_bytes());
         plaintext.extend_from_slice(body);
-        transaction.writing = true;
-        let wire = {
-            let mut guard = self.cipher.lock();
-            match guard.as_mut() {
-                Some(cipher) => cipher.encrypt(&plaintext),
-                None => plaintext,
+        let (wire, counter) = {
+            let guard = self.cipher.lock();
+            match guard.as_ref() {
+                Some(cipher) => {
+                    let (wire, counter) = cipher.preview_encrypt(&plaintext);
+                    (wire, Some(counter))
+                }
+                None => (plaintext, None),
             }
         };
-        tokio::time::timeout_at(deadline, async {
-            w.write_all(&wire).await?;
-            w.flush().await
+        let written = tokio::time::timeout_at(deadline, async {
+            let offset = if let Some(start) = start {
+                match start.prefix(wire.len(), || w.writable(), || w.try_write(&wire)).await? {
+                    Some(count) => count,
+                    None => return Ok(false),
+                }
+            } else { 0 };
+            transaction.writing = true;
+            if let Some(counter) = counter {
+                if let Some(cipher) = self.cipher.lock().as_mut() { cipher.commit_encrypt(counter); }
+            }
+            if let Some(start) = start.filter(|start| start.syn_ack) {
+                start.finish_syn_ack(wire.len(), offset, || w.writable(), |at| w.try_write(&wire[at..])).await?;
+            } else {
+                w.write_all(&wire[offset..]).await?;
+            }
+            w.flush().await?;
+            Ok::<_, std::io::Error>(true)
         }).await.map_err(|_| { self.record_close("write_timeout"); "事件通道发送超时".to_string() })?
             .map_err(|e| {
                 if self.event_trace.is_some() { self.record_close(&io_close_reason("write_error", &e)); }
                 format!("事件通道写失败: {e}")
             })?;
         transaction.writing = false;
+        if !written {
+            if hud.is_some() { self.hud_replies.lock().retain(|(id, _)| *id != cseq); }
+            if self.session_header.mbux.load(Ordering::Relaxed) {
+                self.session_header.state.lock().async_cseqs.retain(|id| *id != cseq);
+            }
+            return Ok(None);
+        }
         if let Some(hud) = hud {
             crate::emit_log(&format!("HUD {hud} RTSP#{} CSeq={cseq} written", self.trace_id));
         }
@@ -1058,13 +1103,19 @@ async fn reader_loop(
                     continue;
                 }
                 let body = reply.as_ref().and_then(|f| f(&mut msg)).unwrap_or_default();
-                let ui_type = if msg.first_line.contains("/command") {
-                    crate::bplist::parse(&msg.body).ok().and_then(|v| match v.get("type").and_then(crate::bplist::Value::as_str) {
-                        Some("requestUI") => Some("requestUI"),
-                        Some("changeUIContext") => Some("changeUIContext"),
-                        _ => None,
-                    })
-                } else { None };
+                let command = if msg.first_line.contains("/command") { crate::bplist::parse(&msg.body).ok() } else { None };
+                let ui_type = match command.as_ref().and_then(|v| v.get("type")).and_then(crate::bplist::Value::as_str) {
+                    Some("requestUI") => Some("requestUI"),
+                    Some("changeUIContext") => Some("changeUIContext"),
+                    _ => None,
+                };
+                // Register before either the generic queue or the RTSP reply can yield.
+                let mut request = msg.first_line.split_whitespace();
+                if request.next() == Some("POST") && request.next() == Some("/command") {
+                    if let Some(bytes) = command.as_ref().and_then(crate::wifi_iap2::command_bytes) {
+                        session_end.iap_ingress.queue(event_trace.is_some(), bytes);
+                    }
+                }
                 if let Some(ui_type) = ui_type {
                     // Finish the UI command's acknowledgement before feedback can be scheduled.
                     // iAP and touch keep their existing immediate dispatch path below.

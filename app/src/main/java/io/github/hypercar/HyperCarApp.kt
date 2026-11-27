@@ -14,6 +14,7 @@ class HyperCarApp : Application() {
     override fun onCreate() {
         super.onCreate()
         io.github.hypercar.iap2.Iap2PowerSource.init(this)
+        io.github.hypercar.iap2.Iap2CommunicationsSource.init(this)
         io.github.hypercar.iap2.Iap2MediaLibrary.init(this)
         SettingsStore.init(this)
         // 兼容已安装的临时排查版：恢复被禁用的组件，将旧停用状态迁移至自动连接开关。

@@ -1,5 +1,7 @@
 package io.github.hypercar.iap2
 
+import io.github.hypercar.navigation.NavigationCue
+import io.github.hypercar.navigation.NavigationDestinationTarget
 import java.security.SecureRandom
 import java.util.TimeZone
 
@@ -9,7 +11,7 @@ internal class WifiIap2Protocol(
     private val log: (String) -> Unit,
     private val nonce: (Int) -> ByteArray = { size -> ByteArray(size).also(SecureRandom()::nextBytes) },
     private val navigationEnabled: () -> Boolean = { false },
-    private val navigationCue: () -> io.github.hypercar.navigation.NavigationCue? = { null },
+    private val navigationCue: () -> NavigationCue? = { null },
     private val deviceName: String = "HyperCar",
     private val onMediaKey: (Int) -> Unit = {},
     private val nowPlayingProvider: () -> Iap2NowPlaying = { Iap2NowPlaying() },
@@ -19,10 +21,15 @@ internal class WifiIap2Protocol(
     onVehicleLocation: (Iap2VehicleLocation?) -> Unit = {},
     onWheelSpeed: (Iap2WheelSpeed?) -> Unit = {},
     callStateSource: Iap2CallStateSource? = null,
-    private val onTransportReady: (Boolean) -> Boolean = { true },
+    private val onTransportReady: (Boolean, Long) -> Boolean = { _, _ -> true },
+    private val transportCapacity: (Long) -> Int = { 64 },
+    private val allowBulkStart: () -> Boolean = { true },
+    private val cancelPendingWrite: (Long, Long) -> Unit = { _, _ -> },
+    socketWriteFeedback: Boolean = false,
+    destinationTransportCurrent: (Long) -> Boolean = { true },
 ) {
     private val audiMib3 = profileId == "audi_mib3"
-    private val engine = Iap2LinkEngine(reliableTransport = true, declaredWindow = 32)
+    private val engine = Iap2LinkEngine(reliableTransport = true, declaredWindow = 32, socketWriteFeedback = socketWriteFeedback)
     private var parser = Iap2Csm.Parser()
     private val media = Iap2MediaSession(log, onMediaKey)
     private val nowPlaying = Iap2NowPlayingSession(nowPlayingProvider, log, initializeArtworkWithEmptyFile = true)
@@ -31,6 +38,7 @@ internal class WifiIap2Protocol(
     private var identification: Iap2Messages.Identification? = null
     private var authenticated = false
     private var navigation = RouteGuidanceSession(log)
+    private val destination = Iap2DestinationSession(log) { destinationTransportCurrent(outputGeneration) }
     private val subscriptions = Iap2StatusSubscriptions(log = log, deviceName = deviceName,
         callState = { callStateSource?.snapshot() ?: Iap2CallSample.Unavailable },
         observeCalls = { callStateSource?.setSubscribed(it) })
@@ -75,12 +83,17 @@ internal class WifiIap2Protocol(
     }
     private val seen = mutableSetOf<Int>()
     private val unknown = mutableSetOf<Int>()
-    val ready: Boolean get() = phase == "READY" && !failed && engine.queuedControlPackets == 0
+    val ready: Boolean get() = phase == "READY" && !failed && (readyReported || engine.queuedControlPackets == 0)
     private var readyReported = false
+    @Volatile var outputGeneration = 0L
+        private set
+    @Volatile var destinationTarget: NavigationDestinationTarget? = null
+        private set
     var failed = false
         private set
 
     init {
+        engine.withdrawSocketWrite = { cancelPendingWrite(outputGeneration, it) }
         engine.hudLog = log
         engine.deferInitialDetectEcho = audiMib3
         engine.onPeerAcknowledgement = { ack, lastSent ->
@@ -95,10 +108,14 @@ internal class WifiIap2Protocol(
                 }
             }
         }
+        engine.onDetectionRetiring = {
+            onTransportReady(false, outputGeneration)
+        }
         engine.onDetectionRestart = {
+            outputGeneration++
             readyReported = false
-            // Invalidate the old generation before any new output is handed to the writer.
-            onTransportReady(false)
+            destinationTarget = null
+            destination.reset()
             if (challengeSequence != null) log("AUTH LINK reset $challengeDiagnostic")
             challengeSequence = null
             challengeAcknowledged = false
@@ -144,24 +161,37 @@ internal class WifiIap2Protocol(
     }
 
     fun takeHudOutput() = engine.takeHudOutput()
+    fun takeSocketWrites() = engine.takeSocketWrites()
+    fun socketWriteFinished(ticket: Long, writtenAt: Long?) = engine.socketWriteFinished(ticket, writtenAt)
 
     /** The native writer adds its FIFO readiness barrier after these authentication frames. */
     fun outputEnqueued() {
         if (ready && !readyReported) {
             // The just-enqueued authentication frames may have filled the native queue.
-            readyReported = onTransportReady(true)
+            readyReported = onTransportReady(true, outputGeneration)
+            if (readyReported) updateDestinationTarget()
         }
     }
 
     fun end() {
+        revokeDestinationTransport()
         subscriptions.reset()
         location.reset()
         engine.endHudTrace("transport_ended")
     }
 
-    fun feed(bytes: ByteArray, nowMillis: Long): ByteArray {
-        if (failed) return ByteArray(0)
-        if (bytes.isEmpty()) return advance(nowMillis)
+    fun revokeDestinationTransport() {
+        destination.retireTransport()
+        destinationTarget = null
+    }
+
+    fun feed(bytes: ByteArray, nowMillis: Long, writtenSynAck: Long = 0): ByteArray {
+        ingest(bytes, nowMillis, writtenSynAck)
+        return advance(nowMillis)
+    }
+
+    fun ingest(bytes: ByteArray, nowMillis: Long, writtenSynAck: Long = 0) {
+        if (failed || bytes.isEmpty()) return
         now = nowMillis
         if (!started) {
             started = true
@@ -170,11 +200,16 @@ internal class WifiIap2Protocol(
             log("LINK peer bytes=${bytes.size}; " +
                 if (audiMib3) "parse immediately; startup DETECT gated on screen SETUP" else "reply DETECT, await peer SYN")
         }
-        engine.feed(bytes, now)
-        return advance(now)
+        engine.feed(bytes, now, writtenSynAck)
+        processInbound()
     }
 
-    fun advance(nowMillis: Long): ByteArray {
+    fun retryDeadlineReached(nowMillis: Long) = engine.retryDeadlineReached(nowMillis)
+    val hasWrittenDestinationOffer get() = destination.hasWrittenOffer
+
+    fun advance(
+        nowMillis: Long, allowRetryExpiry: Boolean = true, allowDestinationConfirmation: Boolean = true,
+    ): ByteArray {
         if (failed) return ByteArray(0)
         now = nowMillis
         media.diagnosticsTick()
@@ -187,27 +222,19 @@ internal class WifiIap2Protocol(
             }
             return ByteArray(0)
         }
-        engine.advanceTime(now)
-        if (phase == "LINK" && engine.state == Iap2LinkEngine.State.NORMAL) {
-            // xiap2 0x6b530 selects the opening CSM from the accepted control session version.
-            if (engine.controlSessionVersion == 1) requestCertificate() else requestIdentification()
-        }
-        while (true) {
-            when (val event = engine.pollEvent() ?: break) {
-                is Iap2LinkEngine.Event.Control -> parser.offer(event.bytes).forEach(::handle)
-                is Iap2LinkEngine.Event.FileTransfer -> nowPlaying.fileResponse(event.bytes, now)
-                is Iap2LinkEngine.Event.Dead -> fail(event.reason ?: "link closed")
-            }
-        }
+        engine.advanceTime(now, allowRetryExpiry)
+        processInbound()
+        val enabled = phase == "READY" && navigationEnabled()
+        val cue = if (enabled) navigationCue() else null
+        refreshDestination(cue, enabled)
         if (phase in listOf("CERTIFICATE", "CHALLENGE") && !failed && now >= nextWaitLog) {
             log("WAIT phase=$phase remaining=${(deadline-now).coerceAtLeast(0)}ms pending=${engine.queuedControlPackets} outstanding=${engine.outstandingPackets}; RTSP write/200 does not prove peer link acceptance")
             nextWaitLog = now + 2_000
         }
         if (started && phase != "READY" && now > deadline) fail("phase=$phase timeout")
-        if (phase == "READY" && !failed && engine.queuedControlPackets == 0 &&
+        if (phase == "READY" && !failed && !engine.hasNonBulkControl &&
             (engine.zeroRetryAndAckMode || engine.outstandingPackets < 8)) {
-            subscriptions.drain().forEach { send(it.messageId, it.body) }
-            navigation.updates(now, navigationEnabled(), navigationCue()).forEach { send(it.messageId, it.body) }
+            subscriptions.drain(now).forEach { send(it.messageId, it.body) }
             val limit = (engine.peerSynchronization?.maxLength ?: 0xffff) - Iap2LinkEngine.HEADER_BYTES - 1
             nowPlaying.poll(now, limit, engine.fileTransferSession != null).forEach {
                 when (it) {
@@ -217,7 +244,57 @@ internal class WifiIap2Protocol(
                 }
             }
         }
+        if (readyReported && !failed) {
+            refreshDestination(cue, enabled)
+            navigation.refreshLaneSource(enabled, cue)
+            cancelStaleOutput()
+            if (!engine.hasBulkControl && engine.queuedControlPackets == 0) {
+                navigation.queuedUpdates(now, enabled, cue).forEach(::queueBulkControl)
+                destination.offer()?.let(::queueBulkControl)
+            }
+            engine.flushBulkControl(now, transportCapacity(outputGeneration), allowBulkStart(), reserveForNewBulk = 2)
+        }
+        if (!failed && allowDestinationConfirmation) destination.confirmWrittenOffer()
         return engine.takeOutput()
+    }
+
+    private fun processInbound() {
+        if (phase == "LINK" && engine.state == Iap2LinkEngine.State.NORMAL) {
+            // xiap2 0x6b530 selects the opening CSM from the accepted control session version.
+            if (engine.controlSessionVersion == 1) requestCertificate() else requestIdentification()
+        }
+        var event = engine.pollEvent() ?: return
+        val enabled = phase == "READY" && navigationEnabled()
+        refreshDestination(if (enabled) navigationCue() else null, enabled)
+        while (true) {
+            when (event) {
+                is Iap2LinkEngine.Event.Control -> parser.offer(event.bytes).forEach(::handle)
+                is Iap2LinkEngine.Event.FileTransfer -> nowPlaying.fileResponse(event.bytes, now)
+                is Iap2LinkEngine.Event.Dead -> fail(event.reason ?: "link closed")
+            }
+            event = engine.pollEvent() ?: break
+        }
+    }
+
+    private fun refreshDestination(cue: NavigationCue?, enabled: Boolean) {
+        destination.refreshSource(cue?.destinationToShare.takeIf { enabled && canSendDestination() })
+    }
+
+    private fun canSendDestination() = identification?.navigationReceiveIds?.contains(0x10db) != false
+
+    private fun updateDestinationTarget() {
+        destinationTarget = destination.target.takeIf { readyReported && !failed && canSendDestination() }
+    }
+
+    private fun queueBulkControl(message: Iap2QueuedControl) {
+        val frame = message.frame
+        val hud = frame.messageId.takeIf { it in 0x5201..0x5204 } ?: 0
+        if (!engine.queueBulkControl(Iap2Csm.encode(frame.messageId, frame.body), true, hud,
+                message.canStart, message.commitStart, message.onWritten)) fail("link refused optional CSM id=0x${frame.messageId.toString(16)}")
+    }
+
+    private fun cancelStaleOutput() {
+        engine.discardUnstartedBulkControl()
     }
 
     private fun handle(frame: Iap2Csm.Frame) {
@@ -248,13 +325,10 @@ internal class WifiIap2Protocol(
             if (phase != "READY") log("DEFER phase=$phase id=0x${id.toString(16)} until identification and authentication complete")
             return
         }
+        // Record subscription changes and revoke a pending first write before logging the input.
+        val handled = navigation.handle(frame, ::cancelStaleOutput) || destination.handle(frame, ::cancelStaleOutput)
         if (phase != "READY" || seen.add(id)) log("RX phase=$phase id=0x${id.toString(16)} body=${frame.body.size}B")
-        if (id == 0x5200 || id == 0x5203) {
-            // Retain bounded per-component subscriptions, including those arriving before auth.
-            // advance() emits no navigation data until READY.
-            navigation.handle(frame)
-            return
-        }
+        if (handled) return
         when (id) {
             0x1d01 -> if (phase == "IDENTIFICATION" || phase == "READY") acceptIdentification(frame.body)
             0xaa06 -> if (phase == "CERTIFICATE" && !retriedCertificate) {
@@ -316,14 +390,22 @@ internal class WifiIap2Protocol(
     }
 
     private fun acceptIdentification(body: ByteArray) {
-        if (engine.controlSessionVersion == 1 &&
-            Iap2Csm.parseParams(body).sumOf { it.value.size + Iap2Csm.PARAM_HEADER_BYTES } != body.size) {
+        val peer = Iap2Messages.parseIdentification(body)
+        if (phase == "READY" && !peer.completeIdentification) {
+            if (unknown.add(Iap2MessageIds.IDENTIFICATION_INFORMATION)) {
+                log("RX ignored truncated identification update in READY")
+            }
+            return
+        }
+        if (engine.controlSessionVersion == 1 && !peer.completeIdentification) {
             fail("invalid identification parameters")
             return
         }
-        val peer = Iap2Messages.parseIdentification(body)
         identification = peer
-        navigation.declareReceiveSupport(peer.acceptsRouteGuidance, peer.currentRoadLimits)
+        navigation.declareReceiveSupport(peer)
+        if (!canSendDestination()) destination.reset()
+        cancelStaleOutput()
+        updateDestinationTarget()
         subscriptions.identify(peer.model, peer.manufacturer)
         media.identify(peer.hidComponents)
         send(0x1d02)
@@ -362,7 +444,7 @@ internal class WifiIap2Protocol(
     }
 
     private fun subscribeVehicle(peer: Iap2Messages.Identification) {
-        vehicle.subscribe(peer)?.let { send(Iap2MessageIds.START_VEHICLE_STATUS_UPDATES, it) }
+        if (!failed) vehicle.subscribe(peer)?.let { send(it.messageId, it.body) }
     }
 
     private fun subscribeLocation(peer: Iap2Messages.Identification) {
@@ -378,7 +460,7 @@ internal class WifiIap2Protocol(
         var offset = 0
         while (offset < frame.size && !failed) {
             val end = minOf(frame.size, offset + limit)
-            val hudMessageId = if (id == 0x5201 || id == 0x5202) id else 0
+            val hudMessageId = if (id == 0x5201 || id == 0x5202 || id == 0x5204) id else 0
             val onSequenceAssigned: ((Int) -> Unit)? =
                 if (id == 0xaa02 && end == frame.size) {
                     { sequence ->
@@ -414,6 +496,8 @@ internal class WifiIap2Protocol(
     private fun fail(reason: String) {
         if (!failed) log("FAILED $reason")
         failed = true
+        destinationTarget = null
+        destination.reset()
         location.reset()
         engine.feedEof()
     }

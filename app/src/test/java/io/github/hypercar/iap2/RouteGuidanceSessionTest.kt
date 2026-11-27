@@ -1,10 +1,72 @@
 package io.github.hypercar.iap2
 
 import io.github.hypercar.navigation.NavigationCue
+import io.github.hypercar.navigation.NavigationLane
 import org.junit.Assert.*
 import org.junit.Test
 
 class RouteGuidanceSessionTest {
+    @Test fun declaredLaneGuidancePrecedesReferencesAndClearsOnWithdrawal() {
+        val session = RouteGuidanceSession {}
+        session.declareReceiveSupport(true, laneGuidanceSupported = true)
+        session.handle(start(42))
+        val cue = NavigationCue("左转", 1, 100, lanes = listOf(
+            NavigationLane(2, true, 1),
+            NavigationLane(0, false),
+        ))
+        val frames = session.updates(0, true, cue)
+        assertEquals(listOf(0x5204, 0x5202, 0x5201), frames.map { it.messageId })
+        val lanes = Iap2Csm.parseParams(frames[0].body)
+        assertEquals(listOf(0, 1, 2, 2), lanes.map { it.id })
+        assertEquals(listOf(Iap2Csm.Param(0, byteArrayOf(0, 0)), Iap2Csm.Param(1, byteArrayOf(2)),
+            Iap2Csm.Param(2, byteArrayOf(0, 0)), Iap2Csm.Param(2, byteArrayOf(-1, -90)),
+            Iap2Csm.Param(3, byteArrayOf(-1, -90))), Iap2Csm.parseParams(lanes[2].value))
+        assertArrayEquals(byteArrayOf(0, 0), fields(frames[1])[10])
+        assertArrayEquals(byteArrayOf(0, 0), fields(frames[2])[0x10])
+        assertArrayEquals(byteArrayOf(0, 1), fields(frames[2])[0x11])
+        assertArrayEquals(byteArrayOf(1), fields(frames[2])[0x12])
+        assertEquals(listOf(0x5201), session.updates(10_000, true, cue).map { it.messageId })
+        val cleared = session.updates(11_000, true, cue.copy(lanes = cue.lanes + NavigationLane(5, false)))
+        assertTrue(cleared.none { it.messageId == 0x5204 })
+        assertFalse(fields(cleared.first()).containsKey(0x0a))
+        assertArrayEquals(byteArrayOf(0, 0), fields(cleared.last())[0x11])
+        assertArrayEquals(byteArrayOf(0), fields(cleared.last())[0x12])
+        session.declareReceiveSupport(true)
+        assertEquals(listOf(0x5202, 0x5201), session.updates(12_000, true, cue).map { it.messageId })
+    }
+
+    @Test fun groupedStartAndStopUseAllValidComponentIds() {
+        val session = RouteGuidanceSession {}
+        val cue = NavigationCue("右转", 2, 100)
+        val twoComponents = Iap2Csm.u16(0, 42) + Iap2Csm.u16(0, 43)
+        session.handle(Iap2Csm.Frame(0x5200, twoComponents + Iap2Csm.u16(0, 42)))
+        val updates = session.updates(0, true, cue)
+        assertEquals(listOf(0x5202, 0x5201, 0x5202, 0x5201), updates.map { it.messageId })
+        assertEquals(listOf(42, 42, 43, 43), updates.map { Iap2Csm.parseParams(it.body).first().asU16List().single() })
+        session.handle(Iap2Csm.Frame(0x5203, twoComponents + Iap2Csm.u8(0, 44)))
+        assertEquals(4, session.updates(1_000, true, cue.copy(distanceMeters = 90)).size)
+        session.handle(Iap2Csm.Frame(0x5203, twoComponents))
+        assertTrue(session.updates(20_000, true, cue).isEmpty())
+    }
+
+    @Test fun discardingAnUnstartedClearKeepsItOwedToTheComponent() {
+        val session = RouteGuidanceSession {}
+        session.declareReceiveSupport(true, laneGuidanceSupported = true)
+        session.handle(start(42))
+        val withLanes = cue.copy(lanes = listOf(NavigationLane(3, true, 3)))
+        session.updates(0, true, withLanes)
+        session.refreshLaneSource(true, cue)
+        val clear = session.queuedUpdates(10, true, cue).last()
+        assertArrayEquals(byteArrayOf(0), fields(clear.frame)[0x12])
+        session.declareReceiveSupport(true, maneuverSupported = false)
+        assertFalse(clear.canStart())
+        val replacement = session.queuedUpdates(11, true, cue).single()
+        assertTrue(replacement.canStart())
+        assertArrayEquals(byteArrayOf(0), fields(replacement.frame)[0x12])
+        assertTrue(replacement.commitStart!!.invoke())
+        assertFalse(fields(session.updates(10_011, true, cue).single()).containsKey(0x12))
+    }
+
     private val cue = NavigationCue("右转进入测试路", 2, 300)
     private fun start(id: Int) = Iap2Csm.Frame(0x5200, Iap2Csm.u16(0, id) + Iap2Csm.param(1, byteArrayOf()) + Iap2Csm.param(2, byteArrayOf()))
     private fun fields(f: Iap2Csm.Frame) = Iap2Csm.parseParams(f.body).associate { it.id to it.value }

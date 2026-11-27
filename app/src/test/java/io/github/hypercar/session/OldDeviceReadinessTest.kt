@@ -7,14 +7,17 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class OldDeviceReadinessTest {
-    @Test fun requiresAllThreeLiveConditions() {
+    @Test fun pairedCarCanPageAConnectablePhoneOnlyWhenItsRfcommListenerAccepts() {
         val srv = OldDeviceReadiness.Srv("phone.local", 49152)
-        val ready = OldDeviceReadiness(7, "156", srv, true)
+        val ready = OldDeviceReadiness(7, "156", srv, android.bluetooth.BluetoothAdapter.SCAN_MODE_CONNECTABLE, rfcommAccepting = true)
         assertTrue(ready.ready)
+        assertEquals(false, ready.discoverable)
+        assertTrue(ready.copy(scanMode = android.bluetooth.BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE).ready)
+        assertFalse(ready.copy(rfcommAccepting = false).ready)
+        assertFalse(ready.copy(scanMode = android.bluetooth.BluetoothAdapter.SCAN_MODE_NONE).ready)
+        assertFalse(ready.copy(scanMode = null).ready)
         assertFalse(ready.copy(network = null).ready)
         assertFalse(ready.copy(srv = null).ready)
-        assertFalse(ready.copy(discoverable = false).ready)
-        assertFalse(ready.copy(discoverable = null).ready)
     }
 
     @Test fun srvMustMatchCurrentRegistrationNamePortAndTime() {

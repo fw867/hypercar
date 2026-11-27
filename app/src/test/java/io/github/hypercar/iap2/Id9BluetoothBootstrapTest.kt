@@ -8,6 +8,15 @@ import org.junit.Test
 import org.junit.Before
 
 class Id9BluetoothBootstrapTest {
+    @Test fun sessionDoesNotReportAnAdmittedResultAsWrittenToTheSocket() {
+        val channel = Channel()
+        val lines = mutableListOf<String>()
+        Iap2SenderSession(channel, lines::add, onEndpoint = {}, profile = HeadUnitProfiles.BMW_ID85,
+            nanoTime = { channel.time }).run(10_000)
+        assertTrue(channel.sent.any { it.messageId == 0xaa05 })
+        assertFalse(lines.any { "tx=0xaa05" in it })
+    }
+
     @Test fun mbuxDeclaredStartSessionCanArriveAfterTheInitialWait() {
         val channel = Channel(replyWithWifi = false, replyWithEndpoint = false)
         val lines = mutableListOf<String>()
@@ -91,12 +100,17 @@ class Id9BluetoothBootstrapTest {
         val replyWithEndpoint: Boolean = true,
         val model: String = "IDC23-fixture",
         val manufacturer: String = "BMW Group",
+        val cancelOnChallenge: Boolean = false,
     ) : Iap2LinkChannel {
+        override var isCancelled = false
+            private set
+        var stopping = false
+        override val localStopRequested get() = stopping || isCancelled
         val sent = mutableListOf<Iap2Csm.Frame>()
         val queue = ArrayDeque<ByteArray>()
         var time = 1_000_000L
         var closeAtNanos = Long.MAX_VALUE
-        override val isAlive get() = time < closeAtNanos
+        override val isAlive get() = !isCancelled && time < closeAtNanos
         override fun awaitReady(timeoutMillis: Long) = true
         override fun peerMaxControlPayload() = 65525
         override fun close() {}
@@ -119,7 +133,10 @@ class Id9BluetoothBootstrapTest {
                     0xaa00 -> queue += if(serial!=null && frame.body.isNotEmpty())
                         Iap2Csm.encode(0xaa06,serialOverride ?: Iap2Csm.param(0,serial))
                         else Iap2Csm.encode(0xaa01,certificate)
-                    0xaa02 -> if(signature!=null) queue += Iap2Csm.encode(0xaa03,signature) +
+                    0xaa02 -> if (cancelOnChallenge) {
+                        isCancelled = true
+                        throw IOException("socket closed by local stop")
+                    } else if(signature!=null) queue += Iap2Csm.encode(0xaa03,signature) +
                         (if(subscribeEarly) Iap2Csm.encode(0xae00,Iap2Csm.param(6,byteArrayOf())) else byteArrayOf())
                     0x5702 -> if (replyWithWifi) queue += Iap2Csm.encode(0x5703,Iap2Csm.string(1,"fixture-ap")+Iap2Csm.string(2,"fixture-pass"))
                     0x4300 -> if (replyWithEndpoint) queue += Iap2Csm.encode(0x4301,Iap2Csm.group(1,
@@ -167,6 +184,21 @@ class Id9BluetoothBootstrapTest {
         assertTrue(ids.indexOf(0x4300)>ids.indexOf(0x4e09))
         assertEquals(1,ids.count { it==0x4e0d })
         assertFalse(0x5702 in ids)
+    }
+
+    @Test fun id85ReportsBluetoothAddressInTransportIdentifierFieldOne() {
+        val channel = Channel()
+        val mac = "02:13:24:35:46:57"
+        Iap2SenderSession(channel, {}, bluetoothMac = mac, onEndpoint = {},
+            profile = HeadUnitProfiles.BMW_ID85, nanoTime = { channel.time }).run(10_000)
+        assertArrayEquals(Iap2Csm.string(1, mac), channel.sent.single { it.messageId == 0x4e0e }.body)
+    }
+
+    @Test fun id85SilentChallengeReportsFailureBeforeAnyCarplayStatus() {
+        val channel = Channel(signature = null, model = "MGU-55-BMW")
+        assertThrows(IOException::class.java) { run(channel, id9 = false) }
+        assertEquals(0xaa04, channel.sent.last().messageId)
+        assertFalse(channel.sent.any { it.messageId in setOf(0xaa05, 0x4e0d, 0x5702, 0x4300) })
     }
     @Test fun mguAndMotorcycleLegacyWifiUseTheSameBoxGreetings() {
         for (profile in listOf(HeadUnitProfiles.BMW_ID85, HeadUnitProfiles.MOTORCYCLE)) {
@@ -277,6 +309,71 @@ class Id9BluetoothBootstrapTest {
         assertTrue(failed.sent.none { it.messageId in listOf(0xaa05,0x4300) })
         val retry=Channel(serial=MfiCacheFixture.serial);run(retry)
         assertEquals(2,retry.sent.count { it.messageId==0xaa00 })
+    }
+
+    @Test fun locallyCancelledChallengePreservesId9Certificate() {
+        run(Channel(serial = MfiCacheFixture.serial))
+        val peer = "00:11:22:33:44:55"
+        val key = MfiLengthMemory.receiverKey("BMW-fixture IDC23-fixture BMW Group", peer)
+        val lengths = MfiLengthMemory.load(null, key)
+        assertNotNull(lengths.succeeded)
+        val cancelled = Channel(serial = MfiCacheFixture.serial, cancelOnChallenge = true)
+        assertThrows(java.io.InterruptedIOException::class.java) { run(cancelled) }
+        assertEquals(lengths, MfiLengthMemory.load(null, key))
+        assertNotNull(MfiCertificateCache.load(null, peer, MfiCacheFixture.serial))
+    }
+
+    @Test fun stopAfterLastTimeoutKeepsCachedCertificate() {
+        val peer = "00:11:22:33:44:55"
+        run(Channel(serial = MfiCacheFixture.serial), peer)
+        val channel = Channel(serial = MfiCacheFixture.serial, signature = null)
+        assertThrows(java.io.InterruptedIOException::class.java) {
+            Iap2SenderSession(channel, { if ("挑战全部无应答" in it) channel.stopping = true },
+                onEndpoint = {}, receiverAddress = peer, profile = HeadUnitProfiles.BMW_ID9,
+                nanoTime = { channel.time }).run(10_000)
+        }
+        assertNotNull(MfiCertificateCache.load(null, peer, MfiCacheFixture.serial))
+        assertTrue(channel.sent.none { it.messageId == 0xaa05 })
+    }
+
+    @Test fun gracefulStopWhileWaitingForChallengeSkipsSilenceAndRetry() {
+        val peer = "00:11:22:33:44:55"
+        run(Channel(serial = MfiCacheFixture.serial), peer)
+        val key = MfiLengthMemory.receiverKey("BMW-fixture IDC23-fixture BMW Group", peer)
+        val before = MfiLengthMemory.load(null, key)
+        val channel = Channel(serial = MfiCacheFixture.serial, signature = null)
+        assertThrows(java.io.InterruptedIOException::class.java) {
+            Iap2SenderSession(channel, { if ("tx=0xaa02 challenge=" in it) channel.stopping = true },
+                onEndpoint = {}, receiverAddress = peer, profile = HeadUnitProfiles.BMW_ID9,
+                nanoTime = { channel.time }).run(10_000)
+        }
+        assertEquals(1, challengeLengths(channel).size)
+        assertEquals(before, MfiLengthMemory.load(null, key))
+        assertNotNull(MfiCertificateCache.load(null, peer, MfiCacheFixture.serial))
+        assertTrue(channel.sent.none { it.messageId == 0xaa05 })
+    }
+
+    @Test fun stopAfterResponseSkipsChallengeMemoryAndCertificateWrite() {
+        val peer = "00:11:22:33:44:55"
+        val channel = Channel(serial = MfiCacheFixture.serial)
+        assertThrows(java.io.InterruptedIOException::class.java) {
+            Iap2SenderSession(channel, { if ("rx=0xaa03 signature" in it) channel.stopping = true },
+                onEndpoint = {}, receiverAddress = peer, profile = HeadUnitProfiles.BMW_ID9,
+                nanoTime = { channel.time }).run(10_000)
+        }
+        val key = MfiLengthMemory.receiverKey("BMW-fixture IDC23-fixture BMW Group", peer)
+        assertTrue(MfiLengthMemory.load(null, key).isEmpty)
+        assertNull(MfiCertificateCache.load(null, peer, MfiCacheFixture.serial))
+        assertTrue(channel.sent.none { it.messageId == 0xaa05 })
+    }
+
+    @Test fun stopAsAuthenticationResultIsBeingSentPreventsFrame() {
+        val channel = Channel()
+        assertThrows(java.io.InterruptedIOException::class.java) {
+            Iap2SenderSession(channel, { if ("TX phase=" in it && "id=0xaa05 " in it) channel.stopping = true },
+                onEndpoint = {}, profile = HeadUnitProfiles.BMW_ID85, nanoTime = { channel.time }).run(10_000)
+        }
+        assertTrue(channel.sent.none { it.messageId == 0xaa05 })
     }
     @Test fun malformedSerialFailsBeforeChallengeAndUnknownPeerCannotCache() {
         for(body in listOf(byteArrayOf(),Iap2Csm.param(0,byteArrayOf()),Iap2Csm.param(0,byteArrayOf(1))+byteArrayOf(0),

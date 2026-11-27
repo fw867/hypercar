@@ -6,7 +6,7 @@ import java.io.Closeable
  * until the replacement worker claims it or the connection attempt is cancelled. */
 internal class BmwCaffHandoff<S : Closeable>(
     val old: S,
-    private val incoming: S,
+    val incoming: S,
     private val onReady: (BmwCaffHandoff<S>) -> Unit,
 ) {
     private var released = false

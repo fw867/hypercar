@@ -10,15 +10,16 @@ internal class AmapLinkNavigationState {
     private var updated = 0L
     private var fullGuidanceAt = 0L
     private var replanning: TimedNavigationCue? = null
-    private var initialLanes: Pair<Long, List<NavigationLane>>? = null
+    private var lanesAt: Long? = null
+    private var initialLanes = emptyList<NavigationLane>()
     @Synchronized fun begin(): Long {
         token = ++counter
-        cue = null; rawManeuver = null; initialLanes = null; replanning = null
+        cue = null; rawManeuver = null; clearLanes(); replanning = null
         return token
     }
     @Synchronized fun clear(source: Long? = null) {
         if (source == null || source != 0L && source == token) {
-            token = 0; cue = null; rawManeuver = null; initialLanes = null; replanning = null
+            token = 0; cue = null; rawManeuver = null; clearLanes(); replanning = null
         }
     }
     @Synchronized fun accept(source: Long, type: Int, data: org.json.JSONObject?, now: Long): Boolean {
@@ -33,17 +34,31 @@ internal class AmapLinkNavigationState {
                 val maneuver = integer(info.opt("curManeuverID"), 65535)?.toInt() ?: return false
                 // segmentRemainDist is metres to the current segment end. routeRemainDist is NOT this distance.
                 val distance = integer(info.opt("segmentRemainDist"), 0xffffffffL) ?: return false
+                val routeDistance = integer(info.opt("routeRemainDist"), 0xffffffffL)
                 val road = info.optString("nextRouteName").replace('\u0000', ' ').trim().take(100)
+                val currentRoad = info.optString("curRouteName").replace('\u0000', ' ').trim().take(100)
                 val action = maneuvers[maneuver]
-                val sameManeuver = rawManeuver == maneuver
+                val previous = cue
+                val sameJunction = previous?.state == 1 && rawManeuver == maneuver &&
+                    (previous.nextRoad.isEmpty() || road.isEmpty() || previous.nextRoad == road) &&
+                    (previous.currentRoad.isEmpty() || currentRoad.isEmpty() || previous.currentRoad == currentRoad) &&
+                    previous.distanceMeters?.let {
+                        val increase = distance - it
+                        // A short same-road turn can follow immediately after we reach this junction.
+                        val previousTotal = previous.remainingDistanceMeters
+                        val progressing = routeDistance != null && previousTotal != null && routeDistance < previousTotal
+                        increase < 50 && (it > 15 || increase < if (progressing) 3 else 10)
+                    } != false
+                if ((previous != null && !sameJunction) || !lanesFresh(now)) clearLanes()
+                val lanes = if (previous == null) initialLanes else previous.lanes.takeIf { sameJunction && lanesFresh(now) }.orEmpty()
+                initialLanes = emptyList()
                 rawManeuver = maneuver
                 NavigationCue(listOfNotNull(action?.second, road.takeIf { it.isNotEmpty() }).joinToString(" "),
                     action?.first, distance, nextRoad = road,
-                    currentRoad = info.optString("curRouteName").replace('\u0000', ' ').trim().take(100),
-                    remainingDistanceMeters = integer(info.opt("routeRemainDist"), 0xffffffffL),
+                    currentRoad = currentRoad,
+                    remainingDistanceMeters = routeDistance,
                     remainingTimeSeconds = integer(info.opt("routeRemainTime"), 0xffffffffL),
-                    lanes = if (cue == null) initialLanes?.takeIf { now - it.first in 0..15_000 }?.second.orEmpty()
-                        else cue?.lanes.orEmpty().takeIf { sameManeuver }.orEmpty()).also { initialLanes = null }
+                    lanes = lanes)
             }
             14 -> {
                 val current = cue
@@ -58,7 +73,8 @@ internal class AmapLinkNavigationState {
                     val selected = integer(front!!.opt(index), 255)?.toInt() ?: return false
                     NavigationLane(direction, selected in 0..12, selected.takeIf { it in 0..12 })
                 }
-                if (current == null) initialLanes = now to lanes else cue = current.copy(lanes = lanes)
+                lanesAt = now.takeIf { lanes.isNotEmpty() }
+                if (current == null) initialLanes = lanes else cue = current.copy(lanes = lanes)
                 // A lane event is not proof that the old distance/maneuver is still current.
                 return true
             }
@@ -68,13 +84,15 @@ internal class AmapLinkNavigationState {
                 val action = maneuvers[maneuver]
                 val unchanged = rawManeuver == maneuver
                 rawManeuver = maneuver
-                if (unchanged) current else
+                if (unchanged) current else {
                     // A new direction can arrive before its segment info. Never reuse the old road/distance.
+                    clearLanes()
                     NavigationCue(action?.second.orEmpty(), action?.first, null)
+                }
             }
             100, 200 -> {
                 rawManeuver = null
-                initialLanes = null
+                clearLanes()
                 val stopped = NavigationCue("", null, null, state = 0)
                 when (type) {
                     100 -> cue?.takeIf { it.state == 2 } ?: stopped
@@ -100,7 +118,8 @@ internal class AmapLinkNavigationState {
         if (token == 0L) return null
         val current = cue ?: return null
         // An explicit stop remains authoritative over an old notification. Lost live updates clear the arrow.
-        return if (current.state == 1 && now - updated !in 0..15_000) NavigationCue("", null, null, state = 0) else current
+        if (current.state == 1 && now - updated !in 0..15_000) return NavigationCue("", null, null, state = 0)
+        return if (current.lanes.isNotEmpty() && !lanesFresh(now)) current.copy(lanes = emptyList()) else current
     }
 
     @Synchronized fun hudSnapshot(now: Long, notification: TimedNavigationCue?): NavigationCue? {
@@ -114,6 +133,13 @@ internal class AmapLinkNavigationState {
         }
         return replanning?.cue ?: link
     }
+    private fun lanesFresh(now: Long): Boolean = lanesAt?.let { now - it in 0..15_000 } == true
+
+    private fun clearLanes() {
+        lanesAt = null
+        initialLanes = emptyList()
+    }
+
     private fun integer(value: Any?, maximum: Long): Long? {
         if (value !is Number) return null
         val d = value.toDouble()
