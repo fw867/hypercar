@@ -115,6 +115,16 @@ struct Slot {newest:u64, current:Option<Prepared>}
 static SOURCE: Lazy<Mutex<Slot>>=Lazy::new(||Mutex::new(Slot::default()));
 
 pub(crate) fn prepare(owner:u64,cfg:&EngineConfig, system_canvas:Option<crate::carlife::SystemCanvasHint>)->Result<(),String> {
+    prepare_for(owner, cfg, system_canvas, None, move |startup| crate::reopen_carwith_entry(owner, startup))
+}
+
+pub(crate) fn prepare_for(
+    owner: u64,
+    cfg: &EngineConfig,
+    system_canvas: Option<crate::carlife::SystemCanvasHint>,
+    receiver: Option<crate::carlife::ReceiverDisplay>,
+    reopen: impl Fn(bool) + Send + Sync + 'static,
+) -> Result<(), String> {
     let mut slot=SOURCE.lock();
     if slot.current.as_ref().is_some_and(|s|s.owner==owner) {return Ok(());}
     if owner==0 || owner<=slot.newest {return Err("stale CarWith source owner".into());}
@@ -131,7 +141,7 @@ pub(crate) fn prepare(owner:u64,cfg:&EngineConfig, system_canvas:Option<crate::c
     } else {
         crate::carlife::ReceiverDisplay::default()
     };
-    let display = crate::carlife::DisplayRequest::new(cached);
+    let display = crate::carlife::DisplayRequest::new(receiver.unwrap_or(cached));
     let microphone=cfg.carwith_microphone.then(||Arc::new(crate::mic_probe::ProbeControl::for_carwith()));
     let vehicle_gps = Arc::new(crate::carlife::vehicle_gps::PendingLocation::default());
     let config=CarLifeConfig{
@@ -144,7 +154,7 @@ pub(crate) fn prepare(owner:u64,cfg:&EngineConfig, system_canvas:Option<crate::c
         bt_name:if system && !cfg.hu_bt_name.is_empty() {cfg.hu_bt_name.clone()} else {"HyperCar".into()},
         navigation_updates:cfg.carwith_navigation_enabled,microphone:microphone.clone(),vehicle_gps:Some(vehicle_gps.clone())};
     let (hub,mut events)=CarLifeHub::connect(config,"127.0.0.1".into(),stop.clone(),Some(display.clone()),
-        move |startup| crate::reopen_carwith_entry(owner, startup))?;
+        reopen)?;
     let feed=Arc::new(Mutex::new(Feed::default()));let sink=feed.clone();
     let task=tokio::spawn(async move {while let Some(event)=events.recv().await {sink.lock().receive(event);}});
     slot.current=Some(Prepared{owner,hub:Arc::new(hub),feed,display,microphone,vehicle_gps,stop,task});
@@ -171,6 +181,15 @@ pub(crate) fn stop(owner:u64) {
     // A tap may retire this attempt before its off-thread prepare reaches Rust.
     slot.newest = slot.newest.max(owner);
     if slot.current.as_ref().is_some_and(|s|s.owner==owner) {slot.current=None;}
+}
+
+pub(crate) fn with_hub(owner: u64, action: impl FnOnce(&CarLifeHub)) -> bool {
+    let slot = SOURCE.lock();
+    let Some(source) = slot.current.as_ref().filter(|source| source.owner == owner) else {
+        return false;
+    };
+    action(&source.hub);
+    true
 }
 pub(crate) fn diagnostic_phase(owner: u64) -> Option<Arc<crate::carlife::DiagnosticPhase>> {
     SOURCE.lock().current.as_ref().filter(|source| source.owner == owner)

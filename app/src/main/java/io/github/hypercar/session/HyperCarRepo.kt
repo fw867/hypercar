@@ -591,6 +591,17 @@ object HyperCarRepo {
     // ---------------------------------------------------------------- 对 UI
 
     val hasCurrentSession: Boolean get() = sessionLive.get() || connecting || streaming
+    private val yadeaOwner = java.util.concurrent.atomic.AtomicLong()
+
+    internal suspend fun claimYadeaSource(): Long = autoConnectChanges.withLock {
+        if (hasCurrentSession || yadeaOwner.get() != 0L) return@withLock 0L
+        connectionDiagnostics.reserveAttemptId().also { yadeaOwner.set(it) }
+    }
+
+    internal fun releaseYadeaSource(owner: Long) {
+        yadeaOwner.compareAndSet(owner, 0L)
+    }
+
     internal val hasAirPlayTransport: Boolean get() = sessionLive.get() && sessionSockets != null
 
     /** Source eligibility. Each iAP2 link checks its peer's declaration and subscriptions. */
@@ -903,6 +914,10 @@ object HyperCarRepo {
                              suppressManualWindow: Boolean = false, aclEdge: AclDiscoverabilityEdge? = null,
                              aclWake: ConnectionDiagnostics.AclWake? = null) {
         init(context)
+        if (yadeaOwner.get() != 0L) {
+            log("CONNECT: 雅迪仪表投屏进行中，跳过 CarPlay 连接")
+            return
+        }
         if (sessionLive.get() || connecting || streaming) {
             if (sessionLive.get()) {
                 aclEdge?.ticket?.assign(connectionAttemptId)
@@ -5370,13 +5385,13 @@ object HyperCarRepo {
         return message
     }
 
-    private suspend fun launchCarWith(ctx: android.content.Context, attempt: Long): String {
+    internal suspend fun launchCarWith(ctx: Context, attempt: Long, entries: CarWithEntryGate = carWithEntries): String {
         // Do not probe 7240 with a disposable client: it consumes a real CarLife connection.
         val comp = "com.miui.carlink/com.miui.carlink.castfwk.usb.CarlifeAdbActivity"
         var shellStatus = "Shizuku 未就绪"
-        val launched = carWithEntries.launch(attempt, shell = {
+        val launched = entries.launch(attempt, shell = {
             if (!ShizukuTools.isReady) return@launch false
-            val result = runCatching { ShizukuTools.exec("am start -n $comp", 8_000) { carWithEntries.current(attempt) } }.getOrNull()
+            val result = runCatching { ShizukuTools.exec("am start -n $comp", 8_000) { entries.current(attempt) } }.getOrNull()
             kotlinx.coroutines.currentCoroutineContext().ensureActive()
             shellStatus = result?.let { "am start exit=${it.code} out=${it.out.take(320)} err=${it.err.take(240)}" }
                 ?: "am start 未取得结果"

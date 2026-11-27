@@ -402,6 +402,7 @@ private fun MainContent(onStart: () -> Unit) {
                         onRefreshSetup = { permVersion++ },
                         snapshot = snapshot,
                         onStart = onStart,
+                        onOpenYadea = { context.startActivity(Intent(context, io.github.hypercar.yadea.YadeaActivity::class.java)) },
                         onStop = { HyperCarRepo.disconnect(visibleConnectionAttempt) },
                         onToggleAutoConnect = { HyperCarRepo.setAutoConnect(context, it) },
                         onRequestDegradedPermission = {
