@@ -1,5 +1,6 @@
 package io.github.hypercar.session
 
+import io.github.hypercar.settings.CarWithDisplay
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -26,6 +27,25 @@ class CarLifeSourcePolicyTest {
         assertTrue(CarLifeSourcePolicy.shouldReopen("system_carlife",true))
         assertFalse(CarLifeSourcePolicy.shouldReopen("car_ui",true))
     }
+    @Test fun systemPrewarmUsesTheReceiverCacheThenTheManualCanvas() {
+        val manual = 2880 to 900
+        assertEquals(2736 to 800, CarLifeSourcePolicy.prewarmSize(true, CarWithDisplay(2736, 800, 60), manual))
+        assertEquals(manual, CarLifeSourcePolicy.prewarmSize(true, null, manual))
+        assertEquals(1920 to 1080, CarLifeSourcePolicy.prewarmSize(false, null, manual))
+    }
+
+    @Test fun systemCanvasRequiresEvidenceForTheCurrentReceiver() {
+        val profile = "bmw_id85"
+        val key = "bmw_id85:bt_101112131415"
+        assertNull(CarLifeSourcePolicy.systemCanvasKey(profile, null, null, first, null))
+        assertNull(CarLifeSourcePolicy.systemCanvasKey(profile, null, first, null, null))
+        assertNull(CarLifeSourcePolicy.systemCanvasKey(profile, null, null, null, first))
+        assertNull(CarLifeSourcePolicy.systemCanvasKey(profile, second, first, first, first))
+        assertNull(CarLifeSourcePolicy.systemCanvasKey(profile, first, first, second, null))
+        assertEquals(key, CarLifeSourcePolicy.systemCanvasKey(profile, first, first, null, null))
+        assertEquals(key, CarLifeSourcePolicy.systemCanvasKey(profile, null, null, first, first))
+    }
+
     @Test fun actualReceiverWinsWithoutBorrowingAnotherCarsName() {
         val id=CarLifeSourcePolicy.huIdentity(first,second,"Other car",setOf("$first|Current car|1","$second|Other car|2"))!!
         assertEquals(first,id.address)

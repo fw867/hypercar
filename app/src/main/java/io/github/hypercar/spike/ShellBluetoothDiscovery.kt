@@ -54,6 +54,12 @@ internal class ShellBluetoothDiscovery {
         }
     }
 
+    @Synchronized fun hasActiveLease(): Boolean = owner?.process?.isAlive == true
+
+    @Synchronized fun stopActive() {
+        owner?.let { stop(it.token) }
+    }
+
     @Synchronized fun stop(token: String): String {
         val request = owner?.takeIf { it.token == token } ?: return "SKIP 未开启本轮可发现"
         // 管道 EOF 是独立守护进程的提前结束信号；UserService 被杀时也会自动产生 EOF。

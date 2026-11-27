@@ -5,14 +5,43 @@ import android.content.Context
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.os.Build
+import android.os.DeadObjectException
 import android.os.IBinder
+import android.os.Parcel
+import android.os.ParcelFileDescriptor
+import android.os.Process
 import android.os.SystemClock
+import android.os.UserHandle
 import android.util.Log
 import android.view.InputDevice
 import android.view.InputEvent
 import android.view.MotionEvent
 import android.view.Surface
+import io.github.hypercar.BuildConfig
 import java.lang.reflect.Method
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+
+internal class ShellHostContext<T : Any>(
+    initial: T?,
+    private val uid: (T) -> Int,
+    private val packageForCaller: (String, Int) -> T?,
+) {
+    private val expectedUid = initial?.let(uid)
+    // Shizuku 13 can supply an Application with the profile's UID but the shell's user-0
+    // PackageManager. Resolve a fresh package context for secondary users before publishing it.
+    @Volatile var context: T? = initial?.takeIf { uid(it) in 0 until 100_000 }
+        private set
+
+    @Synchronized fun authorize(callerUid: Int): Boolean {
+        if (expectedUid != null && expectedUid != callerUid) return false
+        context?.let { return uid(it) == callerUid }
+        val resolved = packageForCaller(BuildConfig.APPLICATION_ID, callerUid) ?: return false
+        if (uid(resolved) != callerUid) return false
+        context = resolved
+        return true
+    }
+}
 
 /**
  * SPIKE-P0：跑在 **Shizuku UserService** 进程里的最小 shell 端。
@@ -26,7 +55,105 @@ import java.lang.reflect.Method
  * 进程模型：Shizuku 用 app_process 以 shell 身份加载本类并实例化；它不是 Android Service，
  * 通过客户端 Binder 的死亡通知释放虚拟屏，即使 App 被更新或强制退出。
  */
-class SpikeShellService : ISpikeShell.Stub {
+class SpikeShellService @JvmOverloads constructor(context: Context? = null) : ISpikeShell.Stub() {
+
+    private val hostContext = ShellHostContext(context?.takeIf { it.packageName == BuildConfig.APPLICATION_ID },
+        { it.applicationInfo.uid }, ::packageContextForCaller)
+    private val appContext: Context? get() = hostContext.context
+    private val callAudioLifetime = CallAudioServiceLifetime()
+    private val idle = ShellServiceIdle(SystemClock.elapsedRealtime(), IDLE_TIMEOUT_MS)
+    private val idleExecutor = Executors.newSingleThreadScheduledExecutor { task ->
+        Thread(task, "hypercar-shell-idle").apply { isDaemon = true }
+    }
+    private val hostLock = Any()
+    private val hostDeath = IBinder.DeathRecipient { stopForServiceExit("host_died") }
+    private var host: IBinder? = null
+    private val callAudioBrokerLock = Any()
+    private val callAudioBrokerDeath = IBinder.DeathRecipient { stopForServiceExit("shizuku_died") }
+    @Volatile private var callAudioBroker: IBinder? = null
+
+    override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+        // Shizuku invokes this reserved transaction when replacing or removing a UserService.
+        if (code == IBinder.LAST_CALL_TRANSACTION - 100) {
+            data.enforceInterface(ISpikeShell.DESCRIPTOR)
+            if (android.os.Binder.getCallingUid() != Process.myUid()) return false
+            stopForServiceExit("shizuku_destroyed")
+            return true
+        }
+        if (code !in IBinder.FIRST_CALL_TRANSACTION..IBinder.LAST_CALL_TRANSACTION) {
+            return super.onTransact(code, data, reply, flags)
+        }
+        if (!hostContext.authorize(android.os.Binder.getCallingUid()))
+            throw SecurityException("HyperCar UserService caller UID mismatch")
+        if (!idle.begin()) throw DeadObjectException()
+        return try { super.onTransact(code, data, reply, flags) }
+        finally { idle.end(SystemClock.elapsedRealtime()) }
+    }
+
+    private fun retireIfIdle() {
+        val checkStarted = SystemClock.elapsedRealtime()
+        val displayInUse = synchronized(lock) { displays.isNotEmpty() || physicalScreenOff }
+        if (displayInUse || playbackAudio.hasActiveCapture() || splitPlaybackAudio.hasActiveCapture() ||
+            wifiSelection.hasActiveLease() || bluetoothDiscovery.hasActiveLease() ||
+            (callAudio.isInitialized() && callAudio.value.hasActiveResources())) {
+            idle.noteBusy(SystemClock.elapsedRealtime())
+            return
+        }
+        // A Binder call may have arrived while we checked the resources.
+        if (idle.tryRetire(checkStarted)) stopForServiceExit("idle")
+    }
+
+    private fun stopForServiceExit(reason: String) {
+        if (!callAudioLifetime.startStopping()) return
+        idle.stop()
+        idleExecutor.shutdown()
+        Log.i(TAG, "USER-SERVICE: retiring reason=$reason pid=${Process.myPid()}")
+        Thread({
+            // If AudioService is stuck, process exit releases the OFD lock and preserves the journal.
+            SystemClock.sleep(750)
+            Process.killProcess(Process.myPid())
+        }, "hypercar-shell-exit").apply { isDaemon = true; start() }
+        Thread({
+            runCatching { wifiSelection.stopActive() }
+        }, "hypercar-shell-wifi-cleanup").apply { isDaemon = true; start() }
+        Thread({
+            if (callAudio.isInitialized()) callAudio.value.stopForServiceExit()
+            runCatching { stopAudioCapture() }
+            runCatching { releaseDisplay() }
+            runCatching { bluetoothDiscovery.stopActive() }
+        }, "hypercar-shell-cleanup").apply { isDaemon = true; start() }
+    }
+
+    override fun attachHost(host: IBinder?): Boolean {
+        if (host == null || android.os.Binder.getCallingUid() != appContext?.applicationInfo?.uid) return false
+        return synchronized(hostLock) {
+            if (callAudioLifetime.stopping) return@synchronized false
+            val attached = this.host
+            if (attached != null) return@synchronized attached == host && host.isBinderAlive
+            runCatching { host.linkToDeath(hostDeath, 0) }.getOrElse {
+                stopForServiceExit("host_unavailable")
+                return@synchronized false
+            }
+            callAudioLifetime.whileRunning { this.host = host } != null
+        }
+    }
+
+    override fun attachCallAudioBroker(broker: IBinder?): Boolean {
+        if (broker == null || android.os.Binder.getCallingUid() != appContext?.applicationInfo?.uid) return false
+        return synchronized(callAudioBrokerLock) {
+            if (callAudioLifetime.stopping) return@synchronized false
+            val attached = callAudioBroker
+            if (attached != null) return@synchronized attached == broker && broker.isBinderAlive
+            // A broker crash cannot send the reserved destroy transaction to its UserService.
+            runCatching { broker.linkToDeath(callAudioBrokerDeath, 0) }.getOrElse {
+                stopForServiceExit("shizuku_unavailable")
+                return@synchronized false
+            }
+            callAudioLifetime.whileRunning { callAudioBroker = broker } != null
+        }
+    }
+
+    private fun acceptsCallAudio() = !callAudioLifetime.stopping && callAudioBroker?.isBinderAlive == true
 
     private val playbackAudio = ShellPlaybackAudio()
     private val splitPlaybackAudio = SplitPlaybackAudio()
@@ -37,13 +164,13 @@ class SpikeShellService : ISpikeShell.Stub {
         }, trace = callDiagnostics::record)
     }
     private val callStateMonitor by lazy { ShellCallStateMonitor(callIdentity, callDiagnostics::record) }
-    private val callAudio: Lazy<ShellCallAudio> = lazy { ShellCallAudio(callIdentity) }
+    private val callAudio: Lazy<ShellCallAudio> = lazy { ShellCallAudio(callIdentity, callDiagnostics::record, callAudioLifetime) }
 
     override fun pollCallAudioIdentity(verify: Boolean, publishedThrough: Long): Array<String>? {
         if (android.os.Binder.getCallingUid() != appContext?.applicationInfo?.uid) return null
         val identity = android.os.Binder.clearCallingIdentity()
         return try {
-            val active = if (verify) callStateMonitor.run { callIdentity.currentBridgeIdentity() } else null
+            val active = if (verify && acceptsCallAudio()) callStateMonitor.run { callIdentity.currentBridgeIdentity() } else null
             val batch = callDiagnostics.readAfter(publishedThrough)
             (listOf(active?.lease.orEmpty(), active?.retryKey.orEmpty(), batch.firstSequence.toString()) + batch.lines)
                 .toTypedArray()
@@ -65,7 +192,7 @@ class SpikeShellService : ISpikeShell.Stub {
     override fun openCallAudio(owner: IBinder, token: Long, offer: Long, callId: String, rate: Int,
                                route: ICallAudioRoute): android.os.ParcelFileDescriptor? {
         val context = appContext ?: return null
-        if (android.os.Binder.getCallingUid() != context.applicationInfo.uid) return null
+        if (!acceptsCallAudio() || android.os.Binder.getCallingUid() != context.applicationInfo.uid) return null
         val identity = android.os.Binder.clearCallingIdentity()
         return try { callAudio.value.open(context, owner, token, offer, callId, rate, route) }
         finally { android.os.Binder.restoreCallingIdentity(identity) }
@@ -80,8 +207,24 @@ class SpikeShellService : ISpikeShell.Stub {
 
     override fun revokeCallAudio(token: Long, offer: Long) {
         if (android.os.Binder.getCallingUid() != appContext?.applicationInfo?.uid || !callAudio.isInitialized()) return
-        callAudio.value.revokeOffer(token, offer)
+        val identity = android.os.Binder.clearCallingIdentity()
+        try { callAudio.value.revokeOffer(token, offer) }
+        finally { android.os.Binder.restoreCallingIdentity(identity) }
     }
+
+    override fun setCallOutputJournal(journal: ParcelFileDescriptor?, bootCount: Int): Boolean {
+        val context = appContext
+        if (journal == null) return false
+        if (!acceptsCallAudio() || context == null || android.os.Binder.getCallingUid() != context.applicationInfo.uid || bootCount < 0) {
+            runCatching { journal.close() }
+            return false
+        }
+        return callAudio.value.setOutputJournal(context, journal, bootCount)
+    }
+
+    override fun hasCallOutputJournal(): Boolean = acceptsCallAudio() &&
+        android.os.Binder.getCallingUid() == appContext?.applicationInfo?.uid &&
+        callAudio.isInitialized() && callAudio.value.hasOutputJournal()
     @Volatile private var splitCaptureRequested = false
     private val bluetoothDiscovery = ShellBluetoothDiscovery()
     private val wifiSelection = ShellWifiSelection()
@@ -155,21 +298,27 @@ class SpikeShellService : ISpikeShell.Stub {
 
     override fun audioCaptureStatus(): String = if (splitCaptureRequested) splitPlaybackAudio.status else playbackAudio.status
 
-    constructor() : super() {
-        bindContext(null)
-    }
-
-    constructor(context: Context) : super() {
-        bindContext(context)
-    }
-
-    private fun bindContext(context: Context?) {
-        appContext = context ?: runCatching {
+    // Both Shizuku constructor paths run after ActivityThread.systemMain().
+    private fun packageContextForCaller(packageName: String, callerUid: Int): Context? {
+        val identity = android.os.Binder.clearCallingIdentity()
+        return try {
             val activityThread = Class.forName("android.app.ActivityThread")
-            val current = activityThread.getMethod("currentApplication").invoke(null)
-            current as? Context
-        }.getOrNull()
+            val thread = activityThread.getMethod("currentActivityThread").invoke(null) ?: return null
+            val system = activityThread.getMethod("getSystemContext").invoke(thread) as Context
+            Context::class.java.getMethod("createPackageContextAsUser", String::class.java,
+                Integer.TYPE, UserHandle::class.java)
+                .invoke(system, packageName, 0, UserHandle.getUserHandleForUid(callerUid)) as Context
+        } catch (e: Exception) {
+            Log.w(TAG, "USER-SERVICE: cannot resolve host package for uid=$callerUid", e)
+            null
+        } finally { android.os.Binder.restoreCallingIdentity(identity) }
+    }
+
+    init {
         Log.i(TAG, "service init context=${appContext != null}")
+        idleExecutor.scheduleWithFixedDelay({
+            runCatching { retireIfIdle() }.onFailure { Log.w(TAG, "USER-SERVICE: idle check failed", it) }
+        }, 10_000L, 10_000L, TimeUnit.MILLISECONDS)
     }
 
     override fun createDisplay(
@@ -282,9 +431,14 @@ class SpikeShellService : ISpikeShell.Stub {
     }
 
     override fun releaseDisplayById(displayId: Int): String = synchronized(lock) {
-        val vd = displays.remove(displayId)
+        val vd = displays[displayId]
+        try {
+            vd?.release()
+        } catch (e: RuntimeException) {
+            return@synchronized "ERR display=$displayId release=${e.javaClass.simpleName}"
+        }
+        displays.remove(displayId)
         displaySizes.remove(displayId)
-        runCatching { vd?.release() }
         if (display === vd) display = displays.values.lastOrNull()
         if (displays.isEmpty()) flagsUsed = 0
         "OK released=${vd != null} remaining=${displays.size}"
@@ -294,7 +448,11 @@ class SpikeShellService : ISpikeShell.Stub {
         val retained = displays.entries.lastOrNull {
             retainedMapName.isNotEmpty() && it.value.display.isValid && it.value.display.name == retainedMapName
         }?.key
-        displays.keys.toList().filter { it != retained }.forEach { releaseDisplayById(it) }
+        // The card owner restores task/window state before releasing its display.
+        val retired = displays.filter { (id, display) ->
+            id != retained && display.display.name != SpikeShell.MEDIA_CARD_DISPLAY_NAME
+        }.keys
+        retired.forEach { releaseDisplayById(it) }
         if (retained == null) return@synchronized "OK id=-1"
         val vd = displays.getValue(retained)
         // No resize or activity relaunch: navigation and the manually selected camera survive.
@@ -743,6 +901,7 @@ class SpikeShellService : ISpikeShell.Stub {
 
     private companion object {
         private const val TAG = "HyperCar-SpikeShell"
+        private const val IDLE_TIMEOUT_MS = 3 * 60_000L
         private val lock = Any()
         private var display: VirtualDisplay? = null
         private val displays = LinkedHashMap<Int, VirtualDisplay>()
@@ -753,7 +912,6 @@ class SpikeShellService : ISpikeShell.Stub {
             Log.i(TAG, "display owner retired released=$count")
         }
         private var flagsUsed: Int = 0
-        private var appContext: Context? = null
 
         private fun releaseDisplaysLocked() {
             displays.values.forEach { runCatching { it.release() } }

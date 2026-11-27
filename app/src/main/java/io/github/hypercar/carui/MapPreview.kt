@@ -30,7 +30,21 @@ object MapPreview {
     private val lock = Mutex()
     private val _status = MutableStateFlow("正在打开地图…")
     val status: StateFlow<String> = _status
-    private var displayId = -1
+    // Publish the projection ticket and map display as one snapshot for synchronous retirement.
+    // Recreating a display gets a new identity even if Android reuses the numeric ID.
+    internal class ProjectionDisplay(val ticket: Long, val id: Int) {
+        fun idleAtDisconnect(retiringTicket: Long, routeInProgress: () -> Boolean?): ProjectionDisplay? =
+            takeIf { ticket == retiringTicket && id > 0 && routeInProgress() == false }
+
+        fun parkedNavigation(idleDisplay: ProjectionDisplay?) =
+            if (idleDisplay === this) ParkedNavigation() else null
+    }
+
+    @Volatile private var mapDisplay = ProjectionDisplay(-1, -1)
+    private var displayId: Int
+        get() = mapDisplay.id
+        set(value) { mapDisplay = ProjectionDisplay(mapDisplay.ticket, value) }
+    private var parkedMapCheck: Job? = null
     private var cardSurface: Surface? = null
     private var width = 0
     private var height = 0
@@ -155,7 +169,8 @@ object MapPreview {
     private fun displayName(provider: MapProvider) = "hypercar-map-${provider.id}"
 
     /** Called under the projection lifecycle lock, before creating the new home display. */
-    suspend fun prepareProjection() = lock.withLock {
+    suspend fun prepareProjection(ticket: Long) = lock.withLock {
+        parkedMapCheck?.cancel()
         clearCardInput()
         val provider = appContext?.let { MapApps.selected(it) }
         if (activeProvider != null && activeProvider != provider) releaseMapTask()
@@ -166,7 +181,7 @@ object MapPreview {
             presentation = null
             carMode = retainedId > 0
         }
-        displayId = retainedId
+        mapDisplay = ProjectionDisplay(ticket, retainedId)
         activeProvider = provider.takeIf { displayId > 0 }
         HyperCarRepo.log("CARUI-PREVIEW: 重连复用检查 $result presentation=$presentation")
     }
@@ -272,7 +287,52 @@ object MapPreview {
         }
     }
 
+    internal fun idleDisplayAtDisconnect(ticket: Long, routeInProgress: () -> Boolean?) =
+        mapDisplay.idleAtDisconnect(ticket, routeInProgress)
+
+    /** Called after the home display is released, under the same projection lifecycle lock. */
+    internal suspend fun parkAfterProjection(idleDisplay: ProjectionDisplay, currentRetirement: () -> Boolean) = lock.withLock {
+        parkedMapCheck?.cancel()
+        val provider = activeProvider?.takeIf { it == MapProvider.AMAP } ?: return@withLock
+        val parkedDisplay = mapDisplay
+        val retention = parkedDisplay.parkedNavigation(idleDisplay) ?: return@withLock
+        val binder = SpikeShell.userServiceBinder ?: return@withLock
+        val parkedId = parkedDisplay.id
+        retention.observe(MusicNotificationListener.hasNavigationNotification(provider))
+        parkedMapCheck = scope.launch {
+            while (true) {
+                delay(10_000)
+                val done = lock.withLock {
+                    if (!currentRetirement() || !stopped || mapDisplay !== parkedDisplay ||
+                        SpikeShell.userServiceBinder != binder) return@withLock true
+                    val notification = MusicNotificationListener.hasNavigationNotification(provider)
+                    retention.observe(notification)
+                    if (!retention.idleConfirmed) return@withLock true
+                    if (HyperCarRepo.hasCurrentSession || !retention.canRelease(notification)) return@withLock false
+                    if (!SpikeShell.releaseDisplay(parkedId).startsWith("OK")) return@withLock false
+                    displayId = -1
+                    releaseMapTask(terminateProvider = false)
+                    HyperCarRepo.log("CARUI-PREVIEW: 空闲地图虚拟屏已释放 display=$parkedId")
+                    true
+                }
+                if (done) break
+            }
+        }
+    }
+
+    internal class ParkedNavigation {
+        var idleConfirmed = true
+            private set
+
+        fun observe(notification: Boolean?) {
+            if (notification == true) idleConfirmed = false
+        }
+
+        fun canRelease(notification: Boolean?) = idleConfirmed && notification == false
+    }
+
     suspend fun release() = lock.withLock {
+        parkedMapCheck?.cancel()
         stopped = true
         fullscreen = false
         releaseMapTask()

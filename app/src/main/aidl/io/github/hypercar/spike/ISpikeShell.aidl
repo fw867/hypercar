@@ -80,4 +80,9 @@ interface ISpikeShell {
     boolean isWifiStationJoiningOrConnected(String ssid);
     String callAudioOfferStatus(long token, long offer);
     void revokeCallAudio(long token, long offer);
+    boolean setCallOutputJournal(in ParcelFileDescriptor journal, int bootCount);
+    boolean hasCallOutputJournal();
+    boolean attachCallAudioBroker(IBinder broker);
+    /** Watches the app process, independently of the Shizuku daemon binder. */
+    boolean attachHost(IBinder host);
 }

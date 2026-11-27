@@ -147,6 +147,9 @@ class ShellPlaybackAudio {
     }
 
     @Synchronized
+    fun hasActiveCapture(): Boolean = session != null
+
+    @Synchronized
     fun stop() {
         val current = session ?: return
         session = null

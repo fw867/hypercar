@@ -114,7 +114,7 @@ impl Drop for Prepared {
 struct Slot {newest:u64, current:Option<Prepared>}
 static SOURCE: Lazy<Mutex<Slot>>=Lazy::new(||Mutex::new(Slot::default()));
 
-pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
+pub(crate) fn prepare(owner:u64,cfg:&EngineConfig, system_canvas:Option<crate::carlife::SystemCanvasHint>)->Result<(),String> {
     let mut slot=SOURCE.lock();
     if slot.current.as_ref().is_some_and(|s|s.owner==owner) {return Ok(());}
     if owner==0 || owner<=slot.newest {return Err("stale CarWith source owner".into());}
@@ -122,11 +122,10 @@ pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
     let stop=Arc::new(DialStop::default());
     let system=cfg.system_carlife_source;
     // Cached display values are INIT hints. The AirPlay session confirms the live display.
-    let cached = if cfg.carwith_cached_canvas {
+    let cached = if cfg.carwith_cached_canvas && !system {
         crate::carlife::ReceiverDisplay {
             size: (cfg.width, cfg.height),
-            // Only explicit CarWith can reopen an encrypted encoder to lift a stale cap.
-            max_fps: cfg.carwith_cached_max_fps.filter(|rate| !system && *rate > 0),
+            max_fps: cfg.carwith_cached_max_fps.filter(|rate| *rate > 0),
             confirmed: false,
         }
     } else {
@@ -140,6 +139,7 @@ pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
         manufacturer:if system {cfg.hu_manufacturer.clone()} else {String::new()},
         model:if system {cfg.hu_model.clone()} else {String::new()},
         width:cfg.width,height:cfg.height,fps:cfg.carwith_fps(),
+        cached_system_canvas:system_canvas.filter(|_|system),
         bt_address:if system && !cfg.hu_bt_address.is_empty() {cfg.hu_bt_address.clone()} else {cfg.device_id.clone()},
         bt_name:if system && !cfg.hu_bt_name.is_empty() {cfg.hu_bt_name.clone()} else {"HyperCar".into()},
         navigation_updates:cfg.carwith_navigation_enabled,microphone:microphone.clone(),vehicle_gps:Some(vehicle_gps.clone())};
@@ -242,8 +242,8 @@ mod tests {
             "carwith_cached_canvas":true,"carwith_cached_max_fps":30
         })).unwrap();
         stop(710);
-        assert!(prepare(710, &config).is_err());
-        prepare(711, &config).unwrap();
+        assert!(prepare(710, &config, None).is_err());
+        prepare(711, &config, None).unwrap();
         let first = attach(711).unwrap();
         let cached = *first.display.borrow();
         assert_eq!(cached.size, (2880, 960));
@@ -254,7 +254,7 @@ mod tests {
             display.confirmed = true;
         });
         stop(710);
-        prepare(711, &config).unwrap();
+        prepare(711, &config, None).unwrap();
         let next_engine = attach(711).unwrap();
         assert!(Arc::ptr_eq(&first.hub, &next_engine.hub));
         let confirmed = *next_engine.display.borrow();
@@ -263,11 +263,12 @@ mod tests {
         stop(711);
 
         let system_config = EngineConfig { system_carlife_source: true, ..config };
-        prepare(712, &system_config).unwrap();
+        let hint = crate::carlife::SystemCanvasHint { size: (2880, 960), is_current: Arc::new(|| true) };
+        prepare(712, &system_config, Some(hint)).unwrap();
         let system = attach(712).unwrap();
         let system_hint = *system.display.borrow();
         stop(712);
-        assert_eq!(system_hint.size, (2880, 960));
+        assert_eq!(system_hint.size, (0, 0));
         assert!(!system_hint.confirmed);
         assert_eq!(system_hint.effective_fps(system_config.carwith_fps()), 60);
     }
@@ -311,7 +312,7 @@ mod tests {
             "width":2736,"height":800,"fps":30,"identity_path":"","carlife_source":true
         })).unwrap();
         let owner=90001;
-        prepare(owner,&config).unwrap();
+        prepare(owner,&config,None).unwrap();
         println!("SOURCE-PREWARM READY: launch CarWith now; wait 25s without AirPlay");
         tokio::time::sleep(Duration::from_secs(25)).await;
         {

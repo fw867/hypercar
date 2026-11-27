@@ -166,6 +166,7 @@ pub struct CarLifeConfig {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    pub(crate) cached_system_canvas: Option<SystemCanvasHint>,
     pub navigation_updates: bool,
     pub microphone: Option<Arc<crate::mic_probe::ProbeControl>>,
     pub(crate) vehicle_gps: Option<Arc<vehicle_gps::PendingLocation>>,
@@ -173,6 +174,12 @@ pub struct CarLifeConfig {
     pub bt_address: String,
     /// `HU_INFO` 里 required 的 `btname`（车机蓝牙名）。
     pub bt_name: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct SystemCanvasHint {
+    pub size: (u32, u32),
+    pub is_current: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 /// Authenticated seven-channel CarWith gateway with video/audio events and touch input.
@@ -518,7 +525,7 @@ impl CarLifeHub {
     pub fn system_voice_key_for_epoch(&self, epoch:u64, key:u64) -> bool {
         let queued = matches!(key, 0x21 | 0x22) && !self.stop.is_retired() &&
             self.system_voice.as_ref().is_some_and(|target| target.queue_for_epoch(epoch,key));
-        emit_log(&format!("VOICE-KEY: System CMD 0x68008 epoch={epoch} key=0x{key:x} queued={queued} (recognition unconfirmed)"));
+        crate::emit_hid_log(&format!("VOICE-KEY: System CMD 0x68008 epoch={epoch} key=0x{key:x} queued={queued} (recognition unconfirmed)"));
         queued
     }
 
@@ -526,14 +533,14 @@ impl CarLifeHub {
     pub fn system_voice_key(&self, key: u64) -> bool {
         let queued = matches!(key, 0x21 | 0x22) && !self.stop.is_retired() &&
             self.system_voice.as_ref().is_some_and(|target| target.queue(key));
-        emit_log(&format!("VOICE-KEY: System CMD 0x68008 key=0x{key:x} queued={queued} (recognition unconfirmed)"));
+        crate::emit_hid_log(&format!("VOICE-KEY: System CMD 0x68008 key=0x{key:x} queued={queued} (recognition unconfirmed)"));
         queued
     }
 
     pub fn voice_start(&self) {
         if self.system_voice_epoch().is_some() { let _ = self.system_voice_key(0x21); return; }
         let queued = self.queue_hard_key(0x21, Duration::from_secs(2));
-        emit_log(&format!("VOICE-KEY: CarWith key=0x21 queued={queued} (not recognition confirmation)"));
+        crate::emit_hid_log(&format!("VOICE-KEY: CarWith key=0x21 queued={queued} (not recognition confirmation)"));
     }
 
     pub fn handle_phone_key(&self, key: u32) {
@@ -545,11 +552,11 @@ impl CarLifeHub {
         // Only the explicitly selected CarWith 4.1 source has no system voice target.
         // SystemAuto can probe that dialect too; it still must not gain phone control.
         if self.system_voice.is_some() {
-            emit_log(&format!("PHONE-KEY: usage=0x{key:x} dropped source=system-carlife"));
+            crate::emit_hid_log(&format!("PHONE-KEY: usage=0x{key:x} dropped source=system-carlife"));
             return;
         }
         let queued = self.queue_hard_key(code, Duration::from_secs(1));
-        emit_log(&format!("PHONE-KEY: usage=0x{key:x} CarWith key={code} queued={queued} (execution unconfirmed)"));
+        crate::emit_hid_log(&format!("PHONE-KEY: usage=0x{key:x} CarWith key={code} queued={queued} (execution unconfirmed)"));
     }
 
     pub fn handle_console_key(&self, key: u32) -> bool {
@@ -567,7 +574,7 @@ impl CarLifeHub {
             _ => return false,
         };
         if !self.queue_hard_key(code, Duration::from_secs(1)) {
-            emit_log("CARWITH-KEY: CTRL queue closed");
+            crate::emit_hid_log("CARWITH-KEY: CTRL queue closed");
         }
         // The input belongs to this source even when its CTRL writer has closed.
         true

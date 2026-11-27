@@ -114,14 +114,6 @@ internal class ShellWifiSelection {
                                     val info = wifi.connectionInfo
                                     info.networkId == previous.id && info.ssid.trim('"') == previous.ssid
                                 },
-                                autojoin = { previous, enabled ->
-                                    // Never restore a deleted/replaced saved config under a recycled ID.
-                                    if (savedNetworks().any {
-                                        it.networkId == previous.id && it.SSID?.trim('"') == previous.ssid
-                                    } == true) WifiManager::class.java.getMethod("allowAutojoin",
-                                        Int::class.javaPrimitiveType, Boolean::class.javaPrimitiveType)
-                                        .invoke(wifi, previous.id, enabled)
-                                },
                                 disconnect = { wifi.disconnect() },
                                 scan = { Log.i("HyperCar", "WIFI-SELECT: bounded other-WiFi handoff; scan_requested=${wifi.startScan()}") },
                             )
@@ -213,13 +205,17 @@ internal class ShellWifiSelection {
         }
     }
 
+    @Synchronized fun hasActiveLease(): Boolean = lease != null
+
+    @Synchronized fun stopActive() {
+        lease?.let { stop(it.token) }
+    }
+
     @Synchronized fun stop(token: String): String {
         val current = lease?.takeIf { it.token == token }
             ?: return lastClosed?.takeIf { it.first == token }?.second ?: "SKIP Wi-Fi selector inactive"
         lease = null
-        runCatching { current.recovery.close() }.onFailure {
-            Log.w("HyperCar", "WIFI-SELECT: previous autojoin restore failed ${it.javaClass.simpleName}")
-        }
+        current.recovery.close()
         runCatching { current.binder.unlinkToDeath(current.death, 0) }
         runCatching { current.wifi.javaClass.getMethod("unregisterNetworkRequestMatchCallback", current.callbackType)
             .invoke(current.wifi, current.callback) }

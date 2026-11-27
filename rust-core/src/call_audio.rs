@@ -1,6 +1,6 @@
 //! A CarPlay main-audio stream for an active cellular call. Local PCM belongs
 //! to the shell call-redirection endpoints and never enters the media/VR mixer.
-use std::{collections::VecDeque, os::{fd::{AsRawFd, RawFd}, unix::net::UnixStream as LocalSocket}, sync::atomic::{AtomicBool, AtomicI64, Ordering}, time::Duration};
+use std::{collections::VecDeque, os::{fd::{AsRawFd, RawFd}, unix::net::UnixStream as LocalSocket}, sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering}, time::{Duration, SystemTime, UNIX_EPOCH}};
 use parking_lot::Mutex;
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::{UdpSocket, UnixStream}, sync::mpsc, time::Instant};
 use crate::{audio_out::AudioOut, aux_audio::Session, bplist::{self, Value}, mic_probe, rtsp::RtspMessage};
@@ -339,7 +339,8 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
         bound.or_else(|| session.factory.open_udp(host, port))
     } else { None };
     let output_key = crate::airplay::stream_key(&session.shared, id as u64);
-    let mut speaker = AudioOut::new_pcm(socket, sync, output_key, format.rate);
+    let mut speaker = AudioOut::new_call_pcm(socket, sync, output_key, format.rate);
+    let mut report_socket = speaker.call_report_socket();
     speaker.set_ownership(session.resource.owned.clone());
     speaker.track_rtp_ownership(&session.control.buffered_ownership);
     let input_key = mic_probe::input_key(&session.shared, id as u64);
@@ -359,40 +360,58 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
         if !valid(&ownership.borrow()) { *outcome = OfferResult::SameRate; }
         return Err("phoneCall app state rejected".into());
     }
-    tokio::select! {
+    let initial_pcm = tokio::select! {
         biased;
         _ = &mut stop => return Ok(()),
         _ = ownership.changed() => {
             *outcome = OfferResult::SameRate;
             return Err("main audio grant changed before call audio start".into());
         }
-        // The phone can finish one bounded Telecom retry before settling the audio route.
-        ready = tokio::time::timeout(Duration::from_millis(1500), async {
+        // The phone checks the Bluetooth route and Telecom before committing its first PCM.
+        ready = tokio::time::timeout(Duration::from_secs(2), async {
             local.write_u8(1).await?;
-            local.read_u8().await
+            let size = usize::from(local.read_u16().await?);
+            if !(2..=1920).contains(&size) || size % 2 != 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+            }
+            let mut first = vec![0; size];
+            local.read_exact(&mut first).await?;
+            if local.read_u8().await? != 1 {
+                return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+            }
+            Ok(first)
         }) => {
-            if !matches!(ready, Ok(Ok(1))) {
-                *outcome = OfferResult::NextRate;
-                return Err("phone call audio did not start".into());
+            match ready {
+                Ok(Ok(first)) => first,
+                _ => {
+                    *outcome = OfferResult::NextRate;
+                    return Err("phone call audio did not start".into());
+                }
             }
         }
-    }
+    };
     *outcome = OfferResult::SameRate;
     crate::emit_log(&format!("CALL-AUDIO: telephony SETUP ready type={TYPE} phoneRate={phone_rate} rate={} channels={} codec={:?}",
         format.rate, format.channels, format.codec));
     let uplink_ownership = ownership.clone();
     let phone_fd = local.as_raw_fd();
     let (mut downlink, uplink) = local.split();
+    let (first_rtp_sent, mut first_rtp) = tokio::sync::oneshot::channel();
+    let speaker_receipt = Mutex::new(CallSpeakerReceipt::default());
+    let expect_reports = report_socket.is_some();
     let down = async {
+        let mut first_rtp_sent = Some(first_rtp_sent);
         let phone_frames = (format.frames() * phone_rate as usize).div_ceil(format.rate as usize);
         let mut pcm = vec![0; phone_frames * 2];
         let mut samples = VecDeque::new();
         let mut resampler = MonoResampler::default();
+        resampler.push(&initial_pcm, phone_rate, format.rate, &mut samples);
         let mut sync = std::time::Instant::now() - Duration::from_secs(1);
         let period = Duration::from_secs_f64(format.frames() as f64 / f64::from(format.rate));
         let mut eld_clock = EldClock::new(format);
         let mut next_packet = tokio::time::Instant::now();
-        let mut phone_pcm_ready = false;
+        crate::emit_log("CALL-AUDIO: phone downlink PCM received");
+        let mut last_sender_report = None;
         loop {
             check_phone_endpoint(phone_fd)?;
             while samples.len() < format.frames() {
@@ -401,10 +420,6 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
                         std::io::ErrorKind::UnexpectedEof => "phone downlink PCM endpoint closed".into(),
                         _ => format!("phone downlink PCM read failed: {error}"),
                     })?;
-                if !phone_pcm_ready {
-                    phone_pcm_ready = true;
-                    crate::emit_log("CALL-AUDIO: phone downlink PCM received");
-                }
                 resampler.push(&pcm, phone_rate, format.rate, &mut samples);
             }
             let now = tokio::time::Instant::now();
@@ -428,8 +443,22 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
                 let _ = speaker.send_call_sync(crate::timing::monotonic_nanos(), format.frames() as u32).await;
                 sync = std::time::Instant::now();
             }
-            speaker.send_call_audio(&payload, format.frames() as u32, loss_generation, phone_fd).await
-                .map_err(|error| format!("car speaker RTP send failed: {error}"))?;
+            let sent_at = expect_reports.then(receipt_clock);
+            if let Some(sequence) = speaker.send_call_audio(&payload, format.frames() as u32, loss_generation, phone_fd).await
+                .map_err(|error| format!("car speaker RTP send failed: {error}"))? {
+                if let Some(started) = first_rtp_sent.take() { let _ = started.send(()); }
+                if let Some(sent_at) = sent_at {
+                    let mut receipt = speaker_receipt.lock();
+                    receipt.sent(sequence, sent_at);
+                    if last_sender_report.is_none_or(|at: std::time::Instant| at.elapsed() >= Duration::from_secs(5)) {
+                        last_sender_report = Some(std::time::Instant::now());
+                        let ntp = next_call_sender_report_time();
+                        if speaker.send_call_sender_report(ntp, format.frames() as u32) {
+                            receipt.sent_sender_report((ntp >> 16) as u32, sent_at);
+                        }
+                    }
+                }
+            }
         }
     };
     let up = async {
@@ -438,20 +467,54 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
         let mut input = MicrophoneInput::new(&microphone, receiver_ip, input_key, format.channels, decoder, eld);
         let mut resampler = MonoResampler::default();
         let mut converted = VecDeque::new();
+        let mut report = [0; 2048];
+        let mut receipt_logged = false;
+        let mut startup_acknowledged = false;
         loop {
-            let Some((port, pcm)) = input.next_pcm().await? else {
-                resampler = MonoResampler::default();
-                continue;
+            let frame = tokio::select! {
+                result = &mut first_rtp, if !startup_acknowledged => {
+                    result.map_err(|_| "phone downlink ended before the first RTP packet")?;
+                    startup_acknowledged = true;
+                    STARTED_FRAME.to_be_bytes().to_vec()
+                }
+                packet = receive_call_report(report_socket.as_deref(), &mut report) => {
+                    let size = match packet {
+                        Ok(size) if size < report.len() => size,
+                        Ok(_) => continue,
+                        Err(error) => {
+                            report_socket = None;
+                            crate::emit_log(&format!("CALL-AUDIO: telephony receiver reports unavailable: {error}"));
+                            continue;
+                        }
+                    };
+                    let Some(deadline) = speaker_receipt.lock().confirmed(&report[..size], receipt_clock()) else { continue; };
+                    if !receipt_logged {
+                        crate::emit_log(&format!("CALL-AUDIO: car confirmed telephony downlink RTP stream={id}"));
+                        receipt_logged = true;
+                    }
+                    let deadline_ms = deadline.as_millis() as u64;
+                    let mut frame = Vec::with_capacity(10);
+                    frame.extend_from_slice(&OUTPUT_RECEIPT_FRAME.to_be_bytes());
+                    frame.extend_from_slice(&deadline_ms.to_be_bytes());
+                    frame
+                }
+                packet = input.next_pcm() => {
+                    let Some((port, pcm)) = packet? else {
+                        resampler = MonoResampler::default();
+                        continue;
+                    };
+                    input.playing(port);
+                    resampler.push(&pcm, format.rate, phone_rate, &mut converted);
+                    let bytes = converted.len() * 2;
+                    if bytes == 0 { continue; }
+                    if bytes > 0x7ffe { return Err("phone call microphone frame is too large".into()); }
+                    let mut frame = Vec::with_capacity(2 + bytes);
+                    frame.extend_from_slice(&(bytes as u16).to_be_bytes());
+                    frame.extend(converted.drain(..).flat_map(i16::to_le_bytes));
+                    frame
+                }
             };
             if !session.resource.owned.load(Ordering::Acquire) { return Err("receiver took main audio".into()); }
-            input.playing(port);
-            resampler.push(&pcm, format.rate, phone_rate, &mut converted);
-            let bytes = converted.len() * 2;
-            if bytes == 0 { continue; }
-            if bytes > 0x7ffe { return Err("phone call microphone frame is too large".into()); }
-            let mut frame = Vec::with_capacity(2 + bytes);
-            frame.extend_from_slice(&(bytes as u16).to_be_bytes());
-            frame.extend(converted.drain(..).flat_map(i16::to_le_bytes));
             tokio::time::timeout(Duration::from_millis(100), async {
                 let mut written = 0;
                 while written < frame.len() {
@@ -480,6 +543,136 @@ pub(crate) async fn run(session: &Session, phone_rate: u32, mut local: UnixStrea
         result = down => result,
         result = up => result,
     }
+}
+
+async fn receive_call_report(socket: Option<&UdpSocket>, report: &mut [u8]) -> std::io::Result<usize> {
+    match socket {
+        Some(socket) => socket.recv(report).await,
+        None => std::future::pending().await,
+    }
+}
+
+const SPEAKER_RECEIPT_LIFETIME: Duration = Duration::from_millis(650);
+const MIN_SPEAKER_REPORT_GAP: Duration = Duration::from_millis(80);
+const MAX_SPEAKER_REPORT_GAP: Duration = Duration::from_millis(400);
+const SPEAKER_REPORT_QUALIFY: Duration = Duration::from_millis(1300);
+const SENDER_REPORT_LIFETIME: Duration = Duration::from_secs(8);
+pub(crate) const OUTPUT_RECEIPT_FRAME: u16 = 0x8000;
+pub(crate) const STARTED_FRAME: u16 = 0x8001;
+
+fn next_call_sender_report_time() -> u64 {
+    static LAST_TICK: AtomicU64 = AtomicU64::new(0);
+    let unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let wall = ((unix.as_secs() + 2_208_988_800) << 16) | ((u64::from(unix.subsec_nanos()) << 16) / 1_000_000_000);
+    let new_tick = |last: u64| {
+        let tick = wall.max(last + 1);
+        // RTCP reserves an all-zero LSR for a receiver that hasn't seen a sender report.
+        tick + u64::from(tick as u32 == 0)
+    };
+    let mut prior = LAST_TICK.load(Ordering::Relaxed);
+    loop {
+        let next = new_tick(prior);
+        match LAST_TICK.compare_exchange_weak(prior, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next << 16,
+            Err(updated) => prior = updated,
+        }
+    }
+}
+
+// Shared with System.nanoTime in the shell process. Carry the original RTP expiry
+// through logging, scheduling and IPC without restarting its lifetime.
+fn receipt_clock() -> Duration {
+    Duration::from_nanos(crate::timing::monotonic_nanos())
+}
+
+struct SpeakerReportProgress {
+    sequence: u32,
+    received_at: Duration,
+    deadline: Duration,
+    stable_since: Duration,
+}
+
+#[derive(Default)]
+struct CallSpeakerReceipt {
+    sent: VecDeque<(u32, Duration)>,
+    sender_reports: VecDeque<(u32, Duration)>,
+    last_report: Option<SpeakerReportProgress>,
+    qualified: bool,
+    interrupted: bool,
+}
+
+impl CallSpeakerReceipt {
+    fn sent(&mut self, sequence: u16, now: Duration) {
+        let extended = self.sent.back().map_or(u32::from(sequence), |&(previous, _)| {
+            previous.wrapping_add(u32::from(sequence.wrapping_sub(previous as u16)))
+        });
+        if self.sent.len() == 96 { self.sent.pop_front(); }
+        self.sent.push_back((extended, now));
+    }
+
+    fn sent_sender_report(&mut self, lsr: u32, now: Duration) {
+        if self.sender_reports.len() == 10 { self.sender_reports.pop_front(); }
+        self.sender_reports.push_back((lsr, now));
+    }
+
+    fn confirmed(&mut self, report: &[u8], now: Duration) -> Option<Duration> {
+        if self.interrupted { return None; }
+        let (sequence, lsr) = call_reception_report(report)?;
+        if !self.sender_reports.iter().any(|&(sent_lsr, at)|
+            lsr == sent_lsr && now.saturating_sub(at) < SENDER_REPORT_LIFETIME) {
+            return None;
+        }
+        if self.last_report.as_ref().is_some_and(|previous| (sequence.wrapping_sub(previous.sequence) as i32) <= 0) {
+            return None;
+        }
+        let &(_, sent_at) = self.sent.iter().rev().find(|&&(sent, _)| sent == sequence)?;
+        let deadline = sent_at + SPEAKER_RECEIPT_LIFETIME;
+        if now >= deadline { return None; }
+        if self.last_report.as_ref().is_some_and(|previous|
+            now.saturating_sub(previous.received_at) < MIN_SPEAKER_REPORT_GAP) {
+            return None;
+        }
+        let continued = self.last_report.as_ref().filter(|previous|
+            now < previous.deadline && now.saturating_sub(previous.received_at) <= MAX_SPEAKER_REPORT_GAP);
+        if self.qualified && continued.is_none() {
+            // Once feedback continuity is lost, keep handset sound for the rest of this offer.
+            self.interrupted = true;
+            return None;
+        }
+        let stable_since = continued.map_or(now, |previous| previous.stable_since);
+        self.last_report = Some(SpeakerReportProgress { sequence, received_at: now, deadline, stable_since });
+        self.qualified = now.saturating_sub(stable_since) >= SPEAKER_REPORT_QUALIFY;
+        self.qualified.then_some(deadline)
+    }
+}
+
+// RFC 3550 reception report blocks can be carried by either RTCP RR or SR.
+fn call_reception_report(mut datagram: &[u8]) -> Option<(u32, u32)> {
+    let mut reception = None;
+    while !datagram.is_empty() {
+        let header = datagram.get(..4)?;
+        if header[0] >> 6 != 2 { return None; }
+        let size = (usize::from(u16::from_be_bytes([header[2], header[3]])) + 1) * 4;
+        let (packet, rest) = datagram.split_at_checked(size)?;
+        datagram = rest;
+        let unpadded = if header[0] & 0x20 != 0 {
+            let padding = usize::from(*packet.last()?);
+            if !rest.is_empty() || padding == 0 || padding > size - 4 { return None; }
+            &packet[..size - padding]
+        } else { packet };
+        let start = match header[1] { 200 => 28, 201 => 8, _ => continue };
+        let end = start + usize::from(header[0] & 31) * 24;
+        for block in unpadded.get(start..end)?.chunks_exact(24) {
+            // CarPlay output retains SSRC 0 and uses a separate control socket for this offer.
+            if block[..4] == [0; 4] && block[4] < u8::MAX {
+                let lsr = u32::from_be_bytes(block[16..20].try_into().ok()?);
+                if lsr != 0 {
+                    reception = Some((u32::from_be_bytes(block[8..12].try_into().ok()?), lsr));
+                }
+            }
+        }
+    }
+    reception
 }
 
 type EldQueue<C> = fn(&mut C, &[u8], u64) -> Result<bool, String>;
@@ -743,6 +936,68 @@ fn mono_pcm(payload: &[u8], channels: usize) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_speaker_receipt_matches_only_recent_sent_sequences_and_rejects_replay() {
+        let start = Duration::from_secs(12);
+        let report = |sequence: u32, lsr: u32| {
+            let mut bytes = [0; 32];
+            bytes[..4].copy_from_slice(&[0x81, 201, 0, 7]);
+            bytes[16..20].copy_from_slice(&sequence.to_be_bytes());
+            bytes[24..28].copy_from_slice(&lsr.to_be_bytes());
+            bytes
+        };
+        let mut receipt = CallSpeakerReceipt::default();
+        receipt.sent_sender_report(128, start);
+        receipt.sent(u16::MAX, start);
+        receipt.sent(1, start + Duration::from_millis(40)); // seq 0 was not written.
+        let now = start + Duration::from_millis(100);
+        assert_eq!(receipt.confirmed(&[], now), None);
+        assert_eq!(receipt.confirmed(&report(65536, 128), now), None);
+        assert_eq!(receipt.confirmed(&report(1, 128), now), None);
+        assert_eq!(receipt.confirmed(&report(65537, 127), now), None);
+        assert!(receipt.last_report.is_none());
+        let mut wrong_source = report(65537, 128);
+        wrong_source[11] = 1;
+        assert_eq!(receipt.confirmed(&wrong_source, now), None);
+        let mut invalid_compound = report(65537, 128).to_vec();
+        invalid_compound.extend_from_slice(&[0x81, 201, 0, 7]);
+        assert_eq!(receipt.confirmed(&invalid_compound, now), None);
+        assert_eq!(receipt.confirmed(&report(65537, 128), now), None);
+        assert_eq!(receipt.confirmed(&report(65537, 128), now), None);
+        assert_eq!(receipt.confirmed(&report(65535, 128), now), None);
+        receipt.sent(2, now);
+        assert_eq!(receipt.confirmed(&report(65538, 128), now), None);
+        assert_eq!(receipt.last_report.as_ref().unwrap().sequence, 65537);
+        let second = now + MIN_SPEAKER_REPORT_GAP;
+        assert_eq!(receipt.confirmed(&report(65538, 128), second), None);
+        let third = second + MIN_SPEAKER_REPORT_GAP;
+        receipt.sent(3, third);
+        assert_eq!(receipt.confirmed(&report(65539, 128), third), None);
+        for (start_seq, start_ms, count, stable) in [(4, 5000, 3, false), (7, 10000, 11, true), (18, 15000, 11, false)] {
+            let group = start + Duration::from_millis(start_ms);
+            receipt.sent_sender_report(start_seq, group);
+            for index in 0..count {
+                let at = group + Duration::from_millis(150 * u64::from(index));
+                let seq = start_seq + index;
+                receipt.sent(seq as u16, at);
+                let confirmed = receipt.confirmed(&report(65536 + seq, start_seq), at + Duration::from_millis(40));
+                assert_eq!(confirmed, (stable && index >= 9).then_some(at + SPEAKER_RECEIPT_LIFETIME));
+            }
+        }
+    }
+
+    #[test]
+    fn compound_sender_report_can_confirm_the_same_call_ssrc() {
+        let mut sr = vec![0; 8 + 52];
+        sr[..4].copy_from_slice(&[0x80, 201, 0, 1]);
+        sr[8..12].copy_from_slice(&[0x81, 200, 0, 12]);
+        sr[44..48].copy_from_slice(&42u32.to_be_bytes());
+        sr[52..56].copy_from_slice(&128u32.to_be_bytes());
+        assert_eq!(call_reception_report(&sr), Some((42, 128)));
+        sr[40] = u8::MAX;
+        assert_eq!(call_reception_report(&sr), None);
+    }
     use std::{io::Write, os::fd::AsRawFd};
 
     const MIC_TEST_KEY: [u8; 32] = [42; 32];

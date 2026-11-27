@@ -9,18 +9,18 @@ class WifiHandoffLeaseTest {
         var state = WifiHandoffLease.SavedNetwork(7, "home", true)
         var owned = true
         var allowDisconnect = true
-        var loseOwnerOnDisable = false
-        var changeNetworkOnDisable = false
+        var loseOwnerOnRead = false
+        var changeNetworkOnRead = false
         var scanFailure = false
         val events = mutableListOf<String>()
         fun run(lease: WifiHandoffLease, target: String = "car") = lease.recover(target,
-            owned = { owned }, current = { state },
-            isCurrent = { old -> state.id == old.id && state.ssid == old.ssid },
-            autojoin = { old, enabled ->
-                events += "autojoin:${old.id}:$enabled"
-                if (!enabled && loseOwnerOnDisable) owned = false
-                if (!enabled && changeNetworkOnDisable) state = state.copy(id = 8, ssid = "other")
+            owned = { owned }, current = {
+                state.also {
+                    if (loseOwnerOnRead) owned = false
+                    if (changeNetworkOnRead) state = state.copy(id = 8, ssid = "other")
+                }
             },
+            isCurrent = { old -> state.id == old.id && state.ssid == old.ssid },
             disconnect = { events += "disconnect"; allowDisconnect },
             scan = { events += "scan"; if (scanFailure) throw CancellationException("cancelled") },
         )
@@ -33,13 +33,13 @@ class WifiHandoffLeaseTest {
         assertNull(WifiHandoffLease.currentSavedNetwork(7,"home",listOf(home.copy(id=8))))
     }
 
-    @Test fun oneHandoffRestoresOnlyItsPreviousAutojoinExactlyOnce() {
+    @Test fun oneHandoffOnlyDisconnectsAndScansWithoutChangingPreferences() {
         val n=Network(); val lease=WifiHandoffLease()
         assertTrue(n.run(lease))
         assertFalse(n.run(lease))
-        assertEquals(listOf("autojoin:7:false","disconnect","scan"), n.events)
+        assertEquals(listOf("disconnect","scan"), n.events)
         lease.close();lease.close()
-        assertEquals(listOf("autojoin:7:false","disconnect","scan","autojoin:7:true"),n.events)
+        assertEquals(listOf("disconnect","scan"),n.events)
     }
     @Test fun foreignRequestsCurrentCarAndCancelledLeasesNeverDisconnectAnything() {
         val n=Network();val lease=WifiHandoffLease()
@@ -47,23 +47,23 @@ class WifiHandoffLeaseTest {
         n.owned=true;assertFalse(n.run(lease,"home"));assertTrue(n.events.isEmpty())
         lease.close();assertFalse(n.run(lease));assertTrue(n.events.isEmpty())
     }
-    @Test fun ownershipOrCurrentApChangesRollBackBeforeAnyDisconnect() {
+    @Test fun ownershipOrCurrentApChangesPreventAnyDisconnect() {
         for (changeNetwork in listOf(false,true)) {
             val n=Network();val lease=WifiHandoffLease()
-            n.loseOwnerOnDisable=!changeNetwork;n.changeNetworkOnDisable=changeNetwork
+            n.loseOwnerOnRead=!changeNetwork;n.changeNetworkOnRead=changeNetwork
             assertFalse(n.run(lease))
-            assertEquals(listOf("autojoin:7:false","autojoin:7:true"),n.events)
+            assertTrue(n.events.isEmpty())
             assertFalse(n.run(lease))
         }
     }
-    @Test fun rejectedDisconnectAndCancelledScanRestoreTheOldSetting() {
+    @Test fun rejectedDisconnectAndCancelledScanLeaveNothingToRestore() {
         val rejected=Network().apply { allowDisconnect=false }
         assertFalse(rejected.run(WifiHandoffLease()))
-        assertEquals(listOf("autojoin:7:false","disconnect","autojoin:7:true"),rejected.events)
+        assertEquals(listOf("disconnect"),rejected.events)
         val cancelled=Network().apply { scanFailure=true }
         try { cancelled.run(WifiHandoffLease());fail("must propagate cancellation") }
         catch (_: CancellationException) { }
-        assertEquals(listOf("autojoin:7:false","disconnect","scan","autojoin:7:true"),cancelled.events)
+        assertEquals(listOf("disconnect","scan"),cancelled.events)
     }
     @Test fun userDisabledAutojoinIsNeverEnabledByCleanup() {
         val n=Network().apply { state=state.copy(autojoin=false) };val lease=WifiHandoffLease()

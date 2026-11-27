@@ -41,6 +41,17 @@ class AmapLinkNavigationStateTest {
         assertEquals(2, state.snapshot(6)!!.state)
         state.clear(); assertNull(state.snapshot(7))
     }
+
+    @Test fun anExpiredHudSampleDoesNotEndTheObservedRoute() {
+        val state = AmapLinkNavigationState()
+        val token = state.begin()
+        assertNull(state.routeInProgress())
+        assertTrue(state.accept(token, 4, info(), 0))
+        assertEquals(0, state.snapshot(16_000)?.state)
+        assertEquals(true, state.routeInProgress())
+        assertTrue(state.accept(token, 100, null, 16_001))
+        assertEquals(false, state.routeInProgress())
+    }
     @Test fun manualExitClearsRouteOnceAndStopsHeartbeats() {
         val state = AmapLinkNavigationState(); val token = state.begin()
         val hud = RouteGuidanceSession {}

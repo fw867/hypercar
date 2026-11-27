@@ -40,4 +40,31 @@ internal class MediaDiagnosticLog(
             done.await()
         }
     }
+
+    companion object {
+        fun queuesInputLine(line: String): Boolean =
+            line.startsWith("PHONE-HID: ") || line.startsWith("HID-INPUT: ") ||
+                line.startsWith("HID-KEY: ") || line.startsWith("HID-LAYOUT: ") ||
+                line.startsWith("PHONE-KEY: ") || line.startsWith("VOICE-KEY: ") ||
+                line.startsWith("CARWITH-KEY: ") || line.startsWith("CARWITH-TOUCH: ") ||
+                line.startsWith("EVENT: HID 报告 ") || line.startsWith("TOUCH: 车机(") ||
+                line.startsWith("EVENT: 车机命令 type=hidSendReport（") ||
+                line.startsWith("EVENT: 车机命令 type=requestSiri（") ||
+                line.startsWith("MEDIA-KEY: ") || line.startsWith("MEDIA-KEY-GATE: ") ||
+                line.startsWith("CARUI: console input ") ||
+                line.startsWith("IAP2-MEDIA: ") || line.startsWith("iap2 rx=0x6800 non-media/undeclared HID ") ||
+                isScopedHidLine(line)
+
+        private val iap2HidFrame = Regex("""\b(?:RX|ACK-only) .*\bid=0x680[0-3](?: |$)""")
+
+        private fun isScopedHidLine(line: String): Boolean =
+            (line.startsWith("HS#") || line.startsWith("WIFI-IAP#")) &&
+                (" IAP2-MEDIA: " in line || " AirPlay HID END " in line ||
+                    " iap2 rx=0x6800 non-media/undeclared HID " in line || iap2HidFrame.containsMatchIn(line))
+
+        fun queuesNativeLine(line: String): Boolean = queuesInputLine(line) ||
+            line.startsWith("VIDEO-FEEDBACK: ") || line.startsWith("VIDEO-QUEUE: ") ||
+            line.startsWith("VIDEO-QOS: ") || line.startsWith("VIDEO: reset source ") ||
+            line.startsWith("VIDEO: keepAlive written ") || line.startsWith("CLUSTER: keepAlive written ")
+    }
 }

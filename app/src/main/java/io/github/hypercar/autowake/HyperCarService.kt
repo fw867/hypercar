@@ -15,6 +15,21 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import io.github.hypercar.HyperCarApp
 import io.github.hypercar.R
+import io.github.hypercar.session.HyperCarRepo
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 自动待机与当前会话的前台保活。待机只保持监听，不持 CPU / WiFi 锁；
@@ -27,6 +42,31 @@ class HyperCarService : Service() {
     private var wifiLock: WifiManager.WifiLock? = null
     private var listeningOnly = false
     private var identityOnly = false
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val projectionAllowed = MutableStateFlow(false)
+    @Volatile private var keeperGeneration: Any? = null
+    private var foregroundTypes = 0
+
+    override fun onCreate() {
+        super.onCreate()
+        serviceScope.launch {
+            var keeper: Job? = null
+            combine(projectionAllowed, HyperCarRepo.projectionOwner) { allowed, owner -> owner.takeIf { allowed } }
+                .distinctUntilChanged().collect { owner ->
+                val generation = owner?.let { Any() }
+                keeperGeneration = generation
+                keeper?.cancel()
+                if (projectionAllowed.value && hasPlaybackForeground()) startForegroundSafe()
+                keeper = if (owner != null && generation != null) serviceScope.launch {
+                    coroutineScope {
+                        launch { watchHeartbeat(owner, generation, "main") }
+                        launch(Dispatchers.Default) { watchHeartbeat(owner, generation, "worker") }
+                        ProjectionPlayback.withTrackSlot { holdProjectionPlayback(owner, generation) }
+                    }
+                } else null
+            }
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -76,7 +116,8 @@ class HyperCarService : Service() {
         }
         if (automatic && !autoEnabled) return START_NOT_STICKY
         listeningOnly = requestedIdentity || intent == null || intent.action == ACTION_LISTEN
-        startForegroundSafe()
+        startForegroundSafe(playback = !listeningOnly && hasPlaybackForeground())
+        projectionAllowed.value = !listeningOnly && foregroundTypes != 0
         if (listeningOnly) releaseLocks() else acquireLocks()
         isRunning = true
         val device = deviceOf(intent)
@@ -99,6 +140,9 @@ class HyperCarService : Service() {
 
     override fun onDestroy() {
         isRunning = false
+        projectionAllowed.value = false
+        keeperGeneration = null
+        serviceScope.cancel()
         stopForeground(STOP_FOREGROUND_REMOVE)
         releaseLocks()
         Log.i(TAG, "前台保活已停止，通知与唤醒锁已释放")
@@ -114,33 +158,69 @@ class HyperCarService : Service() {
      * 类型与 manifest 的 `connectedDevice|microphone` 对应；失败时退回纯 connectedDevice，
      * 至少保证会话能进前台（麦克风随后会在 AudioRecord 处再报一次原因）。
      */
-    private fun startForegroundSafe() {
+    private fun startForegroundSafe(playback: Boolean = false) {
         val micGranted = !listeningOnly &&
             androidx.core.content.ContextCompat.checkSelfPermission(
                 this,
                 android.Manifest.permission.RECORD_AUDIO,
             ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-        val types =
-            if (android.os.Build.VERSION.SDK_INT >= 30 && micGranted) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            } else {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-            }
-        try {
-            ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(), types)
-        } catch (t: Throwable) {
-            Log.e(TAG, "startForeground（含 microphone 类型）失败：${t.message}，退回 connectedDevice")
+        val notification = buildNotification()
+        for (types in ProjectionForegroundPolicy.types(micGranted, playback)) {
             try {
-                ServiceCompat.startForeground(
-                    this,
-                    NOTIFICATION_ID,
-                    buildNotification(),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
-                )
-            } catch (t2: Throwable) {
-                Log.e(TAG, "startForeground 失败：${t2.message}")
+                ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, types)
+                foregroundTypes = types
+                return
+            } catch (error: RuntimeException) {
+                Log.w(TAG, "startForeground types=0x${types.toString(16)} failed", error)
             }
+        }
+    }
+
+    private fun hasPlaybackForeground() = foregroundTypes and ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK != 0
+
+    private fun projectionCurrent(owner: Long, generation: Any) = keeperGeneration === generation &&
+        projectionAllowed.value && HyperCarRepo.projectionOwner.value == owner
+
+    private suspend fun holdProjectionPlayback(owner: Long, generation: Any) = withContext(Dispatchers.IO) {
+        if (!projectionCurrent(owner, generation)) return@withContext
+        val track = runCatching { ProjectionPlayback.start { projectionCurrent(owner, generation) } }.getOrElse {
+            HyperCarRepo.log("KEEPER: 静音音轨启动失败 ${it.javaClass.simpleName}: ${it.message}")
+            return@withContext
+        } ?: return@withContext
+        try {
+            val promoted = withContext(Dispatchers.Main.immediate) {
+                if (!projectionCurrent(owner, generation)) false
+                else {
+                    startForegroundSafe(playback = true)
+                    hasPlaybackForeground()
+                }
+            }
+            if (promoted) {
+                HyperCarRepo.log("KEEPER: 投屏静音音轨已开始")
+                awaitCancellation()
+            } else {
+                HyperCarRepo.log("KEEPER: 投屏静音音轨未获前台播放类型")
+            }
+        } finally {
+            ProjectionPlayback.releaseAfterForeground(
+                restoreForeground = {
+                    withContext(NonCancellable + Dispatchers.Main.immediate) {
+                        if (projectionCurrent(owner, generation) && hasPlaybackForeground()) startForegroundSafe()
+                    }
+                },
+                releaseTrack = {
+                    runCatching { track.release() }
+                        .onSuccess { HyperCarRepo.log("KEEPER: 投屏静音音轨已释放") }
+                        .onFailure { HyperCarRepo.log("KEEPER: 投屏静音音轨释放失败 ${it.javaClass.simpleName}") }
+                },
+            )
+        }
+    }
+
+    private suspend fun watchHeartbeat(owner: Long, generation: Any, scheduler: String) = ProjectionHeartbeat.monitor { gap ->
+        serviceScope.launch(Dispatchers.IO) {
+            if (projectionCurrent(owner, generation))
+                HyperCarRepo.log("FREEZE: engine=$owner scheduler=$scheduler elapsed_gap_ms=${gap.elapsedMs} uptime_gap_ms=${gap.uptimeMs} suspend_ms=${gap.suspendMs}")
         }
     }
 
@@ -160,6 +240,7 @@ class HyperCarService : Service() {
     }
 
     private fun releaseLocks() {
+        projectionAllowed.value = false
         runCatching { wakeLock?.release() }
         wakeLock = null
         runCatching { wifiLock?.release() }

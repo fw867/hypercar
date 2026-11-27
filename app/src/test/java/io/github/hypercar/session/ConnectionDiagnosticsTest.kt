@@ -198,6 +198,47 @@ class ConnectionDiagnosticsTest {
         now = 100L
         val next = journal.begin("acl", "bmw_id85", aclWake = stale)
         assertEquals("本轮尚未观察到车机 ACL 连入", journal.aclObservation(next))
+        assertNull(journal.currentAclWakePeer(next))
+    }
+
+    @Test fun cacheCanOnlyUseTheAdmittedWakeWhileItStillDescribesThisAttempt() {
+        var now = 80L
+        val journal = ConnectionDiagnostics { now }
+        val first = "10:11:12:13:14:15"
+        val second = "20:21:22:23:24:25"
+        val wake = ConnectionDiagnostics.AclWake(first, now)
+        journal.recordAcl(first, true, now)
+        now = 100L
+        val attempt = journal.begin("acl", "bmw_id85", aclWake = wake)
+        assertEquals(first, journal.currentAclWakePeer(attempt))
+        journal.recordAcl(second, true, 105L)
+        assertNull(journal.currentAclWakePeer(attempt))
+        journal.recordAcl(second, false, 110L)
+        journal.recordAcl(first, false, 111L)
+        assertNull(journal.currentAclWakePeer(attempt))
+        journal.recordAcl(first, true, 120L)
+        assertNull(journal.currentAclWakePeer(attempt))
+        now = 130L
+        val next = journal.begin("manual", "bmw_id85", aclWake = wake)
+        assertNull(journal.currentAclWakePeer(next))
+        assertNull(journal.currentAclWakePeer(attempt))
+    }
+
+    @Test fun aDelayedDisconnectCanRetireAnInheritedWakeWithoutReplayingOtherOldEdges() {
+        var now = 100L
+        val journal = ConnectionDiagnostics { now }
+        val peer = "10:11:12:13:14:15"
+        val wake = ConnectionDiagnostics.AclWake(peer, now)
+        journal.recordAcl(peer, true, now)
+        now = 120L
+        val attempt = journal.begin("acl", "bmw_id85", aclWake = wake)
+        assertNull(journal.recordAcl("20:21:22:23:24:25", false, 110L))
+        assertNull(journal.recordAcl(peer, false, 99L))
+        assertEquals(peer, journal.currentAclWakePeer(attempt))
+        journal.recordAcl(peer, false, 110L)
+        assertNull(journal.currentAclWakePeer(attempt))
+        assertNull(journal.recordAcl(peer, true, 115L))
+        assertNull(journal.currentAclWakePeer(attempt))
     }
 
     @Test fun newCtrlListenerDoesNotBorrowOldNetworkEvidence() {

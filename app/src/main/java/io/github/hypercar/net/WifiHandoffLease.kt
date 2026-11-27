@@ -10,43 +10,25 @@ internal class WifiHandoffLease {
     }
     private var attempted = false
     private var closed = false
-    private var restore: (() -> Unit)? = null
 
     fun recover(
         targetSsid: String,
         owned: () -> Boolean,
         current: () -> SavedNetwork?,
         isCurrent: (SavedNetwork) -> Boolean,
-        autojoin: (SavedNetwork, Boolean) -> Unit,
         disconnect: () -> Boolean,
         scan: () -> Unit,
     ): Boolean {
         if (closed || attempted || targetSsid.isBlank() || !owned()) return false
         val previous = current()?.takeIf { it.id >= 0 && it.ssid.isNotBlank() && it.ssid != targetSsid } ?: return false
         attempted = true
-        try {
-            if (previous.autojoin) {
-                // Store rollback before the Binder call: it may apply a change and then throw.
-                restore = { autojoin(previous, true) }
-                autojoin(previous, false)
-            }
-            // Recheck live identity, not the now-mutated autojoin metadata or duplicated list.
-            if (!owned() || !isCurrent(previous)) {
-                close(); return false
-            }
-            if (!disconnect()) { close(); return false }
-            scan()
-            return true
-        } catch (error: Exception) {
-            runCatching { close() }
-            throw error
-        }
+        // Release only the current STA association. A saved network preference outlives the shell.
+        if (!owned() || !isCurrent(previous) || !disconnect()) return false
+        scan()
+        return true
     }
 
     fun close() {
         closed = true
-        val action = restore
-        action?.invoke()
-        restore = null
     }
 }

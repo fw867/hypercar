@@ -10,6 +10,10 @@ CarWith 来源现接入 AirPlay `/info` 声明的 Telephony HID 页 `0x0B`：Hoo
 
 电话命令只进入 CarWith 的既有认证加密 CTRL writer，一秒过期，重连清队列；自绘、系统 CarLife 和已结束来源消费并丢弃这些操作，不回退到 Android 媒体会话。`PHONE-KEY` 日志区分识别、入队、写出和丢弃，不记录联系人、号码或通话内容。写出成功只证明传输，接听/挂断及声音、车机麦克风走向仍需实车验证。本次不新增通话音频链路。
 
+系统 CarLife+ 的 `PHONE-HID` 日志记录本轮描述符声明的电话和中控 Report ID，并通过有界异步队列限量采样可确认的非触摸原始报告。带数字键或其他混合输入的报告只记录元数据，能明确识别为 Hook 或 Drop 的单项数组报告可以记录原始字节。系统 CarLife+ 仍沿用现有电话键处理。
+
+AirPlay HID 解码、触摸映射和按键派发诊断共用有界异步日志队列。队列满时丢弃诊断，输入继续按已有路由处理。
+
 依据为本机 CarPlay R14G17 的 `HIDTelephony.c` 数组描述符，以及已反编译 CarLife 的 `CommonMsgTransmit.handleSpecialHardKey`、CarWith 的 `CarlifeHw.onKeyEvent` → `HwHelper` → `HomeActivity.f` 原生回调。盒子 xiap2 的 HID 描述符/虚拟输入路径仅作为输入分层对照；已检查上游 mcarplay 快照 `f1ec3ffaa1f9c11b548ec1a8d8f7afff087d8627` 的 Telephony/Consumer 隔离，未把它或盒子符号当作电话端到端成功的证明。参见[验证记录](VALIDATION.md#2026-11-25-carwith-原生电话键629)。
 
 ## 媒体键

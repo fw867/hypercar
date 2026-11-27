@@ -40,6 +40,7 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
         val earlyInbound: ArrayDeque<Pair<String, Long>> = ArrayDeque(),
         val observations: MutableMap<Observation, Pair<Long, String>> = mutableMapOf(),
         val acl: LinkedHashMap<String, AclEdges> = linkedMapOf(),
+        var admittedAclWake: AclWake? = null,
         val ctrlReached: MutableMap<Stage, Long> = mutableMapOf(),
         var ctrlPort: String? = null,
     )
@@ -219,6 +220,7 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
             val pending = idleAcl[peer]
             if (pending != null && pending.up == aclWake.observedAt && !pending.disconnected) {
                 attempt.acl[peer] = AclEdges().also { it.record(true, aclWake.observedAt) }
+                attempt.admittedAclWake = AclWake(peer, aclWake.observedAt)
             }
         }
         idleAcl.clear()
@@ -278,10 +280,18 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
     /** Called for the original broadcast, with the round bound under the same lock as begin/finish. */
     @Synchronized internal fun recordAcl(peer: String, connected: Boolean, observedAt: Long, profileDrop: Boolean = false): Long? {
         val latest = history.lastOrNull()
-        if (latest != null && observedAt < (latest.ended ?: latest.started)) return null
         val active = latest?.takeIf { it.ended == null }
+        val address = peer.uppercase()
+        if (latest != null && observedAt < (latest.ended ?: latest.started)) {
+            // The inherited connect can predate this round. Its later disconnect still invalidates it.
+            val wake = active?.admittedAclWake
+            if (!connected && wake?.peer == address && observedAt >= wake.observedAt) {
+                active.acl[address]?.record(false, observedAt, profileDrop)
+            }
+            return null
+        }
         val peers = active?.acl ?: idleAcl
-        val edges = peers.getOrPut(peer.uppercase()) { AclEdges() }
+        val edges = peers.getOrPut(address) { AclEdges() }
         if (peers.size > 16) peers.remove(peers.keys.first())
         edges.record(connected, observedAt, profileDrop)
         return active?.id
@@ -289,6 +299,13 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
 
     private fun Attempt.aclFor(peer: String?): AclEdges? =
         if (peer.isNullOrBlank()) acl.values.singleOrNull() else acl[peer.uppercase()]
+
+    @Synchronized internal fun currentAclWakePeer(id: Long): String? {
+        val attempt = history.lastOrNull()?.takeIf { it.id == id && it.ended == null } ?: return null
+        val wake = attempt.admittedAclWake ?: return null
+        val connected = attempt.acl.entries.singleOrNull { it.value.up != null && !it.value.disconnected } ?: return null
+        return wake.peer.takeIf { connected.key == it && connected.value.up == wake.observedAt }
+    }
 
     @Synchronized internal fun aclObservation(id: Long, peer: String? = null): String {
         val attempt = history.lastOrNull()?.takeIf { it.id == id && it.ended == null }

@@ -1,6 +1,8 @@
 package io.github.hypercar.session
 
 import io.github.hypercar.net.CarNetworkReuse
+import io.github.hypercar.settings.CarWithDisplay
+import io.github.hypercar.settings.SettingsStore
 
 /** Entry lifecycle uses the attempt snapshot; wire protocol is negotiated separately in Rust. */
 internal object CarLifeSourcePolicy {
@@ -10,6 +12,19 @@ internal object CarLifeSourcePolicy {
 
     fun shouldReopen(source: String, startup: Boolean) =
         source == "carwith" || source == "system_carlife" && startup
+
+    fun prewarmSize(systemCarLife: Boolean, cached: CarWithDisplay?, manualSize: Pair<Int, Int>): Pair<Int, Int> =
+        cached?.let { it.width to it.height } ?: if (systemCarLife) manualSize else
+            SettingsStore.DEFAULT_VIDEO_WIDTH to SettingsStore.DEFAULT_VIDEO_HEIGHT
+
+    fun systemCanvasKey(profile: String, activePeer: String?, hotspotPeer: String?,
+                        selectedPeer: String?, aclWakePeer: String?): String? {
+        val hotspot = hotspotPeer?.takeIf { it.equals(activePeer, true) && (selectedPeer.isNullOrBlank() || it.equals(selectedPeer, true)) }
+        val wake = aclWakePeer?.takeIf {
+            it.equals(selectedPeer, true) && (activePeer.isNullOrBlank() || it.equals(activePeer, true))
+        }
+        return PairingEvidence.canvasKey(profile, hotspot, wake)
+    }
 
     data class HuIdentity(val address: String, val name: String)
     fun huIdentity(receiver: String?, target: String?, targetName: String?, paired: Set<String>): HuIdentity? {

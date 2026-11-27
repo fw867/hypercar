@@ -325,7 +325,7 @@ pub(crate) mod tests {
                 head_unit_profile:if mbux { "mercedes_mbux" } else { "bmw_id85" }.into(),
                 bmw_box_bootstrap:!mbux,skip_bluetooth_handoff:false,mbux_screen_bootstrap:mbux,id9_screen_bootstrap:false,nbt_audio_first:false,mbux_media_compat:false,desktop_receiver:false,width:1920,height:720,touch_display:None,touch_rect:None,
                 encoder_size:Arc::new(Mutex::new((1920,720))),touch_size:Arc::new(Mutex::new((1920,720))),
-                carwith_display:None,carwith_media_rate:None,carwith_stretch:false,screen_resource_lifecycle:true,pipeline:pipeline.clone(),
+                carwith_display:None,carwith_media_rate:None,carwith_stretch:false,system_carlife_source:false,screen_resource_lifecycle:true,pipeline:pipeline.clone(),
             };
             let (commands,rx)=mpsc::channel(2);let (source,video_rx)=crate::video_queue::channel();
             let pump=tokio::spawn(video_pump(Arc::new(Notify::new()),Arc::new(Mutex::new(PumpStat::default())),true,pipeline,rx,video_rx,None,30,None));

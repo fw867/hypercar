@@ -43,7 +43,7 @@ impl Fixture {
             receiver_id:None,receiver_model:None,receiver_previously_connected:true,enable_audio:true,audio_codec:"pcm".into(),video_codec:String::new(),bmw_capabilities:true,microphone_probe:None,keep_alive_stats:false,request_receiver_stats:false,
             head_unit_profile:"bmw_id85".into(),bmw_box_bootstrap:true,skip_bluetooth_handoff:false,mbux_screen_bootstrap:false,id9_screen_bootstrap:false,nbt_audio_first:false,mbux_media_compat:false,desktop_receiver:false,
             width:1920,height:720,touch_display:None,touch_rect:None,encoder_size:Arc::new(Mutex::new((1920,720))),touch_size:Arc::new(Mutex::new((1920,720))),
-            carwith_display:None,carwith_media_rate:None,carwith_stretch:false,screen_resource_lifecycle:true,pipeline:Arc::new(Mutex::new(crate::pipeline::Pipeline::new())),
+            carwith_display:None,carwith_media_rate:None,carwith_stretch:false,system_carlife_source:false,screen_resource_lifecycle:true,pipeline:Arc::new(Mutex::new(crate::pipeline::Pipeline::new())),
         };
         let mut info=Value::dict(vec![("audioFormats",Value::array(vec![
             Value::dict(vec![("type",Value::int(100)),("audioType",Value::str("speechRecognition")),("audioOutputFormats",Value::int(1<<29))]),
@@ -268,7 +268,7 @@ async fn call_borrows_receiver_audio_without_screen_and_later_offers_can_borrow_
     assert!(fixture.controller.session.resource.owned.load(Ordering::Acquire));
     fixture.setup_reply(&setup, &body).await;
     assert_eq!(tokio::time::timeout(Duration::from_secs(1), phone.read_u8()).await.unwrap().unwrap(), 1);
-    phone.write_u8(1).await.unwrap();
+    phone.write_all(&[0, 2, 0, 0, 1]).await.unwrap();
     drop(phone);
     let (close, _) = fixture.request("teardown:100").await;
     fixture.ack(&close, None).await;
@@ -500,21 +500,32 @@ async fn telephony_bridges_authenticated_pcm_both_ways_and_restores_original_med
         .get("entity").and_then(Value::as_int), Some(1));
     fixture.ack(&state, None).await;
     assert_eq!(tokio::time::timeout(Duration::from_secs(1), phone.read_u8()).await.unwrap().unwrap(), 1);
-    phone.write_u8(1).await.unwrap();
-    assert!(tokio::time::timeout(Duration::from_millis(30), phone.read_u8()).await.is_err());
-
+    phone.write_u16(1920).await.unwrap();
     phone.write_all(&123i16.to_le_bytes().repeat(960)).await.unwrap();
     let mut packet = [0; 2048];
+    assert!(tokio::time::timeout(Duration::from_millis(30), fixture.data.recv(&mut packet)).await.is_err());
+    assert!(tokio::time::timeout(Duration::from_millis(30), phone.read_u8()).await.is_err());
+    phone.write_u8(1).await.unwrap();
     let len = tokio::time::timeout(Duration::from_secs(1), fixture.data.recv(&mut packet)).await.unwrap().unwrap();
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), phone.read_u16()).await.unwrap().unwrap(),
+        crate::call_audio::STARTED_FRAME);
     assert!(tokio::time::timeout(Duration::from_millis(30), phone.read_u8()).await.is_err());
     let nonce = u64::from_le_bytes(packet[len - 8..len].try_into().unwrap());
     let payload = crate::crypto::chacha_open(&crate::airplay::stream_key(&[9; 32], id as u64),
         &crate::crypto::nonce64(nonce), &packet[12..len - 8], &packet[4..12]).unwrap();
     assert_eq!(payload, 123i16.to_be_bytes().repeat(320));
     let mut sync = [0; 20];
-    assert_eq!(tokio::time::timeout(Duration::from_millis(250), fixture.sync.recv(&mut sync)).await.unwrap().unwrap(), 20);
+    let (sync_len, sync_source) = tokio::time::timeout(Duration::from_millis(250), fixture.sync.recv_from(&mut sync)).await.unwrap().unwrap();
+    assert_eq!(sync_len, 20);
     assert_eq!(sync[1], 0xd4);
     assert_eq!(u32::from_be_bytes(sync[16..20].try_into().unwrap()), 320);
+    let mut sr = [0; 128];
+    let (sr_len, sr_source) = tokio::time::timeout(Duration::from_millis(250), fixture.sync.recv_from(&mut sr)).await.unwrap().unwrap();
+    assert_eq!(sr_source, sync_source);
+    assert_eq!(sr_len, 60);
+    assert_eq!(&sr[..4], &[0x80, 200, 0, 6]);
+    let lsr = u32::from_be_bytes(sr[10..14].try_into().unwrap());
+    assert_ne!(lsr, 0);
 
     for _ in 0..6 {
         phone.write_all(&123i16.to_le_bytes().repeat(960)).await.unwrap();
@@ -546,6 +557,55 @@ async fn telephony_bridges_authenticated_pcm_both_ways_and_restores_original_med
     assert_eq!(pcm, (-321i16).to_le_bytes().repeat(958));
 
     let mut speaker_packet = [0; 2048];
+    // Local writes and authenticated microphone packets alone cannot mute the phone.
+    phone.write_all(&123i16.to_le_bytes().repeat(6 * 960)).await.unwrap();
+    for _ in 0..6 {
+        assert!(tokio::time::timeout(Duration::from_millis(500), fixture.data.recv(&mut speaker_packet)).await.unwrap().unwrap() > 36);
+    }
+    fixture.data.send_to(&microphone_packet(101, 2), ("127.0.0.1", microphone_port)).await.unwrap();
+    let count = tokio::time::timeout(Duration::from_secs(1), phone.read_u16()).await.unwrap().unwrap() as usize;
+    assert!(count > 0);
+    let mut next_pcm = vec![0; count];
+    tokio::time::timeout(Duration::from_secs(1), phone.read_exact(&mut next_pcm)).await.unwrap().unwrap();
+
+    // The control port, RTP source, and received sequence must all match this offer.
+    let mut report = [0u8; 32];
+    report[..4].copy_from_slice(&[0x81, 201, 0, 7]);
+    report[8..12].copy_from_slice(&speaker_packet[8..12]);
+    let sent_sequence = u16::from_be_bytes(speaker_packet[2..4].try_into().unwrap());
+    report[24..28].copy_from_slice(&lsr.to_be_bytes());
+    report[18..20].copy_from_slice(&sent_sequence.wrapping_add(100).to_be_bytes());
+    fixture.sync.send_to(&report, sync_source).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(30), phone.read_u8()).await.is_err());
+    report[18..20].copy_from_slice(&sent_sequence.to_be_bytes());
+    fixture.data.send_to(&report, sync_source).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(30), phone.read_u8()).await.is_err());
+    report[24..28].copy_from_slice(&lsr.wrapping_sub(1).to_be_bytes());
+    fixture.sync.send_to(&report, sync_source).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(30), phone.read_u8()).await.is_err());
+    report[24..28].copy_from_slice(&lsr.to_be_bytes());
+    fixture.sync.send_to(&report, sync_source).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(30), phone.read_u8()).await.is_err());
+    let mut accepted_receipt = None;
+    for _ in 0..9 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        phone.write_all(&123i16.to_le_bytes().repeat(960)).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(500), fixture.data.recv(&mut speaker_packet)).await.unwrap().unwrap() > 36);
+        report[18..20].copy_from_slice(&speaker_packet[2..4]);
+        fixture.sync.send_to(&report, sync_source).await.unwrap();
+        // Stop on the first qualification so later valid reports cannot queue extra frames.
+        if let Ok(first_byte) = tokio::time::timeout(Duration::from_millis(50), phone.read_u8()).await {
+            let second_byte = tokio::time::timeout(Duration::from_secs(1), phone.read_u8()).await.unwrap().unwrap();
+            accepted_receipt = Some(u16::from_be_bytes([first_byte.unwrap(), second_byte]));
+            break;
+        }
+    }
+    assert_eq!(accepted_receipt, Some(crate::call_audio::OUTPUT_RECEIPT_FRAME));
+    let deadline = tokio::time::timeout(Duration::from_secs(1), phone.read_u64()).await.unwrap().unwrap();
+    assert!(deadline > crate::timing::monotonic_nanos() / 1_000_000);
+    fixture.sync.send_to(&report, sync_source).await.unwrap();
+    assert!(tokio::time::timeout(Duration::from_millis(30), phone.read_u8()).await.is_err());
+
     for _ in 0..4 {
         phone.write_all(&123i16.to_le_bytes().repeat(960)).await.unwrap();
         assert!(tokio::time::timeout(Duration::from_millis(500), fixture.data.recv(&mut speaker_packet)).await.unwrap().unwrap() > 36);
@@ -556,7 +616,7 @@ async fn telephony_bridges_authenticated_pcm_both_ways_and_restores_original_med
     let restarted_microphone = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     restarted_microphone.send_to(&packet, ("127.0.0.1", microphone_port)).await.unwrap();
     assert!(tokio::time::timeout(Duration::from_millis(30), phone.read_u8()).await.is_err());
-    restarted_microphone.send_to(&microphone_packet(1, 2), ("127.0.0.1", microphone_port)).await.unwrap();
+    restarted_microphone.send_to(&microphone_packet(1, 3), ("127.0.0.1", microphone_port)).await.unwrap();
     assert_eq!(tokio::time::timeout(Duration::from_secs(1), phone.read_u16()).await.unwrap().unwrap(), 1916);
     tokio::time::timeout(Duration::from_secs(1), phone.read_exact(&mut pcm)).await.unwrap().unwrap();
     assert_eq!(pcm, (-321i16).to_le_bytes().repeat(958));

@@ -1,6 +1,7 @@
 package io.github.hypercar.spike
 
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.FutureTask
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals
@@ -290,7 +291,7 @@ class ShellCallIdentityTest {
         elapsed = 250
         assertNull(identity.current())
         elapsed = 450
-        result = TelecomCallSnapshot.Observed(null, noCalls = true)
+        result = TelecomCallSnapshot.Observed(null, noLiveCallsInList = true)
         assertNull(identity.current())
         elapsed = 650
         result = confirmed("TC@8")
@@ -522,7 +523,7 @@ class ShellCallIdentityTest {
 
     @Test fun emptyTelecomSnapshotRetiresTheUnverifiedCandidate() {
         var elapsed = 0L
-        var snapshot = confirmed("TC@4")
+        var snapshot: TelecomCallSnapshot = confirmed("TC@4")
         val identity = ShellCallIdentity({ elapsed }, { snapshot })
         val generation = identity.beginTracking()
         identity.trackSubscriptions(generation, setOf(1))
@@ -530,7 +531,8 @@ class ShellCallIdentityTest {
         elapsed = 500
         assertNull(identity.currentBridgeIdentity())
         elapsed = 700
-        snapshot = TelecomCallSnapshot.Observed(null, noCalls = true)
+        snapshot = ShellCallIdentity.parseSnapshot(sequenceOf("CallsManager:", "  mCalls:", "  mCallAudioManager:",
+            "    Foreground call:", "    ${call(4, "ACTIVE")}"))
         assertNull(identity.currentBridgeIdentity())
 
         snapshot = confirmed("TC@4")
@@ -553,7 +555,7 @@ class ShellCallIdentityTest {
         assertTrue(identity.onDisconnected(generation, 1))
 
         elapsed = 750
-        snapshot = TelecomCallSnapshot.Observed(null, noCalls = true)
+        snapshot = TelecomCallSnapshot.Observed(null, noLiveCallsInList = true)
         assertNull(identity.currentBridgeIdentity())
         snapshot = confirmed("TC@4")
         elapsed = 950
@@ -644,6 +646,26 @@ class ShellCallIdentityTest {
     private fun samsungCall(id: Int) = call(id, "ACTIVE") +
         "caps=[Capabilities: CAPABILITY_HOLD CAPABILITY_MUTE], props=[Properties:], conf(false), had_child(false)"
 
+    @Test fun noCallRecoveryRequiresAnExplicitlyNullAudioForeground() {
+        val header = listOf("CallsManager:", "  mCalls:", "  mCallAudioManager:")
+        val cases = listOf(
+            emptyList(),
+            listOf("    Foreground call:"),
+            listOf("    Foreground call:", "    unknown"),
+            listOf("    Foreground call:", "    ${call(4, "ACTIVE")}"),
+            listOf("    Foreground call:", "    ${call(4, "ON_HOLD")}"),
+        )
+        for (audio in cases) {
+            val snapshot = ShellCallIdentity.parseSnapshot((header + audio).asSequence())
+            assertNull(audio.toString(), ShellCallIdentity.recoveryCallNumber(snapshot))
+        }
+        val idle = ShellCallIdentity.parseSnapshot(telecomDump("null", "null"))
+        assertEquals(ShellCallIdentity.NO_RECOVERY_CALL, ShellCallIdentity.recoveryCallNumber(idle))
+        for (exit in listOf(null, 124)) {
+            assertNull(ShellCallIdentity.recoveryCallNumber(ShellCallIdentity.withProcessExit(idle, exit)))
+        }
+    }
+
     @Test fun oneUi85ActivePstnRecordMustMatchTheForegroundRecord() {
         val active = samsungCall(170)
         val snapshot = ShellCallIdentity.parseSnapshot(telecomDump(active, "null")) as TelecomCallSnapshot.Observed
@@ -705,7 +727,7 @@ class ShellCallIdentityTest {
         elapsed = 200
         result = TelecomCallSnapshot.Unavailable()
         assertEquals(original, identity.current())
-        assertTrue(identity.confirmsOpen(original))
+        assertFalse(identity.confirmsOpen(original))
         elapsed = 280
         result = confirmed()
         assertEquals(original, identity.current())
@@ -911,7 +933,7 @@ class ShellCallIdentityTest {
             Triple(ShellCallIdentity.withProcessExit(ordinary, 137), 451L, "unknown failure=sigkill"),
             Triple(ShellCallIdentity.withProcessExit(ordinary, 137), 15L, "unknown failure=sigkill"),
             Triple(ShellCallIdentity.withProcessExit(ordinary, 1), 15L, "false failure=nonzero_exit"),
-            Triple(ShellCallIdentity.withProcessExit(ordinary, null), 450L, "true failure=timeout"),
+            Triple(ShellCallIdentity.withProcessExit(signalled, null), 450L, "true failure=timeout"),
         )) {
             val result = snapshot as TelecomCallSnapshot.Unavailable
             var elapsed = 0L
@@ -927,6 +949,163 @@ class ShellCallIdentityTest {
                     "exit_code=${result.exitCode ?: "none"}" in it && "timed_out=$diagnostic" in it
             })
         }
+    }
+
+    @Test fun telecomTimeoutOnlyAllowsAnAlreadyRunningCallOneRetry() {
+        for (fallback in listOf(false, true)) for (running in listOf(false, true)) {
+            var elapsed = 0L
+            var result: TelecomCallSnapshot = confirmed()
+            val retired = mutableListOf<String>()
+            val identity = ShellCallIdentity({ elapsed }, { result }, retired::add)
+            val monitor = identity.beginTracking()
+            identity.trackSubscriptions(monitor, if (fallback) setOf(1, 2) else setOf(1))
+            identity.onPreciseCallState(monitor, 1, singleActive)
+            identity.trackingReady(monitor)
+            if (fallback) {
+                elapsed = 500
+                assertNull(identity.currentBridgeIdentity())
+                elapsed = 700
+            }
+            val original = checkNotNull(identity.currentBridgeIdentity())
+            if (running) assertTrue(identity.markRunning(original.lease, Any()))
+            elapsed += 200
+            result = TelecomCallSnapshot.Unavailable(124, TelecomCallSnapshot.Unavailable.Reason.TIMEOUT)
+            assertEquals(original.takeIf { running }, identity.currentBridgeIdentity())
+            assertFalse(identity.confirmsOpen(original.lease))
+            if (running) assertTrue(retired.isEmpty())
+            elapsed += 80
+            assertNull(identity.currentBridgeIdentity())
+            assertEquals(listOf(original.lease), retired)
+        }
+    }
+
+    @Test fun aTimedOutRefreshCannotEarnGraceByStartingMidQuery() {
+        var elapsed = 0L
+        lateinit var lease: String
+        lateinit var identity: ShellCallIdentity
+        identity = ShellCallIdentity({ elapsed }, {
+            if (elapsed == 0L) confirmed() else {
+                assertTrue(identity.markRunning(lease, Any()))
+                TelecomCallSnapshot.Unavailable(124, TelecomCallSnapshot.Unavailable.Reason.TIMEOUT)
+            }
+        })
+        val monitor = identity.beginTracking()
+        identity.trackSubscriptions(monitor, setOf(1))
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        identity.trackingReady(monitor)
+        lease = checkNotNull(identity.current())
+        elapsed = 200
+        assertNull(identity.current())
+    }
+
+    @Test fun missingExitKeepsEitherRunningLeaseForOneRetryAndBlocksOpening() {
+        for (fallback in listOf(false, true)) {
+            var elapsed = 0L
+            var result: TelecomCallSnapshot = confirmed()
+            val retired = mutableListOf<String>()
+            val trace = mutableListOf<String>()
+            val identity = ShellCallIdentity({ elapsed }, { result }, retired::add, trace::add)
+            val monitor = identity.beginTracking()
+            identity.trackSubscriptions(monitor, if (fallback) setOf(1, 2) else setOf(1))
+            identity.onPreciseCallState(monitor, 1, singleActive)
+            identity.trackingReady(monitor)
+            if (fallback) {
+                elapsed = 500
+                assertNull(identity.currentBridgeIdentity())
+                elapsed = 700
+            }
+            val original = checkNotNull(identity.currentBridgeIdentity())
+            assertTrue(identity.markRunning(original.lease, Any()))
+            elapsed += 200
+            result = (confirmed() as TelecomCallSnapshot.Observed).copy(exitCode = null)
+            assertEquals(original, identity.currentBridgeIdentity())
+            assertTrue(identity.matchesCached(original.lease))
+            assertFalse(identity.confirmsOpen(original.lease))
+            assertTrue(retired.isEmpty())
+            elapsed += 80
+            assertNull(identity.currentBridgeIdentity())
+            assertEquals(listOf(original.lease), retired)
+            assertTrue(trace.any { "exit_code=none" in it && "timed_out=unknown" in it && "refresh_retry=true" in it })
+        }
+    }
+
+    @Test fun startupAfterMissingExitWaitsForASuccessfulRetryOfTheSameCall() {
+        for (next in listOf("TC@4", "TC@9", null)) {
+            var elapsed = 0L
+            var reads = 0
+            val identity = ShellCallIdentity({ elapsed }, {
+                when (++reads) {
+                    1 -> confirmed()
+                    2 -> TelecomCallSnapshot.Observed("TC@4", exitCode = null)
+                    else -> TelecomCallSnapshot.Observed(next ?: "TC@4", exitCode = next?.let { 0 })
+                }
+            }, sleepForStartRetry = { elapsed += it })
+            val monitor = identity.beginTracking()
+            identity.trackSubscriptions(monitor, setOf(1))
+            identity.onPreciseCallState(monitor, 1, singleActive)
+            identity.trackingReady(monitor)
+            val lease = checkNotNull(identity.current())
+            assertTrue(identity.markRunning(lease, Any()))
+            elapsed = 200
+            var starts = 0
+            assertEquals(next == "TC@4", identity.confirmsStart(lease, authorize = { starts++; true }))
+            assertEquals(3, reads)
+            assertEquals(if (next == "TC@4") 1 else 0, starts)
+        }
+    }
+
+    @Test fun aSuccessfulPreciseRetryRenewsTheSameLeaseWhenOnlyTheExitCodeWasMissing() {
+        var elapsed = 0L
+        var result: TelecomCallSnapshot = confirmed()
+        val retired = mutableListOf<String>()
+        val trace = mutableListOf<String>()
+        val identity = ShellCallIdentity({ elapsed }, { elapsed += 94; result }, retired::add, trace::add)
+        val monitor = identity.beginTracking()
+        identity.trackSubscriptions(monitor, setOf(1))
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        identity.trackingReady(monitor)
+        val original = checkNotNull(identity.currentBridgeIdentity())
+        assertTrue(identity.markRunning(original.lease, Any()))
+        val dump = telecomDump(call(4, "ACTIVE"), "null")
+        result = ShellCallIdentity.withProcessExit(ShellCallIdentity.parseSnapshot(dump), null)
+
+        elapsed = 200
+        assertEquals(original, identity.currentBridgeIdentity())
+        result = confirmed()
+        assertEquals(original, identity.currentBridgeIdentity())
+        assertTrue(retired.isEmpty())
+        assertTrue(trace.any {
+            "active_pstn=TC@4" in it && "exit_code=none" in it && "timed_out=unknown" in it &&
+                "refresh_retry=false" in it && "duration_ms=94" in it && "timeout_ms=300" in it
+        })
+    }
+
+    @Test fun completeDumpsWithMissingExitStatusCannotOpenOrReplaceALease() {
+        var elapsed = 0L
+        fun missingExit(id: Int) = ShellCallIdentity.withProcessExit(
+            ShellCallIdentity.parseSnapshot(telecomDump(call(id, "ACTIVE"), "null")), null,
+        )
+        var result = missingExit(4)
+        val retired = mutableListOf<String>()
+        val identity = ShellCallIdentity({ elapsed }, { result }, retired::add)
+        val monitor = identity.beginTracking()
+        identity.trackSubscriptions(monitor, setOf(1))
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        identity.trackingReady(monitor)
+        assertNull(identity.current())
+
+        elapsed = 200
+        result = confirmed()
+        val original = checkNotNull(identity.current())
+        elapsed = 400
+        result = missingExit(9)
+        assertNull(identity.current())
+        assertEquals(listOf(original), retired)
+        assertFalse(identity.matchesCached(original))
+
+        elapsed = 600
+        result = confirmed("TC@9")
+        assertNotNull(identity.current())
     }
 
     @Test fun incompleteDumpIsNotAnAuthoritativeEmptyCallList() {
@@ -959,15 +1138,150 @@ class ShellCallIdentityTest {
             identity.onPreciseCallState(monitor, 1, singleActive)
             identity.trackingReady(monitor)
             val original = checkNotNull(identity.current())
+            assertTrue(identity.markRunning(original, Any()))
 
             elapsed = 200
-            result = ShellCallIdentity.parseSnapshot(truncated.asSequence())
+            result = ShellCallIdentity.withProcessExit(ShellCallIdentity.parseSnapshot(truncated.asSequence()), null)
             assertEquals(original, identity.current())
             assertTrue(retired.isEmpty())
             elapsed = 280
-            result = ShellCallIdentity.parseSnapshot((dump.take(5) + "    null").asSequence())
+            result = ShellCallIdentity.withProcessExit(ShellCallIdentity.parseSnapshot(truncated.asSequence()), null)
             assertNull(identity.current())
             assertEquals(listOf(original), retired)
+        }
+    }
+
+    @Test fun aReopenedOfferChecksTelecomEvenBeforeTheCachedSampleExpires() {
+        var elapsed = 0L
+        var result: TelecomCallSnapshot = confirmed()
+        var reads = 0
+        val identity = ShellCallIdentity({ elapsed }, { reads++; result })
+        val monitor = identity.beginTracking()
+        identity.trackSubscriptions(monitor, setOf(1))
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        identity.trackingReady(monitor)
+        val lease = checkNotNull(identity.current())
+        elapsed = 80
+        result = TelecomCallSnapshot.Observed("TC@9", exitCode = null)
+        assertFalse(identity.confirmsNewOffer(lease))
+        assertEquals(2, reads)
+        assertFalse(identity.matchesCached(lease))
+    }
+
+    @Test fun bluetoothPreflightFinishesBeforeTheFreshIdentityProof() {
+        var elapsed = 0L
+        var active = "TC@4"
+        val identity = ShellCallIdentity({ elapsed }, { confirmed(active) })
+        val monitor = identity.beginTracking()
+        identity.trackSubscriptions(monitor, setOf(1))
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        identity.trackingReady(monitor)
+        val lease = checkNotNull(identity.current())
+        assertFalse(identity.confirmsAfterRouteCheck(lease, preflight = {
+            elapsed = 80
+            active = "TC@9"
+            true
+        }, authorize = { error("old call authorized") }))
+    }
+
+    @Test fun aDumpThatAgesWhileWaitingForExitMustBeReadAgainBeforeReady() {
+        for ((switched, keepsAging) in listOf(false to false, true to false, false to true)) {
+            var now = 0L
+            var foreground = "TC@4"
+            var reads = 0
+            var frames = 0
+            val identity = ShellCallIdentity(elapsed = { now }, readWithEvidence = { _, publish ->
+                val dump = confirmed(foreground)
+                publish(dump)
+                if (++reads == 2 || (reads == 3 && keepsAging)) {
+                    now += 300
+                    if (switched) foreground = "TC@9"
+                }
+                dump
+            })
+            val monitor = identity.beginTracking()
+            identity.trackSubscriptions(monitor, setOf(1))
+            identity.onPreciseCallState(monitor, 1, singleActive)
+            identity.trackingReady(monitor)
+            val lease = checkNotNull(identity.current())
+            val endpoint = ShellCallEndpoint(identity, lease)
+            now = 80
+            val allowed = !switched && !keepsAging
+            assertEquals(allowed, identity.confirmsAfterRouteCheck(lease, preflight = { true }) { deadline ->
+                endpoint.writeFirstFrame(deadline) { frames++; true }
+            })
+            assertEquals(3, reads)
+            assertEquals(if (allowed) 1 else 0, frames)
+        }
+    }
+
+    @Test fun onlyACompleteReadyWriteAndConfirmedStartEarnMissingExitGrace() {
+        for ((complete, confirm) in listOf(false to true, true to false, true to true)) {
+            var elapsed = 0L
+            var result: TelecomCallSnapshot = confirmed()
+            val identity = ShellCallIdentity({ elapsed }, { result })
+            val monitor = identity.beginTracking()
+            identity.trackSubscriptions(monitor, setOf(1))
+            identity.onPreciseCallState(monitor, 1, singleActive)
+            identity.trackingReady(monitor)
+            val lease = checkNotNull(identity.current())
+            val endpoint = ShellCallEndpoint(identity, lease)
+            assertEquals(complete, endpoint.writeFirstFrame(100) { complete })
+            if (confirm) assertEquals(complete, endpoint.acknowledgeStart())
+            elapsed = 200
+            result = TelecomCallSnapshot.Observed("TC@4", exitCode = null)
+            assertEquals(if (complete && confirm) lease else null, identity.current())
+            assertFalse(identity.confirmsNewOffer(lease))
+        }
+    }
+
+    @Test fun aVerifiedButUnstartedOfferGetsNoMissingExitGrace() {
+        var elapsed = 0L
+        var result: TelecomCallSnapshot = confirmed()
+        val identity = ShellCallIdentity({ elapsed }, { result })
+        val monitor = identity.beginTracking()
+        identity.trackSubscriptions(monitor, setOf(1))
+        identity.onPreciseCallState(monitor, 1, singleActive)
+        identity.trackingReady(monitor)
+        val lease = checkNotNull(identity.current())
+        elapsed = 80
+        result = TelecomCallSnapshot.Observed("TC@4", exitCode = null)
+        assertFalse(identity.confirmsStart(lease, forceRefresh = true))
+        assertFalse(identity.matchesCached(lease))
+    }
+
+    @Test fun completeSwitchAndHangupRevokeBeforeTheProcessExitArrives() {
+        for (snapshot in listOf(confirmed("TC@9"), TelecomCallSnapshot.Observed(null, noLiveCallsInList = true))) for (exit in listOf(null, 124)) {
+            var elapsed = 0L
+            val exited = CountDownLatch(1)
+            val revoked = CountDownLatch(1)
+            val worker = Executors.newSingleThreadExecutor()
+            val identity = ShellCallIdentity(elapsed = { elapsed }, onRevoked = { revoked.countDown() },
+                readWithEvidence = { _, publish ->
+                    if (elapsed == 0L) confirmed() else {
+                        publish(snapshot)
+                        check(exited.await(5, TimeUnit.SECONDS))
+                        ShellCallIdentity.withProcessExit(snapshot, exit)
+                    }
+                })
+            try {
+                val monitor = identity.beginTracking()
+                identity.trackSubscriptions(monitor, setOf(1))
+                identity.onPreciseCallState(monitor, 1, singleActive)
+                identity.trackingReady(monitor)
+                val lease = checkNotNull(identity.current())
+                assertTrue(identity.markRunning(lease, Any()))
+                elapsed = 200
+                val read = worker.submit<String?> { identity.current() }
+                assertTrue(revoked.await(1, TimeUnit.SECONDS))
+                assertFalse(identity.matchesCached(lease))
+                assertFalse(read.isDone)
+                exited.countDown()
+                assertNull(read.get(5, TimeUnit.SECONDS))
+            } finally {
+                exited.countDown()
+                worker.shutdownNow()
+            }
         }
     }
 
@@ -1038,7 +1352,7 @@ class ShellCallIdentityTest {
         val terminalList = telecomDump(call(4, "DISCONNECTED"), "null").take(5).toList()
         for (header in listOf(completeList, terminalList)) {
             for ((exit, marker) in listOf(
-                124 to emptySequence(), 137 to emptySequence(),
+                124 to emptySequence(), 137 to emptySequence(), null to emptySequence(),
                 0 to sequenceOf("*** SERVICE 'telecom' DUMP TIMEOUT (1000ms) EXPIRED ***"),
             )) {
                 var elapsed = 0L
@@ -1072,6 +1386,7 @@ class ShellCallIdentityTest {
             identity.onPreciseCallState(monitor, 1, singleActive)
             identity.trackingReady(monitor)
             val original = checkNotNull(identity.current())
+            assertTrue(identity.markRunning(original, Any()))
 
             elapsed = 200
             val dump = ShellCallIdentity.parseSnapshot(sequenceOf(
@@ -1088,6 +1403,130 @@ class ShellCallIdentityTest {
                 assertTrue(retired.isEmpty())
             }
         }
+    }
+
+    @Test fun timeoutRevokesFromCompleteCallRowsBeforeAnIncompleteTail() {
+        val timedOut = "timeout: sending signal KILL to command /system/bin/dumpsys"
+        val cases = listOf(
+            listOf("    ${call(4, "DISCONNECTED")}", "    [Call id=TC@9, state=ACTIVE,") to true,
+            listOf("    ${call(4, "ON_HOLD")}", "    [Call id=TC@9, state=ACTIVE,") to true,
+            listOf("    ${call(9, "ACTIVE")}", "  mCallDiagnosticServiceController:") to true,
+            listOf("    [Call id=TC@4,", "  mCallAudioManager:", "    Foreground call:", "    ${call(9, "ACTIVE")}") to true,
+            listOf("    ${call(9, "ACTIVE")}", "    [Call id=TC@4,") to false,
+            listOf("    [Call id=TC@4, state=DISCONNECTED,") to false,
+        )
+        for ((rows, shouldRevoke) in cases) {
+            var elapsed = 0L
+            var result: TelecomCallSnapshot = confirmed()
+            val retired = mutableListOf<String>()
+            val identity = ShellCallIdentity({ elapsed }, { result }, retired::add)
+            val monitor = identity.beginTracking()
+            identity.trackSubscriptions(monitor, setOf(1, 2))
+            identity.onPreciseCallState(monitor, 1, singleActive)
+            identity.trackingReady(monitor)
+            elapsed = 500
+            assertNull(identity.current(true))
+            elapsed = 700
+            val running = checkNotNull(identity.current(true))
+            assertTrue(identity.markRunning(running, Any()))
+
+            elapsed = 900
+            val dump = ShellCallIdentity.parseSnapshot(sequenceOf("CallsManager:", "  mCalls:") + rows + timedOut)
+            result = ShellCallIdentity.withProcessExit(dump, 137)
+            assertEquals(if (shouldRevoke) null else running, identity.current(true))
+            assertEquals(if (shouldRevoke) listOf(running) else emptyList(), retired)
+        }
+    }
+
+    @Test fun completeNegativeEvidenceRevokesWhileTelecomStillHasOutputToRead() {
+        for (head in listOf(
+            listOf("    ${call(4, "DISCONNECTED")}"),
+            listOf("    [Call id=TC@4,", "  mCallAudioManager:", "    Foreground call:", "    ${call(9, "ACTIVE")}"),
+        )) {
+            var elapsed = 0L
+            val tail = CountDownLatch(1)
+            val revoked = CountDownLatch(1)
+            val worker = Executors.newSingleThreadExecutor()
+            val identity = ShellCallIdentity(elapsed = { elapsed }, onRevoked = { revoked.countDown() },
+                readWithEvidence = { _, publish ->
+                    if (elapsed == 0L) confirmed() else {
+                        val output = sequence {
+                            repeat(100) { yield("Service diagnostics") }
+                            yield("CallsManager:")
+                            yield("  mCalls:")
+                            yieldAll(head)
+                            check(tail.await(5, TimeUnit.SECONDS))
+                            yield("timeout: sending signal KILL to command /system/bin/dumpsys")
+                        }
+                        ShellCallIdentity.withProcessExit(ShellCallIdentity.parseSnapshot(output, publish), 137)
+                    }
+                })
+            try {
+                val monitor = identity.beginTracking()
+                identity.trackSubscriptions(monitor, setOf(1))
+                identity.onPreciseCallState(monitor, 1, singleActive)
+                identity.trackingReady(monitor)
+                val lease = checkNotNull(identity.current())
+                assertTrue(identity.markRunning(lease, Any()))
+                elapsed = 200
+                val query = worker.submit<String?> { identity.current() }
+                assertTrue(revoked.await(2, TimeUnit.SECONDS))
+                assertFalse(identity.matchesCached(lease))
+                assertFalse(query.isDone)
+                tail.countDown()
+                assertNull(query.get(5, TimeUnit.SECONDS))
+            } finally {
+                tail.countDown()
+                worker.shutdownNow()
+            }
+        }
+    }
+
+    @Test fun terminalPeersAndInlineSectionsDoNotRetireTheCurrentPstnCall() {
+        val active = "    ${call(4, "ACTIVE")}"
+        val disconnected = "    ${call(8, "DISCONNECTED")}"
+        val timeout = listOf("timeout: sending signal KILL to command /system/bin/dumpsys")
+        val cases = listOf(
+            Triple(listOf(disconnected, "  mCallAudioManager:"), timeout, 137),
+            Triple(listOf("  mPendingCall:TC@8", "  mCallAudioManager:"), listOf("    Foreground call:", active), 0),
+            Triple(listOf("  mPendingRedirectedOutgoingCallInfo:TC@8", "  mCallAudioManager:"), listOf("    Foreground call:", active), 0),
+        )
+        for ((rows, tail, exit) in cases) {
+            var elapsed = 0L
+            var snapshot: TelecomCallSnapshot = confirmed()
+            val identity = ShellCallIdentity({ elapsed }, { snapshot })
+            val generation = identity.beginTracking()
+            identity.trackSubscriptions(generation, setOf(1, 2))
+            identity.onPreciseCallState(generation, 1, singleActive)
+            identity.trackingReady(generation)
+            elapsed = 500
+            assertNull(identity.current(true))
+            elapsed = 700
+            val lease = checkNotNull(identity.current(true))
+            assertTrue(identity.markRunning(lease, Any()))
+            elapsed = 900
+            snapshot = ShellCallIdentity.withProcessExit(ShellCallIdentity.parseSnapshot(
+                sequenceOf("CallsManager:", "  mCalls:", active) + rows + tail,
+            ), exit)
+            assertEquals(lease, identity.current(true))
+        }
+    }
+
+    @Test fun timeoutStillUsesTheForegroundAfterALongAudioSection() {
+        val evidence = mutableListOf<TelecomCallSnapshot>()
+        val output = sequence {
+            yieldAll(listOf("CallsManager:", "  mCalls:", "    ${call(4, "ACTIVE")}", "  mCallAudioManager:"))
+            repeat(110) { yield("    audio diagnostic line $it") }
+            yield("    Foreground call:")
+            yield("    ${call(9, "ACTIVE")}")
+            val switched = (evidence.last() as TelecomCallSnapshot.Unavailable).callEvidence
+            assertNotNull(switched)
+            assertNull(switched?.activeCallId)
+            yield("timeout: sending signal KILL to command /system/bin/dumpsys")
+        }
+        val parsed = ShellCallIdentity.parseSnapshot(output, evidence::add) as TelecomCallSnapshot.Unavailable
+        assertNotNull(parsed.callEvidence)
+        assertNull(parsed.callEvidence?.activeCallId)
     }
 
     @Test fun fallbackStartupRechecksADueSnapshotBeforeUsingThePreviousLease() {
@@ -1143,7 +1582,7 @@ class ShellCallIdentityTest {
     @Test fun aLateSuccessfulSnapshotCannotKeepTheOldLeaseOrPublishAReplacement() {
         for (late in listOf(
             confirmed("TC@9"),
-            TelecomCallSnapshot.Observed(null, noCalls = true),
+            TelecomCallSnapshot.Observed(null, noLiveCallsInList = true),
             confirmed("TC@4", "TC@4"),
         )) {
             var elapsed = 0L

@@ -4,7 +4,7 @@ use tokio::net::TcpListener;
 
 fn config() -> CarLifeConfig {
     CarLifeConfig {dialect:CarLifeDialect::SystemAuto,manufacturer:"Test HU".into(),model:"Receiver".into(),
-        width:1280,height:720,fps:30,navigation_updates:false,microphone:None,vehicle_gps:None,
+        width:1280,height:720,fps:30,cached_system_canvas:None,navigation_updates:false,microphone:None,vehicle_gps:None,
         bt_address:"00:11:22:33:44:55".into(),bt_name:"Test HU".into()}
 }
 async fn listeners() -> (Vec<TcpListener>,[u16;7]) {

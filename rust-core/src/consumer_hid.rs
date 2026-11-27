@@ -12,7 +12,16 @@ struct Device {
     touch_reports: BTreeSet<u8>,
     touch_fields: BTreeMap<(u8, usize), TouchFields>,
     report_bits: HashMap<u8, usize>,
+    call_control_reports: BTreeMap<u8, CallControlReport>,
     pressed: HashMap<u8, BTreeSet<u32>>,
+}
+
+#[derive(Default)]
+struct CallControlReport {
+    telephony: bool,
+    console: bool,
+    other_input: bool,
+    input_items: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -197,6 +206,19 @@ mod tests {
         0x7f,0x75,8,0x95,2,0x81,2,0x05,1,0x09,0x38,0x15,0x81,0x25,0x7f,0x75,8,
         0x95,1,0x81,6,0xc0,
     ];
+    #[test]
+    fn call_diagnostics_trace_raw_hook_drop_and_console_without_dial_digits_or_touch() {
+        let phone = Device::parse(TELEPHONY).unwrap();
+        assert_eq!(phone.call_control_sample(&[1]), Some((0, true, Some(&[1][..]))));
+        assert_eq!(phone.call_control_sample(&[3]), Some((0, true, Some(&[3][..]))));
+        assert_eq!(phone.call_control_sample(&[5]), Some((0, true, None)));
+        assert_eq!(phone.call_control_sample(&[1, 2]), None);
+        let console = Device::parse(MGU_KNOB).unwrap();
+        assert_eq!(console.call_control_sample(&[0, 0, 0, 1]), Some((0, false, Some(&[0, 0, 0, 1][..]))));
+        let touch = Device::parse(&[0x05,0x0d,0x09,4,0xa1,1,0x09,0x42,0x75,1,0x95,1,0x81,2,0xc0]).unwrap();
+        assert_eq!(touch.call_control_sample(&[1]), None);
+    }
+
     const G38_KNOB: &[u8] = &[
         0x05,1,0x09,8,0xa1,1,0x05,9,0x09,1,0x15,0,0x25,1,0x75,1,0x95,1,0x81,2,
         0x05,0x0c,0x0a,0x24,2,0x95,1,0x81,2,0x95,6,0x81,1,0x05,1,0x09,0x38,
@@ -589,6 +611,16 @@ impl Device {
                     let end=offset.checked_add(g.size.checked_mul(g.count)?)?;
                     if end>32768{return None;} device.report_bits.insert(g.id,end);
                     let controller = application == MULTI_AXIS_CONTROLLER;
+                    if value & 1 == 0 {
+                        let report = device.call_control_reports.entry(g.id).or_default();
+                        report.input_items += 1;
+                        report.telephony |= application >> 16 == 0x0b || usages.iter().any(|usage| usage >> 16 == 0x0b);
+                        report.console |= controller;
+                        report.other_input |= usages.is_empty() || !usages.iter().all(|&usage|
+                            is_phone_key(usage) || usage == 0xb0000 || usage == 0xc0224 ||
+                            (usage >> 16 == 0x0c && supported(usage & 0xffff)) ||
+                            (controller && (usage >> 16 == 0x09 || matches!(usage, 0x10030 | 0x10031 | 0x10038))));
+                    }
                     if application >> 16 == 0x0d {
                         device.touch_reports.insert(g.id);
                         if application == 0xd0004 && value & 7 == 2 {
@@ -635,6 +667,24 @@ impl Device {
             (0, bytes)
         };
         self.report_bits.get(&id).is_some_and(|bits| bits.div_ceil(8) == body.len())
+    }
+
+    fn call_control_sample<'a>(&self, bytes: &'a [u8]) -> Option<(u8, bool, Option<&'a [u8]>)> {
+        if self.is_touch_report(bytes) || !self.matches_report_length(bytes) { return None; }
+        let id = if self.has_ids { *bytes.first()? } else { 0 };
+        let report = self.call_control_reports.get(&id)?;
+        if !report.telephony && !report.console { return None; }
+        let raw = (!report.other_input || (report.telephony && report.input_items == 1 &&
+            self.is_phone_only_array_sample(id, bytes))).then_some(bytes).filter(|b| b.len() <= 32);
+        Some((id, report.telephony, raw))
+    }
+
+    fn is_phone_only_array_sample(&self, id: u8, bytes: &[u8]) -> bool {
+        let Some(field) = self.fields.iter().find(|f| f.id == id && !f.variable && f.count == 1) else { return false; };
+        let body = if self.has_ids { &bytes[1..] } else { bytes };
+        let index = i64::from(read_bits(body, field.offset, field.size)) - i64::from(field.min);
+        usize::try_from(index).ok().and_then(|i| field.usages.get(i))
+            .is_some_and(|&usage| is_phone_key(usage) || usage == 0xb0000)
     }
 
     fn diagnostic_report(&self, bytes: &[u8]) -> String {
@@ -717,13 +767,35 @@ pub struct ConsumerHid {
     counts: BTreeMap<String, ReportCounts>,
     unmatched: ReportCounts,
     main_display: Option<String>,
+    call_control_trace: Option<CallControlTrace>,
 }
+
+#[derive(Default)]
+struct CallControlTrace {
+    last: BTreeMap<(String, u8), Option<Vec<u8>>>,
+    telephony: usize,
+    console: usize,
+}
+
 impl ConsumerHid {
     pub fn for_session(session_id: u64, info: &Value, main_display: &str) -> Self {
         let mut hid = Self::from_info(info);
         hid.session_id = Some(session_id);
         hid.main_display = Some(display_identity(main_display));
         hid
+    }
+    pub fn with_call_control_trace(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.call_control_trace = Some(CallControlTrace::default());
+            for (id, device) in &self.devices {
+                let telephony_ids: Vec<_> = device.call_control_reports.iter()
+                    .filter_map(|(&id, report)| report.telephony.then_some(id)).collect();
+                let console_ids: Vec<_> = device.call_control_reports.iter()
+                    .filter_map(|(&id, report)| report.console.then_some(id)).collect();
+                crate::emit_hid_log(&format!("PHONE-HID: session={:?} device={id} telephony_report_ids={telephony_ids:?} console_report_ids={console_ids:?}", self.session_id));
+            }
+        }
+        self
     }
     pub fn from_info(info:&Value)->Self {
         let mut result=Self::default();
@@ -739,15 +811,15 @@ impl ConsumerHid {
                 result.counts.entry(id.clone()).or_default();
                 let descriptor=entry.get("hidDescriptor").or_else(||entry.get("reportDescriptor")).and_then(Value::as_bytes);
                 if let Some(device)=descriptor.and_then(Device::parse) {
-                    crate::emit_log(&format!("HID-KEY: device={id} descriptor={}B control_fields={} report_ids={} touch_reports={:?}",descriptor.unwrap().len(),device.fields.len(),device.has_ids,device.touch_reports));
-                    crate::emit_log(&format!("HID-LAYOUT: device={id} {}",device.diagnostic_layout()));
+                    crate::emit_hid_log(&format!("HID-KEY: device={id} descriptor={}B control_fields={} report_ids={} touch_reports={:?}",descriptor.unwrap().len(),device.fields.len(),device.has_ids,device.touch_reports));
+                    crate::emit_hid_log(&format!("HID-LAYOUT: device={id} {}",device.diagnostic_layout()));
                     result.devices.insert(id,device);
                 } else {
-                    crate::emit_log(&format!("HID-LAYOUT: device={id} descriptor_bytes={:?} consumer_layout=unavailable; touch fallback preserved",descriptor.map(|d| d.len())));
+                    crate::emit_hid_log(&format!("HID-LAYOUT: device={id} descriptor_bytes={:?} consumer_layout=unavailable; touch fallback preserved",descriptor.map(|d| d.len())));
                 }
             }
         }
-        crate::emit_log(&format!("HID-KEY: registered input devices={}",result.devices.len()));
+        crate::emit_hid_log(&format!("HID-KEY: registered input devices={}",result.devices.len()));
         result
     }
     fn diagnostic_summary(&self) -> String {
@@ -849,6 +921,21 @@ impl ConsumerHid {
     /// Some = control report consumed (including releases). None = forward to the touch decoder.
     pub fn report(&mut self,uuid:Option<&Value>,bytes:&[u8])->Option<Vec<u32>> {
         let id=self.layout_id(uuid,bytes);
+        if let (Some(trace), Some(id)) = (&mut self.call_control_trace, &id) {
+            if let Some((report_id, telephony, raw)) = self.devices.get(id).and_then(|d| d.call_control_sample(bytes)) {
+                let (kind, count, limit) = if telephony { ("telephony", &mut trace.telephony, 64) }
+                    else { ("console", &mut trace.console, 32) };
+                if *count < limit {
+                    let key = (id.clone(), report_id);
+                    if trace.last.get(&key).map(|last| last.as_deref()) != Some(raw) {
+                        trace.last.insert(key, raw.map(<[u8]>::to_vec));
+                        *count += 1;
+                        let sample = raw.map_or_else(|| "omitted_mixed_layout".into(), |b| format!("{b:02x?}"));
+                        crate::emit_hid_log(&format!("PHONE-HID: session={:?} device={id} report_id={report_id} kind={kind} bytes={} raw={sample}", self.session_id, bytes.len()));
+                    }
+                }
+            }
+        }
         let keys = self.decode_report(id.as_ref(), bytes);
         let counts = id.as_ref().and_then(|id| self.counts.get_mut(id)).unwrap_or(&mut self.unmatched);
         counts.reports += 1;
@@ -871,7 +958,7 @@ impl ConsumerHid {
             let layout=device.map(|d|d.diagnostic_report(bytes)).unwrap_or_else(||"layout=unmatched".into());
             // Never dump touch coordinates; short control reports alone get a hex sample.
             let sample=if bytes.len()<5 && !device.is_some_and(|d|d.is_touch_report(bytes)) {format!("{:02x?}",bytes)} else {"omitted-touch-or-long-report".into()};
-            crate::emit_log(&format!("HID-INPUT: device={id:?} bytes={} {layout} sample={sample} short_budget={}/64 long_budget={}/8",bytes.len(),self.short_logs,self.long_logs));
+            crate::emit_hid_log(&format!("HID-INPUT: device={id:?} bytes={} {layout} sample={sample} short_budget={}/64 long_budget={}/8",bytes.len(),self.short_logs,self.long_logs));
         }
         if let Some(device)=id.and_then(|id|self.devices.get_mut(id)) {
             if device.is_touch_report(bytes) { return None; }
@@ -897,7 +984,7 @@ impl ConsumerHid {
         }
         if self.unknown<10 {
             self.unknown+=1;
-            crate::emit_log(&format!("HID-KEY: unresolved device={id:?} report={bytes:02x?}; need consumer descriptor, not guessing usage"));
+            crate::emit_hid_log(&format!("HID-KEY: unresolved device={id:?} report={bytes:02x?}; need consumer descriptor, not guessing usage"));
         }
         Some(vec![])
     }
@@ -906,7 +993,7 @@ impl ConsumerHid {
 impl Drop for ConsumerHid {
     fn drop(&mut self) {
         if let Some(id) = self.session_id {
-            crate::emit_log(&format!("WIFI-IAP#{id}: AirPlay HID END {}", self.diagnostic_summary()));
+            crate::emit_hid_log(&format!("WIFI-IAP#{id}: AirPlay HID END {}", self.diagnostic_summary()));
         }
     }
 }

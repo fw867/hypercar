@@ -4,6 +4,27 @@ import io.github.hypercar.shizuku.ExecResult
 import io.github.hypercar.shizuku.ShizukuTools
 import kotlinx.coroutines.delay
 
+private val shellExec: suspend (String) -> ExecResult = { ShizukuTools.exec(it, 2_000) }
+
+internal class MediaCardWindowState {
+    var needsFullscreenReset = false
+    var shortVideo: MediaTaskWindow.ExpandedShortVideo? = null
+
+    suspend fun resetFullscreen(displayId: Int, exec: suspend (String) -> ExecResult = shellExec): Boolean {
+        val restored = MediaTaskWindow.fullscreen(displayId, exec)
+        if (restored) needsFullscreenReset = false
+        return restored
+    }
+
+    suspend fun collapse(displayId: Int, exec: suspend (String) -> ExecResult = shellExec): Boolean {
+        if (needsFullscreenReset && !resetFullscreen(displayId, exec)) return false
+        val original = shortVideo?.restoreIgnoreOrientation
+        if (original != null && !MediaTaskWindow.setIgnoreOrientationRequest(displayId, original, exec)) return false
+        shortVideo = null
+        return true
+    }
+}
+
 internal object MediaTaskWindow {
     private val rootRow = Regex("""RootTask id=(\d+).*\bdisplayId=(\d+)\b""")
     private val taskRow = Regex("""taskId=(\d+):\s+(\S+)\s+bounds=(\S+).*\bvisible=(true|false)\b""")
@@ -12,22 +33,27 @@ internal object MediaTaskWindow {
         val rootId: Int, val visible: Boolean,
     )
 
-    fun tasks(stacks: String): List<Task> = buildList {
+    fun tasks(stacks: String): List<Task> = parseStacks(stacks).orEmpty()
+
+    private fun parseStacks(stacks: String): List<Task>? {
+        val result = mutableListOf<Task>()
         var root = -1
         var display = -1
         for (line in stacks.lineSequence()) {
             val row = line.trimStart()
-            if (row.startsWith("RootTask ")) {
-                val match = rootRow.find(row)
-                root = match?.groupValues?.get(1)?.toIntOrNull() ?: -1
-                display = match?.groupValues?.get(2)?.toIntOrNull() ?: -1
-            } else if (root >= 0 && display >= 0) {
-                val match = taskRow.find(row) ?: continue
-                val id = match.groupValues[1].toIntOrNull() ?: continue
+            if (row.startsWith("RootTask")) {
+                val match = rootRow.find(row) ?: return null
+                root = match.groupValues[1].toIntOrNull() ?: return null
+                display = match.groupValues[2].toIntOrNull() ?: return null
+            } else if (row.startsWith("taskId")) {
+                if (root < 0) return null
+                val match = taskRow.find(row) ?: return null
+                val id = match.groupValues[1].toIntOrNull() ?: return null
                 val packageName = match.groupValues[2].substringBefore('/', missingDelimiterValue = "")
-                add(Task(id, match.groupValues[3], packageName, display, root, match.groupValues[4] == "true"))
+                result.add(Task(id, match.groupValues[3], packageName, display, root, match.groupValues[4] == "true"))
             }
         }
+        return result.takeIf { root >= 0 }
     }
 
     fun visibleTask(stacks: String, displayId: Int, packageName: String): Task? =
@@ -73,29 +99,58 @@ internal object MediaTaskWindow {
         }
     }
 
-    suspend fun snapshot(): List<Task>? = readStackList()?.let(::tasks)?.takeIf { it.isNotEmpty() }
+    suspend fun snapshot(): List<Task>? = readStackList()?.let(::parseStacks)
 
-    suspend fun releaseTasks(
-        displayId: Int, packageName: String, previous: List<Task>?, closeProjectedTasks: Boolean = false,
-    ) {
-        val current = snapshot() ?: return
-        val commands = releaseCommands(previous, current, displayId, packageName, closeProjectedTasks)
-        for (command in commands) {
-            val result = ShizukuTools.exec(command, 2_000)
-            if (!result.ok) {
-                io.github.hypercar.session.HyperCarRepo.log("VIDEO-CARD: cleanup display=$displayId command=$command exit=${result.code}")
-            }
+    suspend fun restoreBeforeRelease(
+        displayId: Int, packageName: String, previous: List<Task>?, restoreFullscreen: Boolean,
+        originalOrientation: Boolean?, closeProjectedTasks: Boolean,
+        expectedDestinations: MutableMap<Int, Int?> = mutableMapOf(), exec: suspend (String) -> ExecResult,
+    ): Boolean {
+        // Unsupported wm commands are best effort. A lost broker prevents even attempting the handoff.
+        var lostTransport: ExecResult? = null
+        val shell: suspend (String) -> ExecResult = { command ->
+            lostTransport ?: exec(command).also { if (it.code < 0) lostTransport = it }
         }
-        if (closeProjectedTasks && commands.isNotEmpty()) {
-            val removed = awaitProjectionTaskRemoval(displayId, packageName)
-            io.github.hypercar.session.HyperCarRepo.log("VIDEO-CARD: package=$packageName display=$displayId projectionTasksClosed=$removed")
-        }
+        if (restoreFullscreen) fullscreen(displayId, shell)
+        if (originalOrientation != null) setIgnoreOrientationRequest(displayId, originalOrientation, shell)
+        return lostTransport == null &&
+            releaseTasks(displayId, packageName, previous, closeProjectedTasks, expectedDestinations, shell)
     }
 
-    private suspend fun awaitProjectionTaskRemoval(displayId: Int, packageName: String): Boolean {
+    private suspend fun releaseTasks(
+        displayId: Int, packageName: String, previous: List<Task>?, closeProjectedTasks: Boolean,
+        expectedDestinations: MutableMap<Int, Int?>, exec: suspend (String) -> ExecResult,
+    ): Boolean {
+        if (previous == null && !closeProjectedTasks) return false
+        suspend fun currentTasks() = exec("am stack list").takeIf { it.ok }?.let { parseStacks(it.out) }
+        val current = currentTasks() ?: return false
+        expectedDestinations.keys.retainAll(current.map { it.id }.toSet())
+        val origins = previous.orEmpty().associateBy { it.id }
+        for (task in current.filter { it.displayId == displayId && it.packageName == packageName }) {
+            expectedDestinations[task.id] = if (closeProjectedTasks) null else origins[task.id]?.displayId
+        }
+        val commands = releaseCommands(previous, current, displayId, packageName, closeProjectedTasks)
+        for (command in commands) {
+            if (!exec(command).ok) return false
+        }
+        var lastExternal: Map<Int, Int>? = null
         repeat(4) { attempt ->
-            val remaining = readStackList()?.let(::tasks) ?: return false
-            if (remaining.none { it.displayId == displayId && it.packageName == packageName }) return true
+            val observed = if (attempt == 0 && commands.isEmpty()) current else currentTasks() ?: return false
+            // A shared root cannot be moved or removed without affecting another task. Leave
+            // such roots to Android's normal migration on removal of this public display.
+            val actionable = releaseCommands(previous, observed, displayId, packageName, closeProjectedTasks)
+            val unknownOnCard = observed.any { it.displayId == displayId && it.packageName.isEmpty() &&
+                it.id in expectedDestinations }
+            if (actionable.isEmpty() && !unknownOnCard) {
+                val external = observed.filter { it.displayId != displayId && it.id in expectedDestinations &&
+                    it.displayId != expectedDestinations[it.id] }.associate { it.id to it.displayId }
+                // An independent move can supersede our command. Confirm the task stays off
+                // this card before retiring it, without issuing a command on another display.
+                if (external.isEmpty() || external == lastExternal) return true
+                lastExternal = external
+            } else {
+                lastExternal = null
+            }
             if (attempt < 3) delay(100)
         }
         return false
@@ -117,7 +172,7 @@ internal object MediaTaskWindow {
 
     suspend fun prepareExpandedShortVideo(
         displayId: Int,
-        exec: suspend (String) -> ExecResult = { ShizukuTools.exec(it, 2_000) },
+        exec: suspend (String) -> ExecResult = shellExec,
     ): ExpandedShortVideo {
         val original = readIgnoreOrientationRequest(displayId, exec)
         val orientation = when (original) {
@@ -134,7 +189,7 @@ internal object MediaTaskWindow {
 
     suspend fun setIgnoreOrientationRequest(
         displayId: Int, ignore: Boolean,
-        exec: suspend (String) -> ExecResult = { ShizukuTools.exec(it, 2_000) },
+        exec: suspend (String) -> ExecResult = shellExec,
     ): Boolean {
         if (displayId <= 0) return false
         runCatching { exec("wm set-ignore-orientation-request -d $displayId $ignore") }
@@ -156,7 +211,7 @@ internal object MediaTaskWindow {
 
     suspend fun fullscreen(
         displayId: Int,
-        exec: suspend (String) -> ExecResult = { ShizukuTools.exec(it, 2_000) },
+        exec: suspend (String) -> ExecResult = shellExec,
     ): Boolean {
         if (displayId <= 0) return false
         repeat(2) {

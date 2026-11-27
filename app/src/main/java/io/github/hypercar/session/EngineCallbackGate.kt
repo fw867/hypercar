@@ -1,18 +1,31 @@
 package io.github.hypercar.session
 
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
 /** Engine starts within one connection attempt need distinct callback owners. */
 internal class EngineCallbackGate {
     private var serial = 0L
     @Volatile private var owner = 0L
     // Separate from deliver(): some general callbacks wait for work on the music thread.
     private val audioLock = Any()
+    private val activeProjection = MutableStateFlow<Long?>(null)
+    val projectionOwner = activeProjection.asStateFlow()
+    private var projectionPermitted = false
     @Volatile private var take: AudioTake? = null
     @Synchronized fun begin(): Long = synchronized(audioLock) {
         take = null
+        activeProjection.value = null
+        projectionPermitted = true
         (++serial).also { owner = it }
     }
     @Synchronized fun current(): Long = owner
-    @Synchronized fun retire() = synchronized(audioLock) { take = null; owner = 0 }
+    @Synchronized fun retire() = synchronized(audioLock) {
+        take = null
+        projectionPermitted = false
+        activeProjection.value = null
+        owner = 0
+    }
     // A posted music-thread action can check its generation while deliver() is awaiting that thread.
     fun isCurrent(expected: Long): Boolean = expected != 0L && owner == expected
 
@@ -33,7 +46,17 @@ internal class EngineCallbackGate {
     }
 
     fun endConnection(markEnded: () -> Boolean): Boolean = synchronized(audioLock) {
-        markEnded().also { if (it) take = null }
+        markEnded().also { ended ->
+            if (ended) {
+                take = null
+                projectionPermitted = false
+                activeProjection.value = null
+            }
+        }
+    }
+
+    fun setProjection(expected: Long, active: Boolean) = synchronized(audioLock) {
+        if (projectionPermitted && isCurrent(expected)) activeProjection.value = expected.takeIf { active }
     }
 
     inner class AudioTake internal constructor() {

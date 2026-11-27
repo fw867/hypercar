@@ -5,6 +5,21 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class EngineCallbackGateTest {
+    @Test fun projectionRetirementIsImmediateAndCannotBeUndoneByTheOldEngine() {
+        val gate = EngineCallbackGate()
+        val first = gate.begin()
+        gate.setProjection(first, true)
+        assertEquals(first, gate.projectionOwner.value)
+        gate.endConnection { true }
+        gate.setProjection(first, true)
+        assertNull(gate.projectionOwner.value)
+        val next = gate.begin()
+        gate.setProjection(next, true)
+        gate.setProjection(first, false)
+        assertEquals(next, gate.projectionOwner.value)
+        gate.retire()
+        assertNull(gate.projectionOwner.value)
+    }
     private class Invite(val address: String)
 
     @Test fun sameAddressInvitationSurvivesOldCleanupAndLateEof() {

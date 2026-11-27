@@ -117,8 +117,13 @@ object RustCoreBridge {
      * @param socketProvider 后续新端口的 socket 供给
      */
     external fun nativeStart(configJson: String, controlFd: Int, socketProvider: SocketProvider): Boolean
+    fun interface CarWithCanvasValidator {
+        fun isCurrent(): Boolean
+    }
+
     /** Source service survives media engine retries; owner is the connection attempt. */
-    external fun nativePrepareCarWith(configJson: String, owner: Long): Boolean
+    external fun nativePrepareCarWith(configJson: String, owner: Long, cachedWidth: Int, cachedHeight: Int,
+                                      validator: CarWithCanvasValidator?): Boolean
     external fun nativeStopCarWith(owner: Long)
 
     /** Capture the native engine generation; zero means no input receiver. */
@@ -162,6 +167,10 @@ object RustCoreBridge {
     external fun nativeStartNavigationAudio(rate: Int, channels: Int)
     external fun nativeCallAudioArmed(token: Long): Boolean
     external fun nativeOfferCallAudio(token: Long, attempt: Long, rate: Int, socketFd: Int): Boolean
+    external fun nativeTryCallOutputJournalLock(fd: Int): Boolean
+
+    /** The registered shell journal retains this shared selector until the UserService exits. */
+    external fun nativeMapCallOutputSelector(fd: Int): java.nio.ByteBuffer?
     external fun nativeTakeCallAudioResult(token: Long, attempt: Long): Int
     external fun nativePushNavigationAudioPcm(pcm: ShortArray, rate: Int, channels: Int)
     external fun nativeStopNavigationAudio()

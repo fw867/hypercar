@@ -148,7 +148,19 @@ class MusicNotificationListener : NotificationListenerService() {
         private val main = Handler(Looper.getMainLooper())
         // Keep the system-granted listener separate from optional media work. requestUnbind
         // during an idle callback can race requestRebind and leave a bound but idle service.
-        private var connected: MusicNotificationListener? = null
+        @Volatile private var connected: MusicNotificationListener? = null
+
+        internal fun hasNavigationNotification(provider: MapProvider): Boolean? {
+            val listener = connected ?: return null
+            if (android.os.Build.VERSION.SDK_INT >= 33 &&
+                listener.packageManager.checkPermission(android.Manifest.permission.POST_NOTIFICATIONS, provider.packageName) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED) return null
+            val notifications = runCatching { listener.activeNotifications }.getOrNull() ?: return null
+            if (connected !== listener) return null
+            return notifications.any {
+                it.packageName == provider.packageName && (it.isOngoing || it.notification.category == "navigation")
+            }
+        }
 
         private fun shouldListen() = HyperCarRepo.automaticConnectionAllowed ||
             HyperCarRepo.hasCurrentSession

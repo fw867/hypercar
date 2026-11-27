@@ -340,6 +340,35 @@ impl AudioOut {
         output
     }
 
+    pub(crate) fn new_call_pcm(data: UdpSocket, sync: Option<UdpSocket>, key: [u8; 32], rate: u32) -> Self {
+        let mut output = Self::new_pcm(data, sync, key, rate);
+        // Keep the CarPlay SSRC at zero. A new sequence space helps distinguish successive calls.
+        output.seq = rand::random::<u16>() & 0x7fff;
+        output
+    }
+
+    pub(crate) fn call_report_socket(&self) -> Option<Arc<UdpSocket>> {
+        self.sync.clone()
+    }
+
+    pub(crate) fn send_call_sender_report(&self, ntp: u64, last_frames: u32) -> bool {
+        let Some(socket) = &self.sync else { return false; };
+        const CNAME: &[u8] = b"hypercar-telephony";
+        let mut packet = [0; 60];
+        packet[..4].copy_from_slice(&[0x80, 200, 0, 6]);
+        // The sender SSRC is zero, the same as the CarPlay RTP header.
+        packet[8..16].copy_from_slice(&ntp.to_be_bytes());
+        packet[16..20].copy_from_slice(&self.ts.wrapping_sub(last_frames).to_be_bytes());
+        packet[20..24].copy_from_slice(&(self.packets as u32).to_be_bytes());
+        packet[24..28].copy_from_slice(&(self.payload_bytes as u32).to_be_bytes());
+        packet[28..32].copy_from_slice(&[0x81, 202, 0, 7]);
+        packet[36] = 1; // SDES CNAME, followed by the zero end item and alignment padding.
+        packet[37] = CNAME.len() as u8;
+        packet[38..38 + CNAME.len()].copy_from_slice(CNAME);
+        socket2::SockRef::from(socket.as_ref()).send_with_flags(&packet, libc::MSG_DONTWAIT)
+            .is_ok_and(|written| written == packet.len())
+    }
+
     pub fn new_aac(data: UdpSocket, sync: Option<UdpSocket>, key: [u8;32], encoder: crate::aac::AacEncoder) -> Self {
         let mut output = Self::new(data, sync, key, 102);
         output.sample_rate = encoder.sample_rate();
@@ -555,8 +584,10 @@ impl AudioOut {
     }
 
     pub(crate) async fn send_call_audio(&mut self, payload: &[u8], frames: u32, loss_generation: u64,
-        phone_endpoint: std::os::fd::RawFd) -> std::io::Result<()> {
-        self.send_payload_checked(payload, frames, Some(loss_generation), Some(phone_endpoint)).await
+        phone_endpoint: std::os::fd::RawFd) -> std::io::Result<Option<u16>> {
+        let (before, sequence) = (self.packets, self.seq);
+        self.send_payload_checked(payload, frames, Some(loss_generation), Some(phone_endpoint)).await?;
+        Ok((self.packets != before).then_some(sequence))
     }
 
     pub async fn send_pcm_for_generation(&mut self, frames: &[i16], expected_generation: Option<u64>) -> std::io::Result<()> {

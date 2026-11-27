@@ -94,6 +94,8 @@ internal class AmapLinkNavigationState {
         cue = next; updated = now
         return true
     }
+    @Synchronized fun routeInProgress(): Boolean? = cue?.let { it.state == 1 }
+
     @Synchronized fun snapshot(now: Long): NavigationCue? {
         if (token == 0L) return null
         val current = cue ?: return null
@@ -136,6 +138,7 @@ internal object AmapLinkNavigation {
     fun clear(token: Long) = state.clear(token)
     fun clear() = state.clear()
     fun accept(token: Long, type: Int, data: org.json.JSONObject?, now: Long) = state.accept(token, type, data, now)
+    fun routeInProgress(): Boolean? = state.routeInProgress()
     fun snapshot(): NavigationCue? = state.snapshot(android.os.SystemClock.elapsedRealtime())
     fun hudSnapshot(now: Long, notification: TimedNavigationCue?) = state.hudSnapshot(now, notification)
 }

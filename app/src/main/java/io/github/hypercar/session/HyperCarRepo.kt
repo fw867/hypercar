@@ -104,7 +104,7 @@ object HyperCarRepo {
     internal val oldDeviceReadiness = _oldDeviceReadiness.asStateFlow()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val mediaLog = MediaDiagnosticLog { log(it) }
+    private val mediaLog = MediaDiagnosticLog { writeLog(it) }
     private val mediaSummaryWrites = Channel<Unit>(Channel.CONFLATED)
     @Volatile private var mediaSummaryStore: MediaSummaryStore? = null
 
@@ -165,6 +165,7 @@ object HyperCarRepo {
 
     private val videoCapabilityGeneration = java.util.concurrent.atomic.AtomicLong()
     private val engineCallbacks = EngineCallbackGate()
+    internal val projectionOwner = engineCallbacks.projectionOwner
     internal fun requestPlaybackAudio(owner: Long) = engineCallbacks.requestPlayback(owner) {
         sessionLive.get() && RustCoreBridge.nativeRequestAudioOwnership()
     }
@@ -201,8 +202,13 @@ object HyperCarRepo {
                 log("CORE-OWNER: start owner=$callbackOwner attempt=$attempt network=${sockets.network}")
                 val videoGeneration = videoCapabilityGeneration.incrementAndGet()
                 SettingsStore.videoCapabilities.begin(videoGeneration)
-                connectionDiagnostics.engineStarted(attempt, callbackOwner, sessionReceiverMac, SystemClock.uptimeMillis(), System.currentTimeMillis())
+                val receiver = sessionReceiverMac
+                val displayPeer = receiver?.takeIf { !sessionSystemCarLife || it.equals(iap2?.activePeerAddress, true) }
+                val displayKey = PairingEvidence.canvasKey(headUnitProfile.protocolProfileId, displayPeer)
+                connectionDiagnostics.engineStarted(attempt, callbackOwner, receiver, SystemClock.uptimeMillis(), System.currentTimeMillis())
                 RustCoreBridge.setListener(EngineEventListener(engineCallbacks, callbackOwner, object : RustCoreBridge.EventListener by rustListener {
+                    override fun onDisplaySize(width: Int, height: Int, maxFps: Int) = recordDisplaySize(width, height, maxFps, displayKey)
+
                     override fun onLog(line: String) {
                         if (line.startsWith("MEDIA-TIMELINE: ")) {
                             if (connectionDiagnostics.mediaEvent(attempt, callbackOwner, line)) {
@@ -211,9 +217,7 @@ object HyperCarRepo {
                             mediaLog.offer(line)
                             return
                         }
-                        if (line.startsWith("VIDEO-FEEDBACK: ") || line.startsWith("VIDEO-QUEUE: ") ||
-                            line.startsWith("VIDEO-QOS: ") || line.startsWith("VIDEO: reset source ") ||
-                            line.startsWith("VIDEO: keepAlive written ") || line.startsWith("CLUSTER: keepAlive written ")) {
+                        if (MediaDiagnosticLog.queuesNativeLine(line)) {
                             mediaLog.offer(line)
                             return
                         }
@@ -1698,7 +1702,7 @@ object HyperCarRepo {
 
     private suspend fun runConnect(context: Context, diagnosticId: Long, wakePeer: String?, manual: Boolean,
                                    systemPrompt: SystemDiscoverabilityPrompt?, experimentTarget: String?,
-                                   suppressManualWindow: Boolean) {
+                                    suppressManualWindow: Boolean) {
         if (!sessionLive.get() || connectionAttemptId != diagnosticId) return
         fun fail(reason: String) = HyperCarRepo.fail(reason, diagnosticId)
         val startupIssues = StartupRequirements.read(context).manualIssues
@@ -2628,6 +2632,11 @@ object HyperCarRepo {
         val requestReceiver = PairingEvidence.receiverKey(requestPeer?.peer) ?: wifiReceiverKey()
         hudSessionEnabled = false
         io.github.hypercar.carui.CarSpeechValidation.cancel()
+        // Retire the UI and capture its map evidence before clearing the Link reader.
+        // Display and encoder cleanup can block in shell calls, so it runs asynchronously.
+        sessionUiJob?.cancel()
+        sessionUiJob = null
+        CarUiCaster.stopAsync(io.github.hypercar.navigation.AmapLinkNavigation::routeInProgress)
         io.github.hypercar.navigation.NavigationSources.clear()
         sessionSockets?.invalidate() // 阻止旧引擎继续创建/移交 socket，先于 nativeStop。
         sessionSockets = null
@@ -2635,11 +2644,6 @@ object HyperCarRepo {
         if (!keepListening) stopForegroundService()
         MusicBridge.onCarDisconnected()
         streaming = false
-        // P1：先停自绘界面（释放 D1 显示/编码器），再停引擎。
-        // 清理涉及 shell binder/编码器释放，可能卡住；异步执行，断开流程不等它。
-        sessionUiJob?.cancel()
-        sessionUiJob = null
-        CarUiCaster.stopAsync()
         // 在解绑网络、结束蓝牙旧会话之前完成有界业务退出；断网/EOF 路径只强制清理。
         runCatching {
             if (graceful) log("SESSION-CLOSE: graceful completed=${RustCoreBridge.nativeStopGracefully()}")
@@ -3978,6 +3982,7 @@ object HyperCarRepo {
                         if (!cachedHotspotMatchesTarget()) return
                         sessionHadLink = true
                     }
+                    engineCallbacks.setProjection(callbackOwner, true)
                     sessionIdentity?.let { ensurePairingIdentity(it) }
                     val diagnosticId = connectionAttemptId
                     connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.CONTROL_READY)
@@ -4108,18 +4113,6 @@ object HyperCarRepo {
 
         override fun onForceKeyFrame() {
             io.github.hypercar.carui.CarUiCaster.requestKeyFrame()
-        }
-
-        override fun onDisplaySize(width: Int, height: Int, maxFps: Int) {
-            val declaredMaxFps = maxFps.takeIf { it > 0 }
-            SettingsStore.receiverMaxFps = declaredMaxFps
-            SettingsStore.receiverViewport = (width to height).takeIf { width >= 320 && height >= 240 }
-            if (sessionLive.get() && width in 320..8192 && height in 240..8192) {
-                // receiverForEngine froze the actual peer for this AirPlay session.
-                val key = PairingEvidence.canvasKey(headUnitProfile.protocolProfileId, sessionReceiverMac)
-                if (key != null) SettingsStore.rememberCarWithDisplay(key, width, height, declaredMaxFps)
-                log("CARWITH-SIZE: receiver=${width}x$height max_fps=${declaredMaxFps ?: "undeclared"} canvas_cache=${if (key != null) "saved" else "no_session_identity"}")
-            }
         }
 
         override fun onViewAreaChoices(revision: Long, uuid: String, targets: IntArray) {
@@ -4862,6 +4855,14 @@ object HyperCarRepo {
      * 故障就是 0.6s 灌了 300 行；有了限流，环形缓冲能把真正的上下文留下来。
      */
     fun log(line: String) {
+        if (MediaDiagnosticLog.queuesInputLine(line)) {
+            mediaLog.offer(line)
+        } else {
+            writeLog(line)
+        }
+    }
+
+    private fun writeLog(line: String) {
         if (line.startsWith("BT-ACCEPT: ")) ctrlDiscoveryTrace.record("event=rfcomm-inbound " + line.removePrefix("BT-ACCEPT: "))
         val now = SystemClock.elapsedRealtime()
         var folded = 0
@@ -5212,35 +5213,98 @@ object HyperCarRepo {
     /** 落盘日志超过这个大小就转存成 `.1`（只留一份上一代）。 */
     private const val DISK_LOG_MAX_BYTES = 1_500_000L
 
+    private fun recordDisplaySize(width: Int, height: Int, maxFps: Int, key: String?) {
+        val declaredMaxFps = maxFps.takeIf { it > 0 }
+        SettingsStore.receiverMaxFps = declaredMaxFps
+        SettingsStore.receiverViewport = (width to height).takeIf { width >= 320 && height >= 240 }
+        if (sessionLive.get() && width in 320..8192 && height in 240..8192) {
+            if (key != null) SettingsStore.rememberCarWithDisplay(key, width, height, declaredMaxFps)
+            log("CARWITH-SIZE: receiver=${width}x$height max_fps=${declaredMaxFps ?: "undeclared"} canvas_cache=${if (key != null) "saved" else "no_session_identity"}")
+        }
+    }
+
+    private fun systemCanvasSelection(attempt: Long, profile: String): Pair<String, RustCoreBridge.CarWithCanvasValidator>? {
+        val coordinator = iap2
+        val bluetoothRound = coordinator?.sessionStartCount
+        val activePeer = coordinator?.activePeerAddress
+        val hotspot = currentBluetoothHotspot(attempt)
+        val selectedPeer = SettingsStore.targetCarMac
+        val wake = connectionDiagnostics.currentAclWakePeer(attempt)
+        val hotspotKey = CarLifeSourcePolicy.systemCanvasKey(profile, activePeer, hotspot?.peer, selectedPeer, null)
+        val key = hotspotKey ?: CarLifeSourcePolicy.systemCanvasKey(profile, activePeer, null, selectedPeer, wake)
+            ?: return null
+        val invalidated = AtomicBoolean(false)
+        fun current() = sessionLive.get() && connectionAttemptId == attempt &&
+            carWithEntries.current(attempt) && sessionSystemCarLife
+        return key to RustCoreBridge.CarWithCanvasValidator {
+            if (invalidated.get()) return@CarWithCanvasValidator false
+            val now = iap2
+            val round = now?.sessionStartCount
+            val peer = now?.activePeerAddress
+            val sameRound = now === coordinator && round == bluetoothRound
+            val target = SettingsStore.targetCarMac
+            val currentKey = when {
+                !current() -> null
+                hotspotKey != null && sameRound && currentBluetoothHotspot(attempt) == hotspot ->
+                    CarLifeSourcePolicy.systemCanvasKey(profile, peer, hotspot?.peer, target, null)
+                hotspotKey == null && (sameRound || peer.equals(wake, true)) &&
+                    connectionDiagnostics.currentAclWakePeer(attempt) == wake ->
+                    CarLifeSourcePolicy.systemCanvasKey(profile, peer, null, target, wake)
+                else -> null
+            }
+            if (currentKey != key || iap2 !== now || now?.sessionStartCount != round ||
+                !peer.equals(now?.activePeerAddress, true) || !target.equals(SettingsStore.targetCarMac, true) || !current()) {
+                invalidated.set(true)
+            }
+            !invalidated.get()
+        }
+    }
+
     private fun prepareCarWithSource(context: Context, diagnosticId: Long, deviceMac: String, wakePeer: String?): Boolean {
-        fun current() = sessionLive.get() && carWithEntries.current(diagnosticId)
+        fun current() = sessionLive.get() && connectionAttemptId == diagnosticId && carWithEntries.current(diagnosticId)
         if (!current()) return false
         // Known-Wi-Fi wakes run before resumeKnownCarNetwork populates wifiReceiverMac.
         val profile = headUnitProfile.protocolProfileId
-        val key = PairingEvidence.canvasKey(profile, iap2?.activePeerAddress,
-            wakePeer, wifiReceiverMac, aclCarMac, SettingsStore.targetCarMac)
-            ?: if (profile in setOf("bmw_id85", "bmw_id9")) {
-                PairingEvidence.canvasKey(profile, knownWifiReceiver(wifiSsidFromApi(context)))
-            } else null
-        val cached = PairingEvidence.cachedDisplay(key, SettingsStore::carWithDisplay)
-        val width = cached?.width ?: SettingsStore.DEFAULT_VIDEO_WIDTH
-        val height = cached?.height ?: SettingsStore.DEFAULT_VIDEO_HEIGHT
         val systemCarLife = sessionSystemCarLife
-        val cachedMaxFps = cached?.maxFps?.takeUnless { systemCarLife }
         val config = org.json.JSONObject(SettingsStore.engineConfigJson("127.0.0.1", 0, deviceMac, "",
-            // Before this attempt's Bluetooth negotiation, only its wake peer or
-            // selected target is authoritative; an idle coordinator may retain another car.
             receiverBluetoothMac = if (systemCarLife) wakePeer ?: SettingsStore.targetCarMac else null,
             carWithSource = true, headUnitProfile = headUnitProfile,
             systemCarLifeSource = systemCarLife, systemCarLifeCallAudio = sessionCallAudioEnabled))
-            .put("width", width).put("height", height)
-            .put("carwith_cached_canvas", cached != null)
+        val systemSelection = if (systemCarLife) systemCanvasSelection(diagnosticId, profile) else null
+        val candidateKey = if (systemCarLife) {
+            systemSelection?.first
+        } else {
+            PairingEvidence.canvasKey(profile, iap2?.activePeerAddress,
+                wakePeer, wifiReceiverMac, aclCarMac, SettingsStore.targetCarMac)
+                ?: if (profile in setOf("bmw_id85", "bmw_id9")) {
+                    PairingEvidence.canvasKey(profile, knownWifiReceiver(wifiSsidFromApi(context)))
+                } else null
+        }
+        val candidate = PairingEvidence.cachedDisplay(candidateKey, SettingsStore::carWithDisplay)
+        val manualSize = SettingsStore.videoWidth to SettingsStore.videoHeight
+        val validator = systemSelection?.second?.takeIf { it.isCurrent() }
+        val key = candidateKey?.takeIf { !systemCarLife || validator != null }
+        val cached = candidate.takeIf { key != null }
+        val (width, height) = CarLifeSourcePolicy.prewarmSize(systemCarLife, cached.takeUnless { systemCarLife }, manualSize)
+        val guardedCache = cached.takeIf { systemCarLife }
+        val cachedMaxFps = cached?.maxFps?.takeUnless { systemCarLife }
+        config.put("width", width).put("height", height)
+            .put("carwith_cached_canvas", cached != null && !systemCarLife)
             .put("carwith_cached_max_fps", cachedMaxFps)
-            .put("carwith_navigation_enabled", carWithHudNavigationAllowed).toString()
+            .put("carwith_navigation_enabled", carWithHudNavigationAllowed)
+        if (!current()) return false
+        val prepared = RustCoreBridge.nativePrepareCarWith(config.toString(), diagnosticId,
+            guardedCache?.width ?: 0, guardedCache?.height ?: 0, validator.takeIf { guardedCache != null })
         val cachedFpsStatus = if (systemCarLife && cached?.maxFps != null) "ignored(system-auto)" else cachedMaxFps?.toString() ?: "unknown"
-        log("CARWITH: 源端预热画布 ${width}x$height cached_max_fps=$cachedFpsStatus canvas_cache=" +
-            when { cached != null -> "hit"; key != null -> "miss"; else -> "no_identity" })
-        if (!RustCoreBridge.nativePrepareCarWith(config, diagnosticId)) return false
+        val cacheStatus = when { cached != null -> "hit"; key != null -> "miss"; else -> "no_identity" }
+        val canvasSource = when {
+            guardedCache != null -> "receiver_cache_candidate(${guardedCache.width}x${guardedCache.height}),manual_fallback"
+            cached != null -> "receiver_cache"
+            systemCarLife -> "manual"
+            else -> "default"
+        }
+        log("CARWITH: 源端预热画布 ${width}x$height cached_max_fps=$cachedFpsStatus canvas_cache=$cacheStatus canvas_source=$canvasSource")
+        if (!prepared) return false
         if (!current()) {
             RustCoreBridge.nativeStopCarWith(diagnosticId)
             return false

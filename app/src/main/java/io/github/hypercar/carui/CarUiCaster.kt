@@ -74,8 +74,8 @@ object CarUiCaster {
 
     suspend fun start(context: Context, current: () -> Boolean = { true }): String {
         val ticket = lifecycle.ticket()
-        return lifecycle.start(ticket, current, ::stopLocked) {
-            startLocked(context.applicationContext) { lifecycle.isCurrent(ticket) && current() }
+        return lifecycle.start(ticket, current, { stopLocked() }) {
+            startLocked(context.applicationContext, ticket) { lifecycle.isCurrent(ticket) && current() }
         } ?: "会话已停止，取消界面启动"
     }
 
@@ -200,12 +200,12 @@ object CarUiCaster {
                                     frameRestartStarted = true
                                     log("recovery rebuilding source reason=frame_stall retry=$retryFrame oldDisplayId=$id sourceUnits=${latest.sourceUnits} writtenFrames=${latest.writtenFrames}")
                                     stopLocked(keepAudio = true)
-                                    startLocked(app, keepAudio = true, current = ::active)
+                                    startLocked(app, ticket, keepAudio = true, current = ::active)
                                 }
                             } else {
                                 log("recovery rebuilding source oldDisplayId=$id")
                                 lifecycle.restart(ticket, ::active, { stopLocked() }) {
-                                    startLocked(app, current = ::active)
+                                    startLocked(app, ticket, current = ::active)
                                 }
                             }
                             val rebuilt = result != null && running
@@ -231,7 +231,7 @@ object CarUiCaster {
         }
     }
 
-    private suspend fun startLocked(context: Context, keepAudio: Boolean = false, current: () -> Boolean): String {
+    private suspend fun startLocked(context: Context, ticket: Long, keepAudio: Boolean = false, current: () -> Boolean): String {
         val desiredCodec = SettingsStore.preferredVideoCodec
         val requested = SettingsStore.encodingPlan
         val limited = SettingsStore.receiverMaxFps != null
@@ -293,7 +293,7 @@ object CarUiCaster {
         }
         // Reclaim dead encoder displays without destroying the retained navigation task.
         MapPreview.init(context)
-        MapPreview.prepareProjection()
+        MapPreview.prepareProjection(ticket)
         val created = SpikeShell.createDisplay(surface, width, height, DPI, 0, "hypercar-d1")
         val id = Regex("id=(\\d+)").find(created)?.groupValues?.get(1)?.toIntOrNull() ?: -1
         if (id <= 0) {
@@ -421,16 +421,18 @@ object CarUiCaster {
     }
 
     /** Retire synchronously; all cleanup stays off the UI thread. */
-    fun stopAsync() {
+    fun stopAsync(routeInProgress: (() -> Boolean?)? = null) {
         val retired = lifecycle.retire()
-        scope.launch { lifecycle.stop(retired, ::stopLocked) }
+        val idleDisplay = if (running && routeInProgress != null)
+            MapPreview.idleDisplayAtDisconnect(retired - 1, routeInProgress) else null
+        scope.launch { lifecycle.stop(retired) { stopLocked(idleDisplay = idleDisplay) } }
     }
 
     private inline fun release(resource: String, block: () -> Unit) {
         runCatching(block).onFailure { HyperCarRepo.log("CARUI: 释放 $resource 失败 ${it.message}") }
     }
 
-    private suspend fun stopLocked(keepAudio: Boolean = false) {
+    private suspend fun stopLocked(keepAudio: Boolean = false, idleDisplay: MapPreview.ProjectionDisplay? = null) {
         if (!keepAudio) release("audio") { CarAudioCapture.stop() }
         if (!running && displayId < 0 && caster == null) return
         // Await surface detachment before destroying encoders; keep the map/navigation alive.
@@ -441,6 +443,10 @@ object CarUiCaster {
             RustCoreBridge.setTouchListener(null)
         }
         if (displayId > 0) release("display") { SpikeShell.releaseDisplay(displayId) }
+        if (idleDisplay != null && displayService != null && displayService == SpikeShell.userServiceBinder)
+            release("parked displays") {
+                MapPreview.parkAfterProjection(idleDisplay) { lifecycle.isCurrent(idleDisplay.ticket + 1) }
+            }
         displayId = -1
         displayService = null
         release("encoder") { caster?.stop() }

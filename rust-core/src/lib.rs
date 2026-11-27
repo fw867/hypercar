@@ -98,6 +98,44 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeOfferCa
     if call_audio::offer(token, attempt, rate as u32, socket) { JNI_TRUE } else { JNI_FALSE }
 }
 
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeTryCallOutputJournalLock(
+    _env: JNIEnv, _class: JClass, fd: jint,
+) -> jboolean {
+    if fd < 0 { return JNI_FALSE; }
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as _;
+    lock.l_whence = libc::SEEK_SET as _;
+    // Linux's OFD lock survives the app closing its copy after the Binder transfer.
+    const F_OFD_SETLK: libc::c_int = 37;
+    if unsafe { libc::fcntl(fd, F_OFD_SETLK, &lock as *const libc::flock) } == 0 { JNI_TRUE } else { JNI_FALSE }
+}
+
+/// One resident, file-backed byte for the dispatch decision after the staged record has been synced.
+/// The shell maps it only after accepting the locked descriptor and keeps both until process exit.
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeMapCallOutputSelector(
+    mut env: JNIEnv, _class: JClass, fd: jint,
+) -> jni::sys::jobject {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if fd < 0 || unsafe { libc::fstat(fd, &mut stat) } != 0 ||
+        stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_size < 1 {
+        return std::ptr::null_mut();
+    }
+    let address = unsafe { libc::mmap(std::ptr::null_mut(), 1, libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_SHARED, fd, 0) };
+    if address == libc::MAP_FAILED { return std::ptr::null_mut(); }
+    if unsafe { libc::mlock(address, 1) } == 0 {
+        if let Ok(buffer) = unsafe { env.new_direct_byte_buffer(address.cast(), 1) } {
+            return buffer.into_raw();
+        }
+    }
+    unsafe { libc::munmap(address, 1); }
+    std::ptr::null_mut()
+}
+
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeTakeCallAudioResult(
     _env: JNIEnv, _class: JClass, token: jlong, attempt: jlong,
@@ -148,6 +186,15 @@ static ENGINE: Lazy<parking_lot::Mutex<Option<EngineHandle>>> =
 /// Rust → Kotlin 日志（经 EventListener.onLog；同时走 logcat）。
 pub(crate) fn emit_log(line: &str) {
     log::info!("{line}");
+    notify_log_listener(line);
+}
+
+/// The engine listener queues HID diagnostics for its asynchronous log writer.
+pub(crate) fn emit_hid_log(line: &str) {
+    notify_log_listener(line);
+}
+
+fn notify_log_listener(line: &str) {
     call_listener("onLog", |env, obj| {
         let jline = env.new_string(line)?;
         env.call_method(obj, "onLog", "(Ljava/lang/String;)V", &[(&jline).into()])
@@ -619,13 +666,23 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSetTouc
 /// 启动全链路网关：controlFd（已连车机 AirPlay 端口）+ socket 供给器 + 引擎配置 JSON。
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePrepareCarWith(
-    mut env:JNIEnv, _class:JClass, json:JString, owner:jlong,
+    mut env:JNIEnv, _class:JClass, json:JString, owner:jlong, cached_width:jint, cached_height:jint, validator:JObject,
 )->jboolean {
     let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||->Result<(),String>{
         let text:String=env.get_string(&json).map_err(|e|e.to_string())?.into();
         let cfg:engine::EngineConfig=serde_json::from_str(&text).map_err(|e|e.to_string())?;
+        let canvas = if cfg.system_carlife_source && (2..=8192).contains(&cached_width) &&
+            (2..=8192).contains(&cached_height) && !validator.is_null() {
+            let validator = env.new_global_ref(validator).map_err(|e| e.to_string())?;
+            Some(carlife::SystemCanvasHint {
+                size: (cached_width as u32, cached_height as u32),
+                is_current: Arc::new(move || with_env(|env|
+                    env.call_method(validator.as_obj(), "isCurrent", "()Z", &[])?.z()
+                ).unwrap_or(false)),
+            })
+        } else { None };
         let _entered=TOKIO_RT.enter();
-        carwith_source::prepare(owner as u64,&cfg)
+        carwith_source::prepare(owner as u64,&cfg,canvas)
     }));
     match result {Ok(Ok(()))=>JNI_TRUE, error=>{emit_log(&format!("CARWITH-SOURCE: prepare failed: {error:?}"));JNI_FALSE}}
 }

@@ -2,39 +2,56 @@ package io.github.hypercar.spike
 
 import android.content.ComponentName
 import android.content.Context
-import android.content.ServiceConnection
 import android.os.Binder
+import android.os.Bundle
 import android.os.IBinder
+import android.os.ParcelFileDescriptor
+import android.os.Process
+import android.provider.Settings
 import android.view.Surface
 import android.view.MotionEvent
 import io.github.hypercar.BuildConfig
+import io.github.hypercar.core.RustCoreBridge
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import moe.shizuku.server.IShizukuService
+import moe.shizuku.server.IShizukuServiceConnection
 import rikka.shizuku.Shizuku
+import rikka.shizuku.ShizukuApiConstants
+import java.io.File
 
 /**
  * SPIKE-P0：绑定 Shizuku UserService（shell 进程），在那里建 D2。
  *
- * 调用方必须在 IO 线程：bind 本身要切主线程（Shizuku 回调走主线程），
- * 建屏/释放是 binder 事务，别放主线程。
+ * Shizuku 绑定事务在后台执行，宿主确认后在主线程发布可用的 shell 服务。
  */
 object SpikeShell {
+    internal const val MEDIA_CARD_DISPLAY_NAME = "hypercar-media-card"
 
     @Volatile
     private var service: ISpikeShell? = null
+    @Volatile private var serviceBroker: IBinder? = null
 
-    @Volatile private var connection: ServiceConnection? = null
-    private var args: Shizuku.UserServiceArgs? = null
+    private var binding: UserServiceBinding? = null
+    private var serviceDeath: Pair<IBinder, IBinder.DeathRecipient>? = null
+    private var outputJournalDelivery: OutputJournalDelivery? = null
+    private val outputJournalScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val bindMutex = Mutex()
+    private val bindingState = Any()
+    private val bindingRpcs = UserServiceBindings()
     @OptIn(ExperimentalCoroutinesApi::class)
     private val wifiProbeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
     @OptIn(ExperimentalCoroutinesApi::class)
@@ -42,11 +59,26 @@ object SpikeShell {
     private data class CallDiagnosticBinding(val binder: IBinder, val delivery: CallAudioDiagnosticDelivery)
     private val callDiagnosticBindingLock = Any()
     private var callDiagnosticBinding: CallDiagnosticBinding? = null
+    private val processHost = Binder()
+    private val hostProbeLock = Any()
+    private var hostProbe: Pair<IBinder, Deferred<Boolean>>? = null
     private val displayOwner = Binder()
     @Volatile var isBinding: Boolean = false
         private set
 
-    internal val userServiceBinder: IBinder? get() = service?.asBinder()?.takeIf { it.isBinderAlive }
+    private data class ConnectedBinding(val ticket: UserServiceBinding, val service: ISpikeShell, val broker: IBinder)
+
+    private fun currentBinding(): ConnectedBinding? = synchronized(bindingState) {
+        val ticket = binding ?: return null
+        val bound = service ?: return null
+        val broker = serviceBroker ?: return null
+        val binder = bound.asBinder()
+        if (serviceDeath?.first != binder || !binder.isBinderAlive || !broker.isBinderAlive || broker != Shizuku.getBinder())
+            return null
+        ConnectedBinding(ticket, bound, broker)
+    }
+
+    internal val userServiceBinder: IBinder? get() = currentBinding()?.service?.asBinder()
 
     fun isConnected(): Boolean = userServiceBinder != null
 
@@ -55,7 +87,7 @@ object SpikeShell {
         service?.startSplitAudioCapture(owner, navigationUid)
     fun stopAudioCapture() { service?.stopAudioCapture() }
     internal fun pollCallAudioIdentity(verify: Boolean, log: (String) -> Unit): CallAudioBridgeIdentity? {
-        val bound = service ?: return null
+        val bound = (if (verify) requestOutputJournal() else service) ?: return null
         return pollCallAudioIdentity(bound, verify, log)
     }
 
@@ -105,7 +137,7 @@ object SpikeShell {
 
     fun openCallAudio(owner: IBinder, token: Long, offer: Long, callId: String, rate: Int,
                       route: ICallAudioRoute): android.os.ParcelFileDescriptor? =
-        service?.openCallAudio(owner, token, offer, callId, rate, route)
+        requestOutputJournal()?.openCallAudio(owner, token, offer, callId, rate, route)
     fun closeCallAudio(token: Long) { service?.closeCallAudio(token) }
     fun revokeCallAudio(token: Long, offer: Long) { service?.revokeCallAudio(token, offer) }
     fun audioCaptureStatus(): String = service?.audioCaptureStatus() ?: "shell disconnected"
@@ -162,62 +194,175 @@ object SpikeShell {
     /** 绑定（幂等）。返回人话结果，写进 spike 报告。 */
     suspend fun connect(context: Context): String {
         return bindMutex.withLock {
-            if (isConnected()) return@withLock "已连接"
-            service = null
+            if (confirmCurrentHost(::currentBinding) { confirmHost(it.service, 750) }) {
+                requestOutputJournal()
+                return@withLock "已连接"
+            }
+            disconnect()
             isBinding = true
-            try { connectUnlocked(context) } finally { isBinding = false }
+            try {
+                val result = connectUnlocked(context)
+                if (result != HOST_UNAVAILABLE) return@withLock result
+                // The idle process can reject transactions just before Shizuku sees its death.
+                disconnect()
+                delay(800)
+                connectUnlocked(context)
+            } catch (cancelled: CancellationException) {
+                disconnect()
+                throw cancelled
+            } finally {
+                if (!isConnected()) disconnect()
+                isBinding = false
+            }
         }
     }
 
+    private suspend fun confirmHost(bound: ISpikeShell, timeoutMs: Long): Boolean {
+        val binder = bound.asBinder()
+        val probe = synchronized(hostProbeLock) {
+            hostProbe?.takeIf { it.first == binder && it.second.isActive }?.second ?: outputJournalScope.async {
+                runCatching { bound.attachHost(processHost) }.getOrDefault(false)
+            }.also { hostProbe = binder to it }
+        }
+        // The independent probe may still be inside Binder when the waiting connection expires.
+        return awaitHostAttachment(probe, timeoutMs)
+    }
+
     private suspend fun connectUnlocked(context: Context): String {
-        if (!Shizuku.pingBinder()) return "Shizuku 未运行"
+        val broker = Shizuku.getBinder()?.takeIf { it.isBinderAlive } ?: return "Shizuku 未运行"
+        val remote = IShizukuService.Stub.asInterface(broker)
         val deferred = CompletableDeferred<String>()
-        val conn = object : ServiceConnection {
-            override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-                if (connection !== this) return
+        val attempt = UserServiceBinding()
+        val conn = object : IShizukuServiceConnection.Stub() {
+            private var callbackVersion = 0L
+
+            override fun connected(binder: IBinder?) {
                 if (binder == null) {
-                    deferred.complete("onServiceConnected binder=null")
+                    died()
                     return
                 }
-                service = ISpikeShell.Stub.asInterface(binder)
-                deferred.complete("connected")
+                val version = synchronized(bindingState) {
+                    if (binding !== attempt) return
+                    clearServiceDeath()
+                    if (!broker.isBinderAlive || broker != Shizuku.getBinder()) {
+                        died()
+                        return
+                    }
+                    val death = IBinder.DeathRecipient {
+                        synchronized(bindingState) { if (serviceDeath?.first == binder) died() }
+                    }
+                    try { binder.linkToDeath(death, 0) }
+                    catch (_: android.os.RemoteException) { died(); return }
+                    serviceDeath = binder to death
+                    ++callbackVersion
+                }
+                val bound = service?.takeIf { it.asBinder() == binder } ?: ISpikeShell.Stub.asInterface(binder)
+                outputJournalScope.launch {
+                    if (!attempt.finished.await()) return@launch
+                    val attached = confirmHost(bound, 4_000)
+                    withContext(Dispatchers.Main.immediate) {
+                        synchronized(bindingState) {
+                            if (binding !== attempt || callbackVersion != version) return@withContext
+                            if (!attached || !binder.isBinderAlive || !broker.isBinderAlive || broker != Shizuku.getBinder()) {
+                                deferred.complete(HOST_UNAVAILABLE)
+                                return@withContext
+                            }
+                            if (service !== bound || serviceBroker != broker) {
+                                outputJournalDelivery?.close()
+                                outputJournalDelivery = newOutputJournalDelivery(context.applicationContext, bound, broker)
+                            }
+                            serviceBroker = broker
+                            service = bound
+                            outputJournalDelivery?.request()
+                            deferred.complete("connected")
+                        }
+                    }
+                }
             }
 
-            override fun onServiceDisconnected(name: ComponentName?) {
-                if (connection !== this) return
-                service = null
+            override fun died() {
+                synchronized(bindingState) {
+                    if (binding !== attempt) return
+                    callbackVersion++
+                    clearServiceDeath()
+                    service = null
+                    serviceBroker = null
+                    outputJournalDelivery?.close()
+                    outputJournalDelivery = null
+                    deferred.complete(HOST_UNAVAILABLE)
+                }
                 SpikeReport.add("SHELL", "user service 断开")
             }
         }
-        connection = conn
-        val a = Shizuku.UserServiceArgs(
-            ComponentName(context.packageName, SpikeShellService::class.java.name),
-        )
-            .daemon(false)
-            .processNameSuffix("spike")
-            .debuggable(BuildConfig.DEBUG)
-            // UserService revisions also distinguish local installs sharing the same versionCode.
-            .version(BuildConfig.VERSION_CODE + 18)
-        args = a
-        // 注意：**不要**在 Main 线程调 bindUserService。Shizuku 13.6 在某些机型上会同步等待
-        // 用户服务把 binder 交回来；放主线程会与「回调也要主线程」互相等死（真机踩过：
-        // 主线程卡住、日志停在 bind 前，行为像 ANR 但没有 ANR 记录）。
-        SpikeReport.add("SHELL", "调用 bindUserService → ${context.packageName}:spike")
-        val called = try {
-            Shizuku.bindUserService(a, conn)
-            SpikeReport.add("SHELL", "bindUserService 已返回")
-            true
-        } catch (t: Throwable) {
-            SpikeReport.add(
-                "SHELL",
-                "bindUserService 异常: ${t.javaClass.simpleName}: ${t.message}",
-            )
-            false
+        val component = ComponentName(context.packageName, SpikeShellService::class.java.name)
+        val identity = Bundle().apply {
+            putParcelable(ShizukuApiConstants.USER_SERVICE_ARG_COMPONENT, component)
+            userServiceTag(Process.myUid())?.let { putString(ShizukuApiConstants.USER_SERVICE_ARG_TAG, it) }
         }
-        if (!called) return "bindUserService 调用失败"
-        val result = withTimeoutOrNull(12_000) { deferred.await() } ?: "绑定超时（12s）"
+        val options = Bundle(identity).apply {
+            putBoolean(ShizukuApiConstants.USER_SERVICE_ARG_DAEMON, false)
+            putString(ShizukuApiConstants.USER_SERVICE_ARG_PROCESS_NAME, "spike")
+            putBoolean(ShizukuApiConstants.USER_SERVICE_ARG_DEBUGGABLE, BuildConfig.DEBUG)
+            // UserService revisions also distinguish local installs sharing the same versionCode.
+            putInt(ShizukuApiConstants.USER_SERVICE_ARG_VERSION_CODE, BuildConfig.VERSION_CODE + 29)
+        }
+        synchronized(bindingState) { binding = attempt }
+        SpikeReport.add("SHELL", "调用 bindUserService → ${context.packageName}:spike")
+        // The SDK caches callbacks by component and unbind(false) clears the whole set. Use the
+        // same AIDL and service identity, but keep both transactions on this broker and callback.
+        var canDetach = false
+        bindingRpcs.start(broker, attempt, bind = {
+            runCatching {
+                if (Shizuku.getBinder() != broker) return@runCatching false
+                val version = Shizuku.getVersion()
+                // Match the pinned 13.1.5 SDK's unbind(false) gate. Earlier servers
+                // do not support detaching just this callback.
+                @android.annotation.SuppressLint("RestrictedApi")
+                val supportsDetach = version >= 14 || (version == 13 && Shizuku.getServerPatchVersion() >= 4)
+                if (attempt.closed.isCompleted || Shizuku.getBinder() != broker) return@runCatching false
+                canDetach = supportsDetach
+                remote.addUserService(conn, options)
+                true
+            }
+                .onFailure { SpikeReport.add("SHELL", "bindUserService 异常: ${it.javaClass.simpleName}: ${it.message}") }
+                .getOrDefault(false)
+        }, unbind = {
+            if (canDetach && broker.isBinderAlive) runCatching {
+                val remove = Bundle(identity).apply {
+                    putBoolean(ShizukuApiConstants.USER_SERVICE_ARG_REMOVE, false)
+                }
+                remote.removeUserService(conn, remove)
+            }
+        })
+        val result = awaitUserServiceBinding(attempt.finished, deferred, 12_000)
+        if (result != "connected") disconnect()
         SpikeReport.add("SHELL", "bind 结果: $result")
         return result
+    }
+
+    private fun requestOutputJournal(): ISpikeShell? = synchronized(bindingState) {
+        outputJournalDelivery?.request()
+        service
+    }
+
+    private fun newOutputJournalDelivery(context: Context, bound: ISpikeShell, broker: IBinder): OutputJournalDelivery {
+        var watchingBroker = false
+        return OutputJournalDelivery(outputJournalScope, deliver = {
+            runCatching {
+                if (service !== bound || serviceBroker != broker || !broker.isBinderAlive) return@runCatching false
+                if (!watchingBroker) watchingBroker = bound.attachCallAudioBroker(broker)
+                if (!watchingBroker) return@runCatching false
+                if (bound.hasCallOutputJournal()) return@runCatching true
+                val boot = Settings.Global.getInt(context.contentResolver, Settings.Global.BOOT_COUNT)
+                val file = File(context.noBackupFilesDir, "call-output-recovery")
+                ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_CREATE or ParcelFileDescriptor.MODE_READ_WRITE)
+                    .use { descriptor ->
+                        // Binder transfers the locked open file description, and the shell retains its copy.
+                        RustCoreBridge.nativeTryCallOutputJournalLock(descriptor.fd) &&
+                            bound.setCallOutputJournal(descriptor, boot)
+                    }
+            }.getOrDefault(false)
+        }, onWaiting = { SpikeReport.add("CALL-AUDIO", "output recovery journal waiting for shell acknowledgement") })
     }
 
     fun createDisplay(
@@ -234,6 +379,16 @@ object SpikeShell {
     fun releaseDisplay(): String = runCatching {
         service?.releaseDisplay() ?: "ERR 未连接"
     }.getOrElse { "ERR ${it.javaClass.simpleName}: ${it.message}" }
+
+    internal data class MediaCardDisplay(val id: Int, val owner: ISpikeShell)
+
+    internal fun createMediaCardDisplay(surface: Surface, width: Int, height: Int, dpi: Int) = runCatching {
+        val owner = checkNotNull(service) { "shell disconnected" }
+        val result = owner.createDisplay(displayOwner, surface, width, height, dpi, 0, MEDIA_CARD_DISPLAY_NAME)
+        val id = result.removePrefix("OK id=").substringBefore(' ').toIntOrNull()
+        check(id != null && id > 0) { result }
+        MediaCardDisplay(id, owner)
+    }
 
     /** P2：只释放指定副屏（D1/D2 并存）。 */
     fun releaseDisplay(displayId: Int): String = runCatching {
@@ -273,14 +428,71 @@ object SpikeShell {
             "ERR $name ${it.javaClass.simpleName}: ${it.message}"
         }
 
-    fun disconnect() {
-        val a = args
-        val c = connection
-        if (a != null && c != null) {
-            runCatching { Shizuku.unbindUserService(a, c, false) }
+    // Called under bindingState. Drop the death registration even when the remote process survives a retry.
+    private fun clearServiceDeath() {
+        serviceDeath?.let { (binder, death) -> runCatching { binder.unlinkToDeath(death, 0) } }
+        serviceDeath = null
+    }
+
+    private fun disconnect() {
+        synchronized(bindingState) {
+            binding?.close()
+            binding = null
+            clearServiceDeath()
+            service = null
+            serviceBroker = null
+            outputJournalDelivery?.close()
+            outputJournalDelivery = null
         }
-        service = null
-        connection = null
-        args = null
+    }
+
+    private const val HOST_UNAVAILABLE = "宿主 Binder 注册失败"
+}
+
+// Shizuku keys its records by package and tag (class name by default), across all Android users.
+internal fun userServiceTag(uid: Int): String? {
+    val user = uid / 100_000 // Android UserHandle.PER_USER_RANGE
+    return if (user == 0) null else "spike-u$user"
+}
+
+internal class OutputJournalDelivery(
+    private val scope: CoroutineScope,
+    private val deliver: () -> Boolean,
+    private val onWaiting: () -> Unit,
+) {
+    @Volatile private var finished = false
+    private var worker: Job? = null
+
+    @Synchronized fun request() {
+        if (finished || worker?.isActive == true) return
+        worker = scope.launch {
+            // A persistent OFD contention or filesystem failure must let an unused shell retire.
+            for (waitMs in longArrayOf(0, 250, 500, 1_000, 1_000)) {
+                delay(waitMs)
+                if (deliver()) {
+                    finished = true
+                    return@launch
+                }
+                if (waitMs == 0L) onWaiting()
+            }
+        }
+    }
+
+    @Synchronized fun close() {
+        finished = true
+        worker?.cancel()
     }
 }
+
+internal suspend fun awaitHostAttachment(probe: Deferred<Boolean>, timeoutMs: Long): Boolean =
+    withTimeoutOrNull(timeoutMs) { probe.await() } == true
+
+internal suspend fun <T : Any> confirmCurrentHost(current: () -> T?, confirm: suspend (T) -> Boolean): Boolean {
+    val bound = current() ?: return false
+    return confirm(bound) && current() == bound
+}
+
+internal suspend fun awaitUserServiceBinding(request: Deferred<Boolean>, callback: Deferred<String>, timeoutMs: Long): String =
+    withTimeoutOrNull(timeoutMs) {
+        if (request.await()) callback.await() else "bindUserService 调用失败"
+    } ?: "绑定超时（12s）"

@@ -728,7 +728,7 @@ async fn write_system_voice(wr:&mut tokio::net::tcp::OwnedWriteHalf, state:&Shar
     let written=tokio::time::timeout(Duration::from_millis(250),send_cmd(wr,0x68008,&body)).await;
     if !matches!(written,Ok(true)) { return Err("System CarLife voice command write failed".into()); }
     state.lock().voice_lease=if key==0x21 {Some(tokio::time::Instant::now()+Duration::from_secs(60))} else {None};
-    emit_log(&format!("VOICE-KEY: System CMD 0x68008 key=0x{key:x} written (recognition unconfirmed)"));
+    crate::emit_hid_log(&format!("VOICE-KEY: System CMD 0x68008 key=0x{key:x} written (recognition unconfirmed)"));
     Ok(())
 }
 
@@ -742,6 +742,51 @@ pub(super) async fn handshake_deadline(progress: &Progress) {
     if stage.authentication {
         tokio::time::sleep_until(start + Duration::from_secs(30)).await;
         if progress.evidence().started {return std::future::pending().await;}
+    }
+}
+
+async fn write_guarded_init(
+    wr: &mut tokio::net::tcp::OwnedWriteHalf,
+    id: u32,
+    requested: &DisplayRequest,
+    cfg: &CarLifeConfig,
+    state: &Shared,
+) -> Result<bool, String> {
+    let Some(hint) = cfg.cached_system_canvas.as_ref().filter(|_| id == CMD_VIDEO_ENCODER_INIT) else {
+        return Ok(false);
+    };
+    loop {
+        wr.writable().await.map_err(|e| e.to_string())?;
+        let display = *requested.borrow();
+        let ((width, height), source) = if display.size.0 >= 2 && display.size.1 >= 2 {
+            (display.size, "receiver")
+        } else if (hint.is_current)() {
+            (hint.size, "receiver_cache")
+        } else {
+            ((cfg.width, cfg.height), "manual")
+        };
+        let (w, h) = canvas_for_receiver(width, height);
+        let fps = display.effective_fps(cfg.fps);
+        let body = proto_encoder_info_payload(w, h, fps);
+        let wire = state.lock().encrypt(&body)?;
+        let frame = build_cmd_frame(id, &wire);
+        // Choose again after WouldBlock. Once TCP has accepted a prefix, finish that frame.
+        let written = match wr.try_write(&frame) {
+            Ok(0) => return Err("CarLife INIT write returned zero".into()),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(format!("CarLife INIT write failed: {e}")),
+        };
+        wr.write_all(&frame[written..]).await.map_err(|e| e.to_string())?;
+        let _ = wr.flush().await;
+        {
+            let mut session = state.lock();
+            session.init_canvas = Some((w, h));
+            session.init_fps = Some(fps);
+        }
+        emit_log(&format!("CARWITH-HS: TX 0x{id:x} payload={}B wire={}B", body.len(), wire.len()));
+        emit_log(&format!("CARWITH-SIZE: receiver={width}x{height} request={w}x{h} cap=2560x2560 requested_fps={} effective_fps={fps} canvas_source={source}", cfg.fps));
+        return Ok(true);
     }
 }
 
@@ -825,6 +870,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
                 let mut epoch_cfg=cfg.clone();epoch_cfg.fps=display.effective_fps(cfg.fps);
                 let actions=state.lock().reconfigure(display,&epoch_cfg)?;
                 for (id,body) in actions {
+                    if write_guarded_init(&mut wr, id, &requested, &cfg, &state).await? { continue; }
                     if !send_cmd(&mut wr,id,&body).await { return Err("System CarLife reconfiguration write failed".into()); }
                 }
                 continue;
@@ -855,6 +901,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
                     session.receive_prepared(u32::MAX, &[], &timer_cfg, None)?
                 };
                 for (id, body) in actions {
+                    if write_guarded_init(&mut wr, id, &requested, &cfg, &state).await? { continue; }
                     let wire = state.lock().encrypt(&body)?;
                     if !send_cmd(&mut wr, id, &wire).await { return Err("System CarLife INIT timer write failed".into()); }
                 }
@@ -957,6 +1004,7 @@ pub(super) async fn run(stream: TcpStream, events: mpsc::UnboundedSender<CarLife
                 let _ = events.send(CarLifeEvent::GoToDesktop);
             }
             for (id,body) in actions {
+                if write_guarded_init(&mut wr, id, &requested, &cfg, &state).await? { continue; }
                 let encrypted=state.lock().encrypt(&body)?;
                 if !send_cmd(&mut wr,id,&encrypted).await { return Err(format!("CarWith write 0x{id:x} failed")); }
                 emit_log(&format!("CARWITH-HS: TX 0x{id:x} payload={}B wire={}B",body.len(),encrypted.len()));
@@ -1082,7 +1130,7 @@ pub(super) async fn control(mut stream: TcpStream, queue: Arc<Mutex<Vec<QueuedCo
                                 gesture = next;
                                 gesture_grant = if gesture.active { report.grant } else { None };
                                 sent += 1;
-                                if sent <= 8 || sent % 60 == 0 { emit_log(&format!("CARWITH-TOUCH: encrypted CTRL report #{sent}")); }
+                                if sent <= 8 || sent % 60 == 0 { crate::emit_hid_log(&format!("CARWITH-TOUCH: encrypted CTRL report #{sent}")); }
                             }
                             Ok(false) => {}
                             Err(_) => return,
@@ -1107,13 +1155,13 @@ pub(super) async fn control(mut stream: TcpStream, queue: Arc<Mutex<Vec<QueuedCo
                 }
             }
             if packet.expires.is_some_and(|at|std::time::Instant::now()>=at) {
-                if let Some(code) = phone_key { emit_log(&format!("PHONE-KEY: key={code} dropped expired")); }
+                if let Some(code) = phone_key { crate::emit_hid_log(&format!("PHONE-KEY: key={code} dropped expired")); }
                 continue;
             }
             let wire={
                 let s=state.lock();
                 if phone_key.is_some() && (s.dialect != CarLifeDialect::CarWithEncrypted41 || !s.started || !s.navigation_ready()) {
-                    emit_log("PHONE-KEY: dropped before authenticated CarWith source ready");
+                    crate::emit_hid_log("PHONE-KEY: dropped before authenticated CarWith source ready");
                     continue;
                 }
                 if !s.started { if packet.expires.is_some(){emit_log("CARWITH-CTRL: source not ready; command dropped");} continue; }
@@ -1121,18 +1169,18 @@ pub(super) async fn control(mut stream: TcpStream, queue: Arc<Mutex<Vec<QueuedCo
                 build_cmd_frame(kind,&body)
             };
             if stream.write_all(&wire).await.is_err(){
-                if let Some(code) = phone_key { emit_log(&format!("PHONE-KEY: key={code} CTRL write failed")); }
+                if let Some(code) = phone_key { crate::emit_hid_log(&format!("PHONE-KEY: key={code} CTRL write failed")); }
                 return;
             }
             sent+=1;
-            if let Some(code) = phone_key { emit_log(&format!("PHONE-KEY: encrypted CTRL written key={code} (execution unconfirmed)")); }
+            if let Some(code) = phone_key { crate::emit_hid_log(&format!("PHONE-KEY: encrypted CTRL written key={code} (execution unconfirmed)")); }
             if let Some(code) = hard_key {
                 last_selector = selector.map(|key| (key, std::time::Instant::now()));
                 if code == 0x21 || sent <= 8 || sent % 60 == 0 {
-                    emit_log(&format!("CARWITH-KEY: encrypted CTRL write key={code}"));
+                    crate::emit_hid_log(&format!("CARWITH-KEY: encrypted CTRL write key={code}"));
                 }
             }
-            if sent<=8 || sent%60==0 {emit_log(&format!("CARWITH-TOUCH: encrypted CTRL packet #{sent} wire={}B",wire.len()));}
+            if sent<=8 || sent%60==0 {crate::emit_hid_log(&format!("CARWITH-TOUCH: encrypted CTRL packet #{sent} wire={}B",wire.len()));}
         } else {
             let plain=state.lock().is_system_plain();
             tokio::select! {
@@ -1327,7 +1375,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1),writer).await.unwrap().unwrap();
     }
     use tokio::net::TcpListener;
-    fn cfg()->CarLifeConfig {CarLifeConfig{dialect:CarLifeDialect::default(),manufacturer:String::new(),model:String::new(),width:1280,height:720,fps:60,navigation_updates:false,microphone:None,vehicle_gps:None,bt_address:"00:11:22:33:44:55".into(),bt_name:"HyperCar".into()}}
+    fn cfg()->CarLifeConfig {CarLifeConfig{dialect:CarLifeDialect::default(),manufacturer:String::new(),model:String::new(),width:1280,height:720,fps:60,cached_system_canvas:None,navigation_updates:false,microphone:None,vehicle_gps:None,bt_address:"00:11:22:33:44:55".into(),bt_name:"HyperCar".into()}}
 
     #[test]
     fn vehicle_gps_requires_this_command_sessions_gps_subscription_and_encryption() {
@@ -2128,7 +2176,7 @@ mod navigation_tests {
 #[cfg(test)]
 mod navigation_subscription_tests {
     use super::*;
-    fn config(enabled:bool)->CarLifeConfig {CarLifeConfig{dialect:CarLifeDialect::default(),manufacturer:String::new(),model:String::new(),width:1280,height:720,fps:30,navigation_updates:enabled,microphone:None,vehicle_gps:None,bt_address:String::new(),bt_name:String::new()}}
+    fn config(enabled:bool)->CarLifeConfig {CarLifeConfig{dialect:CarLifeDialect::default(),manufacturer:String::new(),model:String::new(),width:1280,height:720,fps:30,cached_system_canvas:None,navigation_updates:enabled,microphone:None,vehicle_gps:None,bt_address:String::new(),bt_name:String::new()}}
     fn ready()->Session {let mut s=Session::default();s.proof_ok=true;s.admitted=true;s.ready=true;s.init_sent=true;s}
     #[test] fn capability_query_ack_then_start_only_once() {
         let mut s=ready();let c=config(true);
@@ -2156,8 +2204,43 @@ mod system_plain_tests {
     use super::*;
     fn cfg() -> CarLifeConfig {
         CarLifeConfig { dialect: CarLifeDialect::SystemPlain30, manufacturer: "BMW".into(), model: "ID8.5".into(),
-            width:1280,height:720,fps:30,navigation_updates:true,microphone:None,vehicle_gps:None,
+            width:1280,height:720,fps:30,cached_system_canvas:None,navigation_updates:true,microphone:None,vehicle_gps:None,
             bt_address:"00:11:22:33:44:55".into(),bt_name:"Actual receiver".into() }
+    }
+    #[tokio::test]
+    async fn system_canvas_hint_is_rechecked_on_the_init_socket() {
+        use std::sync::atomic::AtomicBool;
+        use tokio::net::TcpListener;
+
+        let valid = Arc::new(AtomicBool::new(true));
+        let guard = valid.clone();
+        let mut config = cfg();
+        let cached = (2736, 800);
+        config.cached_system_canvas = Some(SystemCanvasHint {
+            size: cached,
+            is_current: Arc::new(move || guard.load(Ordering::Acquire)),
+        });
+        let requested = DisplayRequest::new(ReceiverDisplay::default());
+        let state = Arc::new(Mutex::new(Session::new(config.dialect)));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_, mut writer) = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap().into_split();
+        let (mut peer, _) = listener.accept().await.unwrap();
+
+        for (still_current, live, expected) in [
+            (true, (0, 0), cached),
+            (false, (0, 0), (1280, 720)),
+            (false, (1920, 1080), (1920, 1080)),
+        ] {
+            valid.store(still_current, Ordering::Release);
+            requested.send_replace(ReceiverDisplay { size: live, ..Default::default() });
+            assert!(write_guarded_init(&mut writer, CMD_VIDEO_ENCODER_INIT, &requested, &config, &state).await.unwrap());
+            let canvas = canvas_for_receiver(expected.0, expected.1);
+            let expected_frame = build_cmd_frame(CMD_VIDEO_ENCODER_INIT, &proto_encoder_info_payload(canvas.0, canvas.1, 30));
+            let mut actual = vec![0; expected_frame.len()];
+            peer.read_exact(&mut actual).await.unwrap();
+            assert_eq!(actual, expected_frame);
+            assert_eq!(state.lock().init_canvas, Some(canvas));
+        }
     }
     #[tokio::test]
     async fn system_plain_early_audio_format_and_reconfiguration_pcm_survive_video_epochs() {

@@ -140,6 +140,8 @@ internal class SplitPlaybackAudio {
         }
     }
 
+    @Synchronized fun hasActiveCapture(): Boolean = session != null
+
     @Synchronized fun stop() {
         session?.let { end(it, "requested") }
     }

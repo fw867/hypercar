@@ -208,7 +208,7 @@ pub(crate) fn route_display_key(
 ) {
     if crate::consumer_hid::is_phone_key(key) {
         if let Some(hub) = hub { hub.handle_phone_key(key); }
-        else { crate::emit_log(&format!("PHONE-KEY: usage=0x{key:x} dropped source=self")); }
+        else { crate::emit_hid_log(&format!("PHONE-KEY: usage=0x{key:x} dropped source=self")); }
         return;
     }
     if !hub.is_some_and(|hub| hub.handle_console_key(key)) {
@@ -370,7 +370,7 @@ pub async fn run_engine(
                                 let keys=system_voice.receive(action,system_clock.elapsed().as_millis() as u64);
                                 if !send_system_voice(epoch,keys) {system_voice.reset();}
                             } else if voice.receive(action,clock.elapsed().as_millis() as u64) {
-                                crate::emit_log(&format!("VOICE-KEY: action=Start source={}",if voice_probe.is_some() {"car-microphone-probe"} else if carwith_voice {"CarWith"} else {"phone-assistant"}));
+                                crate::emit_hid_log(&format!("VOICE-KEY: action=Start source={}",if voice_probe.is_some() {"car-microphone-probe"} else if carwith_voice {"CarWith"} else {"phone-assistant"}));
                                 if let Some(probe) = voice_probe.as_ref() {
                                     probe.toggle();
                                 } else if carwith_voice {
@@ -551,6 +551,7 @@ pub async fn run_engine(
         carwith_display,
         carwith_media_rate,
         carwith_stretch: cfg.carlife_source && cfg.carwith_stretch,
+        system_carlife_source: system_voice_enabled,
         screen_resource_lifecycle: cfg.screen_resource_lifecycle,
         pipeline: pipeline.clone(),
     };

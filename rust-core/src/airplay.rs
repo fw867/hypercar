@@ -82,6 +82,7 @@ pub struct AirplayParams {
     pub carwith_display: Option<crate::carlife::DisplayRequest>,
     pub carwith_media_rate: Option<tokio::sync::watch::Receiver<Option<u32>>>,
     pub carwith_stretch: bool,
+    pub system_carlife_source: bool,
     pub screen_resource_lifecycle: bool,
     pub pipeline: Arc<Mutex<crate::pipeline::Pipeline>>,
 }
@@ -587,7 +588,8 @@ pub async fn negotiate(
         p.screen_resource_lifecycle.then(|| screen_session.clone()),
         touch_tx,
         key_tx,
-        crate::consumer_hid::ConsumerHid::for_session(wifi_iap_id, &info, &main_screen_id),
+        crate::consumer_hid::ConsumerHid::for_session(wifi_iap_id, &info, &main_screen_id)
+            .with_call_control_trace(p.system_carlife_source),
         limited_ui,
         Some(main_screen_id),
         // 触摸的「显示空间」分母，优先级：
@@ -3482,7 +3484,7 @@ fn buffered_profile_params_for_test() -> AirplayParams {
         mbux_screen_bootstrap:false, id9_screen_bootstrap:true, nbt_audio_first:false, mbux_media_compat:false,
         desktop_receiver:false, width:1920, height:720, touch_display:None, touch_rect:None,
         encoder_size:Arc::new(Mutex::new((1920,720))), touch_size:Arc::new(Mutex::new((1920,720))),
-        carwith_display:None, carwith_media_rate:None, carwith_stretch:false, screen_resource_lifecycle:true,
+        carwith_display:None, carwith_media_rate:None, carwith_stretch:false, system_carlife_source:false, screen_resource_lifecycle:true,
         pipeline:Arc::new(Mutex::new(crate::pipeline::Pipeline::new())),
     }
 }
@@ -4402,13 +4404,18 @@ fn spawn_event_dispatcher(
                     seen_commands.push(cmd_type.to_string());
                 }
                     let source = if from_control { "control" } else { "event" };
-                    emit_log(&format!("EVENT: 车机命令 type={cmd_type}（首次）source={source}"));
+                    let line = format!("EVENT: 车机命令 type={cmd_type}（首次）source={source}");
+                    if matches!(cmd_type, "hidSendReport" | "requestSiri") {
+                        crate::emit_hid_log(&line);
+                    } else {
+                        emit_log(&line);
+                    }
             }
             if cluster.handle(cmd_type, &command) { continue; }
             match cmd_type {
                 "requestSiri" => {
                     let action=command.get("params").and_then(|v|v.get("siriAction")).or_else(||command.get("siriAction")).and_then(Value::as_int);
-                    emit_log(&format!("VOICE-KEY: requestSiri action={action:?}"));
+                    crate::emit_hid_log(&format!("VOICE-KEY: requestSiri action={action:?}"));
                     if let Some(key)=action.and_then(crate::voice_key::message) {let _=key_tx.send(key);}
                 }
                 "iAPSendMessage" => {
@@ -4478,14 +4485,14 @@ fn spawn_event_dispatcher(
                         let uuid = command.get("uuid").or_else(||command.get("params").and_then(|p|p.get("uuid")));
                         hid_reports += 1;
                         if hid_reports <= 3 || hid_reports % 20 == 0 {
-                            emit_log(&format!(
+                            crate::emit_hid_log(&format!(
                                 "EVENT: HID 报告 #{hid_reports} device={uuid:?} {}B",
                                 report.len()
                             ));
                         }
                         if let Some(keys) = consumer_hid.report(uuid, report) {
                             for usage in keys {
-                                emit_log(&format!("HID-KEY: device={uuid:?} input=0x{usage:x} pressed={}",usage!=crate::voice_key::HID_UP));
+                                crate::emit_hid_log(&format!("HID-KEY: device={uuid:?} input=0x{usage:x} pressed={}",usage!=crate::voice_key::HID_UP));
                                 let _ = key_tx.send(usage);
                             }
                             continue;
@@ -4519,8 +4526,8 @@ fn spawn_event_dispatcher(
                         drop(state);
                         if let Some(at) = touch_trace {
                             last_touch_trace = Some(at);
-                            crate::emit_media_trace(at, "hid_touch_in",
-                                &format!("RTSP#{} bytes={} mapped={}", control.trace_id(), report.len(), touch_logged != before));
+                            crate::emit_hid_log(&format!("MEDIA-TIMELINE: {at} hid_touch_in RTSP#{} bytes={} mapped={}",
+                                control.trace_id(), report.len(), touch_logged != before));
                         }
                     }
                 }
@@ -4894,7 +4901,7 @@ fn handle_touch_sample(
     if *logged <= 5 || *logged % 200 == 0 {
         let (left,top,width,height) = mapping.viewport;
         let (tw,th) = mapping.target;
-        crate::emit_log(&format!("TOUCH: 车机({x_raw},{y_raw}) 空间 {dw}x{dh} 画面 ({left},{top}) {width}x{height} → 画布 {tw}x{th} = ({x},{y})（第 {logged} 次）"));
+        crate::emit_hid_log(&format!("TOUCH: 车机({x_raw},{y_raw}) 空间 {dw}x{dh} 画面 ({left},{top}) {width}x{height} → 画布 {tw}x{th} = ({x},{y})（第 {logged} 次）"));
     }
     let _ = touch_tx.send(TouchInput { action, x, y, pointers: Vec::new(), grant });
 }
