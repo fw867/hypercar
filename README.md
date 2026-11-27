@@ -1,6 +1,6 @@
 # HyperCar
 
-让 Android 手机连接无线 CarPlay 车机或雅迪仪表，无需 root。无线 CarPlay 支持 **自绘车机 UI**、**小米 CarWith** 和 **系统 CarLife+** 三种画面来源。雅迪仪表支持 CarWith 和 CarLife+ 导航投屏，可在手机预览上操作。
+让 Android 手机连接无线 CarPlay 车机或雅迪仪表，将地图、音乐和应用画面送到车机屏幕，并转发声音与触摸操作。无线 CarPlay 支持 **自绘车机 UI**、**小米 CarWith** 和 **系统 CarLife+** 三种画面来源。雅迪仪表支持 CarWith 和 CarLife+ 导航投屏，可在手机预览上操作。
 
 [下载 APK](https://github.com/fw867/hypercar/releases/latest) · [使用与开发文档](docs/README.md) · [验证范围](docs/VALIDATION.md) · [反馈问题](https://github.com/fw867/hypercar/issues)
 
@@ -42,7 +42,7 @@
 ## 手机要求与画面来源
 
 - **Android 12 及以上、arm64-v8a** 手机。
-- 连接无线 CarPlay 车机时，车机需支持无线 Apple CarPlay，手机蓝牙与 Wi-Fi 保持开启。使用雅迪仪表时，手机需连接仪表网络，导航来源需选 CarWith 或 CarLife+。
+- 车机支持无线 Apple CarPlay，手机蓝牙与 Wi-Fi 保持开启。
 - 按首页引导完成必需权限；后台运行、静默入网及系统音频采集能力受 ROM 和应用限制。
 
 | 画面来源 | 必需条件 | 画面与设置 |
