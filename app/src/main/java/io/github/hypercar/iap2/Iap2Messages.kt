@@ -206,6 +206,7 @@ object Iap2Messages {
         internal val vehicleStatusStopSupported: Boolean? = null,
         internal val completeIdentification: Boolean = true,
         internal val navigationReceiveIds: Set<Int>? = receiveIds,
+        internal val validMessageLists: Boolean = true,
     ) {
         /** 车机是否声明会发某消息；null = 未提供清单（未知）。 */
         fun declaresSend(messageId: Int): Boolean? = sendIds?.contains(messageId)
@@ -309,6 +310,7 @@ object Iap2Messages {
             vehicleStatusFields = if (validMessageLists) vehicleStatusFields(params) else null,
             vehicleStatusStopSupported = receiveDeclaration?.contains(Iap2MessageIds.STOP_VEHICLE_STATUS_UPDATES),
             completeIdentification = whole,
+            validMessageLists = validMessageLists,
         )
     }
 

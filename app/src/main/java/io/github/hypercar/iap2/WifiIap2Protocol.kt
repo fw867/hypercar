@@ -248,6 +248,7 @@ internal class WifiIap2Protocol(
             refreshDestination(cue, enabled)
             navigation.refreshLaneSource(enabled, cue)
             cancelStaleOutput()
+            vehicle.offerStop()?.let(::queueBulkControl)
             if (!engine.hasBulkControl && engine.queuedControlPackets == 0) {
                 navigation.queuedUpdates(now, enabled, cue).forEach(::queueBulkControl)
                 destination.offer()?.let(::queueBulkControl)
@@ -290,7 +291,9 @@ internal class WifiIap2Protocol(
         val frame = message.frame
         val hud = frame.messageId.takeIf { it in 0x5201..0x5204 } ?: 0
         if (!engine.queueBulkControl(Iap2Csm.encode(frame.messageId, frame.body), true, hud,
-                message.canStart, message.commitStart, message.onWritten)) fail("link refused optional CSM id=0x${frame.messageId.toString(16)}")
+                message.canStart, message.commitStart, message.onWritten, message.onDiscarded)) {
+            fail("link refused optional CSM id=0x${frame.messageId.toString(16)}")
+        }
     }
 
     private fun cancelStaleOutput() {
@@ -444,7 +447,10 @@ internal class WifiIap2Protocol(
     }
 
     private fun subscribeVehicle(peer: Iap2Messages.Identification) {
-        if (!failed) vehicle.subscribe(peer)?.let { send(it.messageId, it.body) }
+        if (failed) return
+        val start = vehicle.subscribe(peer)
+        cancelStaleOutput()
+        if (start != null) send(start.messageId, start.body)
     }
 
     private fun subscribeLocation(peer: Iap2Messages.Identification) {

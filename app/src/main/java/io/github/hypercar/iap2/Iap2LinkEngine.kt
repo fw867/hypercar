@@ -114,7 +114,11 @@ class Iap2LinkEngine(
 
     private enum class MfiControl { OTHER, RESULT }
 
-    private class BulkMessage(val canStart: () -> Boolean, val commitStart: (() -> Boolean)?) {
+    private class BulkMessage(
+        val canStart: () -> Boolean,
+        val commitStart: (() -> Boolean)?,
+        val onDiscarded: (() -> Unit)?,
+    ) {
         var started = false
     }
 
@@ -165,7 +169,7 @@ class Iap2LinkEngine(
                 if (!start.revoked && group.canStart()) {
                     val index = sendBacklog.indexOfFirst { it.bulk?.started == false }
                     sendBacklog.addAll(if (index < 0) sendBacklog.size else index, listOf(packet) + tail)
-                }
+                } else group.onDiscarded?.invoke()
                 if (!zeroRetryAndAckMode) pendingReliableAck = true
                 return
             }
@@ -492,10 +496,11 @@ class Iap2LinkEngine(
         bytes: ByteArray, awaitAck: Boolean, hudMessageId: Int, canStart: () -> Boolean,
         commitStart: (() -> Boolean)? = null,
         onWritten: (() -> Unit)? = null,
+        onDiscarded: (() -> Unit)? = null,
     ): Boolean {
         val limit = (peerSynchronization?.maxLength ?: 0xffff) - HEADER_BYTES - 1
         if (state != State.NORMAL || limit <= 0) return false
-        val group = BulkMessage(canStart, commitStart)
+        val group = BulkMessage(canStart, commitStart, onDiscarded)
         var offset = 0
         while (offset < bytes.size) {
             val end = minOf(bytes.size, offset + limit)
@@ -512,6 +517,7 @@ class Iap2LinkEngine(
         val invalid = sendBacklog.mapNotNull { it.bulk }.toSet()
             .filterTo(mutableSetOf()) { it !== waitingGroup && !it.started && !it.canStart() }
         sendBacklog.removeAll { it.bulk in invalid }
+        invalid.forEach { it.onDiscarded?.invoke() }
         if (start != null && waitingGroup?.canStart() == false) {
             start.revoked = true
             if (!start.cancelRequested) {
@@ -861,6 +867,7 @@ class Iap2LinkEngine(
                     if (!allowBulkStart || outputPacketCount >= newBulkOutputLimit) return
                     if (!bulk.canStart() || (!socketWriteFeedback && bulk.commitStart?.invoke() == false)) {
                         while (sendBacklog.firstOrNull()?.bulk === bulk) sendBacklog.removeFirst()
+                        bulk.onDiscarded?.invoke()
                         continue
                     }
                     if (socketWriteFeedback) {

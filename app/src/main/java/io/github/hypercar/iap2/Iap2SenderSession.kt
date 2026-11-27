@@ -148,6 +148,8 @@ class Iap2SenderSession(
         callState = { callStateSource?.snapshot() ?: Iap2CallSample.Unavailable },
         observeCalls = { callStateSource?.setSubscribed(it) })
     private var phaseName = "IDLE"
+    private val confirmsCredentialIdentification: Boolean
+        get() = profile.id == HeadUnitProfiles.BMW_ID6.id || profile.id == HeadUnitProfiles.BMW_ID9.id
     private var phaseStarted = nanoTime()
     private var tracedReceivedFrames = 0
 
@@ -170,6 +172,9 @@ class Iap2SenderSession(
      * 直到等待超时）。
      */
     private val pendingFrames = ArrayDeque<Iap2Csm.Frame>()
+    private val deferredBmwIdentifications = ArrayDeque<Iap2Csm.Frame>()
+    private val bmwCredentialReprobes = mutableSetOf<Int>()
+    private var bmwCredentialRecovery: Int? = null
 
     /** 是否已经打过「开始回应电源更新」的日志（车机周期发 0xAE00，日志只留第一条）。 */
 
@@ -324,6 +329,14 @@ class Iap2SenderSession(
             enterPhase("MFI_EXCHANGE")
             if (verifyEarly) authenticatePairedAppsV1(null, deadline)
             else authenticateCompatibility(null, receiverAddress.orEmpty(), deadline)
+            if (confirmsCredentialIdentification) {
+                drainReadBmwFrames(::deferBmwIdentification)
+                // These updates arrived before START_IDENTIFICATION. Acknowledge them after
+                // MFi without using any of them as the response to the new request.
+                while (deferredBmwIdentifications.removeFirstOrNull() != null) {
+                    send(Iap2MessageIds.IDENTIFICATION_ACCEPTED)
+                }
+            }
         }
 
         // ---- 识别 ----
@@ -348,6 +361,12 @@ class Iap2SenderSession(
             } else {
                 authenticateCompatibility(initialIdentity, identityText, deadline)
             }
+        }
+        if (confirmsCredentialIdentification) {
+            while (deferredBmwIdentifications.isNotEmpty()) {
+                handleReidentification(deferredBmwIdentifications.removeFirst())
+            }
+            drainReadBmwFrames(::handleReidentification)
         }
         // IDC23 capture: AA05 -> 4300, before greetings, EA, HID or queued subscriptions.
         val earlyAvailability = usesId9MinimalBootstrap() && profile.sendCarPlayAvailability
@@ -438,6 +457,7 @@ class Iap2SenderSession(
 
         // ---- Optional HID registration; CSM receive continuously consumes declared media components. ----
         awaitOptionalHid(optionalDeadline)
+        if (confirmsCredentialIdentification) drainReadBmwFrames(::handleReidentification)
 
         val wifiIdentity = checkNotNull(peerIdentification)
         fun waitsForCarPlayWindow() = peerIdentification?.let {
@@ -499,7 +519,11 @@ class Iap2SenderSession(
                     return endpointOf(null, null)
                 }
                 if (parsed == null) {
-                    log("iap2 0x5703 未在窗口内到达——改走 0x4300/0x4301（新版协议自带 AP 信息）")
+                    if (confirmsCredentialIdentification && !stillExpectsLegacyWifi()) {
+                        log("iap2 新声明切换到 0x4300/0x4301")
+                    } else {
+                        log("iap2 0x5703 未在窗口内到达——改走 0x4300/0x4301（新版协议自带 AP 信息）")
+                    }
                     null
                 } else if (parsed.messageId == Iap2MessageIds.CARPLAY_START_SESSION) {
                     pendingFrames.addFirst(parsed)
@@ -558,11 +582,12 @@ class Iap2SenderSession(
             } else {
                 // 不能断言「该车机不发」：Audi MMI 9310 声明会发、也确实发，只是晚到
                 // 2 分 35 秒（cardeck 2026-10-18 日志）。措辞保留「稍后可能补发」的预期。
+                val latestDeclaresStartSession = peerIdentification?.declaresSend(Iap2MessageIds.CARPLAY_START_SESSION)
                 log(
-                    if (declaresStartSession == true) {
+                    if (latestDeclaresStartSession == true) {
                         "iap2 0x4301 在 ${startSessionWindow / 1_000_000_000}s 窗口内未到" +
                             "（车机声明会发——可能稍后补发，保活期间收到会重新回调端点）"
-                    } else if (declaresStartSession == false) {
+                    } else if (latestDeclaresStartSession == false) {
                         "iap2 0x4301 未到（车机未声明会发）"
                     } else {
                         "iap2 0x4301 在本轮等待窗口内未到（车机发送清单未知）"
@@ -732,6 +757,9 @@ class Iap2SenderSession(
                 Iap2MessageIds.IDENTIFICATION_INFORMATION -> handleReidentification(frame)
                 else -> Unit
             }
+            if (bmwCredentialRecovery != null && pendingFrames.isEmpty() && receivedFrames.isEmpty()) {
+                pokeWhileWaiting()
+            }
             // 未知消息的报文结构只能靠原始体定谳；每个 id 只 dump 一次
             dumpBodyOnce(frame)
             if (frame.messageId == lastLoggedId) {
@@ -776,7 +804,8 @@ class Iap2SenderSession(
      * 只被动等会整场空转。重发是廉价、可解释的探询（声明可收才发，不硬塞）。
      */
     private fun pokeWhileWaiting() {
-        if (hasAccessoryEndpoint()) return
+        val recovery = bmwCredentialRecovery
+        if (recovery == null && hasAccessoryEndpoint()) return
         val now = nanoTime()
         // 前 12 次每 5s（覆盖上车点屏幕的一分钟），之后退到 30s（长等不刷屏）
         val interval = if (pokeCount < 12) POKE_INTERVAL_NANOS else POKE_INTERVAL_SLOW_NANOS
@@ -787,10 +816,12 @@ class Iap2SenderSession(
         // 链路正在断开时 sendControl 会返回 false / 抛 IOException——重探不是关键路径，
         // 吞掉异常交给下一轮 recvFrame 判定链路已死（否则日志会出现莫须有的「会话异常」）
         runCatching {
-            if (peer?.declaresReceive(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION) == true) {
+            if (recovery == Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION ||
+                recovery == null && peer?.declaresReceive(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION) == true) {
                 sendFireAndForget(Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION, ByteArray(0))
             }
-            if (peer?.declaresReceive(Iap2MessageIds.CARPLAY_AVAILABILITY) == true) {
+            if (recovery == Iap2MessageIds.CARPLAY_AVAILABILITY ||
+                recovery == null && peer?.declaresReceive(Iap2MessageIds.CARPLAY_AVAILABILITY) == true) {
                 sendFireAndForget(Iap2MessageIds.CARPLAY_AVAILABILITY, carPlayAvailabilityBody())
             }
             if (profile.openEaSessions && eaProtocols.isNotEmpty() && !eaSessions.allConfirmed && pokeCount <= EA_REOPEN_ATTEMPTS) {
@@ -822,13 +853,17 @@ class Iap2SenderSession(
      * 会打断正在等待的车机窗口，得不偿失）。
      */
     private fun handleReidentification(frame: Iap2Csm.Frame) {
-        val acknowledgeBeforeApply = profile.id == HeadUnitProfiles.BMW_ID85.id
-        if (acknowledgeBeforeApply && (frame.body.isEmpty() ||
-                Iap2Csm.parseParams(frame.body).sumOf { it.value.size + Iap2Csm.PARAM_HEADER_BYTES } != frame.body.size)) {
+        val id85 = profile.id == HeadUnitProfiles.BMW_ID85.id
+        val acknowledgeBeforeApply = id85 || confirmsCredentialIdentification
+        val ident = Iap2Messages.parseIdentification(frame.body)
+        if (id85 && (frame.body.isEmpty() || !ident.completeIdentification)) {
             log("MGU-REENTRY: ignored incomplete identification update bytes=${frame.body.size}")
             return
         }
-        val ident = Iap2Messages.parseIdentification(frame.body)
+        if (confirmsCredentialIdentification && (frame.body.isEmpty() || !ident.validMessageLists)) {
+            log("iap2 ignored malformed 0x1d01 phase=$phaseName bytes=${frame.body.size}")
+            return
+        }
         val previous = peerIdentification
         val returningMgu = usesMguReentry(ident)
         if (acknowledgeBeforeApply) send(Iap2MessageIds.IDENTIFICATION_ACCEPTED)
@@ -844,7 +879,11 @@ class Iap2SenderSession(
         if (!acknowledgeBeforeApply && (returningMgu || authenticatedAppsV1Early)) {
             send(Iap2MessageIds.IDENTIFICATION_ACCEPTED)
         }
-        if (acknowledgeBeforeApply || returningMgu || authenticatedAppsV1Early) {
+        if (confirmsCredentialIdentification) {
+            log("iap2 tx=0x1d02 accepted updated identification phase=$phaseName")
+            return
+        }
+        if (id85 || returningMgu || authenticatedAppsV1Early) {
             log("MGU-REENTRY: accepted updated identification; CarPlay window=${isCarPlayProfileB(ident)}")
         }
         // The initial exchange reads the updated identity before deciding which credentials to request.
@@ -861,6 +900,58 @@ class Iap2SenderSession(
             lastPokeNanos = 0L
             pokeWhileWaiting()
         }
+    }
+
+    private fun applyBufferedBmwIdentifications() {
+        while (receivedFrames.firstOrNull()?.messageId == Iap2MessageIds.IDENTIFICATION_INFORMATION) {
+            handleReidentification(receivedFrames.removeFirst())
+        }
+    }
+
+    /** Process the frames already read with the MFi result, without reading ahead on RFCOMM. */
+    private fun drainReadBmwFrames(onIdentification: (Iap2Csm.Frame) -> Unit) {
+        while (receivedFrames.isNotEmpty()) {
+            ensureCurrentLink()
+            val frame = receivedFrames.removeFirst()
+            when {
+                frame.messageId == Iap2MessageIds.IDENTIFICATION_REJECTED -> throw IOException("车机拒绝 iAP2 设备识别")
+                frame.messageId == Iap2MessageIds.IDENTIFICATION_INFORMATION -> onIdentification(frame)
+                !handleBusinessFrame(frame) -> stashPendingFrame(frame)
+            }
+        }
+    }
+
+    private fun deferBmwIdentification(frame: Iap2Csm.Frame) {
+        if (frame.body.isEmpty() || !Iap2Messages.parseIdentification(frame.body).validMessageLists) return
+        if (deferredBmwIdentifications.size == maxPendingFrames) deferredBmwIdentifications.removeFirst()
+        deferredBmwIdentifications.addLast(frame)
+    }
+
+    private fun reprobeBmwCredentials(previous: Iap2Messages.Identification?, latest: Iap2Messages.Identification) {
+        val previousWifiGen = ReceiverProfile.classifyWifiGen(previous?.sendIds, previous?.receiveIds)
+        val wifiGen = ReceiverProfile.classifyWifiGen(latest.sendIds, latest.receiveIds)
+        when (bmwCredentialRecovery) {
+            Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION ->
+                if (wifiGen != ReceiverProfile.WifiGen.LEGACY) bmwCredentialRecovery = null
+            Iap2MessageIds.CARPLAY_AVAILABILITY ->
+                if (latest.declaresSend(Iap2MessageIds.CARPLAY_START_SESSION) != true) bmwCredentialRecovery = null
+        }
+        if (lastStartSession != null && hasAccessoryEndpoint()) return
+        val request = when {
+            wifiGen == ReceiverProfile.WifiGen.LEGACY && previousWifiGen != wifiGen ->
+                Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION
+            latest.declaresSend(Iap2MessageIds.CARPLAY_START_SESSION) == true &&
+                (previous?.declaresSend(Iap2MessageIds.CARPLAY_START_SESSION) != true ||
+                    wifiGen == ReceiverProfile.WifiGen.NEW && previousWifiGen != wifiGen) &&
+                profile.sendCarPlayAvailability -> Iap2MessageIds.CARPLAY_AVAILABILITY
+            else -> return
+        }
+        // One immediate correction per dialect on this link. Idle recovery keeps its original backoff.
+        bmwCredentialRecovery = request
+        if (!bmwCredentialReprobes.add(request)) return
+        if (request == Iap2MessageIds.CARPLAY_AVAILABILITY) {
+            sendFireAndForget(request, carPlayAvailabilityBody())
+        } else send(request)
     }
 
     private fun applyIdentification(ident: Iap2Messages.Identification) {
@@ -936,6 +1027,10 @@ class Iap2SenderSession(
             Iap2EndpointUpdate(endpoint, { remember() }) {
                 remember()
                 wifi = configuration
+                if (!configuration.ssid.isNullOrEmpty() &&
+                    bmwCredentialRecovery == Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION) {
+                    bmwCredentialRecovery = null
+                }
                 if (!sameHotspot) lastStartSession = null
             }
         }
@@ -969,6 +1064,12 @@ class Iap2SenderSession(
                 remember()
                 wifi = resolved.credential
                 lastStartSession = resolved.start
+                // A fresh session report with usable transport data satisfies the re-probe.
+                val hasHotspot = !parsed.wirelessAp?.ssid.isNullOrEmpty()
+                if (hasHotspot || bmwCredentialRecovery == Iap2MessageIds.CARPLAY_AVAILABILITY &&
+                    (parsed.ipAddresses.isNotEmpty() || parsed.airPlayPort > 0 && !wifi?.ssid.isNullOrEmpty())) {
+                    bmwCredentialRecovery = null
+                }
             }
         }
         val endpoint = endpointOf(lastStartSession, wifi)
@@ -1391,6 +1492,10 @@ class Iap2SenderSession(
             offset = end
         }
         if (messageId == Iap2MessageIds.MFI_AUTHENTICATION_SUCCEEDED) return // RFCOMM reports each fragment's actual write.
+        if (confirmsCredentialIdentification && (messageId == Iap2MessageIds.REQUEST_ACCESSORY_WIFI_CONFIGURATION ||
+                messageId == Iap2MessageIds.CARPLAY_AVAILABILITY)) {
+            lastPokeNanos = nanoTime()
+        }
         log(
             "iap2 tx=0x${messageId.toString(16).padStart(4, '0')}" +
                 if (awaitAck) "" else "（发后不管）",
@@ -1429,6 +1534,11 @@ class Iap2SenderSession(
         val wifiUpdateId = Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION.takeIf {
             Iap2MessageIds.CARPLAY_START_SESSION in messageIds && it !in messageIds
         }
+        val waitingForBmwCredentials = confirmsCredentialIdentification &&
+            (phaseName == "WIFI_CREDENTIALS" || phaseName == "CARPLAY_START_SESSION")
+        var updatedIdentity = false
+        fun wifiSatisfiesUpdatedIdentity() = updatedIdentity && bmwCredentialRecovery == null && !wifi?.ssid.isNullOrEmpty() &&
+            peerIdentification?.declaresSend(Iap2MessageIds.CARPLAY_START_SESSION) == false
         while (true) {
             val pending = pendingFrames.firstOrNull { it.messageId in messageIds || it.messageId == wifiUpdateId } ?: break
             pendingFrames.remove(pending)
@@ -1450,12 +1560,28 @@ class Iap2SenderSession(
                 ensureActive("等待控制消息")
                 continue
             }
+            if (waitingForBmwCredentials && frame.messageId == Iap2MessageIds.IDENTIFICATION_INFORMATION) {
+                val previous = peerIdentification
+                handleReidentification(frame)
+                applyBufferedBmwIdentifications()
+                val latest = checkNotNull(peerIdentification)
+                if (latest === previous) continue
+                updatedIdentity = true
+                val wifiGen = ReceiverProfile.classifyWifiGen(latest.sendIds, latest.receiveIds)
+                if (phaseName == "WIFI_CREDENTIALS" && wifiGen == ReceiverProfile.WifiGen.NEW) return null
+                if (phaseName == "CARPLAY_START_SESSION") {
+                    reprobeBmwCredentials(previous, latest)
+                    if (wifiSatisfiesUpdatedIdentity()) return null
+                }
+                continue
+            }
             if (frame.messageId in messageIds) {
                 log("MATCH phase=$phaseName id=0x${frame.messageId.toString(16)} elapsed=${(nanoTime() - waitStarted) / 1_000_000L}ms")
                 return frame
             }
             if (frame.messageId == wifiUpdateId) {
                 handleLateWifiConfiguration(frame)
+                if (wifiSatisfiesUpdatedIdentity()) return null
                 continue
             }
             log(
@@ -1465,16 +1591,22 @@ class Iap2SenderSession(
             // bring-up 期间的非预期消息（BMW 0x4C00/0xAE00/0xEA03..）也要留原始体：
             // 车机若在识别后立刻把凭据塞进私有消息，日志里只有长度是查不出结构的。
             dumpBodyOnce(frame)
-            pendingFrames += frame
-            if (pendingFrames.size > maxPendingFrames) {
-                pendingFrames.removeFirst()
-                if (!pendingOverflowLogged) {
-                    pendingOverflowLogged = true
-                    log("iap2 非预期帧暂存区超过 $maxPendingFrames 条——丢弃最旧的（车机订阅类消息过多）")
-                }
-            }
+            stashPendingFrame(frame)
         }
     }
+
+    private fun stashPendingFrame(frame: Iap2Csm.Frame) {
+        pendingFrames += frame
+        if (pendingFrames.size <= maxPendingFrames) return
+        pendingFrames.removeFirst()
+        if (!pendingOverflowLogged) {
+            pendingOverflowLogged = true
+            log("iap2 非预期帧暂存区超过 $maxPendingFrames 条——丢弃最旧的（车机订阅类消息过多）")
+        }
+    }
+
+    private fun handleBusinessFrame(frame: Iap2Csm.Frame) =
+        media.handle(frame) || nowPlaying.handle(frame) || subscriptions.handle(frame) || navigation.handle(frame)
 
     /**
      * 通用取帧（MFi 挑战 / 保活泵）：优先消费暂存的非预期帧
@@ -1485,7 +1617,7 @@ class Iap2SenderSession(
         while (pendingFrames.isNotEmpty()) {
             val frame = pendingFrames.removeFirst()
             if (frame.messageId == Iap2MessageIds.IDENTIFICATION_REJECTED) throw IOException("车机拒绝 iAP2 设备识别")
-            if (media.handle(frame) || nowPlaying.handle(frame) || subscriptions.handle(frame) || navigation.handle(frame)) continue
+            if (handleBusinessFrame(frame)) continue
             return frame
         }
         return recvNewFrame(timeoutMillis)
@@ -1501,9 +1633,26 @@ class Iap2SenderSession(
             if (receivedFrames.isNotEmpty()) {
                 val frame = receivedFrames.removeFirst()
                 if (frame.messageId == Iap2MessageIds.IDENTIFICATION_REJECTED) throw IOException("车机拒绝 iAP2 设备识别")
+                if (frame.messageId == Iap2MessageIds.IDENTIFICATION_INFORMATION &&
+                    confirmsCredentialIdentification && phaseName == "MFI_EXCHANGE") {
+                    deferBmwIdentification(frame)
+                    continue
+                }
                 if (frame.messageId == Iap2MessageIds.IDENTIFICATION_INFORMATION && peerIdentification != null) {
                     if (profile.id == HeadUnitProfiles.BMW_ID85.id) {
                         handleReidentification(frame)
+                        continue
+                    }
+                    if (confirmsCredentialIdentification) {
+                        when (phaseName) {
+                            "WIFI_CREDENTIALS", "CARPLAY_START_SESSION" -> return frame
+                        }
+                        val previous = peerIdentification
+                        handleReidentification(frame)
+                        applyBufferedBmwIdentifications()
+                        if (phaseName == "MAINTAIN_LINK") {
+                            reprobeBmwCredentials(previous, checkNotNull(peerIdentification))
+                        }
                         continue
                     }
                     // Late identity can be queued by a Wi-Fi/credential wait. Its capability
@@ -1515,7 +1664,7 @@ class Iap2SenderSession(
                 }
                 // Consume in wire order: Identification must configure the component before
                 // the following StartHID in the SAME read is registered.
-                if (media.handle(frame) || nowPlaying.handle(frame) || subscriptions.handle(frame) || navigation.handle(frame)) continue
+                if (handleBusinessFrame(frame)) continue
                 return frame
             }
             val remaining = (deadline - nanoTime()) / 1_000_000L
@@ -1549,6 +1698,9 @@ class Iap2SenderSession(
         parser = Iap2Csm.Parser()
         receivedFrames.clear()
         pendingFrames.clear()
+        deferredBmwIdentifications.clear()
+        bmwCredentialReprobes.clear()
+        bmwCredentialRecovery = null
         pendingOverflowLogged = false
         peerIdentification = null
         authenticatedAppsV1Early = false

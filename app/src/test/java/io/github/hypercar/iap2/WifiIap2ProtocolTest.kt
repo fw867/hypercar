@@ -679,6 +679,111 @@ class WifiIap2ProtocolTest {
         assertEquals(listOf(0x1d02), car.message(0x1d01).map { it.messageId })
     }
 
+    @Test fun vehicleStopWaitsForSupportAndIsSentOnlyOnce() {
+        val car = Car()
+        val withdrawn = Iap2Csm.param(7, byteArrayOf())
+        val canStop = Iap2Csm.u16(7, 0xa102)
+        car.ready(vehicleMessages + vehicleComponent(3))
+        car.message(0xa101, Iap2Csm.u16(3, 520))
+
+        assertEquals(listOf(0x1d02), car.message(0x1d01, withdrawn).map { it.messageId })
+        assertEquals(Iap2VehicleStatus(), car.vehicleUpdates.last())
+        car.message(0xa101, Iap2Csm.u16(3, 521))
+        assertEquals(Iap2VehicleStatus(), car.vehicleUpdates.last())
+        assertEquals(listOf(0x1d02), car.message(0x1d01, canStop + withdrawn).map { it.messageId })
+        assertEquals(listOf(0x1d02, 0xa102), car.message(0x1d01, canStop).map { it.messageId })
+        assertEquals(listOf(0x1d02), car.message(0x1d01, canStop).map { it.messageId })
+    }
+
+    @Test fun pendingVehicleStopDoesNotSurviveANewSubscriptionOrLink() {
+        val car = Car()
+        val identity = vehicleMessages + vehicleComponent(3)
+        val withdrawn = Iap2Csm.param(7, byteArrayOf())
+        val canStop = Iap2Csm.u16(7, 0xa102)
+        car.ready(identity)
+        car.message(0x1d01, withdrawn)
+        assertEquals(listOf(0x1d02, 0xa100), car.message(0x1d01, identity).map { it.messageId })
+        assertEquals(listOf(0x1d02), car.message(0x1d01, Iap2Csm.u16(6, 0xa101) +
+            Iap2Csm.param(7, byteArrayOf(0xa1.toByte(), 0, 0xa1.toByte(), 2)) +
+            vehicleComponent(3)).map { it.messageId })
+        car.message(0x1d01, withdrawn)
+        car.ready(canStop)
+        assertTrue(car.authenticationOutput.none { it.messageId == 0xa102 })
+    }
+
+    @Test fun vehicleStopUsesTheLastDeclarationInAnIngressBatch() {
+        val car = Car()
+        val withdrawn = Iap2Csm.param(7, byteArrayOf())
+        val canStop = Iap2Csm.u16(7, 0xa102)
+        car.ready(vehicleMessages + vehicleComponent(3))
+        car.message(0x1d01, withdrawn)
+        val output = car.feed(packet(0x40, ++car.sequence, car.ack, car.controlSession,
+            Iap2Csm.encode(0x1d01, canStop) + Iap2Csm.encode(0x1d01, withdrawn)))
+        assertEquals(listOf(0x1d02, 0x1d02), messages(output).map { it.messageId })
+        assertEquals(listOf(0x1d02, 0xa102), car.message(0x1d01, canStop).map { it.messageId })
+    }
+
+    @Test fun aMalformedVehicleComponentCannotMaskAValidStopCapabilityWithdrawal() {
+        val car = Car()
+        val withdrawn = Iap2Csm.param(7, byteArrayOf())
+        val canStop = Iap2Csm.u16(7, 0xa102)
+        val invalidComponent = Iap2Csm.group(21, Iap2Csm.u8(3, 1))
+        car.ready(vehicleMessages + vehicleComponent(3))
+        car.message(0xa101, Iap2Csm.u16(3, 520))
+        assertEquals(listOf(0x1d02), car.message(0x1d01, withdrawn + invalidComponent).map { it.messageId })
+        assertEquals(520, car.vehicleUpdates.last().rangeKm)
+        car.message(0x1d01, withdrawn)
+        val output = car.feed(packet(0x40, ++car.sequence, car.ack, car.controlSession,
+            Iap2Csm.encode(0x1d01, canStop) + Iap2Csm.encode(0x1d01, withdrawn + invalidComponent)))
+        assertEquals(listOf(0x1d02, 0x1d02), messages(output).map { it.messageId })
+        assertEquals(listOf(0x1d02, 0xa102), car.message(0x1d01, canStop).map { it.messageId })
+        assertEquals(listOf(0x1d02), car.message(0x1d01, canStop).map { it.messageId })
+    }
+
+    @Test fun vehicleStopWaitsForTheRevokedWriteBeforeOfferingAgain() {
+        for (wroteBeforeRevocation in listOf(false, true)) {
+            val car = Car(managedWrites = true)
+            val withdrawn = Iap2Csm.param(7, byteArrayOf())
+            val canStop = Iap2Csm.u16(7, 0xa102)
+            car.ready(vehicleMessages + vehicleComponent(3))
+            car.message(0x1d01, withdrawn)
+            assertEquals(listOf(0x1d02, 0xa102), car.message(0x1d01, canStop).map { it.messageId })
+            val first = car.protocol.takeSocketWrites().single { it.cancellable }
+            assertTrue(car.message(0x1d01, withdrawn).none { it.messageId == 0xa102 })
+            assertEquals(listOf(car.protocol.outputGeneration to first.ticket), car.cancelledWrites)
+            assertTrue(car.message(0x1d01, canStop).none { it.messageId == 0xa102 })
+
+            car.protocol.socketWriteFinished(first.ticket, car.time.takeIf { wroteBeforeRevocation })
+            val output = messages(car.feed(packet(0x40, car.sequence, car.ack)))
+            assertEquals(if (wroteBeforeRevocation) 0 else 1, output.count { it.messageId == 0xa102 })
+            if (!wroteBeforeRevocation) {
+                val retry = car.protocol.takeSocketWrites().single { it.cancellable }
+                assertTrue(retry.ticket > first.ticket)
+                car.protocol.socketWriteFinished(retry.ticket, car.time)
+            }
+            assertTrue(car.message(0x1d01, canStop).none { it.messageId == 0xa102 })
+        }
+    }
+
+    @Test fun aRetiredVehicleStopCannotWriteOrCompleteOnTheNewLink() {
+        val car = Car(managedWrites = true)
+        val canStop = Iap2Csm.u16(7, 0xa102)
+        val withdrawn = Iap2Csm.param(7, byteArrayOf())
+        val identity = vehicleMessages + vehicleComponent(3)
+        car.ready(identity)
+        car.message(0x1d01, withdrawn)
+        assertEquals(listOf(0x1d02, 0xa102), car.message(0x1d01, canStop).map { it.messageId })
+        val old = car.protocol.takeSocketWrites().single { it.cancellable }
+
+        car.ready(identity)
+        assertTrue(car.authenticationOutput.none { it.messageId == 0xa102 })
+        car.message(0x1d01, withdrawn)
+        car.protocol.socketWriteFinished(old.ticket, car.time)
+        assertEquals(listOf(0x1d02, 0xa102), car.message(0x1d01, canStop).map { it.messageId })
+        val current = car.protocol.takeSocketWrites().single { it.cancellable }
+        assertTrue(current.ticket > old.ticket)
+    }
+
     @Test fun vehicleSubscriptionNeedsBothMessageDirectionsAndSupportedComponentFlags() {
         for (identity in listOf(byteArrayOf(), vehicleMessages, vehicleComponent(3),
             Iap2Csm.u16(6, 0xa101) + vehicleComponent(3), Iap2Csm.u16(7, 0xa100) + vehicleComponent(3),

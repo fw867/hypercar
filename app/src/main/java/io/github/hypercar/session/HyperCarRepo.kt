@@ -215,6 +215,9 @@ object HyperCarRepo {
                     override fun onState(state: String, detail: String) =
                         rustListener.onEngineState(state, detail, callbackOwner, engineLosses, sockets.network)
 
+                    override fun onIap2Ingress(id: Long, ticket: Long, bytes: ByteArray, writtenSynAck: Long): Boolean =
+                        io.github.hypercar.iap2.WifiIap2Bridge.receive(id, ticket, bytes, writtenSynAck)
+
                     override fun onDisplaySize(width: Int, height: Int, maxFps: Int) = recordDisplaySize(width, height, maxFps, displayKey)
 
                     override fun onLog(line: String) {

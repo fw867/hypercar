@@ -6,4 +6,5 @@ internal class Iap2QueuedControl(
     val canStart: () -> Boolean,
     val commitStart: (() -> Boolean)? = null,
     val onWritten: (() -> Unit)? = null,
+    val onDiscarded: (() -> Unit)? = null,
 )
