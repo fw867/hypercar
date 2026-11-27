@@ -13,6 +13,7 @@ import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.net.ConnectivityManager
 import android.net.InetAddresses
+import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.IBinder
 import android.os.PowerManager
@@ -36,8 +37,13 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import org.json.JSONObject
 import java.io.IOException
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -98,8 +104,13 @@ class YadeaProjectionService : Service() {
         }
         if (session != null || intent == null) return START_NOT_STICKY
         val host = intent.getStringExtra(EXTRA_HOST)
+        val peer = intent.getStringExtra(EXTRA_PEER_ADDRESS)?.let { address ->
+            YadeaP2pPeer(intent.getStringExtra(EXTRA_PEER_NAME).orEmpty(), address)
+        }
         val source = YadeaSource.entries.firstOrNull { it.name == intent.getStringExtra(EXTRA_SOURCE) }
-        if (host == null || source == null) {
+        val scanner = pendingP2p.getAndSet(null)
+        if ((host == null && peer == null) || source == null) {
+            scanner?.close()
             stopSelf()
             return START_NOT_STICKY
         }
@@ -107,11 +118,12 @@ class YadeaProjectionService : Service() {
         try {
             startForeground(NOTIFICATION_ID, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
         } catch (error: RuntimeException) {
+            scanner?.close()
             state.value = failureState("无法启动雅迪前台服务：${error.localizedMessage}")
             stopSelf()
             return START_NOT_STICKY
         }
-        val next = Session(host, source, route)
+        val next = Session(host, peer, scanner, source, route)
         session = next
         current.set(next)
         if (state.value.link == LinkState.Stopping) next.requestStop()
@@ -160,7 +172,9 @@ class YadeaProjectionService : Service() {
     }
 
     private inner class Session(
-        private val host: String,
+        private val manualHost: String?,
+        private val peer: YadeaP2pPeer?,
+        private val scannedLink: YadeaP2p?,
         private val source: YadeaSource,
         route: Int?,
     ) {
@@ -177,6 +191,7 @@ class YadeaProjectionService : Service() {
         private val launchScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
         @Volatile private var owner = 0L
         @Volatile private var audio: YadeaAudio? = null
+        private val p2pConnectJob = AtomicReference<kotlinx.coroutines.Job?>()
 
         fun update(transform: (YadeaSessionState) -> YadeaSessionState) {
             state.update {
@@ -189,6 +204,7 @@ class YadeaProjectionService : Service() {
         fun requestStop(immediate: Boolean = false) {
             stopping.set(true)
             update { it.copy(link = LinkState.Stopping, awaitingSystemCarLife = false) }
+            p2pConnectJob.get()?.cancel()
             if (immediate || !connected.get()) transport.close()
         }
 
@@ -212,6 +228,7 @@ class YadeaProjectionService : Service() {
         suspend fun run(): String? {
             var video: YadeaVideo? = null
             var wakeLock: PowerManager.WakeLock? = null
+            val p2p = scannedLink
             var outcome: String? = null
             try {
                 if (stopping.get()) return null
@@ -224,9 +241,33 @@ class YadeaProjectionService : Service() {
                     .apply { setReferenceCounted(false); acquire() }
                 update { it.copy(link = LinkState.Negotiating("等待仪表协商尺寸和帧率…")) }
                 val connectivity = getSystemService(ConnectivityManager::class.java)
-                val network = instrumentNetwork(connectivity, host)
-                    ?: error("找不到到达仪表 $host 的 Wi-Fi 网络，请先连接仪表 Wi-Fi")
-                val display = transport.connect(host, network = network)
+                val host: String
+                val network: Network?
+                val localAddress: Inet4Address?
+                if (peer != null) {
+                    update { it.copy(link = LinkState.Negotiating("正在连接 ${peer.name} 的 Wi-Fi Direct…")) }
+                    val link = p2p ?: error("扫描会话已结束，请重新扫描仪表")
+                    host = coroutineScope {
+                        val connection = async { link.connect(peer) }
+                        p2pConnectJob.set(connection)
+                        if (stopping.get()) connection.cancel()
+                        try {
+                            connection.await()
+                        } finally {
+                            p2pConnectJob.compareAndSet(connection, null)
+                        }
+                    }
+                    network = null
+                    val interfaceName = link.interfaceName ?: error("未获取到 Wi-Fi Direct 接口")
+                    localAddress = awaitP2pAddress(link, interfaceName, host)
+                    update { it.copy(link = LinkState.Negotiating("已连接 Wi-Fi Direct，正在协商仪表画面…")) }
+                } else {
+                    host = checkNotNull(manualHost)
+                    localAddress = null
+                    network = instrumentNetwork(connectivity, host)
+                        ?: error("找不到到达仪表 $host 的 Wi-Fi 网络，请先连接仪表 Wi-Fi")
+                }
+                val display = transport.connect(host, network = network, localAddress = localAddress)
                 connected.set(true)
                 if (stopping.get()) return outcome
                 // HyperCar's source canvas limit is independent of the instrument JPEG dimensions.
@@ -329,7 +370,9 @@ class YadeaProjectionService : Service() {
                     transport.checkConnection()
                     val nowNs = SystemClock.elapsedRealtimeNanos()
                     if (nowNs >= nextNetworkCheck) {
-                        check(connectivity.getNetworkCapabilities(network) != null) { "仪表网络已断开" }
+                        val networkConnected = if (network != null) connectivity.getNetworkCapabilities(network) != null
+                            else p2p?.connected?.value == true
+                        check(networkConnected) { "仪表网络已断开" }
                         nextNetworkCheck = nowNs + 1_000_000_000L
                     }
                     if (nowNs >= nextFrameAt) {
@@ -363,6 +406,7 @@ class YadeaProjectionService : Service() {
                 runCatching { audio?.close() }
                 runCatching { if (connected.get()) transport.finish() }
                 runCatching { transport.close() }
+                runCatching { p2p?.close() }
                 if (wakeLock?.isHeld == true) wakeLock.release()
                 if (owner > 0) HyperCarRepo.releaseYadeaSource(owner)
             }
@@ -377,6 +421,20 @@ class YadeaProjectionService : Service() {
             }
         }
 
+        private suspend fun awaitP2pAddress(link: YadeaP2p, interfaceName: String, host: String): Inet4Address {
+            val remote = InetAddresses.parseNumericAddress(host)
+            return withTimeoutOrNull(5_000) {
+                var local: Inet4Address? = null
+                while (local == null && link.connected.value && !stopping.get()) {
+                    // The P2P group can be reported before DHCP assigns a local address.
+                    local = NetworkInterface.getByName(interfaceName)?.inetAddresses?.toList()
+                        ?.filterIsInstance<Inet4Address>()
+                        ?.firstOrNull { it != remote && !it.isLoopbackAddress && !it.isLinkLocalAddress }
+                    if (local == null) delay(150)
+                }
+                local
+            } ?: error("未获取到 Wi-Fi Direct 本机地址")
+        }
     }
 
     private fun instrumentNetwork(connectivity: ConnectivityManager, host: String): Network? {
@@ -398,9 +456,12 @@ class YadeaProjectionService : Service() {
         private const val NOTIFICATION_ID = 8888
         private const val EXTRA_HOST = "host"
         private const val EXTRA_SOURCE = "source"
+        private const val EXTRA_PEER_NAME = "peer_name"
+        private const val EXTRA_PEER_ADDRESS = "peer_address"
         private const val EXTRA_ROUTE = "route"
         private const val ACTION_STOP = "io.github.hypercar.yadea.STOP"
         private val current = AtomicReference<YadeaProjectionService.Session?>()
+        private val pendingP2p = AtomicReference<YadeaP2p?>()
         private val state = MutableStateFlow(YadeaSessionState())
         private val preview = MutableStateFlow<Bitmap?>(null)
         private val selectedRoute = MutableStateFlow<Int?>(null)
@@ -414,9 +475,20 @@ class YadeaProjectionService : Service() {
         private fun failureState(reason: String) = YadeaSessionState(link = LinkState.Failed(reason, recoverable = false))
 
         internal fun start(context: Context, source: YadeaSource, host: String) {
-            if (state.value.active) return
-            val ip = host.trim()
-            if (!isValidInstrumentIp(ip)) {
+            begin(context, source, host, null, null)
+        }
+
+        internal fun startP2p(context: Context, source: YadeaSource, peer: YadeaP2pPeer, scanner: YadeaP2p) {
+            begin(context, source, null, peer, scanner)
+        }
+
+        private fun begin(context: Context, source: YadeaSource, host: String?, peer: YadeaP2pPeer?, scanner: YadeaP2p?) {
+            val ip = host?.trim().orEmpty()
+            if (state.value.active) {
+                scanner?.close()
+                return
+            }
+            if (peer == null && !isValidInstrumentIp(ip)) {
                 state.value = failureState("请输入有效的仪表 IP 地址")
                 return
             }
@@ -424,8 +496,12 @@ class YadeaProjectionService : Service() {
             selectedRoute.value = route
             state.value = YadeaSessionState(link = LinkState.Negotiating("正在启动投屏…"))
             val intent = Intent(context, YadeaProjectionService::class.java)
-                .putExtra(EXTRA_HOST, ip).putExtra(EXTRA_SOURCE, source.name).putExtra(EXTRA_ROUTE, route ?: -1)
+                .putExtra(EXTRA_SOURCE, source.name).putExtra(EXTRA_ROUTE, route ?: -1)
+            if (peer == null) intent.putExtra(EXTRA_HOST, ip)
+            else intent.putExtra(EXTRA_PEER_NAME, peer.name).putExtra(EXTRA_PEER_ADDRESS, peer.address)
+            pendingP2p.getAndSet(scanner)?.close()
             runCatching { context.startForegroundService(intent) }.onFailure {
+                pendingP2p.getAndSet(null)?.close()
                 state.value = failureState("无法启动投屏：${it.localizedMessage}")
             }
         }

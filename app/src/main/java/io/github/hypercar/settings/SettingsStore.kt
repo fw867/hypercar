@@ -1,4 +1,4 @@
-package io.github.hypercar.settings
+﻿package io.github.hypercar.settings
 
 import android.content.Context
 import android.content.SharedPreferences
@@ -318,6 +318,10 @@ object SettingsStore {
     var yadeaInstrumentIp: String
         get() = p().getString("yadea_instrument_ip", "").orEmpty()
         set(value) = p().edit().putString("yadea_instrument_ip", value).apply()
+
+    internal var yadeaConnectionMode: YadeaConnectionMode
+        get() = if (p().getString("yadea_connection_mode", null) == "p2p") YadeaConnectionMode.P2p else YadeaConnectionMode.Manual
+        set(value) = p().edit().putString("yadea_connection_mode", value.key).apply()
 
     /** 车机画面来源：自绘车机首页、系统 CarWith 或手机 CarLife+。 */
     var carSource: String

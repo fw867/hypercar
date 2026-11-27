@@ -22,7 +22,13 @@ internal class YadeaTransport : Closeable {
 
     @Volatile private var session: Session? = null
 
-    fun connect(host: String, tcpPort: Int = 8888, udpPort: Int = 8889, network: Network? = null): YadeaDisplay {
+    fun connect(
+        host: String,
+        tcpPort: Int = 8888,
+        udpPort: Int = 8889,
+        network: Network? = null,
+        localAddress: InetAddress? = null,
+    ): YadeaDisplay {
         require(host.isNotBlank()) { "Yadea host is empty" }
         require(tcpPort in 1..65535 && udpPort in 1..65535) { "Invalid Yadea port" }
         val opened = synchronized(lifecycle) {
@@ -40,6 +46,10 @@ internal class YadeaTransport : Closeable {
             val address = if (network == null) InetAddress.getByName(host) else network.getByName(host)
             network?.bindSocket(opened.tcp)
             network?.bindSocket(opened.udp)
+            localAddress?.let {
+                opened.tcp.bind(InetSocketAddress(it, 0))
+                opened.udp.bind(InetSocketAddress(it, 0))
+            }
             opened.tcp.tcpNoDelay = true
             opened.tcp.connect(InetSocketAddress(address, tcpPort), CONNECT_TIMEOUT_MS)
             opened.udp.connect(InetSocketAddress(address, udpPort))

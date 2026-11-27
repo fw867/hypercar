@@ -88,6 +88,7 @@ import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.settings.SettingsRevision
 import io.github.hypercar.settings.SettingsStore
 import io.github.hypercar.settings.ProjectionTarget
+import io.github.hypercar.settings.YadeaConnectionMode
 import io.github.hypercar.shizuku.ShizukuState
 import io.github.hypercar.shizuku.ShizukuTools
 import io.github.hypercar.ui.components.CarBrandBadge
@@ -253,23 +254,43 @@ private fun ProjectionTargetSection(target: ProjectionTarget, connected: Boolean
 @Composable
 private fun InstrumentNetworkSection(connected: Boolean) {
     var address by rememberSaveable { mutableStateOf(SettingsStore.yadeaInstrumentIp) }
+    val mode = remember(SettingsRevision.value) { SettingsStore.yadeaConnectionMode }
     SectionLabel(text = "雅迪仪表网络")
     GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
-        OutlinedTextField(
-            value = address,
-            onValueChange = { input ->
-                address = input
-                SettingsStore.yadeaInstrumentIp = input.trim()
-                SettingsRevision.bump()
-            },
-            enabled = !connected,
-            singleLine = true,
-            label = { Text("仪表 IP 地址") },
-            isError = address.isNotBlank() && !YadeaProjectionService.isValidInstrumentIp(address),
-            supportingText = { Text("手机接入仪表 Wi-Fi 后，从主页启动连接。") },
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
-            modifier = Modifier.fillMaxWidth(),
-        )
+        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+            YadeaConnectionMode.entries.forEachIndexed { index, option ->
+                SegmentedButton(
+                    selected = option == mode,
+                    enabled = !connected,
+                    onClick = {
+                        SettingsStore.yadeaConnectionMode = option
+                        SettingsRevision.bump()
+                    },
+                    shape = SegmentedButtonDefaults.itemShape(index, YadeaConnectionMode.entries.size),
+                    label = { Text(option.label) },
+                )
+            }
+        }
+        if (mode == YadeaConnectionMode.Manual) {
+            OutlinedTextField(
+                value = address,
+                onValueChange = { input ->
+                    address = input
+                    SettingsStore.yadeaInstrumentIp = input.trim()
+                    SettingsRevision.bump()
+                },
+                enabled = !connected,
+                singleLine = true,
+                label = { Text("仪表 IP 地址") },
+                isError = address.isNotBlank() && !YadeaProjectionService.isValidInstrumentIp(address),
+                supportingText = { Text("手机接入仪表 Wi-Fi 后，从主页启动连接。") },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        } else {
+            Text("仪表开启投屏 Wi-Fi Direct 后，从主页启动扫描并选择仪表。", color = TextSecondary,
+                style = MaterialTheme.typography.bodySmall)
+        }
     }
 }
 
