@@ -92,6 +92,9 @@ fun StatusHeroCard(
     profileLabel: String? = null,
     profileId: String = "",
     modifier: Modifier = Modifier,
+    idleHint: String? = null,
+    connectedLabel: String = "控制已连接",
+    manualRetryHint: String = "请检查蓝牙与车机状态后重试",
 ) {
     var nowMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(Unit) {
@@ -121,14 +124,15 @@ fun StatusHeroCard(
                     label = "hero-state",
                     modifier = Modifier.padding(end = if (onToggleAutoConnect != null) 48.dp else 0.dp),
                 ) { state ->
-                    HeroHeadline(link = state, nowMillis = nowMillis, profileId = profileId, profileLabel = profileLabel, autoConnectEnabled = autoConnectEnabled)
+                    HeroHeadline(state, nowMillis, profileId, profileLabel, autoConnectEnabled,
+                        idleHint, connectedLabel, manualRetryHint)
                 }
                 // Replacing the action/attempt cancels a press that began on the old button.
                 // A touch-down on Start must never become Stop when automatic connection wins.
                 key(connectionAttemptId, link.javaClass) {
                     HeroAction(link = link, onStartClick = onStartClick, onStopClick = onStopClick, startEnabled = startEnabled)
                 }
-                if (!startEnabled && link !is LinkState.Connected && link !is LinkState.Negotiating) {
+                if (!startEnabled && (link is LinkState.Idle || link is LinkState.Failed)) {
                     Text(startBlockReason ?: "请先完成使用引导", color = AmberWarning,
                         style = MaterialTheme.typography.bodySmall)
                 }
@@ -161,7 +165,16 @@ fun StatusHeroCard(
 /* ---------- 头部：图形 + 文案 ---------- */
 
 @Composable
-private fun HeroHeadline(link: LinkState, nowMillis: Long, profileId: String, profileLabel: String?, autoConnectEnabled: Boolean = true) {
+private fun HeroHeadline(
+    link: LinkState,
+    nowMillis: Long,
+    profileId: String,
+    profileLabel: String?,
+    autoConnectEnabled: Boolean,
+    idleHint: String?,
+    connectedLabel: String,
+    manualRetryHint: String,
+) {
     val pauseRemaining = io.github.hypercar.session.HyperCarRepo.automaticPauseRemaining
     val paused = autoConnectEnabled && pauseRemaining > 0
     Row(
@@ -182,7 +195,7 @@ private fun HeroHeadline(link: LinkState, nowMillis: Long, profileId: String, pr
                         color = TextPrimary,
                     )
                     Text(
-                        text = if (paused) "约 ${(pauseRemaining + 59_999) / 60_000} 分钟后恢复，仍可手动启动连接"
+                        text = idleHint ?: if (paused) "约 ${(pauseRemaining + 59_999) / 60_000} 分钟后恢复，仍可手动启动连接"
                             else if (autoConnectEnabled) "正在监听车机，也可手动启动连接" else "自动监听已关闭，仍可手动启动连接",
                         style = MaterialTheme.typography.bodyMedium,
                         color = TextSecondary,
@@ -221,7 +234,7 @@ private fun HeroHeadline(link: LinkState, nowMillis: Long, profileId: String, pr
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         Text(
-                            text = "控制已连接",
+                            text = connectedLabel,
                             style = MaterialTheme.typography.bodyMedium,
                             color = MintGreen.copy(alpha = 0.9f),
                         )
@@ -252,7 +265,7 @@ private fun HeroHeadline(link: LinkState, nowMillis: Long, profileId: String, pr
                         overflow = TextOverflow.Ellipsis,
                     )
                     Text(
-                        text = if (link.recoverable) "将自动重试，也可点击下方手动重连" else "请检查蓝牙与车机状态后重试",
+                        text = if (link.recoverable) "将自动重试，也可点击下方手动重连" else manualRetryHint,
                         style = MaterialTheme.typography.labelSmall,
                         color = AmberWarning.copy(alpha = 0.9f),
                         maxLines = 2,

@@ -1,4 +1,4 @@
-﻿package io.github.hypercar.settings
+package io.github.hypercar.settings
 
 import android.content.Context
 import android.content.SharedPreferences
@@ -311,12 +311,15 @@ object SettingsStore {
         get() = p().getInt(KEY_FPS, 60)
         set(v) = p().edit().putInt(KEY_FPS, v.coerceIn(20, 60)).apply()
 
-    /** 车机画面来源（2026-11-03）：
-     *  · "car_ui"   —— 本 App 自绘车机首页（当前默认，地图卡 + 音乐卡 + Dock）
-     *  · "carwith"  —— 走小米 CarWith：拉起它的 CarLife 入口，由 CarWith 自己建显示/编码，
-     *                 我们只做 CarLife 通道 → AirPlay 的转发（需装 CarWith + 小米版 CarLife）
-     *  · "system_carlife" —— 手机 CarLife+（三星/荣耀等），用户开启无线连接后接入本地引擎
-     */
+    internal var projectionTarget: ProjectionTarget
+        get() = if (p().getString("projection_target", null) == "yadea") ProjectionTarget.Yadea else ProjectionTarget.CarPlay
+        set(value) = p().edit().putString("projection_target", value.key).apply()
+
+    var yadeaInstrumentIp: String
+        get() = p().getString("yadea_instrument_ip", "").orEmpty()
+        set(value) = p().edit().putString("yadea_instrument_ip", value).apply()
+
+    /** 车机画面来源：自绘车机首页、系统 CarWith 或手机 CarLife+。 */
     var carSource: String
         get() = p().getString("car_source", "car_ui") ?: "car_ui"
         set(v) = p().edit().putString("car_source", v).apply()

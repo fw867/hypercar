@@ -43,7 +43,6 @@ fun HomeScreen(
     onRefreshSetup: () -> Unit,
     snapshot: SessionSnapshot,
     onStart: () -> Unit,
-    onOpenYadea: () -> Unit,
     onStop: () -> Unit,
     onToggleAutoConnect: (Boolean) -> Unit,
     onRequestDegradedPermission: () -> Unit,
@@ -63,13 +62,6 @@ fun HomeScreen(
     val selection = io.github.hypercar.headunit.HeadUnitProfiles.selection()
     val profileId = (selection.profile ?: selection.lockedProfile)?.id.orEmpty()
     val startBlockReason = (listOfNotNull(selection.blockReason) + startup.manualIssues).joinToString("；")
-    @Composable
-    fun YadeaEntry() {
-        io.github.hypercar.ui.components.CapsuleButton(
-            "雅迪仪表投屏", onClick = onOpenYadea,
-            modifier = Modifier.fillMaxWidth(), filled = false,
-        )
-    }
     // 权限检查卡在两种布局里共用
     @Composable
     fun Checklist() {
@@ -120,7 +112,6 @@ fun HomeScreen(
                         .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
-                    YadeaEntry()
                     Setup()
                     StatusHeroCard(
                         startEnabled = startup.manualReady && selection.profile != null,
@@ -164,7 +155,6 @@ fun HomeScreen(
                     .padding(horizontal = 16.dp, vertical = 16.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
-                YadeaEntry()
                 Setup()
                 // 第一张卡：实时步骤（Negotiating 时显示 link.step）
                 StatusHeroCard(

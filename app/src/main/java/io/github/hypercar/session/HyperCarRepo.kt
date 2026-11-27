@@ -49,6 +49,9 @@ import io.github.hypercar.net.SpecifierPermissions
 import io.github.hypercar.net.WifiJoiner
 import io.github.hypercar.net.BluetoothHotspot
 import io.github.hypercar.settings.SettingsStore
+import io.github.hypercar.settings.ProjectionTarget
+import io.github.hypercar.settings.SettingsRevision
+import io.github.hypercar.yadea.YadeaProjectionService
 import io.github.hypercar.shizuku.ShizukuTools
 import java.net.DatagramSocket
 import java.net.InetSocketAddress
@@ -381,7 +384,8 @@ object HyperCarRepo {
     val automaticPauseRemaining: Long get() = appContext()?.let {
         io.github.hypercar.autowake.AutomaticConnectionResume.remaining(it)
     } ?: 0L
-    val automaticConnectionAllowed: Boolean get() = SettingsStore.autoConnect && automaticPauseRemaining == 0L
+    val automaticConnectionAllowed: Boolean get() = SettingsStore.projectionTarget == ProjectionTarget.CarPlay &&
+        SettingsStore.autoConnect && automaticPauseRemaining == 0L
 
     private fun scheduleAutomaticResume(context: Context) {
         automaticResumeJob?.cancel()
@@ -594,8 +598,28 @@ object HyperCarRepo {
     private val yadeaOwner = java.util.concurrent.atomic.AtomicLong()
 
     internal suspend fun claimYadeaSource(): Long = autoConnectChanges.withLock {
-        if (hasCurrentSession || yadeaOwner.get() != 0L) return@withLock 0L
+        if (SettingsStore.projectionTarget != ProjectionTarget.Yadea ||
+            hasCurrentSession || yadeaOwner.get() != 0L) return@withLock 0L
         connectionDiagnostics.reserveAttemptId().also { yadeaOwner.set(it) }
+    }
+
+    internal fun setProjectionTarget(context: Context, target: ProjectionTarget) {
+        val app = context.applicationContext
+        scope.launch {
+            val changed = autoConnectChanges.withLock {
+                if (hasCurrentSession || _snapshots.value.link is LinkState.Stopping ||
+                    YadeaProjectionService.sessionState.value.active || SettingsStore.projectionTarget == target) {
+                    return@withLock false
+                }
+                SettingsStore.projectionTarget = target
+                if (target == ProjectionTarget.Yadea) stopStandbyListening(standbyReady = false)
+                true
+            }
+            if (changed) {
+                SettingsRevision.bump()
+                startAutomaticListening(app)
+            }
+        }
     }
 
     internal fun releaseYadeaSource(owner: Long) {
@@ -839,6 +863,7 @@ object HyperCarRepo {
         scope.launch {
             autoConnectChanges.lock()
             try {
+                if (SettingsStore.projectionTarget != ProjectionTarget.CarPlay) return@launch
                 if (!AutomaticConnectionPolicy.mayStart(manual, SettingsStore.autoConnect, automaticPauseRemaining > 0)) {
                     scheduleAutomaticResume(context.applicationContext)
                     return@launch
@@ -914,7 +939,7 @@ object HyperCarRepo {
                              suppressManualWindow: Boolean = false, aclEdge: AclDiscoverabilityEdge? = null,
                              aclWake: ConnectionDiagnostics.AclWake? = null) {
         init(context)
-        if (yadeaOwner.get() != 0L) {
+        if (SettingsStore.projectionTarget != ProjectionTarget.CarPlay || yadeaOwner.get() != 0L) {
             log("CONNECT: 雅迪仪表投屏进行中，跳过 CarPlay 连接")
             return
         }
@@ -1209,6 +1234,10 @@ object HyperCarRepo {
         return scope.launch {
             autoConnectChanges.lock()
             try {
+                if (SettingsStore.projectionTarget == ProjectionTarget.Yadea) {
+                    stopStandbyListening(standbyReady = false)
+                    return@launch
+                }
                 scheduleAutomaticResume(context)
                 if (SettingsStore.autoConnect && automaticPauseRemaining > 0) {
                     if (!hasCurrentSession) startIdentityOnly()

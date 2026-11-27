@@ -13,18 +13,19 @@ import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.net.ConnectivityManager
 import android.net.InetAddresses
-import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.IBinder
 import android.os.PowerManager
 import android.os.SystemClock
 import android.view.MotionEvent
 import io.github.hypercar.R
+import io.github.hypercar.core.LinkState
 import io.github.hypercar.core.RustCoreBridge
 import io.github.hypercar.session.CarWithEntryGate
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.session.StartupRequirements
 import io.github.hypercar.settings.SettingsStore
+import io.github.hypercar.ui.MainActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -48,18 +49,26 @@ internal enum class YadeaSource(val title: String) {
         CarWith -> StartupRequirements.carWithInstalled(context)
         SystemCarLife -> StartupRequirements.systemCarLifePackage(context) != null
     }
+
+    companion object {
+        fun fromSetting(source: String): YadeaSource? = when (source) {
+            "carwith" -> CarWith
+            "system_carlife" -> SystemCarLife
+            else -> null
+        }
+    }
 }
 
 internal data class YadeaSessionState(
-    val active: Boolean = false,
-    val status: String = "手机接入仪表网络后，输入仪表 IP。",
+    val link: LinkState = LinkState.Idle,
     val display: YadeaDisplay? = null,
     val requestedSize: Pair<Int, Int>? = null,
     val sourceSize: Pair<Int, Int>? = null,
-    val preview: Bitmap? = null,
     val route: String = "等待音频",
-    val routeId: Int? = null,
-)
+    val awaitingSystemCarLife: Boolean = false,
+) {
+    val active: Boolean get() = link is LinkState.Negotiating || link is LinkState.Connected || link is LinkState.Stopping
+}
 
 internal data class YadeaAudioOutput(val id: Int, val label: String)
 
@@ -87,9 +96,9 @@ class YadeaProjectionService : Service() {
             session?.requestStop() ?: stopSelf()
             return START_NOT_STICKY
         }
-        if (session != null) return START_NOT_STICKY
-        val host = intent?.getStringExtra(EXTRA_HOST)
-        val source = YadeaSource.entries.firstOrNull { it.name == intent?.getStringExtra(EXTRA_SOURCE) }
+        if (session != null || intent == null) return START_NOT_STICKY
+        val host = intent.getStringExtra(EXTRA_HOST)
+        val source = YadeaSource.entries.firstOrNull { it.name == intent.getStringExtra(EXTRA_SOURCE) }
         if (host == null || source == null) {
             stopSelf()
             return START_NOT_STICKY
@@ -98,14 +107,15 @@ class YadeaProjectionService : Service() {
         try {
             startForeground(NOTIFICATION_ID, notification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
         } catch (error: RuntimeException) {
-            state.value = YadeaSessionState(status = "无法启动雅迪前台服务：${error.localizedMessage}")
+            state.value = failureState("无法启动雅迪前台服务：${error.localizedMessage}")
             stopSelf()
             return START_NOT_STICKY
         }
         val next = Session(host, source, route)
         session = next
         current.set(next)
-        next.update { YadeaSessionState(active = true, status = "正在连接雅迪仪表…", routeId = route) }
+        if (state.value.link == LinkState.Stopping) next.requestStop()
+        else next.update { YadeaSessionState(link = LinkState.Negotiating("正在连接雅迪仪表…")) }
         scope.launch {
             val outcome = next.run()
             withContext(Dispatchers.Main.immediate) {
@@ -115,7 +125,8 @@ class YadeaProjectionService : Service() {
                     stopSelf()
                 }
                 if (current.compareAndSet(next, null)) {
-                    state.value = YadeaSessionState(status = outcome)
+                    preview.value = null
+                    state.value = outcome?.let(::failureState) ?: YadeaSessionState()
                 }
             }
         }
@@ -133,7 +144,8 @@ class YadeaProjectionService : Service() {
             NotificationChannel(CHANNEL, "雅迪仪表投屏", NotificationManager.IMPORTANCE_LOW)
         )
         val pendingFlags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        val open = PendingIntent.getActivity(this, NOTIFICATION_ID, Intent(this, YadeaActivity::class.java)
+        val open = PendingIntent.getActivity(this, NOTIFICATION_ID, Intent(this, MainActivity::class.java)
+            .setAction(MainActivity.ACTION_SHOW_PROJECTION)
             .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP), pendingFlags)
         val stop = PendingIntent.getService(this, NOTIFICATION_ID, Intent(this, javaClass)
             .setAction(ACTION_STOP), pendingFlags)
@@ -147,7 +159,11 @@ class YadeaProjectionService : Service() {
             .build()
     }
 
-    private inner class Session(private val host: String, private val source: YadeaSource, route: Int?) {
+    private inner class Session(
+        private val host: String,
+        private val source: YadeaSource,
+        route: Int?,
+    ) {
         private val stopping = AtomicBoolean(false)
         private val connected = AtomicBoolean(false)
         private val jpeg = AtomicReference<ByteArray?>()
@@ -163,19 +179,22 @@ class YadeaProjectionService : Service() {
         @Volatile private var audio: YadeaAudio? = null
 
         fun update(transform: (YadeaSessionState) -> YadeaSessionState) {
-            state.update { if (current.get() === this) transform(it) else it }
+            state.update {
+                if (current.get() !== this) it
+                else if (stopping.get()) it.copy(link = LinkState.Stopping, awaitingSystemCarLife = false)
+                else transform(it)
+            }
         }
 
         fun requestStop(immediate: Boolean = false) {
             stopping.set(true)
-            update { it.copy(status = "正在停止投屏…") }
+            update { it.copy(link = LinkState.Stopping, awaitingSystemCarLife = false) }
             if (immediate || !connected.get()) transport.close()
         }
 
         fun setRoute(deviceId: Int?) {
             requestedRoute.set(deviceId)
             audio?.setPreferredDevice(deviceId)
-            update { it.copy(routeId = deviceId) }
         }
 
         fun touch(action: Int, x: Float, y: Float): Boolean {
@@ -190,11 +209,12 @@ class YadeaProjectionService : Service() {
             return accepted
         }
 
-        suspend fun run(): String {
+        suspend fun run(): String? {
             var video: YadeaVideo? = null
             var wakeLock: PowerManager.WakeLock? = null
-            var outcome = "投屏已停止"
+            var outcome: String? = null
             try {
+                if (stopping.get()) return null
                 if (!source.installed(this@YadeaProjectionService)) error("本机未安装或未启用 ${source.title}")
                 owner = HyperCarRepo.claimYadeaSource()
                 if (owner == 0L) error("请先结束当前 CarPlay 会话")
@@ -202,7 +222,7 @@ class YadeaProjectionService : Service() {
                 wakeLock = getSystemService(PowerManager::class.java)
                     .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "HyperCar:YadeaProjection")
                     .apply { setReferenceCounted(false); acquire() }
-                update { it.copy(status = "等待仪表协商尺寸和帧率…") }
+                update { it.copy(link = LinkState.Negotiating("等待仪表协商尺寸和帧率…")) }
                 val connectivity = getSystemService(ConnectivityManager::class.java)
                 val network = instrumentNetwork(connectivity, host)
                     ?: error("找不到到达仪表 $host 的 Wi-Fi 网络，请先连接仪表 Wi-Fi")
@@ -215,7 +235,8 @@ class YadeaProjectionService : Service() {
                 val sourceHeight = ((display.height * scale).toInt() / 2 * 2).coerceAtLeast(2)
                 val waiting = if (source == YadeaSource.SystemCarLife)
                     "请在手机车联中打开 CarLife+ 无线连接，然后返回此页。" else "正在启动 CarWith…"
-                update { it.copy(status = waiting, display = display, requestedSize = sourceWidth to sourceHeight) }
+                update { it.copy(link = LinkState.Negotiating(waiting), display = display,
+                    requestedSize = sourceWidth to sourceHeight) }
                 HyperCarRepo.log("YADEA: instrument=${display.width}x${display.height}@${display.fps} " +
                     "confirmed=${display.negotiated} format=${display.imageFormat} capabilities=${display.capabilities} " +
                     "request=${sourceWidth}x${sourceHeight} source=${source.title}")
@@ -226,7 +247,7 @@ class YadeaProjectionService : Service() {
                     onPreview = { bitmap ->
                         if (!stopping.get()) {
                             previewReady.set(true)
-                            update { it.copy(preview = bitmap) }
+                            preview.value = bitmap
                         }
                     },
                     onJpeg = { data -> if (!stopping.get()) jpeg.set(data) },
@@ -256,7 +277,7 @@ class YadeaProjectionService : Service() {
                         if (previousSize != null && previousSize != size) {
                             previewReady.set(false)
                             jpeg.set(null)
-                            update { it.copy(preview = null) }
+                            preview.value = null
                         }
                         decoder.setSourceSize(width, height)
                         update { it.copy(sourceSize = size) }
@@ -269,14 +290,18 @@ class YadeaProjectionService : Service() {
                         player.stop(false)
                         player.stop(true)
                         jpeg.set(null)
-                        update { it.copy(status = waiting, preview = null, sourceSize = null) }
+                        preview.value = null
+                        update { it.copy(link = LinkState.Negotiating(waiting), sourceSize = null,
+                            awaitingSystemCarLife = source == YadeaSource.SystemCarLife) }
                     }
                     override fun onVideoDisconnected() {
                         previewReady.set(false)
                         decoder.reset()
                         sourceSize.get()?.let { (width, height) -> decoder.setSourceSize(width, height) }
                         jpeg.set(null)
-                        update { it.copy(status = "导航画面已断开，正在等待恢复…", preview = null) }
+                        preview.value = null
+                        update { it.copy(link = LinkState.Negotiating("导航画面已断开，正在等待恢复…"),
+                            awaitingSystemCarLife = source == YadeaSource.SystemCarLife) }
                         if (!stopping.get()) RustCoreBridge.nativeYadeaRequestKeyFrame(owner)
                     }
                     override fun onAudioFormat(tts: Boolean, rate: Int, channels: Int) = player.configure(tts, rate, channels)
@@ -293,12 +318,12 @@ class YadeaProjectionService : Service() {
                 if (!RustCoreBridge.nativeStartYadeaSource(config.toString(), owner, sourceWidth, sourceHeight,
                         display.fps, display.negotiated, listener)) error("无法启动 ${source.title} 导航来源")
                 if (source == YadeaSource.CarWith) launchCarWith()
+                else update { it.copy(awaitingSystemCarLife = true) }
                 val started = SystemClock.elapsedRealtime()
                 val timeoutMs = if (source == YadeaSource.SystemCarLife) 120_000L else 60_000L
                 val intervalNs = 1_000_000_000L / display.fps
                 var nextFrameAt = 0L
                 var nextNetworkCheck = 0L
-                var streaming = false
                 while (!stopping.get()) {
                     failure.get()?.let { throw it }
                     transport.checkConnection()
@@ -312,8 +337,12 @@ class YadeaProjectionService : Service() {
                             transport.sendJpeg(frame)
                             nextFrameAt = nowNs + intervalNs
                             lastFrame.set(SystemClock.elapsedRealtime())
-                            if (!streaming || state.value.status != "投屏中") update { it.copy(status = "投屏中") }
-                            streaming = true
+                            if (state.value.link is LinkState.Negotiating) update {
+                                if (it.link is LinkState.Negotiating) {
+                                    it.copy(link = LinkState.Connected("雅迪仪表", System.currentTimeMillis()),
+                                        awaitingSystemCarLife = false)
+                                } else it
+                            }
                         }
                     }
                     val since = SystemClock.elapsedRealtime() - lastFrame.get().takeIf { it > 0 }.let { it ?: started }
@@ -347,6 +376,7 @@ class YadeaProjectionService : Service() {
                 HyperCarRepo.log("YADEA: CarWith 启动 $detail")
             }
         }
+
     }
 
     private fun instrumentNetwork(connectivity: ConnectivityManager, host: String): Network? {
@@ -372,25 +402,43 @@ class YadeaProjectionService : Service() {
         private const val ACTION_STOP = "io.github.hypercar.yadea.STOP"
         private val current = AtomicReference<YadeaProjectionService.Session?>()
         private val state = MutableStateFlow(YadeaSessionState())
+        private val preview = MutableStateFlow<Bitmap?>(null)
+        private val selectedRoute = MutableStateFlow<Int?>(null)
         internal val sessionState = state.asStateFlow()
+        internal val previewFrames = preview.asStateFlow()
+        internal val audioRoute = selectedRoute.asStateFlow()
 
-        internal fun start(context: Context, host: String, source: YadeaSource, route: Int?) {
+        internal fun isValidInstrumentIp(host: String): Boolean =
+            runCatching { InetAddresses.parseNumericAddress(host.trim()) }.isSuccess
+
+        private fun failureState(reason: String) = YadeaSessionState(link = LinkState.Failed(reason, recoverable = false))
+
+        internal fun start(context: Context, source: YadeaSource, host: String) {
+            if (state.value.active) return
             val ip = host.trim()
-            if (runCatching { InetAddresses.parseNumericAddress(ip) }.isFailure) {
-                if (!state.value.active) state.value = YadeaSessionState(status = "请输入有效的仪表 IP 地址")
+            if (!isValidInstrumentIp(ip)) {
+                state.value = failureState("请输入有效的仪表 IP 地址")
                 return
             }
-            if (state.value.active) return
-            state.value = YadeaSessionState(active = true, status = "正在启动投屏…", routeId = route)
+            val route = selectedRoute.value?.takeIf { id -> yadeaAudioOutputs(context).any { it.id == id } }
+            selectedRoute.value = route
+            state.value = YadeaSessionState(link = LinkState.Negotiating("正在启动投屏…"))
             val intent = Intent(context, YadeaProjectionService::class.java)
                 .putExtra(EXTRA_HOST, ip).putExtra(EXTRA_SOURCE, source.name).putExtra(EXTRA_ROUTE, route ?: -1)
             runCatching { context.startForegroundService(intent) }.onFailure {
-                state.value = YadeaSessionState(status = "无法启动投屏：${it.localizedMessage}")
+                state.value = failureState("无法启动投屏：${it.localizedMessage}")
             }
         }
 
-        internal fun stop() = current.get()?.requestStop()
-        internal fun setRoute(route: Int?) = current.get()?.setRoute(route)
+        internal fun stop() {
+            current.get()?.let { it.requestStop(); return }
+            state.update { if (it.active) it.copy(link = LinkState.Stopping) else it }
+        }
+
+        internal fun setRoute(route: Int?) {
+            selectedRoute.value = route
+            current.get()?.setRoute(route)
+        }
         internal fun touch(action: Int, x: Float, y: Float): Boolean = runCatching {
             current.get()?.touch(action, x, y) == true
         }.getOrDefault(false)

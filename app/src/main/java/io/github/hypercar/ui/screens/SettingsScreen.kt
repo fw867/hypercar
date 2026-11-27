@@ -60,6 +60,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import android.Manifest
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
+import android.os.Handler
+import android.os.Looper
 import android.bluetooth.BluetoothAdapter
 import android.content.pm.PackageManager
 import androidx.core.content.ContextCompat
@@ -82,6 +87,7 @@ import io.github.hypercar.perm.AppPermissions
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.settings.SettingsRevision
 import io.github.hypercar.settings.SettingsStore
+import io.github.hypercar.settings.ProjectionTarget
 import io.github.hypercar.shizuku.ShizukuState
 import io.github.hypercar.shizuku.ShizukuTools
 import io.github.hypercar.ui.components.CarBrandBadge
@@ -97,6 +103,8 @@ import io.github.hypercar.ui.theme.StrokeGlass
 import io.github.hypercar.ui.theme.SurfaceInset
 import io.github.hypercar.ui.theme.TextPrimary
 import io.github.hypercar.ui.theme.TextSecondary
+import io.github.hypercar.yadea.YadeaProjectionService
+import io.github.hypercar.yadea.yadeaAudioOutputs
 
 /**
  * 分辨率预设（**兜底用**）。实际分辨率以车机 `/info` 回报为准，手机回报实际
@@ -129,6 +137,7 @@ fun SettingsScreen(
     var showProjectionApps by rememberSaveable { mutableStateOf(false) }
     val developerMode = remember(SettingsRevision.value) { SettingsStore.developerModeEnabled }
     val showDeveloperMenu = remember(SettingsRevision.value) { SettingsStore.developerMenuVisible }
+    val target = remember(SettingsRevision.value) { SettingsStore.projectionTarget }
     val page = SettingsPage.entries.firstOrNull { it.name == pageName }
         ?.takeUnless { it == SettingsPage.Developer && !showDeveloperMenu } ?: SettingsPage.Main
     fun open(destination: SettingsPage) { pageName = destination.name }
@@ -158,7 +167,7 @@ fun SettingsScreen(
                         Text("选择要调整的功能", color = TextSecondary,
                             style = MaterialTheme.typography.bodySmall)
                         GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp)) {
-                            SettingsMenuItem("我的车机", "车机型号、目标设备与上车自动连接") { open(SettingsPage.Car) }
+                            SettingsMenuItem("我的车机", "投屏目标 · ${target.label}") { open(SettingsPage.Car) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
                             SettingsMenuItem("画面与声音", "画面来源、音频格式与显示参数") { open(SettingsPage.Display) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
@@ -178,16 +187,25 @@ fun SettingsScreen(
                         }
                     }
                     SettingsPage.Car -> {
-                        AutoConnectSection(startup)
-                        HeadUnitSection(connected = linkConnected, onOpenPicker = { open(SettingsPage.HeadUnitPicker) })
-                        TargetCarSection()
+                        ProjectionTargetSection(target, linkConnected)
+                        if (target == ProjectionTarget.Yadea) {
+                            InstrumentNetworkSection(linkConnected)
+                        } else {
+                            AutoConnectSection(startup)
+                            HeadUnitSection(connected = linkConnected, onOpenPicker = { open(SettingsPage.HeadUnitPicker) })
+                            TargetCarSection()
+                        }
                     }
                     SettingsPage.Display -> {
                         CarSourceSection(startup, onRefreshSetup, connected = linkConnected,
-                            title = "画面来源", compact = true)
-                        AudioSection()
-                        ResolutionSection()
-                        ScreenResourceSection()
+                            title = "画面来源", compact = true, yadea = target == ProjectionTarget.Yadea)
+                        if (target == ProjectionTarget.Yadea) {
+                            YadeaDisplayAndAudioSection()
+                        } else {
+                            AudioSection()
+                            ResolutionSection()
+                            ScreenResourceSection()
+                        }
                     }
                     SettingsPage.Permissions -> {
                         PermissionSettingsSection()
@@ -208,6 +226,105 @@ fun SettingsScreen(
     }
     if (page == SettingsPage.Main && showProjectionApps) {
         ProjectionAppsDialog { showProjectionApps = false }
+    }
+}
+
+@Composable
+private fun ProjectionTargetSection(target: ProjectionTarget, connected: Boolean) {
+    val context = LocalContext.current
+    SectionLabel(text = "投屏目标")
+    GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
+        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+            ProjectionTarget.entries.forEachIndexed { index, option ->
+                SegmentedButton(
+                    selected = option == target,
+                    enabled = !connected,
+                    onClick = { HyperCarRepo.setProjectionTarget(context, option) },
+                    shape = SegmentedButtonDefaults.itemShape(index, ProjectionTarget.entries.size),
+                    label = { Text(option.label) },
+                )
+            }
+        }
+        if (connected) Text("结束当前会话后可切换投屏目标。", color = TextSecondary,
+            style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+@Composable
+private fun InstrumentNetworkSection(connected: Boolean) {
+    var address by rememberSaveable { mutableStateOf(SettingsStore.yadeaInstrumentIp) }
+    SectionLabel(text = "雅迪仪表网络")
+    GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
+        OutlinedTextField(
+            value = address,
+            onValueChange = { input ->
+                address = input
+                SettingsStore.yadeaInstrumentIp = input.trim()
+                SettingsRevision.bump()
+            },
+            enabled = !connected,
+            singleLine = true,
+            label = { Text("仪表 IP 地址") },
+            isError = address.isNotBlank() && !YadeaProjectionService.isValidInstrumentIp(address),
+            supportingText = { Text("手机接入仪表 Wi-Fi 后，从主页启动连接。") },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
+}
+
+@Composable
+private fun YadeaDisplayAndAudioSection() {
+    val context = LocalContext.current
+    val state by YadeaProjectionService.sessionState.collectAsStateWithLifecycle()
+    val routeId by YadeaProjectionService.audioRoute.collectAsStateWithLifecycle()
+    var routes by remember(context) { mutableStateOf(yadeaAudioOutputs(context)) }
+    var menuOpen by remember { mutableStateOf(false) }
+    DisposableEffect(context) {
+        val manager = context.getSystemService(AudioManager::class.java)
+        val callback = object : AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+                routes = yadeaAudioOutputs(context)
+            }
+
+            override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                routes = yadeaAudioOutputs(context)
+            }
+        }
+        manager.registerAudioDeviceCallback(callback, Handler(Looper.getMainLooper()))
+        onDispose { manager.unregisterAudioDeviceCallback(callback) }
+    }
+    SectionLabel(text = "媒体音频")
+    GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
+        Text("在 Android 蓝牙设置中连接车辆并启用媒体音频。", color = TextSecondary,
+            style = MaterialTheme.typography.bodySmall)
+        val routeLabel = when (val id = routeId) {
+            null -> "跟随系统"
+            else -> routes.firstOrNull { it.id == id }?.label ?: "选定设备已断开"
+        }
+        Box {
+            TextButton(onClick = { menuOpen = true }) { Text("音频输出 · $routeLabel") }
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                DropdownMenuItem(text = { Text("跟随系统") }, onClick = {
+                    YadeaProjectionService.setRoute(null)
+                    menuOpen = false
+                })
+                routes.forEach { route ->
+                    DropdownMenuItem(text = { Text(route.label) }, onClick = {
+                        YadeaProjectionService.setRoute(route.id)
+                        menuOpen = false
+                    })
+                }
+            }
+        }
+        if (state.active) Text(state.route, color = TextSecondary, style = MaterialTheme.typography.bodySmall)
+    }
+    SectionLabel(text = "显示参数")
+    GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
+        val display = state.display
+        Text(if (display == null) "连接仪表后自动协商分辨率和帧率。"
+            else "${display.width} × ${display.height} · ${display.fps} fps（${if (display.negotiated) "仪表确认" else "本地回退"}）",
+            color = TextSecondary, style = MaterialTheme.typography.bodySmall)
     }
 }
 
@@ -1577,30 +1694,36 @@ fun CarSourceSection(
     connected: Boolean = false,
     title: String = "2. 选择车机画面来源",
     compact: Boolean = false,
+    yadea: Boolean = false,
 ) {
     val ctx = LocalContext.current
-    val current = startup.source
+    val current = remember(SettingsRevision.value) { SettingsStore.carSource }
     val shizukuState = ShizukuTools.state(ctx)
     fun selectSource(source: String) {
         if (connected) return
-        if (source == "car_ui" && !ShizukuTools.isReady) return
+        if (source == "car_ui" && (yadea || !ShizukuTools.isReady)) return
         if (source == "carwith" && !io.github.hypercar.session.StartupRequirements.carWithInstalled(ctx)) return
         SettingsStore.carSource = source
         io.github.hypercar.settings.SettingsRevision.bump()
         HyperCarRepo.log("STARTUP: 画面来源=$source，重新检查启动条件")
         onRefreshSetup()
     }
-    if (compact) {
+    if (compact || yadea) {
+        val sources = buildList {
+            if (!yadea) add("car_ui" to "自绘界面")
+            add("carwith" to "CarWith")
+            add("system_carlife" to "CarLife+")
+        }
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             SectionLabel(text = title)
             GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
                 SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                    listOf("car_ui" to "自绘界面", "carwith" to "CarWith", "system_carlife" to "CarLife+").forEachIndexed { index, (source, label) ->
+                    sources.forEachIndexed { index, (source, label) ->
                         SegmentedButton(
                             selected = current == source,
                             enabled = !connected && when(source) { "car_ui" -> startup.shizukuReady; "carwith" -> startup.carWithInstalled; else -> true },
                             onClick = { selectSource(source) },
-                            shape = SegmentedButtonDefaults.itemShape(index = index, count = 3),
+                            shape = SegmentedButtonDefaults.itemShape(index = index, count = sources.size),
                             label = { Text(label, style = MaterialTheme.typography.labelMedium) },
                         )
                     }
@@ -1609,6 +1732,8 @@ fun CarSourceSection(
                 Text(when {
                     connected -> "断开连接后可切换画面来源。"
                     current == "system_carlife" -> "在手机车联中打开 CarLife+ 的无线连接并开始连接，保持页面等待，HyperCar 会自动接入。"
+                    yadea && current == "carwith" -> "按仪表协商的参数投屏，连接后可在主页的预览里操作。"
+                    yadea -> "选择 CarWith 或 CarLife+ 作为雅迪仪表的导航来源。"
                     current == "carwith" -> "CarWith 画面按车机屏幕自动换算并按需拉伸，源画面最高 2560×2560，无需手动设置。"
                     !startup.shizukuReady -> "自绘 UI 需先在「权限与后台」完成 Shizuku 授权。"
                     else -> "自绘 UI 使用下方显示设置。"
@@ -1618,7 +1743,7 @@ fun CarSourceSection(
                 }
                 if (current == "system_carlife") {
                     SystemCarLifeSettingsShortcut(!connected)
-                    SystemCarLifeCallAudioSwitch(!connected)
+                    if (!yadea) SystemCarLifeCallAudioSwitch(!connected)
                 }
                 if (!startup.carWithInstalled && current != "system_carlife") {
                     Text("未安装系统 CarWith，此选项不可用。", color = AmberWarning,

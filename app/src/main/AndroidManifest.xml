@@ -155,7 +155,6 @@
             android:name=".yadea.YadeaProjectionService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
-        <activity android:name=".yadea.YadeaActivity" android:exported="false" android:launchMode="singleTop" />
 
         <!-- ACL 广播在隐式广播例外清单内，清单静态注册可拉起被杀进程 -->
         <service
