@@ -9,17 +9,22 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
+private const val MAX_CALL_STATE_LINES = 16
+
 /** AIS R32 table 95-48. No call identifiers or contact data are collected. */
 internal enum class Iap2CallState(val wireValue: Int) {
     DISCONNECTED(0), SENDING(1), RINGING(2), ACTIVE(4), HELD(5), DISCONNECTING(6);
 
     companion object {
         private val preciseState = Regex("(?:Ringing|Foreground|Background) call state: (-?\\d+)")
-
         fun fromTelephonyRegistry(text: String): Iap2CallState? {
+            val lines = text.lineSequence().map(String::trim)
+                .filter { it.startsWith("mCallState=") || it.startsWith("mPreciseCallState=") }
+                .take(MAX_CALL_STATE_LINES + 1).toList()
+            if (lines.size > MAX_CALL_STATE_LINES) return null
             val coarse = mutableListOf<Int>()
             val precise = mutableSetOf<Int>()
-            for (line in text.lineSequence().take(16).map(String::trim)) {
+            for (line in lines) {
                 if (line.startsWith("mCallState=")) line.substringAfter('=').toIntOrNull()?.let(coarse::add)
                 if (line.startsWith("mPreciseCallState=")) {
                     for (match in preciseState.findAll(line)) match.groupValues[1].toIntOrNull()?.let(precise::add)
@@ -71,7 +76,8 @@ internal class Iap2CallStateSource {
                 val state = if (ShizukuTools.isReady) {
                     // Only whitelist state lines in the shell. Numbers, call history and logs stay on device.
                     val result = ShizukuTools.exec(
-                        "timeout 1 dumpsys telephony.registry | grep -E '^[[:space:]]*m(CallState|PreciseCallState)=' | head -n 16",
+                        "set -o pipefail; timeout 1 dumpsys telephony.registry | " +
+                            "grep -E '^[[:space:]]*m(CallState|PreciseCallState)=' | sed -n '1,${MAX_CALL_STATE_LINES + 1}p'",
                         1_500,
                     )
                     result.out.takeIf { result.code == 0 }?.let(Iap2CallState::fromTelephonyRegistry)

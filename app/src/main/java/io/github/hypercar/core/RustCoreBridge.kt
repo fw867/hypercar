@@ -70,7 +70,13 @@ object RustCoreBridge {
         fun onIap2Start(id: Long, deviceId: String, deviceName: String, profileId: String) {
             io.github.hypercar.iap2.WifiIap2Bridge.start(id, deviceId, deviceName, profileId)
         }
-        fun onIap2Bytes(id: Long, bytes: ByteArray) { io.github.hypercar.iap2.WifiIap2Bridge.receive(id, bytes) }
+        fun onIap2Ingress(id: Long, ticket: Long, bytes: ByteArray, writtenSynAck: Long = 0): Boolean =
+            io.github.hypercar.iap2.WifiIap2Bridge.receive(id, ticket, bytes, writtenSynAck)
+        fun acquireHudIap2Write(id: Long, generation: Long, ticket: Long): Long =
+            io.github.hypercar.navigation.HudSourceWrites.acquireIfCurrent {
+                io.github.hypercar.iap2.WifiIap2Bridge.canStartHudWrite(id, generation, ticket)
+            }
+        fun releaseHudIap2Write(stamp: Long) = io.github.hypercar.navigation.HudSourceWrites.release(stamp)
         fun onIap2ScreenSetupAccepted(id: Long) { io.github.hypercar.iap2.WifiIap2Bridge.screenSetupAccepted(id) }
         fun onIap2Stop(id: Long) { io.github.hypercar.iap2.WifiIap2Bridge.stop(id) }
     }
@@ -96,8 +102,20 @@ object RustCoreBridge {
 
     fun clusterMapAvailable(w: Int, h: Int) = ClusterMapEncoder.available(w, h)
     fun clusterMapCapable() = ClusterMapEncoder.capable()
-    fun openClusterMap(w: Int, h: Int, x: Int, y: Int, sw: Int, sh: Int, fps: Int): ClusterMapEncoder? =
-        ClusterMapEncoder.open(w, h, x, y, sw, sh, fps)
+    fun clusterMapObservation() = ClusterMapEncoder.mapObservation()
+    fun acquireClusterMapWrite(round: Long, requireReady: Boolean): Long =
+        io.github.hypercar.navigation.HudSourceWrites.tryAcquireIfCurrent {
+            val status = ClusterMapEncoder.mapStatus()
+            (status ushr 2) == round && (!requireReady || (status and 3L) == 3L)
+        }
+    /** Current route generation, or zero when navigation no longer owns a route. */
+    fun projectedNavigationRouteGeneration(): Long = io.github.hypercar.navigation.NavigationSources.ownedRouteGeneration() ?: 0L
+    fun acquireProjectedNavigationRouteWrite(generation: Long): Long = io.github.hypercar.navigation.HudSourceWrites.tryAcquireIfCurrent {
+        projectedNavigationRouteGeneration() == generation
+    }
+    fun releaseProjectedNavigationRouteWrite(stamp: Long) = io.github.hypercar.navigation.HudSourceWrites.release(stamp)
+    fun openClusterMap(w: Int, h: Int, x: Int, y: Int, sw: Int, sh: Int, fps: Int, round: Long, cardGeneration: Long): ClusterMapEncoder? =
+        ClusterMapEncoder.open(w, h, x, y, sw, sh, fps, round, cardGeneration)
 
     /** JNI factory belongs to the stable bridge, independent of delegated session listeners. */
     fun createCarWithTranscoder(inputHevc: Boolean, outputHevc: Boolean, width: Int, height: Int, targetWidth: Int, targetHeight: Int, fps: Int, csd: ByteArray): CarWithHevcTranscoder =
@@ -152,13 +170,20 @@ object RustCoreBridge {
     external fun nativeStop()
     /** 主动退出：有界等待 TEARDOWN 和旧引擎资源释放，不用于网络丢失或蓝牙交接。 */
     external fun nativeStopGracefully(): Boolean
-    external fun nativeMarkWifiIap2Ready(id: Long, ready: Boolean): Boolean
+    external fun nativeMarkWifiIap2Ready(id: Long, generation: Long, ready: Boolean): Boolean
     external fun nativeSetWifiIap2Phase(id: Long, phase: String)
     external fun nativeCanKeepWifiSession(): Boolean
-    external fun nativeSendIap2(id: Long, bytes: ByteArray, hudMessageId: Int, hudSerial: Long): Boolean
+    external fun nativeSendIap2(id: Long, generation: Long, bytes: ByteArray, hudMessageId: Int,
+        hudSerial: Long, writeTicket: Long, hudFirst: Boolean): Boolean
+    external fun nativeWifiIap2SendCapacity(id: Long, generation: Long): Int
+    external fun nativeCancelWifiIap2Write(id: Long, generation: Long, ticket: Long)
+    external fun nativeTakeWifiIap2Writes(id: Long, generation: Long): LongArray?
+    external fun nativeFinishWifiIap2Ingress(id: Long, ticket: Long)
+    external fun nativeWifiIap2IngressFence(id: Long, through: Long): Long
+    external fun nativeWifiIap2DestinationCurrent(id: Long, generation: Long): Boolean
     external fun nativePublishCarWithGps(id: Long, fields: LongArray?)
     external fun nativeWifiIap2PeerSyn(id: Long)
-    external fun nativeSendWifiIap2Detect(id: Long): Boolean
+    external fun nativeSendWifiIap2Detect(id: Long, generation: Long): Boolean
 
     external fun nativeRequestViewArea(revision: Long, uuid: String, target: Int): Boolean
 

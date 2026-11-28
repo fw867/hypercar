@@ -497,19 +497,34 @@ impl Controller {
 impl Drop for Controller {fn drop(&mut self) {self.stop.requested.store(true,Ordering::Release);self.stop.wake.notify_waiters();for task in &self.tasks {task.abort();}}}
 
 #[derive(Clone)]
-enum Lease {Speech(crate::speech_resource::SpeechLease),Navigation(crate::speech_resource::NavigationLease)}
+pub(crate) struct NavigationAudioGrant {
+    resource: Arc<SpeechResource>,
+    lease: crate::modes::NavigationAudioLease,
+}
+impl NavigationAudioGrant {
+    fn valid(&self) -> bool { self.lease.valid(&self.resource.modes.lock()) }
+
+    pub(crate) fn while_valid<T>(&self, write: impl FnOnce() -> T) -> Option<T> {
+        let modes = self.resource.modes.lock();
+        if !self.lease.valid(&modes) { return None; }
+        self.resource.control.while_session_live(|| self.resource.control.without_pending_native_navigation_take(write)).flatten()
+    }
+}
+
+#[derive(Clone)]
+enum Lease {Speech(crate::speech_resource::SpeechLease),Navigation(NavigationAudioGrant)}
 impl Lease {
     fn valid(&self,session:&Session)->bool {match self {
         Self::Speech(lease)=>session.resource.speech_valid(lease),
-        Self::Navigation(lease)=>session.resource.navigation_valid(lease),
+        Self::Navigation(grant)=>grant.valid(),
     }}
     async fn finish(&self,session:&Session)->bool {match self {
         Self::Speech(lease)=>session.resource.end_speech(lease.clone()).await,
-        Self::Navigation(lease)=>session.resource.end_navigation(lease.clone()).await,
+        Self::Navigation(_)=>true,
     }}
 }
 struct Active { output: AudioOut, lease: Lease, restore_media: bool }
-enum StartError {Refused(String),Failed(String),AwaitNavigationCleanup(String)}
+enum StartError {Refused(String),Failed(String),NavigationFailed(NavigationAudioGrant, String),NavigationDeferred}
 impl Session {
     async fn rebuild_on_unborrow(&self, commands: &mpsc::UnboundedSender<MainCommand>, shutdown: &Arc<EngineShutdown>,
         stop: &Stop, input: &Input) {
@@ -1180,10 +1195,16 @@ impl Cleanup {
     }
 }
 async fn start(kind:Kind,session:&Session,input:&Input,commands:&mpsc::UnboundedSender<MainCommand>,allocated:&[AtomicBool;2],cleanup:&mut Cleanup,transition:Option<tokio::sync::OwnedMutexGuard<MainAudioTransition>>)->Result<Active,StartError> {
-    crate::opus_encode::OpusEncoder::new(kind.rate(),kind.spf()).map_err(|e|StartError::Failed(e.to_string()))?;
     let lease=match kind {
-        Kind::Speech=>Lease::Speech(session.resource.begin_speech(input.user_initiated()).await.ok_or_else(||StartError::Refused("speech resource denied or superseded".into()))?),
-        Kind::Navigation=>Lease::Navigation(session.resource.begin_navigation().await.ok_or_else(||StartError::Refused("navigation app state denied or superseded".into()))?),
+        Kind::Speech=>{
+            crate::opus_encode::OpusEncoder::new(kind.rate(),kind.spf()).map_err(|e|StartError::Failed(e.to_string()))?;
+            Lease::Speech(session.resource.begin_speech(input.user_initiated()).await.ok_or_else(||StartError::Refused("speech resource denied or superseded".into()))?)
+        }
+        Kind::Navigation=>{
+            let lease = session.resource.modes.lock().navigation_audio()
+                .ok_or_else(||StartError::Refused("receiver owns navigation".into()))?;
+            Lease::Navigation(NavigationAudioGrant { resource: session.resource.clone(), lease })
+        }
     };
     cleanup.lease=Some(lease.clone());
     let call_media_paused = transition.as_ref().is_some_and(|state| state.call_media_paused);
@@ -1196,7 +1217,10 @@ async fn start(kind:Kind,session:&Session,input:&Input,commands:&mpsc::Unbounded
     }
     allocated[index(kind)].store(true,Ordering::Release);
     cleanup.close_state=crate::aux_setup::CloseState::default(); // A new stream lifecycle, not a cleanup retry.
-    match crate::aux_setup::open(&session.control,&session.factory,&session.params,&session.shared,&session.info,kind).await {
+    let navigation = match &lease { Lease::Navigation(grant) => Some(grant), _ => None };
+    let check = |write: &mut dyn FnMut() -> std::io::Result<usize>| navigation.and_then(|grant| grant.while_valid(write));
+    let check = navigation.map(|_| &check as crate::rtsp::CheckedWrite<'_>);
+    match crate::aux_setup::open(&session.control,&session.factory,&session.params,&session.shared,&session.info,kind,check).await {
         Ok(mut output)=>{
             if !lease.valid(session) {
                 drop(output);cleanup.close=true;
@@ -1204,6 +1228,7 @@ async fn start(kind:Kind,session:&Session,input:&Input,commands:&mpsc::Unbounded
                 return Err(StartError::Refused("resource changed during SETUP".into()));
             }
             if kind==Kind::Speech {output.set_ownership(session.resource.owned.clone());}
+            if let Some(grant) = navigation { output.set_navigation_grant(grant.clone()); }
             // Ownership of cleanup moves to Active only after the stream is usable.
             cleanup.lease = None;
             let restore_media = std::mem::take(&mut cleanup.restore);
@@ -1214,10 +1239,9 @@ async fn start(kind:Kind,session:&Session,input:&Input,commands:&mpsc::Unbounded
             cleanup.close_state=error.cleanup_state;
             if error.cleanup_confirmed {allocated[index(kind)].store(false,Ordering::Release);}
             let cleaned=cleanup.run(kind,session,commands,allocated,false).await;
-            if cleaned {Err(StartError::Failed(error.to_string()))}
-            else if kind == Kind::Navigation {
-                Err(StartError::AwaitNavigationCleanup(error.to_string()))
-            }
+            if error.withdrawn {Err(StartError::NavigationDeferred)}
+            else if let Some(grant) = navigation {Err(StartError::NavigationFailed(grant.clone(), error.to_string()))}
+            else if cleaned {Err(StartError::Failed(error.to_string()))}
             else {Err(StartError::Refused(format!("cleanup/recovery pending: {error}")))}
         }
     }
@@ -1231,7 +1255,7 @@ async fn finish(kind:Kind,active:Active,session:&Session,commands:&mpsc::Unbound
 async fn run_lane(kind:Kind,session:Arc<Session>,input:Arc<Input>,commands:mpsc::UnboundedSender<MainCommand>,fallback:mpsc::UnboundedSender<crate::engine::SourceEvent>,stop:Arc<Stop>,allocated:Arc<[AtomicBool;2]>) {
     if !crate::aux_setup::supports(&session.info,kind) {return;}
     let mut active:Option<Active>=None;let mut handled=0;
-    let mut fallback_after_cleanup = None;
+    let mut fallback_after_cleanup: Option<(u64, NavigationAudioGrant)> = None;
     let mut cleanup=Cleanup::default();let mut cleanup_attempts=0;
     let mut cleanup_mark=tokio::time::Instant::now();
     let mut recovery_media_epoch=input.media_epoch.load(Ordering::Acquire);
@@ -1240,6 +1264,7 @@ async fn run_lane(kind:Kind,session:Arc<Session>,input:Arc<Input>,commands:mpsc:
     let mut sync=tokio::time::interval(Duration::from_secs(1));sync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_data=tokio::time::Instant::now();let mut last_log=last_data;
     let mut packets=0u64;let mut skipped=0u64;
+    let awaiting_native_take = || kind == Kind::Navigation && session.control.without_pending_native_navigation_take(|| ()).is_none();
     loop {
         let is_tick=tokio::select! {
             _=stop.wait()=>break,
@@ -1248,7 +1273,7 @@ async fn run_lane(kind:Kind,session:Arc<Session>,input:Arc<Input>,commands:mpsc:
             scheduled=tick.tick()=>{
                 if let Some(a)=active.as_mut() {
                     let missed=(tokio::time::Instant::now().saturating_duration_since(scheduled).as_millis()/20) as u64*960;
-                    if missed>0 {
+                    if missed>0 && !awaiting_native_take() {
                         if input.retire_late(kind,handled,missed) {
                             a.output.skip_source_frames(missed);skipped+=missed;
                         }
@@ -1276,19 +1301,32 @@ async fn run_lane(kind:Kind,session:Arc<Session>,input:Arc<Input>,commands:mpsc:
                 }
                 continue;
             }
-            if let Some(epoch) = fallback_after_cleanup.take() {
-                fallback_to_mix(&input, kind, epoch, &fallback);
-                continue;
-            }
         }
+        if let Some((epoch, grant)) = fallback_after_cleanup.as_ref() {
+            let completed = {
+                let modes = grant.resource.modes.lock();
+                grant.resource.control.without_pending_native_navigation_take(|| {
+                    if grant.lease.valid(&modes) { fallback_to_mix(&input, kind, *epoch, &fallback); }
+                    else { input.fail(kind, *epoch, Route::Drop); }
+                }).is_some()
+            };
+            if completed { fallback_after_cleanup = None; }
+            continue;
+        }
+        if awaiting_native_take() { continue; }
         if let Some(current)=active.as_ref() {
             let stale=epoch!=handled || !current.lease.valid(&session);
             let drained=ended && queued==0;
             let idle=queued==0 && last_data.elapsed()>Duration::from_secs(5);
             if stale || drained || idle {
+                let idle_navigation = match &current.lease {
+                    Lease::Navigation(grant) if idle && !stale => Some(grant.clone()),
+                    _ => None,
+                };
                 finish(kind,active.take().unwrap(),&session,&commands,&allocated,&mut cleanup,false).await;
                 if stale && epoch==handled {input.fail(kind,epoch,Route::Drop);}
-                if idle {input.fail(kind,epoch,Route::Mix);}
+                else if let Some(grant) = idle_navigation { fallback_after_cleanup = Some((epoch, grant)); }
+                else if idle && !stale {input.fail(kind,epoch,Route::Mix);}
                 continue;
             }
         }
@@ -1299,7 +1337,7 @@ async fn run_lane(kind:Kind,session:Arc<Session>,input:Arc<Input>,commands:mpsc:
                 let Ok(guard) = stop.main_transition.clone().try_lock_owned() else { continue; };
                 Some(guard)
             } else { None };
-            handled=epoch;
+            let prior_handled = std::mem::replace(&mut handled, epoch);
             match start(kind,&session,&input,&commands,&allocated,&mut cleanup,transition).await {
                 Ok(output)=>{
                     active=Some(output);tick.reset();sync.reset();last_data=tokio::time::Instant::now();
@@ -1307,9 +1345,10 @@ async fn run_lane(kind:Kind,session:Arc<Session>,input:Arc<Input>,commands:mpsc:
                 }
                 Err(error)=>{
                     let (message,route)=match error {
-                        StartError::AwaitNavigationCleanup(e) => {
-                            fallback_after_cleanup = Some(epoch);
-                            crate::emit_log(&format!("AUX-AUDIO: navigation SETUP failed: {e}; waiting for cleanup before mixing"));
+                        StartError::NavigationDeferred => { handled = prior_handled; continue; }
+                        StartError::NavigationFailed(grant, e) => {
+                            fallback_after_cleanup = Some((epoch, grant));
+                            crate::emit_log(&format!("AUX-AUDIO: navigation SETUP failed: {e}"));
                             continue;
                         }
                         StartError::Refused(e)=>{input.fail(kind,epoch,Route::Drop);(e,Route::Drop)}

@@ -302,10 +302,15 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
     private fun Attempt.aclFor(peer: String?): AclEdges? =
         if (peer.isNullOrBlank()) acl.values.singleOrNull() else acl[peer.uppercase()]
 
+    private fun Attempt.onlyConnectedAcl() = acl.entries.singleOrNull { it.value.up != null && !it.value.disconnected }
+
+    @Synchronized internal fun connectedAclPeer(id: Long): String? =
+        history.lastOrNull()?.takeIf { it.id == id && it.ended == null }?.onlyConnectedAcl()?.key
+
     @Synchronized internal fun currentAclWakePeer(id: Long): String? {
         val attempt = history.lastOrNull()?.takeIf { it.id == id && it.ended == null } ?: return null
         val wake = attempt.admittedAclWake ?: return null
-        val connected = attempt.acl.entries.singleOrNull { it.value.up != null && !it.value.disconnected } ?: return null
+        val connected = attempt.onlyConnectedAcl() ?: return null
         return wake.peer.takeIf { connected.key == it && connected.value.up == wake.observedAt }
     }
 

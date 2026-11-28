@@ -1,18 +1,24 @@
 package io.github.hypercar.net
 
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 
-/** Allow Android's network metadata to settle and retain changes arriving during a check. */
+/** Wake on verified readiness, otherwise coalesce metadata changes until the original deadline. */
 internal class WifiReconnectSignals {
     private val pending = Channel<Unit>(Channel.CONFLATED)
 
     fun signal() { pending.trySend(Unit) }
 
-    suspend fun collect(check: suspend () -> Unit) {
+    suspend fun collect(tryReady: () -> Boolean = { false }, check: suspend () -> Unit) {
         for (signal in pending) {
-            delay(750)
-            pending.tryReceive() // Updates before the check are covered by that check.
+            withTimeoutOrNull(750) {
+                var submitted = false
+                while (true) {
+                    if (!submitted) submitted = tryReady()
+                    pending.receive()
+                }
+            }
+            // A queued early wake can lose its network before admission. Keep the settled check.
             check()
         }
     }

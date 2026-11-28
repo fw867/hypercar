@@ -72,7 +72,7 @@ use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::Arc;
 
 use jni::objects::{GlobalRef, JByteArray, JClass, JLongArray, JObject, JShortArray, JString};
-use jni::sys::{jboolean, jint, jlong, JNI_FALSE, JNI_TRUE};
+use jni::sys::{jboolean, jint, jlong, jlongArray, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -156,6 +156,21 @@ static TOKIO_RT: Lazy<Runtime> = Lazy::new(|| {
 static JAVA_VM: RwLock<Option<jni::JavaVM>> = RwLock::new(None);
 static LISTENER: RwLock<Option<GlobalRef>> = RwLock::new(None);
 static TRANSCODER_BRIDGE: RwLock<Option<GlobalRef>> = RwLock::new(None);
+
+fn with_navigation_source_write<T>(acquire: impl FnOnce(&GlobalRef) -> Option<i64>, write: impl FnOnce() -> T) -> Option<T> {
+    struct Permit { bridge: GlobalRef, stamp: i64 }
+    impl Drop for Permit {
+        fn drop(&mut self) {
+            with_env(|env| env.call_method(self.bridge.as_obj(), "releaseProjectedNavigationRouteWrite", "(J)V",
+                &[self.stamp.into()])?.v());
+        }
+    }
+    let bridge = TRANSCODER_BRIDGE.read().clone()?;
+    let stamp = acquire(&bridge)?;
+    if stamp == 0 { return None; }
+    let _permit = Permit { bridge, stamp };
+    Some(write())
+}
 /// 车机 HID 触摸回调（Rust → Kotlin）。
 ///
 /// 与 [LISTENER] 分开持有 GlobalRef：触摸是高频事件（车机滑一下就是几十条），
@@ -325,9 +340,10 @@ pub(crate) fn emit_force_keyframe() {
     });
 }
 
-pub(crate) fn emit_carwith_navigation(token:u64, update:Option<&carlife::navigation::NavigationUpdate>) {
+pub(crate) fn emit_carwith_navigation(token:u64, update:Option<&carlife::navigation::NavigationUpdate>, source_reset:bool) {
     if token==0 {return;}
-    let payload=update.and_then(|n|serde_json::to_string(n).ok()).unwrap_or_else(||"null".into());
+    let payload=if source_reset { r#"{"reset":true}"#.into() }
+        else { update.and_then(|n|serde_json::to_string(n).ok()).unwrap_or_else(||"null".into()) };
     call_listener("onCarWithNavigation", |env,obj| {
         let data=env.new_string(payload)?;
         env.call_method(obj,"onCarWithNavigation","(JLjava/lang/String;)V",&[(token as jlong).into(),(&data).into()]).map(|_|())
@@ -344,17 +360,44 @@ pub(crate) fn emit_iap2_start(id: u64, device: &str, device_name: &str, profile_
     });
 }
 
-pub(crate) fn emit_iap2_bytes(id: u64, bytes: &[u8]) {
-    call_listener("onIap2Bytes", |env, obj| {
+pub(crate) fn emit_iap2_ingress(id: u64, ticket: u64, written_syn_ack: u64, bytes: &[u8]) -> bool {
+    let mut accepted = false;
+    call_listener("onIap2Ingress", |env, obj| {
         let data = env.byte_array_from_slice(bytes)?;
-        env.call_method(obj, "onIap2Bytes", "(J[B)V", &[(id as jlong).into(), (&data).into()]).map(|_| ())
+        accepted = env.call_method(obj, "onIap2Ingress", "(JJ[BJ)Z",
+            &[(id as jlong).into(), (ticket as jlong).into(), (&data).into(), (written_syn_ack as jlong).into()])?.z()?;
+        Ok(())
     });
+    accepted
 }
 
 pub(crate) fn emit_iap2_stop(id: u64) {
     call_listener("onIap2Stop", |env, obj| {
         env.call_method(obj, "onIap2Stop", "(J)V", &[(id as jlong).into()]).map(|_| ())
     });
+}
+
+pub(crate) struct HudIap2WritePermit {
+    listener: GlobalRef,
+    stamp: jlong,
+}
+
+impl Drop for HudIap2WritePermit {
+    fn drop(&mut self) {
+        // Release through the exact listener, even if session ownership changed meanwhile.
+        let _ = with_env(|env| env.call_method(self.listener.as_obj(), "releaseHudIap2Write", "(J)V",
+            &[self.stamp.into()]).map(|_| ()));
+    }
+}
+
+pub(crate) fn acquire_hud_iap2_write(id: u64, generation: u64, ticket: u64) -> Option<HudIap2WritePermit> {
+    let listener = match callback_context::current() {
+        Some(context) => context.listener.clone()?,
+        None => LISTENER.read().clone()?,
+    };
+    let stamp = with_env(|env| env.call_method(listener.as_obj(), "acquireHudIap2Write", "(JJJ)J",
+        &[(id as jlong).into(), (generation as jlong).into(), (ticket as jlong).into()])?.j())?;
+    (stamp != 0).then(|| HudIap2WritePermit { listener, stamp })
 }
 
 pub(crate) fn emit_iap2_screen_setup_accepted(id: u64) {
@@ -372,27 +415,78 @@ pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeWifiIap
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendWifiIap2Detect(
-    _env: JNIEnv, _class: JClass, id: jlong,
+    _env: JNIEnv, _class: JClass, id: jlong, generation: jlong,
 ) -> jboolean {
-    if wifi_iap2::queue_startup_detect(id as u64) { JNI_TRUE } else { JNI_FALSE }
+    if id > 0 && wifi_iap2::queue_startup_detect(id as u64, generation as u64) { JNI_TRUE } else { JNI_FALSE }
 }
 
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendIap2(
-    env: JNIEnv, _class: JClass, id: jlong, bytes: JByteArray, hud_message_id: jint, hud_serial: jlong,
+    env: JNIEnv, _class: JClass, id: jlong, generation: jlong, bytes: JByteArray,
+    hud_message_id: jint, hud_serial: jlong, ticket: jlong, hud_first: jboolean,
 ) -> jboolean {
     if id <= 0 { return JNI_FALSE; }
     match env.convert_byte_array(&bytes) {
-        Ok(data) => if wifi_iap2::send(id as u64, data, hud_message_id, hud_serial) { JNI_TRUE } else { JNI_FALSE },
+        Ok(data) => if wifi_iap2::send_packet(id as u64, generation as u64, data, hud_message_id, hud_serial, ticket, hud_first != JNI_FALSE) { JNI_TRUE } else { JNI_FALSE },
         _ => JNI_FALSE,
     }
 }
 
 #[no_mangle]
-pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeMarkWifiIap2Ready(
-    _env: JNIEnv, _class: JClass, id: jlong, ready: jboolean,
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeCancelWifiIap2Write(
+    _env: JNIEnv, _class: JClass, id: jlong, generation: jlong, ticket: jlong,
+) {
+    if id > 0 && ticket > 0 { wifi_iap2::cancel_pending_start(id as u64, generation as u64, ticket as u64); }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeTakeWifiIap2Writes(
+    env: JNIEnv, _class: JClass, id: jlong, generation: jlong,
+) -> jlongArray {
+    let writes = wifi_iap2::take_write_completions(id as u64, generation as u64);
+    if writes.is_empty() { return std::ptr::null_mut(); }
+    match env.new_long_array(writes.len() as i32) {
+        Ok(result) if env.set_long_array_region(&result, 0, &writes).is_ok() => result.into_raw(),
+        _ => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeFinishWifiIap2Ingress(
+    _env: JNIEnv, _class: JClass, id: jlong, ticket: jlong,
+) {
+    if id > 0 && ticket > 0 { wifi_iap2::finish_ingress(id as u64, ticket as u64); }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeWifiIap2IngressFence(
+    _env: JNIEnv, _class: JClass, id: jlong, through: jlong,
+) -> jlong {
+    wifi_iap2::ingress_fence(id as u64, through as u64) as jlong
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeWifiIap2DestinationCurrent(
+    _env: JNIEnv, _class: JClass, id: jlong, generation: jlong,
 ) -> jboolean {
-    if id > 0 && wifi_iap2::mark_ready(id as u64, ready != JNI_FALSE) { JNI_TRUE } else { JNI_FALSE }
+    if wifi_iap2::destination_current(id as u64, generation as u64) { JNI_TRUE } else { JNI_FALSE }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeWifiIap2SendCapacity(
+    _env: JNIEnv, _class: JClass, id: jlong, generation: jlong,
+) -> jint {
+    if id <= 0 { return -1; }
+    wifi_iap2::send_capacity(id as u64, generation as u64).map_or(-1, |capacity| capacity as jint)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeMarkWifiIap2Ready(
+    _env: JNIEnv, _class: JClass, id: jlong, generation: jlong, ready: jboolean,
+) -> jboolean {
+    if id > 0 && wifi_iap2::mark_ready_generation(id as u64, Some(generation as u64), ready != JNI_FALSE) {
+        JNI_TRUE
+    } else { JNI_FALSE }
 }
 #[no_mangle]
 pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeCanKeepWifiSession(

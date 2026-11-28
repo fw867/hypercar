@@ -12,26 +12,57 @@ data class Iap2VehicleStatus(
     val fuelRangeWarnings: Map<VehicleFuel, Boolean> = emptyMap(),
 )
 
+internal val VEHICLE_STATUS_SELECTORS = setOf(3, 4, 6, 9, 10, 11, 12, 13, 14, 15, 16)
+
 /** The BMW box requests empty flags 3, 4, 6 and 9..16, in that order (xiap2 0x5bfcc..0x5c2bc). */
 internal class Iap2VehicleStatusSession(
     private val onUpdate: (Iap2VehicleStatus) -> Unit,
     private val log: (String) -> Unit,
 ) {
+    private class PendingStop {
+        var offered = false
+        var revoked = false
+    }
+
     private var requested = emptyList<Int>()
     private var status = Iap2VehicleStatus()
+    private var stopSupported = false
+    private var pendingStop: PendingStop? = null
 
-    fun subscribe(peer: Iap2Messages.Identification): ByteArray? {
+    fun subscribe(peer: Iap2Messages.Identification): Iap2Csm.Frame? {
+        stopSupported = peer.vehicleStatusStopSupported ?: stopSupported
+        if (!stopSupported) pendingStop?.revoked = true
+        val declaredFields = peer.vehicleStatusFields ?: return null
         val fields = if (peer.declaresReceive(Iap2MessageIds.START_VEHICLE_STATUS_UPDATES) == true &&
             peer.declaresSend(Iap2MessageIds.VEHICLE_STATUS_UPDATE) == true) {
-            peer.vehicleStatusFields.filter { it == 3 || it == 4 || it == 6 || it in 9..16 }.sorted()
+            declaredFields.sorted()
         } else emptyList()
         if (fields == requested) return null
-        reset()
         requested = fields
-        if (fields.isNotEmpty()) log("VEHICLE A100 requested fields=$fields")
-        return fields.takeIf { it.isNotEmpty() }?.fold(byteArrayOf()) { body, field ->
+        pendingStop = if (fields.isEmpty()) PendingStop() else null
+        if (status != Iap2VehicleStatus()) publish(Iap2VehicleStatus())
+        if (fields.isEmpty()) return null
+        log("VEHICLE A100 requested fields=$fields")
+        val body = fields.fold(byteArrayOf()) { body, field ->
             body + Iap2Csm.param(field, byteArrayOf())
         }
+        return Iap2Csm.Frame(Iap2MessageIds.START_VEHICLE_STATUS_UPDATES, body)
+    }
+
+    fun offerStop(): Iap2QueuedControl? {
+        val stop = pendingStop?.takeIf { stopSupported && !it.offered } ?: return null
+        stop.offered = true
+        stop.revoked = false
+        return Iap2QueuedControl(
+            Iap2Csm.Frame(Iap2MessageIds.STOP_VEHICLE_STATUS_UPDATES, byteArrayOf()),
+            canStart = { pendingStop === stop && stopSupported && !stop.revoked },
+            onWritten = {
+                // A successful write may have preceded the revocation on the socket.
+                if (pendingStop === stop) pendingStop = null
+                log("VEHICLE A102 written after capability withdrawal")
+            },
+            onDiscarded = { stop.offered = false },
+        )
     }
 
     fun receive(body: ByteArray) {
@@ -68,6 +99,8 @@ internal class Iap2VehicleStatusSession(
 
     fun reset() {
         requested = emptyList()
+        stopSupported = false
+        pendingStop = null
         if (status != Iap2VehicleStatus()) publish(Iap2VehicleStatus())
     }
 

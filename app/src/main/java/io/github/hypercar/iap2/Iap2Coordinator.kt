@@ -65,7 +65,10 @@ data class CarPlayEndpoint(
 }
 
 /** A logical control generation on one physical RFCOMM socket. EOF alone leaves accepted reports usable. */
-class Iap2EndpointGeneration internal constructor(private val current: () -> Boolean = { true }) {
+class Iap2EndpointGeneration internal constructor(
+    internal val rfcommRegistration: Long = 0,
+    private val current: () -> Boolean = { true },
+) {
     @Volatile private var retired = false
     internal val isCurrent: Boolean get() = !retired && current()
 
@@ -155,14 +158,15 @@ class Iap2Coordinator(
     val activePeerAddress: String? get() = bluetooth?.activePeerAddress
     val isSessionActive: Boolean get() = bluetooth?.isSessionActive == true
     val isListening: Boolean get() = bluetooth?.isListening == true
+    val rfcommAccepting: Boolean get() = bluetooth?.rfcommAccepting == true
 
     /** 本次启动以来成功建过几轮 iAP2 会话（0 = 车机一次都没连进来）。 */
     val sessionStartCount: Int get() = bluetooth?.sessionStartCount ?: 0
 
     fun onTargetChanged() = bluetooth?.onTargetChanged()
 
-    internal fun retireCafeHandoff(attempt: Long, reason: String, networkCurrent: (() -> Boolean)? = null) {
-        bluetooth?.retireCafeHandoff(attempt, reason, networkCurrent)
+    internal fun retireCafeHandoff(attempt: Long, reason: String, currentInvite: (() -> Boolean)? = null, peer: String? = null) {
+        bluetooth?.retireCafeHandoff(attempt, reason, currentInvite, peer)
     }
 
     /**
@@ -256,7 +260,10 @@ class Iap2Coordinator(
     /** Wi-Fi is healthy. Suppress fresh outgoing dials while the car retires RFCOMM. */
     fun pauseOutboundForWifi() { bluetooth?.setOutboundPausedForWifi(true) }
 
-    fun endCurrentSession() { bluetooth?.dropCurrentSession() }
+    internal fun captureSessionClose(wifiLossAttempt: Long? = null, wifiLossNetwork: Long? = null): RfcommClose? =
+        bluetooth?.captureSessionClose(wifiLossAttempt, wifiLossNetwork)
+
+    internal fun claimWifiSource(source: Iap2EndpointGeneration?, network: Long) { bluetooth?.claimWifiSource(source, network) }
 
     fun captureBluetoothLost(address: String): (() -> Unit)? = bluetooth?.captureBluetoothLost(address)
 

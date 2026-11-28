@@ -465,7 +465,8 @@ private fun DeveloperMenuSection() {
             else "等待 ${buildList {
                 if (readiness.network == null) add("车机 Wi-Fi 绑定")
                 if (readiness.srv == null) add("观察到当前 SRV")
-                if (readiness.discoverable != true) add("蓝牙可发现")
+                if (readiness.connectable != true) add("蓝牙可连接")
+                if (!readiness.rfcommAccepting) add("iAP2 入站监听开放")
             }.joinToString("、")}"
             Text(message, color = if (readiness?.ready == true) MintGreen else TextSecondary,
                 style = MaterialTheme.typography.bodyMedium)

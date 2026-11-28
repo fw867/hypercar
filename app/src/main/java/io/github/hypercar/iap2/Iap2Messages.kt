@@ -66,6 +66,7 @@ object Iap2MessageIds {
     const val START_ROUTE_GUIDANCE_UPDATES = 0x5200
     const val START_VEHICLE_STATUS_UPDATES = 0xA100
     const val VEHICLE_STATUS_UPDATE = 0xA101
+    const val STOP_VEHICLE_STATUS_UPDATES = 0xA102
     const val START_POWER_UPDATES = 0xAE00
 
     /** 0xAE01 电源状态上报（车机发 0xAE00 后手机回）。 */
@@ -126,6 +127,7 @@ object Iap2MessageIds {
             START_ROUTE_GUIDANCE_UPDATES -> "StartRouteGuidanceUpdates"
             START_VEHICLE_STATUS_UPDATES -> "StartVehicleStatusUpdates"
             VEHICLE_STATUS_UPDATE -> "VehicleStatusUpdate"
+            STOP_VEHICLE_STATUS_UPDATES -> "StopVehicleStatusUpdates"
             START_POWER_UPDATES -> "StartPowerUpdates"
             START_COMMUNICATIONS_UPDATES -> "StartCommunicationsUpdates"
             START_CALL_STATE_UPDATES -> "StartCallStateUpdates"
@@ -196,10 +198,15 @@ object Iap2Messages {
          */
         val hasWirelessCarPlayComponent: Boolean,
         val hidComponents: List<HidComponent> = emptyList(),
-        val vehicleStatusFields: Set<Int> = emptySet(),
+        /** Null means the vehicle-status declaration was malformed. */
+        val vehicleStatusFields: Set<Int>? = emptySet(),
         val acceptsRouteGuidance: Boolean? = null,
         val locationNmeaTypes: Set<Int> = emptySet(),
         val currentRoadLimits: Map<Int, Int> = emptyMap(),
+        internal val vehicleStatusStopSupported: Boolean? = null,
+        internal val completeIdentification: Boolean = true,
+        internal val navigationReceiveIds: Set<Int>? = receiveIds,
+        internal val validMessageLists: Boolean = true,
     ) {
         /** 车机是否声明会发某消息；null = 未提供清单（未知）。 */
         fun declaresSend(messageId: Int): Boolean? = sendIds?.contains(messageId)
@@ -257,12 +264,21 @@ object Iap2Messages {
         val whole = params.sumOf { it.value.size + Iap2Csm.PARAM_HEADER_BYTES } == body.size
         fun declaredIds(id: Int) = params.singleOrNull { it.id == id }
             ?.takeIf { whole && it.value.size % 2 == 0 }?.asU16List()?.toSet()
+        val sendDeclaration = declaredIds(IDENT_SEND_IDS)
         val receiveDeclaration = declaredIds(IDENT_RECEIVE_IDS)
-        val routeGuidance = receiveDeclaration?.any { it in 0x5200..0x52ff }
-        val locationTypes = if (declaredIds(IDENT_SEND_IDS)?.contains(Iap2MessageIds.LOCATION_INFORMATION) == true &&
+        // Keep the legacy handshake lists, but optional navigation needs a complete declaration.
+        val navigationReceiveIds = when {
+            !whole || (IDENT_RECEIVE_IDS in firstById && receiveDeclaration == null) -> emptySet()
+            else -> receiveDeclaration
+        }
+        val routeGuidance = navigationReceiveIds?.contains(0x5201)
+        val locationTypes = if (sendDeclaration?.contains(Iap2MessageIds.LOCATION_INFORMATION) == true &&
             receiveDeclaration?.containsAll(listOf(Iap2MessageIds.START_LOCATION_INFORMATION, Iap2MessageIds.STOP_LOCATION_INFORMATION)) == true) {
             params.singleOrNull { it.id == 22 }?.let { locationNmeaTypes(it.value) }.orEmpty()
         } else emptySet()
+        val validMessageLists = whole &&
+            (sendDeclaration != null || IDENT_SEND_IDS !in firstById) &&
+            (receiveDeclaration != null || IDENT_RECEIVE_IDS !in firstById)
         val ea = ArrayList<EaProtocol>()
         // 按出现顺序（车机给的顺序就是它的优先级），不要再按 id 排序/去重
         for (param in params) {
@@ -279,6 +295,7 @@ object Iap2Messages {
             sendIds = sendIds,
             receiveIds = receiveIds,
             acceptsRouteGuidance = routeGuidance,
+            navigationReceiveIds = navigationReceiveIds,
             locationNmeaTypes = locationTypes,
             currentRoadLimits = if (whole) currentRoadLimits(params) else emptyMap(),
             eaProtocols = ea,
@@ -290,12 +307,23 @@ object Iap2Messages {
                 val function = fields.singleOrNull { it.id == 2 }?.takeIf { it.value.size == 1 }?.asU8() ?: return@mapNotNull null
                 HidComponent(id, function)
             }.groupBy { it.identifier }.values.filter { it.size == 1 }.map { it.single() },
-            vehicleStatusFields = params.singleOrNull { it.id == 21 }?.let { component ->
-                val fields = Iap2Csm.parseParams(component.value)
-                if (fields.sumOf { it.value.size + 4 } != component.value.size) emptySet()
-                else fields.filter { it.value.isEmpty() }.mapTo(mutableSetOf()) { it.id }
-            }.orEmpty(),
+            vehicleStatusFields = if (validMessageLists) vehicleStatusFields(params) else null,
+            vehicleStatusStopSupported = receiveDeclaration?.contains(Iap2MessageIds.STOP_VEHICLE_STATUS_UPDATES),
+            completeIdentification = whole,
+            validMessageLists = validMessageLists,
         )
+    }
+
+    private fun vehicleStatusFields(params: List<Iap2Csm.Param>): Set<Int>? {
+        val components = params.filter { it.id == 21 }
+        if (components.isEmpty()) return emptySet()
+        val component = components.singleOrNull() ?: return null
+        val fields = Iap2Csm.parseParams(component.value)
+        if (fields.sumOf { it.value.size + Iap2Csm.PARAM_HEADER_BYTES } != component.value.size) return null
+        val selectors = fields.filter { it.id in VEHICLE_STATUS_SELECTORS }
+        val ids = selectors.map { it.id }.toSet()
+        if (ids.size != selectors.size || selectors.any { it.value.isNotEmpty() }) return null
+        return ids
     }
 
     private fun currentRoadLimits(params: List<Iap2Csm.Param>): Map<Int, Int> =

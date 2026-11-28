@@ -470,6 +470,7 @@ pub async fn negotiate(
         crate::modes::Modes::from_info_with_audio_policy(&info, p.enable_audio, false, true)
     } else { crate::modes::Modes::from_info(&info, p.enable_audio, box_bootstrap) };
     let modes = Arc::new(Mutex::new(initial_modes));
+    channel.bind_modes(modes.clone());
     p.pipeline.lock().touch_modes = Arc::downgrade(&modes);
     let screen_owned = Arc::new(std::sync::atomic::AtomicBool::new(modes.lock().screen_owned()));
     let audio_owned = Arc::new(std::sync::atomic::AtomicBool::new(modes.lock().audio_owned()));
@@ -571,7 +572,7 @@ pub async fn negotiate(
         bootstrap_hids: if p.id9_screen_bootstrap { id9_hid_ids(&info, display_uuid.as_deref()) } else { Vec::new() },
         activated:std::sync::atomic::AtomicBool::new(false), resource_state:tokio::sync::Mutex::new(Default::default()),
     });
-    let cluster = crate::cluster_screen::Commands::new(&info, &root, screen_session.clone(), &mut keepalive.0);
+    let cluster = crate::cluster_screen::Commands::new(&info, &root, screen_session.clone(), session_info.setup_accepted_at, &mut keepalive.0);
     let (control_ui_tx, control_ui_rx) = mpsc::unbounded_channel();
     let current = screen_session.clone();
     keepalive.0.push(crate::wifi_iap2::spawn_control_ingress(control_inbound, wifi_iap_id, stop.clone(), session_info.setup_accepted_at,
@@ -758,6 +759,12 @@ pub async fn negotiate(
     }
     if let Some(audio) = audio.as_ref() { streams.push(Value::dict(vec![("type", Value::int(audio.stream_type()))])); }
     let speech_resource=Arc::new(crate::speech_resource::SpeechResource::new(channel.clone(),modes.clone(),audio_owned.clone()));
+    let route_resource = speech_resource.clone();
+    let route_shutdown = screen_session.shutdown.clone();
+    keepalive.0.push(crate::callback_context::spawn(async move {
+        route_resource.follow_navigation_route(route_shutdown, crate::speech_resource::projected_route_generation,
+            crate::speech_resource::with_projected_route_write).await;
+    }));
     let kinds = independent_audio_kinds(p, &info);
     let buffered_media = audio.as_ref().is_some_and(|out| out.stream_type() == 103);
     let realtime_media_rebuild = supports_realtime_media_rebuild(p, &info, desktop);
@@ -4411,20 +4418,14 @@ fn spawn_event_dispatcher(
                         emit_log(&line);
                     }
             }
-            if cluster.handle(cmd_type, &command) { continue; }
+            if cluster.dispatch(cmd_type, &command, msg.received_at) { continue; }
             match cmd_type {
                 "requestSiri" => {
                     let action=command.get("params").and_then(|v|v.get("siriAction")).or_else(||command.get("siriAction")).and_then(Value::as_int);
                     crate::emit_hid_log(&format!("VOICE-KEY: requestSiri action={action:?}"));
                     if let Some(key)=action.and_then(crate::voice_key::message) {let _=key_tx.send(key);}
                 }
-                "iAPSendMessage" => {
-                    if let Some(data)=crate::wifi_iap2::command_bytes(&command) {
-                        crate::wifi_iap2::receive_bytes(wifi_iap_id, data, "event");
-                    } else if crate::wifi_iap2::command_data(&command).is_none() {
-                        emit_log("WIFI-IAP: missing/oversized params.data");
-                    }
-                }
+                "iAPSendMessage" => {}, // Routed at RTSP enqueue on both sockets.
                 "setLimitedUI" => {
                     if let Some(payload) = limited_ui.update(&command) {
                         crate::emit_receiver_ui(cmd_type, payload);

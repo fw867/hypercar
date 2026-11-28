@@ -1861,7 +1861,6 @@ fn generic_receiver(params: &mut AirplayParams, _: &mut Value) {
 
 async fn navigation_duck_cycle(mut f: Fixture) {
     f.source(Kind::Navigation);
-    let(m,v)=f.request("modesChanged").await;let apps=v.get("params").unwrap().get("appStates").unwrap().as_array().unwrap();assert_eq!(apps[2].get("entity").and_then(Value::as_int),Some(1));f.ack(&m,None).await;
     let(m,v)=f.request("duckAudio").await;
     assert_eq!(v.get("params").unwrap().get("volume"),Some(&Value::real(-12.0)));
     f.ack(&m,None).await;
@@ -1870,9 +1869,118 @@ async fn navigation_duck_cycle(mut f: Fixture) {
     assert_eq!(v.get("params").unwrap().get("volume"),Some(&Value::real(0.2)));
     f.ack(&m,None).await;
     let(m,_)=f.request("teardown:101").await;assert!(f.media.borrow().idle());f.ack(&m,None).await;
-    let(m,v)=f.request("modesChanged").await;let apps=v.get("params").unwrap().get("appStates").unwrap().as_array().unwrap();assert_eq!(apps[2].get("entity").and_then(Value::as_int),Some(0));f.ack(&m,None).await;
     f.stopped().await;assert!(f.commands.try_recv().is_err());
-    assert_eq!(f.order,["modesChanged","duckAudio","setup:101:default","unduckAudio","teardown:101","modesChanged"]);
+    assert_eq!(f.order,["duckAudio","setup:101:default","unduckAudio","teardown:101"]);
+}
+
+async fn queued_native_navigation_take(f: &Fixture) -> (Arc<RtspChannel>, TcpStream, tokio::sync::oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let socket = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let (mut peer, _) = listener.accept().await.unwrap();
+    let (read, write) = socket.into_split();
+    let modes = f.controller.session.resource.modes.clone();
+    let reply: crate::rtsp::CommandReply = Arc::new(move |message| {
+        let command = bplist::parse(&message.body).ok()?;
+        modes.lock().response(&command, &Default::default()).map(|reply| reply.body)
+    });
+    let (event, mut inbound) = f.controller.session.control.spawn_event(read, write, Some(reply), Arc::new(|_, _| {}));
+    let (release, wait) = tokio::sync::oneshot::channel();
+    let (locked, ready) = tokio::sync::oneshot::channel();
+    tokio::spawn({
+        let event = event.clone();
+        async move {
+            let _writer = event.hold_writer_for_test().await;
+            let _ = locked.send(());
+            let _ = wait.await;
+        }
+    });
+    ready.await.unwrap();
+    peer.write_all(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+    assert_eq!(tokio::time::timeout(Duration::from_secs(1), inbound.recv()).await.unwrap().unwrap().cseq(), Some(1));
+    let body = bplist::encode(&Value::dict(vec![("type", Value::str("changeModes")),
+        ("params", Value::dict(vec![("appStates", Value::array(vec![Value::dict(vec![
+            ("appStateID", Value::int(3)), ("state", Value::Bool(true)),
+        ])]))]))]));
+    let mut request = format!("POST /command RTSP/1.0\r\nCSeq: 2\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+    request.extend(body);
+    peer.write_all(&request).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while event.without_pending_native_navigation(|| ()).is_some() { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    (event, peer, release)
+}
+
+#[tokio::test]
+async fn native_take_queued_behind_event_ack_blocks_navigation_setup_without_mixing() {
+    let mut f = Fixture::new().await;
+    let (_event, _event_peer, writer) = queued_native_navigation_take(&f).await;
+    f.source(Kind::Navigation);
+    assert!(tokio::time::timeout(Duration::from_millis(100), f.peer.read_u8()).await.is_err());
+    assert!(f.fallback.try_recv().is_err());
+    assert!(f.commands.try_recv().is_err());
+    drop(writer);
+    assert!(tokio::time::timeout(Duration::from_millis(100), f.peer.read_u8()).await.is_err());
+    f.stopped().await;
+}
+
+#[tokio::test]
+async fn native_take_queued_behind_event_ack_stops_navigation_rtp_without_mixing() {
+    let mut f = Fixture::new().await;
+    f.input.init(Kind::Navigation, 48000, 2);
+    assert_eq!(f.input.push(Kind::Navigation, 48000, 2, &4000i16.to_le_bytes().repeat(24_000)), super::Route::Independent);
+    let (duck, _) = f.request("duckAudio").await;
+    f.ack(&duck, None).await;
+    let (setup, value) = f.request("setup:101:default").await;
+    f.setup_reply(&setup, &value).await;
+    f.opus_packet(101).await;
+    let (_event, _event_peer, writer) = queued_native_navigation_take(&f).await;
+    let mut packet = [0; 2048];
+    while f.data.try_recv(&mut packet).is_ok() {}
+    assert!(tokio::time::timeout(Duration::from_millis(100), f.data.recv(&mut packet)).await.is_err());
+    assert!(f.fallback.try_recv().is_err());
+    drop(writer);
+    let (unduck, _) = f.request("unduckAudio").await;
+    f.ack(&unduck, None).await;
+    let (teardown, _) = f.request("teardown:101").await;
+    f.ack(&teardown, None).await;
+    f.stopped().await;
+    assert!(f.commands.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn native_take_during_duck_ack_withdraws_navigation_setup_and_undoes_duck() {
+    let mut f = Fixture::new().await;
+    f.source(Kind::Navigation);
+    let (duck, _) = f.request("duckAudio").await;
+    let (_event, _event_peer, writer) = queued_native_navigation_take(&f).await;
+    f.ack(&duck, None).await;
+    let (unduck, _) = f.request("unduckAudio").await;
+    f.ack(&unduck, None).await;
+    assert!(tokio::time::timeout(Duration::from_millis(100), f.peer.read_u8()).await.is_err());
+    assert!(f.fallback.try_recv().is_err());
+    drop(writer);
+    assert!(tokio::time::timeout(Duration::from_millis(100), f.peer.read_u8()).await.is_err());
+    f.stopped().await;
+}
+
+#[tokio::test]
+async fn navigation_setup_refusal_during_native_take_does_not_fall_back_to_mix() {
+    let mut f = Fixture::new().await;
+    f.source(Kind::Navigation);
+    let (duck, _) = f.request("duckAudio").await;
+    f.ack(&duck, None).await;
+    let (setup, _) = f.request("setup:101:default").await;
+    let (_event, _event_peer, writer) = queued_native_navigation_take(&f).await;
+    f.reject(&setup, 403).await;
+    let (unduck, _) = f.request("unduckAudio").await;
+    f.ack(&unduck, None).await;
+    let (teardown, _) = f.request("teardown:101").await;
+    f.ack(&teardown, None).await;
+    assert!(tokio::time::timeout(Duration::from_millis(100), f.fallback.recv()).await.is_err());
+    drop(writer);
+    assert!(tokio::time::timeout(Duration::from_millis(100), f.fallback.recv()).await.is_err());
+    f.stopped().await;
+    assert!(f.commands.try_recv().is_err());
 }
 
 #[tokio::test] async fn id9_rejected_navigation_setup_returns_pcm_to_mix_after_cleanup() {
@@ -1896,15 +2004,16 @@ async fn navigation_setup_failure(reject_first_release: bool, configure: fn(&mut
     f.input.init(Kind::Navigation,48000,2);
     let pcm = 3000i16.to_le_bytes().repeat(1920);
     assert_eq!(f.input.push(Kind::Navigation,48000,2,&pcm),super::Route::Independent);
-    let (m,_) = f.request("modesChanged").await; f.ack(&m,None).await;
     let (m,_) = f.request("duckAudio").await; f.ack(&m,None).await;
     let (m,_) = f.request("setup:101:default").await; f.reject(&m,400).await;
-    for command in ["unduckAudio", "teardown:101", "modesChanged"] {
-        if command == "modesChanged" && reject_first_release {
-            let (m,_) = f.request(command).await;
-            f.reject(&m,403).await;
-        }
-        let (m,_) = f.request(command).await;
+    let (m,_) = f.request("unduckAudio").await; f.ack(&m,None).await;
+    let (m,_) = f.request("teardown:101").await;
+    if reject_first_release {
+        f.reject(&m,503).await;
+        let (retry, _) = f.request("teardown:101").await;
+        assert!(f.fallback.try_recv().is_err(), "cannot mix before cleanup ACK");
+        f.ack(&retry,None).await;
+    } else {
         assert!(f.fallback.try_recv().is_err(), "cannot mix before cleanup ACK");
         f.ack(&m,None).await;
     }
@@ -1921,7 +2030,6 @@ async fn navigation_setup_failure(reject_first_release: bool, configure: fn(&mut
         f.input.init(Kind::Navigation, 48000, 2);
         let pcm = 3000i16.to_le_bytes().repeat(1920);
         assert_eq!(f.input.push(Kind::Navigation, 48000, 2, &pcm), super::Route::Independent);
-        let (m, _) = f.request("modesChanged").await; f.ack(&m, None).await;
         let (m, _) = f.request("duckAudio").await; f.ack(&m, None).await;
         let (m, v) = f.request("setup:101:default").await;
         if rejected_setup { f.reject(&m, 400).await; }
@@ -1935,7 +2043,6 @@ async fn navigation_setup_failure(reject_first_release: bool, configure: fn(&mut
         assert!(f.fallback.try_recv().is_err(), "must not mix while volume cleanup is pending");
         let (m, _) = f.request("unduckAudio").await; f.ack(&m, None).await;
         // A second TEARDOWN may be a 404: the ACK above must remain recorded.
-        let (m, _) = f.request("modesChanged").await; f.ack(&m, None).await;
         if rejected_setup {
             let event = tokio::time::timeout(Duration::from_secs(1), f.fallback.recv()).await.unwrap();
             assert!(matches!(event, Some(crate::engine::SourceEvent::AuxFallback { kind: Kind::Navigation, samples }) if samples == vec![3000; 1920]));
@@ -1950,11 +2057,9 @@ async fn navigation_setup_failure(reject_first_release: bool, configure: fn(&mut
 #[tokio::test] async fn rejected_navigation_duck_retries_only_unduck_without_tearing_down_unallocated_stream() {
     let mut f = Fixture::with_config(generic_receiver).await;
     f.source(Kind::Navigation);
-    let (m, _) = f.request("modesChanged").await; f.ack(&m, None).await;
     let (m, _) = f.request("duckAudio").await; f.reject(&m, 400).await;
     let (m, _) = f.request("unduckAudio").await; f.reject(&m, 500).await;
     let (m, _) = f.request("unduckAudio").await; f.ack(&m, None).await;
-    let (m, _) = f.request("modesChanged").await; f.ack(&m, None).await;
     assert!(tokio::time::timeout(Duration::from_secs(1), f.fallback.recv()).await.unwrap().is_some());
     assert!(f.commands.try_recv().is_err());
     f.stopped().await;
@@ -1963,14 +2068,12 @@ async fn navigation_setup_failure(reject_first_release: bool, configure: fn(&mut
 #[tokio::test] async fn navigation_teardown_retry_does_not_repeat_successful_volume_restore() {
     let mut f = Fixture::with_config(generic_receiver).await;
     f.source(Kind::Navigation);
-    let (m, _) = f.request("modesChanged").await; f.ack(&m, None).await;
     let (m, _) = f.request("duckAudio").await; f.ack(&m, None).await;
     let (m, v) = f.request("setup:101:default").await; f.setup_reply(&m, &v).await;
     f.opus_packet(101).await;
     let (m, _) = f.request("unduckAudio").await; f.ack(&m, None).await;
     let (m, _) = f.request("teardown:101").await; f.reject(&m, 500).await;
     let (m, _) = f.request("teardown:101").await; f.ack(&m, None).await;
-    let (m, _) = f.request("modesChanged").await; f.ack(&m, None).await;
     assert!(f.commands.try_recv().is_err());
     f.stopped().await;
 }

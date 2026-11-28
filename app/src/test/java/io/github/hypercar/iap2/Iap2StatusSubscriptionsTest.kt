@@ -4,6 +4,105 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class Iap2StatusSubscriptionsTest {
+    @Test fun mguCommunicationsSendsOnlyChangesUntilStopOrLinkRestart() {
+        var reads = 0
+        var sample = Iap2Communications(signal = 3, registration = 4, airplane = false, carrier = "Carrier")
+        val session = Iap2StatusSubscriptions(communications = { reads++; sample })
+        session.identify("MGU-55-BMW", "BMW Group")
+        val request = Iap2Csm.Frame(0x4157, hex("00040000000400010004000200040011"))
+        session.handle(request)
+        assertTrue(session.drain(0).isEmpty())
+        assertEquals(0, reads)
+        session.authenticated()
+        assertArrayEquals(hex("0005000003000500010400050002000005001100"), session.drain(0).single().body)
+
+        sample = Iap2Communications()
+        assertTrue(session.drain(1_999).isEmpty())
+        assertEquals(1, reads)
+        assertTrue(session.drain(2_000).isEmpty())
+        sample = Iap2Communications(signal = 3, registration = 5)
+        assertArrayEquals(Iap2Csm.u8(1, 5), session.drain(4_000).single().body)
+        session.handle(Iap2Csm.Frame(0x4159, hex("00040000")))
+        sample = Iap2Communications(signal = 0, registration = 1)
+        assertArrayEquals(Iap2Csm.u8(0, 0) + Iap2Csm.u8(1, 1), session.drain(6_000).single().body)
+        session.handle(frame(0x4159))
+        assertTrue(session.drain(8_000).isEmpty())
+        assertEquals(4, reads)
+
+        session.handle(Iap2Csm.Frame(0x4157, hex("00040002")))
+        sample = Iap2Communications(signal = 2, registration = 4, airplane = true)
+        assertArrayEquals(Iap2Csm.u8(2, 1), session.drain(8_000).single().body)
+        session.restartLink()
+        assertTrue(session.drain(10_000).isEmpty())
+        assertEquals(5, reads)
+    }
+
+    @Test fun mguAppDiscoveryReportsUnsupportedAndValidatesTheRequest() {
+        val session = Iap2StatusSubscriptions()
+        val request = Iap2Csm.Frame(0xad00, hex("0008000000040002000600010003"))
+        session.handle(request)
+        session.identify("MGU-55-BMW", "BMW Group")
+        assertTrue(session.drain(0).isEmpty())
+        session.authenticated()
+        val reply = session.drain(0).single()
+        assertEquals(0xad01, reply.messageId)
+        assertArrayEquals(Iap2Csm.u8(0, 0), reply.body)
+
+        for (badBody in listOf("00070000000500", "0005000100", "00")) {
+            session.handle(Iap2Csm.Frame(0xad00, hex(badBody)))
+            assertTrue(session.drain(0).isEmpty())
+        }
+        session.handle(request)
+        session.handle(frame(0xad02))
+        assertTrue(session.drain(0).isEmpty())
+        session.reset()
+        session.authenticated()
+        session.handle(request)
+        assertArrayEquals(Iap2Csm.u8(0, 1), session.drain(0).single().body)
+    }
+
+    @Test fun mguCallFirstSampleFailureAndTimeoutDoNotReportDisconnected() {
+        var sample: Iap2CallSample = Iap2CallSample.Unavailable
+        val session = Iap2StatusSubscriptions(callState = { sample })
+        session.identify("MGU-55-BMW", "BMW Group")
+        session.handle(frame(0x4154))
+        assertTrue(session.drain(0).isEmpty())
+        session.authenticated()
+        session.handle(frame(0x4170))
+        assertEquals(0x4171, session.drain(10_000).single().messageId)
+        assertTrue(session.drain(13_000).isEmpty())
+
+        sample = Iap2CallSample.Known(Iap2CallState.ACTIVE)
+        assertArrayEquals(Iap2Csm.u8(2, 4), session.drain(14_000).single().body)
+        sample = Iap2CallSample.Known(Iap2CallState.DISCONNECTED)
+        assertArrayEquals(Iap2Csm.u8(2, 0), session.drain(15_000).single().body)
+
+        sample = Iap2CallSample.Unavailable
+        for (cancel in listOf({ session.handle(frame(0x4156)); Unit }, session::restartLink)) {
+            session.handle(frame(0x4154))
+            assertTrue(session.drain(16_000).isEmpty())
+            cancel()
+            sample = Iap2CallSample.Known(Iap2CallState.ACTIVE)
+            assertTrue(session.drain(17_000).isEmpty())
+            sample = Iap2CallSample.Unavailable
+        }
+    }
+
+    @Test fun mguSamplesRequestedCommunicationsFieldsWhenSendingTheAuthenticatedReply() {
+        var sample = Iap2Communications(signal = 1, registration = 4, carrier = "Old")
+        val session = Iap2StatusSubscriptions(communications = { sample })
+        session.identify("MGU-55-BMW", "BMW Group")
+        val request = Iap2Csm.Frame(0x4157, hex("000400000004000100040002000400040004000a"))
+        session.handle(request)
+        assertTrue(session.drain().isEmpty())
+        sample = Iap2Communications(signal = 3, airplane = false)
+        session.authenticated()
+        assertArrayEquals(Iap2Csm.u8(0, 3) + Iap2Csm.u8(2, 0), session.drain().single().body)
+        session.handle(request)
+        sample = Iap2Communications(registration = 5, carrier = "Carrier")
+        assertArrayEquals(Iap2Csm.u8(1, 5) + Iap2Csm.string(4, "Carrier"), session.drain().single().body)
+    }
+
     private fun frame(id:Int)=Iap2Csm.Frame(id,byteArrayOf())
     @Test fun libraryInfoAndUpdatesMatchTheAdvertisedLibraryAndBoxOrder() {
         val session = Iap2StatusSubscriptions()
@@ -117,6 +216,11 @@ class Iap2StatusSubscriptionsTest {
         assertEquals(Iap2CallState.DISCONNECTING, sample(2, foreground = 8))
         assertNull(Iap2CallState.fromTelephonyRegistry("Permission Denial"))
     }
+
+    @Test fun callDumpPastTheOutputLimitCannotConfirmDisconnect() {
+        val states = List(16) { "mCallState=0" } + "mCallState=1"
+        assertNull(Iap2CallState.fromTelephonyRegistry(states.joinToString("\n")))
+    }
     @Test fun repeatedRequestsCoalesceAndEveryStatusBodyIsWholeTlv() {
         val s=Iap2StatusSubscriptions()
         repeat(100) { for(id in listOf(0x4154,0x4157,0x4170,0xae00,0xad00)) s.handle(frame(id)) }
@@ -138,7 +242,9 @@ class Iap2StatusSubscriptionsTest {
     private fun hex(value: String) = value.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 
     @Test fun bmwMguCommunicationsReplyMatchesRequestedFirmwareFields() {
-        val session = Iap2StatusSubscriptions()
+        val session = Iap2StatusSubscriptions(communications = {
+            Iap2Communications(signal = 3, registration = 4, airplane = false, carrier = "Carrier")
+        })
         session.identify("MGU-55-BMW", "BMW Group")
         session.authenticated()
         fun reply(vararg ids: Int): ByteArray {
@@ -148,11 +254,11 @@ class Iap2StatusSubscriptionsTest {
             assertEquals(0x4158, response.messageId)
             return response.body
         }
-        assertArrayEquals(hex("0005000005000500010400050009000005001100"), reply(0, 1, 9, 17))
+        assertArrayEquals(hex("000500000300050001040005001100"), reply(0, 1, 9, 17))
         assertArrayEquals(hex("0005000104"), reply(1, 3, 1, 0xffff))
         assertArrayEquals(byteArrayOf(), reply(3, 18))
-        assertArrayEquals(hex("0005000200000b00044d6f62696c650000050005010005000601" +
-            "000500070000050008000005000a000005000b000005000c000005000d000005000e000005000f000005001000"),
+        assertArrayEquals(hex("0005000200000c0004436172726965720000050007000005000800" +
+            "0005000c000005000d000005000e000005000f000005001000"),
             reply(16, 15, 14, 13, 12, 11, 10, 8, 7, 6, 5, 4, 2))
         session.reset()
         session.authenticated()

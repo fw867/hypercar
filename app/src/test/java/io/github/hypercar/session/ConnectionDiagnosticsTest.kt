@@ -6,6 +6,21 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ConnectionDiagnosticsTest {
+    @Test fun hotspotSelectionCanUseAnAclArrivingDuringTheRoundOnlyWhileItIsUnambiguous() {
+        val journal = ConnectionDiagnostics { 100L }
+        val attempt = journal.begin("manual", "bmw_id85")
+        journal.recordAcl("AA", true, 101)
+        assertEquals("AA", journal.connectedAclPeer(attempt))
+        assertNull(journal.currentAclWakePeer(attempt))
+        journal.recordAcl("BB", true, 102)
+        assertNull(journal.connectedAclPeer(attempt))
+        journal.recordAcl("AA", false, 103)
+        assertEquals("BB", journal.connectedAclPeer(attempt))
+        journal.finish(attempt, "done", "")
+        assertNull(journal.connectedAclPeer(attempt))
+        assertNull(journal.connectedAclPeer(journal.begin("manual", "bmw_id85")))
+    }
+
     @Test fun inboundWaitUsesOnlyTheLatestAclObservationFromThisAttempt() {
         var now = 1_000L
         val journal = ConnectionDiagnostics { now }

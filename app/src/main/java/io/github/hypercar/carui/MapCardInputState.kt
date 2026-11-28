@@ -1,8 +1,13 @@
 package io.github.hypercar.carui
 
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.StampedLock
+
 /** One immutable input binding per card surface handoff; a gesture never retargets mid-stream. */
 internal class MapCardInputState {
     class Binding(val source: Any, val displayId: Int, val width: Int, val height: Int) {
+        val generation = nextGeneration.incrementAndGet()
+
         fun scaleFrom(viewWidth: Int, viewHeight: Int): Pair<Float, Float> {
             require(viewWidth > 0 && viewHeight > 0)
             return width.toFloat() / viewWidth to height.toFloat() / viewHeight
@@ -20,6 +25,33 @@ internal class MapCardInputState {
     fun acquire(source: Any): Binding? = current?.takeIf { it.source === source }
     fun accepts(binding: Binding): Boolean = current === binding
     fun clear() { current = null }
+
+    private companion object {
+        val nextGeneration = AtomicLong()
+    }
+}
+
+/** Orders publication of the visible card with an instrument record's nonblocking first write. */
+internal class InstrumentMapCard {
+    private val lock = StampedLock()
+    @Volatile var current: MapCardInputState.Binding? = null
+        private set
+
+    fun update(change: (MapCardInputState.Binding?) -> MapCardInputState.Binding?) {
+        val stamp = lock.writeLock()
+        try {
+            current = change(current)
+        } finally { lock.unlockWrite(stamp) }
+    }
+
+    fun tryAcquire(expected: MapCardInputState.Binding): Long {
+        val stamp = lock.tryReadLock()
+        if (stamp == 0L || current === expected) return stamp
+        lock.unlockRead(stamp)
+        return 0L
+    }
+
+    fun release(stamp: Long) = lock.unlockRead(stamp)
 }
 
 /** Once a finger has dragged or a second pointer joined, lifting cannot become a card click. */

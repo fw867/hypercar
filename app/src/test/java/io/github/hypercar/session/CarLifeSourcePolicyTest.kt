@@ -1,10 +1,25 @@
 package io.github.hypercar.session
 
+import io.github.hypercar.headunit.HeadUnitProfiles
 import io.github.hypercar.settings.CarWithDisplay
 import org.junit.Assert.*
 import org.junit.Test
 
 class CarLifeSourcePolicyTest {
+    @Test fun id85CanHoldItsReceiversSocketWhileThePhoneSourceStarts() {
+        val peer = "20:30:40:50:60:70"
+        for (source in listOf("carwith", "system_carlife")) {
+            assertTrue(CarLifeSourcePolicy.canPrepareBmwInbound(source, HeadUnitProfiles.BMW_ID85, peer))
+            assertFalse(CarLifeSourcePolicy.canPrepareBmwInbound(source, HeadUnitProfiles.BMW_ID85, null))
+            assertFalse(CarLifeSourcePolicy.canPrepareBmwInbound(source, HeadUnitProfiles.BMW_ID85, "02:00:00:00:00:00"))
+            assertFalse(CarLifeSourcePolicy.canPrepareBmwInbound(source, HeadUnitProfiles.BMW_ID9, peer))
+            assertFalse(CarLifeSourcePolicy.canPrepareBmwInbound(source, HeadUnitProfiles.MOTORCYCLE, peer))
+        }
+        assertTrue(CarLifeSourcePolicy.canPrepareBmwInbound("mirror", HeadUnitProfiles.BMW_ID9, null))
+        assertTrue(CarLifeSourcePolicy.canPrepareBmwInbound("mirror", HeadUnitProfiles.MOTORCYCLE, null))
+        assertFalse(CarLifeSourcePolicy.canPrepareBmwInbound("mirror", HeadUnitProfiles.GENERIC, peer))
+    }
+
     @Test fun systemCallAudioRequiresOptIn() {
         assertTrue(CarLifeSourcePolicy.allowsCallAudio("carwith", false))
         assertTrue(CarLifeSourcePolicy.allowsCallAudio("carwith", true))

@@ -44,8 +44,21 @@ object Iap2Csm {
     /** 增量解析器：喂入任意分片的 CSM 字节流，弹出完整帧。 */
     class Parser {
         private var buffer = ByteArray(0)
+        private var receivedBytes = 0L
+
+        internal val pendingFrameOffset: Long? get() =
+            (receivedBytes - buffer.size).takeIf { buffer.firstOrNull() == 0x40.toByte() }
+
+        internal val pendingMessageId: Int? get() =
+            if (buffer.size >= HEADER_BYTES) readU16(buffer, 4) else null
+
+        /** After [offer], a remaining start marker may still be missing part of its message ID. */
+        internal fun pendingMayBe(messageId: Int): Boolean = buffer.firstOrNull() == 0x40.toByte() &&
+            (buffer.size < 5 || buffer[4] == (messageId ushr 8).toByte()) &&
+            (buffer.size < HEADER_BYTES || buffer[5] == messageId.toByte())
 
         fun offer(chunk: ByteArray): List<Frame> {
+            receivedBytes += chunk.size
             buffer += chunk
             val frames = ArrayList<Frame>()
             while (true) {

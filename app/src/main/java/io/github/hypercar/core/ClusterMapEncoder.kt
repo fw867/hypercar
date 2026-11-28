@@ -10,11 +10,14 @@ import android.media.MediaFormat
 import android.os.SystemClock
 import android.text.TextPaint
 import android.text.TextUtils
+import io.github.hypercar.carui.MapCardInputState
 import io.github.hypercar.carui.MapPreview
 import io.github.hypercar.carui.CarReceiverUi
 import io.github.hypercar.navigation.AmapLinkNavigation
 import io.github.hypercar.navigation.AmapNavigation
+import io.github.hypercar.navigation.ClusterNavigationRoute
 import io.github.hypercar.navigation.NavigationCue
+import io.github.hypercar.navigation.isUsableInstrumentGuidance
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.spike.SpikeCaster
 import java.util.concurrent.ArrayBlockingQueue
@@ -22,9 +25,33 @@ import java.util.concurrent.TimeUnit
 
 /** Dedicated type-111 AVC producer. Only the AMap card supplies map pixels. */
 class ClusterMapEncoder private constructor(
-    private val width: Int, private val height: Int, private val safe: RectF, fps: Int,
+    private val width: Int, private val height: Int, private val safe: RectF, fps: Int, private val round: Long,
+    private val card: MapCardInputState.Binding,
 ) : AutoCloseable {
     companion object {
+        private val navigationRoute = ClusterNavigationRoute()
+
+        private fun renderable(cue: NavigationCue): Boolean =
+            cue.isUsableInstrumentGuidance() && !CarReceiverUi.state.value.limits.blockMapApp
+
+        private fun routeStatus(): ClusterNavigationRoute.Status = synchronized(navigationRoute) {
+            val now = SystemClock.elapsedRealtime()
+            navigationRoute.update(now, AmapLinkNavigation.clusterRoute(now), AmapNavigation.clusterRoute(now))
+        }
+
+        private fun mapStatus(route: ClusterNavigationRoute.Status, card: MapCardInputState.Binding?): Long {
+            val ready = HyperCarRepo.mapNavigationAllowed && route.cue?.let(::renderable) == true && card != null
+            return (route.round shl 2) or (if (route.active) 2L else 0L) or (if (ready) 1L else 0L)
+        }
+
+        internal fun mapStatus(): Long = mapStatus(routeStatus(), MapPreview.currentInstrumentCard())
+
+        internal fun mapObservation(): LongArray {
+            val route = routeStatus()
+            val card = MapPreview.currentInstrumentCard()
+            return longArrayOf(mapStatus(route, card), card?.generation ?: 0L)
+        }
+
         internal fun capable(): Boolean = HyperCarRepo.mapNavigationAllowed && runCatching {
             MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { codec ->
                 codec.isEncoder && codec.supportedTypes.any { it.equals(MediaFormat.MIMETYPE_VIDEO_AVC, ignoreCase = true) } &&
@@ -40,9 +67,11 @@ class ClusterMapEncoder private constructor(
             return runCatching { MediaCodecList(MediaCodecList.REGULAR_CODECS).findEncoderForFormat(format) != null }.getOrDefault(false)
         }
 
-        internal fun open(w: Int, h: Int, x: Int, y: Int, sw: Int, sh: Int, fps: Int): ClusterMapEncoder? {
+        internal fun open(w: Int, h: Int, x: Int, y: Int, sw: Int, sh: Int, fps: Int, round: Long, cardGeneration: Long): ClusterMapEncoder? {
             if (fps !in 1..2 || !available(w, h) || sw < 64 || sh < 48 || x < 0 || y < 0 || x + sw > w || y + sh > h) return null
-            val encoder = ClusterMapEncoder(w, h, RectF(x.toFloat(), y.toFloat(), (x + sw).toFloat(), (y + sh).toFloat()), fps)
+            val card = MapPreview.currentInstrumentCard()?.takeIf { it.generation == cardGeneration } ?: return null
+            val safe = RectF(x.toFloat(), y.toFloat(), (x + sw).toFloat(), (y + sh).toFloat())
+            val encoder = ClusterMapEncoder(w, h, safe, fps, round, card)
             return try {
                 val initial = encoder.snapshot() ?: return null
                 try {
@@ -66,14 +95,22 @@ class ClusterMapEncoder private constructor(
     private var bridge: CodecSurfaceBridge? = null
     private val paint = TextPaint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
 
+    // Every access unit from this encoder belongs to the card that supplied its first snapshot.
+    fun isCardCurrent(): Boolean = MapPreview.currentInstrumentCard() === card
+
+    fun acquireCardWrite(): Long = MapPreview.acquireInstrumentCardWrite(card)
+
+    fun releaseCardWrite(stamp: Long) = MapPreview.releaseInstrumentCardWrite(stamp)
+
+    private fun navigationCue(): NavigationCue? {
+        if (!HyperCarRepo.mapNavigationAllowed || !isCardCurrent()) return null
+        return routeStatus().takeIf { it.round == round && it.active }?.cue?.takeIf(::renderable)
+    }
+
     private fun snapshot(): Frame? {
-        fun cue() = (AmapLinkNavigation.snapshot() ?: AmapNavigation.snapshot())
-            ?.takeIf { it.state == 1 && it.maneuver != null && it.instruction.isNotBlank() }
-        if (!HyperCarRepo.mapNavigationAllowed || CarReceiverUi.state.value.limits.blockMapApp || cue() == null) return null
-        val map = MapPreview.clusterMap(safe.width().toInt(), safe.height().toInt()) ?: return null
-        val active = cue()
-        if (active != null && HyperCarRepo.mapNavigationAllowed && !CarReceiverUi.state.value.limits.blockMapApp)
-            return Frame(active, map)
+        if (navigationCue() == null) return null
+        val map = MapPreview.clusterMap(card, safe.width().toInt(), safe.height().toInt()) ?: return null
+        navigationCue()?.let { return Frame(it, map) }
         map.recycle()
         return null
     }
@@ -119,12 +156,13 @@ class ClusterMapEncoder private constructor(
         return null
     }
 
-    fun firstSample(): ByteArray? = currentSample(1000)
+    fun firstSample(): ByteArray? = guidanceSample(1000)
 
     fun clearSample(): ByteArray? {
+        if (!HyperCarRepo.mapNavigationAllowed || !isCardCurrent() || routeStatus().round != round) return null
         caster.requestSyncFrame()
         paintFrame(null)
-        return currentSample(700)
+        return currentSample(700)?.takeIf { HyperCarRepo.mapNavigationAllowed && isCardCurrent() && routeStatus().round == round }
     }
 
     fun nextSample(sync: Boolean): ByteArray? {
@@ -133,8 +171,10 @@ class ClusterMapEncoder private constructor(
             if (sync) caster.requestSyncFrame()
             paintFrame(next)
         } finally { next.map.recycle() }
-        return currentSample(700)
+        return guidanceSample(700)
     }
+
+    private fun guidanceSample(timeout: Long): ByteArray? = currentSample(timeout)?.takeIf { navigationCue() != null }
 
     override fun close() {
         try { bridge?.close() } finally { caster.stop() }

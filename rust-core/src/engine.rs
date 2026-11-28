@@ -289,14 +289,15 @@ pub async fn run_engine(
                             }
                             CarLifeEvent::SourceReset { .. } => {
                                 *carwith_touch_size.lock() = (0, 0);
-                                crate::emit_carwith_navigation(navigation_token,None);
+                                crate::emit_carwith_navigation(navigation_token, None, true);
                                 let _ = voice_keys.send(crate::voice_key::RESET); let _ = vtx.send(SourceEvent::ResetVideoSource);
                                 let _=atx.send(SourceEvent::AudioStop{tts:false});
                                 let _=atx.send(SourceEvent::AudioStop{tts:true});
                                 let _=atx.send(SourceEvent::VoiceAudioStop);
                             }
                             CarLifeEvent::VideoReplay => {let _=vtx.send(SourceEvent::ReplayVideoSource);}
-                            CarLifeEvent::Navigation(update) => crate::emit_carwith_navigation(navigation_token,update.as_ref()),
+                            CarLifeEvent::NavigationReset => crate::emit_carwith_navigation(navigation_token, None, true),
+                            CarLifeEvent::Navigation(update) => crate::emit_carwith_navigation(navigation_token, update.as_ref(), false),
                             CarLifeEvent::VideoFrame { pts_us, data } => {
                                 let _ = vtx.send(SourceEvent::VideoFrameTagged { pts_us, data, codec:crate::video_format::VideoCodec::H264, origin });
                             }
@@ -1943,6 +1944,7 @@ struct AudioPumpStat {
 pub enum CarLifeEvent {
     GoToDesktop,
     Navigation(Option<crate::carlife::navigation::NavigationUpdate>),
+    NavigationReset,
     SourceReset { cache_cleared: Option<Arc<Notify>> },
     /// Replay for a new screen transport without resetting active audio/navigation.
     VideoReplay,

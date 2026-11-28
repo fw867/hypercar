@@ -2,6 +2,33 @@ package io.github.hypercar.iap2
 import org.junit.Assert.*
 import org.junit.Test
 class Iap2PowerEaTest {
+ @Test fun subscribedPowerSendsInitialSnapshotAndOnlyChangedRequestedFields() {
+  var sample = Iap2Power(false, 0, 70)
+  var reads = 0
+  val session = Iap2StatusSubscriptions(power = { reads++; sample })
+  session.identify("MGU-55-BMW", "BMW Group")
+  val request = Iap2Csm.Frame(0xae00, Iap2Csm.param(4, byteArrayOf()) + Iap2Csm.param(6, byteArrayOf()))
+  session.handle(request)
+  assertTrue(session.drain(0).isEmpty())
+  assertEquals(0, reads)
+  session.authenticated()
+  assertEquals(listOf(4, 6), session.drain(0).flatMap { Iap2Csm.parseParams(it.body) }.map { it.id })
+  sample = Iap2Power(false, 1, 71)
+  assertTrue(session.drain(999).isEmpty())
+  assertEquals(1, reads)
+  assertArrayEquals(Iap2Csm.u16(6, 71), session.drain(1000).single().body)
+  sample = Iap2Power()
+  assertTrue(session.drain(2000).isEmpty())
+  sample = Iap2Power(false, 1, 71)
+  assertTrue(session.drain(3000).isEmpty())
+  session.handle(Iap2Csm.Frame(0xae02, byteArrayOf()))
+  sample = sample.copy(level = 72)
+  assertTrue(session.drain(4000).isEmpty())
+  session.handle(request)
+  assertEquals(2, session.drain(4100).size)
+  session.restartLink()
+  assertTrue(session.drain(5000).isEmpty())
+ }
  @Test fun mgu55ReportsEachRequestedPowerFieldSeparatelyAfterAuthentication() {
   var reads = 0
   val s = Iap2StatusSubscriptions(power = { reads++; Iap2Power(true, 2, 73) })

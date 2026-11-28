@@ -104,8 +104,10 @@ class EngineEventListenerTest {
                 session = Iap2NowPlayingSession({ state }).also { it.authenticated() }
             }
             // Model the bridge's ID gates. The protocol tests separately exercise actual link framing.
-            override fun onIap2Bytes(id: Long, bytes: ByteArray) {
-                if (id == linkId) Iap2Csm.Parser().offer(bytes).forEach { session?.handle(it) }
+            override fun onIap2Ingress(id: Long, ticket: Long, bytes: ByteArray, writtenSynAck: Long): Boolean {
+                if (id != linkId) return false
+                Iap2Csm.Parser().offer(bytes).forEach { session?.handle(it) }
+                return true
             }
             override fun onIap2Stop(id: Long) { if (id == linkId) session = null }
         }
@@ -116,24 +118,24 @@ class EngineEventListenerTest {
         fun fields(now: Long) = Iap2Csm.parseParams(Iap2Csm.parseParams(updates(now).single().body).single().value)
             .associateBy { it.id }
         val old = EngineEventListener(gate,gate.begin(),target)
-        old.onIap2Start(11,"same-peer","phone", "audi_mib3"); old.onIap2Bytes(11,start)
+        old.onIap2Start(11,"same-peer","phone", "audi_mib3"); old.onIap2Ingress(11, 1, start)
         assertTrue(fields(0).containsKey(0))
         val current = EngineEventListener(gate,gate.begin(),target)
         current.onIap2Start(12,"same-peer","phone", "bmw_id85")
-        old.onIap2Bytes(11,start); old.onIap2Bytes(12,start)
-        current.onIap2Bytes(11,start)
+        old.onIap2Ingress(11, 1, start); old.onIap2Ingress(12, 1, start)
+        current.onIap2Ingress(11, 1, start)
         old.onIap2Stop(11)
         assertTrue(updates(1).isEmpty()) // Old subscriptions cannot consume new initialization.
-        current.onIap2Bytes(12,start)
+        current.onIap2Ingress(12, 1, start)
         assertTrue(fields(2).containsKey(0))
         old.onIap2Start(11,"same-peer","phone", "audi_mib3")
         assertEquals("bmw_id85", linkProfile)
-        old.onIap2Bytes(12,Iap2Csm.encode(0x5002)); old.onIap2Stop(11)
+        old.onIap2Ingress(12, 1, Iap2Csm.encode(0x5002)); old.onIap2Stop(11)
         state = state.copy(title="latest")
         val changed = fields(102)
         assertFalse(changed.containsKey(0)) // Old start/stop cannot reset initialization or stop updates.
         assertEquals("latest",changed.getValue(1).asStringOrNull())
-        current.onIap2Bytes(12,start)
+        current.onIap2Ingress(12, 1, start)
         assertFalse(fields(103).containsKey(0))
     }
 
@@ -153,7 +155,11 @@ class EngineEventListenerTest {
                 }
             }
             // Model the bridge's ID gate; transport framing is tested in WifiIap2ProtocolTest.
-            override fun onIap2Bytes(id: Long, bytes: ByteArray) { if(id==linkId) session?.fileResponse(bytes,10) }
+            override fun onIap2Ingress(id: Long, ticket: Long, bytes: ByteArray, writtenSynAck: Long): Boolean {
+                if (id != linkId) return false
+                session?.fileResponse(bytes, 10)
+                return true
+            }
             override fun onIap2Stop(id: Long) { if(id==linkId) session=null }
         }
         fun files(now: Long)=session!!.poll(now,2048,true)
@@ -166,16 +172,16 @@ class EngineEventListenerTest {
         assertEquals(0x80.toByte(),files(0).single()[0])
         for(command in listOf(1,5)) {
             val reply=byteArrayOf(0x80.toByte(),command.toByte())
-            old.onIap2Bytes(11,reply)
-            old.onIap2Bytes(12,reply)
-            current.onIap2Bytes(11,reply)
+            old.onIap2Ingress(11, 1, reply)
+            old.onIap2Ingress(12, 1, reply)
+            current.onIap2Ingress(11, 1, reply)
         }
         old.onIap2Stop(11)
         assertTrue(session!!.hasFileWork)
         assertTrue(files(11).isEmpty())
-        current.onIap2Bytes(12,byteArrayOf(0x80.toByte(),1))
+        current.onIap2Ingress(12, 1, byteArrayOf(0x80.toByte(),1))
         assertArrayEquals(byteArrayOf(0x80.toByte(),0xc0.toByte()),files(12).single())
-        current.onIap2Bytes(12,byteArrayOf(0x80.toByte(),5))
+        current.onIap2Ingress(12, 1, byteArrayOf(0x80.toByte(),5))
         assertFalse(session!!.hasFileWork)
     }
 
@@ -210,7 +216,11 @@ class EngineEventListenerTest {
             override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {}
             override fun onNightMode(night: Boolean) {}
             override fun onIap2Start(id: Long, deviceId: String, deviceName: String, profileId: String) { wifiId = id; starts++ }
-            override fun onIap2Bytes(id: Long, bytes: ByteArray) { if (wifiId == id) received += id }
+            override fun onIap2Ingress(id: Long, ticket: Long, bytes: ByteArray, writtenSynAck: Long): Boolean {
+                if (wifiId != id) return false
+                received += id
+                return true
+            }
             override fun onIap2ScreenSetupAccepted(id: Long) { if (wifiId == id) screenSetupAccepted += id }
             override fun onIap2Stop(id: Long) { if (wifiId == id) wifiId = 0 }
         }
@@ -252,12 +262,12 @@ class EngineEventListenerTest {
         old.onIap2Start(11, "phone", "phone", "audi_mib3")
         old.onIap2Stop(11)
         val lateConfiguration = io.github.hypercar.iap2.Iap2Csm.encode(0x5703)
-        old.onIap2Bytes(11, lateConfiguration)
-        old.onIap2Bytes(12, lateConfiguration) // Even a matching link ID cannot bypass the engine owner.
+        assertFalse(old.onIap2Ingress(11, 1, lateConfiguration))
+        assertFalse(old.onIap2Ingress(12, 2, lateConfiguration)) // Even a matching link ID cannot bypass the engine owner.
         assertTrue(received.isEmpty())
-        current.onIap2Bytes(11, lateConfiguration) // Current owner still needs the current link ID.
+        assertFalse(current.onIap2Ingress(11, 3, lateConfiguration))
         assertTrue(received.isEmpty())
-        current.onIap2Bytes(12, lateConfiguration)
+        assertTrue(current.onIap2Ingress(12, 4, lateConfiguration))
         assertEquals(listOf(12L), received)
         old.onIap2ScreenSetupAccepted(11)
         old.onIap2ScreenSetupAccepted(12)

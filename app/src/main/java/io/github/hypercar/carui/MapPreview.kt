@@ -56,17 +56,27 @@ object MapPreview {
     private var carMode = false
     private var presentation: MapPresentation? = null
     private val cardInput = MapCardInputState()
-    @Volatile private var clusterBinding: MapCardInputState.Binding? = null
+    private val instrumentCard = InstrumentMapCard()
+
+    private fun clusterCardIsCurrent(card: CardTarget, binding: MapCardInputState.Binding): Boolean =
+        card === visibleTarget && card === target && binding.source === card.texture &&
+            instrumentCard.current === binding && cardInput.accepts(binding)
+
+    internal fun currentInstrumentCard(): MapCardInputState.Binding? {
+        val card = visibleTarget ?: return null
+        return instrumentCard.current?.takeIf { clusterCardIsCurrent(card, it) }
+    }
+
+    internal fun acquireInstrumentCardWrite(binding: MapCardInputState.Binding): Long = instrumentCard.tryAcquire(binding)
+
+    internal fun releaseInstrumentCardWrite(stamp: Long) = instrumentCard.release(stamp)
 
     /** Encoder thread. A resized/detached card invalidates an in-flight read immediately. */
-    internal fun clusterMap(w: Int, h: Int): android.graphics.Bitmap? {
+    internal fun clusterMap(binding: MapCardInputState.Binding, w: Int, h: Int): android.graphics.Bitmap? {
         val card = visibleTarget ?: return null
-        val binding = clusterBinding ?: return null
-        fun active() = card === visibleTarget && card === target && binding.source === card.texture &&
-            clusterBinding === binding && cardInput.accepts(binding)
-        if (!active()) return null
+        if (!clusterCardIsCurrent(card, binding)) return null
         val image = SpikeShell.captureInstrumentMap(binding.displayId, binding.width, binding.height, w, h) ?: return null
-        if (active()) return image
+        if (clusterCardIsCurrent(card, binding)) return image
         image.recycle()
         return null
     }
@@ -153,17 +163,19 @@ object MapPreview {
     }
 
     private fun clearCardInput() {
-        clusterBinding = null
+        instrumentCard.update { null }
         cardInput.clear()
         runCatching { cancelInjectedTouch() }
             .onFailure { HyperCarRepo.log("MAP-CARD-TOUCH: 取消手势失败 ${it.message}") }
     }
 
     private fun bindCardInput(nextPresentation: MapPresentation, w: Int, h: Int) {
-        val texture = target?.texture
-        if (nextPresentation == MapPresentation.CARD && texture != null && !stopped && !fullscreen) {
-            cardInput.bind(texture, displayId, w, h)
-            clusterBinding = cardInput.current.takeIf { carMode && activeProvider == MapProvider.AMAP }
+        val card = target
+        if (nextPresentation == MapPresentation.CARD && card != null && !stopped && !fullscreen) {
+            instrumentCard.update {
+                cardInput.bind(card.texture, displayId, w, h)
+                cardInput.current.takeIf { visibleTarget === card && carMode && activeProvider == MapProvider.AMAP }
+            }
         }
     }
     private fun displayName(provider: MapProvider) = "hypercar-map-${provider.id}"
@@ -188,7 +200,10 @@ object MapPreview {
 
     fun attach(texture: SurfaceTexture, w: Int, h: Int) {
         val card = CardTarget(texture)
-        visibleTarget = card
+        instrumentCard.update {
+            visibleTarget = card
+            null
+        }
         scope.launch {
             lock.withLock {
                 if (visibleTarget !== card) return@withLock
@@ -208,7 +223,12 @@ object MapPreview {
     }
 
     fun detach(texture: SurfaceTexture) {
-        if (visibleTarget?.texture === texture) visibleTarget = null
+        instrumentCard.update { binding ->
+            if (visibleTarget?.texture === texture) {
+                visibleTarget = null
+                null
+            } else binding
+        }
         scope.launch {
             lock.withLock {
                 if (target?.texture === texture) {

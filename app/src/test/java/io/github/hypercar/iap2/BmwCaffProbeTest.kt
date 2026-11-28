@@ -9,6 +9,25 @@ class BmwCaffProbeTest {
     private val extended = BmwCaffProbe.Decision.ENTER_CTRL_GRACE
     private val dial = BmwCaffProbe.Decision.DIAL
 
+    @Test fun capturedCloseStaysWithDialAfterPromotion() {
+        val probe = BmwCaffProbe(1)
+        assertEquals(dial, probe.poll("BMW", 0, false, manual = true))
+        assertTrue(probe.recordSdp(true))
+        var closed = false
+        val owners = RfcommConnections<java.io.Closeable>()
+        val dialSocket = owners.register(java.io.Closeable { closed = true })
+        assertTrue(probe.attach(dialSocket::cancelSocket))
+        val stopOld = owners.captureClose()
+        assertTrue(probe.promote())
+        owners.admit(dialSocket)
+        probe.cancel()
+        stopOld.noteLocalStop()
+        assertTrue(dialSocket.localStopRequested)
+        assertFalse(closed)
+        stopOld.close()
+        assertTrue(closed)
+    }
+
     @Test fun healthyCtrlLetsRepeatedShortClassicWindowsPassWithoutConsumingDial() {
         val p = BmwCaffProbe(1)
         assertEquals(extended, p.poll("BMW", 0, true))

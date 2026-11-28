@@ -7,6 +7,61 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class WifiRequestAssociationTest {
+    @Test fun eitherAndroidLossCallbackMakesTheLostHandleIneligibleForAdoption() {
+        for (monitorFirst in listOf(true, false)) {
+            val state = WifiRequestAssociation<Any, Int>(1)
+            val callback = Any()
+            state.register(callback)
+            state.available(callback, 7)
+            if (monitorFirst) state.monitorLost(1, 7)
+            else assertEquals(1L, state.lost(callback, 7))
+            assertFalse(state.adopt(7, 2) { true })
+            assertNull(state.finish(keepConnected = true) {})
+            assertNull(state.lost(callback, 7, boundFallback = true))
+        }
+    }
+
+    @Test fun adoptionTransfersFutureLossesOnlyAfterTheLeaseIsClaimed() {
+        val state = WifiRequestAssociation<Any, Int>(1)
+        val callback = Any()
+        state.register(callback)
+        state.available(callback, 7)
+        assertFalse(state.adopt(7, 2) { false })
+        assertEquals(1L, state.lost(callback, 7))
+        state.available(callback, 8)
+        assertTrue(state.adopt(8, 2) { true })
+        state.monitorLost(1, 8) // retired monitor arriving after the transfer
+        assertNull(state.lost(callback, 7, boundFallback = true))
+        assertTrue(state.owns(8))
+        assertEquals(2L, state.lost(callback, 8))
+    }
+
+    @Test fun delayedRequestLossCannotUseAnOldBindingAfterTheSuccessorLosesItsOwnNetwork() {
+        val state = WifiRequestAssociation<Any, Int>(1)
+        val callback = Any()
+        state.register(callback)
+        state.available(callback, 7)
+        state.monitorLost(1, 7)
+        state.available(callback, 8)
+        assertTrue(state.adopt(8, 2) { true })
+        state.monitorLost(2, 8)
+        assertNull(state.lost(callback, 7, boundFallback = true))
+        assertEquals(2L, state.lost(callback, 8))
+    }
+
+    @Test fun queuedMonitorLossesOnARedeliveredHandleKeepBothRequestCallbacksInOrder() {
+        val state = WifiRequestAssociation<Any, Int>(1)
+        val callback = Any()
+        state.register(callback)
+        state.available(callback, 7)
+        state.monitorLost(1, 7)
+        state.available(callback, 7)
+        assertTrue(state.adopt(7, 2) { true })
+        state.monitorLost(2, 7)
+        assertNull(state.lost(callback, 7))
+        assertEquals(2L, state.lost(callback, 7))
+    }
+
     @Test fun cleanupKeepsDeliveryAfterTheCallersLastSnapshot() {
         val state = WifiRequestAssociation<Any, Int>()
         val owner = Any()
@@ -14,7 +69,7 @@ class WifiRequestAssociationTest {
         assertNull(state.network())
         state.available(owner, 7)
         repeat(3) { assertEquals(7, state.finish(keepConnected = true) { fail("withdrew the car hotspot") }) }
-        assertTrue(state.lost(owner, 7))
+        assertNotNull(state.lost(owner, 7))
         state.available(owner, 8) // delayed cleanup for network 7 runs after its replacement arrives
         assertEquals(8, state.finish(keepConnected = true) { fail("withdrew replacement") })
         val detached = mutableListOf<Any?>()
@@ -51,7 +106,7 @@ class WifiRequestAssociationTest {
         // the association registry, never that later signal or a capabilities snapshot.
         assertNull(state.cancelPending(owner)) // Caller must not unregister this request.
         assertTrue(state.owns(network))
-        assertTrue(state.lost(owner, network))
+        assertNotNull(state.lost(owner, network))
         assertFalse(state.owns(network))
         assertSame(owner, state.release())
         assertNull(state.release())
@@ -89,7 +144,7 @@ class WifiRequestAssociationTest {
         assertFalse(state.available(old, Any()))
         assertTrue(state.available(current, network))
         assertFalse(state.unavailable(old))
-        assertFalse(state.lost(old, network))
+        assertNull(state.lost(old, network))
         assertNull(state.cancelPending(old))
         assertTrue(state.owns(network))
     }
@@ -100,7 +155,7 @@ class WifiRequestAssociationTest {
         state.register(owner)
         state.available(owner, old)
         state.available(owner, current)
-        assertFalse(state.lost(owner, old, boundFallback = true))
+        assertNull(state.lost(owner, old, boundFallback = true))
         assertNull(state.cancelPending(owner))
         assertTrue(state.owns(current))
     }

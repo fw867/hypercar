@@ -37,15 +37,15 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * ID8.5 以本轮手机名称发布实例，其它档案保留 `sender`；TXT 与端口不随名称变化。
  */
-class CarPlayCtrlAdvertiser(
+class CarPlayCtrlAdvertiser internal constructor(
     context: Context,
     /** 本机真实蓝牙 MAC（TXT id；解析失败时返回占位值，车机不会邀请）。 */
     private val bluetoothMacProvider: () -> String,
     private val log: (String) -> Unit,
     private val onDiagnostic: (Event, Int) -> Unit = { _, _ -> },
     private val serviceNameProvider: () -> String = { "sender" },
-    private val onNetworkInvitation: (CarPlayCtrlAdvertiser, Network, () -> Boolean) -> Unit = { _, _, _ -> },
-    private val attemptId: Long = 0L,
+    private val onNetworkInvitation: (CarPlayCtrlAdvertiser, CtrlInvitation<Network>) -> Unit = { _, _ -> },
+    internal val attemptId: Long = 0L,
     private val onMdnsObservation: (Int, Int?) -> Unit = { _, _ -> },
     /** Diagnostic-only callback under the advertiser monitor; must not do I/O. */
     private val onCtrlEpochChanged: () -> Unit = {},
@@ -131,11 +131,12 @@ class CarPlayCtrlAdvertiser(
      */
     private val invites = CtrlInvitationInbox<Network, InetAddress, CtrlInvitation<Network>> { epoch, invite ->
         inviteCount++
-        runCatching { onNetworkInvitation(this, epoch.network, epoch::isCurrent) }
+        runCatching { onNetworkInvitation(this, invite) }
         runCatching { onDiagnostic(Event.INVITED, port) }
         logCtrl("$TAG: ✓ 车机 ctrl 邀请（第 $inviteCount 次，receiver=${invite.receiverId ?: "?"} network=#${epoch.network}）——AirPlay 窗口已开启")
     }
     internal val lastInvitation: CtrlInvitation<Network>? @Synchronized get() = invites.latest.get()
+    internal fun observedInvitation(): CtrlInvitation<Network>? = invites.latest.get()
     // Read without taking the advertiser monitor: the Bluetooth probe may hold its own lock.
     internal val hasUnresolvedOrPublishedInvite: Boolean get() =
         invitesBeingAcknowledged.get() > 0 || invites.awaitingConfirmation || invites.latest.get() != null
