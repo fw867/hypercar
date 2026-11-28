@@ -28,6 +28,10 @@ internal class WifiIap2Protocol(
     socketWriteFeedback: Boolean = false,
     destinationTransportCurrent: (Long) -> Boolean = { true },
 ) {
+    private data class DestinationFragment(val offset: Long, val controlMessage: Boolean, val deadline: Long)
+    private data class HudWrite(val generation: Long, val ticket: Long, val sourceCurrent: () -> Boolean)
+    @Volatile private var hudWrite: HudWrite? = null
+
     private val audiMib3 = profileId == "audi_mib3"
     private val engine = Iap2LinkEngine(reliableTransport = true, declaredWindow = 32, socketWriteFeedback = socketWriteFeedback)
     private var parser = Iap2Csm.Parser()
@@ -36,6 +40,8 @@ internal class WifiIap2Protocol(
     private val vehicle = Iap2VehicleStatusSession(onVehicleStatus, log)
     private val location = Iap2VehicleLocationSession(onVehicleLocation, onWheelSpeed)
     private var identification: Iap2Messages.Identification? = null
+    private var destinationReceiveEnabled = true // Preserve peers that never declare a receive list.
+    private var destinationFragment: DestinationFragment? = null
     private var authenticated = false
     private var navigation = RouteGuidanceSession(log)
     private val destination = Iap2DestinationSession(log) { destinationTransportCurrent(outputGeneration) }
@@ -113,6 +119,7 @@ internal class WifiIap2Protocol(
         }
         engine.onDetectionRestart = {
             outputGeneration++
+            hudWrite = null
             readyReported = false
             destinationTarget = null
             destination.reset()
@@ -128,6 +135,8 @@ internal class WifiIap2Protocol(
             location.reset()
             locationFrames = 0L
             identification = null
+            destinationReceiveEnabled = true
+            destinationFragment = null
             authenticated = false
             subscriptions.reset()
             navigation = RouteGuidanceSession(log)
@@ -162,7 +171,14 @@ internal class WifiIap2Protocol(
 
     fun takeHudOutput() = engine.takeHudOutput()
     fun takeSocketWrites() = engine.takeSocketWrites()
-    fun socketWriteFinished(ticket: Long, writtenAt: Long?) = engine.socketWriteFinished(ticket, writtenAt)
+    fun socketWriteFinished(ticket: Long, writtenAt: Long?, sourceRevoked: Boolean = false) {
+        if (hudWrite?.ticket == ticket) hudWrite = null
+        engine.socketWriteFinished(ticket, writtenAt, sourceRevoked)
+    }
+
+    fun canStartHudWrite(generation: Long, ticket: Long): Boolean =
+        hudWrite?.takeIf { it.generation == generation && it.ticket == ticket && generation == outputGeneration }
+            ?.sourceCurrent?.invoke() == true
 
     /** The native writer adds its FIFO readiness barrier after these authentication frames. */
     fun outputEnqueued() {
@@ -250,12 +266,15 @@ internal class WifiIap2Protocol(
             cancelStaleOutput()
             vehicle.offerStop()?.let(::queueBulkControl)
             if (!engine.hasBulkControl && engine.queuedControlPackets == 0) {
-                navigation.queuedUpdates(now, enabled, cue).forEach(::queueBulkControl)
-                destination.offer()?.let(::queueBulkControl)
+                navigation.queuedUpdates(now, enabled, cue, liveCue = {
+                    val current = navigationEnabled()
+                    current to if (current) navigationCue() else null
+                }).forEach(::queueBulkControl)
+                destination.offer { destinationFragment == null }?.let(::queueBulkControl)
             }
             engine.flushBulkControl(now, transportCapacity(outputGeneration), allowBulkStart(), reserveForNewBulk = 2)
         }
-        if (!failed && allowDestinationConfirmation) destination.confirmWrittenOffer()
+        if (!failed && allowDestinationConfirmation && destinationFragment == null) destination.confirmWrittenOffer()
         return engine.takeOutput()
     }
 
@@ -264,34 +283,70 @@ internal class WifiIap2Protocol(
             // xiap2 0x6b530 selects the opening CSM from the accepted control session version.
             if (engine.controlSessionVersion == 1) requestCertificate() else requestIdentification()
         }
-        var event = engine.pollEvent() ?: return
-        val enabled = phase == "READY" && navigationEnabled()
-        refreshDestination(if (enabled) navigationCue() else null, enabled)
-        while (true) {
+        var event = engine.pollEvent()
+        if (event != null) {
+            val enabled = phase == "READY" && navigationEnabled()
+            refreshDestination(if (enabled) navigationCue() else null, enabled)
+        }
+        while (event != null) {
             when (event) {
                 is Iap2LinkEngine.Event.Control -> parser.offer(event.bytes).forEach(::handle)
                 is Iap2LinkEngine.Event.FileTransfer -> nowPlaying.fileResponse(event.bytes, now)
                 is Iap2LinkEngine.Event.Dead -> fail(event.reason ?: "link closed")
             }
-            event = engine.pollEvent() ?: break
+            event = engine.pollEvent()
+        }
+        updateDestinationFragment()
+    }
+
+    private fun updateDestinationFragment() {
+        if (!readyReported || !destination.isSubscribed) {
+            destinationFragment = null
+            return
+        }
+        val controlOffset = parser.pendingFrameOffset?.takeIf {
+            parser.pendingMayBe(0x10da) || parser.pendingMayBe(0x10dc) || parser.pendingMayBe(0x1d01)
+        }
+        val offset = controlOffset ?: engine.partialControlInputOffset
+        val controlMessage = controlOffset != null
+        val previous = destinationFragment
+        if (offset == null) {
+            destinationFragment = null
+        } else if (previous == null || previous.offset != offset || previous.controlMessage != controlMessage) {
+            // Revoke an unwritten 10DB before the bridge releases this ingress ticket.
+            destinationFragment = DestinationFragment(offset, controlMessage, now + 1_000)
+            cancelStaleOutput()
+        } else if (now >= previous.deadline) {
+            // A stalled withdrawal must never release the old subscription on timeout.
+            destination.unsubscribe(::cancelStaleOutput)
+            destinationFragment = null
+            log("DESTINATION: incomplete control message timed out; waiting for a new subscription")
         }
     }
 
     private fun refreshDestination(cue: NavigationCue?, enabled: Boolean) {
-        destination.refreshSource(cue?.destinationToShare.takeIf { enabled && canSendDestination() })
+        destination.refreshSource(cue?.destinationToShare.takeIf { enabled && destinationReceiveEnabled })
     }
 
-    private fun canSendDestination() = identification?.navigationReceiveIds?.contains(0x10db) != false
-
     private fun updateDestinationTarget() {
-        destinationTarget = destination.target.takeIf { readyReported && !failed && canSendDestination() }
+        destinationTarget = destination.target.takeIf { readyReported && !failed && destinationReceiveEnabled }
     }
 
     private fun queueBulkControl(message: Iap2QueuedControl) {
         val frame = message.frame
         val hud = frame.messageId.takeIf { it in 0x5201..0x5204 } ?: 0
+        val generation = outputGeneration
+        val authorizeWrite = message.liveSourceAllowsFirstWrite?.let { sourceCurrent ->
+            { ticket: Long ->
+                sourceCurrent().also { current ->
+                    if (current) hudWrite = HudWrite(generation, ticket, sourceCurrent)
+                }
+            }
+        } ?: message.authorizeFirstWrite?.let { authorize ->
+            { ticket: Long -> authorize { cancelPendingWrite(generation, ticket) } }
+        }
         if (!engine.queueBulkControl(Iap2Csm.encode(frame.messageId, frame.body), true, hud,
-                message.canStart, message.commitStart, message.onWritten, message.onDiscarded)) {
+                message.canStart, message.commitStart, message.onWritten, message.onDiscarded, authorizeWrite)) {
             fail("link refused optional CSM id=0x${frame.messageId.toString(16)}")
         }
     }
@@ -328,12 +383,20 @@ internal class WifiIap2Protocol(
             if (phase != "READY") log("DEFER phase=$phase id=0x${id.toString(16)} until identification and authentication complete")
             return
         }
+        if (id == 0x10da && !destinationReceiveEnabled) return
         // Record subscription changes and revoke a pending first write before logging the input.
         val handled = navigation.handle(frame, ::cancelStaleOutput) || destination.handle(frame, ::cancelStaleOutput)
         if (phase != "READY" || seen.add(id)) log("RX phase=$phase id=0x${id.toString(16)} body=${frame.body.size}B")
         if (handled) return
         when (id) {
-            0x1d01 -> if (phase == "IDENTIFICATION" || phase == "READY") acceptIdentification(frame.body)
+            0x1d01 -> when (phase) {
+                "IDENTIFICATION", "READY" -> acceptIdentification(frame.body)
+                "CERTIFICATE", "CHALLENGE" -> {
+                    // Track the optional destination declaration without acknowledging or restarting MFi.
+                    val peer = Iap2Messages.parseIdentification(frame.body)
+                    if (peer.completeIdentification) declareDestinationReceiveSupport(peer)
+                }
+            }
             0xaa06 -> if (phase == "CERTIFICATE" && !retriedCertificate) {
                 retriedCertificate = true
                 send(0xaa00)
@@ -406,7 +469,7 @@ internal class WifiIap2Protocol(
         }
         identification = peer
         navigation.declareReceiveSupport(peer)
-        if (!canSendDestination()) destination.reset()
+        declareDestinationReceiveSupport(peer)
         cancelStaleOutput()
         updateDestinationTarget()
         subscriptions.identify(peer.model, peer.manufacturer)
@@ -421,6 +484,12 @@ internal class WifiIap2Protocol(
             authenticated -> enterReady()
             else -> requestCertificate(peer.declaresSend(0xaa06) == true)
         }
+    }
+
+    private fun declareDestinationReceiveSupport(peer: Iap2Messages.Identification) {
+        val supported = peer.navigationReceiveIds?.contains(0x10db) ?: return
+        if (destinationReceiveEnabled && !supported) destination.reset()
+        destinationReceiveEnabled = supported
     }
 
     private fun enterReady() {

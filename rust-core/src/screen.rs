@@ -37,9 +37,27 @@ use std::os::fd::AsRawFd;
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::OwnedWriteHalf;
 use crate::video_format::FrameOrigin;
+use crate::rtsp::{checked_prefix, CheckedWrite};
 use std::sync::Arc;
 
 pub(crate) mod keyframe;
+
+#[derive(Clone, Copy)]
+struct InstrumentWrite<'a> {
+    check: CheckedWrite<'a>,
+    first_write_budget: Duration,
+}
+
+#[derive(Debug)]
+pub(crate) struct InstrumentFirstWriteTimeout;
+
+impl std::fmt::Display for InstrumentFirstWriteTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("type111 first write timed out before writing any bytes")
+    }
+}
+
+impl std::error::Error for InstrumentFirstWriteTimeout {}
 
 pub(crate) enum RecoveryAccessUnit { Sync, Parameters, Skip }
 
@@ -451,13 +469,34 @@ impl ScreenSender {
     /// 头部必须与 catplay `ScreenFrame::config` 一致：`small_param[1] |= Encrypted(0x04)`
     /// 声明「后续视频帧是密封的」、params[1] = (width, height) 两个 f32 LE（车机据此
     /// 建立解码器画布）、params[0] 归零（config 不带 PTS）。缺任何一项 → 真车黑屏。
+    #[cfg(test)]
     pub async fn send_config(&mut self, avcc: &[u8]) -> std::io::Result<()> {
         if self.codec!=VideoCodec::H264 {return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,"AVC configuration supplied for HEVC source"));}
         let size=crate::h264::avcc_dimensions(avcc);
-        self.write_config(avcc,size).await
+        self.write_config(avcc,size,None).await.map(|_| ())
     }
 
-    async fn write_config(&mut self, avcc: &[u8], sps_size: Option<(u32,u32)>) -> std::io::Result<()> {
+    async fn write_video_record(&mut self, bytes: &[u8], instrument: Option<InstrumentWrite<'_>>) -> std::io::Result<bool> {
+        let Some(instrument) = instrument else {
+            self.w.write_all(bytes).await?;
+            return Ok(true);
+        };
+        let offset = tokio::time::timeout(instrument.first_write_budget, checked_prefix(&self.w, bytes, instrument.check))
+            .await.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, InstrumentFirstWriteTimeout))??;
+        let Some(offset) = offset else { return Ok(false); };
+        if offset < bytes.len() {
+            // Once a record has started, retain the old socket while the peer makes progress.
+            // The card and session permits only guard the nonblocking first write.
+            let fd = self.w.as_ref().as_raw_fd();
+            crate::screen_write::with_progress(self.w.write_all(&bytes[offset..]), || {
+                crate::tcp_diagnostics::TcpSnapshot::capture(fd, 0).acked_bytes
+            }).await?;
+        }
+        Ok(true)
+    }
+
+    async fn write_config(&mut self, avcc: &[u8], sps_size: Option<(u32,u32)>, instrument: Option<InstrumentWrite<'_>>)
+        -> std::io::Result<bool> {
         let mut header = build_header(OP_CONFIG, avcc.len(), &ZERO_TS);
         header[6] = SCREEN_FLAG_ENCRYPTED;
         if self.codec == VideoCodec::Hevc {header[6]=0x1e;header[7]=1;}
@@ -469,20 +508,20 @@ impl ScreenSender {
         let mut wire = Vec::with_capacity(HEADER_LEN + avcc.len());
         wire.extend_from_slice(&header);
         wire.extend_from_slice(avcc);
-        self.w.write_all(&wire).await?;
+        if !self.write_video_record(&wire, instrument).await? { return Ok(false); }
         self.publish_format(sps_size, Some((display_w, display_h)));
         self.config_sent = true;
         self.waiting_idr = true;
         self.video_log(format_args!("config TCP written {}B codec={} header={}x{} encoder_report={}x{} sps={sps_size:?} report_matches_sps={:?} flags=0x{:02x} header_stretch=false requested_target={:?}; receiver decode/display unconfirmed",
             avcc.len(), self.codec.as_str(), display_w, display_h, self.width, self.height, sps_size.map(|s| s == self.size()), header[6], self.display_target));
-        Ok(())
+        Ok(true)
     }
 
     fn source_nal_type(&self,nal:&[u8])->u8 {
         match self.codec {VideoCodec::H264=>nal_type(nal),VideoCodec::Hevc=>crate::hevc::nal_type(nal).unwrap_or(255)}
     }
 
-    async fn update_hevc_config(&mut self,nals:&[&[u8]])->std::io::Result<()> {
+    async fn update_hevc_config(&mut self,nals:&[&[u8]], instrument: Option<InstrumentWrite<'_>>)->std::io::Result<bool> {
         let get=|kind|nals.iter().copied().find(|n|crate::hevc::nal_type(n)==Some(kind));
         let (v,s,p)=(get(32),get(33),get(34));
         let changed=v.map(|n|self.last_vps.as_deref()!=Some(n)).unwrap_or(false)
@@ -500,10 +539,10 @@ impl ScreenSender {
         if !self.config_sent {
             if let (Some(v),Some(s),Some(p))=(&self.last_vps,&self.last_sps,&self.last_pps) {
                 let (config,size)=crate::hevc::build_config(v,s,p).ok_or_else(||std::io::Error::new(std::io::ErrorKind::InvalidData,"invalid or unsupported HEVC parameter sets"))?;
-                self.write_config(&config,Some(size)).await?;
+                return self.write_config(&config,Some(size),instrument).await;
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// 发送一帧视频。输入 AnnexB（可能粘连 SPS/PPS/IDR/P 多 NAL）：
@@ -517,7 +556,17 @@ impl ScreenSender {
         self.send_video_annexb_from(annexb, pts_us, crate::video_format::FrameOrigin::Live).await
     }
 
+    pub(crate) async fn send_instrument_map_while(&mut self, annexb: &[u8], pts_us: u64,
+        check: CheckedWrite<'_>, first_write_budget: Duration) -> std::io::Result<bool> {
+        self.send_video_access_unit(annexb, pts_us, FrameOrigin::Live, Some(InstrumentWrite { check, first_write_budget })).await
+    }
+
     pub async fn send_video_annexb_from(&mut self, annexb: &[u8], pts_us: u64, origin: crate::video_format::FrameOrigin) -> std::io::Result<()> {
+        self.send_video_access_unit(annexb, pts_us, origin, None).await.map(|_| ())
+    }
+
+    async fn send_video_access_unit(&mut self, annexb: &[u8], pts_us: u64, origin: FrameOrigin,
+        instrument: Option<InstrumentWrite<'_>>) -> std::io::Result<bool> {
         self.source_frames += 1;
         self.last_source = Some(tokio::time::Instant::now());
         let owned = self.observe_owner();
@@ -533,10 +582,10 @@ impl ScreenSender {
             self.ownership_skips += 1;
             self.waiting_idr = true;
             self.last_sync_request = None;
-            return Ok(());
+            return Ok(instrument.is_none());
         }
         if nals.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         if !self.logged_first_frame {
             self.logged_first_frame = true;
@@ -547,7 +596,7 @@ impl ScreenSender {
             if nals.iter().any(|n|crate::hevc::nal_type(n).is_none()) {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,"invalid HEVC NAL header"));
             }
-            self.update_hevc_config(&nals).await?;
+            if !self.update_hevc_config(&nals, instrument).await? { return Ok(false); }
         }
         if self.codec == VideoCodec::H264 {
         let mut sps: Option<&[u8]> = None;
@@ -572,9 +621,10 @@ impl ScreenSender {
             if changed || !self.config_sent {
                 let avcc = build_avcc(s, p);
                 if !avcc.is_empty() {
+                    let size = crate::h264::avcc_dimensions(&avcc);
+                    if !self.write_config(&avcc, size, instrument).await? { return Ok(false); }
                     self.last_sps = Some(s.to_vec());
                     self.last_pps = Some(p.to_vec());
-                    self.send_config(&avcc).await?;
                 }
             }
         }
@@ -591,12 +641,12 @@ impl ScreenSender {
                 crate::emit_force_keyframe();
                 self.video_log(format_args!("awaiting config/IDR config={} idr={is_idr}; requested sync frame", self.config_sent));
             }
-            return Ok(());
+            return Ok(true);
         }
         let resuming = self.waiting_idr;
         if self.waiting_idr {
             self.video_log(format_args!("first IDR ready pts={pts_us}us clock={}us", crate::timing::monotonic_nanos() / 1000));
-            self.waiting_idr = false;
+            if instrument.is_none() { self.waiting_idr = false; }
         }
 
         // 打包「4 字节 BE 长度前缀 NAL 序列」（SPS/PPS 已经走 VideoConfig，不进帧体）
@@ -610,7 +660,7 @@ impl ScreenSender {
             plain.extend_from_slice(nal);
         }
         if plain.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
 
         let ntp = ntp_le_from_us(pts_us);
@@ -631,12 +681,14 @@ impl ScreenSender {
                 (header, encrypted)
             }
         };
-        self.frame_counter = self.frame_counter.wrapping_add(1);
-
         let mut wire = Vec::with_capacity(HEADER_LEN + body.len());
         wire.extend_from_slice(&header);
         wire.extend_from_slice(&body);
-        self.w.write_all(&wire).await?;
+        let next_counter = self.frame_counter.wrapping_add(1);
+        if instrument.is_none() { self.frame_counter = next_counter; }
+        if !self.write_video_record(&wire, instrument).await? { return Ok(false); }
+        self.frame_counter = next_counter;
+        self.waiting_idr = false;
 
         if cutoff != 0 {
             if let (Some(frame), Some(trace)) = (sync_frame, self.current_keyframe_trace()) {
@@ -661,7 +713,7 @@ impl ScreenSender {
         self.bytes = self.bytes.wrapping_add(plain.len() as u64);
         self.frames_since_keep_alive = self.frames_since_keep_alive.wrapping_add(1);
         self.bytes_since_keep_alive = self.bytes_since_keep_alive.wrapping_add(plain.len() as u64);
-        Ok(())
+        Ok(true)
     }
 
     /// 屏幕流 keepAlive（内部按 1s 节流，调用方在推流循环里逐帧调用即可）。
@@ -849,6 +901,88 @@ pub fn build_avcc(sps: &[u8], pps: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn instrument_config_and_idr_each_use_the_current_write_authority() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let key = [7; 32];
+        let mut sender = ScreenSender::new(client.into_split().1, ScreenCipher::ChaCha(key), 64, 48, false);
+        sender.mark_instrument_map();
+        let idr = [0,0,1,0x67,0x42,0,0x1e,0xf4,0,0,1,0x68,0xce,0x3c,0x80,0,0,1,0x65,0x88,0x84];
+        assert!(!sender.send_instrument_map_while(&idr, 1_000, &|_| None, Duration::from_millis(750)).await.unwrap());
+        assert!(!sender.config_sent);
+
+        let checks = AtomicUsize::new(0);
+        let config_only = |write: &mut dyn FnMut() -> std::io::Result<usize>| {
+            (checks.fetch_add(1, Ordering::Relaxed) == 0).then(write)
+        };
+        assert!(!sender.send_instrument_map_while(&idr, 2_000, &config_only, Duration::from_millis(750)).await.unwrap());
+        assert_eq!(checks.load(Ordering::Relaxed), 2);
+        assert_eq!(sender.frame_counter, 0);
+        let mut header = [0; HEADER_LEN];
+        peer.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[4], OP_CONFIG);
+        let mut body = vec![0; u32::from_le_bytes(header[..4].try_into().unwrap()) as usize];
+        peer.read_exact(&mut body).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(40), peer.read_exact(&mut header)).await.is_err());
+
+        assert!(sender.send_instrument_map_while(&idr, 3_000, &|write| Some(write()), Duration::from_millis(750)).await.unwrap());
+        peer.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[4], OP_FRAME);
+        body.resize(u32::from_le_bytes(header[..4].try_into().unwrap()) as usize, 0);
+        peer.read_exact(&mut body).await.unwrap();
+        assert!(crate::crypto::chacha_open(&key, &nonce64(0), &body, &header).is_ok());
+    }
+
+    #[tokio::test]
+    async fn instrument_frame_finishes_after_its_card_is_revoked_mid_record() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpSocket::new_v4().unwrap();
+        client.set_send_buffer_size(4096).unwrap();
+        let socket = client.connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let key = [7; 32];
+        let mut sender = ScreenSender::new(socket.into_split().1, ScreenCipher::ChaCha(key), 64, 48, false);
+        sender.mark_instrument_map();
+        let mut idr = vec![0,0,1,0x67,0x42,0,0x1e,0xf4,0,0,1,0x68,0xce,0x3c,0x80,0,0,1,0x65,0x88,0x84];
+        idr.resize(512 * 1024, 0x55);
+        let config_written = AtomicBool::new(false);
+        let frame_prefix = AtomicUsize::new(0);
+        let write_while_bound = |write: &mut dyn FnMut() -> std::io::Result<usize>| {
+            if frame_prefix.load(Ordering::Relaxed) != 0 { return None; }
+            let result = write();
+            if let Ok(size) = result {
+                if size != 0 && config_written.swap(true, Ordering::Relaxed) {
+                    frame_prefix.store(size, Ordering::Relaxed);
+                }
+            }
+            Some(result)
+        };
+        let receive = async {
+            let mut header = [0; HEADER_LEN];
+            for opcode in [OP_CONFIG, OP_FRAME] {
+                peer.read_exact(&mut header).await.unwrap();
+                assert_eq!(header[4], opcode);
+                let mut body = vec![0; u32::from_le_bytes(header[..4].try_into().unwrap()) as usize];
+                peer.read_exact(&mut body).await.unwrap();
+                if opcode == OP_FRAME {
+                    let first = frame_prefix.load(Ordering::Relaxed);
+                    assert!((1..HEADER_LEN + body.len()).contains(&first), "expected a partial first write");
+                    let frame = crate::crypto::chacha_open(&key, &nonce64(0), &body, &header).unwrap();
+                    assert_eq!(&frame[4..], *annexb_nals(&idr).last().unwrap());
+                }
+            }
+        };
+        let send = sender.send_instrument_map_while(&idr, 1_000, &write_while_bound, Duration::from_millis(750));
+        let (sent, _) = tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(send, receive) }).await.unwrap();
+        assert!(sent.unwrap());
+        assert!(!sender.send_instrument_map_while(&idr, 2_000, &write_while_bound, Duration::from_millis(750)).await.unwrap());
+        assert_eq!(sender.frames_sent(), 1);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn keepalive_reports_completed_intervals_for_each_body_mode() {

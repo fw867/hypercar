@@ -1,7 +1,7 @@
 //! Reliable iAP2 bytes through RTSP commands or the negotiated DiPlay data stream.
 //! A generation guard prevents an old Kotlin worker writing into a new CarPlay session.
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::sync::{Arc, Weak, atomic::{AtomicU64, Ordering}};
+use std::sync::{Arc, Weak, atomic::{AtomicBool, AtomicU64, Ordering}};
 use std::time::Duration;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -393,7 +393,7 @@ fn frame_diagnostic(data: &[u8]) -> String {
     format!("seq={} ack={} session={} csm={csm}",data[5],data[6],data[7])
 }
 enum Outbound {
-    Frame(u64, Vec<u8>, Option<crate::rtsp::HudPostTrace>, i64),
+    Frame(u64, Vec<u8>, Option<crate::rtsp::HudPostTrace>, i64, bool),
     Ready(u64),
     StartupDetect(u64),
 }
@@ -460,6 +460,7 @@ fn write_is_current(state: &Handoff, id: u64, token: u64, startup_detect: bool) 
 pub(crate) struct WriteStart {
     id: u64, generation: u64, startup_detect: bool, ticket: i64,
     pub(crate) syn_ack: bool,
+    hud_start: Option<AtomicBool>,
 }
 
 impl WriteStart {
@@ -492,6 +493,17 @@ impl WriteStart {
     }
 
     fn try_first_write(&self, remaining: usize, write: impl FnOnce() -> std::io::Result<usize>) -> Option<std::io::Result<usize>> {
+        // Acquire the source read stamp before HANDOFF and release it after this
+        // nonblocking write attempt, so route publication and byte one are ordered.
+        let _hud_permit = if let Some(revoked) = &self.hud_start {
+            match crate::acquire_hud_iap2_write(self.id, self.generation, self.ticket.unsigned_abs()) {
+                Some(permit) => Some(permit),
+                None => {
+                    revoked.store(true, Ordering::Release);
+                    return None;
+                }
+            }
+        } else { None };
         // A single non-blocking socket attempt shares the lock with DETECT and cancellation.
         let mut state = HANDOFF.lock();
         if !self.allowed(&state) { return None; }
@@ -562,7 +574,11 @@ impl WriteStart {
             state.cancelled_writes.remove(&(ticket as u64));
             state.completed_cancellable = ticket as u64;
         }
-        let time = if written { (crate::timing::monotonic_nanos() / 1_000_000) as i64 } else { -1 };
+        let time = if written {
+            (crate::timing::monotonic_nanos() / 1_000_000) as i64
+        } else if self.hud_start.as_ref().is_some_and(|revoked| revoked.load(Ordering::Acquire)) {
+            -2 // source revocation is final even if Kotlin sees the same cue again
+        } else { -1 };
         state.writes.extend([ticket, time]);
     }
 }
@@ -585,10 +601,10 @@ pub fn take_write_completions(id: u64, generation: u64) -> Vec<i64> {
 
 #[cfg(test)]
 pub fn send(id: u64, generation: u64, data: Vec<u8>, hud_message_id: i32, hud_serial: i64) -> bool {
-    send_packet(id, generation, data, hud_message_id, hud_serial, 0)
+    send_packet(id, generation, data, hud_message_id, hud_serial, 0, false)
 }
 
-pub fn send_packet(id: u64, generation: u64, data: Vec<u8>, hud_message_id: i32, hud_serial: i64, ticket: i64) -> bool {
+pub fn send_packet(id: u64, generation: u64, data: Vec<u8>, hud_message_id: i32, hud_serial: i64, ticket: i64, hud_first: bool) -> bool {
     if data.is_empty() || data.len() > 65535 { return false; }
     if !current_write(id, generation, false) { return false; }
     let hud = match (hud_message_id, data.get(5)) {
@@ -597,9 +613,10 @@ pub fn send_packet(id: u64, generation: u64, data: Vec<u8>, hud_message_id: i32,
         }),
         _ => None,
     };
+    if hud_first && (hud.is_none() || ticket >= 0) { return false; }
     let output = OUTPUT.lock();
     output.as_ref().filter(|(current, _)| *current == id)
-        .map(|(_, tx)| tx.try_send(Outbound::Frame(generation, data, hud, ticket)).is_ok()).unwrap_or(false)
+        .map(|(_, tx)| tx.try_send(Outbound::Frame(generation, data, hud, ticket, hud_first)).is_ok()).unwrap_or(false)
 }
 
 pub struct WifiIap2 {
@@ -641,11 +658,11 @@ impl WifiIap2 {
                     _ = stop.notified() => break,
                     bytes = rx.recv() => match bytes { Some(b) => b, None => break },
                 };
-                let (token, data, hud, startup_detect, ticket) = match data {
-                    Outbound::Frame(token, data, hud, ticket) => (token, data, hud, false, ticket),
+                let (token, data, hud, startup_detect, ticket, hud_first) = match data {
+                    Outbound::Frame(token, data, hud, ticket, hud_first) => (token, data, hud, false, ticket, hud_first),
                     Outbound::Ready(token) => {
                         if !channel.session_is_live() { break; }
-                        let barrier = WriteStart { id, generation: token, startup_detect: false, ticket: 0, syn_ack: false };
+                        let barrier = WriteStart { id, generation: token, startup_detect: false, ticket: 0, syn_ack: false, hud_start: None };
                         let publish = async {
                             while barrier.wait_for_ingress().await {
                                 if ready_written(id, token) { break; }
@@ -654,11 +671,12 @@ impl WifiIap2 {
                         tokio::select! { _ = stop.notified() => break, _ = publish => {} }
                         continue;
                     }
-                    Outbound::StartupDetect(token) => (token, DETECT.to_vec(), None, true, 0),
+                    Outbound::StartupDetect(token) => (token, DETECT.to_vec(), None, true, 0, false),
                 };
                 if !current_write(id, token, startup_detect) { continue; }
                 let syn_ack = ticket > 0 && data.starts_with(&[0xff, 0x5a]) && data.get(4) == Some(&0xc0);
-                let start = WriteStart { id, generation: token, startup_detect, ticket, syn_ack };
+                let start = WriteStart { id, generation: token, startup_detect, ticket, syn_ack,
+                    hud_start: hud_first.then(AtomicBool::default) };
                 let frame_bytes = data.len();
                 let metadata = if startup_detect { "link=startup_detect_after_screen_setup".into() } else { frame_diagnostic(&data) };
                 if let Some(tunnel) = tunnel.as_mut() {
@@ -994,9 +1012,9 @@ mod tests {
         assert!(!mark_ready(76, true)); assert!(!can_keep_session());
         for _ in 0..4 { assert!(send(77, 0, vec![1,2,3], 0, 0)); }
         assert!(!mark_ready(77, true));
-        match rx.try_recv().unwrap() { Outbound::Frame(0, data, None, 0)=>assert_eq!(data,vec![1,2,3]), _=>panic!("barrier overtook frame") }
+        match rx.try_recv().unwrap() { Outbound::Frame(0, data, None, 0, false)=>assert_eq!(data,vec![1,2,3]), _=>panic!("barrier overtook frame") }
         assert!(mark_ready(77, true)); assert!(!can_keep_session());
-        for _ in 0..3 { assert!(matches!(rx.try_recv().unwrap(), Outbound::Frame(0, _, None, 0))); }
+        for _ in 0..3 { assert!(matches!(rx.try_recv().unwrap(), Outbound::Frame(0, _, None, 0, false))); }
         let token=match rx.try_recv().unwrap() { Outbound::Ready(t)=>t, _=>panic!("expected barrier") };
         ready_written(77,token);
         assert!(can_keep_generation(77)); assert!(!can_keep_generation(76));
@@ -1030,11 +1048,11 @@ mod tests {
         assert!(!mark_ready_generation(999, Some(0), true));
         assert!(!mark_ready_generation(999, Some(0), false));
         assert_eq!(send_capacity(999, 0), None);
-        let Outbound::Frame(retired, _, _, _) = rx.try_recv().unwrap() else { panic!("expected old output"); };
+        let Outbound::Frame(retired, _, _, _, _) = rx.try_recv().unwrap() else { panic!("expected old output"); };
         assert!(!current_write(999, retired, false));
         assert!(!send(999, 0, vec![2], 0, 0));
         assert!(send(999, 1, vec![2], 0, 0));
-        let Outbound::Frame(current, _, _, _) = rx.try_recv().unwrap() else { panic!("expected fresh output"); };
+        let Outbound::Frame(current, _, _, _, _) = rx.try_recv().unwrap() else { panic!("expected fresh output"); };
         assert!(current_write(999, current, false));
         assert!(take_rtsp_end(999));
         assert!(!current_write(999, current, false));
@@ -1047,7 +1065,7 @@ mod tests {
         let _test_lock = OUTPUT_TEST_LOCK.lock();
         let id = 778;
         *HANDOFF.lock() = Handoff::new_session(id);
-        let start = WriteStart { id, generation: 0, startup_detect: false, ticket: -4, syn_ack: false };
+        let start = WriteStart { id, generation: 0, startup_detect: false, ticket: -4, syn_ack: false, hud_start: None };
         let waiting = start.prefix(
             1,
             std::future::pending::<std::io::Result<()>>,
@@ -1059,9 +1077,9 @@ mod tests {
         start.complete(false);
         assert_eq!(take_write_completions(id, 0), vec![4, -1]);
         assert!(mark_ready_generation(id, Some(0), false));
-        let old = WriteStart { id, generation: 0, startup_detect: false, ticket: 7, syn_ack: false };
+        let old = WriteStart { id, generation: 0, startup_detect: false, ticket: 7, syn_ack: false, hud_start: None };
         assert!(old.try_first_write(1, || panic!("retired packet reached the socket")).is_none());
-        let current = WriteStart { id, generation: 1, startup_detect: false, ticket: -8, syn_ack: false };
+        let current = WriteStart { id, generation: 1, startup_detect: false, ticket: -8, syn_ack: false, hud_start: None };
         assert_eq!(current.prefix(1, || std::future::ready(Ok(())), || Ok(1)).await.unwrap(), Some(1));
         current.complete(true);
         let completed = take_write_completions(id, 1);
@@ -1075,8 +1093,8 @@ mod tests {
         let _test_lock = OUTPUT_TEST_LOCK.lock();
         let id = 779;
         *HANDOFF.lock() = Handoff::new_session(id);
-        let optional = WriteStart { id, generation: 0, startup_detect: false, ticket: -4, syn_ack: false };
-        let required = WriteStart { id, generation: 0, startup_detect: false, ticket: 0, syn_ack: false };
+        let optional = WriteStart { id, generation: 0, startup_detect: false, ticket: -4, syn_ack: false, hud_start: None };
+        let required = WriteStart { id, generation: 0, startup_detect: false, ticket: 0, syn_ack: false, hud_start: None };
         let stop = HANDOFF.lock().register_ingress(&[0x52, 0x03]);
         assert!(optional.try_first_write(1, || panic!("optional write overtook STOP")).is_none());
         assert_eq!(required.try_first_write(1, || Ok(1)).unwrap().unwrap(), 1);
@@ -1095,6 +1113,25 @@ mod tests {
         clear_handoff(id);
     }
 
+    #[test]
+    fn hud_start_without_a_source_permit_is_terminal_but_retransmission_can_write() {
+        let _test_lock = OUTPUT_TEST_LOCK.lock();
+        let id = 782;
+        *HANDOFF.lock() = Handoff::new_session(id);
+        let first = WriteStart { id, generation: 0, startup_detect: false, ticket: -4, syn_ack: false,
+            hud_start: Some(AtomicBool::default()) };
+        assert!(first.try_first_write(1, || panic!("HUD start reached the socket without a source permit")).is_none());
+        first.complete(false);
+        assert_eq!(take_write_completions(id, 0), vec![4, -2]);
+        let retry = WriteStart { id, generation: 0, startup_detect: false, ticket: -5, syn_ack: false, hud_start: None };
+        assert_eq!(retry.try_first_write(1, || Ok(1)).unwrap().unwrap(), 1);
+        retry.complete(true);
+        let completed = take_write_completions(id, 0);
+        assert_eq!(completed[0], 5);
+        assert!(completed[1] >= 0);
+        clear_handoff(id);
+    }
+
     #[tokio::test]
     async fn enqueue_snapshots_only_the_syn_ack_whose_final_byte_has_been_written() {
         let _guard = OUTPUT_TEST_LOCK.lock();
@@ -1103,7 +1140,7 @@ mod tests {
         let ingress = Ingress::default();
         ingress.queue(false, &[0x80]);
         ingress.bind(id);
-        let start = WriteStart { id, generation: 0, startup_detect: false, ticket: 9, syn_ack: true };
+        let start = WriteStart { id, generation: 0, startup_detect: false, ticket: 9, syn_ack: true, hud_start: None };
         assert_eq!(start.try_first_write(3, || Ok(1)).unwrap().unwrap(), 1);
         ingress.queue(true, &[0x40]);
         start.finish_syn_ack(3, 1, || std::future::ready(Ok(())), |_| Ok(2)).await.unwrap();

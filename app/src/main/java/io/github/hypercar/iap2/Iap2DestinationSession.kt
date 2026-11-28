@@ -23,11 +23,13 @@ internal class Iap2DestinationSession(
         private set
     private var retired = false
     private var subscribed = false
+    private var sourceNameRequested = false
     private var subscriptionVersion = 0L
     private var authorizedSource: NavigationDestinationShare? = null
     private var queued: Exchange? = null
     private var awaitingResult: Exchange? = null
     val hasWrittenOffer get() = queued?.written == true
+    val isSubscribed get() = subscribed
 
     @Synchronized fun retireTransport() {
         retired = true
@@ -38,6 +40,7 @@ internal class Iap2DestinationSession(
         target.close()
         if (!retired) target = NavigationDestinationTarget()
         subscribed = false
+        sourceNameRequested = false
         subscriptionVersion++
         authorizedSource = null
         queued = null
@@ -59,24 +62,33 @@ internal class Iap2DestinationSession(
                     (frame.body.size == Iap2Csm.PARAM_HEADER_BYTES && field?.id == 0 && field.value.isEmpty())) {
                     if (!subscribed) log("DESTINATION: subscribed")
                     subscribed = true
+                    val requestsSourceName = field != null
+                    if (sourceNameRequested != requestsSourceName) {
+                        sourceNameRequested = requestsSourceName
+                        onRevoked?.invoke()
+                    }
                 }
             }
-            0x10dc -> if (frame.body.isEmpty() && subscribed) {
-                subscribed = false
-                subscriptionVersion++
-                queued = null
-                awaitingResult = null
-                onRevoked?.invoke()
-                log("DESTINATION: unsubscribed")
-            }
+            0x10dc -> if (frame.body.isEmpty()) unsubscribe(onRevoked)
             0x10dd -> receiveResult(frame.body)
         }
         return true
     }
 
-    fun offer(): Iap2QueuedControl? {
+    fun unsubscribe(onRevoked: (() -> Unit)?) {
+        if (!subscribed) return
+        subscribed = false
+        sourceNameRequested = false
+        subscriptionVersion++
+        queued = null
+        awaitingResult = null
+        onRevoked?.invoke()
+        log("DESTINATION: unsubscribed")
+    }
+
+    fun offer(allowStart: () -> Boolean = { true }): Iap2QueuedControl? {
         val share = authorizedSource ?: return null
-        if (!subscribed || queued?.share === share || !target.canClaim(share)) return null
+        if (!allowStart() || !subscribed || queued?.share === share || !target.canClaim(share)) return null
         val offer = Exchange(UUID.randomUUID().toString(), share, target, subscriptionVersion)
         queued = offer
         val destination = share.destination
@@ -86,19 +98,32 @@ internal class Iap2DestinationSession(
         fields += coordinates
         if (destination.address.isNotBlank()) fields += Iap2Csm.string(3, destination.address)
         fields += Iap2Csm.string(6, destination.locale)
-        fun canStart() = isAuthorized(offer) && offer.scope.canClaim(share)
+        val sourceName = requestedSourceName(share)
+        if (sourceName != null) fields += Iap2Csm.string(7, sourceName)
+        fun canStart() = allowStart() && isAuthorized(offer) && offer.scope.canClaim(share) &&
+            sourceName == requestedSourceName(share)
         return Iap2QueuedControl(
             Iap2Csm.Frame(0x10db, fields.reduce(ByteArray::plus)), ::canStart,
             commitStart = {
-                offer.started = canStart() && offer.scope.claim(share)
+                // STOP may retire the exchange before the notification of an actual write arrives.
+                val canConfirm = offer.scope.consumeWrittenShare(share)
+                offer.started = canConfirm && isAuthorized(offer)
                 if (offer.started) {
                     log("DESTINATION: offer started")
                 } else if (queued === offer) queued = null
                 offer.started
             },
             onWritten = { offer.written = offer.started },
+            onDiscarded = {
+                offer.scope.forgetPendingWrite(share)
+                if (queued === offer) queued = null
+            },
+            authorizeFirstWrite = { cancel -> offer.scope.reserveWrite(share, cancel) },
         )
     }
+
+    private fun requestedSourceName(share: NavigationDestinationShare): String? =
+        share.destination.sourceName?.takeIf { sourceNameRequested && it.isNotBlank() }
 
     private fun isAuthorized(offer: Exchange) = queued === offer && subscribed &&
         subscriptionVersion == offer.subscriptionVersion && target === offer.scope && authorizedSource === offer.share

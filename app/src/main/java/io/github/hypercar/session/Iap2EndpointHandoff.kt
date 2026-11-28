@@ -8,13 +8,19 @@ import io.github.hypercar.iap2.RfcommClose
 /** Called under the endpoint inbox lock, including receiver changes. */
 internal class Iap2EndpointHandoff(private val merge: (CarPlayEndpoint?, CarPlayEndpoint) -> CarPlayEndpoint) {
     private var cutoff = 0L
+    private val preservedRegistrations = mutableSetOf<Long>()
     private var waiting = false
     private var latest: CarPlayEndpoint? = null
     // One credential-bearing report and one route-only report can complement each other.
     private val uncommitted = linkedMapOf<Boolean, Iap2EndpointUpdate>()
 
     fun prepare(old: RfcommClose?) {
-        cutoff = maxOf(cutoff, old?.registrationCutoff ?: 0L)
+        if (old != null) {
+            val retained = old.preservedRegistrations.filter(::eligibleRegistration)
+            preservedRegistrations.removeAll(old::retires)
+            preservedRegistrations.addAll(retained)
+            cutoff = maxOf(cutoff, old.registrationCutoff)
+        }
         latest = latest?.takeIf(::eligible)
         for (update in uncommitted.values) {
             if (eligible(update.endpoint)) update.endpoint.whileSourceCurrent { update.commitDeferred(update.endpoint) }
@@ -32,6 +38,7 @@ internal class Iap2EndpointHandoff(private val merge: (CarPlayEndpoint?, CarPlay
     fun clear() {
         latest = null
         waiting = false
+        preservedRegistrations.clear()
         uncommitted.clear()
     }
 
@@ -57,5 +64,8 @@ internal class Iap2EndpointHandoff(private val merge: (CarPlayEndpoint?, CarPlay
     }
 
     private fun eligible(endpoint: CarPlayEndpoint): Boolean =
-        endpoint.sourceGeneration?.let { it.rfcommRegistration > cutoff && it.isCurrent } == true
+        endpoint.sourceGeneration?.let { eligibleRegistration(it.rfcommRegistration) && it.isCurrent } == true
+
+    private fun eligibleRegistration(registration: Long): Boolean =
+        registration > cutoff || registration in preservedRegistrations
 }

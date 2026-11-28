@@ -9,6 +9,40 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class RfcommSessionCloseTest {
+    @Test fun cancelledHandshakeCannotReplyToAnAlreadyBufferedDetect() {
+        val owner = RfcommTransport(Closeable {})
+        val engine = Iap2LinkEngine()
+        engine.start(0, passive = true)
+        engine.feed(Iap2LinkEngine.MARKER, 1)
+        owner.noteLocalStop()
+        assertThrows(java.io.InterruptedIOException::class.java) {
+            owner.writeOutput(engine) { fail("Detect echo reached the cancelled socket") }
+        }
+    }
+
+    @Test fun stopInterruptsAnInFlightDetectReply() {
+        val writing = CountDownLatch(1)
+        val closed = CountDownLatch(1)
+        val owner = RfcommTransport(Closeable { closed.countDown() })
+        val engine = Iap2LinkEngine()
+        engine.start(0, passive = true)
+        engine.feed(Iap2LinkEngine.MARKER, 1)
+        val writer = thread(isDaemon = true) {
+            owner.writeOutput(engine) {
+                writing.countDown()
+                closed.await()
+            }
+        }
+        try {
+            assertTrue(writing.await(2, TimeUnit.SECONDS))
+            owner.noteLocalStop()
+            assertTrue(closed.await(2, TimeUnit.SECONDS))
+        } finally {
+            closed.countDown()
+            writer.join(2000)
+        }
+    }
+
     @Test fun acceptBeforeWorkerLaunchBelongsToTheStopSnapshot() {
         val closed = mutableListOf<String>()
         val owners = RfcommConnections<Closeable>()

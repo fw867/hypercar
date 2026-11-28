@@ -447,7 +447,7 @@ impl CarLifeHub {
                 children.abort_all(); while children.join_next().await.is_some() {}
                 queue.lock().clear();
                 if let Some(mic) = config.microphone.as_ref() { mic.request(false); }
-                let _ = events_task.send(CarLifeEvent::Navigation(None));
+                let _ = events_task.send(CarLifeEvent::NavigationReset);
                 if stop.is_retired() {return;}
                 let mut evidence = protocol_progress.evidence();
                 evidence.video_sync = video_sync_received.as_ref().is_some_and(|ready| *ready.borrow());

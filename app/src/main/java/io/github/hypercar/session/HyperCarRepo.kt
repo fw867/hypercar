@@ -413,6 +413,7 @@ object HyperCarRepo {
     @Volatile private var lastHandoffInviteNudgeAt = 0L
     /** True while bound and waiting for ctrl invite / inbound iAP2 (not while streaming). */
     @Volatile private var awaitingCarInvitation = false
+    @Volatile private var retiredRetryInvitationAttempt = 0L
 
     /**
      * [Iap2Bluetooth.sessionStartCount] when this connect round started.
@@ -893,6 +894,7 @@ object HyperCarRepo {
     private fun claimInvitationRetry(retry: WaitingInvitationRetryPolicy.Request): Boolean = synchronized(ctrlNetworkLock) {
         fun claim(hasInvite: Boolean): Boolean {
             if (!retry.mayCommit(connectionAttemptId, awaitingCarInvitation, hasCurrentSession, streaming, hasInvite)) return false
+            retiredRetryInvitationAttempt = retry.attempt
             awaitingCarInvitation = false
             return true
         }
@@ -1535,6 +1537,7 @@ object HyperCarRepo {
         advertiser: CarPlayCtrlAdvertiser,
         selected: CtrlInvitation<Network>? = null,
     ): CtrlInvitation<Network>? {
+        if (advertiser.attemptId != 0L && retiredRetryInvitationAttempt == advertiser.attemptId) return null
         val invite = selected ?: advertiser.lastInvitation ?: return null
         val now = SystemClock.elapsedRealtime()
         if (invite.isOn(boundNetwork) && cachedHotspotMatchesTarget() &&
@@ -1543,6 +1546,25 @@ object HyperCarRepo {
             log("CTRL: 忽略过期/跨网络/旧目标邀请 profile=${headUnitProfile.id} age=${now - invite.receivedAtMillis}ms inviteNetwork=${invite.network} currentNetwork=$boundNetwork")
         }
         return null
+    }
+
+    private fun currentCafeInvitation(source: CarPlayCtrlAdvertiser, invite: CtrlInvitation<Network>, peer: String): Boolean {
+        val attempt = source.attemptId
+        val age = SystemClock.elapsedRealtime() - invite.receivedAtMillis
+        return sessionLive.get() && connectionAttemptId == attempt && retiredRetryInvitationAttempt != attempt &&
+            !userDisconnectRequested && ctrlAdvertiser === source && headUnitProfile.id == "bmw_id85" &&
+            source.observedInvitation() === invite && invite.isOn(boundNetwork) && invite.network != unverifiedInvitationNetwork &&
+            age in 0L..HeadUnitActivationPolicy.FRESH_INVITE_MILLIS && cachedHotspotMatchesTarget() &&
+            peer.equals(wifiReceiverMac ?: sessionReceiverMac ?: id85InvitationPeer(attempt), ignoreCase = true) &&
+            io.github.hypercar.bluetooth.CarTargetPolicy.acceptsIncoming(SettingsStore.targetCarMac, peer)
+    }
+
+    // Admission may hold the Bluetooth monitor while the advertiser is delivering a callback.
+    internal fun prefersCtrlOverCafe(peer: String?): Boolean {
+        val source = ctrlAdvertiser ?: return false
+        if (peer == null) return false
+        val invite = source.observedInvitation() ?: return false
+        return currentCafeInvitation(source, invite, peer)
     }
 
     /** Called under autoConnectChanges by both known-network discovery paths. */
@@ -1733,7 +1755,7 @@ object HyperCarRepo {
                 if (network != expected || sessionNetworkMonitor !== this) return
                 val owner = this
                 request?.monitorLost(losses.attempt, network)
-                val endOldRfcomm = losses.first(network) { iap2?.captureSessionClose() }
+                val endOldRfcomm = losses.first(network) { iap2?.captureSessionClose(losses.attempt, network.networkHandle) }
                 if (recoverActivationWifiLoss(credentials) { wifiLosses === losses && sessionNetworkMonitor === owner && boundNetwork == network }) return
                 scope.launch {
                     autoConnectChanges.lock()
@@ -1964,10 +1986,11 @@ object HyperCarRepo {
                     if (port != null) ConnectionDiagnostics.Observation.MDNS_LOCAL_ANNOUNCEMENT
                     else ConnectionDiagnostics.Observation.MDNS_PEER_QUERY,
                     if (port != null) "IPv$family port=$port" else "IPv$family")
-            }, onNetworkInvitation = { source, network, stillCurrent ->
-                if (p.id == "bmw_id85" && sessionLive.get() && connectionAttemptId == diagnosticId &&
-                    ctrlAdvertiser === source && iap2 === coordinator && network == boundNetwork) {
-                    coordinator.retireCafeHandoff(diagnosticId, "ctrl-invite", stillCurrent)
+            }, onNetworkInvitation = { source, invite ->
+                val peer = wifiReceiverMac ?: sessionReceiverMac ?: id85InvitationPeer(diagnosticId)
+                if (p.id == "bmw_id85" && peer != null && iap2 === coordinator && currentCafeInvitation(source, invite, peer)) {
+                    coordinator.retireCafeHandoff(diagnosticId, "ctrl-invite",
+                        currentInvite = { iap2 === coordinator && currentCafeInvitation(source, invite, peer) }, peer = peer)
                 }
             })
             synchronized(ctrlNetworkLock) {
@@ -2308,6 +2331,7 @@ object HyperCarRepo {
                     continue@activation
                 }
                 endpoint = verified
+                coordinator.claimWifiSource(endpoint.sourceGeneration, network.networkHandle)
                 val sockets = SessionSocketLease(network)
                 sessionSockets?.invalidate()
                 sessionSockets = sockets
@@ -3355,7 +3379,9 @@ object HyperCarRepo {
         joiner = WifiJoiner(context, connectionAttemptId, diagnostic = ::log, maySubmitRequest = { maySubmitRequest(joiner) }) { attempt, network ->
             val losses = wifiLosses
             if (wifiJoiner !== joiner) return@WifiJoiner {}
-            val endOldRfcomm = losses.takeIf { it.attempt == attempt }?.first(network) { iap2?.captureSessionClose() }
+            val endOldRfcomm = losses.takeIf { it.attempt == attempt }?.first(network) {
+                iap2?.captureSessionClose(attempt, network.networkHandle)
+            }
             return@WifiJoiner { onLoss(attempt, endOldRfcomm) }
         }
         return joiner
@@ -4111,7 +4137,8 @@ object HyperCarRepo {
             // The native terminal and both Android callbacks can arrive in any order. Only a
             // terminal that will actually tear down this engine participates in the snapshot.
             val endOldRfcomm = if (state == "failed" || state == "ended") {
-                losses.first(checkNotNull(engineNetwork)) { iap2?.captureSessionClose() }
+                val network = checkNotNull(engineNetwork)
+                losses.first(network) { iap2?.captureSessionClose(losses.attempt, network.networkHandle) }
             } else null
             log("CORE: [$state] $detail")
             if (state in setOf("ended", "failed", "error", "stopping")) {

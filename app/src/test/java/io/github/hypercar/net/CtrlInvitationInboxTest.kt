@@ -100,7 +100,7 @@ class CtrlInvitationInboxTest {
         val slots = BmwCafeReservations<Closeable>()
         val invited = mutableListOf<String>()
         val requests = CtrlInvitationInbox<String, String, String> { epoch, value ->
-            slots.retire(1, epoch::isCurrent)
+            slots.retire(1, currentInvite = epoch::isCurrent)
             invited += value
         }
         val a = requests.select("A")!!

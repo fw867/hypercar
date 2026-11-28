@@ -1,6 +1,6 @@
 //! Assistant/navigation output negotiation; resource ownership is managed by the caller.
 use std::{sync::Arc,time::Duration};
-use crate::{airplay::{AirplayParams,SocketProvider},audio_out::AudioOut,bplist::{self,Value},rtsp::{RtspChannel,RtspMessage}};
+use crate::{airplay::{AirplayParams,SocketProvider},audio_out::AudioOut,bplist::{self,Value},rtsp::{CheckedWrite,RequestError,RtspChannel,RtspMessage}};
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub enum Kind { Speech, Navigation }
@@ -13,6 +13,7 @@ pub struct CloseState {
 #[derive(Debug)]
 pub struct OpenError {
     pub message:String,
+    pub withdrawn:bool,
     /// True only when no receiver mutation occurred, or all required cleanup ACKs arrived.
     pub cleanup_confirmed:bool,
     pub cleanup_state:CloseState,
@@ -34,8 +35,8 @@ pub fn supports(info:&Value,kind:Kind)->bool {
         f.get("audioType").and_then(Value::as_str)==Some(kind.label()) &&
         f.get("audioOutputFormats").and_then(Value::as_int).is_some_and(|bits|bits>=0 && bits & kind.format()!=0))
 }
-pub async fn open(control:&Arc<RtspChannel>,factory:&Arc<dyn SocketProvider>,params:&AirplayParams,shared:&[u8;32],info:&Value,kind:Kind)->Result<AudioOut,OpenError> {
-    open_at(control,factory,&params.car_ip,params.airplay_port,shared,info,kind).await
+pub async fn open(control:&Arc<RtspChannel>,factory:&Arc<dyn SocketProvider>,params:&AirplayParams,shared:&[u8;32],info:&Value,kind:Kind,check:Option<CheckedWrite<'_>>)->Result<AudioOut,OpenError> {
+    open_at(control,factory,&params.car_ip,params.airplay_port,shared,info,kind,check).await
 }
 fn latency_ms(info:&Value,kind:Kind)->i64 {
     // Both negotiated Opus formats decode to 16-bit mono. 32 is the R14G17 Opus compression selector.
@@ -70,28 +71,32 @@ fn response(reply:&RtspMessage,kind:Kind,id:i64)->Result<(u16,Option<u16>),Strin
     }else{None};
     Ok((data,control))
 }
-async fn duck(control:&Arc<RtspChannel>,enabled:bool)->Result<(),String> {
+async fn duck(control:&RtspChannel,enabled:bool,check:Option<CheckedWrite<'_>>)->Result<(),RequestError> {
     // xiap2 0x41bc0/0x42188: values are command parameters, not RTSP headers.
     let body=bplist::encode(&Value::dict(vec![("type",Value::str(if enabled{"duckAudio"}else{"unduckAudio"})),
         ("params",Value::dict(vec![("durationMs",Value::real(100.0)),("volume",Value::real(if enabled{-12.0}else{0.2}))]))]));
-    let reply=control.request("POST","/command",&body,"application/x-apple-binary-plist",&[],Duration::from_secs(3)).await.map_err(|e|e.to_string())?;
-    ack(&reply)
+    let reply=control.request_plist_while("POST","/command",&body,Duration::from_secs(3),check).await?;
+    ack(&reply).map_err(RequestError::from)
 }
-async fn open_at(control:&Arc<RtspChannel>,factory:&Arc<dyn SocketProvider>,host:&str,port:u16,shared:&[u8;32],info:&Value,kind:Kind)->Result<AudioOut,OpenError> {
-    if !supports(info,kind){return Err(OpenError{message:format!("{} output format unsupported",kind.label()),cleanup_confirmed:true,cleanup_state:CloseState::default()});}
+async fn open_at(control:&Arc<RtspChannel>,factory:&Arc<dyn SocketProvider>,host:&str,port:u16,shared:&[u8;32],info:&Value,kind:Kind,check:Option<CheckedWrite<'_>>)->Result<AudioOut,OpenError> {
+    let before_write = |message, withdrawn| OpenError { message, withdrawn, cleanup_confirmed: true, cleanup_state: CloseState::default() };
+    if !supports(info,kind){return Err(before_write(format!("{} output format unsupported",kind.label()), false));}
     // Fail before muting the receiver or allocating its stream if local Opus is unavailable.
-    let _preflight=crate::opus_encode::OpusEncoder::new(kind.rate(),kind.spf()).map_err(|e|OpenError{message:format!("Opus preflight: {e}"),cleanup_confirmed:true,cleanup_state:CloseState::default()})?;
+    let _preflight=crate::opus_encode::OpusEncoder::new(kind.rate(),kind.spf()).map_err(|e| before_write(format!("Opus preflight: {e}"), false))?;
     if kind==Kind::Navigation {
-        if let Err(error)=duck(control,true).await {
-            let cleanup=duck(control,false).await;
-            return Err(OpenError{message:format!("duck failed: {error}; unduck cleanup={cleanup:?}"),cleanup_confirmed:cleanup.is_ok(),
+        if let Err(error)=duck(control,true,check).await {
+            if matches!(error, RequestError::Withdrawn) { return Err(before_write(error.to_string(), true)); }
+            let cleanup=duck(control,false,None).await;
+            return Err(OpenError{message:format!("duck failed: {error}; unduck cleanup={cleanup:?}"),withdrawn:false,cleanup_confirmed:cleanup.is_ok(),
                 cleanup_state:CloseState{unducked:cleanup.is_ok(),torn_down:true}}); // SETUP was never attempted.
         }
     }
     let id=crate::airplay::random_positive_i64();
     let body=setup(info,kind,id);
-    let result: Result<AudioOut, String> = async {
-        let reply=control.request("SETUP",&crate::rtsp_uri::audio_uri(host,port),&body,"application/x-apple-binary-plist",&[],Duration::from_secs(8)).await.map_err(|e|e.to_string())?;
+    let reply=control.request_plist_while("SETUP",&crate::rtsp_uri::audio_uri(host,port),&body,Duration::from_secs(8),check).await;
+    let withdrawn = matches!(reply, Err(RequestError::Withdrawn));
+    let result: Result<AudioOut, String> = (|| {
+        let reply=reply.map_err(|e|e.to_string())?;
         let (data_port,control_port)=response(&reply,kind,id)?;
         control.udp_media.set(kind.stream_type(), true);
         let data=factory.open_udp(host,data_port).ok_or("cannot open audio data socket")?;
@@ -109,20 +114,20 @@ async fn open_at(control:&Arc<RtspChannel>,factory:&Arc<dyn SocketProvider>,host
             .map_err(|e| e.to_string())?;
         output.observe_d4(control.trace_id(), id, control_port.unwrap_or(0));
         Ok(output)
-    }.await;
+    })();
     match result {
         Ok(out)=>Ok(out),
         // Even a malformed 200 or lost reply may have allocated a receiver stream.
         Err(error)=>{
-            let mut cleanup_state=CloseState::default();
+            let mut cleanup_state=CloseState { torn_down: withdrawn, ..CloseState::default() };
             let cleanup=close(control,kind,&mut cleanup_state).await;
-            Err(OpenError{message:format!("{} SETUP failed: {error}; cleanup={cleanup:?}",kind.label()),cleanup_confirmed:cleanup.is_ok(),cleanup_state})
+            Err(OpenError{message:format!("{} SETUP failed: {error}; cleanup={cleanup:?}",kind.label()),withdrawn,cleanup_confirmed:cleanup.is_ok(),cleanup_state})
         }
     }
 }
 pub async fn close(control:&Arc<RtspChannel>,kind:Kind,state:&mut CloseState)->Result<(),String> {
     // Caller drops/stops AudioOut first. Firmware restores duck before retiring AltAudio.
-    let unduck=if kind==Kind::Navigation && !state.unducked {duck(control,false).await}else{Ok(())};
+    let unduck=if kind==Kind::Navigation && !state.unducked {duck(control,false,None).await}else{Ok(())};
     if unduck.is_ok() {state.unducked=true;}
     let body=bplist::encode(&Value::dict(vec![("streams",Value::array(vec![Value::dict(vec![("type",Value::int(kind.stream_type()))])]))]));
     control.udp_media.set(kind.stream_type(), false);
@@ -214,7 +219,7 @@ mod tests {
     }
     #[tokio::test] async fn rejected_duck_is_undone_without_setup_and_close_still_tears_down_on_unduck_error(){
         let(c,mut peer)=channel().await;let cc=c.clone();let mut buf=Vec::new();
-        let task=tokio::spawn(async move{let f:Arc<dyn SocketProvider>=Arc::new(Factory{fail:false});open_at(&cc,&f,"127.0.0.1",7000,&[1;32],&info(Kind::Navigation),Kind::Navigation).await});
+        let task=tokio::spawn(async move{let f:Arc<dyn SocketProvider>=Arc::new(Factory{fail:false});open_at(&cc,&f,"127.0.0.1",7000,&[1;32],&info(Kind::Navigation),Kind::Navigation,None).await});
         let m=next(&mut peer,&mut buf).await;reply(&mut peer,&m,Some(Value::dict(vec![("status",Value::int(1))]))).await;
         let m=next(&mut peer,&mut buf).await;assert_eq!(bplist::parse(&m.body).unwrap().get("type").and_then(Value::as_str),Some("unduckAudio"));reply(&mut peer,&m,None).await;
         assert!(task.await.unwrap().err().unwrap().cleanup_confirmed);
@@ -227,7 +232,7 @@ mod tests {
         for (kind,fail,bad_echo,cleanup_failure) in [(Kind::Speech,false,false,false),(Kind::Navigation,false,false,false),(Kind::Navigation,true,false,false),(Kind::Speech,false,true,false),(Kind::Speech,true,false,true)] {
             let(c,mut peer)=channel().await;let task_c=c.clone();
             let factory:Arc<dyn SocketProvider>=Arc::new(Factory{fail});
-            let mut task=Some(tokio::spawn(async move{open_at(&task_c,&factory,"127.0.0.1",7000,&[7;32],&info(kind),kind).await}));
+            let mut task=Some(tokio::spawn(async move{open_at(&task_c,&factory,"127.0.0.1",7000,&[7;32],&info(kind),kind,None).await}));
             let mut buf=Vec::new();
             if kind==Kind::Navigation {
                 let m=next(&mut peer,&mut buf).await;assert!(m.first_line.starts_with("POST /command "));

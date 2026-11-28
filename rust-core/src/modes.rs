@@ -121,7 +121,12 @@ pub struct Modes {
     phone_epoch: u64,
     pending_call_borrow: Option<(u64, u64)>,
     navigation_epoch: u64,
+    navigation_receiver_epoch: u64,
+    unconfirmed_navigation: Option<UnconfirmedNavigation>,
 }
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum UnconfirmedNavigation { MayDiffer, MayHaveReleased }
 
 #[derive(Clone, Debug)]
 pub struct SpeechLease { generation:u64, borrow_generation:u64, borrowed:bool, mode:i64 }
@@ -130,8 +135,23 @@ impl SpeechLease { pub fn valid(&self,modes:&Modes)->bool { modes.speech_epoch==
 pub struct NavigationLease { generation:u64 }
 impl NavigationLease { pub fn valid(&self,modes:&Modes)->bool { modes.navigation_epoch==self.generation && modes.apps[2]==1 } }
 #[derive(Clone)]
+pub(crate) struct NavigationAudioLease(u64);
+impl NavigationAudioLease {
+    pub(crate) fn valid(&self, modes: &Modes) -> bool {
+        modes.apps[2] != 2 && modes.navigation_receiver_epoch == self.0
+    }
+}
+#[derive(Clone)]
 pub(crate) struct AuxTransition { base:(u64,u64,u64), next:Modes, speech:bool }
-impl AuxTransition { pub fn declaration(&self)->Vec<u8> { self.next.declaration() } }
+impl AuxTransition {
+    pub fn declaration(&self)->Vec<u8> { self.next.declaration() }
+
+    pub(crate) fn navigation_declaration(&self) -> Vec<u8> {
+        let app = Value::dict(vec![("appStateID", Value::int(3)), ("entity", Value::int(self.next.apps[2]))]);
+        bplist::encode(&Value::dict(vec![("type", Value::str("modesChanged")),
+            ("params", Value::dict(vec![("appStates", Value::array(vec![app]))]))]))
+    }
+}
 
 pub(crate) struct CallAudioLease { phone: u64, audio: u64 }
 
@@ -246,29 +266,71 @@ impl Modes {
         Some(AuxTransition{base:self.aux_generations(),next,speech:true})
     }
     pub(crate) fn navigation_begin(&self)->Option<(AuxTransition,NavigationLease)> {
-        if self.apps[2]!=0 {return None;}
+        (self.apps[2] == 0).then(|| self.navigation_claim())
+    }
+    pub(crate) fn navigation_reassert(&self, lease: &NavigationLease) -> Option<(AuxTransition, NavigationLease)> {
+        lease.valid(self).then(|| self.navigation_claim())
+    }
+    fn navigation_claim(&self) -> (AuxTransition, NavigationLease) {
         let mut next=self.clone(); next.apps[2]=1; next.navigation_epoch=self.navigation_epoch.wrapping_add(1);
         let lease=NavigationLease{generation:next.navigation_epoch};
-        Some((AuxTransition{base:self.aux_generations(),next,speech:false},lease))
+        (AuxTransition{base:self.aux_generations(),next,speech:false},lease)
     }
     pub(crate) fn navigation_end(&self,lease:&NavigationLease)->Option<AuxTransition> {
         if !lease.valid(self) {return None;}
         let mut next=self.clone(); next.apps[2]=0; next.navigation_epoch=self.navigation_epoch.wrapping_add(1);
         Some(AuxTransition{base:self.aux_generations(),next,speech:false})
     }
+    pub(crate) fn reconcile_unconfirmed_navigation(&self, receiver_epoch: u64) -> Option<AuxTransition> {
+        (self.navigation_receiver_epoch == receiver_epoch && self.apps[2] == 0 && self.unconfirmed_navigation.is_some())
+            .then(|| AuxTransition { base: self.aux_generations(), next: self.clone(), speech: false })
+    }
+    pub(crate) fn navigation_receiver_epoch(&self) -> u64 { self.navigation_receiver_epoch }
+    pub(crate) fn navigation_needs_reassertion(&self) -> bool {
+        matches!(self.unconfirmed_navigation, Some(UnconfirmedNavigation::MayHaveReleased))
+    }
+    pub(crate) fn publish_navigation(&mut self, proposal: &AuxTransition) -> Option<UnconfirmedNavigation> {
+        // A later claim write does not resolve a previously unacknowledged release.
+        let may_have_released = self.navigation_needs_reassertion() || (self.apps[2] == 1 && proposal.next.apps[2] == 0);
+        self.unconfirmed_navigation.replace(if may_have_released {
+            UnconfirmedNavigation::MayHaveReleased
+        } else {
+            UnconfirmedNavigation::MayDiffer
+        })
+    }
+    pub(crate) fn reject_navigation(&mut self, proposal: &AuxTransition, previous: Option<UnconfirmedNavigation>) {
+        if self.aux_transition_current(proposal) { self.unconfirmed_navigation = previous; }
+    }
+    pub(crate) fn wire_navigation(&self, native_pending: bool) -> Option<i64> {
+        (!native_pending && self.unconfirmed_navigation.is_none()).then_some(self.apps[2])
+    }
+    pub(crate) fn navigation_audio(&self) -> Option<NavigationAudioLease> {
+        (self.apps[2] != 2).then_some(NavigationAudioLease(self.navigation_receiver_epoch))
+    }
     fn aux_generations(&self)->(u64,u64,u64) {(self.speech_epoch,self.audio_borrow_epoch,self.navigation_epoch)}
+    pub(crate) fn aux_transition_current(&self, proposal: &AuxTransition) -> bool {
+        let base = self.aux_generations();
+        if proposal.speech {
+            base.0 == proposal.base.0 && base.1 == proposal.base.1
+        } else {
+            base.2 == proposal.base.2
+        }
+    }
     pub(crate) fn commit_aux(&mut self,proposal:&AuxTransition)->bool {
         // Only changed domains invalidate an acknowledged proposal. Merge the
         // touched fields so a receiver screen/other-app update is never reverted.
-        let base=self.aux_generations();
-        if if proposal.speech {base.0!=proposal.base.0 || base.1!=proposal.base.1}else{base.2!=proposal.base.2} {return false;}
+        if !self.aux_transition_current(proposal) { return false; }
         if proposal.speech {
             self.resources[1]=proposal.next.resources[1]; self.apps[0]=proposal.next.apps[0];
             self.speech=proposal.next.speech; self.speech_epoch=proposal.next.speech_epoch;
             self.audio_borrow_epoch=proposal.next.audio_borrow_epoch;
-        } else {self.apps[2]=proposal.next.apps[2];self.navigation_epoch=proposal.next.navigation_epoch;}
-        self.audio_epoch=self.audio_epoch.wrapping_add(1);
-        self.audio_change_epoch=self.audio_change_epoch.wrapping_add(1);
+            self.audio_epoch=self.audio_epoch.wrapping_add(1);
+            self.audio_change_epoch=self.audio_change_epoch.wrapping_add(1);
+        } else {
+            self.apps[2] = proposal.next.apps[2];
+            self.navigation_epoch = proposal.next.navigation_epoch;
+            self.unconfirmed_navigation = None;
+        }
         true
     }
     pub fn initial() -> Self { Self { speech: -1, playback_enabled: true, ..Self::default() } }
@@ -465,7 +527,11 @@ impl Modes {
             .map(|values| values.iter().any(|v| integer(v,"appStateID")==Some(id))).unwrap_or(false);
         if audio_request {next.audio_borrow_epoch=self.audio_borrow_epoch.wrapping_add(1);}
         if requested_app(1) {next.speech_epoch=self.speech_epoch.wrapping_add(1);}
-        if requested_app(3) {next.navigation_epoch=self.navigation_epoch.wrapping_add(1);}
+        if requested_app(3) && next.apps[2] != self.apps[2] {
+            next.navigation_epoch = self.navigation_epoch.wrapping_add(1);
+            next.navigation_receiver_epoch = self.navigation_receiver_epoch.wrapping_add(1);
+            next.unconfirmed_navigation = None;
+        }
         // Even an identical receiver take supersedes a pending local audio claim.
         if resource_request || params.get("appStates").and_then(Value::as_array).is_some_and(|s| !s.is_empty()) {
             next.audio_epoch = self.audio_epoch.wrapping_add(1);

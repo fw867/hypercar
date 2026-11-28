@@ -265,6 +265,7 @@ pub struct AudioOut {
     /** 首包 Marker 待打标记（打完即清）。 */
     marker_pending: bool,
     ownership: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    navigation_grant: Option<crate::aux_audio::NavigationAudioGrant>,
     blocked_samples: u64,
     aac: Option<crate::aac::AacEncoder>,
     aac_worker: Option<aac_worker::AacWorker>,
@@ -321,6 +322,7 @@ impl AudioOut {
             sync_seq: 0,
             marker_pending: true,
             ownership: None,
+            navigation_grant: None,
             blocked_samples: 0,
             aac: None,
             aac_worker: None,
@@ -552,6 +554,10 @@ impl AudioOut {
     /// 采集是原生小端，漏换序实测得到「沙沙声」（cardeck 2026-10-10 真车验证）。
     /// AAC receives little-endian PCM at the encoder input; its raw output is never byte-swapped.
     pub fn set_ownership(&mut self, ownership: std::sync::Arc<std::sync::atomic::AtomicBool>) { self.ownership = Some(ownership); }
+
+    pub(crate) fn set_navigation_grant(&mut self, grant: crate::aux_audio::NavigationAudioGrant) {
+        self.navigation_grant = Some(grant);
+    }
     pub fn owns_audio(&self) -> bool {
         self.ownership.as_ref().map(|v| v.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(true)
     }
@@ -865,7 +871,14 @@ impl AudioOut {
                 crate::call_audio::check_phone_endpoint(phone_endpoint)
                     .map_err(|reason| std::io::Error::new(std::io::ErrorKind::BrokenPipe, reason))?;
             }
-            socket2::SockRef::from(udp).send_with_flags(&wire, libc::MSG_DONTWAIT)
+            let write = || socket2::SockRef::from(udp).send_with_flags(&wire, libc::MSG_DONTWAIT);
+            if let Some(grant) = &self.navigation_grant {
+                let Some(result) = grant.while_valid(write) else {
+                    self.marker_pending = true;
+                    return Ok(());
+                };
+                result
+            } else { write() }
         };
         // A rejected generation never reaches the kernel. Consume the nonce only
         // on an actual attempt, even if that attempt reports a send error.
@@ -955,7 +968,11 @@ impl AudioOut {
         };
         let packet = build_sync_packet_for_frames(self.sync_seq, rtp_ts, ntp_nanos, frames);
         // Sync shares the audio pump with media. A full socket must not stall the next tick.
-        let result = socket2::SockRef::from(sync).send_with_flags(&packet, libc::MSG_DONTWAIT);
+        let write = || socket2::SockRef::from(sync).send_with_flags(&packet, libc::MSG_DONTWAIT);
+        let result = if let Some(grant) = &self.navigation_grant {
+            let Some(result) = grant.while_valid(write) else { return Ok(()); };
+            result
+        } else { write() };
         if let Err(error) = &result {
             crate::audio_diagnostics::observe_port_refusal(self.port_refusal.as_ref(), error);
         }

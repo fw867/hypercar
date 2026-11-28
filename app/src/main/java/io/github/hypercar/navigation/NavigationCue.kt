@@ -1,5 +1,8 @@
 package io.github.hypercar.navigation
 
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.StampedLock
+
 /** Actual source facts only, from a map notification or verified CarWith navigation message. */
 data class NavigationCue(
     val instruction: String,
@@ -13,6 +16,9 @@ data class NavigationCue(
     val remainingTimeSeconds: Long? = null,
     val lanes: List<NavigationLane> = emptyList(),
     val destinationToShare: NavigationDestinationShare? = null,
+    val estimatedArrivalEpochSeconds: Long? = null,
+    /** Locally observed route lifecycle, shared by a source's successive guidance samples. */
+    val routeGeneration: Long? = null,
 ) {
     init {
         require(state in 0..6)
@@ -22,6 +28,42 @@ data class NavigationCue(
         require(distanceMeters == null || distanceMeters in 0..0xffffffffL)
         require('\u0000' !in instruction && instruction.encodeToByteArray().size <= 512)
     }
+}
+
+internal object NavigationRouteGenerations {
+    private val generation = AtomicLong()
+    fun next(): Long = generation.incrementAndGet()
+}
+
+/** Orders source publication and the first write of navigation requests. */
+internal object HudSourceWrites {
+    private val lock = StampedLock()
+
+    fun <T> publish(change: () -> T): T {
+        val stamp = lock.writeLock()
+        try {
+            return change()
+        } finally {
+            lock.unlockWrite(stamp)
+        }
+    }
+
+    fun acquireIfCurrent(check: () -> Boolean): Long = checkStamp(lock.readLock(), check)
+
+    fun tryAcquireIfCurrent(check: () -> Boolean): Long = checkStamp(lock.tryReadLock(), check)
+
+    private fun checkStamp(stamp: Long, check: () -> Boolean): Long {
+        if (stamp == 0L) return 0L
+        var current = false
+        try {
+            current = check()
+            return if (current) stamp else 0L
+        } finally {
+            if (!current) lock.unlockRead(stamp)
+        }
+    }
+
+    fun release(stamp: Long) = lock.unlockRead(stamp)
 }
 
 /** AMap LaneAction, not the maneuver enum. Foreground 255 means this lane is not recommended. */
@@ -35,6 +77,8 @@ data class NavigationDestination(
     val locale: String,
     val name: String = "",
     val address: String = "",
+    /** Name supplied by the navigation app authorizing this handoff. */
+    val sourceName: String? = null,
 ) {
     init {
         require(latitude in -90.0..90.0 && longitude in -180.0..180.0)
@@ -42,6 +86,7 @@ data class NavigationDestination(
         require(locale.isNotBlank() && locale.encodeToByteArray().size <= 32 && '\u0000' !in locale)
         require(name.encodeToByteArray().size <= 512 && '\u0000' !in name)
         require(address.encodeToByteArray().size <= 512 && '\u0000' !in address)
+        require(sourceName == null || '\u0000' !in sourceName && sourceName.encodeToByteArray().size <= 64)
     }
 }
 
@@ -49,10 +94,12 @@ data class NavigationDestination(
 class NavigationDestinationTarget internal constructor() {
     private var active = true
     private var current: NavigationDestinationShare? = null
+    private var cancelPendingWrite: (() -> Unit)? = null
 
     @Synchronized
     fun authorize(destination: NavigationDestination): NavigationDestinationShare? {
         if (!active) return null
+        revokePendingWrite()
         return NavigationDestinationShare(destination).also { current = it }
     }
 
@@ -72,16 +119,36 @@ class NavigationDestinationTarget internal constructor() {
     internal fun canClaim(share: NavigationDestinationShare): Boolean = isCurrent(share) && !share.claimed
 
     @Synchronized
-    internal fun claim(share: NavigationDestinationShare): Boolean {
+    internal fun reserveWrite(share: NavigationDestinationShare, cancel: () -> Unit): Boolean {
         if (!canClaim(share)) return false
-        share.claimed = true
+        cancelPendingWrite = cancel
         return true
     }
 
     @Synchronized
+    internal fun forgetPendingWrite(share: NavigationDestinationShare) {
+        if (current === share) cancelPendingWrite = null
+    }
+
+    @Synchronized
+    internal fun consumeWrittenShare(share: NavigationDestinationShare): Boolean {
+        val canConfirm = canClaim(share)
+        forgetPendingWrite(share)
+        share.claimed = true
+        return canConfirm
+    }
+
+    @Synchronized
     internal fun close() {
+        revokePendingWrite()
         active = false
         current = null
+    }
+
+    private fun revokePendingWrite() {
+        // Native cancellation and the non-blocking first socket write share the writer lock.
+        cancelPendingWrite?.invoke()
+        cancelPendingWrite = null
     }
 }
 

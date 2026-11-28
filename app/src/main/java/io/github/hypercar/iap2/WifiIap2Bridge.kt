@@ -47,6 +47,11 @@ object WifiIap2Bridge {
         if (active?.id == id) { active?.close(); active = null }
     }
 
+    internal fun canStartHudWrite(id: Long, generation: Long, ticket: Long): Boolean {
+        val worker = synchronized(this) { active?.takeIf { it.id == id && !it.closed } } ?: return false
+        return worker.canStartHudWrite(generation, ticket)
+    }
+
     @Synchronized private fun isCurrent(id: Long): Boolean = active?.let { it.id == id && !it.closed } == true
 
     @Synchronized private fun publishVehicle(worker: Worker, status: Iap2VehicleStatus) {
@@ -79,7 +84,7 @@ object WifiIap2Bridge {
     }
 
     private class Worker(val id: Long, deviceId: String, deviceName: String, profileId: String) {
-        private class Output(val bytes: ByteArray, val trace: Iap2LinkEngine.HudFrame?, val ticket: Long)
+        private class Output(val bytes: ByteArray, val trace: Iap2LinkEngine.HudFrame?, val ticket: Long, val hudFirst: Boolean)
         private val pending = ArrayDeque<Output>()
         // Reserve one slot for the ordered screen SETUP signal.
         val input = ArrayBlockingQueue<Input>(65)
@@ -101,6 +106,7 @@ object WifiIap2Bridge {
             socketWriteFeedback = true,
             destinationTransportCurrent = { generation -> RustCoreBridge.nativeWifiIap2DestinationCurrent(id, generation) })
         val destinationTarget get() = protocol.destinationTarget
+        fun canStartHudWrite(generation: Long, ticket: Long) = !closed && protocol.canStartHudWrite(generation, ticket)
         val thread = Thread({
             var lastPhase = ""
             var queuedFrames = 0L
@@ -134,7 +140,8 @@ object WifiIap2Bridge {
                     }
                     RustCoreBridge.nativeTakeWifiIap2Writes(id, activeGeneration)?.let { completed ->
                         for (index in completed.indices step 2) {
-                            protocol.socketWriteFinished(completed[index], completed[index + 1].takeIf { it >= 0 })
+                            val result = completed[index + 1]
+                            protocol.socketWriteFinished(completed[index], result.takeIf { it >= 0 }, sourceRevoked = result == -2L)
                         }
                     }
                     // Drain a fixed set of earlier ingress before expiry or destination confirmation.
@@ -166,7 +173,7 @@ object WifiIap2Bridge {
                         val write = socketWrites[offset]
                         val ticket = if (write?.cancellable == true) -write.ticket else write?.ticket ?: 0L
                         offset += it.size
-                        pending.addLast(Output(it, hud, ticket))
+                        pending.addLast(Output(it, hud, ticket, write?.hudFirst == true))
                     }
                     val capacity = RustCoreBridge.nativeWifiIap2SendCapacity(id, activeGeneration)
                     if (capacity < 0) break
@@ -174,7 +181,7 @@ object WifiIap2Bridge {
                     for (index in 0 until minOf(capacity, pending.size)) {
                         val frame = pending.first()
                         if (!RustCoreBridge.nativeSendIap2(id, activeGeneration, frame.bytes,
-                                frame.trace?.messageId ?: 0, frame.trace?.serial ?: 0, frame.ticket)) {
+                                frame.trace?.messageId ?: 0, frame.trace?.serial ?: 0, frame.ticket, frame.hudFirst)) {
                             accepted = false
                             break
                         }

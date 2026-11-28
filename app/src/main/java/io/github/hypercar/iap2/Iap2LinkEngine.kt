@@ -39,6 +39,7 @@ class Iap2LinkEngine(
     private val reliableTransport: Boolean = false,
     private val declaredWindow: Int = PHONE_DECLARED_MAX_OUTGOING,
     private val socketWriteFeedback: Boolean = false,
+    private val rfcommHudWriteFeedback: Boolean = false,
 ) {
     enum class State { IDLE, NEGOTIATING, NORMAL, DEAD }
 
@@ -118,6 +119,8 @@ class Iap2LinkEngine(
         val canStart: () -> Boolean,
         val commitStart: (() -> Boolean)?,
         val onDiscarded: (() -> Unit)?,
+        val authorizeFirstWrite: ((Long) -> Boolean)?,
+        val isHud: Boolean,
     ) {
         var started = false
     }
@@ -141,12 +144,12 @@ class Iap2LinkEngine(
         var retryDueAt: Long? = null
     }
 
-    private class PendingStart(val packet: Packet) {
+    private class PendingStart(val packet: Packet, val receiveWatermark: Int) {
         var acknowledged = false
         var cancelRequested = false
         var revoked = false
     }
-    internal data class SocketWrite(val offset: Int, val ticket: Long, val cancellable: Boolean)
+    internal data class SocketWrite(val offset: Int, val ticket: Long, val cancellable: Boolean, val hudFirst: Boolean = false)
     internal var withdrawSocketWrite: ((Long) -> Unit)? = null
     private var nextWriteTicket = 0L
     private var pendingStart: PendingStart? = null
@@ -155,7 +158,11 @@ class Iap2LinkEngine(
 
     internal fun takeSocketWrites(): List<SocketWrite> = socketWrites.toList().also { socketWrites.clear() }
 
-    internal fun socketWriteFinished(ticket: Long, writtenAt: Long?) {
+    internal fun canStartRfcommHudWrite(ticket: Long): Boolean = pendingStart?.let {
+        it.packet.writeTicket == ticket && !it.cancelRequested && !it.revoked && it.packet.bulk?.canStart() == true
+    } == true
+
+    internal fun socketWriteFinished(ticket: Long, writtenAt: Long?, sourceRevoked: Boolean = false) {
         if (state == State.DEAD) return
         val onWritten = writeCallbacks.remove(ticket)
         val start = pendingStart
@@ -166,14 +173,19 @@ class Iap2LinkEngine(
             if (writtenAt == null) {
                 val tail = sendBacklog.filter { it.bulk === group }
                 sendBacklog.removeAll { it.bulk === group }
-                if (!start.revoked && group.canStart()) {
+                if (!sourceRevoked && !start.revoked && group.canStart()) {
                     val index = sendBacklog.indexOfFirst { it.bulk?.started == false }
                     sendBacklog.addAll(if (index < 0) sendBacklog.size else index, listOf(packet) + tail)
                 } else group.onDiscarded?.invoke()
-                if (!zeroRetryAndAckMode) pendingReliableAck = true
+                if (reliableTransport && !zeroRetryAndAckMode) pendingReliableAck = true
                 return
             }
             // No other data sequence was assigned while this first fragment was cancellable.
+            if (rfcommHudWriteFeedback) {
+                lastOutputMillis = writtenAt
+                onFrameSent?.invoke(CONTROL_ACKNOWLEDGEMENT, packet.sequence, start.receiveWatermark,
+                    packet.sessionId ?: controlSessionId(), packet.payload.size)
+            }
             sentSequence = packet.sequence
             group.started = true
             group.commitStart?.invoke()
@@ -182,6 +194,8 @@ class Iap2LinkEngine(
                 unacknowledged += packet
                 packet.deadlineMillis = writtenAt + retryTimeoutMillis
                 updateRetransmitDeadline()
+            } else if (packet.awaitAck && !reliableTransport && agreedRetryCount == 0) {
+                lastSentAcknowledged = packet.sequence
             }
             if (start.acknowledged) handleAcknowledgement(packet.sequence, writtenAt)
             onWritten?.invoke()
@@ -296,6 +310,8 @@ class Iap2LinkEngine(
         mfiResults.forEach { log("MFi RFCOMM discarded ${it.label} reason=$reason") }
     }
     private val receive = ReceiveBuffer()
+    private var rfcommControlPrefixOffset: Long? = null
+    private var rfcommControlPrefixDeadline = 0L
 
     private var markerDeadline: Long? = null
     private var syncDeadline: Long? = null
@@ -329,6 +345,16 @@ class Iap2LinkEngine(
     private var previouslyNegotiated = false
     internal val hasPartialInput: Boolean get() =
         receive.size > 1 || (receive.size == 1 && receive[0] == 0xff.toByte())
+
+    internal val partialControlInputOffset: Long? get() {
+        if (!hasPartialInput) return null
+        if (receive.size >= 2 && u8(receive[1]) == 0x5a) {
+            // A standalone ACK or another session cannot contain a control message.
+            if (receive.size >= 4 && ((u8(receive[2]) shl 8) or u8(receive[3])) <= HEADER_BYTES) return null
+            if (receive.size >= 8 && u8(receive[7]) != controlSessionId()) return null
+        }
+        return receive.offset
+    }
 
     /** Same-transport detection restart: consumers must discard partial CSMs from the old link. */
     internal var onDetectionRetiring: (() -> Unit)? = null
@@ -380,6 +406,15 @@ class Iap2LinkEngine(
             offset += count
             while (parseAvailable(nowMillis) && state != State.DEAD) {
                 // 排空所有完整帧
+            }
+        }
+        if (rfcommHudWriteFeedback) {
+            val offset = if (state == State.NORMAL && (receive.size < 2 || u8(receive[1]) == 0x5a)) {
+                partialControlInputOffset
+            } else null
+            if (offset != rfcommControlPrefixOffset) {
+                rfcommControlPrefixOffset = offset
+                rfcommControlPrefixDeadline = nowMillis + RFCOMM_HUD_FRAGMENT_GRACE_MILLIS
             }
         }
     }
@@ -497,10 +532,11 @@ class Iap2LinkEngine(
         commitStart: (() -> Boolean)? = null,
         onWritten: (() -> Unit)? = null,
         onDiscarded: (() -> Unit)? = null,
+        authorizeFirstWrite: ((Long) -> Boolean)? = null,
     ): Boolean {
         val limit = (peerSynchronization?.maxLength ?: 0xffff) - HEADER_BYTES - 1
         if (state != State.NORMAL || limit <= 0) return false
-        val group = BulkMessage(canStart, commitStart, onDiscarded)
+        val group = BulkMessage(canStart, commitStart, onDiscarded, authorizeFirstWrite, hudMessageId != 0)
         var offset = 0
         while (offset < bytes.size) {
             val end = minOf(bytes.size, offset + limit)
@@ -511,14 +547,14 @@ class Iap2LinkEngine(
         return true
     }
 
-    internal fun discardUnstartedBulkControl() {
+    internal fun discardUnstartedBulkControl(discardHud: Boolean = false) {
         val start = pendingStart
         val waitingGroup = start?.packet?.bulk
         val invalid = sendBacklog.mapNotNull { it.bulk }.toSet()
-            .filterTo(mutableSetOf()) { it !== waitingGroup && !it.started && !it.canStart() }
+            .filterTo(mutableSetOf()) { it !== waitingGroup && !it.started && (discardHud && it.isHud || !it.canStart()) }
         sendBacklog.removeAll { it.bulk in invalid }
         invalid.forEach { it.onDiscarded?.invoke() }
-        if (start != null && waitingGroup?.canStart() == false) {
+        if (start != null && waitingGroup != null && (discardHud && waitingGroup.isHud || !waitingGroup.canStart())) {
             start.revoked = true
             if (!start.cancelRequested) {
                 start.cancelRequested = true
@@ -529,11 +565,15 @@ class Iap2LinkEngine(
 
     internal fun flushBulkControl(
         nowMillis: Long, capacity: Int, allowBulkStart: Boolean = true, reserveForNewBulk: Int = 0,
+        allowHudStart: Boolean = true,
     ) {
         flushOutputLimit = minOf(capacity.coerceAtLeast(0), outputPacketCount + 8)
         newBulkOutputLimit = (capacity - reserveForNewBulk).coerceAtLeast(0)
+        // A raw prefix might carry a STOP. Incomplete link bytes have no verified CSM ID,
+        // so one fixed grace period applies even if that prefix keeps receiving bytes.
+        val partialControl = rfcommControlPrefixOffset != null && nowMillis < rfcommControlPrefixDeadline
         try {
-            drainSendWindow(nowMillis, allowBulkStart)
+            drainSendWindow(nowMillis, allowBulkStart, allowHudStart && !partialControl)
         } finally {
             flushOutputLimit = null
         }
@@ -848,7 +888,7 @@ class Iap2LinkEngine(
 
     // ---- 发送 ----
 
-    private fun drainSendWindow(nowMillis: Long, allowBulkStart: Boolean = true) {
+    private fun drainSendWindow(nowMillis: Long, allowBulkStart: Boolean = true, allowHudStart: Boolean = true) {
         if (state != State.NORMAL || pendingStart != null) return
         val peer = peerSynchronization
         // Box firmware uses the same negotiated mode for the send window and standalone ACKs.
@@ -864,18 +904,23 @@ class Iap2LinkEngine(
             if (bulk != null) {
                 if (flushLimit == null) return
                 if (!bulk.started) {
-                    if (!allowBulkStart || outputPacketCount >= newBulkOutputLimit) return
-                    if (!bulk.canStart() || (!socketWriteFeedback && bulk.commitStart?.invoke() == false)) {
+                    if (!allowBulkStart || (bulk.isHud && !allowHudStart) || outputPacketCount >= newBulkOutputLimit) return
+                    val hudFirst = bulk.isHud
+                    val waitForWrite = socketWriteFeedback || (rfcommHudWriteFeedback && hudFirst)
+                    val mayStart = bulk.canStart() && if (waitForWrite) {
+                        bulk.authorizeFirstWrite?.invoke(nextWriteTicket + 1) != false
+                    } else bulk.commitStart?.invoke() != false
+                    if (!mayStart) {
                         while (sendBacklog.firstOrNull()?.bulk === bulk) sendBacklog.removeFirst()
                         bulk.onDiscarded?.invoke()
                         continue
                     }
-                    if (socketWriteFeedback) {
+                    if (waitForWrite) {
                         val first = sendBacklog.removeFirst()
                         first.sequence = nextSequence(sentSequence)
                         assignHudSerial(first)
-                        pendingStart = PendingStart(first)
-                        writeDataPacket(first, cancellable = true, needsCompletion = true, firstAttempt = true)
+                        pendingStart = PendingStart(first, lastReceivedInOrder)
+                        writeDataPacket(first, cancellable = true, needsCompletion = true, firstAttempt = true, hudFirst = hudFirst)
                         return
                     }
                     bulk.started = true
@@ -993,11 +1038,12 @@ class Iap2LinkEngine(
         sequence: Int,
         control: Int,
         sessionId: Int,
+        recordOutput: Boolean = true,
     ) {
         if (state == State.DEAD) return
         // Every ACK-bearing packet confirms the current receive watermark, including CSM replies.
         if (control and CONTROL_ACKNOWLEDGEMENT != 0) pendingReliableAck = false
-        onFrameSent?.invoke(control, sequence, lastReceivedInOrder, sessionId, payload?.size ?: 0)
+        if (recordOutput) onFrameSent?.invoke(control, sequence, lastReceivedInOrder, sessionId, payload?.size ?: 0)
         val length = payload?.size?.plus(HEADER_BYTES + 1) ?: HEADER_BYTES
         val frame = ByteArray(length)
         frame[0] = 0xFF.toByte()
@@ -1017,16 +1063,17 @@ class Iap2LinkEngine(
             payload.forEach { payloadSum += u8(it) }
             frame[frame.size - 1] = (-payloadSum and 0xFF).toByte()
         }
-        lastOutputMillis = now()
+        if (recordOutput) lastOutputMillis = now()
         appendOutput(frame)
     }
 
     private fun writeDataPacket(
         packet: Packet, needsCompletion: Boolean = false, cancellable: Boolean = false, firstAttempt: Boolean = false,
+        hudFirst: Boolean = false,
     ) {
         if (needsCompletion) {
             packet.writeTicket = ++nextWriteTicket
-            socketWrites += SocketWrite(output.size(), packet.writeTicket, cancellable)
+            socketWrites += SocketWrite(output.size(), packet.writeTicket, cancellable, hudFirst)
             if (firstAttempt) packet.onWritten?.let { writeCallbacks[packet.writeTicket] = it }
         }
         if (packet.mfi != null && state != State.DEAD) {
@@ -1038,8 +1085,9 @@ class Iap2LinkEngine(
         if (state != State.DEAD && packet.hudMessageId != 0) {
             hudOutput += HudFrame(output.size(), packet.hudMessageId, packet.sequence, packet.hudSerial)
         }
-        writePacket(packet.payload, packet.sequence, CONTROL_ACKNOWLEDGEMENT, packet.sessionId ?: controlSessionId())
-        if (firstAttempt && !socketWriteFeedback) packet.onWritten?.invoke()
+        writePacket(packet.payload, packet.sequence, CONTROL_ACKNOWLEDGEMENT, packet.sessionId ?: controlSessionId(),
+            recordOutput = !(rfcommHudWriteFeedback && hudFirst))
+        if (firstAttempt && !socketWriteFeedback && !needsCompletion) packet.onWritten?.invoke()
     }
 
     /** 单调时钟基准（与调用方喂进 feed/advanceTime 的 nowMillis 同源）。 */
@@ -1074,6 +1122,8 @@ class Iap2LinkEngine(
         private val bytes = ByteArray(0xFFFF + 8)
         private var head = 0
         private var tail = 0
+        var offset = 0L
+            private set
 
         val size: Int get() = tail - head
 
@@ -1094,6 +1144,7 @@ class Iap2LinkEngine(
         }
 
         fun discard(count: Int) {
+            offset += count
             head += count
             if (head == tail) {
                 head = 0
@@ -1118,6 +1169,8 @@ class Iap2LinkEngine(
     }
 
     companion object {
+        internal const val RFCOMM_HUD_FRAGMENT_GRACE_MILLIS = 1_000L
+
         const val SESSION_CONTROL = 10
         const val SESSION_EA = 11
         const val SESSION_FILE_TRANSFER = 12

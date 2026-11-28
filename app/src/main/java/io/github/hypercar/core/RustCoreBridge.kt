@@ -72,6 +72,11 @@ object RustCoreBridge {
         }
         fun onIap2Ingress(id: Long, ticket: Long, bytes: ByteArray, writtenSynAck: Long = 0): Boolean =
             io.github.hypercar.iap2.WifiIap2Bridge.receive(id, ticket, bytes, writtenSynAck)
+        fun acquireHudIap2Write(id: Long, generation: Long, ticket: Long): Long =
+            io.github.hypercar.navigation.HudSourceWrites.acquireIfCurrent {
+                io.github.hypercar.iap2.WifiIap2Bridge.canStartHudWrite(id, generation, ticket)
+            }
+        fun releaseHudIap2Write(stamp: Long) = io.github.hypercar.navigation.HudSourceWrites.release(stamp)
         fun onIap2ScreenSetupAccepted(id: Long) { io.github.hypercar.iap2.WifiIap2Bridge.screenSetupAccepted(id) }
         fun onIap2Stop(id: Long) { io.github.hypercar.iap2.WifiIap2Bridge.stop(id) }
     }
@@ -97,8 +102,20 @@ object RustCoreBridge {
 
     fun clusterMapAvailable(w: Int, h: Int) = ClusterMapEncoder.available(w, h)
     fun clusterMapCapable() = ClusterMapEncoder.capable()
-    fun openClusterMap(w: Int, h: Int, x: Int, y: Int, sw: Int, sh: Int, fps: Int): ClusterMapEncoder? =
-        ClusterMapEncoder.open(w, h, x, y, sw, sh, fps)
+    fun clusterMapObservation() = ClusterMapEncoder.mapObservation()
+    fun acquireClusterMapWrite(round: Long, requireReady: Boolean): Long =
+        io.github.hypercar.navigation.HudSourceWrites.tryAcquireIfCurrent {
+            val status = ClusterMapEncoder.mapStatus()
+            (status ushr 2) == round && (!requireReady || (status and 3L) == 3L)
+        }
+    /** Current route generation, or zero when navigation no longer owns a route. */
+    fun projectedNavigationRouteGeneration(): Long = io.github.hypercar.navigation.NavigationSources.ownedRouteGeneration() ?: 0L
+    fun acquireProjectedNavigationRouteWrite(generation: Long): Long = io.github.hypercar.navigation.HudSourceWrites.tryAcquireIfCurrent {
+        projectedNavigationRouteGeneration() == generation
+    }
+    fun releaseProjectedNavigationRouteWrite(stamp: Long) = io.github.hypercar.navigation.HudSourceWrites.release(stamp)
+    fun openClusterMap(w: Int, h: Int, x: Int, y: Int, sw: Int, sh: Int, fps: Int, round: Long, cardGeneration: Long): ClusterMapEncoder? =
+        ClusterMapEncoder.open(w, h, x, y, sw, sh, fps, round, cardGeneration)
 
     /** JNI factory belongs to the stable bridge, independent of delegated session listeners. */
     fun createCarWithTranscoder(inputHevc: Boolean, outputHevc: Boolean, width: Int, height: Int, targetWidth: Int, targetHeight: Int, fps: Int, csd: ByteArray): CarWithHevcTranscoder =
@@ -139,7 +156,8 @@ object RustCoreBridge {
     external fun nativeMarkWifiIap2Ready(id: Long, generation: Long, ready: Boolean): Boolean
     external fun nativeSetWifiIap2Phase(id: Long, phase: String)
     external fun nativeCanKeepWifiSession(): Boolean
-    external fun nativeSendIap2(id: Long, generation: Long, bytes: ByteArray, hudMessageId: Int, hudSerial: Long, writeTicket: Long): Boolean
+    external fun nativeSendIap2(id: Long, generation: Long, bytes: ByteArray, hudMessageId: Int,
+        hudSerial: Long, writeTicket: Long, hudFirst: Boolean): Boolean
     external fun nativeWifiIap2SendCapacity(id: Long, generation: Long): Int
     external fun nativeCancelWifiIap2Write(id: Long, generation: Long, ticket: Long)
     external fun nativeTakeWifiIap2Writes(id: Long, generation: Long): LongArray?

@@ -11,10 +11,19 @@ internal object AmapNavigation {
     private var reportedUnsupported = false
     private var nextLogAt = 0L
 
-    fun posted(notification: StatusBarNotification) {
+    fun posted(notification: StatusBarNotification) = update(notification, store.generation(), fromActiveSnapshot = false)
+
+    fun activeSnapshot(notifications: Array<StatusBarNotification>) {
+        val generation = store.generation()
+        notifications.asSequence().filter { it.packageName == "com.autonavi.minimap" }
+            .sortedByDescending { it.postTime }
+            .forEach { update(it, generation, fromActiveSnapshot = true) }
+        HudSourceWrites.publish { store.finishActiveSnapshot(generation) }
+    }
+
+    private fun update(notification: StatusBarNotification, generation: Long, fromActiveSnapshot: Boolean) {
         if (notification.packageName != "com.autonavi.minimap") return
         if (!HyperCarRepo.hudNavigationAllowed || HyperCarRepo.carWithHudNavigationAllowed) { clear(); return }
-        val generation = store.generation()
         val n = notification.notification
         val extras = n.extras
         val texts = listOf(Notification.EXTRA_TITLE, Notification.EXTRA_TEXT, Notification.EXTRA_BIG_TEXT)
@@ -22,7 +31,7 @@ internal object AmapNavigation {
             extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES).orEmpty().map { it.toString() }
         val cue = AmapNotificationParser.parse(texts, notification.isOngoing)
         if (cue == null) {
-            store.remove(notification.key) // do not retain a superseded instruction
+            HudSourceWrites.publish { store.hide(generation, notification.key, notification.postTime) }
             if (!reportedUnsupported) {
                 reportedUnsupported = true
                 HyperCarRepo.log("HUD: 高德通知没有可识别的导航提示；不推断转向/距离（需通知使用权与导航通知）")
@@ -31,9 +40,16 @@ internal object AmapNavigation {
         }
         // Replaying an old notification after a reconnect must not make it fresh again.
         val age = (System.currentTimeMillis() - notification.postTime).coerceAtLeast(0)
-        store.put(generation, notification.key, cue, SystemClock.elapsedRealtime() - age)
-        reportedUnsupported = false
         val now = SystemClock.elapsedRealtime()
+        val updated = now - age
+        val accepted = HudSourceWrites.publish {
+            (fromActiveSnapshot && store.restoreActiveNotification(generation, notification.key, cue, notification.postTime, now) ||
+                store.put(generation, notification.key, cue, updated, notification.postTime)).also {
+                if (it) AmapLinkNavigation.observeNotification(now, store.clusterRoute(now))
+            }
+        }
+        if (!accepted) return
+        reportedUnsupported = false
         if (now >= nextLogAt) {
             nextLogAt = now + 10_000
             HyperCarRepo.log("HUD: 高德通知更新 state=${cue.state} maneuver=${cue.maneuver} distance=${cue.distanceMeters}m（不记录道路文本）")
@@ -41,10 +57,16 @@ internal object AmapNavigation {
     }
 
     fun removed(notification: StatusBarNotification) {
-        store.remove(notification.key)
+        if (notification.packageName != "com.autonavi.minimap") return
+        HudSourceWrites.publish { store.remove(notification.key, notification.postTime, SystemClock.elapsedRealtime()) }
     }
 
-    fun clear() { store.clear() }
+    fun listenerDisconnected() { HudSourceWrites.publish { store.disconnectListener() } }
+    fun clear() { HudSourceWrites.publish { store.clear() } }
+    fun clusterRoute(now: Long): ClusterRouteObservation {
+        val observation = store.clusterRoute(now)
+        return if (HyperCarRepo.hudNavigationAllowed) observation else observation.copy(cue = null)
+    }
 
     fun snapshot(now: Long = SystemClock.elapsedRealtime()): NavigationCue? = timedSnapshot(now)?.cue
 

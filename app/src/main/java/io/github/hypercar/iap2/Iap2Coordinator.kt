@@ -165,8 +165,8 @@ class Iap2Coordinator(
 
     fun onTargetChanged() = bluetooth?.onTargetChanged()
 
-    internal fun retireCafeHandoff(attempt: Long, reason: String, networkCurrent: (() -> Boolean)? = null) {
-        bluetooth?.retireCafeHandoff(attempt, reason, networkCurrent)
+    internal fun retireCafeHandoff(attempt: Long, reason: String, currentInvite: (() -> Boolean)? = null, peer: String? = null) {
+        bluetooth?.retireCafeHandoff(attempt, reason, currentInvite, peer)
     }
 
     /**
@@ -260,7 +260,10 @@ class Iap2Coordinator(
     /** Wi-Fi is healthy. Suppress fresh outgoing dials while the car retires RFCOMM. */
     fun pauseOutboundForWifi() { bluetooth?.setOutboundPausedForWifi(true) }
 
-    internal fun captureSessionClose(): RfcommClose? = bluetooth?.captureSessionClose()
+    internal fun captureSessionClose(wifiLossAttempt: Long? = null, wifiLossNetwork: Long? = null): RfcommClose? =
+        bluetooth?.captureSessionClose(wifiLossAttempt, wifiLossNetwork)
+
+    internal fun claimWifiSource(source: Iap2EndpointGeneration?, network: Long) { bluetooth?.claimWifiSource(source, network) }
 
     fun captureBluetoothLost(address: String): (() -> Unit)? = bluetooth?.captureBluetoothLost(address)
 

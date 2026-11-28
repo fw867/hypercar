@@ -66,6 +66,8 @@ internal class EngineEventListener(
         deliver { accepted = target.onIap2Ingress(id, ticket, bytes, writtenSynAck) }
         return accepted
     }
+    override fun acquireHudIap2Write(id: Long, generation: Long, ticket: Long): Long =
+        if (gate.isCurrent(owner)) target.acquireHudIap2Write(id, generation, ticket) else 0L
     override fun onIap2ScreenSetupAccepted(id: Long) = deliver { target.onIap2ScreenSetupAccepted(id) }
     // Stop is already scoped by the Wi-Fi iAP2 ID. Retire the old worker even while waiting.
     override fun onIap2Stop(id: Long) = target.onIap2Stop(id)

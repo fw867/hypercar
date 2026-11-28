@@ -6,6 +6,154 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class RouteGuidanceSessionTest {
+    @Test fun clearsCachedTripFieldsOnAllComponentsBeforePublishingNewSource() {
+        val session = RouteGuidanceSession {}
+        session.handle(Iap2Csm.Frame(0x5200, Iap2Csm.u16(0, 42) + Iap2Csm.u16(0, 43)))
+        val link = cue.copy(estimatedArrivalEpochSeconds = 1_800_000_000, remainingTimeSeconds = 90, remainingDistanceMeters = 1250)
+        session.updates(0, true, link)
+        val notification = cue.copy(sourceName = "Notification")
+        val resets = session.queuedUpdates(500, true, notification)
+        assertEquals(listOf(0x5201, 0x5201), resets.map { it.frame.messageId })
+        assertEquals(listOf(42, 43), resets.map { Iap2Csm.parseParams(it.frame.body).first().asU16List().single() })
+        assertTrue(resets.all { fields(it.frame).getValue(1).single() == 0.toByte() })
+        assertTrue(resets[0].commitStart!!.invoke())
+        session.declareReceiveSupport(true)
+        assertFalse(resets[1].canStart())
+        val remainingReset = session.queuedUpdates(501, true, notification).single()
+        assertArrayEquals(byteArrayOf(0, 43), fields(remainingReset.frame)[0])
+        assertTrue(remainingReset.commitStart!!.invoke())
+        val refreshed = session.updates(502, true, notification)
+        assertEquals(listOf(0x5202, 0x5201, 0x5202, 0x5201), refreshed.map { it.messageId })
+        assertTrue(refreshed.filter { it.messageId == 0x5201 }.all { frame ->
+            fields(frame).getValue(1).single() == 1.toByte() && (5..9).none { it in fields(frame) }
+        })
+    }
+
+    @Test fun clearingMissingTripFieldsIsWithdrawnWhenFullGuidanceReturnsFirst() {
+        val session = RouteGuidanceSession {}
+        session.handle(start(42))
+        val link = cue.copy(estimatedArrivalEpochSeconds = 1_800_000_000, remainingTimeSeconds = 90, remainingDistanceMeters = 1250)
+        session.updates(0, true, link)
+        var live = cue
+        val reset = session.queuedUpdates(500, true, live, liveCue = { true to live }).single()
+        assertArrayEquals(byteArrayOf(0), fields(reset.frame)[1])
+        live = link
+        assertFalse(reset.liveSourceAllowsFirstWrite!!.invoke())
+    }
+
+    @Test fun aQueuedStatusCannotWriteTripFieldsThatTheLatestSampleWithdrew() {
+        val session = RouteGuidanceSession {}
+        session.handle(start(42))
+        val link = cue.copy(routeGeneration = 10, estimatedArrivalEpochSeconds = 1_800_000_000,
+            remainingTimeSeconds = 90, remainingDistanceMeters = 1250)
+        var live = link
+        session.updates(0, true, link)
+        val waiting = session.queuedUpdates(10_000, true, link, liveCue = { true to live }).single()
+        assertEquals(0x5201, waiting.frame.messageId)
+        assertTrue(waiting.canStart())
+
+        live = link.copy(estimatedArrivalEpochSeconds = null)
+        assertFalse(waiting.liveSourceAllowsFirstWrite!!.invoke())
+        session.refreshLaneSource(true, live)
+        assertFalse(waiting.canStart())
+        waiting.onDiscarded!!.invoke()
+        val reset = session.queuedUpdates(10_001, true, live).single()
+        assertArrayEquals(byteArrayOf(0), fields(reset.frame)[1])
+    }
+
+    @Test fun withdrawingTheSegmentDistanceRevokesTheQueuedValueAndClearsTheReceiverCache() {
+        val session = RouteGuidanceSession {}
+        session.handle(start(42))
+        val withDistance = cue.copy(distanceMeters = 80, routeGeneration = 10)
+        var live = withDistance
+        session.updates(0, true, withDistance)
+        val waiting = session.queuedUpdates(10_000, true, withDistance, liveCue = { true to live }).single()
+        assertArrayEquals(byteArrayOf(0, 0, 0, 80), fields(waiting.frame)[0x0a])
+
+        live = withDistance.copy(distanceMeters = null)
+        assertFalse(waiting.liveSourceAllowsFirstWrite!!.invoke())
+        waiting.onDiscarded!!.invoke()
+        val reset = session.updates(10_001, true, live).single()
+        assertArrayEquals(byteArrayOf(0), fields(reset)[1])
+        val replacement = session.updates(10_002, true, live).last()
+        assertArrayEquals(byteArrayOf(1), fields(replacement)[1])
+        assertNull(fields(replacement)[0x0a])
+    }
+
+    @Test fun sameArrowOnTheNextRouteCannotAuthorizeAnOlderFirstWrite() {
+        val session = RouteGuidanceSession {}
+        session.handle(start(42))
+        var live = cue.copy(routeGeneration = 10)
+        val pending = session.queuedUpdates(1000, true, live, liveCue = { true to live })
+        assertTrue(pending.all { it.canStart() })
+        live = live.copy(routeGeneration = 11)
+        assertTrue(pending.none { it.liveSourceAllowsFirstWrite!!.invoke() })
+    }
+
+    @Test fun discardedManeuverCannotLeaveAnOrphanedStatusReference() {
+        val session = RouteGuidanceSession {}
+        session.handle(start(42))
+        val pending = session.queuedUpdates(1000, true, cue)
+        assertEquals(listOf(0x5202, 0x5201), pending.map { it.frame.messageId })
+        pending[0].onDiscarded!!.invoke()
+        assertFalse(pending[1].canStart())
+        val refreshed = session.updates(1001, true, cue)
+        assertEquals(listOf(0x5202, 0x5201), refreshed.map { it.messageId })
+    }
+
+    @Test fun stoppingNavigationRevokesUnstartedArrowAndClearsPublishedStateImmediately() {
+        val session = RouteGuidanceSession {}
+        session.handle(start(42))
+        session.updates(0, true, cue)
+        val pending = session.queuedUpdates(1000, true, cue.copy(distanceMeters = 200))
+        assertEquals(listOf(0x5202, 0x5201), pending.map { it.frame.messageId })
+        session.refreshLaneSource(false, null)
+        assertTrue(pending.none { it.canStart() })
+        val clearing = session.updates(1001, false, null).single()
+        assertEquals(0x5201, clearing.messageId)
+        assertArrayEquals(byteArrayOf(0), fields(clearing)[1])
+        assertTrue(session.updates(12_000, false, null).isEmpty())
+    }
+
+    @Test fun obsoleteArrowIsRevokedWhenTheTurnChangesButNotOnDistanceProgress() {
+        val session = RouteGuidanceSession {}
+        session.handle(start(42))
+        session.refreshLaneSource(true, cue)
+        val pending = session.queuedUpdates(1000, true, cue)
+        session.refreshLaneSource(true, cue.copy(distanceMeters = 200))
+        assertTrue(pending.all { it.canStart() })
+        session.refreshLaneSource(true, cue.copy(maneuver = 1, instruction = "左转"))
+        assertTrue(pending.none { it.canStart() })
+    }
+
+    @Test fun notificationRoadTextAloneRevokesTheQueuedManeuver() {
+        val session = RouteGuidanceSession {}
+        session.handle(start(42))
+        var live = NavigationCue("右转进入甲路", 2, 200, routeGeneration = 12)
+        val queued = session.queuedUpdates(1_000, true, live, liveCue = { true to live })
+        assertEquals(listOf(0x5202, 0x5201), queued.map { it.frame.messageId })
+        live = live.copy(instruction = "右转进入乙路")
+        assertTrue(queued.none { it.liveSourceAllowsFirstWrite!!.invoke() })
+        session.refreshLaneSource(true, live)
+        assertTrue(queued.none { it.canStart() })
+    }
+
+    @Test fun remainingDistanceTextAndUnitDescribeOnlyTheFullRouteDistance() {
+        val session = RouteGuidanceSession {}
+        session.handle(start(42))
+        val short = fields(session.updates(0, true, cue.copy(remainingDistanceMeters = 850)).last())
+        assertArrayEquals("850\u0000".encodeToByteArray(), short[0x08])
+        assertArrayEquals(byteArrayOf(2), short[0x09])
+        val long = fields(session.updates(1000, true, cue.copy(remainingDistanceMeters = 1250)).last())
+        assertArrayEquals("1.25\u0000".encodeToByteArray(), long[0x08])
+        assertArrayEquals(byteArrayOf(0), long[0x09])
+        val clearing = fields(session.updates(2000, true, cue).single())
+        assertArrayEquals(byteArrayOf(0), clearing[1])
+        val nextTurnOnly = fields(session.updates(2001, true, cue).last())
+        assertFalse(nextTurnOnly.keys.any { it in 0x05..0x09 })
+        assertTrue(nextTurnOnly.containsKey(0x0a))
+    }
+
     @Test fun declaredLaneGuidancePrecedesReferencesAndClearsOnWithdrawal() {
         val session = RouteGuidanceSession {}
         session.declareReceiveSupport(true, laneGuidanceSupported = true)

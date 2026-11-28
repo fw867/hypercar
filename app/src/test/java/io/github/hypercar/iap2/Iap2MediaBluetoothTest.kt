@@ -1,6 +1,7 @@
 package io.github.hypercar.iap2
 
 import io.github.hypercar.headunit.HeadUnitProfiles
+import io.github.hypercar.navigation.NavigationCue
 import io.github.hypercar.net.CarWifiRequestIdentity
 import io.github.hypercar.session.CarHotspotReconnect
 import io.github.hypercar.session.verifiedAirplayEndpoint
@@ -48,6 +49,7 @@ class Iap2MediaBluetoothTest {
         val updates=mutableListOf<Iap2Csm.Frame>()
         val deviceUuids=mutableListOf<String>()
         val statusUpdates=mutableListOf<Iap2Csm.Frame>()
+        val maneuverInstructions = mutableListOf<String>()
         var time=1_000_000L
         var open=true
         var endWhenEmpty=false
@@ -79,6 +81,9 @@ class Iap2MediaBluetoothTest {
                     assertTrue("Metadata must wait for authentication",0xaa05 in sent)
                     updates+=frame
                 }
+                if (frame.messageId == 0x5202) {
+                    Iap2Csm.parseParams(frame.body).firstOrNull { it.id == 2 }?.asStringOrNull()?.let(maneuverInstructions::add)
+                }
                 sent+=frame.messageId
                 when(frame.messageId){
                     0x1d00 -> {
@@ -106,6 +111,53 @@ class Iap2MediaBluetoothTest {
             Iap2Csm.param(6, byteArrayOf(0xea.toByte(), 3, 0x4c, 0)) +
             Iap2Csm.param(7, byteArrayOf(0xea.toByte(), 0, 0x4e, 0x0d, 0x4c, 1)) +
             Iap2Csm.group(10, Iap2Csm.u8(0, 1), Iap2Csm.string(1, "de.bmw.a4a.pairing")))
+
+    @Test fun aFragmentedRouteStopBlocksHudBeforeDispatchAndAResubscribeRestoresIt() {
+        for (splitAt in 1..Iap2Csm.HEADER_BYTES) {
+            val identity = Iap2Csm.encode(0x1d01,
+                Iap2Csm.string(1, "MGU-fixture") +
+                    Iap2Csm.param(6, byteArrayOf(0x57, 3, 0x52, 0, 0x52, 3)) +
+                    Iap2Csm.param(7, byteArrayOf(0x57, 2, 0x52, 1, 0x52, 2)))
+            val channel = Channel(identificationExchange = identity)
+            val subscribe = Iap2Csm.encode(0x5200, Iap2Csm.u16(0, 42))
+            val stop = Iap2Csm.encode(0x5203, Iap2Csm.u16(0, 42))
+            val prefix = stop.copyOf(splitAt)
+            val resume = stop.copyOfRange(splitAt, stop.size) + Iap2Csm.encode(0x4154)
+            var cue = NavigationCue("first maneuver", 2, 100)
+            var pauseReads = 0
+            val incoming = object : Iap2LinkChannel by channel {
+                override fun recvControl(timeoutMillis: Long): ByteArray? {
+                    if (pauseReads > 0) {
+                        pauseReads--
+                        // The known STOP stalls beyond the uncertain-prefix deadline.
+                        channel.time += (if (splitAt == Iap2Csm.HEADER_BYTES) 800L else 50L) * 1_000_000
+                        return null
+                    }
+                    return channel.recvControl(timeoutMillis).also { bytes ->
+                        if (bytes === prefix) {
+                            channel.time += 1_000_000_000L
+                            cue = cue.copy(instruction = "stale maneuver")
+                            pauseReads = 3
+                        }
+                        if (bytes === resume) cue = cue.copy(instruction = "fresh maneuver")
+                    }
+                }
+            }
+            val sender = Iap2SenderSession(incoming, {}, pairedReceiver = true, nanoTime = { channel.time },
+                navigationEnabled = { true }, navigationCue = { cue })
+            sender.run(10_000L)
+            channel.queue += subscribe
+            channel.queue += prefix
+            channel.queue += resume
+            channel.queue += subscribe
+            channel.endWhenEmpty = true
+            sender.pumpIncomingForever()
+
+            assertEquals("STOP split at $splitAt", listOf("first maneuver", "fresh maneuver"),
+                channel.maneuverInstructions)
+            assertTrue(0x4155 in channel.sent)
+        }
+    }
 
     @Test fun detectRenegotiatesBluetoothBusinessOrderUsingTheNewControlVersion() {
         val keys = KeyPairGenerator.getInstance("EC").apply { initialize(ECGenParameterSpec("secp256r1")) }

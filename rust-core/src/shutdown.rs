@@ -27,9 +27,16 @@ impl EngineShutdown {
             graceful: AtomicBool::new(false), completion: Mutex::new(Completion::default()), completed: Condvar::new() }
     }
     pub fn request(&self, graceful: bool) {
-        self.graceful.store(graceful, Ordering::Release);
-        self.requested.store(true, Ordering::Release);
+        {
+            let _state = self.completion.lock();
+            self.graceful.store(graceful, Ordering::Release);
+            self.requested.store(true, Ordering::Release);
+        }
         self.signal.notify_waiters();
+    }
+    pub(crate) fn while_running<T>(&self, run: impl FnOnce() -> T) -> Option<T> {
+        let _state = self.completion.lock();
+        (!self.requested()).then(run)
     }
     pub fn requested(&self) -> bool { self.requested.load(Ordering::Acquire) }
     pub fn graceful(&self) -> bool { self.graceful.load(Ordering::Acquire) }

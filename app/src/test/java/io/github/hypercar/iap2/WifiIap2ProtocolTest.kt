@@ -1,5 +1,12 @@
 package io.github.hypercar.iap2
 
+import io.github.hypercar.navigation.HudSourceWrites
+import java.io.ByteArrayOutputStream
+import java.io.Closeable
+import java.io.IOException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -1023,6 +1030,409 @@ class WifiIap2ProtocolTest {
         assertEquals(0x4155, messages(listOf(response)).single().messageId)
     }
 
+    @Test fun localRouteStopBlocksPendingHudBeforeTheWorkerObservesIt() {
+        val car = Car(profileId = "bmw_id85", managedWrites = true)
+        car.ready()
+        car.navigationAllowed = true
+        car.navigationCue = io.github.hypercar.navigation.NavigationCue("右转", 2, 100)
+        val lastWritten = car.ack
+        val staged = car.feed(packet(0x40, ++car.sequence, lastWritten, car.controlSession,
+            Iap2Csm.encode(0x5200, Iap2Csm.u16(0, 42)))).single()
+        val ticket = car.protocol.takeSocketWrites().single().ticket
+        assertTrue(car.protocol.canStartHudWrite(0, ticket))
+        car.navigationCue = io.github.hypercar.navigation.NavigationCue("", null, null, state = 0)
+        assertFalse(car.protocol.canStartHudWrite(0, ticket))
+        car.protocol.socketWriteFinished(ticket, null)
+        val clearing = car.feed(packet(0x40, car.sequence, lastWritten)).single()
+        assertEquals(staged.seq, clearing.seq)
+        val update = messages(listOf(clearing)).single()
+        assertEquals(0x5201, update.messageId)
+        assertArrayEquals(byteArrayOf(0), Iap2Csm.parseParams(update.body).single { it.id == 1 }.value)
+    }
+
+    @Test fun localRouteStopFinishesTheStartedHudMessageWithoutAnOldArrowReference() {
+        val car = Car(packetLength = 32, profileId = "bmw_id85", managedWrites = true)
+        val receive = Iap2Csm.param(Iap2Messages.IDENT_RECEIVE_IDS, byteArrayOf(0x52, 1, 0x52, 2, 0x52, 4))
+        car.ready(receive)
+        car.navigationAllowed = true
+        car.navigationCue = io.github.hypercar.navigation.NavigationCue("左转", 1, 100,
+            lanes = List(16) { io.github.hypercar.navigation.NavigationLane(7, true, 1) })
+        val started = car.feed(packet(0x40, ++car.sequence, car.ack, car.controlSession,
+            Iap2Csm.encode(0x5200, Iap2Csm.u16(0, 42)))).single()
+        val ticket = car.protocol.takeSocketWrites().single().ticket
+        assertTrue(car.protocol.canStartHudWrite(0, ticket))
+        car.protocol.socketWriteFinished(ticket, car.time)
+        car.navigationAllowed = false
+        val output = mutableListOf(started)
+        repeat(45) {
+            output += car.feed(packet(0x40, car.sequence, car.ack))
+            for (write in car.protocol.takeSocketWrites()) {
+                assertFalse(write.cancellable)
+                car.protocol.socketWriteFinished(write.ticket, car.time)
+            }
+        }
+        assertEquals(listOf(0x5204), messages(output).map { it.messageId })
+        assertTrue(car.cancelledWrites.isEmpty())
+    }
+
+    @Test fun hudRetransmissionKeepsItsSequenceWithoutRequiringAFirstFragmentPermit() {
+        val engine = Iap2LinkEngine(reliableTransport = true, socketWriteFeedback = true)
+        openHudTestLink(engine, managed = true)
+        var sourceActive = true
+        assertTrue(engine.queueBulkControl(byteArrayOf(1, 2, 3), true, 0x5201, { sourceActive }))
+        engine.flushBulkControl(4, 8)
+        val first = split(engine.takeOutput()).single()
+        val firstWrite = engine.takeSocketWrites().single()
+        assertTrue(firstWrite.hudFirst)
+        engine.socketWriteFinished(firstWrite.ticket, 4)
+        sourceActive = false
+        engine.advanceTime(4_004)
+        val retransmitted = split(engine.takeOutput()).single()
+        val retryWrite = engine.takeSocketWrites().single()
+        assertTrue(retryWrite.cancellable)
+        assertFalse(retryWrite.hudFirst)
+        assertEquals(first.seq, retransmitted.seq)
+        assertArrayEquals(first.body, retransmitted.body)
+    }
+
+    @Test fun nativeSourceRejectionDiscardsItsCsmEvenIfTheSourceHasAlreadyReturned() {
+        val car = Car(profileId = "bmw_id85", managedWrites = true)
+        car.ready()
+        car.navigationAllowed = true
+        val cue = io.github.hypercar.navigation.NavigationCue("右转", 2, 100)
+        car.navigationCue = cue
+        val lastWritten = car.ack
+        val staged = car.feed(packet(0x40, ++car.sequence, lastWritten, car.controlSession,
+            Iap2Csm.encode(0x5200, Iap2Csm.u16(0, 42)))).single()
+        val ticket = car.protocol.takeSocketWrites().single().ticket
+        car.navigationCue = null
+        assertFalse(car.protocol.canStartHudWrite(0, ticket))
+        car.navigationCue = cue.copy(instruction = "新指引")
+        car.protocol.socketWriteFinished(ticket, null, sourceRevoked = true)
+        val next = car.feed(packet(0x40, ++car.sequence, lastWritten, car.controlSession, Iap2Csm.encode(0x4154)))
+        assertEquals(staged.seq, next.first().seq)
+        val replies = messages(next)
+        assertEquals(0x4155, replies.first().messageId)
+        val fresh = replies.single { it.messageId == 0x5202 }
+        assertEquals("新指引", Iap2Csm.parseParams(fresh.body).single { it.id == 2 }.asStringOrNull())
+    }
+
+    @Test fun rfcommRechecksTheHudStartAfterEarlierSocketBytesHaveBeenWritten() {
+        val engine = Iap2LinkEngine(rfcommHudWriteFeedback = true)
+        openHudTestLink(engine, managed = false)
+        val transport = RfcommTransport(java.io.Closeable {})
+        var sourceActive = true
+        var discarded = false
+        val earlier = byteArrayOf(1, 2, 3)
+        assertTrue(engine.sendControl(earlier, 4, awaitAck = false))
+        assertTrue(engine.queueBulkControl(byteArrayOf(4, 5, 6), false, 0x5201, { sourceActive },
+            onDiscarded = { discarded = true }))
+        engine.flushBulkControl(4, 8)
+
+        val writes = mutableListOf<Wire>()
+        transport.writeOutput(engine) { bytes ->
+            writes += split(bytes)
+            HudSourceWrites.publish { sourceActive = false }
+        }
+        assertArrayEquals(earlier, writes.single().body)
+        assertTrue(discarded)
+        assertTrue(engine.sendControl(byteArrayOf(7), 5, awaitAck = false))
+        val next = split(engine.takeOutput()).single { it.session != 0 }
+        assertEquals((writes.single().seq + 1) and 0xff, next.seq)
+    }
+
+    @Test fun rfcommFinishesAStartedHudMessageAfterTheSourceStops() {
+        val engine = Iap2LinkEngine(rfcommHudWriteFeedback = true)
+        openHudTestLink(engine, managed = false, maxLength = 32)
+        val transport = RfcommTransport(java.io.Closeable {})
+        val cue = ByteArray(44) { it.toByte() }
+        var sourceActive = true
+        var discarded = false
+        assertTrue(engine.queueBulkControl(cue, false, 0x5202, { sourceActive },
+            onDiscarded = { discarded = true }))
+
+        val output = ByteArrayOutputStream()
+        engine.flushBulkControl(4, 8)
+        transport.writeOutput(engine, output::write)
+        assertEquals(1, split(output.toByteArray()).size)
+        HudSourceWrites.publish { sourceActive = false }
+        engine.discardUnstartedBulkControl()
+        engine.flushBulkControl(5, 8)
+        transport.writeOutput(engine, output::write)
+
+        val writes = split(output.toByteArray())
+        assertEquals(2, writes.size)
+        assertArrayEquals(cue, writes[0].body + writes[1].body)
+        assertEquals((writes[0].seq + 1) and 0xff, writes[1].seq)
+        assertFalse(discarded)
+    }
+
+    @Test fun rfcommRejectsHudWhenLocalStopWinsDuringSourceValidation() {
+        val engine = Iap2LinkEngine(rfcommHudWriteFeedback = true)
+        openHudTestLink(engine, managed = false)
+        val transport = RfcommTransport(Closeable { fail("stop aborted an unadmitted write") })
+        var checkingTheFirstWrite = false
+        var discarded = false
+        assertTrue(engine.queueBulkControl(byteArrayOf(4, 5, 6), false, 0x5201, canStart = {
+            if (checkingTheFirstWrite) transport.noteLocalStop()
+            true
+        }, onDiscarded = { discarded = true }))
+        engine.flushBulkControl(4, 8)
+        checkingTheFirstWrite = true
+
+        assertEquals(0, transport.writeOutput(engine) { fail("HUD reached a stopped RFCOMM socket") })
+        assertTrue(transport.localStopRequested)
+        assertTrue(discarded)
+    }
+
+    @Test fun rfcommDefersFirstHudByteWhenACompletedReadIsWaitingForTheChannelLock() {
+        val engine = Iap2LinkEngine(rfcommHudWriteFeedback = true)
+        openHudTestLink(engine, managed = false)
+        val transport = RfcommTransport(Closeable { fail("a pending read should not close RFCOMM") })
+        val required = byteArrayOf(1, 2, 3)
+        val hud = byteArrayOf(4, 5, 6)
+        var discarded = false
+        assertTrue(engine.sendControl(required, 4, awaitAck = false))
+        assertTrue(engine.queueBulkControl(hud, false, 0x5201, { true }, onDiscarded = { discarded = true }))
+        engine.flushBulkControl(4, 8)
+
+        val output = ByteArrayOutputStream()
+        transport.writeOutput(engine) { bytes ->
+            output.write(bytes)
+            transport.setSocketReadPending(true)
+        }
+        val earlier = split(output.toByteArray())
+        assertEquals(listOf(required.toList()), earlier.map { it.body.toList() })
+        assertTrue(engine.hasBulkControl)
+        assertFalse(discarded)
+
+        transport.setSocketReadPending(false)
+        output.reset()
+        engine.flushBulkControl(5, 8)
+        transport.writeOutput(engine, output::write)
+        val resumed = split(output.toByteArray()).single()
+        assertArrayEquals(hud, resumed.body)
+        assertEquals((earlier.single().seq + 1) and 0xff, resumed.seq)
+    }
+
+    @Test fun rfcommLocalStopImmediatelyAbortsAnAdmittedFirstHudByte() {
+        val engine = Iap2LinkEngine(rfcommHudWriteFeedback = true)
+        openHudTestLink(engine, managed = false)
+        val firstWrite = CountDownLatch(1)
+        val socketClosed = CountDownLatch(1)
+        val finishWrite = CountDownLatch(1)
+        val workers = Executors.newSingleThreadExecutor()
+        val connections = RfcommConnections<Closeable>()
+        val original = connections.register(Closeable { socketClosed.countDown() })
+        connections.admit(original)
+        val stop = connections.captureClose()
+        val replacement = connections.register(Closeable { fail("replacement socket was closed") })
+        connections.admit(replacement)
+        assertTrue(engine.queueBulkControl(byteArrayOf(4, 5, 6), false, 0x5201, { true }))
+        engine.flushBulkControl(4, 8)
+
+        try {
+            val writer = workers.submit<IOException> {
+                assertThrows(IOException::class.java) {
+                    original.writeOutput(engine) { bytes ->
+                        assertEquals(1, bytes.size)
+                        firstWrite.countDown()
+                        assertTrue(finishWrite.await(3, TimeUnit.SECONDS))
+                        throw IOException("socket closed")
+                    }
+                }
+            }
+            assertTrue(firstWrite.await(2, TimeUnit.SECONDS))
+            stop.noteLocalStop()
+            assertEquals("local stop must close the admitted socket before returning", 0L, socketClosed.count)
+            assertTrue(original.isCancelled)
+            assertSame(replacement, connections.session.get())
+            assertFalse(replacement.localStopRequested)
+            finishWrite.countDown()
+            assertEquals("socket closed", writer.get(2, TimeUnit.SECONDS).message)
+        } finally {
+            finishWrite.countDown()
+            workers.shutdownNow()
+        }
+    }
+
+    @Test fun rfcommSourcePublicationWaitsForTheFirstByteAndCanCompleteDuringTheRemainder() {
+        val engine = Iap2LinkEngine(rfcommHudWriteFeedback = true)
+        openHudTestLink(engine, managed = false)
+        val socketClosed = CountDownLatch(1)
+        val transport = RfcommTransport(Closeable { socketClosed.countDown() })
+        val cue = byteArrayOf(4, 5, 6)
+        var sourceActive = true
+        assertTrue(engine.queueBulkControl(cue, false, 0x5201, { sourceActive }))
+        engine.flushBulkControl(4, 8)
+
+        val firstWrite = CountDownLatch(1)
+        val releaseFirstByte = CountDownLatch(1)
+        val publicationStarted = CountDownLatch(1)
+        val publicationFinished = CountDownLatch(1)
+        val output = ByteArrayOutputStream()
+        val workers = Executors.newFixedThreadPool(2)
+        try {
+            val writer = workers.submit<Int> {
+                transport.writeOutput(engine) { bytes ->
+                    if (output.size() == 0) {
+                        assertEquals(1, bytes.size)
+                        firstWrite.countDown()
+                        assertTrue(releaseFirstByte.await(2, TimeUnit.SECONDS))
+                    } else {
+                        assertTrue(publicationFinished.await(2, TimeUnit.SECONDS))
+                        assertFalse(socketClosed.await(1_250, TimeUnit.MILLISECONDS))
+                    }
+                    output.write(bytes)
+                }
+            }
+            assertTrue(firstWrite.await(2, TimeUnit.SECONDS))
+            val stop = workers.submit {
+                publicationStarted.countDown()
+                HudSourceWrites.publish { sourceActive = false }
+                publicationFinished.countDown()
+            }
+            assertTrue(publicationStarted.await(2, TimeUnit.SECONDS))
+            assertFalse(publicationFinished.await(100, TimeUnit.MILLISECONDS))
+            releaseFirstByte.countDown()
+            stop.get(2, TimeUnit.SECONDS)
+            assertEquals(13, writer.get(3, TimeUnit.SECONDS))
+            assertArrayEquals(cue, split(output.toByteArray()).single().body)
+        } finally {
+            releaseFirstByte.countDown()
+            workers.shutdownNow()
+        }
+    }
+
+    @Test fun rfcommClosesAStalledFirstHudByteAndUnblocksSourcePublication() {
+        val engine = Iap2LinkEngine(rfcommHudWriteFeedback = true)
+        openHudTestLink(engine, managed = false)
+        val socketClosed = CountDownLatch(1)
+        val transport = RfcommTransport(Closeable { socketClosed.countDown() })
+        var sourceActive = true
+        assertTrue(engine.queueBulkControl(byteArrayOf(4, 5, 6), false, 0x5201, { sourceActive }))
+        engine.flushBulkControl(4, 8)
+
+        val firstWrite = CountDownLatch(1)
+        val workers = Executors.newFixedThreadPool(2)
+        try {
+            val writer = workers.submit<IOException> {
+                try {
+                    transport.writeOutput(engine) {
+                        firstWrite.countDown()
+                        assertTrue(socketClosed.await(3, TimeUnit.SECONDS))
+                        throw IOException("socket closed")
+                    }
+                    throw AssertionError("stalled write returned")
+                } catch (error: IOException) {
+                    error
+                }
+            }
+            assertTrue(firstWrite.await(2, TimeUnit.SECONDS))
+            val stop = workers.submit { HudSourceWrites.publish { sourceActive = false } }
+            assertEquals("socket closed", writer.get(4, TimeUnit.SECONDS).cause?.message)
+            stop.get(2, TimeUnit.SECONDS)
+            assertFalse(sourceActive)
+            assertFalse(transport.localStopRequested)
+        } finally {
+            workers.shutdownNow()
+        }
+    }
+
+    @Test fun rfcommDiscardedHudStartDoesNotPostponeKeepalive() {
+        val engine = Iap2LinkEngine(rfcommHudWriteFeedback = true)
+        openHudTestLink(engine, managed = false)
+        val transport = RfcommTransport(Closeable {})
+        val trace = mutableListOf<Int>()
+        engine.onFrameSent = { _, _, _, session, _ -> trace += session }
+        val deadline = engine.nextDeadlineMillis()!!
+        var sourceActive = true
+        assertTrue(engine.queueBulkControl(byteArrayOf(4, 5, 6), false, 0x5201, { sourceActive }))
+        engine.flushBulkControl(deadline - 1, 8)
+
+        HudSourceWrites.publish { sourceActive = false }
+        assertEquals(0, transport.writeOutput(engine) { fail("revoked HUD reached RFCOMM") })
+        assertTrue(trace.isEmpty())
+        engine.advanceTime(deadline)
+        val keepalive = split(engine.takeOutput()).single()
+        assertEquals(0x40, keepalive.control)
+        assertEquals(0, keepalive.session)
+        assertEquals(listOf(0), trace)
+        assertTrue(keepalive.body.isEmpty())
+    }
+
+    @Test fun rfcommPartialInboundControlOnlyDefersNewHudAndKeepsLinkOutputMoving() {
+        val engine = Iap2LinkEngine(rfcommHudWriteFeedback = true)
+        openHudTestLink(engine, managed = false, maxLength = 32)
+        val transport = RfcommTransport(Closeable {})
+        val output = ByteArrayOutputStream()
+        val route = ByteArray(44) { it.toByte() }
+        assertTrue(engine.queueBulkControl(route, false, 0x5202, { true }))
+        engine.flushBulkControl(4, 8)
+        transport.writeOutput(engine, output::write)
+        val first = split(output.toByteArray()).single()
+        output.reset()
+
+        val stop = packet(0x40, 87, first.seq, 1, Iap2Csm.encode(0x5203, Iap2Csm.u16(0, 42)))
+        engine.feed(stop.copyOf(11), 5)
+        assertTrue(engine.queueBulkControl(byteArrayOf(99), false, 0x5202, { true }))
+        val required = byteArrayOf(11, 22, 33)
+        assertTrue(engine.sendControl(required, 5, awaitAck = false))
+        engine.flushBulkControl(5, 8)
+        transport.writeOutput(engine, output::write)
+        assertEquals(listOf(route.copyOfRange(22, 44).toList(), required.toList()),
+            split(output.toByteArray()).map { it.body.toList() })
+        assertTrue(engine.hasBulkControl)
+        output.reset()
+
+        val keepaliveDeadline = engine.nextDeadlineMillis()!!
+        engine.advanceTime(keepaliveDeadline)
+        transport.writeOutput(engine, output::write)
+        assertEquals(0, split(output.toByteArray()).single().session)
+
+        // Unknown stream prefix stops deferring optional work after its fixed grace period.
+        output.reset()
+        engine.flushBulkControl(6_000, 8)
+        transport.writeOutput(engine, output::write)
+        assertArrayEquals(byteArrayOf(99), split(output.toByteArray()).single().body)
+    }
+
+    @Test fun rfcommRetransmitsAnUnacknowledgedHudFrameAfterTheSourceStops() {
+        val engine = Iap2LinkEngine(rfcommHudWriteFeedback = true)
+        openHudTestLink(engine, managed = false)
+        val transport = RfcommTransport(Closeable {})
+        val cue = byteArrayOf(4, 5, 6)
+        var sourceActive = true
+        assertTrue(engine.queueBulkControl(cue, true, 0x5201, { sourceActive }))
+        engine.flushBulkControl(4, 8)
+        val output = ByteArrayOutputStream()
+        transport.writeOutput(engine, output::write)
+        val first = split(output.toByteArray()).single()
+
+        HudSourceWrites.publish { sourceActive = false }
+        engine.discardUnstartedBulkControl()
+        engine.advanceTime(System.nanoTime() / 1_000_000 + 5_000)
+        output.reset()
+        transport.writeOutput(engine, output::write)
+        val retry = split(output.toByteArray()).single { it.session != 0 }
+        assertEquals(first.seq, retry.seq)
+        assertArrayEquals(cue, retry.body)
+    }
+
+    private fun openHudTestLink(engine: Iap2LinkEngine, managed: Boolean, maxLength: Int = 65535) {
+        engine.start(0, passive = true)
+        engine.feed(Iap2LinkEngine.MARKER, 1)
+        engine.takeOutput()
+        val sync = Iap2LinkEngine.SynchronizationPayload(32, maxLength, 4000, 1000, 4, 3,
+            listOf(Iap2LinkEngine.SessionDescriptor(1, 0, 2)))
+        engine.feed(packet(0x80, 86, 0, body = sync.encode()), 2)
+        val answer = split(engine.takeOutput()).single()
+        val ticket = if (managed) engine.takeSocketWrites().single().ticket else 0L
+        engine.feed(packet(0x40, 86, answer.seq), 3, writtenSynAck = ticket)
+        engine.takeOutput()
+        assertEquals(Iap2LinkEngine.State.NORMAL, engine.state)
+    }
+
     @Test fun aStartedCsmAndControlResponseDrainWhileNewBulkStartsArePaused() {
         val car = Car(packetLength = 32, profileId = "bmw_id85", managedWrites = true)
         val receive = Iap2Csm.param(Iap2Messages.IDENT_RECEIVE_IDS, byteArrayOf(0x52, 1, 0x52, 2, 0x52, 4))
@@ -1125,7 +1535,7 @@ class WifiIap2ProtocolTest {
         assertTrue(car.authenticationOutput.none { it.messageId == 0x10db })
 
         val offer = io.github.hypercar.navigation.NavigationDestination("test-trip", 1.0, -2.0, "en_GB",
-            name = "Station", address = "Main Road")
+            name = "Station", address = "Main Road", sourceName = "高德地图")
         val target = car.protocol.destinationTarget!!
         val cue = io.github.hypercar.navigation.NavigationCue("", null, null, destinationToShare = target.authorize(offer))
         car.navigationCue = cue
@@ -1136,6 +1546,7 @@ class WifiIap2ProtocolTest {
         assertNotEquals(offer.id, firstWireId)
         assertEquals("en_GB", params.getValue(6).asStringOrNull())
         assertEquals("Main Road", params.getValue(3).asStringOrNull())
+        assertArrayEquals("高德地图\u0000".encodeToByteArray(), params.getValue(7).value)
         val coordinates = Iap2Csm.parseParams(params.getValue(2).value)
         assertArrayEquals(byteArrayOf(0, 64, 0, 0), coordinates[0].value)
         assertArrayEquals(byteArrayOf(-1, -128, 0, 0), coordinates[1].value)
@@ -1155,12 +1566,212 @@ class WifiIap2ProtocolTest {
         car.navigationCue = cue.copy(destinationToShare = car.protocol.destinationTarget!!.authorize(offer))
         val second = car.message(0x1234).single()
         assertEquals(0x10db, second.messageId)
-        val secondWireId = Iap2Csm.parseParams(second.body).first().asStringOrNull()!!
+        val secondParams = Iap2Csm.parseParams(second.body)
+        assertTrue(secondParams.none { it.id == 7 })
+        val secondWireId = secondParams.first().asStringOrNull()!!
         assertNotEquals(firstWireId, secondWireId)
         car.message(0x10dd, Iap2Csm.string(0, firstWireId))
         assertEquals(1, car.logs.count { "DESTINATION: result accepted" in it })
         car.message(0x10dd, Iap2Csm.string(0, secondWireId))
         assertEquals(2, car.logs.count { "DESTINATION: result accepted" in it })
+    }
+
+    @Test fun destinationSourceNameIsOmittedWhenTheAuthorizedSourceHasNoName() {
+        val car = Car().apply { navigationAllowed = true }
+        car.ready()
+        car.message(0x10da, Iap2Csm.param(0, byteArrayOf()))
+        val target = car.protocol.destinationTarget!!
+        for (sourceName in listOf(null, "   ")) {
+            val destination = io.github.hypercar.navigation.NavigationDestination(
+                "A", 1.0, 2.0, "en_GB", name = "Display name", sourceName = sourceName,
+            )
+            car.navigationCue = io.github.hypercar.navigation.NavigationCue(
+                "", null, null, sourceName = "Cue label", destinationToShare = target.authorize(destination),
+            )
+            val reply = car.message(0x1234).single { it.messageId == 0x10db }
+            assertTrue(Iap2Csm.parseParams(reply.body).none { it.id == 7 })
+        }
+    }
+
+    @Test fun destinationRequestsDuringExplicitDenialDoNotSurviveCapabilityRecovery() {
+        val car = Car(profileId = "bmw_id85").apply { navigationAllowed = true }
+        val receive = Iap2Messages.IDENT_RECEIVE_IDS
+        val supported = Iap2Csm.u16(receive, 0x10db)
+        car.ready(supported)
+        car.message(0x10da, Iap2Csm.param(0, byteArrayOf()))
+        car.message(0x1d01, Iap2Csm.u16(receive, 0x5001))
+        assertNull(car.protocol.destinationTarget)
+        car.message(0x1d01)
+        assertNull(car.protocol.destinationTarget)
+        car.message(0x10da, Iap2Csm.param(0, byteArrayOf()))
+        car.message(0x1d01, supported)
+
+        val target = car.protocol.destinationTarget!!
+        val destination = io.github.hypercar.navigation.NavigationDestination("A", 1.0, 2.0, "en_GB", sourceName = "Map app")
+        car.navigationCue = io.github.hypercar.navigation.NavigationCue("", null, null,
+            destinationToShare = target.authorize(destination))
+        assertTrue(car.message(0x1234).none { it.messageId == 0x10db })
+        val offer = car.message(0x10da, Iap2Csm.param(0, byteArrayOf())).single { it.messageId == 0x10db }
+        assertEquals("Map app", Iap2Csm.parseParams(offer.body).single { it.id == 7 }.asStringOrNull())
+    }
+
+    @Test fun mfiDestinationDenialGatesRequestsWithoutChangingAuthenticationOrder() {
+        for (version in listOf(1, 2)) {
+            val car = Car(profileId = "bmw_id85").apply { navigationAllowed = true }
+            val supported = Iap2Csm.u16(Iap2Messages.IDENT_RECEIVE_IDS, 0x10db)
+            val denied = Iap2Csm.u16(Iap2Messages.IDENT_RECEIVE_IDS, 0x5001)
+            val start = car.start { it.copy(sessions = it.sessions.map { session ->
+                if (session.kind == 0) session.copy(version = version) else session
+            }) }
+            assertEquals(listOf(if (version == 1) 0xaa00 else 0x1d00), start.map { it.messageId })
+            if (version == 2) {
+                assertEquals(listOf(0x1d02, 0xaa00), car.message(0x1d01, supported).map { it.messageId })
+                assertTrue(car.message(0x10da, Iap2Csm.param(0, byteArrayOf())).isEmpty())
+            }
+            if (version == 1) assertTrue(car.message(0x1d01, denied).isEmpty())
+            assertEquals(0xaa02, car.message(0xaa01, Iap2Csm.param(0, byteArrayOf(1))).single().messageId)
+            if (version == 2) assertTrue(car.message(0x1d01, denied).isEmpty())
+            assertTrue(car.message(0x10da, Iap2Csm.param(0, byteArrayOf())).isEmpty())
+            val greetings = listOf(0x4e0c, 0x5702, 0x4e0a, 0x4e09, 0x4e0b)
+            val authentication = car.message(0xaa03, Iap2Csm.param(0, ByteArray(64))).map { it.messageId }
+            assertEquals(listOf(0xaa05) + if (version == 1) listOf(0x1d00) else greetings, authentication)
+            if (version == 2) assertNull(car.protocol.destinationTarget)
+            val identification = car.message(0x1d01, supported).map { it.messageId }
+            assertEquals(listOf(0x1d02) + if (version == 1) greetings else emptyList(), identification)
+
+            val destination = io.github.hypercar.navigation.NavigationDestination("A", 1.0, 2.0, "en_GB", sourceName = "Map app")
+            car.navigationCue = io.github.hypercar.navigation.NavigationCue("", null, null,
+                destinationToShare = car.protocol.destinationTarget!!.authorize(destination))
+            assertTrue(car.message(0x1234).none { it.messageId == 0x10db })
+            val offer = car.message(0x10da, Iap2Csm.param(0, byteArrayOf())).single { it.messageId == 0x10db }
+            assertEquals("Map app", Iap2Csm.parseParams(offer.body).single { it.id == 7 }.asStringOrNull())
+        }
+    }
+
+    @Test fun aPartialDestinationWithdrawalHoldsOrCancelsTheUnwrittenFirstFragment() {
+        for (staged in listOf(false, true)) {
+            val car = Car(managedWrites = true).apply { navigationAllowed = true }
+            car.ready()
+            car.message(0x10da, Iap2Csm.param(0, byteArrayOf()))
+            val target = car.protocol.destinationTarget!!
+            val destination = io.github.hypercar.navigation.NavigationDestination("A", 1.0, 2.0, "en_GB", sourceName = "Map app")
+            car.navigationCue = io.github.hypercar.navigation.NavigationCue("", null, null,
+                destinationToShare = target.authorize(destination))
+            val lastWritten = car.ack
+            val stagedTicket = if (staged) {
+                assertEquals(0x10db, car.message(0x1234).single().messageId)
+                car.protocol.takeSocketWrites().single().ticket
+            } else null
+            val bareRequest = Iap2Csm.encode(0x10da)
+            assertTrue(car.feed(packet(0x40, ++car.sequence, lastWritten, car.controlSession,
+                bareRequest.copyOfRange(0, 4))).isEmpty())
+            if (stagedTicket != null) {
+                assertEquals(listOf(0L to stagedTicket), car.cancelledWrites)
+                car.protocol.socketWriteFinished(stagedTicket, null)
+            }
+            val output = car.feed(packet(0x40, ++car.sequence, lastWritten, car.controlSession,
+                bareRequest.copyOfRange(4, bareRequest.size))).single()
+            assertEquals((lastWritten + 1) and 0xff, output.seq)
+            val offer = messages(listOf(output)).single()
+            assertEquals(0x10db, offer.messageId)
+            assertTrue(Iap2Csm.parseParams(offer.body).none { it.id == 7 })
+        }
+    }
+
+    @Test fun stalledControlFragmentExpiresTheDestinationSubscriptionWithoutBlockingReplies() {
+        val car = Car().apply { navigationAllowed = true }
+        car.ready()
+        car.message(0x10da, Iap2Csm.param(0, byteArrayOf()))
+        val destination = io.github.hypercar.navigation.NavigationDestination("A", 1.0, 2.0, "en_GB", sourceName = "Map app")
+        car.navigationCue = io.github.hypercar.navigation.NavigationCue("", null, null,
+            destinationToShare = car.protocol.destinationTarget!!.authorize(destination))
+        val query = Iap2Csm.encode(0x4154)
+        assertTrue(car.feed(packet(0x40, ++car.sequence, car.ack, car.controlSession, query.copyOfRange(0, 4))).isEmpty())
+        car.time += 1_100
+        assertTrue(car.protocol.advance(car.time).isEmpty())
+        val complete = car.feed(packet(0x40, ++car.sequence, car.ack, car.controlSession, query.copyOfRange(4, query.size)))
+        assertEquals(listOf(0x4155), messages(complete).map { it.messageId })
+        val offer = car.message(0x10da).single()
+        assertEquals(0x10db, offer.messageId)
+        assertTrue(Iap2Csm.parseParams(offer.body).none { it.id == 7 })
+    }
+
+    @Test fun aNewControlPrefixInTheSamePacketGetsItsOwnDeadline() {
+        val car = Car(profileId = "bmw_id85").apply { navigationAllowed = true }
+        car.ready()
+        car.message(0x10da, Iap2Csm.param(0, byteArrayOf()))
+        val query = Iap2Csm.encode(0x4154)
+        val prefix = query.copyOfRange(0, 4)
+        val suffix = query.copyOfRange(4, query.size)
+        fun incoming(time: Long, body: ByteArray): List<Int> {
+            car.time = time
+            return messages(car.feed(packet(0x40, ++car.sequence, car.ack, car.controlSession, body))).map { it.messageId }
+        }
+        assertTrue(incoming(1_000, prefix).isEmpty())
+        assertEquals(listOf(0x4155), incoming(1_950, suffix + prefix))
+        assertTrue(car.protocol.advance(2_001).isEmpty())
+        assertEquals(listOf(0x4155), incoming(2_050, suffix))
+
+        val destination = io.github.hypercar.navigation.NavigationDestination("A", 1.0, 2.0, "en_GB", sourceName = "Map app")
+        car.navigationCue = io.github.hypercar.navigation.NavigationCue("", null, null,
+            destinationToShare = car.protocol.destinationTarget!!.authorize(destination))
+        val offer = car.message(0x1234).single { it.messageId == 0x10db }
+        assertEquals("Map app", Iap2Csm.parseParams(offer.body).single { it.id == 7 }.asStringOrNull())
+    }
+
+    @Test fun aSplitBareLinkAckDoesNotExpireTheDestinationSubscription() {
+        val car = Car().apply { navigationAllowed = true }
+        car.ready()
+        car.message(0x10da)
+        val ack = packet(0x40, car.sequence, car.ack)
+        assertTrue(car.feed(ack.copyOfRange(0, 4)).isEmpty())
+        car.time += 1_100
+        assertTrue(car.protocol.advance(car.time).isEmpty())
+        assertTrue(car.feed(ack.copyOfRange(4, ack.size)).isEmpty())
+
+        val destination = io.github.hypercar.navigation.NavigationDestination("A", 1.0, 2.0, "en_GB")
+        car.navigationCue = io.github.hypercar.navigation.NavigationCue("", null, null,
+            destinationToShare = car.protocol.destinationTarget!!.authorize(destination))
+        assertEquals(0x10db, car.message(0x1234).single().messageId)
+    }
+
+    @Test fun changingTheDestinationSourceNameRequestPreservesOnlyAlreadyWrittenOffers() {
+        for (wroteBeforeChange in listOf(false, true)) {
+            val car = Car(managedWrites = true).apply { navigationAllowed = true }
+            car.ready()
+            car.message(0x10da, Iap2Csm.param(0, byteArrayOf()))
+            val target = car.protocol.destinationTarget!!
+            val destination = io.github.hypercar.navigation.NavigationDestination(
+                "A", 1.0, 2.0, "en_GB", sourceName = "Map app",
+            )
+            car.navigationCue = io.github.hypercar.navigation.NavigationCue(
+                "", null, null, destinationToShare = target.authorize(destination),
+            )
+            val offer = car.message(0x1234).single { it.messageId == 0x10db }
+            val fields = Iap2Csm.parseParams(offer.body).associateBy { it.id }
+            assertEquals("Map app", fields.getValue(7).asStringOrNull())
+            val oldId = fields.getValue(0)
+            val ticket = car.protocol.takeSocketWrites().single { it.cancellable }
+            assertTrue(car.message(0x10da).none { it.messageId == 0x10db })
+            assertEquals(listOf(car.protocol.outputGeneration to ticket.ticket), car.cancelledWrites)
+            car.protocol.socketWriteFinished(ticket.ticket, car.time.takeIf { wroteBeforeChange })
+
+            val output = car.message(0x10dd, Iap2Csm.param(0, oldId.value))
+            if (wroteBeforeChange) {
+                assertTrue(output.none { it.messageId == 0x10db })
+            } else {
+                assertTrue(car.logs.none { "DESTINATION: result" in it })
+                val replacement = output.single { it.messageId == 0x10db }
+                val newFields = Iap2Csm.parseParams(replacement.body)
+                assertTrue(newFields.none { it.id == 7 })
+                val newId = newFields.first()
+                assertFalse(oldId.value.contentEquals(newId.value))
+                val write = car.protocol.takeSocketWrites().single { it.cancellable }
+                car.protocol.socketWriteFinished(write.ticket, car.time)
+                car.message(0x10dd, Iap2Csm.param(0, newId.value))
+            }
+            assertEquals(1, car.logs.count { "DESTINATION: result accepted" in it })
+        }
     }
 
     @Test fun earlyHudSubscriptionWaitsForAuthenticationAndRealSource() {
@@ -1340,7 +1951,7 @@ class WifiIap2ProtocolTest {
         fun type4(road: String) = org.json.JSONObject()
             .put("curManeuverID", 3).put("segmentRemainDist", 100).put("curRouteName", road)
         fun send(id: Int, body: ByteArray = byteArrayOf()): List<Iap2Csm.Frame> {
-            car.navigationCue = link.hudSnapshot(car.time, notifications.timedSnapshot(car.time))
+            car.navigationCue = link.hudSnapshot(car.time, notifications.clusterRoute(car.time))
             return car.message(id, body).filter { it.messageId in 0x5201..0x5202 }
         }
         fun field(frames: List<Iap2Csm.Frame>, id: Int) = Iap2Csm.parseParams(frames.single { it.messageId == 0x5201 }.body)
@@ -1548,6 +2159,36 @@ class WifiIap2ProtocolTest {
 
     }
 
+    @Test fun aStartedDestinationAndRequiredReplyDrainAcrossAFragmentedStop() {
+        val car = Car(packetLength = 64, profileId = "bmw_id85", managedWrites = true).apply { navigationAllowed = true }
+        car.ready()
+        car.message(0x10da, Iap2Csm.param(0, byteArrayOf()))
+        val destination = io.github.hypercar.navigation.NavigationDestination("A", 1.0, 2.0, "en_GB",
+            name = "A".repeat(500), sourceName = "Map app")
+        car.navigationCue = io.github.hypercar.navigation.NavigationCue("", null, null,
+            destinationToShare = car.protocol.destinationTarget!!.authorize(destination))
+        val first = car.feed(packet(0x40, car.sequence, car.ack)).single()
+        val id = Iap2Csm.parseParams(first.body.copyOfRange(6, first.body.size)).first()
+        car.protocol.socketWriteFinished(car.protocol.takeSocketWrites().single().ticket, car.time)
+
+        car.nativeCapacity = 2
+        car.allowBulkStart = false
+        val stop = Iap2Csm.encode(0x10dc)
+        val duringStop = car.feed(packet(0x40, ++car.sequence, car.ack, car.controlSession, stop.copyOfRange(0, 4)))
+        assertTrue(duringStop.isNotEmpty())
+        val output = (listOf(first) + duringStop).toMutableList()
+        output += car.feed(packet(0x40, ++car.sequence, car.ack, car.controlSession,
+            stop.copyOfRange(4, stop.size) + Iap2Csm.encode(0x4154)))
+        repeat(12) { output += car.feed(packet(0x40, car.sequence, car.ack)) }
+        val messages = messages(output)
+        assertEquals(listOf(0x10db, 0x4155), messages.map { it.messageId })
+        assertEquals("Map app", Iap2Csm.parseParams(messages.first().body).single { it.id == 7 }.asStringOrNull())
+        assertTrue(car.cancelledWrites.isEmpty())
+        car.protocol.takeSocketWrites().forEach { car.protocol.socketWriteFinished(it.ticket, car.time) }
+        car.message(0x10dd, Iap2Csm.param(0, id.value))
+        assertTrue(car.logs.none { "DESTINATION: result" in it })
+    }
+
     @Test fun destinationResultWaitsForWriteConfirmationAndStillChecksTheCurrentAuthorization() {
         val car = Car(managedWrites = true).apply { navigationAllowed = true }
         car.ready()
@@ -1564,9 +2205,11 @@ class WifiIap2ProtocolTest {
         car.message(0x10dd, Iap2Csm.param(0, oldId.value))
         assertTrue(car.logs.none { "DESTINATION: result" in it })
         target.authorize(destination)
+        assertEquals(listOf(0L to oldTicket), car.cancelledWrites)
         car.protocol.socketWriteFinished(oldTicket, car.time)
         assertTrue(car.logs.none { "DESTINATION: result" in it })
         val (newId, newTicket) = sendOffer()
+        car.message(0x10dd, Iap2Csm.param(0, oldId.value))
         car.message(0x10dd, Iap2Csm.param(0, newId.value))
         assertTrue(car.logs.none { "DESTINATION: result" in it })
         car.protocol.socketWriteFinished(newTicket, car.time)
@@ -1579,6 +2222,35 @@ class WifiIap2ProtocolTest {
         assertTrue(car.protocol.hasWrittenDestinationOffer)
         car.protocol.ingest(packet(0x40, ++car.sequence, car.ack, car.controlSession, Iap2Csm.encode(0x10dc)), car.time)
         car.protocol.advance(car.time)
+        assertEquals(1, car.logs.count { "DESTINATION: result accepted" in it })
+    }
+
+    @Test fun stopBeforeWriteFeedbackCannotReuseAnAuthorizationWhoseFirstBytesWereWritten() {
+        val car = Car(profileId = "bmw_id85", managedWrites = true).apply { navigationAllowed = true }
+        car.ready()
+        car.message(0x10da)
+        val destination = io.github.hypercar.navigation.NavigationDestination("A", 1.0, 2.0, "en_GB")
+        val target = car.protocol.destinationTarget!!
+        car.navigationCue = io.github.hypercar.navigation.NavigationCue("", null, null,
+            destinationToShare = target.authorize(destination))
+        val oldOffer = car.message(0x1234).single { it.messageId == 0x10db }
+        val oldId = Iap2Csm.parseParams(oldOffer.body).first()
+        val oldWrite = car.protocol.takeSocketWrites().single()
+        val writtenAt = car.time
+        assertTrue(car.message(0x10dc).isEmpty())
+        assertEquals(listOf(0L to oldWrite.ticket), car.cancelledWrites)
+        car.protocol.socketWriteFinished(oldWrite.ticket, writtenAt)
+        assertTrue(car.message(0x10da).none { it.messageId == 0x10db })
+
+        car.navigationCue = car.navigationCue!!.copy(destinationToShare = target.authorize(destination))
+        val newOffer = car.message(0x1234).single { it.messageId == 0x10db }
+        val newId = Iap2Csm.parseParams(newOffer.body).first()
+        assertNotEquals(oldId, newId)
+        val newWrite = car.protocol.takeSocketWrites().single()
+        car.protocol.socketWriteFinished(newWrite.ticket, car.time)
+        car.message(0x10dd, Iap2Csm.param(0, oldId.value))
+        assertTrue(car.logs.none { "DESTINATION: result" in it })
+        car.message(0x10dd, Iap2Csm.param(0, newId.value))
         assertEquals(1, car.logs.count { "DESTINATION: result accepted" in it })
     }
 

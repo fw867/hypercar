@@ -38,8 +38,14 @@ interface Iap2LinkChannel {
         sendControl(bytes, awaitAck)
 
     val hasQueuedHudMessages: Boolean get() = false
-    fun queueHudMessage(bytes: ByteArray, messageId: Int, canStart: () -> Boolean, commitStart: (() -> Boolean)?): Boolean {
-        if (!canStart() || commitStart?.invoke() == false) return true
+    fun queueHudMessage(
+        bytes: ByteArray, messageId: Int, canStart: () -> Boolean, commitStart: (() -> Boolean)?,
+        onDiscarded: (() -> Unit)?,
+    ): Boolean {
+        if (!canStart() || commitStart?.invoke() == false) {
+            onDiscarded?.invoke()
+            return true
+        }
         val limit = peerMaxControlPayload() ?: bytes.size
         if (limit <= 0) return false
         var offset = 0
@@ -50,7 +56,7 @@ interface Iap2LinkChannel {
         }
         return true
     }
-    fun flushHudMessages() {}
+    fun flushHudMessages(allowHudStart: Boolean = true, discardUnstartedHud: Boolean = false) {}
 
     /** 取下一个控制载荷；空数组表示同一传输上的链路重建边界，null 表示超时或结束。 */
     fun recvControl(timeoutMillis: Long): ByteArray?
@@ -140,6 +146,8 @@ class Iap2SenderSession(
     },
 ) {
     private var parser = Iap2Csm.Parser()
+    private var pendingHudStopOffset: Long? = null
+    private var pendingHudStopDeadline = 0L
     private val media = Iap2MediaSession(log, onMediaKey)
     private val nowPlaying = Iap2NowPlayingSession(nowPlayingProvider, log)
     private var navigation = RouteGuidanceSession(log)
@@ -255,6 +263,7 @@ class Iap2SenderSession(
 
         /** 保活期空闲轮询间隔：必须短于重探周期，否则「一个包都不来」时轮不到重探。 */
         const val IDLE_POLL_MILLIS = 1_000L
+        const val STOP_ROUTE_GUIDANCE = 0x5203
 
         /** 等不到热点凭据时的重探节奏：前 12 次 5s（覆盖上车点屏幕那一分钟），之后 30s。 */
         val POKE_INTERVAL_NANOS = 5_000_000_000L
@@ -750,7 +759,7 @@ class Iap2SenderSession(
             // 限流逻辑走，它要么被当成 keep-alive 只记长度，要么因与上一条同 ID 被
             // continue 掉——两种都等于丢弃（车机等 15 秒无人连入 AirPlay 就拆 RFCOMM）。
             when (frame.messageId) {
-                0x5200, 0x5203 -> navigation.handle(frame)
+                0x5200, STOP_ROUTE_GUIDANCE -> navigation.handle(frame)
                 Iap2MessageIds.CARPLAY_START_SESSION -> handleLateStartSession(frame)
                 Iap2MessageIds.ACCESSORY_WIFI_CONFIGURATION -> handleLateWifiConfiguration(frame)
                 Iap2MessageIds.EA_SESSION_STATUS -> handleEaSessionStatus(frame, phase1 = false)
@@ -1696,6 +1705,8 @@ class Iap2SenderSession(
 
     private fun resetBusinessLink() {
         parser = Iap2Csm.Parser()
+        pendingHudStopOffset = null
+        pendingHudStopDeadline = 0L
         receivedFrames.clear()
         pendingFrames.clear()
         deferredBmwIdentifications.clear()
@@ -1729,15 +1740,28 @@ class Iap2SenderSession(
             val enabled = navigationEnabled()
             val cue = navigationCue()
             navigation.refreshLaneSource(enabled, cue)
-            if (!channel.hasQueuedHudMessages) navigation.queuedUpdates(now, enabled, cue).forEach {
+            val stopPrefix = parser.pendingFrameOffset?.takeIf { parser.pendingMayBe(STOP_ROUTE_GUIDANCE) }
+            if (pendingHudStopOffset != stopPrefix) {
+                pendingHudStopOffset = stopPrefix
+                pendingHudStopDeadline = now + Iap2LinkEngine.RFCOMM_HUD_FRAGMENT_GRACE_MILLIS
+            }
+            val stopIdentified = parser.pendingMessageId == STOP_ROUTE_GUIDANCE
+            val fragmentExpired = now >= pendingHudStopDeadline
+            // An ambiguous prefix gets a fixed grace period. An identified STOP must be
+            // parsed in order before any unstarted HUD message can use the subscription.
+            val allowHudStart = stopPrefix == null || (!stopIdentified && fragmentExpired)
+            if (allowHudStart && !channel.hasQueuedHudMessages) navigation.queuedUpdates(now, enabled, cue, liveCue = {
+                val current = navigationEnabled()
+                current to if (current) navigationCue() else null
+            }).forEach {
                 val frame = it.frame
                 if (!channel.queueHudMessage(Iap2Csm.encode(frame.messageId, frame.body), frame.messageId,
-                        it.canStart, it.commitStart)) {
+                        it.canStart, it.commitStart, it.onDiscarded)) {
                     ensureCurrentLink()
                     throw IOException("iAP2 链路在排队 0x${frame.messageId.toString(16)} 时关闭")
                 }
             }
-            channel.flushHudMessages()
+            channel.flushHudMessages(allowHudStart, discardUnstartedHud = stopIdentified && fragmentExpired)
         }
         for (index in 0 until 64) {
             val bytes = channel.recvFileTransfer() ?: break

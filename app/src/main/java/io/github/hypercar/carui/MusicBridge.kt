@@ -101,7 +101,7 @@ class MusicNotificationListener : NotificationListenerService() {
     }
 
     override fun onNotificationPosted(notification: android.service.notification.StatusBarNotification?) {
-        if (!shouldListen()) return
+        if (connected !== this || !shouldListen()) return
         ensureAttached()
         notification?.let {
             MusicBridge.onNotificationChanged(it.packageName)
@@ -110,7 +110,7 @@ class MusicNotificationListener : NotificationListenerService() {
     }
 
     override fun onNotificationRemoved(notification: android.service.notification.StatusBarNotification?) {
-        if (!shouldListen()) return
+        if (connected !== this || !shouldListen()) return
         ensureAttached()
         notification?.let {
             MusicBridge.onNotificationChanged(it.packageName)
@@ -119,7 +119,7 @@ class MusicNotificationListener : NotificationListenerService() {
     }
 
     private fun replayNavigation() {
-        runCatching { activeNotifications?.forEach { io.github.hypercar.navigation.AmapNavigation.posted(it) } }
+        runCatching { activeNotifications?.let(io.github.hypercar.navigation.AmapNavigation::activeSnapshot) }
     }
 
     private fun ensureAttached() {
@@ -132,16 +132,21 @@ class MusicNotificationListener : NotificationListenerService() {
     }
 
     override fun onDestroy() {
-        if (connected === this) connected = null
+        disconnectNavigation()
         if (MusicBridge.isAttachedTo(this)) MusicBridge.detach()
         super.onDestroy()
     }
 
     override fun onListenerDisconnected() {
-        io.github.hypercar.navigation.AmapNavigation.clear()
-        if (connected === this) connected = null
+        disconnectNavigation()
         if (MusicBridge.isAttachedTo(this)) MusicBridge.detach()
         super.onListenerDisconnected()
+    }
+
+    private fun disconnectNavigation() {
+        if (connected !== this) return
+        connected = null
+        io.github.hypercar.navigation.AmapNavigation.listenerDisconnected()
     }
 
     companion object {

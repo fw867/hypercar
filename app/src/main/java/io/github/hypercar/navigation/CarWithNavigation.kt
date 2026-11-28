@@ -9,36 +9,48 @@ internal object CarWithNavigation {
     private val state = CarWithNavigationState()
     private var nextLogAt = 0L
 
-    @Synchronized fun prepareConfig(json: String): String {
-        return JSONObject(json).put("carwith_navigation_token", state.begin())
+    fun prepareConfig(json: String): String {
+        return JSONObject(json).put("carwith_navigation_token", HudSourceWrites.publish(state::begin))
             .put("carwith_navigation_enabled", HyperCarRepo.carWithHudNavigationAllowed).toString()
     }
 
-    @Synchronized fun clear() { state.clear() }
+    fun clear() { HudSourceWrites.publish(state::clear) }
 
-    @Synchronized fun receive(sourceToken: Long, json: String) {
+    fun receive(sourceToken: Long, json: String) {
         if (!state.accepts(sourceToken)) return
-        if (!HyperCarRepo.carWithHudNavigationAllowed || json == "null") {
-            state.update(sourceToken, null, SystemClock.elapsedRealtime()); return
+        if (json == "{\"reset\":true}") {
+            HudSourceWrites.publish { state.reset(sourceToken) }
+            return
         }
-        val cue = runCatching {
+        val update = if (HyperCarRepo.carWithHudNavigationAllowed && json != "null") runCatching {
             require(json.length <= 2048)
             val n = JSONObject(json)
-            CarWithCueMapper.map(n.getInt("action"),
+            val action = n.getInt("action")
+            action to CarWithCueMapper.map(action,
                 if (n.isNull("turn")) null else n.getInt("turn"),
                 if (n.isNull("distance")) null else n.getLong("distance"), n.getString("road"))
-        }.getOrNull()
-        if (cue == null) { state.update(sourceToken, null, SystemClock.elapsedRealtime()); return }
-        val now = SystemClock.elapsedRealtime()
-        if (!state.update(sourceToken, cue, now)) return
-        if (now >= nextLogAt) {
+        }.getOrNull() else null
+        val loggedCue = HudSourceWrites.publish {
+            if (!HyperCarRepo.carWithHudNavigationAllowed) {
+                state.reset(sourceToken)
+                return@publish null
+            }
+            val cue = update?.second
+            val now = SystemClock.elapsedRealtime()
+            if (!state.update(sourceToken, cue, now, startsRoute = update?.first == 1) ||
+                cue == null || now < nextLogAt) return@publish null
             nextLogAt = now + 10_000
+            cue
+        }
+        loggedCue?.let { cue ->
             HyperCarRepo.log("HUD: CarWith结构化导航 state=${cue.state} maneuver=${cue.maneuver} distance=${cue.distanceMeters}m（不记录道路文本）")
         }
     }
 
     fun snapshot(): NavigationCue? = if (HyperCarRepo.carWithHudNavigationAllowed)
         state.snapshot(SystemClock.elapsedRealtime()) else null
+
+    fun ownedRouteGeneration(now: Long): Long? = state.ownedRouteGeneration(now)
 }
 
 internal object CarWithCueMapper {
@@ -72,7 +84,15 @@ internal object NavigationSources {
         if (!HyperCarRepo.hudNavigationAllowed) return null
         if (HyperCarRepo.carWithHudNavigationAllowed) return CarWithNavigation.snapshot()
         val now = SystemClock.elapsedRealtime()
-        return AmapLinkNavigation.hudSnapshot(now, AmapNavigation.timedSnapshot(now))
+        return AmapLinkNavigation.hudSnapshot(now, AmapNavigation.clusterRoute(now))
     }
+
+    fun ownedRouteGeneration(): Long? {
+        if (!HyperCarRepo.hudNavigationAllowed) return null
+        val now = SystemClock.elapsedRealtime()
+        if (HyperCarRepo.carWithHudNavigationAllowed) return CarWithNavigation.ownedRouteGeneration(now)
+        return AmapLinkNavigation.ownedRouteGeneration(now, AmapNavigation.clusterRoute(now))
+    }
+
     fun clear() { AmapNavigation.clear(); AmapLinkNavigation.clear(); CarWithNavigation.clear(); AmapLinkProbe.stop() }
 }

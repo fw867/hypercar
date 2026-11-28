@@ -73,6 +73,52 @@ class Iap2EndpointHandoffTest {
         assertNull(handoff.take())
     }
 
+    @Test fun oldWifiLossPreservesAlreadyAcceptedCafeAndItsFirstRoute() {
+        val old = sockets.register(Closeable {})
+        sockets.admit(old)
+        val retiredRoute = report(old, "192.168.1.1")
+        old.endIo()
+        var replacementClosed = false
+        val replacement = sockets.register(Closeable { replacementClosed = true }, wifiLossPredecessorAttempt = 12)
+        val loss = sockets.captureClose(wifiLossAttempt = 12)
+        sockets.admit(replacement)
+        val firstRoute = report(replacement, "192.168.1.2")
+        assertFalse(send(firstRoute) { null })
+        handoff.prepare(loss)
+        loss.close()
+        assertFalse(replacementClosed)
+        assertFalse(send(retiredRoute))
+        assertSame(firstRoute, handoff.take())
+        assertEquals(1, deferredCommits)
+
+        val nextRoundLoss = sockets.captureClose(wifiLossAttempt = 13)
+        handoff.prepare(nextRoundLoss)
+        nextRoundLoss.close()
+        assertTrue(replacementClosed)
+        assertFalse(send(firstRoute))
+        assertNull(handoff.take())
+    }
+
+    @Test fun laterWifiLossOnlyClosesTheReplacementForItsOwnNetwork() {
+        var closed = false
+        val replacement = sockets.register(Closeable { closed = true }, wifiLossPredecessorAttempt = 12)
+        sockets.admit(replacement)
+        replacement.ownedWifiNetwork = 102L
+        val staleLoss = sockets.captureClose(wifiLossAttempt = 12, wifiLossNetwork = 101)
+        handoff.prepare(staleLoss)
+        staleLoss.close()
+        val endpoint = report(replacement, "192.168.1.2")
+        assertFalse(closed)
+        assertTrue(send(endpoint))
+
+        val currentLoss = sockets.captureClose(wifiLossAttempt = 12, wifiLossNetwork = 102)
+        handoff.prepare(currentLoss)
+        currentLoss.close()
+        assertTrue(closed)
+        assertFalse(send(endpoint))
+        assertNull(handoff.take())
+    }
+
     @Test fun nullSnapshotWithoutBluetoothAllowsSubsequentFreshConnection() {
         handoff.prepare(null)
         val fresh = report(sockets.register(Closeable {}), "192.168.1.2")
