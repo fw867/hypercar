@@ -1,5 +1,7 @@
 package io.github.hypercar.session
 
+import io.github.hypercar.iap2.AirplayRouteBinding
+
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
@@ -154,8 +156,12 @@ internal object CarHotspotReconnect {
                 return !matchesLostRequest(lost, endpoint)
             }
 
+            fun independentAddress(endpoint: CarPlayEndpoint, pinned: CarPlayEndpoint? = selected): Boolean =
+                endpoint.addressOnlyAirplayReport && endpoint.sourceGeneration != null &&
+                    pinned?.sourceGeneration !== endpoint.sourceGeneration
+
             fun matchesSelection(endpoint: CarPlayEndpoint, pinned: CarPlayEndpoint?): Boolean =
-                endpoint.passphrase == null || pinned?.let {
+                endpoint.passphrase == null || independentAddress(endpoint, pinned) || pinned?.let {
                     it.matchesHotspotRequest(endpoint) && it.bluetoothHotspot == endpoint.bluetoothHotspot
                 } == true
 
@@ -191,10 +197,12 @@ internal object CarHotspotReconnect {
             onDeferredAccept: ((CarPlayEndpoint) -> Unit)? = null,
             onDeferredAddress: (CarPlayEndpoint) -> Unit = {},
             onDeferredPublish: (CarPlayEndpoint) -> Unit = {},
+            onRetainedAddress: (CarPlayEndpoint) -> Unit = {},
             onAccept: () -> Unit = {},
         ): Boolean =
             synchronized(lock) {
-                if (closed || !canQueue(endpoint)) return@synchronized false
+                if (closed || !canQueue(endpoint) || endpoint.sourceGeneration?.canPublish == false)
+                    return@synchronized false
                 val enqueuedAt = nowMillis()
                 val recovery = wifiRecovery
                 // A new SSID is only published by onAccept. Check its proposed
@@ -205,7 +213,8 @@ internal object CarHotspotReconnect {
                     if (endpoint.addressOnlyAirplayReport && endpoint.verifiedAirplayNetworkHandle == null && recovery.joining) {
                         val peer = endpoint.bluetoothHotspot?.peer ?: recovery.selected?.bluetoothHotspot?.peer
                         val future = recovery.deferred.lastOrNull {
-                            it.endpoint.sourceIsCurrent && it.endpoint.bluetoothHotspot?.peer?.equals(peer, ignoreCase = true) == true
+                            it.endpoint.sourceGeneration === endpoint.sourceGeneration &&
+                                it.endpoint.sourceIsCurrent && it.endpoint.bluetoothHotspot?.peer?.equals(peer, ignoreCase = true) == true
                         }
                         if (future != null) {
                             // A route-only report received behind pending credentials is
@@ -214,9 +223,14 @@ internal object CarHotspotReconnect {
                                 ssid = future.endpoint.ssid, passphrase = future.endpoint.passphrase,
                                 wifiSecurityType = future.endpoint.wifiSecurityType, wifiChannel = future.endpoint.wifiChannel,
                                 bluetoothHotspot = future.endpoint.bluetoothHotspot,
+                                requiresBoundAirplayRoute = true,
                                 requiresMatchingAirplayCredentials = true,
+                                airplayRouteBinding = endpoint.airplayRouteBinding ?: AirplayRouteBinding(),
                             )
-                            future.followingAddress = DeferredArrival(route, enqueuedAt, {}, onDeferredAddress)
+                            if (endpoint.sourceGeneration?.canPublish != false) {
+                                future.followingAddress = DeferredArrival(route, enqueuedAt, {}, onDeferredAddress)
+                                onRetainedAddress(route)
+                            }
                             return@synchronized false
                         }
                     }
@@ -228,7 +242,7 @@ internal object CarHotspotReconnect {
                     if (replacesRetiredSelection && recovery.joining && enqueuedAt > recovery.deadlineMillis) {
                         // A timely selection already started recovery. Hold the first
                         // still-current successor until that older join has settled.
-                        if (recovery.deferred.none { canQueue(it.endpoint) }) {
+                        if (recovery.deferred.none { canQueue(it.endpoint) } && endpoint.sourceGeneration?.canPublish != false) {
                             recovery.defer(withoutVerifiedRoute(endpoint), enqueuedAt, onDeferredAccept ?: { onAccept() },
                                 onDeferredPublish)
                         }
@@ -238,18 +252,22 @@ internal object CarHotspotReconnect {
                         (pinned != null || enqueuedAt > recovery.deadlineMillis) && !recovery.matchesSelection(endpoint, pinned)) {
                         // An unknown lost password cannot be distinguished from a rollback.
                         // For a known loss, hold newer reports without publishing or committing them.
-                        if (recovery.lost != null && !endpoint.addressOnlyAirplayReport) {
+                        if (recovery.lost != null && !endpoint.addressOnlyAirplayReport && endpoint.sourceGeneration?.canPublish != false) {
                             recovery.defer(withoutVerifiedRoute(endpoint), enqueuedAt, onDeferredAccept ?: { onAccept() },
                                 onDeferredPublish)
                         }
                         return@synchronized false
                     }
                 }
+                var committed = false
                 endpoint.whileSourceCurrent {
+                    if (endpoint.sourceGeneration?.canPublish == false) return@whileSourceCurrent
                     onAccept()
                     enqueue(endpoint, enqueuedAt)
                     if (replacesRetiredSelection) recovery?.selected = endpoint
+                    committed = true
                 }
+                committed
             }
 
         private fun withoutVerifiedRoute(endpoint: CarPlayEndpoint): CarPlayEndpoint {
@@ -276,7 +294,7 @@ internal object CarHotspotReconnect {
         }
 
         private fun enqueue(endpoint: CarPlayEndpoint, enqueuedAt: Long) {
-            val fresh = hasFreshCredentials(endpoint)
+            val fresh = eligibleCredentials(endpoint)
             pending.addLast(Arrival(endpoint, enqueuedAt, fresh))
             if (fresh) latestReceivedCredentials = endpoint
             wake.trySend(Unit)
@@ -375,7 +393,8 @@ internal object CarHotspotReconnect {
             fun release(arrival: DeferredArrival, endpoint: CarPlayEndpoint): Boolean {
                 var accepted = false
                 endpoint.whileSourceCurrent {
-                    if (canQueue(endpoint) && accept(endpoint)) {
+                    if (canQueue(endpoint) && endpoint.sourceGeneration?.canPublish != false && accept(endpoint) &&
+                        endpoint.sourceGeneration?.canPublish != false) {
                         arrival.commit(endpoint)
                         enqueue(endpoint, arrival.enqueuedAt)
                         accepted = true
@@ -418,15 +437,23 @@ internal object CarHotspotReconnect {
         }
 
         fun newestCredentials(current: CarPlayEndpoint): CarPlayEndpoint = synchronized(lock) {
-            newestPendingCredentials() ?: current
+            val generation = current.sourceGeneration
+            newestPendingCredentials { candidate ->
+                val source = candidate.sourceGeneration
+                generation == null || source == null || source === generation ||
+                    source.rfcommRegistration > generation.rfcommRegistration
+            } ?: current
         }
 
         private fun credentialsPending(): Boolean = newestPendingCredentials() != null
 
-        private fun newestPendingCredentials(): CarPlayEndpoint? {
+        private fun eligibleCredentials(endpoint: CarPlayEndpoint): Boolean =
+            wifiRecovery?.independentAddress(endpoint) != true && hasFreshCredentials(endpoint)
+
+        private fun newestPendingCredentials(allowed: (CarPlayEndpoint) -> Boolean = { true }): CarPlayEndpoint? {
             if (closed) return null
-            return pending.lastOrNull { canQueue(it.endpoint) && hasFreshCredentials(it.endpoint) }?.endpoint
-                ?: standby.get()?.takeIf { canQueue(it) && hasFreshCredentials(it) }
+            return pending.lastOrNull { canQueue(it.endpoint) && allowed(it.endpoint) && eligibleCredentials(it.endpoint) }?.endpoint
+                ?: standby.get()?.takeIf { canQueue(it) && allowed(it) && eligibleCredentials(it) }
         }
 
         fun close() = synchronized(lock) {

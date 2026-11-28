@@ -79,6 +79,8 @@ import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.session.StartupRequirements
 import io.github.hypercar.settings.SettingsRevision
 import io.github.hypercar.settings.SettingsStore
+import io.github.hypercar.settings.ProjectionTarget
+import io.github.hypercar.yadea.YadeaProjectionService
 import java.lang.ref.WeakReference
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -104,6 +106,17 @@ import io.github.hypercar.ui.theme.TextSecondary
 
 /** 单 Activity：底部三 Tab（主页 / 设置 / 诊断），state-based 切换，无需 navigation-compose。 */
 class MainActivity : ComponentActivity() {
+    internal companion object {
+        const val ACTION_SHOW_PROJECTION = "io.github.hypercar.SHOW_PROJECTION"
+    }
+
+    private val projectionHomeRequest = mutableIntStateOf(0)
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (intent.action == ACTION_SHOW_PROJECTION) projectionHomeRequest.intValue++
+    }
+
     private enum class DiscoverabilityPhase { PERMISSION, READY, DIALOG }
     private class DiscoverabilityRequest(val stillWaiting: () -> Boolean, val state: SystemDiscoverabilityRequest) {
         var phase = DiscoverabilityPhase.PERMISSION
@@ -181,6 +194,7 @@ class MainActivity : ComponentActivity() {
     @Suppress("DEPRECATION")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (intent.action == ACTION_SHOW_PROJECTION && savedInstanceState == null) projectionHomeRequest.intValue++
         // ActivityResultRegistry restores the in-flight result with these same launchers.
         pendingDiscoverability = lastCustomNonConfigurationInstance as? DiscoverabilityRequest
         pendingDiscoverability?.takeIf { it.phase == DiscoverabilityPhase.READY }?.let(::launchDiscoverabilityWhenResumed)
@@ -209,7 +223,10 @@ class MainActivity : ComponentActivity() {
                         isAppearanceLightNavigationBars = !dark
                     }
                 }
-                MainContent(onStart = { HyperCarRepo.connect(applicationContext, systemPrompt) })
+                MainContent(
+                    projectionHomeRequest = projectionHomeRequest.intValue,
+                    onStart = { HyperCarRepo.connect(applicationContext, systemPrompt) },
+                )
             }
         }
     }
@@ -223,11 +240,20 @@ private enum class AppTab(val title: String, val icon: ImageVector) {
 }
 
 @Composable
-private fun MainContent(onStart: () -> Unit) {
+private fun MainContent(projectionHomeRequest: Int, onStart: () -> Unit) {
     val snapshot by HyperCarRepo.snapshots.collectAsStateWithLifecycle()
+    val yadea by YadeaProjectionService.sessionState.collectAsStateWithLifecycle()
+    val target = remember(SettingsRevision.value) { SettingsStore.projectionTarget }
+    val showingYadea = target == ProjectionTarget.Yadea || yadea.active
+    val currentLink = if (showingYadea) yadea.link else snapshot.link
+    val projectionBusy = currentLink is LinkState.Connected || currentLink is LinkState.Negotiating ||
+        currentLink is LinkState.Stopping
     val visibleConnectionAttempt = snapshot.connectionAttemptId
     val context = LocalContext.current
     var tabIndex by rememberSaveable { mutableIntStateOf(0) }
+    LaunchedEffect(projectionHomeRequest) {
+        if (projectionHomeRequest > 0) tabIndex = AppTab.Home.ordinal
+    }
     val tabs = AppTab.entries
     val current = tabs[tabIndex.coerceIn(tabs.indices)]
 
@@ -349,7 +375,7 @@ private fun MainContent(onStart: () -> Unit) {
 
     Scaffold(
         containerColor = DeepSpace,
-        topBar = { StatusStrip(link = snapshot.link) },
+        topBar = { StatusStrip(link = currentLink) },
         bottomBar = {
             NavigationBar(
                 containerColor = SurfaceNavBar,
@@ -397,7 +423,9 @@ private fun MainContent(onStart: () -> Unit) {
                 label = "tab-crossfade",
             ) { tab ->
                 when (tab) {
-                    AppTab.Home -> HomeScreen(
+                    AppTab.Home -> if (showingYadea) {
+                        io.github.hypercar.ui.screens.YadeaHomeScreen(startup, yadea)
+                    } else HomeScreen(
                         startup = startup,
                         onRefreshSetup = { permVersion++ },
                         snapshot = snapshot,
@@ -431,8 +459,8 @@ private fun MainContent(onStart: () -> Unit) {
                     AppTab.Settings -> SettingsScreen(
                             startup = startup,
                             onRefreshSetup = { permVersion++ },
-                            linkConnected = snapshot.link is io.github.hypercar.core.LinkState.Connected ||
-                                snapshot.link is io.github.hypercar.core.LinkState.Negotiating,)
+                            linkConnected = projectionBusy,
+                    )
 
                     AppTab.Diagnostics -> DiagnosticsScreen(
                         logs = snapshot.recentLogs,

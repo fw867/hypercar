@@ -40,10 +40,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.unit.dp
 import io.github.hypercar.headunit.HeadUnitPicker
+import io.github.hypercar.headunit.ElectricVehicleProfile
 import io.github.hypercar.headunit.HeadUnitProfile
 import io.github.hypercar.headunit.HeadUnitProfiles
 import io.github.hypercar.headunit.RemoteProfiles
 import io.github.hypercar.session.HyperCarRepo
+import io.github.hypercar.settings.ProjectionTarget
 import io.github.hypercar.settings.SettingsRevision
 import io.github.hypercar.settings.SettingsStore
 import io.github.hypercar.ui.components.CarBrandBadge
@@ -56,11 +58,15 @@ import io.github.hypercar.ui.theme.TextSecondary
 import kotlinx.coroutines.launch
 
 @Composable
-internal fun HeadUnitPickerScreen(connected: Boolean, modifier: Modifier = Modifier, onClose: () -> Unit) {
+internal fun HeadUnitPickerScreen(
+    connected: Boolean, modifier: Modifier = Modifier,
+    onOpenElectricVehicle: (ElectricVehicleProfile) -> Unit, onClose: () -> Unit,
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val catalog = remember(SettingsRevision.value) { HeadUnitProfiles.catalog() }
     val selectedId = SettingsStore.headUnitProfileId
+    val target = remember(SettingsRevision.value) { SettingsStore.projectionTarget }
     val current = catalog.select(selectedId)
     val groups = remember(catalog) { HeadUnitPicker.groups(catalog.profiles) }
     var groupId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -75,6 +81,8 @@ internal fun HeadUnitPickerScreen(connected: Boolean, modifier: Modifier = Modif
     var selectionError by rememberSaveable { mutableStateOf<String?>(null) }
     val group = groups.firstOrNull { it.id == groupId }
     val searching = query.isNotBlank()
+    val electricVehicles = if (searching) remember(query) { HeadUnitPicker.electricVehicles(query) }
+        else group?.electricVehicles.orEmpty()
     val candidates = when {
         searching -> remember(catalog, query) { HeadUnitPicker.search(catalog.profiles, query) }
         group != null -> group.profiles
@@ -91,6 +99,7 @@ internal fun HeadUnitPickerScreen(connected: Boolean, modifier: Modifier = Modif
 
     fun choose(profile: HeadUnitProfile) {
         if (profile.id == selectedId) {
+            if (target != ProjectionTarget.CarPlay) HyperCarRepo.setProjectionTarget(context, ProjectionTarget.CarPlay)
             onClose()
             return
         }
@@ -145,25 +154,31 @@ internal fun HeadUnitPickerScreen(connected: Boolean, modifier: Modifier = Modif
             Text(message.orEmpty(), color = TextSecondary, style = MaterialTheme.typography.bodySmall)
         }
         val blockedMessage = if (connected) "断开连接后可切换档案" else current.blockReason
-        key(searching, group?.id) {
+        key(searching, groupId) {
             LazyColumn(
                 Modifier.fillMaxWidth().weight(1f),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
                 contentPadding = PaddingValues(bottom = 12.dp),
             ) {
-                if (blockedMessage != null || (!searching && group == null)) {
+                if (blockedMessage != null || (!searching && groupId == null)) {
                     item("current") {
                         GlassPanel(Modifier.fillMaxWidth(), contentPadding = PaddingValues(12.dp)) {
-                            Text("当前档案：${current.label}", color = TextPrimary, style = MaterialTheme.typography.titleSmall)
+                            val currentLabel = if (target == ProjectionTarget.CarPlay) "当前档案" else "已保存的 CarPlay 档案"
+                            Text("$currentLabel：${current.label}", color = TextPrimary, style = MaterialTheme.typography.titleSmall)
                             if (blockedMessage != null) {
                                 Text(blockedMessage, color = AmberWarning, style = MaterialTheme.typography.bodySmall)
+                            }
+                            if (target != ProjectionTarget.CarPlay) {
+                                TextButton(enabled = !connected, onClick = {
+                                    HyperCarRepo.setProjectionTarget(context, ProjectionTarget.CarPlay)
+                                }) { Text("使用 CarPlay 车机") }
                             }
                         }
                     }
                 }
                 if (searching || group != null) {
                     item("heading") { SectionLabel(if (searching) "搜索结果" else group?.label.orEmpty()) }
-                    if (candidates.isEmpty()) {
+                    if (candidates.isEmpty() && electricVehicles.isEmpty()) {
                         item("empty") {
                             Text("没有找到匹配的档案", color = TextSecondary, modifier = Modifier.padding(8.dp))
                         }
@@ -172,17 +187,31 @@ internal fun HeadUnitPickerScreen(connected: Boolean, modifier: Modifier = Modif
                         val extra = (listOf(profile.listing.platformName) + profile.listing.vehicleModels)
                             .filterNot { it.isBlank() || profile.model.contains(it, ignoreCase = true) }.distinct()
                         val detail = (listOf(profile.model).filter { it.isNotBlank() } + extra).joinToString(" · ")
-                        PickerRow(profile.label, detail, profile, profile.id == selectedId,
+                        PickerRow(profile.label, detail, profile.id, profile.label,
+                            selected = target == ProjectionTarget.CarPlay && profile.id == selectedId,
                             enabled = !connected, notes = profile.notes) { choose(profile) }
+                    }
+                    items(electricVehicles, key = { "electric:${it.id}" }) { profile ->
+                        PickerRow(profile.label, profile.model, profile.id, profile.label,
+                            selected = target == profile.target) { onOpenElectricVehicle(profile) }
                     }
                 } else {
                     item("heading") { SectionLabel("按品牌浏览") }
                     items(groups, key = { it.id }) { entry ->
-                        val detail = entry.profiles.take(3).joinToString(" · ") {
-                            it.listing.platformName.ifBlank { it.model }
+                        val badge = entry.profiles.firstOrNull()
+                        if (badge == null) {
+                            PickerRow(entry.label, entry.electricVehicles.joinToString(" · ") { it.label },
+                                entry.id, entry.label, selected = entry.electricVehicles.any { it.target == target }) {
+                                groupId = entry.id
+                            }
+                        } else {
+                            val detail = entry.profiles.take(3).joinToString(" · ") {
+                                it.listing.platformName.ifBlank { it.model }
+                            }
+                            PickerRow(entry.label, detail, badge.id, badge.label,
+                                selected = target == ProjectionTarget.CarPlay &&
+                                    entry.profiles.any { it.id == selectedId }) { groupId = entry.id }
                         }
-                        PickerRow(entry.label, detail, entry.profiles.first(),
-                            selected = entry.profiles.any { it.id == selectedId }) { groupId = entry.id }
                     }
                 }
             }
@@ -221,6 +250,8 @@ internal fun HeadUnitPickerScreen(connected: Boolean, modifier: Modifier = Modif
                         try {
                             val result = HyperCarRepo.selectHeadUnitProfile(id, targetMac, keepTarget)
                             if (result == null) {
+                                if (target != ProjectionTarget.CarPlay)
+                                    HyperCarRepo.setProjectionTarget(context, ProjectionTarget.CarPlay)
                                 onClose()
                             } else {
                                 selectionError = result
@@ -242,7 +273,7 @@ internal fun HeadUnitPickerScreen(connected: Boolean, modifier: Modifier = Modif
 }
 
 @Composable
-private fun PickerRow(title: String, detail: String, badge: HeadUnitProfile, selected: Boolean,
+private fun PickerRow(title: String, detail: String, badgeId: String, badgeLabel: String, selected: Boolean,
                       enabled: Boolean = true, notes: String = "", onClick: () -> Unit) {
     GlassPanel(Modifier.fillMaxWidth(), contentPadding = PaddingValues(0.dp)) {
         Row(
@@ -251,7 +282,7 @@ private fun PickerRow(title: String, detail: String, badge: HeadUnitProfile, sel
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            CarBrandBadge(badge.id, badge.label, size = 40.dp)
+            CarBrandBadge(badgeId, badgeLabel, size = 40.dp)
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
                 Text(title, style = MaterialTheme.typography.titleSmall, color = if (selected) ElectricCyan else TextPrimary)
                 if (detail.isNotBlank()) Text(detail, color = TextSecondary, style = MaterialTheme.typography.bodySmall)

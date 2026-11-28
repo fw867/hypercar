@@ -2,6 +2,7 @@ package io.github.hypercar.autowake
 
 import android.bluetooth.BluetoothDevice
 import android.content.Context
+import io.github.hypercar.session.ProjectionTargetEpoch
 
 /**
  * 会话层注入的「车机蓝牙事件 → 会话」回调（由 Application 初始化时接线）。
@@ -21,6 +22,6 @@ import android.content.Context
  */
 object AutoStart {
     @Volatile
-    // The service handoff preserves the original edge timestamp.
-    var handler: ((Context, BluetoothDevice, Boolean, Boolean, Long) -> Unit)? = null
+    // The service handoff preserves the original ACL ticket and timestamp.
+    internal var handler: ((Context, BluetoothDevice, Boolean, Long, ProjectionTargetEpoch.ServiceStart?) -> Unit)? = null
 }

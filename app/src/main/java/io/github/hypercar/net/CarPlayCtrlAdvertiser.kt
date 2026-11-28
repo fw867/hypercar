@@ -15,6 +15,11 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -59,6 +64,17 @@ class CarPlayCtrlAdvertiser internal constructor(
         private const val TAG = "CTRL"
         private const val PLACEHOLDER_MAC = "02:00:00:00:00:00"
         private const val REGISTRATION_TIMEOUT_MILLIS = 10_000L
+        private const val ACK_WRITE_TIMEOUT_MILLIS = 1_500L
+        private val ackTimer = ScheduledThreadPoolExecutor(1) { task ->
+            Thread(task, "carplay-ctrl-ack-deadline").apply { isDaemon = true }
+        }.apply { removeOnCancelPolicy = true }
+        private val invitationEffects = ctrlWorker("carplay-ctrl-invitation")
+        private val invitationDiagnostics = ctrlWorker("carplay-ctrl-diagnostics")
+
+        private fun ctrlWorker(name: String) = ThreadPoolExecutor(
+            1, 1, 0L, TimeUnit.MILLISECONDS, ArrayBlockingQueue(32),
+            { task -> Thread(task, name).apply { isDaemon = true } }, ThreadPoolExecutor.DiscardOldestPolicy(),
+        )
 
         internal fun isConnectRequest(line: String): Boolean = CtrlHttpHead.isConnectRequestLine(line)
     }
@@ -129,14 +145,20 @@ class CarPlayCtrlAdvertiser internal constructor(
      * 但它会主动来 `GET /ctrl-int/1/connect` 邀请手机，TCP 对端地址就是车机自己。
      * 于是把「邀请方 IP + 7000」当 AirPlay 端点，是这条链路上唯一可靠的来源。
      */
-    private val invites = CtrlInvitationInbox<Network, InetAddress, CtrlInvitation<Network>> { epoch, invite ->
-        inviteCount++
-        runCatching { onNetworkInvitation(this, invite) }
-        runCatching { onDiagnostic(Event.INVITED, port) }
-        logCtrl("$TAG: ✓ 车机 ctrl 邀请（第 $inviteCount 次，receiver=${invite.receiverId ?: "?"} network=#${epoch.network}）——AirPlay 窗口已开启")
+    private val invites = CtrlInvitationInbox<Network, InetAddress, CtrlInvitation<Network>>(SystemClock::elapsedRealtime) { epoch, invite ->
+        val count = ++inviteCount
+        val listenerPort = port
+        invitationEffects.execute { runCatching { onNetworkInvitation(this, invite) } }
+        invitationDiagnostics.execute {
+            if (epoch.isCurrent) runCatching { onDiagnostic(Event.INVITED, listenerPort) }
+            logCtrl("$TAG: ✓ 车机 ctrl 邀请（第 $count 次，receiver=${invite.receiverId ?: "?"} network=#${epoch.network}）——AirPlay 窗口已开启")
+        }
     }
+    private var addressEvidenceVersion = 0L
     internal val lastInvitation: CtrlInvitation<Network>? @Synchronized get() = invites.latest.get()
     internal fun observedInvitation(): CtrlInvitation<Network>? = invites.latest.get()
+    @Synchronized internal fun retireConnectRequests(deadline: Long): Boolean = invites.retireConnectRequests(deadline)
+    @Synchronized internal fun keepConnectRequests() = invites.keepConnectRequests()
     // Read without taking the advertiser monitor: the Bluetooth probe may hold its own lock.
     internal val hasUnresolvedOrPublishedInvite: Boolean get() =
         invitesBeingAcknowledged.get() > 0 || invites.awaitingConfirmation || invites.latest.get() != null
@@ -167,16 +189,26 @@ class CarPlayCtrlAdvertiser internal constructor(
     @Synchronized internal fun networkAddresses(network: Network, addresses: Set<InetAddress>) {
         val epoch = invites.current ?: return
         if (epoch.network == network) {
+            addressEvidenceVersion++
             if (srvEvidence.addressesChanged(addresses, SystemClock.elapsedRealtime())) mdnsObserver?.invalidateLocalAddresses()
             invites.addresses(epoch, addresses)
         }
     }
 
     private fun refreshAddresses(epoch: CtrlInvitationInbox.Epoch<Network>) {
+        val evidence = synchronized(this) {
+            if (invites.current !== epoch || !invites.awaitingConfirmation) return
+            addressEvidenceVersion
+        }
         val link = runCatching {
             appContext.getSystemService(ConnectivityManager::class.java)?.getLinkProperties(epoch.network)
-        }.getOrNull()
-        if (link != null) invites.addresses(epoch, link.linkAddresses.map { it.address }.toSet())
+        }.getOrNull() ?: return
+        val addresses = link.linkAddresses.map { it.address }.toSet()
+        synchronized(this) {
+            if (invites.current !== epoch || evidence != addressEvidenceVersion) return
+            addressEvidenceVersion++
+            invites.addresses(epoch, addresses)
+        }
     }
 
     /** 已注册的端口（-1 = 未启动）。 */
@@ -517,40 +549,65 @@ class CarPlayCtrlAdvertiser internal constructor(
                     when {
                         invites.current !== receipt.epoch || serverSocket !== listener -> reply = CtrlHttpHead.Reply.STALE_NETWORK
                         host == null -> reply = CtrlHttpHead.Reply.BAD_REQUEST
+                        !invites.beginAcknowledgement(receipt) -> reply = CtrlHttpHead.Reply.STALE_NETWORK
                         else -> {
                             invite = CtrlInvitation(host, SystemClock.elapsedRealtime(), receipt.epoch, decision.request?.receiverId)
                             invitesBeingAcknowledged.incrementAndGet()
                             acknowledgingInvite = true
-                            runCatching { onDiagnostic(Event.INVITE_HEAD, port) }
+                            invitationDiagnostics.execute {
+                                if (receipt.epoch.isCurrent) runCatching { onDiagnostic(Event.INVITE_HEAD, listener.localPort) }
+                            }
                         }
                     }
                 }
             }
             // Never hold the advertiser monitor across socket I/O. Recheck the epoch after flushing.
             val output = client.getOutputStream()
-            output.write(reply.encode())
-            output.flush()
-            httpResponses.incrementAndGet()
-            logCtrl("CTRL-TCP: response connection=$connection status=${reply.status} elapsedMs=${SystemClock.elapsedRealtime() - started}")
-            val candidate = invite ?: return
-            synchronized(this) {
-                if (invites.current !== receipt.epoch || serverSocket !== listener) {
-                    logCtrl("CTRL-TCP: invitation-rejected connection=$connection reason=stale-network")
-                    return
-                }
-                runCatching { onDiagnostic(Event.INVITE_ACK, port) }
-                // An early request can be ACKed before Android reports its local Wi-Fi address.
-                // Only the inbox may publish it, after advertisement and address confirmation.
-                refreshAddresses(receipt.epoch)
-                invites.offer(receipt, client.localAddress, candidate)
-                traceDiscovery("event=ctrl-invitation attempt=$attemptId network=${receipt.epoch.network} " +
-                    "connection=$connection acceptedPort=${client.localPort}")
-                logCtrl("CTRL-TCP: invitation connection=$connection network=${receipt.epoch.network} " +
-                    "local=${client.localAddress.hostAddress} published=${invites.latest.get() === candidate} " +
-                    "awaitingAddress=${invites.awaitingConfirmation}")
+            if (invite != null && !synchronized(this) { invites.canAcknowledge(receipt) && serverSocket === listener }) {
+                reply = CtrlHttpHead.Reply.STALE_NETWORK
+                invite = null
             }
-            invitesBeingAcknowledged.decrementAndGet()
-            acknowledgingInvite = false
+            val writingAck = AtomicBoolean(invite != null)
+            val deadline = if (invite != null) ackTimer.schedule({
+                if (writingAck.compareAndSet(true, false)) runCatching { client.close() }
+            }, ACK_WRITE_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS) else null
+            try {
+                output.write(reply.encode())
+                output.flush()
+            } finally {
+                writingAck.set(false)
+                deadline?.cancel(false)
+            }
+            val candidate = invite
+            val accepted = synchronized(this) {
+                val current = candidate != null && invites.current === receipt.epoch && serverSocket === listener
+                if (current) {
+                    invitationDiagnostics.execute {
+                        if (receipt.epoch.isCurrent) runCatching { onDiagnostic(Event.INVITE_ACK, listener.localPort) }
+                    }
+                    // Keep the ACK and its pending address proof in the same transition.
+                    invites.acknowledge(receipt, client.localAddress, candidate)
+                }
+                if (acknowledgingInvite) {
+                    invites.finishAcknowledgement(receipt)
+                    invitesBeingAcknowledged.decrementAndGet()
+                    acknowledgingInvite = false
+                }
+                current
+            }
+            httpResponses.incrementAndGet()
+            if (accepted) refreshAddresses(receipt.epoch)
+            logCtrl("CTRL-TCP: response connection=$connection status=${reply.status} elapsedMs=${SystemClock.elapsedRealtime() - started}")
+            if (candidate == null) return
+            if (!accepted) {
+                logCtrl("CTRL-TCP: invitation-rejected connection=$connection reason=stale-network")
+                return
+            }
+            traceDiscovery("event=ctrl-invitation attempt=$attemptId network=${receipt.epoch.network} " +
+                "connection=$connection acceptedPort=${client.localPort}")
+            logCtrl("CTRL-TCP: invitation connection=$connection network=${receipt.epoch.network} " +
+                "local=${client.localAddress.hostAddress} published=${invites.latest.get() === candidate} " +
+                "awaitingAddress=${invites.awaitingConfirmation}")
             // Count bounded trailing data for diagnostics only; never parse it as a second request.
             readDeadline = SystemClock.elapsedRealtime() + 3_000L
             var trailingBytes = 0
@@ -566,10 +623,18 @@ class CarPlayCtrlAdvertiser internal constructor(
             }
             if (trailingBytes > 0) logCtrl("$TAG: 应答后收到 $trailingBytes 字节（仅统计，不转储内容）")
         } catch (error: IOException) {
+            if (acknowledgingInvite) {
+                synchronized(this) { invites.finishAcknowledgement(receipt) }
+                invitesBeingAcknowledged.decrementAndGet()
+                acknowledgingInvite = false
+            }
             logCtrl("$TAG: $peer 连接异常 - ${error.message}")
             logCtrl("CTRL-TCP: error connection=$connection kind=${error.javaClass.simpleName} elapsedMs=${SystemClock.elapsedRealtime() - started}")
         } finally {
-            if (acknowledgingInvite) invitesBeingAcknowledged.decrementAndGet()
+            if (acknowledgingInvite) {
+                synchronized(this) { invites.finishAcknowledgement(receipt) }
+                invitesBeingAcknowledged.decrementAndGet()
+            }
             runCatching { client.close() }
             logCtrl("CTRL-TCP: closed connection=$connection elapsedMs=${SystemClock.elapsedRealtime() - started}")
         }

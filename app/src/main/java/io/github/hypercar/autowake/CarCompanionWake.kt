@@ -14,13 +14,13 @@ import android.os.Looper
 import androidx.core.content.ContextCompat
 import androidx.annotation.ChecksSdkIntAtLeast
 import io.github.hypercar.session.HyperCarRepo
+import io.github.hypercar.session.ProjectionTargetEpoch
 import io.github.hypercar.settings.SettingsRevision
 import io.github.hypercar.settings.SettingsStore
 
 /** 独立使用 Android 的系统关联 API；不依赖第三方实现或授权材料。 */
 object CarCompanionWake {
-    private var lastTrigger: Long? = null
-    private var lastAddress: String? = null
+    private var lastTrigger: Pair<ProjectionTargetEpoch.Wake.Companion, Long>? = null
     private val associationGate = AssociationRequestGate()
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
     private class PendingAssociation(
@@ -48,16 +48,17 @@ object CarCompanionWake {
             if (address != null && address.equals(SettingsStore.targetCarMac, ignoreCase = true)) {
                 sync(request.context)
                 SettingsRevision.bump()
-            } else runCatching { manager(request.context)?.disassociate(info.id) }
+            } else runCatching { manager(request.context)?.let { disassociate(it, info) } }
             return
         }
         if (address == null || !address.equals(SettingsStore.targetCarMac, ignoreCase = true) ||
             !address.equals(request.ticket.address, ignoreCase = true)) {
-            runCatching { manager(request.context)?.disassociate(info.id) }
+            runCatching { manager(request.context)?.let { disassociate(it, info) } }
             finishAssociation(request, "目标车机已变化，请重新申请增强发现")
             return
         }
         request.createdId = info.id
+        HyperCarRepo.replaceCompanionAssociation(info.id, address)
         val observing = sync(request.context)
         SettingsRevision.bump()
         finishAssociation(request, if (!observing) "增强发现已授权，但系统观察更新失败，请查看诊断日志"
@@ -90,6 +91,23 @@ object CarCompanionWake {
         context.packageManager.hasSystemFeature(PackageManager.FEATURE_COMPANION_DEVICE_SETUP)
 
     private fun manager(context: Context) = context.getSystemService(CompanionDeviceManager::class.java)
+
+    internal fun hasExactAssociation(context: Context, presence: ProjectionTargetEpoch.Wake.Companion): Boolean =
+        hasAssociation(context, presence.associationId, presence.address)
+
+    private fun hasAssociation(context: Context, id: Int, address: String): Boolean {
+        if (!supported(context)) return false
+        return runCatching { manager(context)?.myAssociations?.any { info ->
+            info.id == id && address.equals(info.deviceMacAddress?.toString(), ignoreCase = true)
+        } == true }.getOrDefault(false)
+    }
+
+    @androidx.annotation.RequiresApi(33)
+    private fun disassociate(manager: CompanionDeviceManager, info: AssociationInfo) {
+        // Retire the exact association before calling Android. A replacement at the same address owns its own ticket.
+        HyperCarRepo.retireCompanionPresence(info.id, info.deviceMacAddress?.toString())
+        manager.disassociate(info.id)
+    }
 
     fun isAssociated(context: Context): Boolean {
         val target = SettingsStore.targetCarMac ?: return false
@@ -164,11 +182,17 @@ object CarCompanionWake {
         val cdm = manager(context) ?: return false
         return runCatching {
             val target = SettingsStore.targetCarMac
-            for (info in cdm.myAssociations) {
+            val presence = HyperCarRepo.companionPresence()
+            val associations = cdm.myAssociations
+            if (presence != null && (!presence.address.equals(target, ignoreCase = true) || !SettingsStore.autoConnect ||
+                    associations.none { info -> info.deviceMacAddress?.toString()?.let { presence.matches(info.id, it) } == true })) {
+                HyperCarRepo.retireCompanionPresence(presence)
+            }
+            for (info in associations) {
                 val address = info.deviceMacAddress?.toString() ?: continue
                 if (!address.equals(target, ignoreCase = true)) {
                     runCatching { cdm.stopObservingDevicePresence(address) }
-                    cdm.disassociate(info.id)
+                    disassociate(cdm, info)
                 } else if (SettingsStore.autoConnect) {
                     cdm.startObservingDevicePresence(address)
                 } else {
@@ -187,7 +211,7 @@ object CarCompanionWake {
         return runCatching {
             cdm.myAssociations.filter { mac.equals(it.deviceMacAddress?.toString(), ignoreCase = true) }.forEach {
                 runCatching { cdm.stopObservingDevicePresence(mac) }
-                cdm.disassociate(it.id)
+                disassociate(cdm, it)
             }
             true
         }.onFailure { HyperCarRepo.log("COMPANION: 解除该车机关联失败 ${it.message}") }.getOrDefault(false)
@@ -200,7 +224,7 @@ object CarCompanionWake {
         val removed = runCatching {
             cdm.myAssociations.forEach { info ->
                 info.deviceMacAddress?.toString()?.let { runCatching { cdm.stopObservingDevicePresence(it) } }
-                cdm.disassociate(info.id)
+                disassociate(cdm, info)
             }
             true
         }.onFailure { HyperCarRepo.log("COMPANION: 解除关联失败：${it.message}") }
@@ -209,20 +233,26 @@ object CarCompanionWake {
         return removed
     }
 
-    @Synchronized fun appeared(context: Context, info: AssociationInfo) {
+    fun appeared(context: Context, info: AssociationInfo) {
         if (!supported(context) || !HyperCarRepo.automaticConnectionAllowed) return
         val address = info.deviceMacAddress?.toString() ?: return
+        if (!hasAssociation(context, info.id, address)) return
+        val presence = HyperCarRepo.observeCompanionPresence(info.id, address) ?: return
         val now = SystemClock.elapsedRealtime()
-        val last = lastTrigger.takeIf { address.equals(lastAddress, ignoreCase = true) }
-        if (!CompanionWakePolicy.shouldTrigger(SettingsStore.autoConnect, SettingsStore.targetCarMac,
-                address, HyperCarRepo.hasCurrentSession, now, last)) return
-        // 校验关联仍属于本应用且未被用户撤销。
-        if (runCatching { manager(context)?.myAssociations?.any { it.id == info.id &&
-                address.equals(it.deviceMacAddress?.toString(), ignoreCase = true) } == true }.getOrDefault(false).not()) return
-        lastTrigger = now
-        lastAddress = address
+        val hasSession = HyperCarRepo.hasCurrentSession
+        synchronized(this) {
+            val last = lastTrigger?.takeIf { it.first == presence }?.second
+            if (!CompanionWakePolicy.shouldTrigger(SettingsStore.autoConnect, SettingsStore.targetCarMac,
+                    address, hasSession, now, last)) return
+            lastTrigger = presence to now
+        }
         HyperCarRepo.log("COMPANION: 目标车机出现，恢复连接 addr=$address association=${info.id}")
-        runCatching { ContextCompat.startForegroundService(context, HyperCarService.companionIntent(context, address)) }
+        runCatching { ContextCompat.startForegroundService(context, HyperCarService.companionIntent(context, presence)) }
             .onFailure { HyperCarRepo.log("COMPANION: 后台启动失败：${it.message}；可手动连接") }
+    }
+
+    @androidx.annotation.RequiresApi(33)
+    fun disappeared(info: AssociationInfo) {
+        HyperCarRepo.retireCompanionPresence(info.id, info.deviceMacAddress?.toString())
     }
 }

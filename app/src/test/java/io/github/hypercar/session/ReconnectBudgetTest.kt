@@ -4,6 +4,55 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ReconnectBudgetTest {
+    @Test fun actualBluetoothOrEngineReceiverSupersedesThePassiveWifiHint() {
+        val budget = ReconnectBudget()
+        val hint = "bmw_id85:bt_021122334466"
+        val actual = "bmw_id85:bt_021122334477"
+        repeat(ReconnectBudget.MAX_RETRIES) { budget.failed(hint, true, it.toLong()) }
+        budget.grantWifiWakeAfterProjectionSwitch()
+        val pending = budget.reserveWifiWake(hint, 41L) as ReconnectBudget.WifiWake.Extra
+        assertEquals(hint, ReconnectBudget.receiverForRetry("bmw_id85", null, null, hint, null))
+        val confirmed = ReconnectBudget.receiverForRetry("bmw_id85", null, "02:11:22:33:44:77", hint, null)
+        assertEquals(actual, confirmed)
+        assertEquals(actual, ReconnectBudget.receiverForRetry("bmw_id85", "02:11:22:33:44:77", null, hint, null))
+        budget.videoReady(confirmed, 100)
+        assertFalse(budget.commitWifiWake(pending, 41L))
+        assertEquals(1, budget.failed(confirmed, true, 200)!!.number)
+    }
+
+    @Test fun switchingBackGrantsOnlyOneWifiWakeWithoutReplenishingReconnectRetries() {
+        val budget = ReconnectBudget()
+        repeat(ReconnectBudget.MAX_RETRIES) { budget.failed("bmw_id85:a", true, it.toLong()) }
+        budget.grantWifiWakeAfterProjectionSwitch()
+        assertSame(ReconnectBudget.WifiWake.Regular, budget.reserveWifiWake("bmw_id85:b", verifiedNetwork = 10L))
+        assertTrue(budget.mayWake("bmw_id85:a"))
+        val reserved = budget.reserveWifiWake("bmw_id85:a", verifiedNetwork = 10L) as ReconnectBudget.WifiWake.Extra
+        assertNull(budget.reserveWifiWake("bmw_id85:a", verifiedNetwork = 10L))
+        assertTrue(budget.commitWifiWake(reserved, boundNetwork = 10L))
+        assertNull(budget.reserveWifiWake("bmw_id85:a", verifiedNetwork = 10L))
+        assertNull(budget.failed("bmw_id85:a", true, 100L))
+    }
+
+    @Test fun staleWifiWakeDoesNotSpendTheProjectionSwitchOpportunity() {
+        val budget = ReconnectBudget()
+        val receiver = "bmw_id85:a"
+        repeat(ReconnectBudget.MAX_RETRIES) { budget.failed(receiver, true, it.toLong()) }
+        budget.grantWifiWakeAfterProjectionSwitch()
+
+        assertNull(budget.reserveWifiWake(receiver, verifiedNetwork = null))
+        assertTrue(budget.mayWake(receiver))
+        val unbound = budget.reserveWifiWake(receiver, verifiedNetwork = 10L) as ReconnectBudget.WifiWake.Extra
+        assertFalse(budget.commitWifiWake(unbound, boundNetwork = 11L))
+        assertTrue(budget.releaseWifiWake(unbound))
+        assertTrue(budget.mayWake(receiver))
+        val bound = budget.reserveWifiWake(receiver, verifiedNetwork = 11L) as ReconnectBudget.WifiWake.Extra
+        assertFalse(budget.commitWifiWake(unbound, boundNetwork = 10L))
+        assertFalse(budget.releaseWifiWake(unbound))
+        assertTrue(budget.commitWifiWake(bound, boundNetwork = 11L))
+        assertFalse(budget.commitWifiWake(bound, boundNetwork = 11L))
+        assertNull(budget.reserveWifiWake(receiver, verifiedNetwork = 11L))
+    }
+
     @Test fun briefSuccessesAndFailedRetriesShareOneBoundedBudget() {
         val b = ReconnectBudget()
         assertNull(b.failed("bmw:a", false, 0))

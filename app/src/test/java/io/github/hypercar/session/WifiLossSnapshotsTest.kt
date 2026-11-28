@@ -11,6 +11,29 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class WifiLossSnapshotsTest {
+    @Test fun activationRecoveryKeepsTheOriginalEmptyCloseSnapshot() {
+        val recovery = ProactiveActivation()
+        val later = RfcommClose({}) { fail("later RFCOMM was collected") }
+        assertTrue(recovery.interceptWifiLoss(null, 10, null))
+        assertTrue(recovery.interceptWifiLoss(null, 11, later))
+        assertEquals(10L, recovery.wifiLoss?.observedAt)
+        assertNull(recovery.wifiLoss?.rfcommClose)
+    }
+    @Test fun oldNetworkCannotRetireARegistrationAlreadyBoundToItsReplacement() {
+        val losses = WifiLossSnapshots<String>(7)
+        losses.bindRfcomm("old network", 12)
+        losses.bindRfcomm("replacement", 12)
+        assertNull(losses.first("old network") {
+            assertNull(it)
+            null
+        })
+        losses.bindRfcomm("old network", 13)
+        assertNull(losses.first("old network") { fail("late binding replaced first loss"); null })
+        assertEquals(12L, losses.first("replacement") {
+            RfcommClose({}, exactRegistration = it) {}
+        }!!.exactRegistration)
+    }
+
     @Test fun concurrentLossCallbacksTakeOneSnapshot() {
         val losses = WifiLossSnapshots<String>(1)
         val pool = Executors.newFixedThreadPool(2)

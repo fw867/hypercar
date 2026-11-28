@@ -53,6 +53,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -78,10 +79,12 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.hypercar.carui.CarUiSettings
+import io.github.hypercar.headunit.ElectricVehicleProfile
 import io.github.hypercar.perm.AppPermissions
 import io.github.hypercar.session.HyperCarRepo
 import io.github.hypercar.settings.SettingsRevision
 import io.github.hypercar.settings.SettingsStore
+import io.github.hypercar.settings.ProjectionTarget
 import io.github.hypercar.shizuku.ShizukuState
 import io.github.hypercar.shizuku.ShizukuTools
 import io.github.hypercar.ui.components.CarBrandBadge
@@ -107,6 +110,7 @@ private val FpsOptions = listOf(30, 60)
 private enum class SettingsPage(val title: String) {
     Main("设置"),
     Car("我的车机"),
+    ElectricVehicle("电动车"),
     HeadUnitPicker("选择车机档案"),
     Display("画面与声音"),
     Permissions("权限与后台"),
@@ -114,7 +118,11 @@ private enum class SettingsPage(val title: String) {
     Appearance("主题与外观"),
     Developer("开发者菜单");
 
-    val parent: SettingsPage get() = Main
+    val parent: SettingsPage get() = when (this) {
+        ElectricVehicle -> HeadUnitPicker
+        HeadUnitPicker -> Car
+        else -> Main
+    }
 }
 
 /** Settings navigation changes presentation only; all writes keep their existing handlers. */
@@ -126,16 +134,28 @@ fun SettingsScreen(
     linkConnected: Boolean = false,
 ) {
     var pageName by rememberSaveable { mutableStateOf(SettingsPage.Main.name) }
+    var electricProfile by rememberSaveable { mutableStateOf(ElectricVehicleProfile.Yadea.name) }
+    val pickerState = rememberSaveableStateHolder()
     var showProjectionApps by rememberSaveable { mutableStateOf(false) }
     val developerMode = remember(SettingsRevision.value) { SettingsStore.developerModeEnabled }
     val showDeveloperMenu = remember(SettingsRevision.value) { SettingsStore.developerMenuVisible }
+    val target = remember(SettingsRevision.value) { SettingsStore.projectionTarget }
     val page = SettingsPage.entries.firstOrNull { it.name == pageName }
         ?.takeUnless { it == SettingsPage.Developer && !showDeveloperMenu } ?: SettingsPage.Main
     fun open(destination: SettingsPage) { pageName = destination.name }
     BackHandler(enabled = page != SettingsPage.Main && page != SettingsPage.HeadUnitPicker) { open(page.parent) }
 
     if (page == SettingsPage.HeadUnitPicker) {
-        HeadUnitPickerScreen(connected = linkConnected, modifier = modifier, onClose = { open(SettingsPage.Car) })
+        pickerState.SaveableStateProvider(SettingsPage.HeadUnitPicker.name) {
+            HeadUnitPickerScreen(connected = linkConnected, modifier = modifier,
+                onOpenElectricVehicle = {
+                    electricProfile = it.name
+                    open(SettingsPage.ElectricVehicle)
+                }, onClose = {
+                    pickerState.removeState(SettingsPage.HeadUnitPicker.name)
+                    open(SettingsPage.Car)
+                })
+        }
         return
     }
 
@@ -179,8 +199,13 @@ fun SettingsScreen(
                     }
                     SettingsPage.Car -> {
                         AutoConnectSection(startup)
-                        HeadUnitSection(connected = linkConnected, onOpenPicker = { open(SettingsPage.HeadUnitPicker) })
+                        HeadUnitSection(connected = linkConnected && target == ProjectionTarget.CarPlay,
+                            onOpenPicker = { open(SettingsPage.HeadUnitPicker) })
                         TargetCarSection()
+                    }
+                    SettingsPage.ElectricVehicle -> when (ElectricVehicleProfile.entries.firstOrNull { it.name == electricProfile }
+                        ?: ElectricVehicleProfile.Yadea) {
+                        ElectricVehicleProfile.Yadea -> ElectricVehicleSettings(target == ProjectionTarget.Yadea, linkConnected)
                     }
                     SettingsPage.Display -> {
                         CarSourceSection(startup, onRefreshSetup, connected = linkConnected,
@@ -1721,7 +1746,7 @@ private fun SystemCarLifeCallAudioSwitch(enabled: Boolean) {
 }
 
 @Composable
-private fun SystemCarLifeSettingsShortcut(enabled: Boolean) {
+internal fun SystemCarLifeSettingsShortcut(enabled: Boolean) {
     val context=LocalContext.current
     if (io.github.hypercar.session.StartupRequirements.systemCarLifePackage(context) == null) return
     CapsuleButton("打开手机车联", onClick = {
@@ -1731,7 +1756,7 @@ private fun SystemCarLifeSettingsShortcut(enabled: Boolean) {
 }
 
 @Composable
-private fun CarWithSettingsShortcut() {
+internal fun CarWithSettingsShortcut() {
     val ctx = LocalContext.current
     TextButton(onClick = {
         val intent = android.content.Intent().setClassName(

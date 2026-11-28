@@ -151,6 +151,10 @@
             android:name=".autowake.HyperCarService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice|mediaPlayback|microphone" />
+        <service
+            android:name=".yadea.YadeaProjectionService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
 
         <!-- ACL 广播在隐式广播例外清单内，清单静态注册可拉起被杀进程 -->
         <service

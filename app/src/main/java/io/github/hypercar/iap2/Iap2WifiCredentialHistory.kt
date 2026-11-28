@@ -117,7 +117,12 @@ class Iap2WifiCredentialHistory {
             currentWifi: Iap2Messages.WifiConfiguration?,
         ): Resolution? {
             val ap = start.wirelessAp
-            if (ap == null) return Resolution(start, hotspots[activeSsid]?.credential ?: currentWifi)
+            if (ap == null) {
+                val candidate = hotspots[activeSsid]?.credential ?: currentWifi
+                return Resolution(start, candidate?.takeUnless {
+                    isRetiredRecoveryCredential(it.ssid, it.passphrase, it.securityType)
+                })
+            }
             if (isRetiredRecoveryCredential(ap.ssid, ap.passphrase, ap.securityType)) return null
             val hotspot = hotspots[ap.ssid]
             if (ap.ssid != activeSsid && hotspot?.cachePasswordsReplacedByDifferentSsid?.contains(ap.passphrase) == true) return null

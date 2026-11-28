@@ -4,9 +4,22 @@ import java.io.Closeable
 import java.io.IOException
 
 /** Captures one session's network; cancelling it never changes another session's lease. */
-internal class SessionSocketLease<N>(val network: N) {
+internal class SessionSocketLease<N>(val network: N, rfcommRegistration: Long? = null) {
     private val lock = Any()
     @Volatile private var active = true
+    val isActive: Boolean get() = active
+    @Volatile private var transportEnded = false
+    val blocksBluetoothInbound: Boolean get() = active && !transportEnded
+    @Volatile var rfcommRegistration: Long? = rfcommRegistration
+        private set
+
+    fun noteTransportEnded() = synchronized(lock) { transportEnded = true }
+
+    fun endedWithRfcomm(registration: Long): Boolean = transportEnded && rfcommRegistration == registration
+
+    fun bindRfcomm(registration: Long) = synchronized(lock) {
+        if (active && !transportEnded) rfcommRegistration = registration
+    }
 
     fun invalidate() = synchronized(lock) { active = false }
 

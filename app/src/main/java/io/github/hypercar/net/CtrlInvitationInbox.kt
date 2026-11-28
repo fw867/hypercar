@@ -11,13 +11,17 @@ internal class CtrlInvitation<N : Any>(
 }
 
 /** The advertiser serializes network changes and publication on the same monitor. */
-internal class CtrlInvitationInbox<N : Any, A : Any, V : Any>(private val publish: (Epoch<N>, V) -> Unit) {
+internal class CtrlInvitationInbox<N : Any, A : Any, V : Any>(
+    private val clockMillis: () -> Long = { System.nanoTime() / 1_000_000 },
+    private val publish: (Epoch<N>, V) -> Unit,
+) {
+    companion object { const val CONFIRMATION_WAIT_MILLIS = 2_000L }
     class Epoch<N>(val network: N) {
         @Volatile var isCurrent = true
             internal set
     }
     class Receipt<N>(val epoch: Epoch<N>, val sequence: Long)
-    private class Candidate<V>(val sequence: Long, val value: V)
+    private class Candidate<V>(val sequence: Long, val value: V, val expiresAt: Long)
 
     val latest = PendingInvitation<V>()
     var current: Epoch<N>? = null
@@ -27,6 +31,9 @@ internal class CtrlInvitationInbox<N : Any, A : Any, V : Any>(private val publis
     private var sequence = 0L
     private var published = 0L
     private val waiting = mutableMapOf<A, Candidate<V>>()
+    private val acknowledging = mutableSetOf<Receipt<N>>()
+    private var connectRequestsRetired = false
+    private var retryConfirmationDeadline = Long.MAX_VALUE
     @Volatile var awaitingConfirmation: Boolean = false
         private set
 
@@ -45,12 +52,40 @@ internal class CtrlInvitationInbox<N : Any, A : Any, V : Any>(private val publis
     fun accept(listener: Epoch<N>): Receipt<N>? =
         if (current === listener) Receipt(listener, ++sequence) else null
 
+    fun beginAcknowledgement(receipt: Receipt<N>): Boolean =
+        !connectRequestsRetired && clockMillis() < retryConfirmationDeadline &&
+            current === receipt.epoch && acknowledging.add(receipt)
+
+    fun finishAcknowledgement(receipt: Receipt<N>) { acknowledging.remove(receipt) }
+
+    fun acknowledge(receipt: Receipt<N>, local: A, value: V) {
+        if (!acknowledging.remove(receipt)) return
+        offer(receipt, local, value)
+    }
+
+    fun canAcknowledge(receipt: Receipt<N>): Boolean =
+        !connectRequestsRetired && current === receipt.epoch && receipt in acknowledging
+
+    fun retireConnectRequests(confirmationDeadline: Long = Long.MAX_VALUE): Boolean {
+        retryConfirmationDeadline = minOf(retryConfirmationDeadline, confirmationDeadline)
+        if (acknowledging.isNotEmpty()) return false
+        expireConfirmation()
+        if (awaitingConfirmation) return false
+        connectRequestsRetired = true
+        return true
+    }
+
+    fun keepConnectRequests() {
+        if (retryConfirmationDeadline != Long.MAX_VALUE) expireConfirmation()
+        retryConfirmationDeadline = Long.MAX_VALUE
+    }
+
     fun offer(receipt: Receipt<N>, local: A, value: V) {
-        if (current !== receipt.epoch || receipt.sequence <= published) return
+        if (connectRequestsRetired || current !== receipt.epoch || receipt.sequence <= published) return
         val previous = waiting[local]
         if (previous != null && previous.sequence >= receipt.sequence) return
         awaitingConfirmation = true
-        waiting[local] = Candidate(receipt.sequence, value)
+        waiting[local] = Candidate(receipt.sequence, value, clockMillis() + CONFIRMATION_WAIT_MILLIS)
         flush(receipt.epoch)
     }
 
@@ -67,6 +102,7 @@ internal class CtrlInvitationInbox<N : Any, A : Any, V : Any>(private val publis
     }
 
     private fun flush(epoch: Epoch<N>) {
+        if (retryConfirmationDeadline != Long.MAX_VALUE) expireConfirmation()
         if (!advertised) return
         val next = localAddresses.mapNotNull(waiting::get).maxByOrNull { it.sequence } ?: return
         published = next.sequence
@@ -74,5 +110,11 @@ internal class CtrlInvitationInbox<N : Any, A : Any, V : Any>(private val publis
         latest.set(next.value)
         awaitingConfirmation = waiting.isNotEmpty()
         publish(epoch, next.value)
+    }
+
+    private fun expireConfirmation() {
+        val now = clockMillis()
+        waiting.entries.removeAll { now >= minOf(it.value.expiresAt, retryConfirmationDeadline) }
+        awaitingConfirmation = waiting.isNotEmpty()
     }
 }

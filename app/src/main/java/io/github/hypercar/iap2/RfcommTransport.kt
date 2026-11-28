@@ -4,6 +4,7 @@ import io.github.hypercar.navigation.HudSourceWrites
 import java.io.Closeable
 import java.io.IOException
 import java.io.InterruptedIOException
+import java.io.OutputStream
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -25,39 +26,40 @@ internal class RfcommTransport<S : Closeable>(
     }
 
     internal val registration = registrations.incrementAndGet()
-    fun endpointGeneration() = Iap2EndpointGeneration(registration) { !localStopRequested }
-    @Volatile internal var wifiLossPredecessorAttempt: Long? = null
-    @Volatile internal var ownedWifiNetwork: Long? = null
+    fun endpointGeneration() = Iap2EndpointGeneration(registration,
+        publisher = { !endpointPublicationRevoked }, current = { !localStopRequested })
+    @Volatile private var endpointPublicationRevoked = false
+    fun revokeEndpointPublication() { endpointPublicationRevoked = true }
     @Volatile var socketClosed = false
         private set
 
     private enum class End { STOPPING, LOCAL, IO }
     private enum class HudAdmission { ADMITTED, READ_PENDING, REVOKED }
-    private val end = AtomicReference<End?>()
-    val isCancelled: Boolean get() = end.get() == End.LOCAL
-    val endedByIo: Boolean get() = end.get() == End.IO
-    val localStopRequested: Boolean get() = when (end.get()) {
+    private data class IoState(val end: End? = null, val writeCommitted: Boolean = false, val readPending: Boolean = false)
+    private val io = AtomicReference(IoState())
+    private val closingSocket = AtomicBoolean()
+    private val afterClose = AtomicReference<(() -> Unit)?>(null)
+    val isCancelled: Boolean get() = io.get().end == End.LOCAL
+    val endedByIo: Boolean get() = io.get().end == End.IO
+    val localStopRequested: Boolean get() = when (io.get().end) {
         End.STOPPING, End.LOCAL -> true
         else -> false
     }
     @Volatile var channel: Closeable? = null
 
-    private var abortWriteOnStop = false
-    private var socketReadPending = false
-
-    @Synchronized fun setSocketReadPending(pending: Boolean) {
-        socketReadPending = pending
+    fun setSocketReadPending(pending: Boolean) {
+        io.updateAndGet { it.copy(readPending = pending) }
     }
 
     fun noteLocalStop() {
-        val interruptWrite = synchronized(this) {
-            end.compareAndSet(null, End.STOPPING)
-            abortWriteOnStop
-        }
-        if (interruptWrite) endIo()
+        if (markLocalStop()) endIo()
     }
 
-    /** Serialize MFi bookkeeping or queue admission with a local stop. Never do socket I/O here. */
+    fun markLocalStop(): Boolean = io.updateAndGet { state ->
+        if (state.end == null) state.copy(end = End.STOPPING) else state
+    }.writeCommitted
+
+    /** Serialize bookkeeping, with lock-free cancellation checked at admission. */
     @Synchronized fun <T> commitMfi(action: () -> T): T {
         if (localStopRequested || Thread.currentThread().isInterrupted) throw InterruptedIOException("MFi 已取消")
         return action()
@@ -77,12 +79,19 @@ internal class RfcommTransport<S : Closeable>(
     }
 
     /** One writer under the channel lock. A stop may close the socket while write is blocked. */
-    fun writeOutput(engine: Iap2LinkEngine, write: (ByteArray) -> Unit): Int {
+    fun writeOutputFrom(engine: Iap2LinkEngine, stream: () -> OutputStream): Int =
+        writeOutput(engine, prepare = { stream()::write })
+
+    fun writeOutput(engine: Iap2LinkEngine, write: (ByteArray) -> Unit): Int =
+        writeOutput(engine, prepare = { write })
+
+    private fun writeOutput(engine: Iap2LinkEngine, prepare: () -> (ByteArray) -> Unit): Int {
         val containsMfi = engine.outputContainsMfi
         val frames = engine.pendingMfiResults()
         val hudStart = engine.takeSocketWrites().singleOrNull { it.hudFirst }
         val bytes = engine.takeOutput()
         if (bytes.isEmpty()) return 0
+        val write = prepare()
         val prefixSize = hudStart?.offset ?: bytes.size
         if (prefixSize != 0) {
             val prefix = if (prefixSize == bytes.size) bytes else bytes.copyOfRange(0, prefixSize)
@@ -122,19 +131,18 @@ internal class RfcommTransport<S : Closeable>(
                 write(bytes.copyOfRange(prefixSize + 1, bytes.size))
                 engine.socketWriteFinished(hudStart.ticket, System.nanoTime() / 1_000_000)
             } finally {
-                synchronized(this) { abortWriteOnStop = false }
+                finishWrite()
             }
         }
         return bytes.size
     }
 
-    @Synchronized private fun admitHudWrite(): HudAdmission {
-        if (end.get() != null || Thread.currentThread().isInterrupted) return HudAdmission.REVOKED
+    private fun admitHudWrite(): HudAdmission {
+        if (io.get().end != null || Thread.currentThread().isInterrupted) return HudAdmission.REVOKED
         // The reader has bytes but is waiting for the channel lock held by this writer.
-        if (socketReadPending) return HudAdmission.READ_PENDING
-        // A stop that follows admission closes this captured socket outside the monitor.
-        abortWriteOnStop = true
-        return HudAdmission.ADMITTED
+        if (commitWrite(yieldToReader = true)) return HudAdmission.ADMITTED
+        val state = io.get()
+        return if (state.end == null && state.readPending) HudAdmission.READ_PENDING else HudAdmission.REVOKED
     }
 
     private fun writeFirstHudByte(write: () -> Unit) {
@@ -163,23 +171,55 @@ internal class RfcommTransport<S : Closeable>(
     fun writeMfi(write: () -> Unit) = writeInterruptibly(write)
 
     private fun writeInterruptibly(write: () -> Unit) {
-        synchronized(this) {
-            if (end.get() != null || Thread.currentThread().isInterrupted)
-                throw InterruptedIOException("RFCOMM 已结束")
-            abortWriteOnStop = true
-        }
+        if (!commitWrite()) throw InterruptedIOException("RFCOMM 已结束")
         try {
+            if (io.get().end != null) throw InterruptedIOException("RFCOMM 已结束")
             write()
         } finally {
-            synchronized(this) { abortWriteOnStop = false }
+            finishWrite()
         }
     }
 
+    // This CAS orders submission against cancellation without holding a lock during socket I/O.
+    private fun commitWrite(yieldToReader: Boolean = false): Boolean {
+        while (!Thread.currentThread().isInterrupted) {
+            val state = io.get()
+            if (state.end != null || state.writeCommitted || (yieldToReader && state.readPending)) return false
+            if (io.compareAndSet(state, state.copy(writeCommitted = true))) return true
+        }
+        return false
+    }
+
+    private fun finishWrite() { io.updateAndGet { it.copy(writeCommitted = false) } }
+
     fun endIo() {
-        end.compareAndSet(null, End.IO)
-        end.compareAndSet(End.STOPPING, End.LOCAL)
-        runCatching { socket.close() }.onSuccess { socketClosed = true }
-        onSocketClosed(this)
+        io.updateAndGet { state ->
+            when (state.end) {
+                null -> state.copy(end = End.IO)
+                End.STOPPING -> state.copy(end = End.LOCAL)
+                else -> state
+            }
+        }
+        if (socketClosed || !closingSocket.compareAndSet(false, true)) return
+        try {
+            if (!socketClosed && runCatching { socket.close() }.isSuccess) {
+                socketClosed = true
+                onSocketClosed(this)
+            }
+        } finally {
+            closingSocket.set(false)
+            notifyClosed()
+        }
+    }
+
+    /** The worker may finish while a different thread is still closing its socket. */
+    fun finishWhenSocketClosed(action: () -> Unit) {
+        afterClose.set(action)
+        notifyClosed()
+    }
+
+    private fun notifyClosed() {
+        if (socketClosed) afterClose.getAndSet(null)?.invoke()
     }
 
     fun readFailed(error: Throwable, finishChannel: (Throwable) -> Unit) {
@@ -212,13 +252,13 @@ internal class RfcommTransport<S : Closeable>(
 
 internal class RfcommClose(
     private val mark: () -> Unit,
-    val preservedRegistrations: Set<Long> = emptySet(),
+    val exactRegistration: Long? = null,
+    private val markOnly: () -> Unit = mark,
     val close: () -> Unit,
 ) {
-    val registrationCutoff = RfcommTransport.lastRegistration
+    val registrationCutoff = if (exactRegistration == null) RfcommTransport.lastRegistration else 0L
     fun noteLocalStop() = mark()
-    fun retires(registration: Long): Boolean =
-        registration <= registrationCutoff && registration !in preservedRegistrations
+    fun markBeforeDeferredClose() = markOnly()
 }
 
 /** Admission publishes these under the Bluetooth monitor. Workers only clear their own references. */
@@ -228,11 +268,8 @@ internal class RfcommConnections<S : Closeable> {
     val pending = AtomicReference<RfcommTransport<S>?>()
     private val awaitingHandshake = mutableSetOf<RfcommTransport<S>>()
 
-    @Synchronized fun register(socket: S, wifiLossPredecessorAttempt: Long? = null): RfcommTransport<S> =
-        RfcommTransport(socket, ::removePendingHandshake).also {
-            it.wifiLossPredecessorAttempt = wifiLossPredecessorAttempt
-            awaitingHandshake.add(it)
-        }
+    @Synchronized fun register(socket: S): RfcommTransport<S> =
+        RfcommTransport(socket, ::removePendingHandshake).also { awaitingHandshake.add(it) }
 
     @Synchronized private fun removePendingHandshake(owner: RfcommTransport<S>) {
         awaitingHandshake.remove(owner)
@@ -245,23 +282,28 @@ internal class RfcommConnections<S : Closeable> {
     }
 
     @Synchronized fun captureClose(includeWaiting: Boolean = true,
-                                  wifiLossAttempt: Long? = null,
-                                  wifiLossNetwork: Long? = null,
                                   afterClose: (List<RfcommTransport<S>>) -> Unit = {}): RfcommClose {
+        return snapshot(owners(includeWaiting), null, afterClose)
+    }
+
+    @Synchronized fun captureWifiClose(registration: Long): RfcommClose =
+        snapshot(owners(includeWaiting = false).filter { it.registration == registration }, registration) {}
+
+    private fun owners(includeWaiting: Boolean): List<RfcommTransport<S>> {
         val published = listOfNotNull(session.get(), pending.get(), current.get())
-        val captured = (if (includeWaiting) published + awaitingHandshake else published).distinct()
-        val (preserved, owners) = captured.partition {
-            wifiLossAttempt != null && it.wifiLossPredecessorAttempt == wifiLossAttempt &&
-                (it.ownedWifiNetwork == null || it.ownedWifiNetwork != wifiLossNetwork)
-        }
-        return RfcommClose({ owners.forEach { it.noteLocalStop() } }, preserved.mapTo(mutableSetOf()) { it.registration }) {
+        return (if (includeWaiting) published + awaitingHandshake else published).distinct()
+    }
+
+    private fun snapshot(owners: List<RfcommTransport<S>>, exactRegistration: Long?,
+                         afterClose: (List<RfcommTransport<S>>) -> Unit): RfcommClose =
+        RfcommClose({ owners.filter { it.markLocalStop() }.forEach { it.endIo() } }, exactRegistration,
+            markOnly = { owners.forEach { it.markLocalStop() } }) {
             for (owner in owners) {
                 owner.close()
                 forget(owner)
             }
             afterClose(owners)
         }
-    }
 
     fun forget(owner: RfcommTransport<S>) {
         session.compareAndSet(owner, null)

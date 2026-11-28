@@ -9,6 +9,66 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class RfcommSessionCloseTest {
+    @Test fun finishingTheWorkerCannotReleaseHandoffWhileSocketCloseStillBlocks() {
+        val closing = CountDownLatch(1)
+        val allowClose = CountDownLatch(1)
+        val admitted = java.util.concurrent.atomic.AtomicInteger()
+        val owner = RfcommTransport(Closeable { closing.countDown(); allowClose.await() })
+        val closer = thread(isDaemon = true) { owner.endIo() }
+        try {
+            assertTrue(closing.await(2, TimeUnit.SECONDS))
+            owner.finish()
+            owner.finishWhenSocketClosed { admitted.incrementAndGet() }
+            assertFalse(owner.socketClosed)
+            assertEquals(0, admitted.get())
+        } finally {
+            allowClose.countDown()
+            closer.join(2_000)
+        }
+        assertTrue(owner.socketClosed)
+        assertEquals(1, admitted.get())
+    }
+
+    @Test fun cancellationCanMarkAnOwnerDuringMfiBookkeeping() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val stopped = CountDownLatch(1)
+        val owner = RfcommTransport(Closeable {})
+        val writer = thread(isDaemon = true) {
+            owner.commitMfi {
+                entered.countDown()
+                release.await()
+            }
+        }
+        try {
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            thread(isDaemon = true) {
+                owner.noteLocalStop()
+                stopped.countDown()
+            }
+            assertTrue(stopped.await(1, TimeUnit.SECONDS))
+            assertTrue(owner.localStopRequested)
+        } finally {
+            release.countDown()
+            writer.join(2000)
+        }
+    }
+
+    @Test fun cancellationWhilePreparingTheOutputDoesNotWriteTheFirstReply() {
+        val owner = RfcommTransport(Closeable {})
+        val engine = Iap2LinkEngine()
+        engine.start(0, passive = true)
+        engine.feed(Iap2LinkEngine.MARKER, 1)
+        assertThrows(java.io.InterruptedIOException::class.java) {
+            owner.writeOutputFrom(engine) {
+                owner.noteLocalStop()
+                object : java.io.OutputStream() {
+                    override fun write(byte: Int) { fail("cancelled Detect reached the socket") }
+                }
+            }
+        }
+    }
+
     @Test fun cancelledHandshakeCannotReplyToAnAlreadyBufferedDetect() {
         val owner = RfcommTransport(Closeable {})
         val engine = Iap2LinkEngine()

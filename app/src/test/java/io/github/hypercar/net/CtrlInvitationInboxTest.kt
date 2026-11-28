@@ -6,6 +6,79 @@ import io.github.hypercar.iap2.BmwCafeReservations
 import java.io.Closeable
 
 class CtrlInvitationInboxTest {
+    @Test fun confirmationAfterTheRetryDeadlineCannotPublishBeforeTheNextPoll() {
+        var now = 100L
+        val requests = CtrlInvitationInbox<String, String, String>({ now }) { _, _ -> fail("late invitation published") }
+        val epoch = requests.select("A")!!
+        val receipt = requests.accept(epoch)!!
+        requests.advertise(epoch)
+        assertTrue(requests.beginAcknowledgement(receipt))
+        requests.acknowledge(receipt, "local", "waiting")
+        assertFalse(requests.retireConnectRequests(200L))
+        now = 201L
+        requests.addresses(epoch, setOf("local"))
+        assertNull(requests.latest.get())
+        assertTrue(requests.retireConnectRequests(200L))
+    }
+
+    @Test fun retryCannotDiscardAnAcknowledgedInvitationWaitingForAddressConfirmation() {
+        val epoch = inbox.select("A")!!
+        val receipt = inbox.accept(epoch)!!
+        assertTrue(inbox.beginAcknowledgement(receipt))
+        inbox.offer(receipt, "local", "confirmed after ACK")
+        inbox.finishAcknowledgement(receipt)
+        assertFalse(inbox.retireConnectRequests())
+        inbox.advertise(epoch)
+        inbox.addresses(epoch, setOf("local"))
+        assertEquals("confirmed after ACK", inbox.latest.get())
+    }
+
+    @Test fun manualRetryStopsWaitingForAnAcknowledgedInvitationAtItsDeadline() {
+        var now = 100L
+        val requests = CtrlInvitationInbox<String, String, String>({ now }) { _, _ -> fail("old invitation published") }
+        val epoch = requests.select("A")!!
+        val receipt = requests.accept(epoch)!!
+        assertTrue(requests.beginAcknowledgement(receipt))
+        requests.offer(receipt, "local", "not confirmed")
+        requests.finishAcknowledgement(receipt)
+        assertFalse(requests.retireConnectRequests(200L))
+        now = 200L
+        assertTrue(requests.retireConnectRequests(200L))
+        requests.advertise(epoch)
+        requests.addresses(epoch, setOf("local"))
+        assertNull(requests.latest.get())
+        assertFalse(requests.beginAcknowledgement(requests.accept(epoch)!!))
+    }
+
+    @Test fun additionalRequestsCannotExtendTheRetryDeadlineWhileAnAckIsFinishing() {
+        var now = 100L
+        val requests = CtrlInvitationInbox<String, String, String>({ now }) { _, _ -> }
+        val epoch = requests.select("A")!!
+        val first = requests.accept(epoch)!!
+        assertTrue(requests.beginAcknowledgement(first))
+        assertFalse(requests.retireConnectRequests(200L))
+        now = 200L
+        assertFalse(requests.beginAcknowledgement(requests.accept(epoch)!!))
+        assertTrue(requests.canAcknowledge(first))
+        requests.finishAcknowledgement(first)
+        assertTrue(requests.retireConnectRequests(300L))
+    }
+
+    @Test fun retryRetiresLateHeadersAndCannotTakeAnAlreadyAdmittedHttpSuccess() {
+        val epoch = inbox.select("A")!!
+        val admitted = inbox.accept(epoch)!!
+        val late = inbox.accept(epoch)!!
+        assertTrue(inbox.beginAcknowledgement(admitted))
+        assertFalse(inbox.retireConnectRequests())
+        inbox.select("B")
+        assertFalse(inbox.canAcknowledge(admitted))
+        assertFalse(inbox.retireConnectRequests())
+        inbox.finishAcknowledgement(admitted)
+        assertTrue(inbox.retireConnectRequests())
+        assertFalse(inbox.beginAcknowledgement(late))
+        assertFalse(inbox.beginAcknowledgement(inbox.accept(inbox.current!!)!!))
+    }
+
     private val events = mutableListOf<String>()
     private val inbox = CtrlInvitationInbox<String, String, String> { _, invite -> events += invite }
 

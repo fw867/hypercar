@@ -85,7 +85,7 @@ class CarBluetoothReceiver : BroadcastReceiver() {
         // 转交会话层：connected 区分上车/下车。handler 内部决定 startForegroundService/stop，
         // 并做会话重活。这里只兜底捕获异常（如 ForegroundServiceStartNotAllowedException——
         // Android 12+ 后台 FGS 豁免靠 SYSTEM_ALERT_WINDOW，用户没授悬浮窗时会被拦，只记日志不崩）。
-        runCatching { handler(app, device, connected, false, SystemClock.elapsedRealtime()) }
+        runCatching { handler(app, device, connected, SystemClock.elapsedRealtime(), null) }
             .onFailure { t ->
                 Log.e(
                     TAG,

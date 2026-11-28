@@ -6,6 +6,33 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SessionSocketLeaseTest {
+    @Test fun anEndedAirPlayLeaseCanOnlyReleaseItsActualRfcommOwner() {
+        val old = SessionSocketLease("car", 12)
+        old.bindRfcomm(13)
+        assertFalse(old.endedWithRfcomm(13))
+        old.noteTransportEnded()
+        old.bindRfcomm(14)
+        assertFalse(old.endedWithRfcomm(12))
+        assertTrue(old.endedWithRfcomm(13))
+        assertFalse(old.endedWithRfcomm(14))
+        assertFalse(SessionSocketLease("car").apply { noteTransportEnded() }.endedWithRfcomm(14))
+    }
+
+    @Test fun terminalObservationReleasesInboundBeforeCleanupWithoutChangingAnotherLease() {
+        val old = SessionSocketLease("car")
+        val replacement = SessionSocketLease("car")
+        old.noteTransportEnded()
+        assertFalse(old.blocksBluetoothInbound)
+        assertTrue(old.isActive)
+        assertTrue(replacement.blocksBluetoothInbound)
+    }
+    @Test fun invalidatedLeaseStopsOwningAirplayEvenWhileTheReferenceIsRetained() {
+        val lease = SessionSocketLease("car")
+        assertTrue(lease.isActive)
+        lease.invalidate()
+        assertFalse(lease.isActive)
+    }
+
     private class FakeSocket : Closeable {
         var closed = false
         override fun close() { closed = true }

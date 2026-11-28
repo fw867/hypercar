@@ -6,6 +6,22 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class HeadUnitPickerTest {
+    @Test fun electricVehicleCategoryFollowsMotorcycleAndHasNoCarPlayProfiles() {
+        val groups = HeadUnitPicker.groups(HeadUnitProfiles.builtin)
+        val motorcycle = groups.indexOfFirst { it.id == HeadUnitCategory.MOTORCYCLE.key }
+        assertTrue(motorcycle >= 0)
+        val electric = groups[motorcycle + 1]
+        assertEquals(HeadUnitPicker.ELECTRIC_VEHICLE_GROUP, electric.id)
+        assertTrue(electric.profiles.isEmpty())
+        assertEquals(listOf(ElectricVehicleProfile.Yadea), electric.electricVehicles)
+    }
+
+    @Test fun searchListsYadeaSeparatelyFromCarPlayProfiles() {
+        assertEquals(listOf(ElectricVehicleProfile.Yadea), HeadUnitPicker.electricVehicles("电动车 雅迪"))
+        assertTrue(HeadUnitPicker.electricVehicles("宝马").isEmpty())
+        assertTrue(HeadUnitPicker.search(HeadUnitProfiles.builtin, "雅迪").isEmpty())
+    }
+
     @Test fun groupsByBrandAndKeepsSpecialCategoriesSeparate() {
         val groups = HeadUnitPicker.groups(HeadUnitProfiles.builtin).associateBy { it.label }
         assertEquals(setOf("bmw_id85", "bmw_id6", "bmw_id9"),

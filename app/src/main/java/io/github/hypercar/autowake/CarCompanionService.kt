@@ -13,6 +13,7 @@ class CarCompanionService : CompanionDeviceService() {
 
     override fun onDeviceDisappeared(associationInfo: AssociationInfo) {
         // 设备出现观察可能包含 BLE；不能据此拆除已交接至 Wi-Fi 的 CarPlay。
+        CarCompanionWake.disappeared(associationInfo)
         HyperCarRepo.log("COMPANION: 设备不再可见 association=${associationInfo.id}，会话由现有链路判断")
     }
 }

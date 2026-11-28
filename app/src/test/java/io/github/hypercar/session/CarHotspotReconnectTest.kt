@@ -418,16 +418,19 @@ class CarHotspotReconnectTest {
         var committed = false
         assertFalse(inbox.offer(deferred) { committed = true })
         var releasedRoute: CarPlayEndpoint? = null
+        var retainedRoute: CarPlayEndpoint? = null
         repeat(20) { index ->
             assertFalse(inbox.offer(report.copy(airPlayPort = 7000 + index), onDeferredAddress = { releasedRoute = it }))
         }
-        assertFalse(inbox.offer(report, onDeferredAddress = { releasedRoute = it }) {
+        assertFalse(inbox.offer(report, onDeferredAddress = { releasedRoute = it }, onRetainedAddress = { retainedRoute = it }) {
             throw AssertionError("address-only report committed with the old credential")
         })
         assertSame(selected, inbox.awaitReplacementCredentials(lost, 12_000))
         assertSame(selected, inbox.newestCredentials(selected))
         assertFalse(committed)
         assertNull(releasedRoute)
+        assertEquals(deferred.ssid, retainedRoute?.ssid)
+        assertTrue(retainedRoute?.requiresMatchingAirplayCredentials == true)
         inbox.finishRecoveryJoin()
         assertTrue(committed)
 
@@ -440,6 +443,31 @@ class CarHotspotReconnectTest {
         val verified = checkNotNull(route.verifiedAirplayEndpoint(second.ssid, 12L, hasMatchingCredentials = true) { true })
         assertEquals(listOf("192.168.6.2"), verified.ipAddresses)
         assertEquals(12L, verified.verifiedAirplayNetworkHandle)
+    }
+
+    @Test fun newSocketsFirstAddressSurvivesRejectionOfTheOldSocketsDeferredCredentials() = kotlinx.coroutines.test.runTest {
+        val hotspot = checkNotNull(BluetoothHotspot.fromPeer(receiver, "CAR-WIFI"))
+        val old = io.github.hypercar.iap2.RfcommTransport(java.io.Closeable {})
+        val new = io.github.hypercar.iap2.RfcommTransport(java.io.Closeable {})
+        val selected = CarPlayEndpoint(hotspot.ssid, "selected-passphrase", 0, null, null, null, emptyList(), null,
+            bluetoothHotspot = hotspot, sourceGeneration = old.endpointGeneration())
+        val deferred = selected.copy(passphrase = "deferred-passphrase")
+        val route = selected.copy(passphrase = null, ipAddresses = listOf("192.168.6.2"), airPlayPort = 7300,
+            addressOnlyAirplayReport = true, sourceGeneration = new.endpointGeneration())
+        var now = 11_999L
+        val inbox = CarHotspotReconnect.EndpointInbox(nowMillis = { now }, hasFreshCredentials = { it.passphrase != null })
+        val lost = CarWifiRequestIdentity(hotspot.ssid, "lost-passphrase")
+        inbox.beginWifiRecovery(lost, 12_000)
+        assertTrue(inbox.offer(selected))
+        now = 12_001
+        assertFalse(inbox.offer(deferred) { throw AssertionError("retired deferred credentials were committed") })
+        assertTrue(inbox.offer(route))
+        assertSame(selected, inbox.awaitReplacementCredentials(lost, 12_000))
+        old.revokeEndpointPublication()
+        inbox.finishRecoveryJoin()
+        assertSame(selected, inbox.poll())
+        assertSame(route, inbox.poll())
+        assertNull(inbox.poll())
     }
 
     @Test fun verifiedAddressOnly4301KeepsItsOwnerWhileAnotherCredentialIsDeferred() = kotlinx.coroutines.test.runTest {

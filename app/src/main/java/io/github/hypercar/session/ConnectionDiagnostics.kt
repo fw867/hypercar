@@ -206,6 +206,8 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
         if (t.engine == engine && t.closed == null) t.tcp = sample
     }
 
+    @Synchronized internal fun reserveAttemptId(): Long = ++serial
+
     @Synchronized internal fun begin(
         source: String, profile: String, startedUptime: Long = clockMillis(), aclWake: AclWake? = null,
     ): Long {
@@ -213,7 +215,7 @@ class ConnectionDiagnostics(private val clockMillis: () -> Long) {
         history.lastOrNull()?.takeIf { it.ended == null }?.let {
             it.outcome = "SUPERSEDED"; it.ended = now
         }
-        val attempt = Attempt(++serial, clean(source), clean(profile), now, startedUptime)
+        val attempt = Attempt(reserveAttemptId(), clean(source), clean(profile), now, startedUptime)
         // Only the original idle edge that actually opens this round may predate it.
         if (aclWake != null) {
             val peer = aclWake.peer.uppercase()

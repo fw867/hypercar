@@ -144,6 +144,23 @@ object RustCoreBridge {
                                       validator: CarWithCanvasValidator?): Boolean
     external fun nativeStopCarWith(owner: Long)
 
+    interface YadeaSourceListener {
+        fun onVideo(data: ByteArray, ptsUs: Long, codec: Int)
+        fun onSourceSize(width: Int, height: Int)
+        fun onSourceReset()
+        fun onVideoDisconnected()
+        fun onAudioFormat(tts: Boolean, rate: Int, channels: Int)
+        fun onAudioStop(tts: Boolean)
+        fun onAudio(tts: Boolean, rate: Int, channels: Int, pcm: ByteArray)
+        fun onReopen(startup: Boolean)
+        fun onSourceClosed()
+    }
+
+    external fun nativeStartYadeaSource(configJson: String, owner: Long, width: Int, height: Int, fps: Int,
+                                        confirmed: Boolean, listener: YadeaSourceListener): Boolean
+    external fun nativeYadeaTouch(owner: Long, action: Int, x: Int, y: Int): Boolean
+    external fun nativeYadeaRequestKeyFrame(owner: Long)
+
     /** Capture the native engine generation; zero means no input receiver. */
     external fun nativeVoiceKeyToken(): Long
     external fun nativeCancelMicrophone(token: Long): Boolean

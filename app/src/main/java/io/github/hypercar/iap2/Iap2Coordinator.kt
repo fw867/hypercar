@@ -67,18 +67,34 @@ data class CarPlayEndpoint(
 /** A logical control generation on one physical RFCOMM socket. EOF alone leaves accepted reports usable. */
 class Iap2EndpointGeneration internal constructor(
     internal val rfcommRegistration: Long = 0,
+    private val publisher: () -> Boolean = { true },
+    private val parent: Iap2EndpointGeneration? = null,
     private val current: () -> Boolean = { true },
 ) {
     @Volatile private var retired = false
     internal val isCurrent: Boolean get() = !retired && current()
+    internal val canPublish: Boolean get() = isCurrent && publisher()
 
     @Synchronized internal fun retire() { retired = true }
 
     @Synchronized internal fun runIfCurrent(action: () -> Unit): Boolean {
         if (!isCurrent) return false
+        if (parent != null) {
+            var ran = false
+            parent.runIfCurrent {
+                if (isCurrent) {
+                    action()
+                    ran = true
+                }
+            }
+            return ran
+        }
         action()
         return true
     }
+
+    internal fun unpublishedRoute() =
+        Iap2EndpointGeneration(rfcommRegistration, current = { canPublish }, parent = this)
 }
 
 /** One physical RFCOMM worker's current accepted endpoint. */
@@ -260,10 +276,11 @@ class Iap2Coordinator(
     /** Wi-Fi is healthy. Suppress fresh outgoing dials while the car retires RFCOMM. */
     fun pauseOutboundForWifi() { bluetooth?.setOutboundPausedForWifi(true) }
 
-    internal fun captureSessionClose(wifiLossAttempt: Long? = null, wifiLossNetwork: Long? = null): RfcommClose? =
-        bluetooth?.captureSessionClose(wifiLossAttempt, wifiLossNetwork)
+    internal fun captureSessionClose(): RfcommClose? = bluetooth?.captureSessionClose()
 
-    internal fun claimWifiSource(source: Iap2EndpointGeneration?, network: Long) { bluetooth?.claimWifiSource(source, network) }
+    internal fun captureWifiClose(registration: Long?): RfcommClose? =
+        if (profile.protocolProfileId == "bmw_id85") registration?.let { bluetooth?.captureWifiClose(it) }
+        else captureSessionClose()
 
     fun captureBluetoothLost(address: String): (() -> Unit)? = bluetooth?.captureBluetoothLost(address)
 

@@ -1,12 +1,13 @@
 package io.github.hypercar.session
 
 import io.github.hypercar.net.CarWifiRequestIdentity
+import io.github.hypercar.iap2.RfcommClose
 import kotlinx.coroutines.CompletableDeferred
 
 /** One native activation, ending at a real video TCP connection (not merely RECORD/connected).
  * Keep rejected callbacks contained until nativeStop has joined the old engine. */
 internal class ProactiveActivation {
-    data class WifiLoss(val credentials: CarWifiRequestIdentity?, val observedAt: Long)
+    data class WifiLoss(val credentials: CarWifiRequestIdentity?, val observedAt: Long, val rfcommClose: RfcommClose?)
 
     val result = CompletableDeferred<String?>()
     private var ready = false
@@ -23,9 +24,10 @@ internal class ProactiveActivation {
         result.complete(null)
     }
 
-    @Synchronized fun interceptWifiLoss(credentials: CarWifiRequestIdentity?, observedAt: Long): Boolean {
+    @Synchronized fun interceptWifiLoss(credentials: CarWifiRequestIdentity?, observedAt: Long,
+                                        rfcommClose: RfcommClose? = null): Boolean {
         if (ready) return false
-        if (wifiLoss == null) wifiLoss = WifiLoss(credentials, observedAt)
+        if (wifiLoss == null) wifiLoss = WifiLoss(credentials, observedAt, rfcommClose)
         return interceptTerminal("视频建立前车机 Wi-Fi 已断开")
     }
 

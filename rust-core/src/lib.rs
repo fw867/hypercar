@@ -31,6 +31,7 @@ mod voice_key;
 mod crypto;
 mod carlife;
 mod carwith_source;
+mod yadea_source;
 mod engine;
 mod modes;
 mod pairing;

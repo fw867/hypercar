@@ -16,6 +16,9 @@ import androidx.core.app.ServiceCompat
 import io.github.hypercar.HyperCarApp
 import io.github.hypercar.R
 import io.github.hypercar.session.HyperCarRepo
+import io.github.hypercar.session.ProjectionTargetEpoch
+import io.github.hypercar.settings.ProjectionTarget
+import io.github.hypercar.settings.SettingsStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -71,8 +74,37 @@ class HyperCarService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (SettingsStore.projectionTarget != ProjectionTarget.CarPlay) {
+            projectionAllowed.value = false
+            isRunning = false
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            releaseLocks()
+            stopSelfResult(startId)
+            return START_NOT_STICKY
+        }
         val automatic = intent?.action != ACTION_SESSION
-        val autoEnabled = io.github.hypercar.settings.SettingsStore.autoConnect
+        val device = intent?.takeIf { it.action == ACTION_START }?.let(::deviceOf)
+        val serviceStart = intent?.serviceStart(device)
+        if (serviceStart?.source is ProjectionTargetEpoch.Wake.Companion) {
+            return HyperCarRepo.withCurrentCompanionServiceStart(serviceStart) {
+                startCurrentCommand(intent, startId, automatic, device, serviceStart)
+            } ?: ignoreServiceStart(startId)
+        }
+        if (intent != null && (!HyperCarRepo.isCarPlayServiceStartCurrent(serviceStart, automatic) ||
+            !automatic && !HyperCarRepo.isCarPlayServiceSessionCurrent(intent.getLongExtra(EXTRA_SERVICE_SESSION, -1)))) {
+            return ignoreServiceStart(startId)
+        }
+        return startCurrentCommand(intent, startId, automatic, device, serviceStart)
+    }
+
+    private fun startCurrentCommand(intent: Intent?, startId: Int, automatic: Boolean, device: BluetoothDevice?,
+                                    serviceStart: ProjectionTargetEpoch.ServiceStart?): Int {
+        val autoEnabled = SettingsStore.autoConnect
+        if (intent?.action == ACTION_COMPANION && !CompanionWakePolicy.accepts(
+                autoEnabled, SettingsStore.targetCarMac, intent.getStringExtra(EXTRA_ADDRESS),
+            )) {
+            return ignoreServiceStart(startId)
+        }
         val paused = autoEnabled && io.github.hypercar.session.HyperCarRepo.automaticPauseRemaining > 0
         val requestedIdentity = intent?.action == ACTION_IDENTITY || (intent == null && paused)
         if (automatic && io.github.hypercar.session.HyperCarRepo.hasCurrentSession &&
@@ -84,7 +116,7 @@ class HyperCarService : Service() {
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 releaseLocks()
                 isRunning = false
-                stopSelf()
+                stopSelfResult(startId)
                 return START_NOT_STICKY
             }
         }
@@ -92,19 +124,19 @@ class HyperCarService : Service() {
         if (automatic && autoEnabled && !identityOnly && !io.github.hypercar.session.HyperCarRepo.hasCurrentSession) {
             val readiness = io.github.hypercar.session.StartupRequirements.read(this)
             if (readiness.automaticStandbyIssues.isNotEmpty()) {
-                if (readiness.bluetoothEnabled) io.github.hypercar.session.HyperCarRepo.setAutoConnect(this, false)
+                // A sticky restart may restore standby, but it has no original request to authorize a preference write.
+                if (serviceStart != null && !HyperCarRepo.isCarPlayServiceStartCurrent(serviceStart, automatic)) {
+                    return ignoreServiceStart(startId)
+                }
+                if (readiness.bluetoothEnabled && serviceStart != null) {
+                    HyperCarRepo.disableAutoConnectAfterServiceCheck(this, serviceStart)
+                }
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 releaseLocks()
                 isRunning = false
                 stopSelf()
                 return START_NOT_STICKY
             }
-        }
-        if (intent?.action == ACTION_COMPANION && !CompanionWakePolicy.accepts(
-                autoEnabled, io.github.hypercar.settings.SettingsStore.targetCarMac, intent.getStringExtra(EXTRA_ADDRESS),
-            )) {
-            if (!io.github.hypercar.session.HyperCarRepo.hasCurrentSession) stopSelf()
-            return START_NOT_STICKY
         }
         if (intent?.action == ACTION_STOP ||
             (automatic && !autoEnabled && !io.github.hypercar.session.HyperCarRepo.hasCurrentSession)) {
@@ -120,22 +152,23 @@ class HyperCarService : Service() {
         projectionAllowed.value = !listeningOnly && foregroundTypes != 0
         if (listeningOnly) releaseLocks() else acquireLocks()
         isRunning = true
-        val device = deviceOf(intent)
-        if (intent?.action == ACTION_START && device != null) {
+        if (device != null && serviceStart?.source is ProjectionTargetEpoch.Wake.Acl) {
             runCatching {
-                val observedAt = intent.getLongExtra(EXTRA_ACL_OBSERVED_AT, android.os.SystemClock.elapsedRealtime())
-                AutoStart.handler?.invoke(applicationContext, device, true, true, observedAt)
+                AutoStart.handler?.invoke(applicationContext, device, true, serviceStart.source.observedAt, serviceStart)
             }
                 .onFailure { Log.e(TAG, "触发会话失败", it) }
-        } else if (intent?.action == ACTION_COMPANION) {
-            intent.getStringExtra(EXTRA_ADDRESS)?.let {
-                io.github.hypercar.session.HyperCarRepo.connectFromCompanion(applicationContext, it)
-            }
+        } else if (serviceStart?.source is ProjectionTargetEpoch.Wake.Companion) {
+            HyperCarRepo.connectFromCompanion(applicationContext, serviceStart, serviceStart.source.address)
         } else if (autoEnabled && (intent == null || (requestedIdentity && !paused))) {
             // 系统回收后只恢复自动待机，不能凭空重建一轮手动会话。
             io.github.hypercar.session.HyperCarRepo.startAutomaticListening(applicationContext)
         }
         return if (autoEnabled) START_STICKY else START_NOT_STICKY
+    }
+
+    private fun ignoreServiceStart(startId: Int): Int {
+        if (!isRunning) stopSelfResult(startId)
+        return if (isRunning && SettingsStore.autoConnect) START_STICKY else START_NOT_STICKY
     }
 
     override fun onDestroy() {
@@ -301,6 +334,13 @@ class HyperCarService : Service() {
         private const val ACTION_SESSION = "io.github.hypercar.action.SESSION"
         private const val ACTION_COMPANION = "io.github.hypercar.action.COMPANION"
         private const val EXTRA_ADDRESS = "io.github.hypercar.extra.COMPANION_ADDRESS"
+        private const val EXTRA_ASSOCIATION_ID = "io.github.hypercar.extra.COMPANION_ASSOCIATION"
+        private const val EXTRA_PRESENCE_GENERATION = "io.github.hypercar.extra.COMPANION_PRESENCE"
+        private const val EXTRA_SERVICE_ORIGIN = "io.github.hypercar.extra.SERVICE_ORIGIN"
+        private const val EXTRA_SERVICE_PROJECTION = "io.github.hypercar.extra.SERVICE_PROJECTION"
+        private const val EXTRA_SERVICE_AUTOMATIC = "io.github.hypercar.extra.SERVICE_AUTOMATIC"
+        private const val EXTRA_SERVICE_CAR = "io.github.hypercar.extra.SERVICE_CAR"
+        private const val EXTRA_SERVICE_SESSION = "io.github.hypercar.extra.SERVICE_SESSION"
 
         /** 下车：ACL 断开时（经 startService）收摊。 */
         const val ACTION_STOP = "io.github.hypercar.action.AUTO_STOP"
@@ -314,28 +354,57 @@ class HyperCarService : Service() {
             private set
 
         fun listenIntent(context: Context): Intent =
-            Intent(context, HyperCarService::class.java).setAction(ACTION_LISTEN)
+            serviceIntent(context, ACTION_LISTEN)
 
         fun identityIntent(context: Context): Intent =
-            Intent(context, HyperCarService::class.java).setAction(ACTION_IDENTITY)
+            serviceIntent(context, ACTION_IDENTITY)
 
-        fun sessionIntent(context: Context): Intent =
-            Intent(context, HyperCarService::class.java).setAction(ACTION_SESSION)
+        fun sessionIntent(context: Context, attempt: Long): Intent =
+            serviceIntent(context, ACTION_SESSION).putExtra(EXTRA_SERVICE_SESSION, attempt)
 
-        fun companionIntent(context: Context, address: String): Intent =
-            Intent(context, HyperCarService::class.java).setAction(ACTION_COMPANION).putExtra(EXTRA_ADDRESS, address)
+        internal fun companionIntent(context: Context, presence: ProjectionTargetEpoch.Wake.Companion): Intent =
+            serviceIntent(context, ACTION_COMPANION, presence)
+                .putExtra(EXTRA_ADDRESS, presence.address)
+                .putExtra(EXTRA_ASSOCIATION_ID, presence.associationId)
+                .putExtra(EXTRA_PRESENCE_GENERATION, presence.presenceGeneration)
 
         private const val EXTRA_ACL_OBSERVED_AT = "io.github.hypercar.extra.ACL_OBSERVED_AT"
+        private const val EXTRA_ACL_SEQUENCE = "io.github.hypercar.extra.ACL_SEQUENCE"
 
-        fun startIntent(context: Context, device: BluetoothDevice, observedAt: Long): Intent =
-            Intent(context, HyperCarService::class.java)
-                .setAction(ACTION_START)
+        internal fun startIntent(context: Context, device: BluetoothDevice, edge: ProjectionTargetEpoch.Wake.Acl): Intent =
+            serviceIntent(context, ACTION_START, edge)
                 .putExtra(EXTRA_DEVICE, device)
-                .putExtra(EXTRA_ACL_OBSERVED_AT, observedAt)
+                .putExtra(EXTRA_ACL_OBSERVED_AT, edge.observedAt)
+                .putExtra(EXTRA_ACL_SEQUENCE, edge.sequence)
 
         fun stopIntent(context: Context, device: BluetoothDevice?): Intent =
-            Intent(context, HyperCarService::class.java)
-                .setAction(ACTION_STOP)
+            serviceIntent(context, ACTION_STOP)
                 .let { if (device != null) it.putExtra(EXTRA_DEVICE, device) else it }
+
+        private fun serviceIntent(context: Context, action: String, source: ProjectionTargetEpoch.Wake? = null): Intent =
+            Intent(context, HyperCarService::class.java).setAction(action).apply {
+                HyperCarRepo.captureCarPlayServiceStart(source)?.let { start ->
+                    putExtra(EXTRA_SERVICE_ORIGIN, start.origin)
+                    putExtra(EXTRA_SERVICE_PROJECTION, start.projection)
+                    putExtra(EXTRA_SERVICE_AUTOMATIC, start.automaticRequest)
+                    putExtra(EXTRA_SERVICE_CAR, start.carSelection)
+                }
+            }
+
+        private fun Intent.serviceStart(device: BluetoothDevice?): ProjectionTargetEpoch.ServiceStart? {
+            val origin = getStringExtra(EXTRA_SERVICE_ORIGIN) ?: return null
+            val source = when (action) {
+                ACTION_START -> {
+                    val peer = runCatching { device?.address }.getOrNull() ?: return null
+                    ProjectionTargetEpoch.Wake.Acl(peer, getLongExtra(EXTRA_ACL_OBSERVED_AT, -1),
+                        getLongExtra(EXTRA_ACL_SEQUENCE, -1))
+                }
+                ACTION_COMPANION -> ProjectionTargetEpoch.Wake.Companion(getStringExtra(EXTRA_ADDRESS) ?: return null,
+                    getIntExtra(EXTRA_ASSOCIATION_ID, -1), getLongExtra(EXTRA_PRESENCE_GENERATION, -1L))
+                else -> null
+            }
+            return ProjectionTargetEpoch.ServiceStart(origin, getLongExtra(EXTRA_SERVICE_PROJECTION, -1),
+                getLongExtra(EXTRA_SERVICE_AUTOMATIC, -1), getLongExtra(EXTRA_SERVICE_CAR, -1), source)
+        }
     }
 }

@@ -11,6 +11,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.DirectionsCar
 import androidx.compose.material.icons.rounded.DesktopWindows
+import androidx.compose.material.icons.rounded.ElectricScooter
 import androidx.compose.material.icons.rounded.TwoWheeler
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
@@ -33,6 +34,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import io.github.hypercar.headunit.HeadUnitProfiles
+import io.github.hypercar.headunit.HeadUnitPicker
+import io.github.hypercar.headunit.ElectricVehicleProfile
 import io.github.hypercar.ui.theme.ElectricCyan
 import io.github.hypercar.ui.theme.StrokeGlass
 import io.github.hypercar.ui.theme.SurfaceInset
@@ -44,6 +47,7 @@ import java.util.Locale
 fun CarBrandBadge(profileId: String, label: String, modifier: Modifier = Modifier, size: Dp = 44.dp, framed: Boolean = true) {
     val identity = "$profileId $label".lowercase(Locale.ROOT)
     val brand = when {
+        profileId == ElectricVehicleProfile.Yadea.id -> "雅迪"
         "bmw" in identity || "宝马" in identity -> "BMW"
         "mercedes" in identity || "奔驰" in identity -> "Mercedes-Benz"
         "audi" in identity || "奥迪" in identity -> "Audi"
@@ -53,6 +57,7 @@ fun CarBrandBadge(profileId: String, label: String, modifier: Modifier = Modifie
         else -> "generic"
     }
     val icon = when {
+        profileId == HeadUnitPicker.ELECTRIC_VEHICLE_GROUP -> Icons.Rounded.ElectricScooter
         profileId == HeadUnitProfiles.MOTORCYCLE_ID -> Icons.Rounded.TwoWheeler
         brand == "desktop" -> Icons.Rounded.DesktopWindows
         brand == "generic" -> Icons.Rounded.DirectionsCar
@@ -74,6 +79,9 @@ fun CarBrandBadge(profileId: String, label: String, modifier: Modifier = Modifie
         } else if (brand == "BMW") {
             Image(painterResource(if (framed || dark) R.drawable.ic_brand_bmw_light else R.drawable.ic_brand_bmw),
                 contentDescription = null, modifier = Modifier.size(size))
+        } else if (brand == "雅迪") {
+            Image(painterResource(R.drawable.ic_brand_yadea), contentDescription = null,
+                modifier = Modifier.size(size * 0.68f))
         } else {
             Canvas(Modifier.size(size)) {
                 val chrome = if (framed || dark) listOf(Color(0xFFF9FAFC), Color(0xFF8E9AA9), Color(0xFFE6EBF2))

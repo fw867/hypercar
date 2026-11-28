@@ -8,6 +8,7 @@ import java.util.concurrent.Future
 internal class BmwCaffHandoff<S : Closeable>(
     val old: S,
     val incoming: S,
+    private val closeIncoming: (S) -> Unit = { it.close() },
     private val onReady: (BmwCaffHandoff<S>) -> Unit,
 ) {
     private var released = false
@@ -37,7 +38,7 @@ internal class BmwCaffHandoff<S : Closeable>(
         if (!isHeld) return
         isHeld = false
         cancelDeadline()
-        runCatching { incoming.close() }
+        runCatching { closeIncoming(incoming) }
     }
 
     private fun cancelDeadline() {
@@ -47,7 +48,7 @@ internal class BmwCaffHandoff<S : Closeable>(
 }
 
 /** All operations, including the worker's claim, run under the Bluetooth admission lock. */
-internal class BmwCafeReservations<S : Closeable> {
+internal class BmwCafeReservations<S : Closeable>(private val closeIncoming: (S) -> Unit = { it.close() }) {
     var pending: BmwCaffHandoff<S>? = null
         private set
     private var pendingAttempt = 0L
@@ -60,7 +61,7 @@ internal class BmwCafeReservations<S : Closeable> {
         if (attempt != 0L && attempt <= retiredThrough || pending != null) return false
         if (invitationOwns(attempt, incoming)) return false
         pendingAttempt = attempt
-        pending = BmwCaffHandoff(old, incoming, onReady)
+        pending = BmwCaffHandoff(old, incoming, closeIncoming, onReady)
         return true
     }
 
